@@ -3942,7 +3942,7 @@ mod tests {
         for request in durable_object_requests() {
             let root = DurableTestRoot::new();
             let blocking = Arc::new(BlockingState::new());
-            let (backend, store) = bind_with_capacity_and_recovery(
+            let (backend, store, _) = bind_with_capacity_and_recovery(
                 LinuxXfrmBackend::with_transport(BlockingTransport {
                     state: Arc::clone(&blocking),
                 }),
@@ -3951,6 +3951,7 @@ mod tests {
                     root.path().to_path_buf(),
                     XfrmObjectRecoveryProofKey::new([0x6e; 32]).unwrap(),
                 )),
+                None,
             )
             .unwrap();
             let store = store.unwrap();
@@ -6815,10 +6816,41 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[derive(Debug, Clone, Default)]
+    struct UntrustedReadbackTransport {
+        operations: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[cfg(unix)]
+    impl LinuxXfrmTransport for UntrustedReadbackTransport {
+        fn transact(
+            &self,
+            operation: &'static str,
+            _operation_class: crate::linux::NetlinkOperationClass,
+            _request: &[u8],
+            _expected_sequence: u32,
+            _config: LinuxXfrmBackendConfig,
+        ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+            self.operations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(operation);
+            // An empty response for every operation: unlike a decisive
+            // NotFound, it cannot be parsed into an exact identity, so every
+            // readback is untrustworthy.
+            Ok(None)
+        }
+
+        fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
+            XfrmProbe::unsupported()
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn untrusted_pre_effect_readback_returns_relocation_authority() {
         let root = DurableTestRoot::new();
-        let transport = RecordingSuccessTransport::default();
+        let transport = UntrustedReadbackTransport::default();
         let (backend, store) = bind_with_relocation_recovery(transport.clone(), &root);
         let operation_id = XfrmSaRelocationOperationId::generate().unwrap();
         let operation_generation = XfrmSaRelocationOperationGeneration::new(6).unwrap();
@@ -7233,6 +7265,7 @@ mod tests {
                 &object_store.handle_for_record(&prepared).unwrap(),
                 XfrmObjectInstallDurablePhase::Prepared,
                 XfrmObjectInstallDurablePhase::Issuing,
+                Some(XfrmObjectInstallPreEffectProof::Absent),
             )
             .unwrap();
 
@@ -7255,6 +7288,7 @@ mod tests {
                 &object_store.handle_for_record(&issuing).unwrap(),
                 XfrmObjectInstallDurablePhase::Issuing,
                 XfrmObjectInstallDurablePhase::NoMutation,
+                None,
             )
             .unwrap();
         object_store
@@ -7262,6 +7296,7 @@ mod tests {
                 &object_store.handle_for_record(&no_mutation).unwrap(),
                 XfrmObjectInstallDurablePhase::NoMutation,
                 XfrmObjectInstallDurablePhase::Retired,
+                None,
             )
             .unwrap();
         assert!(backend
@@ -7327,6 +7362,7 @@ mod tests {
                 &object_store.handle_for_record(&prepared).unwrap(),
                 XfrmObjectInstallDurablePhase::Prepared,
                 XfrmObjectInstallDurablePhase::Issuing,
+                Some(XfrmObjectInstallPreEffectProof::Absent),
             )
             .unwrap();
         let acquired = object_store
@@ -7334,6 +7370,7 @@ mod tests {
                 &object_store.handle_for_record(&issuing).unwrap(),
                 XfrmObjectInstallDurablePhase::Issuing,
                 XfrmObjectInstallDurablePhase::Acquired,
+                None,
             )
             .unwrap();
 
@@ -7361,6 +7398,7 @@ mod tests {
                 &object_store.handle_for_record(&acquired).unwrap(),
                 XfrmObjectInstallDurablePhase::Acquired,
                 XfrmObjectInstallDurablePhase::Committed,
+                None,
             )
             .unwrap();
         backend.remove_sa(remove_request()).await.unwrap();
@@ -7720,7 +7758,9 @@ mod tests {
             backend.run_durable_object_install(authority).await.unwrap(),
             XfrmObjectInstallDurableOutcome::Acquired(_)
         ));
-        assert_eq!(transport.operations(), vec!["install_sa"]);
+        // The install run witnesses the deletion identity (query_sa) before
+        // admitting the NEWSA effect.
+        assert_eq!(transport.operations(), vec!["query_sa", "install_sa"]);
         assert_eq!(
             backend
                 .finalize_durable_object_install(
