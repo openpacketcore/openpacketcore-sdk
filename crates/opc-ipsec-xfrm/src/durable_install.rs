@@ -23,12 +23,16 @@ pub enum XfrmObjectInstallDurableOutcome {
     /// The backend acknowledged acquisition and durable cleanup authority was
     /// published before this result became visible.
     Acquired(XfrmObjectInstallRecoveryHandle),
-    /// `AlreadyExists` definitively proved that the create-exclusive request
-    /// made no mutation.
+    /// A pre-effect conflict or `AlreadyExists` definitively proved that this
+    /// request made no mutation.
     NoMutation(XfrmObjectInstallRecoveryHandle),
-    /// Ownership cannot be proved. Recovery must retain state and perform no
-    /// deletion. A live call carries its value-free backend failure; a
-    /// restored `Issuing` record has no recoverable source value.
+    /// The live install result alone cannot prove ownership. The record and
+    /// its durable pre-effect proof remain unresolved so restart recovery can
+    /// reconcile them with fresh exact readback under the writer gate. Only a
+    /// witnessed pre-effect absence followed by exact presence may establish
+    /// owned residue and authorize admitted deletion. A live call carries its
+    /// value-free backend failure; a restored record has no recoverable source
+    /// value.
     Indeterminate {
         /// Authenticated correlation handle for the fail-closed record.
         handle: XfrmObjectInstallRecoveryHandle,
@@ -94,10 +98,10 @@ pub enum XfrmObjectInstallRestartOutcome {
         /// Redaction-safe backend failure.
         source: XfrmError,
     },
-    /// A pre-effect proof proved the exact identity present before the effect
-    /// was admitted, and that same foreign/conflicting identity is still
-    /// present. The record was retired without any deletion; the foreign state
-    /// was left untouched.
+    /// A pre-effect proof witnessed the exact identity already present, so no
+    /// install effect was admitted, and that same foreign/conflicting identity
+    /// is still present. The record was retired without any deletion; the
+    /// foreign state was left untouched.
     ForeignUntouched,
     /// The durable record is inconsistent in a way this boundary cannot safely
     /// repair (for example a stale writer epoch or a missing proof). The record
@@ -215,11 +219,19 @@ where
         XfrmObjectInstallDurablePhase::Issuing,
         Some(pre_effect_proof),
     )?;
-    let result = install(backend, request).await;
-    let (phase, source) = match result {
-        Ok(()) => (XfrmObjectInstallDurablePhase::Acquired, None),
-        Err(XfrmError::AlreadyExists) => (XfrmObjectInstallDurablePhase::NoMutation, None),
-        Err(source) => (XfrmObjectInstallDurablePhase::Indeterminate, Some(source)),
+    let (phase, source) = match pre_effect_proof {
+        // A conflicting SA can expire autonomously between GETSA and NEWSA.
+        // Issuing after witnessing it could therefore acquire the same
+        // identity while retaining a Conflict proof, which cannot authorize
+        // later cleanup. Resolve the collision without admitting an effect.
+        XfrmObjectInstallPreEffectProof::Conflict => {
+            (XfrmObjectInstallDurablePhase::NoMutation, None)
+        }
+        XfrmObjectInstallPreEffectProof::Absent => match install(backend, request).await {
+            Ok(()) => (XfrmObjectInstallDurablePhase::Acquired, None),
+            Err(XfrmError::AlreadyExists) => (XfrmObjectInstallDurablePhase::NoMutation, None),
+            Err(source) => (XfrmObjectInstallDurablePhase::Indeterminate, Some(source)),
+        },
     };
     let terminal = store.transition(
         &store.handle_for_record(&issuing)?,
@@ -264,10 +276,13 @@ pub(crate) async fn cut_durable_object_install_at_issuing<B>(
     backend: &B,
     pre_effect_proof: XfrmObjectInstallPreEffectProof,
     admit_backend_effect: bool,
-) -> Result<(), XfrmObjectInstallDurableError>
+) -> Result<XfrmObjectInstallRecoveryHandle, XfrmObjectInstallDurableError>
 where
     B: XfrmBackend + ?Sized,
 {
+    if admit_backend_effect && pre_effect_proof != XfrmObjectInstallPreEffectProof::Absent {
+        return Err(XfrmObjectInstallDurableError::InvalidTransition);
+    }
     validate_durable_object_install_admission(
         store,
         prepared,
@@ -275,7 +290,7 @@ where
         operation_generation,
         request,
     )?;
-    store.transition(
+    let issuing = store.transition(
         prepared,
         XfrmObjectInstallDurablePhase::Prepared,
         XfrmObjectInstallDurablePhase::Issuing,
@@ -287,7 +302,97 @@ where
         // leaves no durable terminal result regardless of success.
         let _ = install(backend, request).await;
     }
-    Ok(())
+    store.handle_for_record(&issuing)
+}
+
+/// Process-loss detector seam: admit the real install effect and durably
+/// publish `Indeterminate`, then stop before recovery can reconcile it.
+///
+/// This uses the same validation, `Prepared -> Issuing` transition, and
+/// backend effect admission as the production run path. It deliberately
+/// replaces the successful terminal publication with `Indeterminate`, which
+/// models losing an otherwise unknowable backend acknowledgement. The
+/// returned handle authenticates the current cut record for privileged
+/// restart detectors.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cut_durable_object_install_at_indeterminate_after_effect<B>(
+    store: &XfrmObjectInstallRecoveryStore,
+    prepared: &XfrmObjectInstallRecoveryHandle,
+    operation_id: XfrmObjectInstallOperationId,
+    operation_generation: XfrmObjectInstallOperationGeneration,
+    request: &XfrmObjectInstallRequest,
+    backend: &B,
+    pre_effect_proof: XfrmObjectInstallPreEffectProof,
+) -> Result<XfrmObjectInstallRecoveryHandle, XfrmObjectInstallDurableError>
+where
+    B: XfrmBackend + ?Sized,
+{
+    // The effect is admitted exactly once by the same cut helper used for the
+    // Issuing process-loss detector. A Conflict proof is rejected there,
+    // mirroring the production rule that no install may follow a witnessed
+    // conflict.
+    let issuing = cut_durable_object_install_at_issuing(
+        store,
+        prepared,
+        operation_id,
+        operation_generation,
+        request,
+        backend,
+        pre_effect_proof,
+        true,
+    )
+    .await?;
+    let indeterminate = store.transition(
+        &issuing,
+        XfrmObjectInstallDurablePhase::Issuing,
+        XfrmObjectInstallDurablePhase::Indeterminate,
+        None,
+    )?;
+    store.handle_for_record(&indeterminate)
+}
+
+/// Process-loss detector seam: durably admit exact cleanup for an acquired
+/// object, optionally issue the deletion, and stop before publishing
+/// `Retired`.
+///
+/// The live production recovery path performs the same authenticated restore,
+/// `Acquired -> RemovalAdmitted` transition, and exact deletion. Leaving the
+/// record at `RemovalAdmitted` models a crash after the deletion was admitted
+/// (including after the kernel effect but before its acknowledgement was
+/// durably reflected). The returned handle authenticates the current cut
+/// record for privileged restart detectors.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cut_durable_object_install_at_removal_admitted<B>(
+    store: &XfrmObjectInstallRecoveryStore,
+    operation_id: XfrmObjectInstallOperationId,
+    operation_generation: XfrmObjectInstallOperationGeneration,
+    request: &XfrmObjectInstallRequest,
+    backend: &B,
+    admit_backend_effect: bool,
+) -> Result<XfrmObjectInstallRecoveryHandle, XfrmObjectInstallDurableError>
+where
+    B: XfrmBackend + ?Sized,
+{
+    let fingerprints = store.fingerprints_for_request(request)?;
+    let acquired = store.restore(
+        operation_id,
+        operation_generation,
+        request.object(),
+        fingerprints,
+    )?;
+    let admitted = store.transition(
+        &store.handle_for_record(&acquired)?,
+        XfrmObjectInstallDurablePhase::Acquired,
+        XfrmObjectInstallDurablePhase::RemovalAdmitted,
+        None,
+    )?;
+    if admit_backend_effect {
+        // Deliberately omit the terminal publication regardless of the reply.
+        // Restart recovery must safely retry an exact delete or observe
+        // NotFound while the durable removal authority remains intact.
+        let _ = remove(backend, &request.removal(), request.policy_if_id()).await;
+    }
+    store.handle_for_record(&admitted)
 }
 
 pub(crate) fn finalize_durable_object_install(
@@ -389,20 +494,19 @@ where
 /// Reconcile an `Issuing` or `Indeterminate` record by combining its durable
 /// pre-effect proof with a fresh exact readback of the deletion identity.
 ///
-/// The proof was witnessed before the backend effect was admitted. Because the
-/// extended writer gate excluded every other cooperating writer for the whole
-/// time the record remained unresolved, the proof plus the current readback is
-/// sufficient to classify the exact identity:
+/// The proof was witnessed before any possible backend effect admission.
+/// Because the extended writer gate excluded every other cooperating writer
+/// for the whole time the record remained unresolved, the proof plus the
+/// current readback is sufficient to classify the exact identity:
 ///
 /// - absent + `Absent`: the effect provably never happened; retire as
 ///   no-mutation without any deletion.
 /// - present + `Absent`: the identity appeared inside this operation's effect
 ///   window and can only be this operation's residue; admit and remove it.
-/// - present + `Conflict`: the identity predates the effect, so the
-///   create-exclusive install cannot have created it; leave the foreign state
-///   untouched and retire.
-/// - absent + `Conflict`: the pre-existing conflict is gone and this operation
-///   made no mutation; retire as no-mutation.
+/// - present + `Conflict`: the identity was witnessed before admission and no
+///   install effect followed; leave the foreign state untouched and retire.
+/// - absent + `Conflict`: the pre-existing conflict is gone; because no
+///   install effect followed, retire as no-mutation.
 ///
 /// A readback failure leaves the record unresolved and retryable. A durable
 /// anomaly (stale epoch or missing proof) is classified for repair and the
@@ -970,6 +1074,77 @@ mod tests {
                 "no_mutation"
             );
             assert_no_removal(&backend);
+        }
+    }
+
+    #[tokio::test]
+    async fn indeterminate_after_effect_retires_exact_owned_residue_and_gates_writers() {
+        for (case, request) in [(0x35, sa_request()), (0x36, policy_request(None))] {
+            let root = TestRoot::new();
+            let backend = MockXfrmBackend::new();
+            let operation_id = operation(case);
+            let operation_generation = generation(3);
+            let store = open_store(&root);
+
+            // Model an install whose effect reached the backend but whose
+            // acknowledgement was lost: durable truth advances from Issuing
+            // to Indeterminate while preserving the witnessed absence proof.
+            issuing_cut(
+                &store,
+                operation_id,
+                operation_generation,
+                &request,
+                XfrmObjectInstallPreEffectProof::Absent,
+            );
+            install(&backend, &request).await.unwrap();
+            let fingerprints = store.fingerprints_for_request(&request).unwrap();
+            let issuing = store
+                .restore(
+                    operation_id,
+                    operation_generation,
+                    request.object(),
+                    fingerprints,
+                )
+                .unwrap();
+            let handle = store.handle_for_record(&issuing).unwrap();
+            let indeterminate = store
+                .transition(
+                    &handle,
+                    XfrmObjectInstallDurablePhase::Issuing,
+                    XfrmObjectInstallDurablePhase::Indeterminate,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                indeterminate.pre_effect_proof,
+                Some(XfrmObjectInstallPreEffectProof::Absent)
+            );
+            assert_eq!(
+                store.advance_writer_epoch(),
+                Err(XfrmObjectInstallDurableError::InvalidTransition),
+                "Indeterminate owned residue must keep the writer gate closed"
+            );
+            drop(store);
+
+            backend.clear_operations();
+            let reopened = open_store(&root);
+            assert_eq!(
+                recover_durable_object_install(
+                    &reopened,
+                    operation_id,
+                    operation_generation,
+                    &request,
+                    &backend,
+                )
+                .await
+                .unwrap()
+                .as_str(),
+                "owned_residue_retired"
+            );
+            install(&backend, &request)
+                .await
+                .expect("recovery must remove exact Indeterminate owned residue");
+            assert!(reopened.advance_writer_epoch().is_ok());
         }
     }
 

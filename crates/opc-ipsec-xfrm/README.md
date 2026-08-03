@@ -160,12 +160,14 @@ The required ordering after that atomic bind is:
    gate, the actor performs an exact readback of the deletion identity and
    embeds the witnessed presence (`Absent` or `Conflict`) as a durable
    pre-effect proof in the same authenticated record, then publishes
-   `Issuing`, and only then admits the actor-serialized backend effect. The
-   method durably publishes `Acquired`, `NoMutation`, or `Indeterminate`
-   before returning its outcome. Two pre-consumption rejections return the
-   same authenticated authority and retain `Prepared` for an exact retry: a
-   deferred DSCP activation gate, and a pre-effect readback that could not be
-   trusted (reported as `xfrm_object_install_pre_effect_readback_failed`).
+   `Issuing`. An `Absent` proof permits the actor-serialized backend effect;
+   a `Conflict` proof admits no effect and proceeds directly to `NoMutation`,
+   because an SA may expire autonomously after readback. The method durably
+   publishes `Acquired`, `NoMutation`, or `Indeterminate` before returning its
+   outcome. Two pre-consumption rejections return the same authenticated
+   authority and retain `Prepared` for an exact retry: a deferred DSCP
+   activation gate, and a pre-effect readback that could not be trusted
+   (reported as `xfrm_object_install_pre_effect_readback_failed`).
 4. Durably record the consumer decision. If an acquired object is adopted,
    call `finalize_durable_object_install` only after that adoption is durable.
    Finalization surrenders cleanup authority and leaves the object installed.
@@ -210,8 +212,8 @@ unresolved, the proof plus the current presence is a complete classification:
 | --- | --- | --- | --- |
 | absent | `Absent` | effect provably never happened | none; retired no-mutation |
 | present | `Absent` | residue can only be this operation's | exact removal; `owned_residue_retired` |
-| present | `Conflict` | identity predates the effect (foreign) | none; `foreign_untouched` |
-| absent | `Conflict` | the prior conflict is gone | none; retired no-mutation |
+| present | `Conflict` | witnessed foreign identity; no install was attempted | none; `foreign_untouched` |
+| absent | `Conflict` | prior conflict is gone; no install was attempted | none; retired no-mutation |
 | unreadable | either | retryable; record unchanged | none; `indeterminate` |
 | stale epoch / missing proof | either | durable anomaly, product repair | none; `repair_required` |
 

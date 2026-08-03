@@ -65,9 +65,10 @@
 //! consumer first durably records poll admission, then
 //! `NamespaceBoundLinuxXfrmBackend::run_durable_object_install` consumes that
 //! exact actor-, store-, correlation-, generation-, and request-bound authority
-//! and persists `Issuing` before invoking the backend. Immediately before the
-//! effect is admitted, the actor witnesses the exact deletion identity and
-//! stores that presence as a durable pre-effect proof in the same record. The
+//! and persists `Issuing` before any possible backend mutation. Immediately
+//! beforehand, the actor witnesses the exact deletion identity and stores that
+//! presence as a durable pre-effect proof in the same record. An absence proof
+//! permits effect admission; a conflict proof admits no effect. The
 //! consumer finalizes only after its adoption decision is durable; otherwise
 //! restart recovery treats `Prepared` as authoritative no-mutation, removes
 //! residue solely from authenticated, epoch-current acquisition authority, and

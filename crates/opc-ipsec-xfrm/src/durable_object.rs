@@ -239,7 +239,7 @@ pub enum XfrmObjectInstallDurablePhase {
     Issuing,
     /// Linux acknowledged that this operation acquired the object.
     Acquired,
-    /// An explicit create-exclusive collision proved no mutation.
+    /// A pre-effect conflict or create-exclusive collision proved no mutation.
     NoMutation,
     /// The backend result cannot safely prove ownership or absence.
     Indeterminate,
@@ -312,7 +312,8 @@ impl XfrmObjectInstallDurablePhase {
     }
 }
 
-/// Durable pre-effect proof witnessed before a backend install is admitted.
+/// Durable pre-effect proof witnessed before possible backend install
+/// admission.
 ///
 /// Immediately before the `Prepared -> Issuing` transition, the namespace
 /// actor performs an exact readback of the deletion identity and embeds the
@@ -324,10 +325,11 @@ impl XfrmObjectInstallDurablePhase {
 /// only observable through the recovery outcome it authorizes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum XfrmObjectInstallPreEffectProof {
-    /// The exact deletion identity was absent when the effect was admitted.
+    /// The exact deletion identity was absent immediately before possible
+    /// effect admission.
     Absent = 1,
-    /// The exact deletion identity was already present when the effect was
-    /// admitted, so a create-exclusive install cannot have created it.
+    /// The exact deletion identity was already present, so the install effect
+    /// was not admitted.
     Conflict = 2,
 }
 
@@ -3384,6 +3386,18 @@ mod tests {
             (
                 XfrmObjectInstallDurablePhase::Issuing,
                 XfrmObjectInstallDurablePhase::Indeterminate,
+            ),
+            (
+                XfrmObjectInstallDurablePhase::Issuing,
+                XfrmObjectInstallDurablePhase::RemovalAdmitted,
+            ),
+            (
+                XfrmObjectInstallDurablePhase::Indeterminate,
+                XfrmObjectInstallDurablePhase::NoMutation,
+            ),
+            (
+                XfrmObjectInstallDurablePhase::Indeterminate,
+                XfrmObjectInstallDurablePhase::RemovalAdmitted,
             ),
             (
                 XfrmObjectInstallDurablePhase::Acquired,
