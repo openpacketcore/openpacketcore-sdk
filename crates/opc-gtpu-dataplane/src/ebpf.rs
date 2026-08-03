@@ -1021,10 +1021,11 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
 
     /// Return whether PDP cleanup can safely mutate the held maps.
     ///
-    /// Every named pin must still identify its exact held map, and each tc
-    /// slot must contain either this runtime's exact program or no filter.
-    /// An absent hook is safe because removal only reduces reachability; a
-    /// foreign/replacement hook is not.
+    /// Every named pin must still identify its exact held map. An ordinary
+    /// attachment permits its exact hook or absence in each tc slot because
+    /// removal only reduces reachability. A cleanup-only attachment requires
+    /// both forwarding hooks to remain absent; any reappearance revokes its
+    /// narrower authority.
     fn pdp_cleanup_datapath_usable(&self, ifindex: u32) -> bool;
 }
 
@@ -3694,9 +3695,9 @@ impl EbpfGtpuDataplaneBackend {
             request.local_endpoint().octets(),
         ) {
             // `hooks_fenced` is deliberately not surfaced: the cleanup-safe
-            // readback/removal posture (exact-or-absent hooks) already proves
-            // forwarding is disabled regardless of whether a live hook was
-            // detached or both slots were already empty.
+            // readback/removal posture independently proves both forwarding
+            // hooks are absent regardless of whether a live hook was detached
+            // or both slots were already empty.
             Ok(EbpfCleanupOnlyAdoption::Adopted { local_ip, .. }) => {
                 let mut devices = self.devices()?;
                 devices.insert(
@@ -3861,11 +3862,14 @@ impl EbpfGtpuDataplaneBackend {
         validate_interface_name(&device.name)?;
         require_ebpf_executable_pmtu_policy(policy)?;
         let devices = self.devices()?;
-        if devices
-            .get(&device.ifindex)
-            .is_none_or(|managed| managed.name != device.name)
-        {
+        let managed = devices.get(&device.ifindex).ok_or(GtpuError::NotFound)?;
+        if managed.name != device.name {
             return Err(GtpuError::NotFound);
+        }
+        if managed.cleanup_only {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "cleanup_only_uplink_mtu_policy_update",
+            });
         }
         if !self.inner.runtime.pmtu_datapath_writable(device.ifindex) {
             return Err(GtpuError::StateIndeterminate {
@@ -3944,8 +3948,7 @@ impl EbpfGtpuDataplaneBackend {
     /// An active attachment requires live exact hooks. A cleanup-only
     /// attachment keeps forwarding fenced, so its readback/removal authority is
     /// the cleanup-safe posture instead: every named pin still identifies the
-    /// held map and each tc slot is exact-or-absent (removal only reduces
-    /// reachability, so an absent hook is safe and a foreign one is not).
+    /// held map and both forwarding hooks remain authoritatively absent.
     fn pdp_reconciliation_datapath_usable(&self, ifindex: u32) -> Result<bool, GtpuError> {
         let cleanup_only = self
             .devices()?
@@ -4352,6 +4355,15 @@ impl EbpfGtpuDataplaneBackend {
     ) -> Result<PdpContextInstallOutcome, GtpuError> {
         let _operation = self.operation_guard()?;
         self.validate_reconciliation_context_locked(&request)?;
+        if self
+            .devices()?
+            .get(&request.link_ifindex)
+            .is_some_and(|device| device.cleanup_only)
+        {
+            return Ok(PdpContextInstallOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable,
+            ));
+        }
         if !self
             .inner
             .runtime
@@ -4556,6 +4568,11 @@ impl EbpfGtpuDataplaneBackend {
             let device = devices
                 .get(&request.link_ifindex)
                 .ok_or(GtpuError::NotFound)?;
+            if device.cleanup_only {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: "cleanup_only_pdp_install",
+                });
+            }
             device.local_ip.ok_or(GtpuError::UnsupportedFeature {
                 feature: "legacy_ipv4_pdp_on_grouped_attachment",
             })?
@@ -4988,6 +5005,15 @@ impl EbpfGtpuDataplaneBackend {
 
     fn remove_pdp_context_sync(&self, request: RemovePdpContextRequest) -> Result<(), GtpuError> {
         let _operation = self.operation_guard()?;
+        if self
+            .devices()?
+            .get(&request.link_ifindex)
+            .is_some_and(|device| device.cleanup_only)
+        {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "cleanup_only_pdp_removal_requires_exact_context",
+            });
+        }
         self.remove_pdp_context_locked(request)
     }
 
@@ -5416,27 +5442,66 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
 
     fn pdp_context_reconciliation_capabilities(&self) -> PdpContextReconciliationCapabilities {
         let environment = self.inner.runtime.probe_environment();
-        let capability = if !environment.platform_supported
+        let unavailable = if !environment.platform_supported
             || !environment.bpffs_present
             || !environment.btf_present
         {
-            GtpuCapability::Missing
+            Some(GtpuCapability::Missing)
         } else if !environment.net_admin_capable || !environment.bpf_capable {
-            GtpuCapability::PermissionDenied
-        } else if self.devices().is_ok_and(|devices| {
-            !devices.is_empty()
-                && devices
-                    .keys()
-                    .all(|ifindex| self.inner.runtime.pdp_readback_datapath_usable(*ifindex))
-        }) {
-            GtpuCapability::Available
+            Some(GtpuCapability::PermissionDenied)
         } else {
-            GtpuCapability::Unknown
+            None
         };
+        if let Some(capability) = unavailable {
+            return PdpContextReconciliationCapabilities {
+                readback: capability,
+                classified_install: capability,
+                exact_removal: capability,
+            };
+        }
+
+        // Copy only the authorization mode while holding the registry lock;
+        // runtime identity probes may take their own locks and must not be
+        // nested beneath it.
+        let devices = match self.devices() {
+            Ok(devices) if !devices.is_empty() => devices
+                .iter()
+                .map(|(ifindex, device)| (*ifindex, device.cleanup_only))
+                .collect::<Vec<_>>(),
+            Ok(_) | Err(_) => {
+                return PdpContextReconciliationCapabilities {
+                    readback: GtpuCapability::Unknown,
+                    classified_install: GtpuCapability::Unknown,
+                    exact_removal: GtpuCapability::Unknown,
+                };
+            }
+        };
+        let reconciliation_available = devices.iter().all(|(ifindex, cleanup_only)| {
+            if *cleanup_only {
+                self.inner.runtime.pdp_cleanup_datapath_usable(*ifindex)
+            } else {
+                self.inner.runtime.pdp_readback_datapath_usable(*ifindex)
+            }
+        });
+        let classified_install_available = devices.iter().all(|(ifindex, cleanup_only)| {
+            !cleanup_only && self.inner.runtime.pdp_readback_datapath_usable(*ifindex)
+        });
         PdpContextReconciliationCapabilities {
-            readback: capability,
-            classified_install: capability,
-            exact_removal: capability,
+            readback: if reconciliation_available {
+                GtpuCapability::Available
+            } else {
+                GtpuCapability::Unknown
+            },
+            classified_install: if classified_install_available {
+                GtpuCapability::Available
+            } else {
+                GtpuCapability::Unknown
+            },
+            exact_removal: if reconciliation_available {
+                GtpuCapability::Available
+            } else {
+                GtpuCapability::Unknown
+            },
         }
     }
 
@@ -11076,6 +11141,20 @@ mod aya_runtime {
             };
             if identity != loaded.datapath_identity {
                 return false;
+            }
+            if loaded.cleanup_only {
+                // Cleanup authority is deliberately narrower than ordinary
+                // removal authority: forwarding must remain fenced. Check the
+                // configured slots and the all-placement SDK inventory so an
+                // out-of-band reattachment cannot silently widen authority.
+                return matches!(
+                    slot_owner(ifindex, TcAttachType::Egress, loaded.tc_priority),
+                    Ok(None)
+                ) && matches!(
+                    slot_owner(ifindex, TcAttachType::Ingress, loaded.tc_priority),
+                    Ok(None)
+                ) && Self::live_sdk_programs(ifindex, loaded.tc_priority)
+                    .is_ok_and(|occupants| occupants.is_empty());
             }
             let slot_is_exact_or_absent = |attach_type, name: &str, program_id| match slot_owner(
                 ifindex,
@@ -20630,6 +20709,9 @@ mod tests {
                 && !state.pin_identity_invalid.contains(&ifindex)
                 && !state.uplink_filter_foreign.contains(&ifindex)
                 && !state.downlink_filter_foreign.contains(&ifindex)
+                && (!state.cleanup_only.contains(&ifindex)
+                    || !state.uplink_filter_ready.contains(&ifindex)
+                        && !state.downlink_filter_ready.contains(&ifindex))
         }
     }
 
@@ -26562,6 +26644,168 @@ mod tests {
             recovered.read_pdp_context(selector).await.unwrap(),
             PdpContextReadback::Absent
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_capabilities_expose_read_and_exact_removal_but_not_install() {
+        let (backend, runtime) = backend_with_fake();
+        let installed = create_device_with_context(&backend).await;
+        simulate_process_loss(&runtime, true);
+
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime);
+        assert_eq!(
+            recovered
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Acquired
+        );
+        assert_eq!(
+            recovered.pdp_context_reconciliation_capabilities(),
+            PdpContextReconciliationCapabilities {
+                readback: GtpuCapability::Available,
+                classified_install: GtpuCapability::Unknown,
+                exact_removal: GtpuCapability::Available,
+            }
+        );
+        assert_eq!(
+            recovered.remove_pdp_context_exact(installed).await.unwrap(),
+            PdpContextRemovalOutcome::Removed
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_hook_reappearance_revokes_authority_and_raw_removal_retains_state() {
+        for reappeared_hook in ["uplink", "downlink"] {
+            let (backend, runtime) = backend_with_fake();
+            let installed = create_device_with_context(&backend).await;
+            simulate_process_loss(&runtime, true);
+
+            let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+            assert_eq!(
+                recovered
+                    .acquire_cleanup_only_recovery(cleanup_request(
+                        Ipv4Addr::new(192, 0, 2, 1),
+                        S2BU_IFINDEX,
+                    ))
+                    .await
+                    .unwrap(),
+                RetainedGraphCleanupClassification::Acquired
+            );
+            {
+                let mut state = runtime.state();
+                match reappeared_hook {
+                    "uplink" => {
+                        state.uplink_filter_ready.insert(S2BU_IFINDEX);
+                    }
+                    "downlink" => {
+                        state.downlink_filter_ready.insert(S2BU_IFINDEX);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            assert_eq!(
+                recovered.pdp_context_reconciliation_capabilities(),
+                PdpContextReconciliationCapabilities {
+                    readback: GtpuCapability::Unknown,
+                    classified_install: GtpuCapability::Unknown,
+                    exact_removal: GtpuCapability::Unknown,
+                },
+                "reappeared_hook={reappeared_hook}"
+            );
+            assert!(matches!(
+                recovered
+                    .read_pdp_context(PdpContextSelector::LocalTeid(
+                        PdpContextLocalTeidSelector::from_context(&installed).unwrap(),
+                    ))
+                    .await
+                    .unwrap_err(),
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_pdp_context_readback"
+                }
+            ));
+            assert_eq!(
+                recovered
+                    .remove_pdp_context_exact(installed.clone())
+                    .await
+                    .unwrap(),
+                PdpContextRemovalOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::AuthorityUnavailable
+                ),
+                "reappeared_hook={reappeared_hook}"
+            );
+            assert_eq!(
+                recovered
+                    .install_pdp_context_classified(installed.clone())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::AuthorityUnavailable
+                ),
+                "reappeared_hook={reappeared_hook}"
+            );
+            assert!(matches!(
+                recovered
+                    .install_pdp_context(installed.clone())
+                    .await
+                    .unwrap_err(),
+                GtpuError::UnsupportedFeature {
+                    feature: "cleanup_only_pdp_install"
+                }
+            ));
+
+            let before = {
+                let state = runtime.state();
+                (
+                    state.far.clone(),
+                    state.pdr.clone(),
+                    state.downlink_binding.clone(),
+                    state.sport.clone(),
+                    state.default_teid_by_ue.clone(),
+                )
+            };
+            assert!(matches!(
+                recovered
+                    .remove_pdp_context(RemovePdpContextRequest::from_context(&installed))
+                    .await
+                    .unwrap_err(),
+                GtpuError::UnsupportedFeature {
+                    feature: "cleanup_only_pdp_removal_requires_exact_context"
+                }
+            ));
+            {
+                let state = runtime.state();
+                assert_eq!(state.far, before.0, "reappeared_hook={reappeared_hook}");
+                assert_eq!(state.pdr, before.1, "reappeared_hook={reappeared_hook}");
+                assert_eq!(
+                    state.downlink_binding, before.2,
+                    "reappeared_hook={reappeared_hook}"
+                );
+                assert_eq!(state.sport, before.3, "reappeared_hook={reappeared_hook}");
+                assert_eq!(
+                    state.default_teid_by_ue, before.4,
+                    "reappeared_hook={reappeared_hook}"
+                );
+            }
+
+            let device = GtpDevice {
+                name: "s2bu".to_string(),
+                ifindex: S2BU_IFINDEX,
+            };
+            assert!(matches!(
+                recovered
+                    .set_uplink_mtu_policy(&device, None)
+                    .await
+                    .unwrap_err(),
+                GtpuError::UnsupportedFeature {
+                    feature: "cleanup_only_uplink_mtu_policy_update"
+                }
+            ));
+        }
     }
 
     #[tokio::test]
