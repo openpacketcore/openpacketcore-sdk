@@ -2416,7 +2416,9 @@ fn poisoned_lock() -> io::Error {
 mod tests {
     use std::collections::VecDeque;
     use std::net::{Ipv4Addr, Ipv6Addr};
-    use std::sync::{Arc, Condvar, Mutex};
+    #[cfg(target_os = "linux")]
+    use std::sync::Condvar;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::model::{Teid, DEFAULT_PDP_HASHSIZE};
@@ -2430,6 +2432,7 @@ mod tests {
     /// future exactly at the admitted-mutation point.
     enum QueuedResponse {
         Immediate(TransportResponse),
+        #[cfg(target_os = "linux")]
         Latched {
             latch: Arc<ResponseLatch>,
             response: TransportResponse,
@@ -2439,11 +2442,13 @@ mod tests {
     type ResponseQueue = Arc<Mutex<VecDeque<QueuedResponse>>>;
 
     /// One-shot gate used to hold a transport response until released.
+    #[cfg(target_os = "linux")]
     struct ResponseLatch {
         released: Mutex<bool>,
         condvar: Condvar,
     }
 
+    #[cfg(target_os = "linux")]
     impl ResponseLatch {
         fn new() -> Self {
             Self {
@@ -2475,8 +2480,10 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     struct ResponseLatchReleaseGuard(Option<Arc<ResponseLatch>>);
 
+    #[cfg(target_os = "linux")]
     impl ResponseLatchReleaseGuard {
         fn new(latch: Arc<ResponseLatch>) -> Self {
             Self(Some(latch))
@@ -2489,6 +2496,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     impl Drop for ResponseLatchReleaseGuard {
         fn drop(&mut self) {
             self.release_now();
@@ -2515,6 +2523,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     impl fmt::Debug for ResponseLatch {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("ResponseLatch").finish_non_exhaustive()
@@ -2527,6 +2536,7 @@ mod tests {
                 QueuedResponse::Immediate(_) => {
                     f.write_str("QueuedResponse::Immediate(<netlink-response>)")
                 }
+                #[cfg(target_os = "linux")]
                 QueuedResponse::Latched { .. } => {
                     f.write_str("QueuedResponse::Latched(<latched-netlink-response>)")
                 }
@@ -2601,6 +2611,7 @@ mod tests {
                 .push_back(QueuedResponse::Immediate(response));
         }
 
+        #[cfg(target_os = "linux")]
         fn push_latched_response(
             &self,
             latch: Arc<ResponseLatch>,
@@ -2669,6 +2680,7 @@ mod tests {
                 .pop_front();
             match queued {
                 Some(QueuedResponse::Immediate(response)) => response,
+                #[cfg(target_os = "linux")]
                 Some(QueuedResponse::Latched { latch, response }) => {
                     // Hold the (blocking-pool) caller here until the test
                     // releases the latch; the requests log already records the
@@ -4228,6 +4240,7 @@ mod tests {
         assert_eq!(requests.len(), 6);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn linux_exact_removal_completes_without_overlap_when_future_is_dropped() {
         // Acceptance: cancellation at an admitted-mutation boundary leaves
