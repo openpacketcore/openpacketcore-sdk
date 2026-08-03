@@ -2003,6 +2003,24 @@ pub enum PdpContextInstallOutcome {
     Indeterminate(PdpContextIndeterminateReason),
 }
 
+/// Structural reason an exact PDP-context removal was refused before any
+/// mutation.
+///
+/// These outcomes are fail-closed and deliberately distinct from the
+/// retryable [`PdpContextIndeterminateReason`]s: retrying the identical
+/// request cannot succeed until the underlying structural condition is
+/// repaired (for example, by reprovisioning the durable descriptor against
+/// the current device identity). Values are never carried.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PdpContextRepairReason {
+    /// The expected GTP device identity no longer matches the durable
+    /// descriptor: the device name no longer resolves to the expected ifindex
+    /// (the device was replaced, renamed, or removed). The resident state was
+    /// left untouched and the descriptor must be reprovisioned.
+    DeviceIdentityChanged,
+}
+
 /// Classified result of exact PDP-context removal.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2015,6 +2033,95 @@ pub enum PdpContextRemovalOutcome {
     Conflict(PdpContextConflict),
     /// Exact ownership or the final mutation state could not be proven.
     Indeterminate(PdpContextIndeterminateReason),
+    /// A structural precondition failed closed before any mutation; retrying
+    /// the identical request cannot succeed without repair.
+    RepairRequired(PdpContextRepairReason),
+}
+
+/// Explicit caller attestation that the process which previously owned a
+/// durable Linux kernel-GTP PDP context has stopped.
+///
+/// Supplying this value authorizes restart recovery over the exact context.
+/// It never bypasses device-identity, dual-selector, or cross-process
+/// authority validation; it only records the caller's assertion that the
+/// prior writer is gone and its durable descriptor may be reconciled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PdpRestartRecoveryProof {
+    _private: (),
+}
+
+impl PdpRestartRecoveryProof {
+    /// Attest that the prior writer of the durable PDP descriptor is stopped.
+    #[must_use]
+    pub const fn previous_writer_stopped() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Request to acquire exact restart-recovery authority over one durable Linux
+/// kernel-GTP PDP context.
+///
+/// This is the durable-reconciliation primitive an ePDG-style consumer uses
+/// after process loss: the kernel-GTP PDP context (and the GTP device that
+/// owns it) survive the writer, and the consumer must prove either exact
+/// removal or exact absence of the descriptor before protocol egress. The
+/// request binds the complete expected identity — the device identity
+/// (`device`) plus both selector axes and full context (`expected`) — so a
+/// resident context is only ever removed when it matches exactly.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PdpRestartRecoveryRequest {
+    device: GtpDevice,
+    expected: GtpPdpContext,
+    writer_proof: PdpRestartRecoveryProof,
+}
+
+impl PdpRestartRecoveryRequest {
+    /// Build a restart-recovery request for one exact durable PDP context.
+    ///
+    /// `device` is the expected GTP device identity (name and ifindex) that
+    /// the durable descriptor records. `expected` is the complete expected
+    /// PDP context (both selector axes and every identity field).
+    /// `writer_proof` attests that the prior writer has stopped.
+    #[must_use]
+    pub const fn new(
+        device: GtpDevice,
+        expected: GtpPdpContext,
+        writer_proof: PdpRestartRecoveryProof,
+    ) -> Self {
+        Self {
+            device,
+            expected,
+            writer_proof,
+        }
+    }
+
+    /// Return the expected GTP device identity of the durable context.
+    #[must_use]
+    pub const fn device(&self) -> &GtpDevice {
+        &self.device
+    }
+
+    /// Return the complete expected PDP context identity.
+    #[must_use]
+    pub const fn expected(&self) -> &GtpPdpContext {
+        &self.expected
+    }
+
+    /// Return the prior-writer stop attestation.
+    #[must_use]
+    pub const fn writer_proof(&self) -> PdpRestartRecoveryProof {
+        self.writer_proof
+    }
+}
+
+impl fmt::Debug for PdpRestartRecoveryRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PdpRestartRecoveryRequest")
+            .field("device", &"<redacted-device-identity>")
+            .field("expected", &"<redacted-pdp-context>")
+            .field("writer_proof", &self.writer_proof)
+            .finish()
+    }
 }
 
 /// Capabilities of the explicit PDP-context reconciliation contract.

@@ -218,9 +218,61 @@ may omit `GTPA_FAMILY`; one unambiguous MS/PAA attribute still determines its
 family independently of the required peer attribute. Linux currently stores an
 IPv6 MS/PAA as a canonical `/64` prefix. A kernel that cannot perform the
 requested family lookup fails closed rather than reporting absence. Mainline
-Linux exposes unconditional `DELPDP` but no compare-delete primitive or
-cross-process writer lease, so `remove_pdp_context_exact` is intentionally
-unsupported there.
+Linux exposes unconditional `DELPDP` but no compare-delete primitive, so exact
+removal is built on a cross-process recovery authority instead; see the next
+section.
+
+### Linux PDP restart recovery authority
+
+`LinuxGtpuDataplaneBackend::recover_pdp_context_exact` is the supported
+durable-reconciliation primitive for the process-loss case: the kernel-GTP PDP
+context and the GTP device that owns it both survive the writer, and an
+ePDG-style consumer must prove either exact removal or exact absence of a
+durable descriptor before protocol egress. Mainline Linux has no atomic
+compare-delete, so the SDK supplies the missing cross-process writer authority
+and the authoritative readback that together make exact removal safe.
+
+Bind a durable recovery root once at construction with
+`LinuxGtpuDataplaneBackend::with_pdp_recovery_root`. The root must be a
+directory shared by every process that may reconcile the same GTP device. The
+backend creates one lease file per device beneath it and takes an exclusive
+`flock` for exactly one exact-removal transaction. The lease is host-global and
+released by the kernel on process exit, so a dying writer and a restarting
+reconciler cannot overlap on the same device. Until a recovery root is bound,
+exact removal stays unsupported and the capability reports `Missing`.
+
+`recover_pdp_context_exact(PdpRestartRecoveryRequest)` validates, in order and
+before any mutation: the request is internally consistent (the device ifindex
+matches the context link), the expected device identity still holds (the device
+name must still resolve to the expected ifindex — a replaced, renamed, or
+removed device returns `RepairRequired(DeviceIdentityChanged)` with state
+untouched), and the cross-process lease is acquired (a concurrent owner returns
+retryable `Indeterminate(AuthorityUnavailable)`). It then stably reads both
+selector axes and classifies:
+
+- `Removed` — the resident context matched the complete expected identity, an
+  admitted `DELPDP` ran, and the post-mutation readback proves both axes absent.
+- `AlreadyAbsent` — both selector axes were already authoritatively absent; no
+  mutation occurred. Re-running after a confirmed removal is idempotent.
+- `Conflict(_)` — valid resident state occupies a selector but differs from the
+  expected identity; it is never touched. Diagnostics carry only occupied axes
+  and differing field names, never values.
+- `Indeterminate(_)` — state changed during observation, evidence was incomplete,
+  or the final mutation could not be confirmed; retry the exact request.
+- `RepairRequired(_)` — a structural precondition (for example a stale device
+  identity) failed closed; retrying the identical request cannot succeed without
+  repair.
+
+The kernel API still cannot compare-and-delete, so the admission boundary is the
+authoritative dual-axis readback immediately before `DELPDP`, held under the
+lease. Dropping the returned future does not cancel the blocking worker: the
+transaction runs to completion under the lease, so a retry never overlaps an
+admitted delete and instead re-reads the converged kernel state.
+`GtpuDataplaneBackend::remove_pdp_context_exact` shares the same authority and
+classification (it derives the device from the context link and therefore omits
+the name-based device-identity proof that the restart primitive performs).
+`Debug` output for the request and every outcome redacts TEIDs, addresses, and
+device identity.
 
 Readback/classified-install/exact-removal capabilities are reported separately
 through `pdp_context_reconciliation_capabilities`; they are not inferred from

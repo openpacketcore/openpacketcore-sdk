@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Exact Linux PDP restart recovery authority — `opc-gtpu-dataplane`:**
+  `LinuxGtpuDataplaneBackend::recover_pdp_context_exact` and the
+  `with_pdp_recovery_root` binding close the gap where
+  `remove_pdp_context_exact` always reported `UnsupportedFeature` because
+  mainline generic-netlink GTP exposes only unconditional `DELPDP`, with no
+  compare-delete and no cross-process writer lease. Binding a durable recovery
+  root creates one host-global `flock` lease file per GTP device, held for
+  exactly one exact-removal transaction and released by the kernel on process
+  exit, so a dying writer and a restarting reconciler cannot overlap. The
+  restart primitive proves the expected device identity (name must still
+  resolve to the expected ifindex) and the complete dual-selector context
+  identity before any mutation; a replaced device fails closed as
+  `RepairRequired(DeviceIdentityChanged)` and a concurrent lease holder as
+  retryable `Indeterminate(AuthorityUnavailable)`. Removal is admitted only
+  after an authoritative stable dual-axis `GETPDP` readback proves the exact
+  resident identity, and the outcome is classified from a post-mutation
+  readback rather than the delete's own success: exact removal is `Removed`,
+  proven absence is `AlreadyAbsent`, differing resident state is `Conflict`
+  and never touched, and unstable or unconfirmable evidence stays retryable
+  `Indeterminate`. Dropping the future does not cancel the blocking worker, so
+  a retry never overlaps an admitted delete and re-reads converged kernel
+  state; a confirmed removal is idempotent. Without a bound recovery root the
+  capability remains `Missing` and exact removal stays unsupported. Request and
+  outcome diagnostics redact TEID, address, and device-identity values.
 - **Cleanup-only retained eBPF recovery authority — `opc-gtpu-dataplane`:**
   `EbpfGtpuDataplaneBackend::acquire_cleanup_only_recovery` takes ownership of
   the exact retained current-schema pin graph after process loss and fences the

@@ -14,8 +14,10 @@
 //! exact removal. Existing backend implementations inherit fail-closed
 //! unsupported defaults. The eBPF adapter proves complete pinned-map state and
 //! held mutation authority; the Linux adapter provides strict double-read
-//! `GETPDP` inspection but intentionally cannot claim exact removal because the
-//! kernel API has no compare-delete primitive.
+//! `GETPDP` inspection and, once a durable recovery root is bound, exact
+//! restart-recovery authority: a cross-process per-device lease plus the
+//! authoritative dual-axis readback that together compensate for the kernel's
+//! missing compare-delete primitive.
 //!
 //! A separate maintenance-only drained-v2 teardown accepts an explicit typed
 //! drain attestation, proves the complete frozen legacy program/map identity,
@@ -80,8 +82,9 @@ pub use model::{
     GtpuUplinkChecksumOffloadContract, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
     GtpuV2DrainProof, PdpContextConflict, PdpContextIndeterminateReason, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextMismatchField, PdpContextReadback,
-    PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextSelector,
-    PdpContextSelectorOccupancy, PdpContextUplinkIdentity, PdpContextUplinkSelector,
+    PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextRepairReason,
+    PdpContextSelector, PdpContextSelectorOccupancy, PdpContextUplinkIdentity,
+    PdpContextUplinkSelector, PdpRestartRecoveryProof, PdpRestartRecoveryRequest,
     RemovePdpContextRequest, RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal,
     RetainedGraphCleanupRequest, Teid, GTPU_PORT,
 };
