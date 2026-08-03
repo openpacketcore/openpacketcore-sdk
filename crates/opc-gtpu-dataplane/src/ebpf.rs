@@ -18922,7 +18922,7 @@ mod tests {
                 }
                 None => {
                     return Ok(EbpfCleanupOnlyAdoption::Refused(
-                        RetainedGraphCleanupRefusal::IdentityMismatch,
+                        RetainedGraphCleanupRefusal::NotCurrentSchema,
                     ));
                 }
             }
