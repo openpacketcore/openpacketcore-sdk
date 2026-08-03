@@ -132,9 +132,25 @@ impl LinuxGtpuDataplaneBackend {
     /// [`Self::recover_pdp_context_exact`]) is unsupported until a recovery
     /// root is bound. The root must be a durable directory shared by every
     /// process that may reconcile the same GTP device; the backend creates a
-    /// per-device lease file beneath it. Binding is a construction-time step:
-    /// the returned backend carries the same transport and configuration but a
-    /// fresh operation lock and device-socket registry.
+    /// per-device lease file beneath it.
+    ///
+    /// Bind exactly once at construction, before cloning the backend. This
+    /// builder consumes `self` and returns a backend with a fresh in-process
+    /// operation lock and device-socket registry (the transport and
+    /// configuration are carried over). Continuing to use a pre-rebind clone
+    /// against the same device therefore bypasses the in-process serialization
+    /// of the rebound handle; the cross-process lease still guards exact
+    /// removal, but ordinary install/remove/read on the two handles are no
+    /// longer serialized together.
+    ///
+    /// The root is trusted security surface: it must not be writable or
+    /// pre-creatable by an untrusted principal. A hostile process that can
+    /// create or replace files beneath it can deny recovery (by holding the
+    /// lease or planting a symlink/directory at a lease path, which fails
+    /// closed) but can never force deletion of non-matching state, because
+    /// every removal still requires the authoritative dual-axis readback to
+    /// match the expected identity. Avoid a world-writable location such as an
+    /// unhardened shared `/tmp`.
     #[must_use]
     pub fn with_pdp_recovery_root(self, root: impl Into<PathBuf>) -> Self {
         let prior = &*self.inner;
@@ -1951,14 +1967,83 @@ fn poisoned_lock() -> io::Error {
 mod tests {
     use std::collections::VecDeque;
     use std::net::{Ipv4Addr, Ipv6Addr};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
 
     use super::*;
     use crate::model::{Teid, DEFAULT_PDP_HASHSIZE};
     use crate::{PdpContextMismatchField, PdpContextSelectorOccupancy, PdpRestartRecoveryProof};
 
     type TransportResponse = Result<Option<Vec<u8>>, GtpuError>;
-    type ResponseQueue = Arc<Mutex<VecDeque<TransportResponse>>>;
+
+    /// A queued transport response. `Latched` blocks the (blocking-pool)
+    /// caller inside `transact` until the latch is released, letting a test
+    /// hold the worker at a precise netlink boundary — e.g. drop a recovery
+    /// future exactly at the admitted-mutation point.
+    enum QueuedResponse {
+        Immediate(TransportResponse),
+        Latched {
+            latch: Arc<ResponseLatch>,
+            response: TransportResponse,
+        },
+    }
+
+    type ResponseQueue = Arc<Mutex<VecDeque<QueuedResponse>>>;
+
+    /// One-shot gate used to hold a transport response until released.
+    struct ResponseLatch {
+        released: Mutex<bool>,
+        condvar: Condvar,
+    }
+
+    impl ResponseLatch {
+        fn new() -> Self {
+            Self {
+                released: Mutex::new(false),
+                condvar: Condvar::new(),
+            }
+        }
+
+        fn release(&self) {
+            let mut released = self
+                .released
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *released = true;
+            self.condvar.notify_all();
+        }
+
+        fn wait(&self) {
+            let mut released = self
+                .released
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*released {
+                released = self
+                    .condvar
+                    .wait(released)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+    }
+
+    impl fmt::Debug for ResponseLatch {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("ResponseLatch").finish_non_exhaustive()
+        }
+    }
+
+    impl fmt::Debug for QueuedResponse {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                QueuedResponse::Immediate(_) => {
+                    f.write_str("QueuedResponse::Immediate(<netlink-response>)")
+                }
+                QueuedResponse::Latched { .. } => {
+                    f.write_str("QueuedResponse::Latched(<latched-netlink-response>)")
+                }
+            }
+        }
+    }
 
     #[derive(Debug, Clone)]
     struct CapturingTransport {
@@ -2014,7 +2099,18 @@ mod tests {
             self.responses
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push_back(response);
+                .push_back(QueuedResponse::Immediate(response));
+        }
+
+        fn push_latched_response(
+            &self,
+            latch: Arc<ResponseLatch>,
+            response: Result<Option<Vec<u8>>, GtpuError>,
+        ) {
+            self.responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_back(QueuedResponse::Latched { latch, response });
         }
 
         fn requests(&self) -> Vec<CapturedRequest> {
@@ -2060,11 +2156,22 @@ mod tests {
                     request: request.to_vec(),
                     expected_sequence,
                 });
-            self.responses
+            let queued = self
+                .responses
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .pop_front()
-                .unwrap_or(Ok(None))
+                .pop_front();
+            match queued {
+                Some(QueuedResponse::Immediate(response)) => response,
+                Some(QueuedResponse::Latched { latch, response }) => {
+                    // Hold the (blocking-pool) caller here until the test
+                    // releases the latch; the requests log already records the
+                    // admitted operation.
+                    latch.wait();
+                    response
+                }
+                None => Ok(None),
+            }
         }
 
         fn open_gtpu_socket(
@@ -2422,6 +2529,11 @@ mod tests {
         assert_eq!(attr_u8(attrs, GTPA_FAMILY), AF_INET);
         assert_eq!(attr_u32(attrs, GTPA_I_TEI), 0x1122_3344);
         assert!(attr_payload(attrs, GTPA_O_TEI).is_none());
+        // Axis purity: DELPDP selects only the downlink I_TEI axis. The kernel
+        // checks GTPA_MS_ADDRESS before GTPA_I_TEI, so sending an MS attribute
+        // would silently flip the lookup axis; it must never be present.
+        assert!(attr_payload(attrs, GTPA_MS_ADDRESS).is_none());
+        assert!(attr_payload(attrs, GTPA_MS_ADDR6).is_none());
     }
 
     #[test]
@@ -3213,6 +3325,315 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linux_exact_removal_confirms_from_readback_not_delete_ack() {
+        // DELPDP is ACKed, but the post-mutation readback still finds the
+        // exact context. The outcome must come from the readback, so this is
+        // MutationUnconfirmed, never Removed.
+        let transport = CapturingTransport::new();
+        let context = pdp_context();
+        push_family_lookup(&transport);
+        push_exact_readback(&transport, &context);
+        transport.push_response(Ok(None));
+        push_exact_readback(&transport, &context);
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(unique_recovery_root("confirm-present"));
+
+        let outcome = backend.remove_pdp_context_exact(context).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PdpContextRemovalOutcome::Indeterminate(
+                PdpContextIndeterminateReason::MutationUnconfirmed
+            )
+        );
+        let requests = transport.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.operation == "remove_pdp_context_exact")
+                .count(),
+            1
+        );
+        // family + 4 pre-reads + 1 delete + 4 confirmation reads.
+        assert_eq!(requests.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn linux_exact_removal_ack_loss_with_absent_confirmation_is_removed() {
+        // A non-definitive DELPDP failure can be ACK loss after a committed
+        // delete. The authoritative absent confirmation readback proves the
+        // removal, so the outcome is Removed rather than the raw error.
+        let transport = CapturingTransport::new();
+        let context = pdp_context();
+        push_family_lookup(&transport);
+        push_exact_readback(&transport, &context);
+        transport.push_response(Err(GtpuError::io(
+            "netlink_ack",
+            io::Error::new(io::ErrorKind::TimedOut, "redacted"),
+        )));
+        push_absent_readback(&transport);
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(unique_recovery_root("ack-loss-absent"));
+
+        let outcome = backend.remove_pdp_context_exact(context).await.unwrap();
+
+        assert_eq!(outcome, PdpContextRemovalOutcome::Removed);
+        assert_eq!(
+            transport
+                .requests()
+                .iter()
+                .filter(|request| request.operation == "remove_pdp_context_exact")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_exact_removal_ack_loss_with_present_confirmation_is_unconfirmed() {
+        // ACK loss followed by a confirmation readback that still finds the
+        // exact context cannot prove either way; it stays retryable.
+        let transport = CapturingTransport::new();
+        let context = pdp_context();
+        push_family_lookup(&transport);
+        push_exact_readback(&transport, &context);
+        transport.push_response(Err(GtpuError::io(
+            "netlink_ack",
+            io::Error::new(io::ErrorKind::TimedOut, "redacted"),
+        )));
+        push_exact_readback(&transport, &context);
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(unique_recovery_root("ack-loss-present"));
+
+        let outcome = backend.remove_pdp_context_exact(context).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PdpContextRemovalOutcome::Indeterminate(
+                PdpContextIndeterminateReason::MutationUnconfirmed
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_exact_removal_definitive_delete_error_propagates() {
+        // A definitive DELPDP failure proves no mutation and is propagated as
+        // an error rather than classified as Removed; no confirmation readback
+        // follows.
+        let transport = CapturingTransport::new();
+        let context = pdp_context();
+        push_family_lookup(&transport);
+        push_exact_readback(&transport, &context);
+        transport.push_response(Err(GtpuError::io(
+            "netlink_ack",
+            io::Error::new(io::ErrorKind::PermissionDenied, "redacted"),
+        )));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(unique_recovery_root("definitive-error"));
+
+        let error = backend.remove_pdp_context_exact(context).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            GtpuError::Io {
+                kind: io::ErrorKind::PermissionDenied,
+                ..
+            }
+        ));
+        let requests = transport.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.operation == "remove_pdp_context_exact")
+                .count(),
+            1
+        );
+        // family + 4 pre-reads + 1 delete; no confirmation reads after a
+        // definitive no-mutation error.
+        assert_eq!(requests.len(), 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linux_exact_removal_completes_without_overlap_when_future_is_dropped() {
+        // Acceptance: cancellation at an admitted-mutation boundary leaves
+        // durable retry authority and no overlapping delete. The latched DELPDP
+        // response holds the worker exactly at the admitted-mutation point so
+        // the caller's future can be dropped there; the spawn_blocking worker
+        // must still run the transaction to completion, issuing exactly one
+        // DELPDP and performing the confirmation readback.
+        let transport = CapturingTransport::new();
+        let context = pdp_context();
+        let latch = Arc::new(ResponseLatch::new());
+        push_family_lookup(&transport);
+        push_exact_readback(&transport, &context);
+        transport.push_latched_response(latch.clone(), Ok(None));
+        push_absent_readback(&transport);
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(unique_recovery_root("drop-at-admission"));
+
+        // Move the owned backend into the task so the future is 'static.
+        let handle = tokio::spawn(async move { backend.remove_pdp_context_exact(context).await });
+
+        // Wait until the worker admits the delete and blocks on the latch.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let admitted = transport
+                .requests()
+                .iter()
+                .any(|request| request.operation == "remove_pdp_context_exact");
+            if admitted {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the delete was never admitted"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Cancel the caller's future at the admitted-mutation boundary.
+        handle.abort();
+
+        // The worker is still blocked on the latch; release it and let the
+        // transaction converge.
+        latch.release();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if transport.requests().len() >= 10 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker did not complete the transaction after drop"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let requests = transport.requests();
+        // Exactly one admitted delete: no overlapping or duplicated DELPDP.
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.operation == "remove_pdp_context_exact")
+                .count(),
+            1
+        );
+        // Both the pre-readback and the post-mutation confirmation ran.
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.operation == "read_pdp_context")
+                .count(),
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_exact_removal_ipv6_context_removes_under_recovery_authority() {
+        let transport = CapturingTransport::new();
+        let mut context = pdp_context();
+        // Linux stores an IPv6 MS/PAA as the canonical /64 prefix.
+        context.ms_address = "2001:db8:23:1::".parse().unwrap();
+        push_family_lookup(&transport);
+        push_exact_readback(&transport, &context);
+        transport.push_response(Ok(None));
+        push_absent_readback(&transport);
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(unique_recovery_root("ipv6"));
+
+        let outcome = backend.remove_pdp_context_exact(context).await.unwrap();
+
+        assert_eq!(outcome, PdpContextRemovalOutcome::Removed);
+        assert_eq!(
+            transport
+                .requests()
+                .iter()
+                .filter(|request| request.operation == "remove_pdp_context_exact")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_recovery_maps_missing_gtp_family_to_unsupported_platform() {
+        // The trait-level exact removal surfaces an unsupported kernel as a
+        // structural error, distinct from retryable indeterminate outcomes.
+        let transport = CapturingTransport::with_response(Err(GtpuError::NotFound));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport)
+            .with_pdp_recovery_root(unique_recovery_root("unsupported-trait"));
+        assert!(matches!(
+            backend
+                .remove_pdp_context_exact(pdp_context())
+                .await
+                .unwrap_err(),
+            GtpuError::UnsupportedPlatform
+        ));
+
+        // The restart primitive proves the device identity first, then maps a
+        // missing GTP generic-netlink family the same way.
+        let transport = CapturingTransport::with_response(Err(GtpuError::NotFound));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport)
+            .with_pdp_recovery_root(unique_recovery_root("unsupported-recover"));
+        assert!(matches!(
+            backend
+                .recover_pdp_context_exact(recovery_request(pdp_context()))
+                .await
+                .unwrap_err(),
+            GtpuError::UnsupportedPlatform
+        ));
+    }
+
+    #[tokio::test]
+    async fn linux_exact_removal_malformed_readback_is_structural_error_not_indeterminate() {
+        // A truncated/malformed GETPDP payload is a structural decode failure
+        // (InvalidData), never a retryable Indeterminate outcome, and never a
+        // mutation.
+        let transport = CapturingTransport::new();
+        push_family_lookup(&transport);
+        transport.push_response(Ok(Some(vec![0u8; 2])));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(unique_recovery_root("malformed"));
+
+        let error = backend
+            .remove_pdp_context_exact(pdp_context())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GtpuError::Io {
+                kind: io::ErrorKind::InvalidData,
+                ..
+            }
+        ));
+        assert_no_exact_delete(&transport.requests());
+    }
+
+    #[tokio::test]
+    async fn linux_exact_removal_single_axis_occupied_is_incomplete_state() {
+        // One selector axis occupied by the exact context with the other
+        // authoritatively absent is unrepresentable/incomplete state: it is
+        // retryable indeterminate, never a delete.
+        let transport = CapturingTransport::new();
+        let context = pdp_context();
+        push_family_lookup(&transport);
+        push_present(&transport, &context);
+        push_absent(&transport);
+        push_present(&transport, &context);
+        push_absent(&transport);
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(unique_recovery_root("single-axis"));
+
+        let outcome = backend.remove_pdp_context_exact(context).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PdpContextRemovalOutcome::Indeterminate(PdpContextIndeterminateReason::IncompleteState)
+        );
+        assert_no_exact_delete(&transport.requests());
+    }
+
+    #[tokio::test]
     async fn linux_restart_recovery_removes_exact_context_after_device_proof() {
         let transport = CapturingTransport::new();
         let context = pdp_context();
@@ -3330,6 +3751,91 @@ mod tests {
         );
         assert_no_exact_delete(&transport.requests());
         drop(held);
+    }
+
+    /// Child entry for the cross-process lease test: hold an exclusive flock
+    /// on the lease path, signal readiness, then keep the lease until killed.
+    #[cfg(target_os = "linux")]
+    fn cross_process_lease_child_main() -> ! {
+        let lock_path = std::env::var("OPC_GTPU_627_LEASE_PATH").expect("lease path env");
+        let ready_path = std::env::var("OPC_GTPU_627_LEASE_READY").expect("ready path env");
+        let file = rustix::fs::open(
+            std::path::Path::new(&lock_path),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .map(std::fs::File::from)
+        .expect("child opens lease file");
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .expect("child takes exclusive lease");
+        std::fs::write(&ready_path, b"ready").expect("child signals readiness");
+        // Keep the lease held until the parent kills us.
+        std::thread::sleep(Duration::from_secs(60));
+        std::process::exit(0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_exact_removal_cross_process_lease_excludes() {
+        // Re-exec'd child role: hold the lease instead of running the parent
+        // logic. This must be checked before any other work.
+        if std::env::var_os("OPC_GTPU_627_LEASE_CHILD").is_some() {
+            cross_process_lease_child_main();
+        }
+
+        let root = unique_recovery_root("xproc");
+        std::fs::create_dir_all(&root).unwrap();
+        let ifindex = pdp_context().link_ifindex;
+        let lock_path = root.join(format!("pdp-recovery-{ifindex}.lock"));
+        let ready_path = root.join("child-ready");
+
+        let exe = std::env::current_exe().expect("current test binary");
+        let mut child = std::process::Command::new(exe)
+            // Substring filter (no `--exact`): libtest's exact match would
+            // require the full `linux::tests::` module path.
+            .arg("linux_exact_removal_cross_process_lease_excludes")
+            .env("OPC_GTPU_627_LEASE_CHILD", "1")
+            .env("OPC_GTPU_627_LEASE_PATH", &lock_path)
+            .env("OPC_GTPU_627_LEASE_READY", &ready_path)
+            .spawn()
+            .expect("spawn lease-holding child");
+
+        // Parent role: while the child holds the lease from another process,
+        // exact recovery must be refused as retryable authority-unavailable.
+        async {
+            // Wait for the child to take the lease in a separate process.
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while !ready_path.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "child never acquired the lease"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            let transport = CapturingTransport::new();
+            push_family_lookup(&transport);
+            let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+                .with_pdp_recovery_root(root.clone());
+            let outcome = backend
+                .remove_pdp_context_exact(pdp_context())
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                PdpContextRemovalOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::AuthorityUnavailable
+                )
+            );
+            assert_no_exact_delete(&transport.requests());
+        }
+        .await;
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

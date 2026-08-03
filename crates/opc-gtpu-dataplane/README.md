@@ -241,6 +241,14 @@ released by the kernel on process exit, so a dying writer and a restarting
 reconciler cannot overlap on the same device. Until a recovery root is bound,
 exact removal stays unsupported and the capability reports `Missing`.
 
+The recovery root is trusted security surface: bind it once at construction and
+do not place it where an untrusted principal can create or replace files (for
+example, an unhardened world-writable `/tmp`). A hostile writer inside the root
+can at most deny recovery — by holding the lease or planting a symlink or
+directory at a lease path, all of which fail closed — and can never force
+deletion of non-matching state, because every removal still requires the
+authoritative dual-axis readback to match the expected identity.
+
 `recover_pdp_context_exact(PdpRestartRecoveryRequest)` validates, in order and
 before any mutation: the request is internally consistent (the device ifindex
 matches the context link), the expected device identity still holds (the device
