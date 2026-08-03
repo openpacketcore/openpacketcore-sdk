@@ -35,6 +35,7 @@ const RUN_PRIVILEGED_ENV: &str = "OPC_XFRM_RUN_SA_RELOCATION_RECOVERY_PRIVILEGED
 const CHILD_ROLE_ENV: &str = "OPC_XFRM_SA_RELOCATION_RECOVERY_CHILD_ROLE";
 const CHILD_ROOT_ENV: &str = "OPC_XFRM_SA_RELOCATION_RECOVERY_CHILD_ROOT";
 const CHILD_TOKEN_ENV: &str = "OPC_XFRM_SA_RELOCATION_RECOVERY_CHILD_TOKEN";
+const CHILD_EFFECT_ENV: &str = "OPC_XFRM_SA_RELOCATION_RECOVERY_CHILD_EFFECT";
 const CHILD_TEST_NAME: &str = "xfrm_sa_relocation_recovery_privileged_child";
 const RESOURCE_PREFIX: &str = "opc-xfrm-629-";
 const PROVISION_ATTEMPTS: usize = 32;
@@ -134,6 +135,23 @@ fn sa_install_request(spi: u32, encap: Option<UdpEncap>) -> InstallSaRequest {
     InstallSaRequest {
         parameters: sa_parameters(spi, encap),
     }
+}
+
+/// The exact post-move fixture state for one role: the relocated identity
+/// carrying the new outer endpoints and the resulting encapsulation. Used to
+/// reproduce the kernel truth of an admitted migration on hosts whose kernel
+/// lacks the exact single-SA migration UAPI.
+fn relocated_install_request(role: &str, spi: u32) -> TestResult<InstallSaRequest> {
+    let same_identity = matches!(
+        role,
+        ROLE_ENCAP_ONLY_CUT_BEFORE_EFFECT | ROLE_ENCAP_ONLY_CUT_AFTER_EFFECT
+    );
+    let mut parameters = sa_parameters(spi, Some(relocated_natt_encap()));
+    if !same_identity {
+        parameters.id.destination = new_destination();
+        parameters.source_address = new_source();
+    }
+    Ok(InstallSaRequest { parameters })
 }
 
 fn query_at(destination: IpAddress, spi: u32) -> QuerySaRequest {
@@ -536,6 +554,8 @@ fn block_policy_count(namespace: &str) -> TestResult<usize> {
 /// non-cooperating writer the durable gate deliberately cannot exclude.
 fn inject_foreign_target_sa(namespace: &str, spi: u32) -> TestResult {
     let encoded_spi = format!("0x{spi:08x}");
+    // iproute2 parses the source address before the destination: reversed
+    // order is rejected as an unknown argument.
     let output = run_ip(&[
         "netns",
         "exec",
@@ -544,6 +564,8 @@ fn inject_foreign_target_sa(namespace: &str, spi: u32) -> TestResult {
         "xfrm",
         "state",
         "add",
+        "src",
+        "203.0.113.7",
         "dst",
         "198.51.100.20",
         "proto",
@@ -552,8 +574,6 @@ fn inject_foreign_target_sa(namespace: &str, spi: u32) -> TestResult {
         &encoded_spi,
         "mode",
         "tunnel",
-        "src",
-        "203.0.113.7",
         "enc",
         "cbc(aes)",
         "0x000102030405060708090a0b0c0d0e0f",
@@ -680,7 +700,12 @@ impl PrivilegedFixture {
         format!("{}:{role}:{child_pid}:ready\n", self.token).into_bytes()
     }
 
-    fn child_command(&self, namespace: &str, role: &str) -> io::Result<Command> {
+    fn child_command(
+        &self,
+        namespace: &str,
+        role: &str,
+        admit_effect: bool,
+    ) -> io::Result<Command> {
         let executable = env::current_exe()?;
         let mut command = Command::new("ip");
         command
@@ -698,6 +723,7 @@ impl PrivilegedFixture {
             .env(CHILD_ROLE_ENV, role)
             .env(CHILD_ROOT_ENV, &self.root)
             .env(CHILD_TOKEN_ENV, &self.token)
+            .env(CHILD_EFFECT_ENV, if admit_effect { "1" } else { "0" })
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -953,6 +979,13 @@ fn issuing_cut_admits_effect(role: &str) -> bool {
     )
 }
 
+/// Whether the child should admit the relocation effect. The parent sets the
+/// effect flag to `0` on kernels without the exact single-SA migration UAPI;
+/// there the parent reproduces the post-move kernel state itself instead.
+fn child_admits_effect(role: &str) -> bool {
+    issuing_cut_admits_effect(role) && env::var(CHILD_EFFECT_ENV).as_deref() == Ok("1")
+}
+
 fn run_sa_relocation_crash_child(role: &str, root: &Path, token: &str) -> TestResult {
     let (backend, store) = LinuxXfrmBackend::new()
         .bind_current_network_namespace_with_sa_relocation_recovery(
@@ -981,7 +1014,7 @@ fn run_sa_relocation_crash_child(role: &str, root: &Path, token: &str) -> TestRe
             request,
         ))?;
     } else {
-        let admit_effect = issuing_cut_admits_effect(role);
+        let admit_effect = child_admits_effect(role);
         let authority = block_on(backend.prepare_sa_relocation(
             &store,
             operation_id(token)?,
@@ -1027,9 +1060,10 @@ fn crash_sa_relocation_operation(
     fixture: &PrivilegedFixture,
     namespace: &str,
     role: &str,
+    admit_effect: bool,
 ) -> TestResult {
     let ready_path = fixture.ready_path(role);
-    let mut child = TestChild::spawn(fixture.child_command(namespace, role)?)?;
+    let mut child = TestChild::spawn(fixture.child_command(namespace, role, admit_effect)?)?;
     let ready_bytes = fixture.readiness_bytes(role, child.id()?);
     child.wait_for_readiness(&ready_path, &ready_bytes)?;
     let output = child.kill_and_reap()?;
@@ -1075,19 +1109,20 @@ fn sa_relocation_recovery_detector(
     );
     let spi = role_spi(role)?;
 
-    // After-effect detectors require the real exact single-SA migration UAPI.
-    // Probe it inside the target namespace first and skip cleanly on kernels
-    // without it, exactly like the capability-gated relocation proof.
-    if issuing_cut_admits_effect(role) {
+    // The after-effect crash window needs the kernel SA in its post-move
+    // state. Where the kernel exposes the exact single-SA migration UAPI the
+    // child admits the real MIGRATE effect; otherwise the child cuts before
+    // the effect and the parent reproduces the identical post-move kernel
+    // state through a store-less binding (which consumes no writer epoch), so
+    // the recovery classification runs against real kernel truth either way.
+    let kernel_admits_effect = if issuing_cut_admits_effect(role) {
         let probe = bind_namespace(fixture.namespace_a())?;
         let capability = block_on(probe.sa_relocation_capability())?;
         drop(probe);
-        if !matches!(capability, XfrmCapability::Available) {
-            eprintln!("skipping {role}: kernel does not expose the exact single-SA migration UAPI");
-            fixture.cleanup()?;
-            return Ok(());
-        }
-    }
+        matches!(capability, XfrmCapability::Available)
+    } else {
+        false
+    };
 
     // Keep an identical object in the foreign namespace so recovery in
     // namespace A is also crossed against the namespace boundary.
@@ -1095,7 +1130,14 @@ fn sa_relocation_recovery_detector(
     block_on(foreign_backend.install_sa(sa_install_request(spi, role_encap(role)?)))?;
     drop(foreign_backend);
 
-    crash_sa_relocation_operation(&fixture, fixture.namespace_a(), role)?;
+    crash_sa_relocation_operation(&fixture, fixture.namespace_a(), role, kernel_admits_effect)?;
+
+    if issuing_cut_admits_effect(role) && !kernel_admits_effect {
+        let emulation = bind_namespace(fixture.namespace_a())?;
+        block_on(emulation.remove_sa(removal_at(old_destination(), spi)))?;
+        block_on(emulation.install_sa(relocated_install_request(role, spi)?))?;
+        drop(emulation);
+    }
 
     let (backend, store) = bind_namespace_with_sa_recovery(fixture.namespace_a(), &fixture)?;
     assert_pre_recovery_kernel_state(
@@ -1284,7 +1326,7 @@ fn foreign_replacement_at_target_is_left_untouched() -> TestResult {
     let fixture = PrivilegedFixture::provision()?;
     let role = ROLE_ISSUING_CUT_BEFORE_EFFECT;
     let spi = role_spi(role)?;
-    crash_sa_relocation_operation(&fixture, fixture.namespace_a(), role)?;
+    crash_sa_relocation_operation(&fixture, fixture.namespace_a(), role, false)?;
 
     // After the crash, a non-cooperating writer occupies the target identity
     // with state that matches neither the bound current identity nor the
@@ -1352,7 +1394,7 @@ fn wrong_namespace_store_binding_fails_closed() -> TestResult {
     let fixture = PrivilegedFixture::provision()?;
     let role = ROLE_ISSUING_CUT_BEFORE_EFFECT;
     let spi = role_spi(role)?;
-    crash_sa_relocation_operation(&fixture, fixture.namespace_a(), role)?;
+    crash_sa_relocation_operation(&fixture, fixture.namespace_a(), role, false)?;
 
     // Binding the retained store from another namespace must fail closed
     // even though the object shape is identical there.
