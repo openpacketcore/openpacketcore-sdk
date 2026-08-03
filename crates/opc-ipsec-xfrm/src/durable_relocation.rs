@@ -56,12 +56,14 @@ const DELETION_IDENTITY_AUTH_DOMAIN: &[u8] = b"opc-xfrm-relocation-deletion-iden
 const NAMESPACE_AUTH_DOMAIN: &[u8] = b"opc-xfrm-relocation-namespace-v1\0";
 const CONTROL_BYTES: usize = 128;
 const CONTROL_BODY_BYTES: usize = CONTROL_BYTES - AUTH_TAG_BYTES;
-const CONTROL_MAGIC: [u8; 8] = *b"OPCXCTL1";
+// Family-distinct control/epoch magics: an open against another durable
+// family's root must fail control-record validation, never adopt it.
+const CONTROL_MAGIC: [u8; 8] = *b"OPCXRCT1";
 const CONTROL_AUTH_DOMAIN: &[u8] = b"opc-xfrm-relocation-control-v1\0";
 const CONTROL_NAME: &str = "control";
 const EPOCH_BYTES: usize = 80;
 const EPOCH_BODY_BYTES: usize = EPOCH_BYTES - AUTH_TAG_BYTES;
-const EPOCH_MAGIC: [u8; 8] = *b"OPCXEPC1";
+const EPOCH_MAGIC: [u8; 8] = *b"OPCXREP1";
 const EPOCH_AUTH_DOMAIN: &[u8] = b"opc-xfrm-relocation-epoch-v1\0";
 const MAX_STORE_ENTRIES: usize = 64;
 const MAX_ACTIVE_RECORDS: usize = MAX_STORE_ENTRIES - 3;
@@ -975,6 +977,13 @@ impl XfrmSaRelocationRecoveryStore {
     /// `Prepared`, `Issuing`, `Indeterminate`, or `RemovalAdmitted` record
     /// blocks preparation so consumer bookkeeping/recovery remains ordered
     /// before every later cooperating writer.
+    ///
+    /// The exact operation-identity and active-deletion-identity duplicate
+    /// checks run before the unresolved-record gate, so replaying the exact
+    /// same operation and generation reports [`XfrmSaRelocationDurableError::Duplicate`]
+    /// even while that very record keeps the writer gate closed; a distinct
+    /// operation still reports [`XfrmSaRelocationDurableError::InvalidTransition`]
+    /// from the gate.
     pub(crate) fn prepare(
         &self,
         operation_id: XfrmSaRelocationOperationId,
@@ -985,12 +994,6 @@ impl XfrmSaRelocationRecoveryStore {
         let mut inventory = lease.inventory()?;
         if lease.prune_terminal_records(&inventory)? {
             inventory = lease.inventory()?;
-        }
-        if inventory.has_unresolved_writer_authority() {
-            return Err(XfrmSaRelocationDurableError::InvalidTransition);
-        }
-        if inventory.records.len() >= MAX_ACTIVE_RECORDS {
-            return Err(XfrmSaRelocationDurableError::CapacityExceeded);
         }
         if inventory.records.iter().any(|(_, record)| {
             record.operation_id == operation_id
@@ -1010,6 +1013,12 @@ impl XfrmSaRelocationRecoveryStore {
             )
         }) {
             return Err(XfrmSaRelocationDurableError::Duplicate);
+        }
+        if inventory.has_unresolved_writer_authority() {
+            return Err(XfrmSaRelocationDurableError::InvalidTransition);
+        }
+        if inventory.records.len() >= MAX_ACTIVE_RECORDS {
+            return Err(XfrmSaRelocationDurableError::CapacityExceeded);
         }
         let epoch = lease.current_epoch(&inventory)?;
         let record = DurableRelocationRecord {
@@ -1054,6 +1063,22 @@ impl XfrmSaRelocationRecoveryStore {
     /// Inspect the authenticated current phase for a retained handle.
     ///
     /// The result is diagnostic state only and never cleanup authority.
+    ///
+    /// # Lease contention with the namespace actor
+    ///
+    /// Every store operation, including this read, holds the store's
+    /// process-local non-reentrant try-lock lease for its duration. The
+    /// namespace actor operates on a clone of this same open store, so an
+    /// `inspect` (or the crate-internal phase observation helper) held
+    /// concurrently with an in-flight admitted run contends for that one
+    /// lease. The actor's next lease acquisition then fails
+    /// [`XfrmSaRelocationDurableError::StoreBusy`] and the admitted run
+    /// aborts after admission without any durable phase change or backend
+    /// effect. That rejection is fail-closed and retryable: recovery of the
+    /// retained record followed by re-preparation converges to the same
+    /// operation. This is the identical convention used by the released
+    /// install store, whose direct same-process reads contend the same way.
+    /// Keep direct reads short and outside admitted runs.
     pub fn inspect(
         &self,
         handle: &XfrmSaRelocationRecoveryHandle,
@@ -2578,6 +2603,10 @@ mod tests {
         ] {
             assert!(!rendered.contains("abab"));
             assert!(!rendered.contains("feed"));
+            // The module fixtures carry encapsulation ports; no diagnostic
+            // may leak them.
+            assert!(!rendered.contains("4500"));
+            assert!(!rendered.contains("62000"));
         }
         for error in [
             XfrmSaRelocationDurableError::AuthenticationFailed,
@@ -2927,6 +2956,44 @@ mod tests {
                 fingerprints(0xb3),
             )
             .is_ok());
+    }
+
+    #[test]
+    fn exact_duplicate_prepare_reports_duplicate_even_while_that_record_gates() {
+        let root = TestRoot::new();
+        let store = store(&root);
+        let operation = XfrmSaRelocationOperationId::generate().unwrap();
+        let generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
+        store
+            .prepare(operation, generation, fingerprints(0xc1))
+            .unwrap();
+        assert!(store.has_unresolved_writer_authority().unwrap());
+        // Replaying the exact operation and generation reports the duplicate
+        // even though that same Prepared record keeps the writer gate closed.
+        assert_eq!(
+            store.prepare(operation, generation, fingerprints(0xc1)),
+            Err(XfrmSaRelocationDurableError::Duplicate)
+        );
+        // The same holds for a distinct operation repeating the active
+        // deletion identity while the record gates.
+        assert_eq!(
+            store.prepare(
+                XfrmSaRelocationOperationId::generate().unwrap(),
+                generation,
+                fingerprints(0xc1),
+            ),
+            Err(XfrmSaRelocationDurableError::Duplicate)
+        );
+        // A distinct operation with a distinct identity still fails at the
+        // unresolved-record gate, not at the duplicate checks.
+        assert_eq!(
+            store.prepare(
+                XfrmSaRelocationOperationId::generate().unwrap(),
+                generation,
+                fingerprints(0xc2),
+            ),
+            Err(XfrmSaRelocationDurableError::InvalidTransition)
+        );
     }
 
     #[test]
@@ -3387,6 +3454,26 @@ mod tests {
         assert_eq!(
             reopened.advance_writer_epoch(),
             Err(XfrmSaRelocationDurableError::Malformed)
+        );
+    }
+
+    #[test]
+    fn install_family_store_root_rejects_relocation_open_fail_closed() {
+        let root = TestRoot::new();
+        let install_store = crate::durable_object::XfrmObjectInstallRecoveryStore::open_bound(
+            root.path(),
+            crate::durable_object::XfrmObjectRecoveryProofKey::new([9; 32]).unwrap(),
+            [0x42; 40],
+        )
+        .unwrap();
+        drop(install_store);
+        // The dropped install store's root passes ownership, mode, and flock
+        // validation on reopen; the rejection must come from control-record
+        // validation, where the install family's distinct control magic fails
+        // `ControlRecord::decode` before authentication is even attempted.
+        assert_eq!(
+            XfrmSaRelocationRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]).unwrap_err(),
+            XfrmSaRelocationDurableError::Malformed
         );
     }
 

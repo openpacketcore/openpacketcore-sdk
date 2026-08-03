@@ -182,7 +182,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace, and the install and relocation stores gate each other, with each
   admitted mutation advancing both durable writer epochs; recovery remains the
   escape from gating. Fixed-size relocation records (`OPCXRLC1`, format
-  version 1 with the proof byte present from version 1) retain only opaque
+  version 1 with the proof byte present from version 1, and family-distinct
+  `OPCXRCT1`/`OPCXREP1` control/epoch file magics so an open against another
+  durable family's root fails closed) retain only opaque
   correlation, phase, proof code, incarnation, epoch, and independent
   proof-keyed fingerprints of the deletion identity and complete relocation
   request; no address, selector, SPI, mark, encap port, namespace identity,

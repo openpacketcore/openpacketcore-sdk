@@ -3581,6 +3581,29 @@ mod tests {
     }
 
     #[test]
+    fn relocation_family_store_root_rejects_install_open_fail_closed() {
+        let root = TestRoot::new();
+        let relocation_store =
+            crate::durable_relocation::XfrmSaRelocationRecoveryStore::open_bound(
+                root.path(),
+                crate::durable_relocation::XfrmSaRelocationRecoveryProofKey::new([9; 32]).unwrap(),
+                [0x42; 40],
+            )
+            .unwrap();
+        drop(relocation_store);
+        // The dropped relocation store's root passes ownership, mode, and
+        // flock validation on reopen; the rejection must come from
+        // control-record validation, where the relocation family's distinct
+        // control magic fails `ControlRecord::decode` before authentication
+        // is even attempted.
+        assert_eq!(
+            XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40])
+                .unwrap_err(),
+            XfrmObjectInstallDurableError::Malformed
+        );
+    }
+
+    #[test]
     fn deletion_fingerprint_covers_sa_and_scoped_policy_identity() {
         let root = TestRoot::new();
         let store = store(&root);

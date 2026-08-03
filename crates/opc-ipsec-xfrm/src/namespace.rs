@@ -1321,21 +1321,31 @@ impl NamespaceActorState {
     }
 
     fn admit_xfrm_mutation(&mut self) -> Result<(), XfrmError> {
-        // Advance the install epoch before the relocation epoch. If the
-        // relocation gate rejects, the extra install epoch burn is harmless:
-        // it only fences the install store harder.
+        // Advance both stores' writer epochs before clearing anything. Only
+        // after BOTH advances succeed are the admission registries cleared
+        // and the counter receipts invalidated. Ordering matters: when the
+        // relocation gate rejects after a successful install advance (an
+        // unresolved relocation record fences the mutation), no kernel
+        // mutation has happened, so a live install authority must survive
+        // the rejection. That is sound: install runs remain cross-gated on
+        // the relocation store until the relocation record is recovered, so
+        // the surviving authority cannot be admitted ahead of that recovery;
+        // the extra install epoch burn only fences the install store harder.
         #[cfg(unix)]
         if let Some(store) = &self.object_recovery_store {
             store
                 .advance_writer_epoch()
                 .map_err(|_| XfrmError::Unavailable)?;
-            self.object_install_admissions.clear();
         }
         #[cfg(unix)]
         if let Some(store) = &self.relocation_recovery_store {
             store
                 .advance_writer_epoch()
                 .map_err(|_| XfrmError::Unavailable)?;
+        }
+        #[cfg(unix)]
+        {
+            self.object_install_admissions.clear();
             self.relocation_admissions.clear();
         }
         self.invalidate_counter_receipts();
@@ -1650,6 +1660,14 @@ impl NamespaceBoundLinuxXfrmBackend {
     /// relocation keeps the namespace-wide writer gate closed until it is
     /// recovered or admitted, and preparation is itself rejected while any
     /// durable install or relocation record remains unresolved.
+    ///
+    /// After a terminal `Relocated` proof, a re-preparation with the same
+    /// operation identity and generation succeeds: terminal records are
+    /// pruned by preparation, so the replay is not stopped by prepare-time
+    /// correlation. A replayed run is then stopped by the pre-effect
+    /// witness, which reports a value-free current-state mismatch because
+    /// the bound old identity no longer matches the kernel — mirroring the
+    /// released install boundary.
     #[cfg(unix)]
     pub async fn prepare_sa_relocation(
         &self,
@@ -1722,6 +1740,11 @@ impl NamespaceBoundLinuxXfrmBackend {
     /// owned residue is removed, through the exact target deletion identity.
     /// Unreadable readbacks keep the record unresolved; stale epochs or
     /// missing or inconsistent proofs keep it gating for repair.
+    ///
+    /// Idempotent recovery of a terminal phase holds only until the next
+    /// cooperating write prunes the terminal record; once pruned, the
+    /// correlation is unknown to the store and restore fails
+    /// [`XfrmSaRelocationDurableError::NotFound`].
     #[cfg(unix)]
     pub async fn recover_durable_sa_relocation(
         &self,
@@ -7353,8 +7376,387 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn relocation_run_error_diagnostics_are_value_free() {
+    #[tokio::test]
+    async fn relocation_wrong_store_instance_is_rejected_before_any_transport() {
+        let root = DurableTestRoot::new();
+        let wrong_store_root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_relocation_recovery(transport.clone(), &root);
+        let wrong_store = XfrmSaRelocationRecoveryStore::open_bound(
+            wrong_store_root.path(),
+            XfrmSaRelocationRecoveryProofKey::new([0x7a; 32]).unwrap(),
+            backend.network_namespace_binding().durable_bytes().unwrap(),
+        )
+        .unwrap();
+        let operation_id = XfrmSaRelocationOperationId::generate().unwrap();
+        let operation_generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
+        let request = relocation_request();
+        let authority = backend
+            .prepare_sa_relocation(&store, operation_id, operation_generation, request.clone())
+            .await
+            .unwrap();
+
+        // A run attempt presenting a different same-shape store instance
+        // fails at the actor's store binding check.
+        let mut wrong_store_attempt = duplicate_sa_relocation_admission(&authority);
+        wrong_store_attempt.operation.store = wrong_store.clone();
+        assert_eq!(
+            backend
+                .run_durable_sa_relocation(wrong_store_attempt)
+                .await
+                .unwrap_err(),
+            XfrmSaRelocationDurableError::WrongBinding
+        );
+
+        // Recovery through the wrong store is rejected the same way.
+        assert_eq!(
+            backend
+                .recover_durable_sa_relocation(
+                    &wrong_store,
+                    operation_id,
+                    operation_generation,
+                    request.clone(),
+                )
+                .await
+                .unwrap_err(),
+            XfrmSaRelocationDurableError::WrongBinding
+        );
+
+        // Preparation against the wrong store is rejected too.
+        assert_eq!(
+            backend
+                .prepare_sa_relocation(
+                    &wrong_store,
+                    XfrmSaRelocationOperationId::generate().unwrap(),
+                    XfrmSaRelocationOperationGeneration::new(2).unwrap(),
+                    request.clone(),
+                )
+                .await
+                .unwrap_err(),
+            XfrmSaRelocationDurableError::WrongBinding
+        );
+
+        // Zero transport operations; the original authority remains valid on
+        // the bound store and its record stays recoverable.
+        assert!(transport.operations().is_empty());
+        drop(authority);
+        assert!(matches!(
+            backend
+                .recover_durable_sa_relocation(&store, operation_id, operation_generation, request,)
+                .await
+                .unwrap(),
+            XfrmSaRelocationRestartOutcome::NoMutation
+        ));
+        assert!(transport.operations().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_relocation_authority_blocks_same_process_recovery_until_dropped() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_relocation_recovery(transport.clone(), &root);
+        let operation_id = XfrmSaRelocationOperationId::generate().unwrap();
+        let operation_generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
+        let request = relocation_request();
+        let authority = backend
+            .prepare_sa_relocation(&store, operation_id, operation_generation, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.inspect(&authority.prepared),
+            Ok(XfrmSaRelocationDurablePhase::Prepared)
+        );
+        assert!(transport.operations().is_empty());
+
+        // A live registered authority keeps same-process recovery fail-closed.
+        assert_eq!(
+            backend
+                .recover_durable_sa_relocation(
+                    &store,
+                    operation_id,
+                    operation_generation,
+                    request.clone(),
+                )
+                .await
+                .unwrap_err(),
+            XfrmSaRelocationDurableError::InvalidTransition
+        );
+        assert!(transport.operations().is_empty());
+
+        // Dropping the authority lets recovery retire the prepared record as
+        // authoritative no-mutation.
+        drop(authority);
+        assert!(matches!(
+            backend
+                .recover_durable_sa_relocation(&store, operation_id, operation_generation, request)
+                .await
+                .unwrap(),
+            XfrmSaRelocationRestartOutcome::NoMutation
+        ));
+        assert!(transport.operations().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_dscp_gate_returns_relocation_authority_and_retains_prepared() {
+        let root = DurableTestRoot::new();
+        let config = LinuxXfrmDscpMarkingConfig::new([String::from("lo")], 25).unwrap();
+        let runtime = DeferredDscpRuntime::with_outcomes([]);
+        let transport = RecordingSuccessTransport::default();
+        let profile = config.profile().unwrap();
+        let mut request = relocation_request();
+        request.current.output_mark = Some(crate::XfrmMark {
+            value: profile.encode_token(46).unwrap(),
+            mask: profile.mask,
+        });
+        let (backend, store) = LinuxXfrmBackend::with_transport_and_deferred_dscp_runtime(
+            transport.clone(),
+            config,
+            runtime.clone(),
+        )
+        .unwrap()
+        .bind_current_network_namespace_with_sa_relocation_recovery(
+            root.path().to_path_buf(),
+            XfrmSaRelocationRecoveryProofKey::new([0x79; 32]).unwrap(),
+        )
+        .unwrap();
+        let operation_id = XfrmSaRelocationOperationId::generate().unwrap();
+        let operation_generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
+        let authority = backend
+            .prepare_sa_relocation(&store, operation_id, operation_generation, request.clone())
+            .await
+            .unwrap();
+
+        // The deferred DSCP gate is not activated, so the run is rejected
+        // before any readback: the exact authority is returned and the record
+        // stays Prepared.
+        let error = backend
+            .run_durable_sa_relocation(authority)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_str(),
+            "xfrm_sa_relocation_dscp_activation_required"
+        );
+        assert!(error.durable_error().is_none());
+        let authority = error.into_retry_authority().expect("retry authority");
+        assert_eq!(
+            store.inspect(&authority.prepared),
+            Ok(XfrmSaRelocationDurablePhase::Prepared)
+        );
+        assert!(transport.operations().is_empty());
+        assert!(runtime.records().is_empty());
+
+        // Dropping the retry authority leaves the record recoverable as
+        // authoritative no-mutation.
+        drop(authority);
+        assert!(matches!(
+            backend
+                .recover_durable_sa_relocation(&store, operation_id, operation_generation, request)
+                .await
+                .unwrap(),
+            XfrmSaRelocationRestartOutcome::NoMutation
+        ));
+        assert!(transport.operations().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn combined_binding_constructor_attaches_both_stores_and_cross_gates() {
+        let object_root = DurableTestRoot::new();
+        let relocation_root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, object_store, relocation_store) =
+            LinuxXfrmBackend::with_transport(transport.clone())
+                .bind_current_network_namespace_with_object_and_sa_relocation_recovery(
+                    object_root.path().to_path_buf(),
+                    XfrmObjectRecoveryProofKey::new([0x7b; 32]).unwrap(),
+                    relocation_root.path().to_path_buf(),
+                    XfrmSaRelocationRecoveryProofKey::new([0x7c; 32]).unwrap(),
+                )
+                .unwrap();
+
+        // Both stores are attached to the same actor: a prepared relocation
+        // gates install preparation through the combined binding.
+        let relocation_operation = XfrmSaRelocationOperationId::generate().unwrap();
+        let relocation_generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
+        let authority = backend
+            .prepare_sa_relocation(
+                &relocation_store,
+                relocation_operation,
+                relocation_generation,
+                relocation_request(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            backend
+                .prepare_durable_object_install(
+                    &object_store,
+                    XfrmObjectInstallOperationId::generate().unwrap(),
+                    XfrmObjectInstallOperationGeneration::new(1).unwrap(),
+                    durable_object_requests()[0].clone(),
+                )
+                .await,
+            Err(XfrmObjectInstallDurableError::InvalidTransition)
+        ));
+        drop(authority);
+        assert!(transport.operations().is_empty());
+
+        // Recovery through the relocation store reopens the install gate.
+        assert!(matches!(
+            backend
+                .recover_durable_sa_relocation(
+                    &relocation_store,
+                    relocation_operation,
+                    relocation_generation,
+                    relocation_request(),
+                )
+                .await
+                .unwrap(),
+            XfrmSaRelocationRestartOutcome::NoMutation
+        ));
+        assert!(backend
+            .prepare_durable_object_install(
+                &object_store,
+                XfrmObjectInstallOperationId::generate().unwrap(),
+                XfrmObjectInstallOperationGeneration::new(2).unwrap(),
+                durable_object_requests()[0].clone(),
+            )
+            .await
+            .is_ok());
+        assert!(transport.operations().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_authority_survives_relocation_gated_mutation_rejection() {
+        let object_root = DurableTestRoot::new();
+        let relocation_root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, object_store, relocation_store) = bind_with_capacity_and_recovery(
+            LinuxXfrmBackend::with_transport(transport.clone()),
+            LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY,
+            Some((
+                object_root.path().to_path_buf(),
+                XfrmObjectRecoveryProofKey::new([0x7d; 32]).unwrap(),
+            )),
+            Some((
+                relocation_root.path().to_path_buf(),
+                XfrmSaRelocationRecoveryProofKey::new([0x7e; 32]).unwrap(),
+            )),
+        )
+        .unwrap();
+        let object_store = object_store.unwrap();
+        let relocation_store = relocation_store.unwrap();
+
+        // Prepare an install authority and keep it live.
+        let install_operation = XfrmObjectInstallOperationId::generate().unwrap();
+        let install_generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+        let install_request = durable_object_requests()[0].clone();
+        let authority = backend
+            .prepare_durable_object_install(
+                &object_store,
+                install_operation,
+                install_generation,
+                install_request.clone(),
+            )
+            .await
+            .unwrap();
+
+        // A prepared relocation record gates ordinary mutations.
+        let relocation_operation = XfrmSaRelocationOperationId::generate().unwrap();
+        let relocation_generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
+        let relocation_authority = backend
+            .prepare_sa_relocation(
+                &relocation_store,
+                relocation_operation,
+                relocation_generation,
+                relocation_request(),
+            )
+            .await
+            .unwrap();
+        drop(relocation_authority);
+        assert!(matches!(
+            backend
+                .install_sa(InstallSaRequest {
+                    parameters: sa_parameters(),
+                })
+                .await,
+            Err(XfrmError::Unavailable)
+        ));
+        assert!(transport.operations().is_empty());
+
+        // The rejected mutation burned the install epoch but must not have
+        // cleared the live install authority: its run validation passes the
+        // seal check and fails only at the cross-family gate, not Stale.
+        let gated_attempt = duplicate_admission(&authority);
+        let gated_error = backend
+            .run_durable_object_install(gated_attempt)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            gated_error.durable_error(),
+            Some(XfrmObjectInstallDurableError::InvalidTransition)
+        );
+        assert!(transport.operations().is_empty());
+
+        // Once the relocation record is recovered, the surviving authority
+        // runs to completion.
+        assert!(matches!(
+            backend
+                .recover_durable_sa_relocation(
+                    &relocation_store,
+                    relocation_operation,
+                    relocation_generation,
+                    relocation_request(),
+                )
+                .await
+                .unwrap(),
+            XfrmSaRelocationRestartOutcome::NoMutation
+        ));
+        assert!(matches!(
+            backend.run_durable_object_install(authority).await.unwrap(),
+            XfrmObjectInstallDurableOutcome::Acquired(_)
+        ));
+        assert_eq!(transport.operations(), vec!["install_sa"]);
+        assert_eq!(
+            backend
+                .finalize_durable_object_install(
+                    &object_store,
+                    install_operation,
+                    install_generation,
+                    install_request,
+                )
+                .await
+                .unwrap(),
+            XfrmObjectInstallDurablePhase::Committed
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relocation_run_error_diagnostics_are_value_free() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_relocation_recovery(transport.clone(), &root);
+        // The fixture request carries addresses, a SPI, a lookup mark, and
+        // encapsulation ports; none may leak through any run diagnostic.
+        let mut request = relocation_request();
+        request.current.encap = Some(crate::UdpEncap::esp_in_udp(4500, 4500));
+        request.current.mark = Some(XfrmLookupMark::full(0x6290));
+        request.encap = SaRelocationEncap::Set(crate::UdpEncap::esp_in_udp(4500, 62_000));
+        let authority = backend
+            .prepare_sa_relocation(
+                &store,
+                XfrmSaRelocationOperationId::generate().unwrap(),
+                XfrmSaRelocationOperationGeneration::new(1).unwrap(),
+                request,
+            )
+            .await
+            .unwrap();
+
         for (error, label) in [
             (
                 XfrmSaRelocationRunError::current_state_mismatch(),
@@ -7368,14 +7770,40 @@ mod tests {
                 XfrmSaRelocationRunError::from(XfrmSaRelocationDurableError::WrongBinding),
                 "xfrm_sa_relocation_recovery_wrong_binding",
             ),
+            (
+                XfrmSaRelocationRunError::dscp_activation_required(Box::new(
+                    duplicate_sa_relocation_admission(&authority),
+                )),
+                "xfrm_sa_relocation_dscp_activation_required",
+            ),
+            (
+                XfrmSaRelocationRunError::target_conflict(Box::new(
+                    duplicate_sa_relocation_admission(&authority),
+                )),
+                "xfrm_sa_relocation_target_conflict",
+            ),
+            (
+                XfrmSaRelocationRunError::pre_effect_readback_failed(
+                    Box::new(duplicate_sa_relocation_admission(&authority)),
+                    XfrmError::StateIndeterminate {
+                        operation: "query_sa_relocation_identity",
+                    },
+                ),
+                "xfrm_sa_relocation_pre_effect_readback_failed",
+            ),
         ] {
             assert_eq!(error.as_str(), label);
             assert_eq!(error.to_string(), label);
             let debug = format!("{error:?}");
             assert!(debug.contains(label), "debug must carry only the label");
-            for leaked in ["192.0", "198.51", "1020", "3040", "0x1020"] {
+            for leaked in [
+                "192.0", "198.51", "1020", "3040", "0x1020", "6290", "0x6290", "4500", "62000",
+            ] {
                 assert!(!debug.contains(leaked), "diagnostic leaked {leaked}");
+                assert!(!label.contains(leaked), "label leaked {leaked}");
             }
         }
+        drop(authority);
+        assert!(transport.operations().is_empty());
     }
 }

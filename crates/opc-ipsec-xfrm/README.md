@@ -288,8 +288,8 @@ MOBIKE makes this a first-class restart case: UPDATE_SA_ADDRESSES changes only
 the outer tunnel-header addresses and UDP-encapsulation port (RFC 4555 §1.1,
 §3.3), one address pair exists per SA at a time so kernel migration is a move,
 not a copy (RFC 4555 §1.2), NAT rebinding may change "IP address and/or port"
-so encapsulation-only same-XfrmId relocation is expected (RFC 4555 §3.5,
-§3.8), and the initiator detects and recovers from failures, so fail-closed
+so encapsulation-only same-XfrmId relocation is expected (RFC 4555 §3.8),
+and the initiator detects and recovers from failures, so fail-closed
 cleanup of an unproven move is spec-consistent (RFC 4555 §3.11). Because the
 Linux SAD identity is destination/SPI/protocol (RFC 4301 §4.1; plus lookup
 mark on Linux), an address-changing relocation changes the XfrmId while an
@@ -377,7 +377,9 @@ Recovery deletes only through the exact target deletion identity
 `RemovalAdmitted`; a failed removal stays `removal_pending` and retryable
 across restart. Recovery is idempotent after a record retires, returns
 terminal `Relocated` proof without ever deleting after terminal publication,
-and a retryable outcome leaves the record gating until it converges.
+and a retryable outcome leaves the record gating until it converges. That
+terminal idempotence holds only until the next cooperating write prunes the
+terminal record; once pruned, restore fails `NotFound`.
 
 Linux has no owner- or generation-conditional `DELSA`. The store therefore
 implements a cooperating-writer protocol: every unresolved relocation phase —

@@ -177,6 +177,11 @@ pub(crate) fn prepare_durable_sa_relocation(
     store.prepare(operation_id, operation_generation, fingerprints)
 }
 
+/// Observe the current durable phase for one exact operation.
+///
+/// This direct read holds the store's process-local try-lock lease, so it
+/// contends with an in-flight admitted run on the actor's clone of the same
+/// open store exactly like [`XfrmSaRelocationRecoveryStore::inspect`].
 pub(crate) fn durable_sa_relocation_phase(
     store: &XfrmSaRelocationRecoveryStore,
     operation_id: XfrmSaRelocationOperationId,
@@ -824,6 +829,24 @@ mod tests {
         direction: SaRelocationDirection,
         same_identity: bool,
     ) -> RelocateSaRequest {
+        seeded_request_with_encap(
+            backend,
+            direction,
+            same_identity,
+            SaRelocationEncap::Set(relocated_encap()),
+        )
+        .await
+    }
+
+    /// Like [`seeded_request`], with an explicit encapsulation action (used
+    /// for the NAT-T removal rows, where the current encapsulation is present
+    /// and the resulting encapsulation is none).
+    async fn seeded_request_with_encap(
+        backend: &MockXfrmBackend,
+        direction: SaRelocationDirection,
+        same_identity: bool,
+        encap: SaRelocationEncap,
+    ) -> RelocateSaRequest {
         install_at(backend, old_destination(), old_source(), current_encap()).await;
         let current = backend
             .query_sa_relocation_identity(query_at(old_destination()))
@@ -838,7 +861,7 @@ mod tests {
             current,
             new_source_address: new_source(),
             new_destination,
-            encap: SaRelocationEncap::Set(relocated_encap()),
+            encap,
             direction,
         }
     }
@@ -1752,6 +1775,107 @@ mod tests {
                 );
                 assert_no_removal(&backend);
             }
+
+            // NAT-T removal (current encapsulation present, resulting
+            // encapsulation none): the shared identity still matches the
+            // bound current, so the effect never happened.
+            {
+                let root = TestRoot::new();
+                let backend = MockXfrmBackend::new();
+                let request =
+                    seeded_request_with_encap(&backend, direction, true, SaRelocationEncap::Remove)
+                        .await;
+                let operation_id = operation(0x54);
+                let store = open_store(&root);
+                issuing_cut(
+                    &store,
+                    operation_id,
+                    generation(5),
+                    &request,
+                    &backend,
+                    false,
+                )
+                .await;
+                drop(store);
+
+                backend.clear_operations();
+                let reopened = open_store(&root);
+                assert_eq!(
+                    recover_durable_sa_relocation(
+                        &reopened,
+                        operation_id,
+                        generation(5),
+                        &request,
+                        &backend,
+                    )
+                    .await
+                    .unwrap()
+                    .as_str(),
+                    "no_mutation"
+                );
+                assert_no_removal(&backend);
+                assert_identity(&backend, old_destination(), old_source(), current_encap()).await;
+            }
+
+            // NAT-T removal whose encap/source change happened: the shared
+            // identity matches the relocation expectation (native ESP at the
+            // new source) and is retired through the exact same identity.
+            {
+                let root = TestRoot::new();
+                let backend = MockXfrmBackend::new();
+                let request =
+                    seeded_request_with_encap(&backend, direction, true, SaRelocationEncap::Remove)
+                        .await;
+                let operation_id = operation(0x55);
+                let store = open_store(&root);
+                issuing_cut(
+                    &store,
+                    operation_id,
+                    generation(5),
+                    &request,
+                    &backend,
+                    true,
+                )
+                .await;
+                drop(store);
+
+                backend.clear_operations();
+                let reopened = open_store(&root);
+                assert_eq!(
+                    recover_durable_sa_relocation(
+                        &reopened,
+                        operation_id,
+                        generation(5),
+                        &request,
+                        &backend,
+                    )
+                    .await
+                    .unwrap()
+                    .as_str(),
+                    "owned_residue_retired"
+                );
+                assert_eq!(removal_count(&backend), 1);
+                assert_absent(&backend, old_destination()).await;
+                // Reinstall after delete succeeds as native ESP; repeat
+                // recovery is idempotent and never re-deletes.
+                install_at(&backend, old_destination(), new_source(), None).await;
+                backend.clear_operations();
+                assert_eq!(
+                    recover_durable_sa_relocation(
+                        &reopened,
+                        operation_id,
+                        generation(5),
+                        &request,
+                        &backend,
+                    )
+                    .await
+                    .unwrap()
+                    .as_str(),
+                    "retired"
+                );
+                assert_no_removal(&backend);
+                assert_identity(&backend, old_destination(), new_source(), None).await;
+            }
         }
     }
 
@@ -1820,10 +1944,24 @@ mod tests {
         )
         .await;
 
-        // A distinct operation cannot prepare while the first stays
-        // unresolved, and ordinary epoch advances are fenced.
+        // A distinct operation repeating the active deletion identity reports
+        // the duplicate even while the first record gates preparation.
         assert_eq!(
             prepare_durable_sa_relocation(&store, operation(0x71), generation(7), &request_a),
+            Err(XfrmSaRelocationDurableError::Duplicate)
+        );
+        // A distinct operation with a distinct deletion identity fails at the
+        // unresolved-record gate instead, and ordinary epoch advances are
+        // fenced too.
+        let mut distinct_request = request_a.clone();
+        distinct_request.new_destination = ipv4(198, 51, 100, 21);
+        assert_eq!(
+            prepare_durable_sa_relocation(
+                &store,
+                operation(0x71),
+                generation(7),
+                &distinct_request
+            ),
             Err(XfrmSaRelocationDurableError::InvalidTransition)
         );
         assert_eq!(
@@ -2254,7 +2392,9 @@ mod tests {
             )),
             XfrmSaRelocationPreEffectProof::TargetAbsent,
         );
-        for leaked in ["192.0", "198.51", "6290", "0x6290", "5a5a"] {
+        // The module fixtures carry addresses, a mark, and encapsulation
+        // ports; no diagnostic may leak them.
+        for leaked in ["192.0", "198.51", "6290", "0x6290", "5a5a", "4500", "62000"] {
             assert!(!rendered.contains(leaked), "diagnostic leaked {leaked}");
         }
     }
