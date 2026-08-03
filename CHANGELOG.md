@@ -172,23 +172,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   durable proof that the consumer continues on the new addresses. After
   process loss, `recover_durable_sa_relocation` classifies unresolved
   `Issuing`/`Indeterminate` records from their proof plus fresh exact
-  readbacks — intact old state retires as no-mutation, an unpublished owned
-  move is removed through the exact target deletion identity after
-  `RemovalAdmitted`, foreign or ambiguous state authorizes no deletion, and
-  stale-epoch or missing/inconsistent-proof records stay fail-closed for
-  repair — while prepared records retire as authoritative no-mutation and
-  terminal proof is returned idempotently. Every unresolved relocation phase,
-  including `Prepared`, gates all later cooperating mutations in the
-  namespace, and the install and relocation stores gate each other, with each
-  admitted mutation advancing both durable writer epochs; recovery remains the
-  escape from gating. Fixed-size relocation records (`OPCXRLC1`, format
+  readbacks — intact old state retires as no-mutation, absent current/target
+  state publishes the distinct terminal `StateAbsent` outcome without
+  claiming no mutation, and an unpublished owned move is removed through the
+  exact target deletion identity after `RemovalAdmitted`; foreign or ambiguous
+  state authorizes no deletion, and stale-epoch or missing/inconsistent-proof
+  records stay fail-closed for repair — while prepared records retire as
+  authoritative no-mutation and terminal proof is returned idempotently.
+  Every unresolved relocation phase, including `Prepared`, gates all later
+  cooperating mutations in the namespace. Effect-capable install and
+  relocation records gate each other, and every admitted mutation advances
+  both durable writer epochs. Durable runs and effect-capable recovery
+  cross-fence older prepared authority before kernel access. Reopen also
+  removes only strictly validated, family-specific staging residue left by
+  process death before atomic rename; unsafe lookalikes stay fail-closed.
+  Fixed-size relocation records (`OPCXRLC1`, format
   version 1 with the proof byte present from version 1, and family-distinct
   `OPCXRCT1`/`OPCXREP1` control/epoch file magics so an open against another
   durable family's root fails closed) retain only opaque
   correlation, phase, proof code, incarnation, epoch, and independent
   proof-keyed fingerprints of the deletion identity and complete relocation
   request; no address, selector, SPI, mark, encap port, namespace identity,
-  or operation identity is persisted or rendered. Privileged
+  request body, or operation identity is rendered. Privileged
   process-loss detectors cover prepared cuts, issuing cuts before and after
   the MIGRATE effect for inbound, outbound-block-policy, and same-XfrmId
   encapsulation relocations, foreign-state injection, and wrong-namespace

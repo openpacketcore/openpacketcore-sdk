@@ -80,6 +80,9 @@ pub enum XfrmSaRelocationRestartOutcome {
     /// A prepared or explicit no-mutation record was retired without a
     /// backend removal.
     NoMutation,
+    /// Fresh exact readback proved that the current and target SA identity
+    /// are absent, without claiming that the relocation made no mutation.
+    StateAbsent,
     /// The relocation was already proven complete; the terminal proof is
     /// returned idempotently and no deletion is ever authorized.
     Relocated,
@@ -114,6 +117,7 @@ impl XfrmSaRelocationRestartOutcome {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::NoMutation => "no_mutation",
+            Self::StateAbsent => "state_absent",
             Self::Relocated => "relocated",
             Self::OwnedResidueRetired => "owned_residue_retired",
             Self::ForeignUntouched => "foreign_untouched",
@@ -472,6 +476,9 @@ where
             // deletes after terminal publication.
             Ok(XfrmSaRelocationRestartOutcome::Relocated)
         }
+        XfrmSaRelocationDurablePhase::StateAbsent => {
+            Ok(XfrmSaRelocationRestartOutcome::StateAbsent)
+        }
         XfrmSaRelocationDurablePhase::RemovalAdmitted => {
             retire_admitted(store, record, &removal, backend).await
         }
@@ -560,8 +567,8 @@ where
                 Ok(XfrmSaRelocationRestartOutcome::ForeignUntouched)
             }
             IdentityReadback::Absent => {
-                retire_through_no_mutation(store, &handle, phase)?;
-                Ok(XfrmSaRelocationRestartOutcome::NoMutation)
+                publish_state_absent(store, &handle, phase)?;
+                Ok(XfrmSaRelocationRestartOutcome::StateAbsent)
             }
             IdentityReadback::Unreadable => Ok(XfrmSaRelocationRestartOutcome::Indeterminate),
         };
@@ -601,8 +608,8 @@ where
             return retire_admitted(store, admitted, removal, backend).await;
         }
         if target_absent {
-            retire_through_no_mutation(store, &handle, phase)?;
-            return Ok(XfrmSaRelocationRestartOutcome::NoMutation);
+            publish_state_absent(store, &handle, phase)?;
+            return Ok(XfrmSaRelocationRestartOutcome::StateAbsent);
         }
         retire_through_no_mutation(store, &handle, phase)?;
         return Ok(XfrmSaRelocationRestartOutcome::ForeignUntouched);
@@ -628,6 +635,20 @@ fn retire_through_no_mutation(
         &store.handle_for_record(&no_mutation)?,
         XfrmSaRelocationDurablePhase::NoMutation,
         XfrmSaRelocationDurablePhase::Retired,
+        None,
+    )?;
+    Ok(())
+}
+
+fn publish_state_absent(
+    store: &XfrmSaRelocationRecoveryStore,
+    handle: &XfrmSaRelocationRecoveryHandle,
+    phase: XfrmSaRelocationDurablePhase,
+) -> Result<(), XfrmSaRelocationDurableError> {
+    store.transition(
+        handle,
+        phase,
+        XfrmSaRelocationDurablePhase::StateAbsent,
         None,
     )?;
     Ok(())
@@ -1446,7 +1467,22 @@ mod tests {
                     .await
                     .unwrap()
                     .as_str(),
-                    "no_mutation"
+                    "state_absent"
+                );
+                assert_no_removal(&backend);
+                backend.clear_operations();
+                assert_eq!(
+                    recover_durable_sa_relocation(
+                        &reopened,
+                        operation_id,
+                        generation(4),
+                        &request,
+                        &backend,
+                    )
+                    .await
+                    .unwrap()
+                    .as_str(),
+                    "state_absent"
                 );
                 assert_no_removal(&backend);
             }
@@ -1771,7 +1807,22 @@ mod tests {
                     .await
                     .unwrap()
                     .as_str(),
-                    "no_mutation"
+                    "state_absent"
+                );
+                assert_no_removal(&backend);
+                backend.clear_operations();
+                assert_eq!(
+                    recover_durable_sa_relocation(
+                        &reopened,
+                        operation_id,
+                        generation(5),
+                        &request,
+                        &backend,
+                    )
+                    .await
+                    .unwrap()
+                    .as_str(),
+                    "state_absent"
                 );
                 assert_no_removal(&backend);
             }
@@ -2359,6 +2410,7 @@ mod tests {
     fn restart_outcome_labels_and_diagnostics_are_value_free() {
         for (outcome, label) in [
             (XfrmSaRelocationRestartOutcome::NoMutation, "no_mutation"),
+            (XfrmSaRelocationRestartOutcome::StateAbsent, "state_absent"),
             (XfrmSaRelocationRestartOutcome::Relocated, "relocated"),
             (
                 XfrmSaRelocationRestartOutcome::OwnedResidueRetired,

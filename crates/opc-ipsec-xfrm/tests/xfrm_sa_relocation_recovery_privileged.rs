@@ -138,9 +138,10 @@ fn sa_install_request(spi: u32, encap: Option<UdpEncap>) -> InstallSaRequest {
 }
 
 /// The exact post-move fixture state for one role: the relocated identity
-/// carrying the new outer endpoints and the resulting encapsulation. Used to
-/// reproduce the kernel truth of an admitted migration on hosts whose kernel
-/// lacks the exact single-SA migration UAPI.
+/// carrying the new outer endpoints and the resulting encapsulation. Used by
+/// the child-only, store-less kernel-state emulation when the exact single-SA
+/// migration UAPI is unavailable. This is causally equivalent to an admitted
+/// migration for the crash detector, but it is not a real MIGRATE effect.
 fn relocated_install_request(role: &str, spi: u32) -> TestResult<InstallSaRequest> {
     let same_identity = matches!(
         role,
@@ -981,7 +982,8 @@ fn issuing_cut_admits_effect(role: &str) -> bool {
 
 /// Whether the child should admit the relocation effect. The parent sets the
 /// effect flag to `0` on kernels without the exact single-SA migration UAPI;
-/// there the parent reproduces the post-move kernel state itself instead.
+/// the child then performs the causally equivalent state emulation after the
+/// durable Issuing cut through a store-less binding.
 fn child_admits_effect(role: &str) -> bool {
     issuing_cut_admits_effect(role) && env::var(CHILD_EFFECT_ENV).as_deref() == Ok("1")
 }
@@ -1030,6 +1032,23 @@ fn run_sa_relocation_crash_child(role: &str, root: &Path, token: &str) -> TestRe
             if block_on(backend.query_sa_relocation_identity(target_query)).is_err() {
                 return Err(io::Error::other("relocation effect did not reach the kernel").into());
             }
+        } else if issuing_cut_admits_effect(role) {
+            // The exact MIGRATE UAPI is unavailable. Emulate its resulting
+            // kernel state in this same child, after the durable Issuing cut
+            // and before readiness, through a binding that has no recovery
+            // store and therefore cannot be gated by the unresolved record.
+            // This preserves process-loss causality without pretending that a
+            // real MIGRATE effect was admitted.
+            let emulation = LinuxXfrmBackend::new().bind_current_network_namespace()?;
+            block_on(emulation.remove_sa(removal_at(old_destination(), spi)))?;
+            block_on(emulation.install_sa(relocated_install_request(role, spi)?))?;
+            if block_on(emulation.query_sa_relocation_identity(target_query)).is_err() {
+                return Err(io::Error::other(
+                    "same-child kernel-state emulation did not reach the kernel",
+                )
+                .into());
+            }
+            drop(emulation);
         }
     }
 
@@ -1112,9 +1131,10 @@ fn sa_relocation_recovery_detector(
     // The after-effect crash window needs the kernel SA in its post-move
     // state. Where the kernel exposes the exact single-SA migration UAPI the
     // child admits the real MIGRATE effect; otherwise the child cuts before
-    // the effect and the parent reproduces the identical post-move kernel
-    // state through a store-less binding (which consumes no writer epoch), so
-    // the recovery classification runs against real kernel truth either way.
+    // the effect and performs causally equivalent same-child kernel-state
+    // emulation through a store-less binding (which consumes no writer epoch).
+    // In either case, recovery classification runs against kernel truth after
+    // the process-loss cut.
     let kernel_admits_effect = if issuing_cut_admits_effect(role) {
         let probe = bind_namespace(fixture.namespace_a())?;
         let capability = block_on(probe.sa_relocation_capability())?;
@@ -1131,13 +1151,6 @@ fn sa_relocation_recovery_detector(
     drop(foreign_backend);
 
     crash_sa_relocation_operation(&fixture, fixture.namespace_a(), role, kernel_admits_effect)?;
-
-    if issuing_cut_admits_effect(role) && !kernel_admits_effect {
-        let emulation = bind_namespace(fixture.namespace_a())?;
-        block_on(emulation.remove_sa(removal_at(old_destination(), spi)))?;
-        block_on(emulation.install_sa(relocated_install_request(role, spi)?))?;
-        drop(emulation);
-    }
 
     let (backend, store) = bind_namespace_with_sa_recovery(fixture.namespace_a(), &fixture)?;
     assert_pre_recovery_kernel_state(
@@ -1206,6 +1219,9 @@ fn sa_relocation_recovery_detector(
         }
         "no_mutation" => {
             assert_old_sa_intact(&backend, spi)?;
+            if request.new_destination != request.current.id.destination {
+                assert_sa_absent(&backend, request.new_destination, spi)?;
+            }
         }
         "foreign_untouched" => {
             assert_old_sa_intact(&backend, spi)?;

@@ -61,6 +61,7 @@ const CONTROL_BODY_BYTES: usize = CONTROL_BYTES - AUTH_TAG_BYTES;
 const CONTROL_MAGIC: [u8; 8] = *b"OPCXRCT1";
 const CONTROL_AUTH_DOMAIN: &[u8] = b"opc-xfrm-relocation-control-v1\0";
 const CONTROL_NAME: &str = "control";
+const TEMPORARY_PREFIX: &str = ".opc-xfrm-relocation-pending-";
 const EPOCH_BYTES: usize = 80;
 const EPOCH_BODY_BYTES: usize = EPOCH_BYTES - AUTH_TAG_BYTES;
 const EPOCH_MAGIC: [u8; 8] = *b"OPCXREP1";
@@ -252,6 +253,9 @@ pub enum XfrmSaRelocationDurablePhase {
     NoMutation,
     /// The backend result cannot safely prove relocation or absence.
     Indeterminate,
+    /// Fresh exact readback proved that neither the current nor target SA is
+    /// present, without claiming that the relocation made no mutation.
+    StateAbsent,
     /// Recovery authority was validated and fenced before deletion.
     RemovalAdmitted,
     /// Recovery completed and no cleanup authority remains.
@@ -267,6 +271,7 @@ impl XfrmSaRelocationDurablePhase {
             Self::Relocated => "relocated",
             Self::NoMutation => "no_mutation",
             Self::Indeterminate => "indeterminate",
+            Self::StateAbsent => "state_absent",
             Self::RemovalAdmitted => "removal_admitted",
             Self::Retired => "retired",
         }
@@ -281,6 +286,7 @@ impl XfrmSaRelocationDurablePhase {
             Self::Indeterminate => 5,
             Self::RemovalAdmitted => 6,
             Self::Retired => 7,
+            Self::StateAbsent => 8,
         }
     }
 
@@ -293,6 +299,7 @@ impl XfrmSaRelocationDurablePhase {
             5 => Ok(Self::Indeterminate),
             6 => Ok(Self::RemovalAdmitted),
             7 => Ok(Self::Retired),
+            8 => Ok(Self::StateAbsent),
             _ => Err(XfrmSaRelocationDurableError::Malformed),
         }
     }
@@ -305,8 +312,10 @@ impl XfrmSaRelocationDurablePhase {
                 | (Self::Issuing, Self::Relocated)
                 | (Self::Issuing, Self::NoMutation)
                 | (Self::Issuing, Self::Indeterminate)
+                | (Self::Issuing, Self::StateAbsent)
                 | (Self::Issuing, Self::RemovalAdmitted)
                 | (Self::Indeterminate, Self::NoMutation)
+                | (Self::Indeterminate, Self::StateAbsent)
                 | (Self::Indeterminate, Self::RemovalAdmitted)
                 | (Self::Relocated, Self::Retired)
                 | (Self::NoMutation, Self::Retired)
@@ -610,6 +619,7 @@ fn validate_record(record: &DurableRelocationRecord) -> Result<(), XfrmSaRelocat
             | XfrmSaRelocationDurablePhase::Relocated
             | XfrmSaRelocationDurablePhase::NoMutation
             | XfrmSaRelocationDurablePhase::Indeterminate
+            | XfrmSaRelocationDurablePhase::StateAbsent
             | XfrmSaRelocationDurablePhase::RemovalAdmitted
     );
     let proof_forbidden = record.phase == XfrmSaRelocationDurablePhase::Prepared;
@@ -1009,6 +1019,7 @@ impl XfrmSaRelocationRecoveryStore {
                 record.phase,
                 XfrmSaRelocationDurablePhase::NoMutation
                     | XfrmSaRelocationDurablePhase::Relocated
+                    | XfrmSaRelocationDurablePhase::StateAbsent
                     | XfrmSaRelocationDurablePhase::Retired
             )
         }) {
@@ -1487,6 +1498,7 @@ impl StoreLease<'_> {
                     record.phase,
                     XfrmSaRelocationDurablePhase::NoMutation
                         | XfrmSaRelocationDurablePhase::Relocated
+                        | XfrmSaRelocationDurablePhase::StateAbsent
                         | XfrmSaRelocationDurablePhase::Retired
                 )
             })
@@ -1585,6 +1597,7 @@ fn validate_unique_active_deletion_identities(
             left.phase,
             XfrmSaRelocationDurablePhase::NoMutation
                 | XfrmSaRelocationDurablePhase::Relocated
+                | XfrmSaRelocationDurablePhase::StateAbsent
                 | XfrmSaRelocationDurablePhase::Retired
         ) {
             continue;
@@ -1594,6 +1607,7 @@ fn validate_unique_active_deletion_identities(
                 right.phase,
                 XfrmSaRelocationDurablePhase::NoMutation
                     | XfrmSaRelocationDurablePhase::Relocated
+                    | XfrmSaRelocationDurablePhase::StateAbsent
                     | XfrmSaRelocationDurablePhase::Retired
             ) && fingerprints_equal(
                 &left.deletion_identity_fingerprint,
@@ -1830,6 +1844,7 @@ fn initialize_or_load_control(
     namespace_seal: [u8; 32],
 ) -> Result<ControlRecord, XfrmSaRelocationDurableError> {
     verify_visible_identity(store)?;
+    cleanup_interrupted_publications(store)?;
     let names = scan_raw_names(store)?;
     if names.is_empty() {
         let control = ControlRecord {
@@ -1901,6 +1916,46 @@ fn scan_raw_names(store: &StoreInner) -> Result<Vec<String>, XfrmSaRelocationDur
         );
     }
     Ok(names)
+}
+
+/// Remove only SDK-owned named staging files left by process death before
+/// their atomic rename. Unknown entries and unsafe lookalikes remain
+/// fail-closed; the store root is a trusted, permanently leased directory.
+fn cleanup_interrupted_publications(
+    store: &StoreInner,
+) -> Result<(), XfrmSaRelocationDurableError> {
+    let names = scan_raw_names(store)?;
+    let mut removed = false;
+    for name in names {
+        if !is_temporary_name(&name) {
+            continue;
+        }
+        let descriptor = openat(
+            store.descriptor.as_fd(),
+            name.as_str(),
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| XfrmSaRelocationDurableError::Malformed)?;
+        let metadata = fstat(&descriptor).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
+        if !FileType::from_raw_mode(metadata.st_mode).is_file()
+            || stat_device(&metadata)? != store.root_device
+            || metadata.st_uid != store.root_owner
+            || metadata.st_mode.store_permissions() != FILE_MODE
+            || metadata.st_nlink != 1
+            || metadata.st_size < 0
+            || metadata.st_size > XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES as i64
+        {
+            return Err(XfrmSaRelocationDurableError::Malformed);
+        }
+        unlinkat(store.descriptor.as_fd(), name.as_str(), AtFlags::empty())
+            .map_err(|_| XfrmSaRelocationDurableError::Storage)?;
+        removed = true;
+    }
+    if removed {
+        fsync(&store.descriptor).map_err(|_| XfrmSaRelocationDurableError::Storage)?;
+    }
+    Ok(())
 }
 
 fn read_fixed_file<const N: usize>(
@@ -2063,7 +2118,21 @@ fn random_nonzero_16() -> Result<[u8; 16], XfrmSaRelocationDurableError> {
 
 #[cfg(target_os = "linux")]
 fn temporary_name() -> Result<String, XfrmSaRelocationDurableError> {
-    Ok(format!(".pending-{}", encode_hex(&random_nonzero_16()?)))
+    Ok(format!(
+        "{TEMPORARY_PREFIX}{}",
+        encode_hex(&random_nonzero_16()?)
+    ))
+}
+
+fn is_temporary_name(name: &str) -> bool {
+    let Some(encoded) = name.strip_prefix(TEMPORARY_PREFIX) else {
+        return false;
+    };
+    encoded.len() == 32
+        && encoded
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && encoded.bytes().any(|byte| byte != b'0')
 }
 
 fn epoch_name(epoch: NonZeroU64) -> String {
@@ -2323,6 +2392,7 @@ fn parse_record_name(
         "relocated" => XfrmSaRelocationDurablePhase::Relocated,
         "no_mutation" => XfrmSaRelocationDurablePhase::NoMutation,
         "indeterminate" => XfrmSaRelocationDurablePhase::Indeterminate,
+        "state_absent" => XfrmSaRelocationDurablePhase::StateAbsent,
         "removal_admitted" => XfrmSaRelocationDurablePhase::RemovalAdmitted,
         "retired" => XfrmSaRelocationDurablePhase::Retired,
         _ => return None,
@@ -2371,6 +2441,8 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
 mod tests {
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    use rustix::fs::{mkfifoat, CWD};
 
     use crate::{
         IpAddress, SaRelocationIdentity, SaRelocationSelector, XfrmId, XfrmLookupMark, XfrmMark,
@@ -2516,6 +2588,7 @@ mod tests {
             XfrmSaRelocationDurablePhase::Relocated,
             XfrmSaRelocationDurablePhase::NoMutation,
             XfrmSaRelocationDurablePhase::Indeterminate,
+            XfrmSaRelocationDurablePhase::StateAbsent,
             XfrmSaRelocationDurablePhase::RemovalAdmitted,
             XfrmSaRelocationDurablePhase::Retired,
         ] {
@@ -2635,6 +2708,10 @@ mod tests {
             .permits(XfrmSaRelocationDurablePhase::RemovalAdmitted));
         assert!(XfrmSaRelocationDurablePhase::Indeterminate
             .permits(XfrmSaRelocationDurablePhase::NoMutation));
+        assert!(XfrmSaRelocationDurablePhase::Issuing
+            .permits(XfrmSaRelocationDurablePhase::StateAbsent));
+        assert!(XfrmSaRelocationDurablePhase::Indeterminate
+            .permits(XfrmSaRelocationDurablePhase::StateAbsent));
         assert!(
             XfrmSaRelocationDurablePhase::Relocated.permits(XfrmSaRelocationDurablePhase::Retired)
         );
@@ -2648,6 +2725,8 @@ mod tests {
         assert!(!XfrmSaRelocationDurablePhase::Relocated
             .permits(XfrmSaRelocationDurablePhase::RemovalAdmitted));
         assert!(!XfrmSaRelocationDurablePhase::NoMutation
+            .permits(XfrmSaRelocationDurablePhase::RemovalAdmitted));
+        assert!(!XfrmSaRelocationDurablePhase::StateAbsent
             .permits(XfrmSaRelocationDurablePhase::RemovalAdmitted));
         assert!(
             !XfrmSaRelocationDurablePhase::Retired.permits(XfrmSaRelocationDurablePhase::Prepared)
@@ -2757,6 +2836,87 @@ mod tests {
         let inventory = reopened.lease().unwrap().inventory().unwrap();
         assert_eq!(inventory.epoch, NonZeroU64::new(1).unwrap());
         assert!(inventory.records.is_empty());
+    }
+
+    #[test]
+    fn process_loss_staging_residue_is_removed_before_reopen() {
+        let root = TestRoot::new();
+        let initial = store(&root);
+        drop(initial);
+
+        // Model SIGKILL after a partial staging-file write and sync but before
+        // the atomic rename. No publisher-side error cleanup can run then.
+        let pending = root
+            .path()
+            .join(".opc-xfrm-relocation-pending-1234567890abcdef1234567890abcdef");
+        fs::write(&pending, [0xa5; 17]).unwrap();
+        fs::set_permissions(&pending, fs::Permissions::from_mode(FILE_MODE)).unwrap();
+        std::fs::File::open(&pending).unwrap().sync_all().unwrap();
+        std::fs::File::open(root.path())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+
+        let reopened = store(&root);
+        assert!(!pending.exists());
+        assert!(reopened.lease().unwrap().inventory().is_ok());
+    }
+
+    #[test]
+    fn first_publication_staging_residue_is_removed_before_initialization() {
+        let root = TestRoot::new();
+        fs::create_dir(root.path()).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(DIRECTORY_MODE)).unwrap();
+        let pending = root
+            .path()
+            .join(".opc-xfrm-relocation-pending-abcdef1234567890abcdef1234567890");
+        fs::write(&pending, [0x5a; 9]).unwrap();
+        fs::set_permissions(&pending, fs::Permissions::from_mode(FILE_MODE)).unwrap();
+        std::fs::File::open(&pending).unwrap().sync_all().unwrap();
+        std::fs::File::open(root.path())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+
+        let initialized = store(&root);
+        assert!(!pending.exists());
+        let inventory = initialized.lease().unwrap().inventory().unwrap();
+        assert_eq!(inventory.epoch, NonZeroU64::new(1).unwrap());
+        assert!(inventory.records.is_empty());
+    }
+
+    #[test]
+    fn unsafe_staging_lookalike_remains_fail_closed() {
+        let root = TestRoot::new();
+        let initial = store(&root);
+        drop(initial);
+        let pending = root
+            .path()
+            .join(".opc-xfrm-relocation-pending-fedcba0987654321fedcba0987654321");
+        symlink(root.path().join(CONTROL_NAME), &pending).unwrap();
+
+        assert!(matches!(
+            XfrmSaRelocationRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]),
+            Err(XfrmSaRelocationDurableError::Malformed)
+        ));
+        assert!(pending.symlink_metadata().is_ok());
+    }
+
+    #[test]
+    fn staging_fifo_is_rejected_without_blocking() {
+        let root = TestRoot::new();
+        let initial = store(&root);
+        drop(initial);
+        let pending = root
+            .path()
+            .join(".opc-xfrm-relocation-pending-0123456789abcdef0123456789abcdef");
+        mkfifoat(CWD, &pending, Mode::from_raw_mode(FILE_MODE)).unwrap();
+
+        assert!(matches!(
+            XfrmSaRelocationRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]),
+            Err(XfrmSaRelocationDurableError::Malformed)
+        ));
+        assert!(pending.symlink_metadata().is_ok());
     }
 
     #[test]
@@ -3301,11 +3461,19 @@ mod tests {
             ),
             (
                 XfrmSaRelocationDurablePhase::Issuing,
+                XfrmSaRelocationDurablePhase::StateAbsent,
+            ),
+            (
+                XfrmSaRelocationDurablePhase::Issuing,
                 XfrmSaRelocationDurablePhase::RemovalAdmitted,
             ),
             (
                 XfrmSaRelocationDurablePhase::Indeterminate,
                 XfrmSaRelocationDurablePhase::NoMutation,
+            ),
+            (
+                XfrmSaRelocationDurablePhase::Indeterminate,
+                XfrmSaRelocationDurablePhase::StateAbsent,
             ),
             (
                 XfrmSaRelocationDurablePhase::Indeterminate,

@@ -57,6 +57,7 @@ const CONTROL_BODY_BYTES: usize = CONTROL_BYTES - AUTH_TAG_BYTES;
 const CONTROL_MAGIC: [u8; 8] = *b"OPCXCTL1";
 const CONTROL_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-control-v1\0";
 const CONTROL_NAME: &str = "control";
+const TEMPORARY_PREFIX: &str = ".opc-xfrm-object-pending-";
 const EPOCH_BYTES: usize = 80;
 const EPOCH_BODY_BYTES: usize = EPOCH_BYTES - AUTH_TAG_BYTES;
 const EPOCH_MAGIC: [u8; 8] = *b"OPCXEPC1";
@@ -1858,6 +1859,7 @@ fn initialize_or_load_control(
     namespace_seal: [u8; 32],
 ) -> Result<ControlRecord, XfrmObjectInstallDurableError> {
     verify_visible_identity(store)?;
+    cleanup_interrupted_publications(store)?;
     let names = scan_raw_names(store)?;
     if names.is_empty() {
         let control = ControlRecord {
@@ -1929,6 +1931,46 @@ fn scan_raw_names(store: &StoreInner) -> Result<Vec<String>, XfrmObjectInstallDu
         );
     }
     Ok(names)
+}
+
+/// Remove only SDK-owned named staging files left by process death before
+/// their atomic rename. Unknown entries and unsafe lookalikes remain
+/// fail-closed; the store root is a trusted, permanently leased directory.
+fn cleanup_interrupted_publications(
+    store: &StoreInner,
+) -> Result<(), XfrmObjectInstallDurableError> {
+    let names = scan_raw_names(store)?;
+    let mut removed = false;
+    for name in names {
+        if !is_temporary_name(&name) {
+            continue;
+        }
+        let descriptor = openat(
+            store.descriptor.as_fd(),
+            name.as_str(),
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| XfrmObjectInstallDurableError::Malformed)?;
+        let metadata = fstat(&descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+        if !FileType::from_raw_mode(metadata.st_mode).is_file()
+            || stat_device(&metadata)? != store.root_device
+            || metadata.st_uid != store.root_owner
+            || metadata.st_mode.store_permissions() != FILE_MODE
+            || metadata.st_nlink != 1
+            || metadata.st_size < 0
+            || metadata.st_size > XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES as i64
+        {
+            return Err(XfrmObjectInstallDurableError::Malformed);
+        }
+        unlinkat(store.descriptor.as_fd(), name.as_str(), AtFlags::empty())
+            .map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+        removed = true;
+    }
+    if removed {
+        fsync(&store.descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+    }
+    Ok(())
 }
 
 fn read_fixed_file<const N: usize>(
@@ -2091,7 +2133,21 @@ fn random_nonzero_16() -> Result<[u8; 16], XfrmObjectInstallDurableError> {
 
 #[cfg(target_os = "linux")]
 fn temporary_name() -> Result<String, XfrmObjectInstallDurableError> {
-    Ok(format!(".pending-{}", encode_hex(&random_nonzero_16()?)))
+    Ok(format!(
+        "{TEMPORARY_PREFIX}{}",
+        encode_hex(&random_nonzero_16()?)
+    ))
+}
+
+fn is_temporary_name(name: &str) -> bool {
+    let Some(encoded) = name.strip_prefix(TEMPORARY_PREFIX) else {
+        return false;
+    };
+    encoded.len() == 32
+        && encoded
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && encoded.bytes().any(|byte| byte != b'0')
 }
 
 fn epoch_name(epoch: NonZeroU64) -> String {
@@ -2562,6 +2618,8 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
+    use rustix::fs::{mkfifoat, CWD};
+
     use crate::{IpAddress, RemovePolicyRequest, RemoveSaRequest, XfrmLookupMark, XfrmSelector};
 
     use super::*;
@@ -2890,6 +2948,84 @@ mod tests {
         let inventory = reopened.lease().unwrap().inventory().unwrap();
         assert_eq!(inventory.epoch, NonZeroU64::new(1).unwrap());
         assert!(inventory.records.is_empty());
+    }
+
+    #[test]
+    fn process_loss_staging_residue_is_removed_before_reopen() {
+        let root = TestRoot::new();
+        let initial = store(&root);
+        drop(initial);
+        let pending = root
+            .path()
+            .join(".opc-xfrm-object-pending-1234567890abcdef1234567890abcdef");
+        fs::write(&pending, [0xa5; 17]).unwrap();
+        fs::set_permissions(&pending, fs::Permissions::from_mode(FILE_MODE)).unwrap();
+        std::fs::File::open(&pending).unwrap().sync_all().unwrap();
+        std::fs::File::open(root.path())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+
+        let reopened = store(&root);
+        assert!(!pending.exists());
+        assert!(reopened.lease().unwrap().inventory().is_ok());
+    }
+
+    #[test]
+    fn first_publication_staging_residue_is_removed_before_initialization() {
+        let root = TestRoot::new();
+        fs::create_dir(root.path()).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(DIRECTORY_MODE)).unwrap();
+        let pending = root
+            .path()
+            .join(".opc-xfrm-object-pending-abcdef1234567890abcdef1234567890");
+        fs::write(&pending, [0x5a; 9]).unwrap();
+        fs::set_permissions(&pending, fs::Permissions::from_mode(FILE_MODE)).unwrap();
+        std::fs::File::open(&pending).unwrap().sync_all().unwrap();
+        std::fs::File::open(root.path())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+
+        let initialized = store(&root);
+        assert!(!pending.exists());
+        let inventory = initialized.lease().unwrap().inventory().unwrap();
+        assert_eq!(inventory.epoch, NonZeroU64::new(1).unwrap());
+        assert!(inventory.records.is_empty());
+    }
+
+    #[test]
+    fn unsafe_staging_lookalike_remains_fail_closed() {
+        let root = TestRoot::new();
+        let initial = store(&root);
+        drop(initial);
+        let pending = root
+            .path()
+            .join(".opc-xfrm-object-pending-fedcba0987654321fedcba0987654321");
+        symlink(root.path().join(CONTROL_NAME), &pending).unwrap();
+
+        assert!(matches!(
+            XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]),
+            Err(XfrmObjectInstallDurableError::Malformed)
+        ));
+        assert!(pending.symlink_metadata().is_ok());
+    }
+
+    #[test]
+    fn staging_fifo_is_rejected_without_blocking() {
+        let root = TestRoot::new();
+        let initial = store(&root);
+        drop(initial);
+        let pending = root
+            .path()
+            .join(".opc-xfrm-object-pending-0123456789abcdef0123456789abcdef");
+        mkfifoat(CWD, &pending, Mode::from_raw_mode(FILE_MODE)).unwrap();
+
+        assert!(matches!(
+            XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]),
+            Err(XfrmObjectInstallDurableError::Malformed)
+        ));
+        assert!(pending.symlink_metadata().is_ok());
     }
 
     #[test]

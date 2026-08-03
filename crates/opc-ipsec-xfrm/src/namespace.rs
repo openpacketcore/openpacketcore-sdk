@@ -54,9 +54,10 @@ use crate::{
         XfrmObjectInstallRecoveryStore, XfrmObjectRecoveryProofKey,
     },
     durable_relocation::{
-        XfrmSaRelocationDurableError, XfrmSaRelocationOperationGeneration,
-        XfrmSaRelocationOperationId, XfrmSaRelocationRecoveryHandle,
-        XfrmSaRelocationRecoveryProofKey, XfrmSaRelocationRecoveryStore,
+        XfrmSaRelocationDurableError, XfrmSaRelocationDurablePhase,
+        XfrmSaRelocationOperationGeneration, XfrmSaRelocationOperationId,
+        XfrmSaRelocationRecoveryHandle, XfrmSaRelocationRecoveryProofKey,
+        XfrmSaRelocationRecoveryStore,
     },
     durable_relocation_flow::{
         cut_durable_sa_relocation_at_issuing as cut_sa_relocation_at_issuing,
@@ -1195,12 +1196,50 @@ impl NamespaceActorState {
     }
 
     #[cfg(unix)]
-    fn consume_object_install_admission(
+    fn admit_durable_object_install_mutation(
         &mut self,
         authority: &XfrmObjectInstallAdmissionAuthority,
     ) -> Result<(), XfrmObjectInstallDurableError> {
         self.require_object_install_admission(authority)?;
+        // The object's own `Prepared -> Issuing` transition advances the
+        // object-store epoch. Fence the other durable family first so a
+        // previously prepared relocation authority cannot survive this
+        // independently admitted kernel mutation.
+        if let Some(store) = &self.relocation_recovery_store {
+            store
+                .advance_writer_epoch()
+                .map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+        }
         self.object_install_admissions.remove(&authority.key());
+        self.relocation_admissions.clear();
+        self.invalidate_counter_receipts();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn admit_durable_object_install_recovery(
+        &mut self,
+        phase: XfrmObjectInstallDurablePhase,
+    ) -> Result<(), XfrmObjectInstallDurableError> {
+        if matches!(
+            phase,
+            XfrmObjectInstallDurablePhase::Issuing
+                | XfrmObjectInstallDurablePhase::Indeterminate
+                | XfrmObjectInstallDurablePhase::Acquired
+                | XfrmObjectInstallDurablePhase::RemovalAdmitted
+        ) {
+            // These recovery phases may issue exact cleanup and carry the
+            // same cross-family fencing obligation as a live run. Prepared
+            // and terminal recovery are metadata-only.
+            self.require_relocation_gate_open_for_install()?;
+            if let Some(store) = &self.relocation_recovery_store {
+                store
+                    .advance_writer_epoch()
+                    .map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+            }
+            self.relocation_admissions.clear();
+        }
+        self.invalidate_counter_receipts();
         Ok(())
     }
 
@@ -1260,12 +1299,49 @@ impl NamespaceActorState {
     }
 
     #[cfg(unix)]
-    fn consume_sa_relocation_admission(
+    fn admit_durable_sa_relocation_mutation(
         &mut self,
         authority: &XfrmSaRelocationAdmissionAuthority,
     ) -> Result<(), XfrmSaRelocationDurableError> {
         self.require_sa_relocation_admission(authority)?;
-        self.relocation_admissions.remove(&authority.key());
+        // Object `Prepared` records are deliberately not writer gates, so a
+        // relocation may be prepared behind one. Burn the object-store epoch
+        // before admitting the relocation and clear every live affine seal;
+        // otherwise that older object authority could mutate after the move.
+        if let Some(store) = &self.object_recovery_store {
+            store
+                .advance_writer_epoch()
+                .map_err(|_| XfrmSaRelocationDurableError::Storage)?;
+        }
+        self.object_install_admissions.clear();
+        self.relocation_admissions.clear();
+        self.invalidate_counter_receipts();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn admit_durable_sa_relocation_recovery(
+        &mut self,
+        phase: XfrmSaRelocationDurablePhase,
+    ) -> Result<(), XfrmSaRelocationDurableError> {
+        if matches!(
+            phase,
+            XfrmSaRelocationDurablePhase::Issuing
+                | XfrmSaRelocationDurablePhase::Indeterminate
+                | XfrmSaRelocationDurablePhase::RemovalAdmitted
+        ) {
+            // These phases may remove exact residue. Prepared and terminal
+            // recovery only update metadata and preserve unrelated prepared
+            // object authorities.
+            self.require_install_gate_open_for_relocation()?;
+            if let Some(store) = &self.object_recovery_store {
+                store
+                    .advance_writer_epoch()
+                    .map_err(|_| XfrmSaRelocationDurableError::Storage)?;
+            }
+            self.object_install_admissions.clear();
+        }
+        self.invalidate_counter_receipts();
         Ok(())
     }
 
@@ -1734,12 +1810,13 @@ impl NamespaceBoundLinuxXfrmBackend {
     /// Reconcile one retained durable relocation after process loss.
     ///
     /// A prepared record is retired as authoritative no-mutation. Terminal
-    /// `Relocated` proof is returned idempotently and never authorizes
-    /// deletion. Unresolved `Issuing`/`Indeterminate` records are classified
-    /// from their pre-effect proof plus fresh exact readbacks; only a proved
-    /// owned residue is removed, through the exact target deletion identity.
-    /// Unreadable readbacks keep the record unresolved; stale epochs or
-    /// missing or inconsistent proofs keep it gating for repair.
+    /// `Relocated` and `StateAbsent` proofs are returned idempotently and never
+    /// authorize deletion. Unresolved `Issuing`/`Indeterminate` records are
+    /// classified from their pre-effect proof plus fresh exact readbacks;
+    /// only a proved owned residue is removed, through the exact target
+    /// deletion identity. Absent state never claims no mutation. Unreadable
+    /// readbacks keep the record unresolved; stale epochs or missing or
+    /// inconsistent proofs keep it gating for repair.
     ///
     /// Idempotent recovery of a terminal phase holds only until the next
     /// cooperating write prunes the terminal record; once pruned, the
@@ -2360,9 +2437,8 @@ impl NamespaceCommand {
                             return;
                         }
                     };
-                let result = match state.consume_object_install_admission(&authority) {
+                let result = match state.admit_durable_object_install_mutation(&authority) {
                     Ok(()) => {
-                        state.invalidate_counter_receipts();
                         run_object_install(
                             &authority.operation.store,
                             &authority.prepared,
@@ -2386,6 +2462,7 @@ impl NamespaceCommand {
                 let validation = state
                     .require_object_recovery_store(&authority.operation.store)
                     .and_then(|()| state.require_object_install_admission(&authority))
+                    .and_then(|()| state.require_relocation_gate_open_for_install())
                     .and_then(|()| {
                         validate_object_install_admission(
                             &authority.operation.store,
@@ -2426,39 +2503,36 @@ impl NamespaceCommand {
                             return;
                         }
                     };
-                let result = match state.consume_object_install_admission(&authority) {
-                    Ok(()) => {
-                        state.invalidate_counter_receipts();
-                        match cut {
-                            DetectorPreparedCut::Issuing {
+                let result = match state.admit_durable_object_install_mutation(&authority) {
+                    Ok(()) => match cut {
+                        DetectorPreparedCut::Issuing {
+                            admit_backend_effect,
+                        } => {
+                            cut_object_install_at_issuing(
+                                &authority.operation.store,
+                                &authority.prepared,
+                                authority.operation.operation_id,
+                                authority.operation.operation_generation,
+                                &authority.operation.request,
+                                backend,
+                                pre_effect_proof,
                                 admit_backend_effect,
-                            } => {
-                                cut_object_install_at_issuing(
-                                    &authority.operation.store,
-                                    &authority.prepared,
-                                    authority.operation.operation_id,
-                                    authority.operation.operation_generation,
-                                    &authority.operation.request,
-                                    backend,
-                                    pre_effect_proof,
-                                    admit_backend_effect,
-                                )
-                                .await
-                            }
-                            DetectorPreparedCut::IndeterminateAfterEffect => {
-                                cut_object_install_at_indeterminate_after_effect(
-                                    &authority.operation.store,
-                                    &authority.prepared,
-                                    authority.operation.operation_id,
-                                    authority.operation.operation_generation,
-                                    &authority.operation.request,
-                                    backend,
-                                    pre_effect_proof,
-                                )
-                                .await
-                            }
+                            )
+                            .await
                         }
-                    }
+                        DetectorPreparedCut::IndeterminateAfterEffect => {
+                            cut_object_install_at_indeterminate_after_effect(
+                                &authority.operation.store,
+                                &authority.prepared,
+                                authority.operation.operation_id,
+                                authority.operation.operation_generation,
+                                &authority.operation.request,
+                                backend,
+                                pre_effect_proof,
+                            )
+                            .await
+                        }
+                    },
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result.map_err(XfrmObjectInstallRunError::from));
@@ -2478,15 +2552,17 @@ impl NamespaceCommand {
                             &operation.request,
                         )
                     })
-                    .and_then(|_| {
+                    .and_then(|phase| {
                         state.reconcile_object_install_admission(
                             operation.operation_id,
                             operation.operation_generation,
-                        )
+                        )?;
+                        Ok(phase)
                     });
-                let result = match validation {
+                let result = match validation
+                    .and_then(|phase| state.admit_durable_object_install_recovery(phase))
+                {
                     Ok(()) => {
-                        state.invalidate_counter_receipts();
                         cut_object_install_at_removal_admitted(
                             &operation.store,
                             operation.operation_id,
@@ -2527,15 +2603,17 @@ impl NamespaceCommand {
                             &operation.request,
                         )
                     })
-                    .and_then(|_| {
+                    .and_then(|phase| {
                         state.reconcile_object_install_admission(
                             operation.operation_id,
                             operation.operation_generation,
-                        )
+                        )?;
+                        Ok(phase)
                     });
-                let result = match validation {
+                let result = match validation
+                    .and_then(|phase| state.admit_durable_object_install_recovery(phase))
+                {
                     Ok(()) => {
-                        state.invalidate_counter_receipts();
                         recover_object_install(
                             &operation.store,
                             operation.operation_id,
@@ -2636,9 +2714,8 @@ impl NamespaceCommand {
                         return;
                     }
                 };
-                let result = match state.consume_sa_relocation_admission(&authority) {
+                let result = match state.admit_durable_sa_relocation_mutation(&authority) {
                     Ok(()) => {
-                        state.invalidate_counter_receipts();
                         run_sa_relocation(
                             &authority.operation.store,
                             &authority.prepared,
@@ -2666,15 +2743,17 @@ impl NamespaceCommand {
                             &operation.request,
                         )
                     })
-                    .and_then(|_| {
+                    .and_then(|phase| {
                         state.reconcile_sa_relocation_admission(
                             operation.operation_id,
                             operation.operation_generation,
-                        )
+                        )?;
+                        Ok(phase)
                     });
-                let result = match validation {
+                let result = match validation
+                    .and_then(|phase| state.admit_durable_sa_relocation_recovery(phase))
+                {
                     Ok(()) => {
-                        state.invalidate_counter_receipts();
                         recover_sa_relocation(
                             &operation.store,
                             operation.operation_id,
@@ -2744,9 +2823,8 @@ impl NamespaceCommand {
                         return;
                     }
                 };
-                let result = match state.consume_sa_relocation_admission(&authority) {
+                let result = match state.admit_durable_sa_relocation_mutation(&authority) {
                     Ok(()) => {
-                        state.invalidate_counter_receipts();
                         cut_sa_relocation_at_issuing(
                             &authority.operation.store,
                             &authority.prepared,
@@ -6812,6 +6890,104 @@ mod tests {
             XfrmSaRelocationRestartOutcome::Relocated
         ));
         // Recovery performed no additional netlink work.
+        assert_eq!(transport.operations().len(), 7);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_relocation_fences_an_older_prepared_object_authority() {
+        let object_root = DurableTestRoot::new();
+        let relocation_root = DurableTestRoot::new();
+        let old_body = durable_relocation_old_body();
+        let transport = RelocationReadbackTransport::new(vec![
+            Ok(Some(old_body.clone())),
+            Err(XfrmError::NotFound),
+            Ok(Some(old_body)),
+            Err(XfrmError::NotFound),
+            Ok(None),
+            Ok(Some(durable_relocation_new_body())),
+            Err(XfrmError::NotFound),
+            // A stale object authority would consume these responses and
+            // perform NEWSA if the relocation failed to cross-fence it.
+            Err(XfrmError::NotFound),
+            Ok(None),
+        ]);
+        let (backend, object_store, relocation_store) = bind_with_capacity_and_recovery(
+            LinuxXfrmBackend::with_transport(transport.clone()),
+            LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY,
+            Some((
+                object_root.path().to_path_buf(),
+                XfrmObjectRecoveryProofKey::new([0x83; 32]).unwrap(),
+            )),
+            Some((
+                relocation_root.path().to_path_buf(),
+                XfrmSaRelocationRecoveryProofKey::new([0x84; 32]).unwrap(),
+            )),
+        )
+        .unwrap();
+        let object_store = object_store.unwrap();
+        let relocation_store = relocation_store.unwrap();
+
+        // Object Prepared is intentionally not a writer gate, so a durable
+        // relocation can be admitted behind it. The relocation must burn the
+        // object epoch before its own backend effect.
+        let object_operation = XfrmObjectInstallOperationId::generate().unwrap();
+        let object_generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+        let object_request = durable_object_requests()[0].clone();
+        let object_authority = backend
+            .prepare_durable_object_install(
+                &object_store,
+                object_operation,
+                object_generation,
+                object_request.clone(),
+            )
+            .await
+            .unwrap();
+
+        let relocation_operation = XfrmSaRelocationOperationId::generate().unwrap();
+        let relocation_generation = XfrmSaRelocationOperationGeneration::new(1).unwrap();
+        let relocation_request = relocation_request();
+        let relocation_authority = backend
+            .prepare_sa_relocation(
+                &relocation_store,
+                relocation_operation,
+                relocation_generation,
+                relocation_request.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            backend
+                .run_durable_sa_relocation(relocation_authority)
+                .await
+                .unwrap(),
+            XfrmSaRelocationDurableOutcome::Relocated(_)
+        ));
+
+        let stale = backend
+            .run_durable_object_install(object_authority)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            stale.durable_error(),
+            Some(XfrmObjectInstallDurableError::Stale)
+        );
+        assert_eq!(transport.operations().len(), 7);
+
+        // The fenced Prepared record remains recoverable by correlation and
+        // is retired without touching kernel state.
+        assert!(matches!(
+            backend
+                .recover_durable_object_install(
+                    &object_store,
+                    object_operation,
+                    object_generation,
+                    object_request,
+                )
+                .await
+                .unwrap(),
+            XfrmObjectInstallRestartOutcome::NoMutation
+        ));
         assert_eq!(transport.operations().len(), 7);
     }
 

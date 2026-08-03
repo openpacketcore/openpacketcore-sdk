@@ -357,7 +357,7 @@ Different identities (`TargetAbsent`):
 | intact | present (any) | atomic move cannot duplicate | `foreign_untouched` | none |
 | absent | TARGET-RELOCATED | move happened, never published | `owned_residue_retired` | exact `DELSA` of the target identity |
 | absent | foreign/present-other | foreign | `foreign_untouched` | none |
-| absent | absent | foreign removal/expiry | `no_mutation` (retired) | none |
+| absent | absent | foreign removal/expiry; mutation history is unknown | `state_absent` | none |
 | foreign | any | foreign | `foreign_untouched` | none |
 | unreadable | any unreadable | retryable; record unchanged | `indeterminate` | none |
 | stale epoch / missing or inconsistent proof | durable anomaly | `repair_required`, record keeps gating | none |
@@ -369,16 +369,18 @@ Same identity (`SameIdentityWitnessed`), one readback of the shared identity:
 | matches bound current | never happened | `no_mutation` (retired) | none |
 | matches relocation expectation | happened | `owned_residue_retired` | exact `DELSA` of the same identity |
 | matches neither | foreign | `foreign_untouched` | none |
-| absent | foreign removal/expiry | `no_mutation` (retired) | none |
+| absent | foreign removal/expiry; mutation history is unknown | `state_absent` | none |
 | unreadable | retryable; record unchanged | `indeterminate` | none |
 
 Recovery deletes only through the exact target deletion identity
 (new destination, SPI, protocol, and lookup mark) after publishing
 `RemovalAdmitted`; a failed removal stays `removal_pending` and retryable
-across restart. Recovery is idempotent after a record retires, returns
-terminal `Relocated` proof without ever deleting after terminal publication,
-and a retryable outcome leaves the record gating until it converges. That
-terminal idempotence holds only until the next cooperating write prunes the
+across restart. Recovery is idempotent after a record retires, returns terminal
+`Relocated` or `StateAbsent` proof without ever deleting after terminal
+publication, and a retryable outcome leaves the record gating until it
+converges. `StateAbsent` is intentionally distinct from `NoMutation`: absence
+cannot prove whether the move happened before external removal or expiry.
+Terminal idempotence holds only until the next cooperating write prunes the
 terminal record; once pruned, restore fails `NotFound`.
 
 Linux has no owner- or generation-conditional `DELSA`. The store therefore
@@ -389,20 +391,25 @@ ordinary `XfrmBackend` operations and new preparation, until recovery retires
 the record. A prepared-but-unrecovered relocation reserves the namespace: the
 relocation fencing holds while recovery authority and protocol egress remain
 fenced. Entering `Issuing` and every independent actor mutation burns a
-durable global writer epoch. The install and relocation stores gate each
-other: an unresolved record in either family rejects preparation and effect
-admission in the other, and each admitted mutation advances both epochs.
-Recovery and recovery-style commands remain admitted regardless of the gates:
-recovery is the escape from gating. These guarantees do not exclude another
-raw-netlink socket, another namespace actor with a different store, or
-packet/product activity outside this protocol; a deployment must use one
-cooperating writer domain for all XFRM identity mutations in the namespace.
+durable global writer epoch. Relocation `Prepared` and every effect-capable
+record in either family gate the other family. Object `Prepared` is
+metadata-only and may coexist with a prepared relocation; a relocation run
+advances the object epoch and invalidates all older object admissions before
+kernel access. Every object run is first gated by unresolved relocation
+authority and advances the relocation epoch before kernel access. Each
+admitted mutation advances both epochs.
+Metadata-only recovery remains the escape from its own gate. A recovery phase
+that may issue exact cleanup also respects the other durable family's gate and
+advances that family's epoch before kernel access. These guarantees do not
+exclude another raw-netlink socket, another namespace actor with a different
+store, or packet/product activity outside this protocol; a deployment must use
+one cooperating writer domain for all XFRM identity mutations in the namespace.
 
-Relocation records carry only opaque correlation, phase, proof code,
+Relocation records carry only opaque operation correlation, phase, proof code,
 incarnation, epoch, and independent proof-keyed fingerprints of the exact
 deletion identity and complete relocation request. No address, selector, SPI,
-mark, encap port, namespace identity, or operation identity value is persisted
-or rendered; handles, outcomes, errors, and diagnostics are value-free. The
+mark, encap port, namespace identity, request body, or operation identity is
+rendered; handles, outcomes, errors, and diagnostics are value-free. The
 store root, proof-key, lease, and non-rollback obligations match the durable
 staged-object boundary. Relocation records use format version 1 with the
 pre-effect proof byte present from version 1; there is no compatibility path,
