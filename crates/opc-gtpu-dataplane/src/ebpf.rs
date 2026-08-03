@@ -11272,9 +11272,15 @@ mod aya_runtime {
             .map_err(|_: ProgramError| {
                 GtpuError::io("ebpf_program_type", invalid_data("not a classifier"))
             })?;
-        program
-            .load()
-            .map_err(|error| program_error("ebpf_program_load", &error))?;
+        // A cleanup-only adoption loads the programs (to prove their identity
+        // while forwarding stays fenced) before activation attaches them, so a
+        // program may already be loaded by the time activation re-enters this
+        // path. Loading is a one-time kernel side effect; treat an
+        // already-loaded program as success rather than re-verifying it.
+        match program.load() {
+            Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
+            Err(error) => return Err(program_error("ebpf_program_load", &error)),
+        }
         program
             .info()
             .map_err(|error| program_error("ebpf_artifact_program_info", &error))
@@ -12817,6 +12823,11 @@ mod aya_runtime {
                 Self::recover_incomplete_pdp_commits(&mut ebpf, expected_local_ip, ifindex)?;
                 Self::pdp_host_indexes(&ebpf, expected_local_ip, ifindex, true)?
             };
+            // Load both programs so their kernel identity can be proven while
+            // forwarding stays fenced. Activation later attaches these same
+            // already-loaded programs without reloading them.
+            load_program(&mut ebpf, PROG_UPLINK)?;
+            load_program(&mut ebpf, PROG_DOWNLINK)?;
             let datapath_identity = Self::datapath_identity(&ebpf, &canonical_pin_dir)
                 .map_err(|_| state_indeterminate("ebpf_map_identity"))?;
             let mut devices = self
