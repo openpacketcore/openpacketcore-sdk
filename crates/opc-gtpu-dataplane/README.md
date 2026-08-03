@@ -339,6 +339,66 @@ mutation failures are re-read and returned as exact, conflict, or indeterminate
 state. Product policy decides which stale context it owns, coordinates drain,
 and sequences route/XFRM/session changes.
 
+### Linux retained device identity acquisition
+
+`LinuxGtpuDataplaneBackend::acquire_retained_device_identity` is the
+identity-bearing, mutation-free companion of the restart-recovery primitive.
+An ePDG-style consumer that stops after creating a shared recoverable device
+but before admitting any PDP effect can restart to find the device retained by
+the kernel with no effect-possible PDP descriptor. The consumer must clear
+provably unpolled work without an adapter call, then choose between serving
+reuse and fresh creation. `create_recoverable_device` correctly refuses a
+retained device, `resolve_device` proves only name and ifindex, and
+`recover_pdp_context_exact` proves the incarnation only as part of a
+PDP-context recovery request that may remove an exact resident context. This
+primitive closes that gap without a compatibility path, name-only fallback, or
+any device mutation.
+
+Build `RetainedDeviceIdentityRequest` from the durably recorded device name
+and ifindex, the non-reusable `PdpDeviceIncarnation` minted before the create
+effect, and `PdpRestartRecoveryProof::previous_writer_stopped()`. The recovery
+root must already be bound. Under the shared topology authority and then the
+per-device authority for the expected ifindex — the same hierarchy every other
+cooperating writer uses — the acquisition proves the live name still resolves
+to the expected ifindex and proves the kernel `IFLA_IFALIAS` incarnation with
+one read-only `RTM_GETLINK` probe. It never reads, installs, or deletes a PDP
+context and never mutates the device.
+
+The outcome is typed and value-free:
+
+- `Retained` — the exact name, ifindex, and kernel-bound incarnation were all
+  proven live. The retained device may be reused as-is.
+- `Absent` — the recorded name is authoritatively absent under the topology
+  authority (the device was removed, or renamed, which takes it out of the
+  recorded identity). One fresh `create_recoverable_device` call with a newly
+  minted incarnation is the supported next step; no name-only adoption occurs.
+- `Conflict(ReplacementIdentity)` — the name is occupied by a different
+  ifindex, or the name and ifindex are occupied with a different kernel-bound
+  identity (including foreign or malformed alias content). The live state is
+  left untouched; the durable record must be reconciled against the
+  replacement.
+- `Indeterminate(AuthorityUnavailable)` — a concurrent cooperating writer
+  holds the topology or per-device authority; retry the identical request.
+- `RepairRequired(Unstamped)` — a link matching the expected name and ifindex
+  carries no incarnation stamp: it was never published as recoverable (for
+  example, process loss interrupted provisioning before publication). Retrying
+  cannot succeed without repair.
+
+Renamed, removed, unstamped, malformed-alias, and unrepresentable states are
+all structurally distinct from transient authority unavailability:
+unrepresentable link evidence fails closed as an error rather than any
+classification. Because the operation never mutates, an idempotent retry
+returns the same classified identity state while live state is unchanged.
+
+Dropping the returned future does not cancel its detached blocking worker: the
+worker retains both writer authorities until the classification finishes, so a
+retry cannot overlap an admitted acquisition (it may observe authority
+unavailable) and later re-reads the unchanged state. The acquisition does not
+extend the writer authorities past its return; subsequent device and PDP
+mutations are fenced independently by the existing lease hierarchy. Request
+and outcome diagnostics are redaction-safe: they carry no device identity,
+incarnation, endpoint, TEID, packet, or descriptor values.
+
 ### Downlink outer-envelope validation
 
 The tc ingress program validates the complete unfragmented outer envelope

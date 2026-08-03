@@ -31,7 +31,9 @@ use crate::{
     GtpuProbe, PdpContextIndeterminateReason, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextReadback, PdpContextReconciliationCapabilities,
     PdpContextRemovalOutcome, PdpContextRepairReason, PdpContextSelector, PdpContextUplinkSelector,
-    PdpDeviceIncarnation, PdpRestartRecoveryRequest, RemovePdpContextRequest, Teid, GTPU_PORT,
+    PdpDeviceIncarnation, PdpRestartRecoveryRequest, RemovePdpContextRequest,
+    RetainedDeviceConflictReason, RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest,
+    RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason, Teid, GTPU_PORT,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -42,6 +44,7 @@ const IFNAMSIZ: usize = 16;
 const CAP_NET_ADMIN: u32 = 12;
 const ENOENT: i32 = 2;
 const ESRCH: i32 = 3;
+const ENODEV: i32 = 19;
 #[cfg(target_os = "linux")]
 const PDP_TOPOLOGY_LEASE_NAME: &str = "pdp-recovery-topology.lock";
 const PDP_DEVICE_ALIAS_PREFIX: &str = "opc-pdp-recovery-v1:";
@@ -858,6 +861,149 @@ impl LinuxGtpuDataplaneBackend {
         self.remove_pdp_context_exact_locked(family_id, &expected)
     }
 
+    /// Acquire the identity of one retained Linux kernel-GTP device without
+    /// reading, installing, or deleting any PDP context and without mutating
+    /// any device.
+    ///
+    /// This is the identity-bearing, mutation-free restart-recovery primitive
+    /// an ePDG-style consumer uses after process loss when its durable roster
+    /// records a shared recoverable device that may have survived without an
+    /// effect-possible PDP descriptor. [`Self::create_recoverable_device`]
+    /// refuses a retained device, [`GtpuDataplaneBackend::resolve_device`]
+    /// proves only name and ifindex, and
+    /// [`Self::recover_pdp_context_exact`] verifies the incarnation only as
+    /// part of a PDP-context recovery request that may remove an exact
+    /// resident context. This primitive closes that gap: it classifies the
+    /// retained device identity so the consumer can choose exact retained
+    /// reuse or authoritative absence followed by one
+    /// [`Self::create_recoverable_device`] call.
+    ///
+    /// The request carries the exact durable [`GtpDevice`], the non-reusable
+    /// [`PdpDeviceIncarnation`], and the prior-writer stop attestation. The
+    /// recovery root must already be bound. The acquisition acquires the
+    /// shared topology authority and then the per-device writer authority for
+    /// the expected ifindex, proves the live name still resolves to that
+    /// ifindex, and proves the kernel `IFLA_IFALIAS` incarnation with one
+    /// read-only `RTM_GETLINK` probe. Outcomes:
+    ///
+    /// - [`RetainedDeviceIdentityOutcome::Retained`] — name, ifindex, and
+    ///   incarnation all match; the retained device may be reused.
+    /// - [`RetainedDeviceIdentityOutcome::Absent`] — the name is
+    ///   authoritatively absent under the topology authority; one fresh
+    ///   [`Self::create_recoverable_device`] call with a newly minted
+    ///   incarnation is the supported next step.
+    /// - [`RetainedDeviceIdentityOutcome::Conflict`] — the name is occupied by
+    ///   a different ifindex, or the name and ifindex are occupied with a
+    ///   different (including foreign or malformed) kernel-bound identity;
+    ///   the live state is left untouched.
+    /// - [`RetainedDeviceIdentityOutcome::Indeterminate`] — a concurrent
+    ///   cooperating writer holds the writer authority; retry the identical
+    ///   request.
+    /// - [`RetainedDeviceIdentityOutcome::RepairRequired`] — a link matching
+    ///   the expected name and ifindex is unstamped; retrying cannot succeed
+    ///   without repair.
+    ///
+    /// Renamed and removed devices present as authoritative name absence;
+    /// structurally unreadable link evidence fails closed as an error. Every
+    /// classification is structurally distinct from transient authority
+    /// unavailability. The operation never reads, installs, or deletes a PDP
+    /// context and never mutates the device, so an idempotent retry returns
+    /// the same classified identity state while live state is unchanged.
+    ///
+    /// Like [`Self::recover_pdp_context_exact`], the blocking worker runs to
+    /// completion even if the returned future is dropped: it retains both
+    /// writer authorities until the classification finishes, so a retry cannot
+    /// overlap an admitted acquisition. This call does not extend the writer
+    /// authorities past its return; subsequent device and PDP mutations are
+    /// fenced independently by the existing lease hierarchy.
+    pub async fn acquire_retained_device_identity(
+        &self,
+        request: RetainedDeviceIdentityRequest,
+    ) -> Result<RetainedDeviceIdentityOutcome, GtpuError> {
+        self.run_blocking("acquire_retained_device_identity", move |backend| {
+            backend.acquire_retained_device_identity_sync(request)
+        })
+        .await
+    }
+
+    fn acquire_retained_device_identity_sync(
+        &self,
+        request: RetainedDeviceIdentityRequest,
+    ) -> Result<RetainedDeviceIdentityOutcome, GtpuError> {
+        let device = request.device().clone();
+        validate_device(&device)?;
+        let _operation = self.pdp_operation_guard()?;
+        let root = self.pdp_recovery_root_or_unsupported()?;
+        let _topology_lease = match acquire_pdp_topology_lease(&root) {
+            Ok(lease) => lease,
+            Err(GtpuError::AlreadyExists) => {
+                return Ok(RetainedDeviceIdentityOutcome::Indeterminate(
+                    RetainedDeviceIndeterminateReason::AuthorityUnavailable,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let _device_lease = match acquire_pdp_recovery_lease(&root, device.ifindex) {
+            Ok(lease) => lease,
+            Err(GtpuError::AlreadyExists) => {
+                return Ok(RetainedDeviceIdentityOutcome::Indeterminate(
+                    RetainedDeviceIndeterminateReason::AuthorityUnavailable,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        // Prove the complete device identity only after both authorities are
+        // held, and never touch PDP state. Name and ifindex alone are
+        // reusable after link deletion.
+        match self.inner.transport.ifindex_by_name(&device.name) {
+            Err(GtpuError::NotFound) => return Ok(RetainedDeviceIdentityOutcome::Absent),
+            Ok(ifindex) if ifindex != device.ifindex => {
+                return Ok(RetainedDeviceIdentityOutcome::Conflict(
+                    RetainedDeviceConflictReason::ReplacementIdentity,
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+        match self
+            .inner
+            .transport
+            .link_identity(device.ifindex, self.inner.config)
+        {
+            Ok(Some(probe)) => {
+                if probe.name != device.name.as_bytes() {
+                    // The name resolved to this ifindex but the authoritative
+                    // link readback disagrees. No cooperating writer can
+                    // rename a link while both authorities are held, so fail
+                    // closed rather than classify contested state.
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "retained_device_identity",
+                    });
+                }
+                let expected_alias = encode_pdp_device_alias(request.incarnation());
+                match probe.alias {
+                    Some(alias) if alias == expected_alias.as_bytes() => {
+                        Ok(RetainedDeviceIdentityOutcome::Retained)
+                    }
+                    Some(_) => Ok(RetainedDeviceIdentityOutcome::Conflict(
+                        RetainedDeviceConflictReason::ReplacementIdentity,
+                    )),
+                    None => Ok(RetainedDeviceIdentityOutcome::RepairRequired(
+                        RetainedDeviceRepairReason::Unstamped,
+                    )),
+                }
+            }
+            // The name just resolved to this ifindex, so a live link must own
+            // it. Absent link evidence at this point is unrepresentable
+            // state; fail closed without classifying it as owned, absent, or
+            // retryable authority unavailability.
+            Ok(None) => Err(GtpuError::StateIndeterminate {
+                operation: "retained_device_identity",
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
     fn pdp_recovery_root_or_unsupported(&self) -> Result<PathBuf, GtpuError> {
         self.inner
             .pdp_recovery_root
@@ -1212,6 +1358,18 @@ trait LinuxGtpuTransport: Send + Sync + fmt::Debug {
         config: LinuxGtpuDataplaneBackendConfig,
     ) -> Result<Option<Vec<u8>>, GtpuError>;
 
+    /// Read the live identity of one exact link by ifindex.
+    ///
+    /// Returns the link's current name and optional `IFLA_IFALIAS` bytes
+    /// without asserting the name, or `None` when no link owns `ifindex`.
+    /// This is a read-only `RTM_GETLINK` probe; it never mutates link or PDP
+    /// state.
+    fn link_identity(
+        &self,
+        ifindex: u32,
+        config: LinuxGtpuDataplaneBackendConfig,
+    ) -> Result<Option<LinkIdentityProbe>, GtpuError>;
+
     fn probe(&self, config: LinuxGtpuDataplaneBackendConfig) -> GtpuProbe;
 }
 
@@ -1325,6 +1483,44 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
                 )
             })?;
         parse_device_alias_response(&response, device)
+    }
+
+    fn link_identity(
+        &self,
+        ifindex: u32,
+        config: LinuxGtpuDataplaneBackendConfig,
+    ) -> Result<Option<LinkIdentityProbe>, GtpuError> {
+        const IDENTITY_QUERY_SEQUENCE: u32 = 1;
+        let body = encode_get_device_request(ifindex)?;
+        let request =
+            encode_netlink_message(RTM_GETLINK, NLM_F_REQUEST, IDENTITY_QUERY_SEQUENCE, &body)?;
+        let response = match self.transact(
+            NetlinkProtocol::Route,
+            "retained_device_identity_read",
+            &request,
+            IDENTITY_QUERY_SEQUENCE,
+            config,
+        ) {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                return Err(GtpuError::io(
+                    "retained_device_identity_read",
+                    invalid_data("missing link identity response"),
+                ));
+            }
+            // The kernel answers an RTM_GETLINK for a vanished ifindex with
+            // -ENODEV. `parse_netlink_error` maps ENOENT/ESRCH (and any errno
+            // whose I/O kind is NotFound) to `NotFound`; map the ENODEV
+            // remainder explicitly so absence is authoritative on every
+            // kernel/libc combination.
+            Err(GtpuError::NotFound) => return Ok(None),
+            Err(GtpuError::Io {
+                raw_os_error: Some(ENODEV),
+                ..
+            }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        parse_link_identity_response(&response, ifindex, "retained_device_identity_read").map(Some)
     }
 
     fn probe(&self, config: LinuxGtpuDataplaneBackendConfig) -> GtpuProbe {
@@ -2232,11 +2428,24 @@ fn parse_generic_family_id(body: &[u8]) -> Result<u16, GtpuError> {
     Err(GtpuError::NotFound)
 }
 
-fn parse_device_alias_response(
+/// Live identity of one exact link: its current name and optional
+/// `IFLA_IFALIAS` bytes.
+///
+/// This probe is deliberately name-tolerant: callers that already know the
+/// expected name compare it themselves so a renamed or replaced link can be
+/// classified instead of surfacing as a decode failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkIdentityProbe {
+    name: Vec<u8>,
+    alias: Option<Vec<u8>>,
+}
+
+fn parse_link_identity_response(
     body: &[u8],
-    expected: &GtpDevice,
-) -> Result<Option<Vec<u8>>, GtpuError> {
-    let invalid = |reason| GtpuError::io("pdp_device_identity_read", invalid_data(reason));
+    expected_ifindex: u32,
+    operation: &'static str,
+) -> Result<LinkIdentityProbe, GtpuError> {
+    let invalid = |reason| GtpuError::io(operation, invalid_data(reason));
     if body.len() < IF_INFO_MESSAGE_LEN {
         return Err(invalid("short link identity response"));
     }
@@ -2245,7 +2454,7 @@ fn parse_device_alias_response(
             .try_into()
             .map_err(|_| invalid("short link ifindex"))?,
     );
-    if index != ifindex_i32(expected.ifindex, "pdp_recovery.device_ifindex")? {
+    if index != ifindex_i32(expected_ifindex, "pdp_recovery.device_ifindex")? {
         return Err(invalid("link identity ifindex mismatch"));
     }
 
@@ -2281,7 +2490,7 @@ fn parse_device_alias_response(
             if raw_attribute_type != attribute_type {
                 return Err(invalid("flagged link identity attribute"));
             }
-            let value = parse_nul_terminated_link_attribute(payload)?;
+            let value = parse_nul_terminated_link_attribute(payload, operation)?;
             if slot.replace(value.to_vec()).is_some() {
                 return Err(invalid("duplicate link identity attribute"));
             }
@@ -2290,22 +2499,34 @@ fn parse_device_alias_response(
     }
 
     let name = name.ok_or_else(|| invalid("missing link name attribute"))?;
-    if name != expected.name.as_bytes() {
-        return Err(invalid("link identity name mismatch"));
-    }
-    Ok(alias)
+    Ok(LinkIdentityProbe { name, alias })
 }
 
-fn parse_nul_terminated_link_attribute(payload: &[u8]) -> Result<&[u8], GtpuError> {
+fn parse_device_alias_response(
+    body: &[u8],
+    expected: &GtpDevice,
+) -> Result<Option<Vec<u8>>, GtpuError> {
+    let invalid = |reason| GtpuError::io("pdp_device_identity_read", invalid_data(reason));
+    let probe = parse_link_identity_response(body, expected.ifindex, "pdp_device_identity_read")?;
+    if probe.name != expected.name.as_bytes() {
+        return Err(invalid("link identity name mismatch"));
+    }
+    Ok(probe.alias)
+}
+
+fn parse_nul_terminated_link_attribute<'a>(
+    payload: &'a [u8],
+    operation: &'static str,
+) -> Result<&'a [u8], GtpuError> {
     let Some(value) = payload.strip_suffix(&[0]) else {
         return Err(GtpuError::io(
-            "pdp_device_identity_read",
+            operation,
             invalid_data("unterminated link string attribute"),
         ));
     };
     if value.contains(&0) {
         return Err(GtpuError::io(
-            "pdp_device_identity_read",
+            operation,
             invalid_data("embedded NUL in link string attribute"),
         ));
     }
@@ -2422,7 +2643,11 @@ mod tests {
 
     use super::*;
     use crate::model::{Teid, DEFAULT_PDP_HASHSIZE};
-    use crate::{PdpContextMismatchField, PdpContextSelectorOccupancy, PdpRestartRecoveryProof};
+    use crate::{
+        PdpContextMismatchField, PdpContextSelectorOccupancy, PdpRestartRecoveryProof,
+        RetainedDeviceConflictReason, RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest,
+        RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
+    };
 
     type TransportResponse = Result<Option<Vec<u8>>, GtpuError>;
 
@@ -2440,6 +2665,35 @@ mod tests {
     }
 
     type ResponseQueue = Arc<Mutex<VecDeque<QueuedResponse>>>;
+
+    /// A queued link-identity probe response. `Latched` blocks the
+    /// (blocking-pool) caller inside `link_identity` until the latch is
+    /// released, letting a test hold the worker at the admitted identity-read
+    /// boundary — e.g. drop an acquisition future exactly there.
+    enum QueuedLinkIdentity {
+        Immediate(Result<Option<LinkIdentityProbe>, GtpuError>),
+        #[cfg(target_os = "linux")]
+        Latched {
+            latch: Arc<ResponseLatch>,
+            response: Result<Option<LinkIdentityProbe>, GtpuError>,
+        },
+    }
+
+    type LinkIdentityQueue = Arc<Mutex<VecDeque<QueuedLinkIdentity>>>;
+
+    /// A queued name-lookup response. `Latched` blocks the (blocking-pool)
+    /// caller inside `ifindex_by_name` until the latch is released, letting a
+    /// test hold the worker at the admitted name-lookup boundary.
+    enum QueuedIfindex {
+        Immediate(IfindexResponse),
+        #[cfg(target_os = "linux")]
+        Latched {
+            latch: Arc<ResponseLatch>,
+            response: IfindexResponse,
+        },
+    }
+
+    type IfindexQueue = Arc<Mutex<VecDeque<QueuedIfindex>>>;
 
     /// One-shot gate used to hold a transport response until released.
     #[cfg(target_os = "linux")]
@@ -2544,15 +2798,60 @@ mod tests {
         }
     }
 
+    impl fmt::Debug for QueuedLinkIdentity {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                QueuedLinkIdentity::Immediate(_) => {
+                    f.write_str("QueuedLinkIdentity::Immediate(<link-identity>)")
+                }
+                #[cfg(target_os = "linux")]
+                QueuedLinkIdentity::Latched { .. } => {
+                    f.write_str("QueuedLinkIdentity::Latched(<latched-link-identity>)")
+                }
+            }
+        }
+    }
+
+    impl fmt::Debug for QueuedIfindex {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                QueuedIfindex::Immediate(_) => {
+                    f.write_str("QueuedIfindex::Immediate(<name-lookup>)")
+                }
+                #[cfg(target_os = "linux")]
+                QueuedIfindex::Latched { .. } => {
+                    f.write_str("QueuedIfindex::Latched(<latched-name-lookup>)")
+                }
+            }
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct CapturingTransport {
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
         responses: ResponseQueue,
-        ifindex_responses: Arc<Mutex<VecDeque<IfindexResponse>>>,
+        ifindex_responses: IfindexQueue,
+        link_identity_responses: LinkIdentityQueue,
+        /// Counts admitted name lookups. A latched lookup blocks the caller
+        /// after this increments, so a test can observe the exact
+        /// admitted-name-lookup boundary.
+        ifindex_admissions: Arc<AtomicU32>,
+        /// Counts admitted link-identity probes. A latched probe blocks the
+        /// caller after this increments, so a test can observe the exact
+        /// admitted-identity-read boundary.
+        link_identity_admissions: Arc<AtomicU32>,
         probe: GtpuProbe,
         socket_fd: i32,
         ifindex: u32,
         device_alias: Option<Vec<u8>>,
+        link_identity: Option<LinkIdentityProbe>,
+    }
+
+    fn test_link_identity() -> LinkIdentityProbe {
+        LinkIdentityProbe {
+            name: b"gtp0".to_vec(),
+            alias: Some(encode_pdp_device_alias(test_device_incarnation()).into_bytes()),
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2575,6 +2874,9 @@ mod tests {
                 requests: Arc::new(Mutex::new(Vec::new())),
                 responses: Arc::new(Mutex::new(VecDeque::new())),
                 ifindex_responses: Arc::new(Mutex::new(VecDeque::new())),
+                link_identity_responses: Arc::new(Mutex::new(VecDeque::new())),
+                ifindex_admissions: Arc::new(AtomicU32::new(0)),
+                link_identity_admissions: Arc::new(AtomicU32::new(0)),
                 probe: GtpuProbe {
                     kind: GtpuBackendKind::LinuxKernel,
                     platform_supported: true,
@@ -2595,6 +2897,7 @@ mod tests {
                 socket_fd: 9,
                 ifindex: 42,
                 device_alias: Some(encode_pdp_device_alias(test_device_incarnation()).into_bytes()),
+                link_identity: Some(test_link_identity()),
             }
         }
 
@@ -2627,7 +2930,41 @@ mod tests {
             self.ifindex_responses
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push_back(response);
+                .push_back(QueuedIfindex::Immediate(response));
+        }
+
+        #[cfg(target_os = "linux")]
+        fn push_latched_ifindex_response(
+            &self,
+            latch: Arc<ResponseLatch>,
+            response: IfindexResponse,
+        ) {
+            self.ifindex_responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_back(QueuedIfindex::Latched { latch, response });
+        }
+
+        fn push_link_identity_response(
+            &self,
+            response: Result<Option<LinkIdentityProbe>, GtpuError>,
+        ) {
+            self.link_identity_responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_back(QueuedLinkIdentity::Immediate(response));
+        }
+
+        #[cfg(target_os = "linux")]
+        fn push_latched_link_identity_response(
+            &self,
+            latch: Arc<ResponseLatch>,
+            response: Result<Option<LinkIdentityProbe>, GtpuError>,
+        ) {
+            self.link_identity_responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_back(QueuedLinkIdentity::Latched { latch, response });
         }
 
         fn requests(&self) -> Vec<CapturedRequest> {
@@ -2702,15 +3039,27 @@ mod tests {
         }
 
         fn ifindex_by_name(&self, _name: &str) -> Result<u32, GtpuError> {
-            match self
+            self.ifindex_admissions.fetch_add(1, Ordering::SeqCst);
+            let queued = self
                 .ifindex_responses
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .pop_front()
-            {
-                Some(IfindexResponse::Found(ifindex)) => Ok(ifindex),
-                Some(IfindexResponse::NotFound) => Err(GtpuError::NotFound),
-                None => Ok(self.ifindex),
+                .pop_front();
+            let response = match queued {
+                Some(QueuedIfindex::Immediate(response)) => response,
+                #[cfg(target_os = "linux")]
+                Some(QueuedIfindex::Latched { latch, response }) => {
+                    // Hold the (blocking-pool) caller here until the test
+                    // releases the latch; the admission counter already
+                    // records the admitted name lookup.
+                    latch.wait();
+                    response
+                }
+                None => return Ok(self.ifindex),
+            };
+            match response {
+                IfindexResponse::Found(ifindex) => Ok(ifindex),
+                IfindexResponse::NotFound => Err(GtpuError::NotFound),
             }
         }
 
@@ -2722,8 +3071,43 @@ mod tests {
             Ok(self.device_alias.clone())
         }
 
+        fn link_identity(
+            &self,
+            _ifindex: u32,
+            _config: LinuxGtpuDataplaneBackendConfig,
+        ) -> Result<Option<LinkIdentityProbe>, GtpuError> {
+            self.link_identity_admissions.fetch_add(1, Ordering::SeqCst);
+            let queued = self
+                .link_identity_responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front();
+            match queued {
+                Some(QueuedLinkIdentity::Immediate(response)) => response,
+                #[cfg(target_os = "linux")]
+                Some(QueuedLinkIdentity::Latched { latch, response }) => {
+                    // Hold the (blocking-pool) caller here until the test
+                    // releases the latch; the admission counter already
+                    // records the admitted identity read.
+                    latch.wait();
+                    response
+                }
+                None => Ok(self.link_identity.clone()),
+            }
+        }
+
         fn probe(&self, _config: LinuxGtpuDataplaneBackendConfig) -> GtpuProbe {
             self.probe
+        }
+    }
+
+    impl CapturingTransport {
+        fn ifindex_admissions(&self) -> u32 {
+            self.ifindex_admissions.load(Ordering::SeqCst)
+        }
+
+        fn link_identity_admissions(&self) -> u32 {
+            self.link_identity_admissions.load(Ordering::SeqCst)
         }
     }
 
@@ -4747,6 +5131,15 @@ mod tests {
                 operation: "pdp_writer_authority"
             }
         ));
+        assert_eq!(
+            backend
+                .acquire_retained_device_identity(retained_device_request())
+                .await
+                .unwrap(),
+            RetainedDeviceIdentityOutcome::Indeterminate(
+                RetainedDeviceIndeterminateReason::AuthorityUnavailable
+            )
+        );
         assert!(transport.requests().is_empty());
         drop(device_lease);
 
@@ -4769,9 +5162,702 @@ mod tests {
                 PdpContextIndeterminateReason::AuthorityUnavailable
             )
         );
+        assert_eq!(
+            backend
+                .acquire_retained_device_identity(retained_device_request())
+                .await
+                .unwrap(),
+            RetainedDeviceIdentityOutcome::Indeterminate(
+                RetainedDeviceIndeterminateReason::AuthorityUnavailable
+            )
+        );
         assert!(transport.requests().is_empty());
         drop(topology_lease);
         drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn retained_device_request() -> RetainedDeviceIdentityRequest {
+        RetainedDeviceIdentityRequest::new(
+            GtpDevice {
+                name: "gtp0".to_string(),
+                ifindex: 42,
+            },
+            test_device_incarnation(),
+            PdpRestartRecoveryProof::previous_writer_stopped(),
+        )
+    }
+
+    fn assert_no_netlink_traffic(transport: &CapturingTransport) {
+        // The acquisition is mutation-free and, in the mock, proof-only: no
+        // transact call (create/stamp/delete/read of any device or PDP state)
+        // may have been issued. The panic message names only static operation
+        // labels, never request bytes.
+        let operations: Vec<&'static str> = transport
+            .requests()
+            .iter()
+            .map(|request| request.operation)
+            .collect();
+        assert!(
+            operations.is_empty(),
+            "acquisition issued unexpected netlink transactions: {operations:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_returns_retained_without_mutation() {
+        let root = unique_recovery_root("acquire-retained");
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let outcome = backend
+            .acquire_retained_device_identity(retained_device_request())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetainedDeviceIdentityOutcome::Retained);
+        assert_eq!(transport.ifindex_admissions(), 1);
+        assert_eq!(transport.link_identity_admissions(), 1);
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_removed_or_renamed_name_is_absent_without_mutation() {
+        // A removed device and a renamed device both present as authoritative
+        // absence of the recorded name. Under the held topology authority no
+        // cooperating writer can create the name concurrently, so absence
+        // authorizes exactly one fresh create_recoverable_device call.
+        let root = unique_recovery_root("acquire-absent");
+        let transport = CapturingTransport::new();
+        transport.push_ifindex_response(IfindexResponse::NotFound);
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let outcome = backend
+            .acquire_retained_device_identity(retained_device_request())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetainedDeviceIdentityOutcome::Absent);
+        // Absence is proven by the name lookup alone: no link probe follows.
+        assert_eq!(transport.ifindex_admissions(), 1);
+        assert_eq!(transport.link_identity_admissions(), 0);
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_same_name_different_ifindex_fails_closed() {
+        let root = unique_recovery_root("acquire-replaced-ifindex");
+        let mut transport = CapturingTransport::new();
+        // The recorded name is occupied by a different link.
+        transport.ifindex = 99;
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let outcome = backend
+            .acquire_retained_device_identity(retained_device_request())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            RetainedDeviceIdentityOutcome::Conflict(
+                RetainedDeviceConflictReason::ReplacementIdentity
+            )
+        );
+        assert_eq!(transport.link_identity_admissions(), 0);
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_same_name_and_ifindex_new_incarnation_fails_closed() {
+        // Linux permits explicit ifindex reuse. The name and ifindex still
+        // match, but the replacement's kernel-bound incarnation does not, so
+        // the identity must not be reused and nothing may be mutated.
+        let root = unique_recovery_root("acquire-replaced-incarnation");
+        let mut transport = CapturingTransport::new();
+        let replacement = PdpDeviceIncarnation::from_bytes([0x5a; 16]).unwrap();
+        transport.link_identity = Some(LinkIdentityProbe {
+            name: b"gtp0".to_vec(),
+            alias: Some(encode_pdp_device_alias(replacement).into_bytes()),
+        });
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let outcome = backend
+            .acquire_retained_device_identity(retained_device_request())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            RetainedDeviceIdentityOutcome::Conflict(
+                RetainedDeviceConflictReason::ReplacementIdentity
+            )
+        );
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_unstamped_link_is_structural_repair() {
+        // A link matching the expected name and ifindex without an
+        // incarnation stamp was never published as recoverable; ownership
+        // cannot be proven and retrying cannot succeed without repair.
+        let root = unique_recovery_root("acquire-unstamped");
+        let mut transport = CapturingTransport::new();
+        transport.link_identity = Some(LinkIdentityProbe {
+            name: b"gtp0".to_vec(),
+            alias: None,
+        });
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let outcome = backend
+            .acquire_retained_device_identity(retained_device_request())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            RetainedDeviceIdentityOutcome::RepairRequired(RetainedDeviceRepairReason::Unstamped)
+        );
+        assert_ne!(
+            outcome,
+            RetainedDeviceIdentityOutcome::Indeterminate(
+                RetainedDeviceIndeterminateReason::AuthorityUnavailable
+            )
+        );
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_malformed_alias_fails_closed_as_replacement() {
+        // A foreign or malformed alias is not the kernel-bound incarnation;
+        // it is a conflicting identity, never retryable authority
+        // unavailability, and it is left untouched.
+        let root = unique_recovery_root("acquire-malformed-alias");
+        let mut transport = CapturingTransport::new();
+        transport.link_identity = Some(LinkIdentityProbe {
+            name: b"gtp0".to_vec(),
+            alias: Some(b"operator-assigned alias".to_vec()),
+        });
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let outcome = backend
+            .acquire_retained_device_identity(retained_device_request())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            RetainedDeviceIdentityOutcome::Conflict(
+                RetainedDeviceConflictReason::ReplacementIdentity
+            )
+        );
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_unrepresentable_link_evidence_fails_closed() {
+        // The name just resolved to the expected ifindex, yet the link probe
+        // reports no link: unrepresentable state fails closed as an error,
+        // never as absence, retention, or retryable authority unavailability.
+        let root = unique_recovery_root("acquire-unrepresentable");
+        let transport = CapturingTransport::new();
+        transport.push_link_identity_response(Ok(None));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let error = backend
+            .acquire_retained_device_identity(retained_device_request())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GtpuError::StateIndeterminate {
+                operation: "retained_device_identity"
+            }
+        ));
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_contested_name_readback_fails_closed() {
+        // The authoritative link readback disagrees with the name that just
+        // resolved to the expected ifindex. No cooperating writer can rename
+        // a link while both authorities are held, so the contested state is a
+        // structural error rather than a classification.
+        let root = unique_recovery_root("acquire-contested-name");
+        let transport = CapturingTransport::new();
+        transport.push_link_identity_response(Ok(Some(LinkIdentityProbe {
+            name: b"gtp-renamed".to_vec(),
+            alias: Some(encode_pdp_device_alias(test_device_incarnation()).into_bytes()),
+        })));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let error = backend
+            .acquire_retained_device_identity(retained_device_request())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GtpuError::StateIndeterminate {
+                operation: "retained_device_identity"
+            }
+        ));
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_malformed_link_response_is_structural_error() {
+        // A malformed RTM_GETLINK reply is a structural decode failure
+        // (InvalidData), never a retryable Indeterminate outcome.
+        let root = unique_recovery_root("acquire-malformed-link");
+        let transport = CapturingTransport::new();
+        transport.push_link_identity_response(Err(GtpuError::io(
+            "retained_device_identity_read",
+            io::Error::new(io::ErrorKind::InvalidData, "redacted"),
+        )));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let error = backend
+            .acquire_retained_device_identity(retained_device_request())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GtpuError::Io {
+                kind: io::ErrorKind::InvalidData,
+                ..
+            }
+        ));
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_requires_bound_recovery_root() {
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
+
+        let error = backend
+            .acquire_retained_device_identity(retained_device_request())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GtpuError::UnsupportedFeature {
+                feature: "pdp_restart_recovery_authority"
+            }
+        ));
+        assert_eq!(transport.link_identity_admissions(), 0);
+        assert_no_netlink_traffic(&transport);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_validates_device_identity_before_authority() {
+        let root = unique_recovery_root("acquire-validate");
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let mut device = GtpDevice {
+            name: "gtp0".to_string(),
+            ifindex: 0,
+        };
+        let error = backend
+            .acquire_retained_device_identity(RetainedDeviceIdentityRequest::new(
+                device.clone(),
+                test_device_incarnation(),
+                PdpRestartRecoveryProof::previous_writer_stopped(),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, GtpuError::InvalidConfig { .. }));
+
+        device.name = String::new();
+        device.ifindex = 42;
+        let error = backend
+            .acquire_retained_device_identity(RetainedDeviceIdentityRequest::new(
+                device,
+                test_device_incarnation(),
+                PdpRestartRecoveryProof::previous_writer_stopped(),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, GtpuError::InvalidConfig { .. }));
+
+        assert_eq!(transport.link_identity_admissions(), 0);
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_retained_device_identity_reports_authority_unavailable_while_lease_held() {
+        let root = unique_recovery_root("acquire-busy");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Topology authority held by a concurrent writer.
+        let topology_lease = acquire_pdp_topology_lease(&root).unwrap();
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+        assert_eq!(
+            backend
+                .acquire_retained_device_identity(retained_device_request())
+                .await
+                .unwrap(),
+            RetainedDeviceIdentityOutcome::Indeterminate(
+                RetainedDeviceIndeterminateReason::AuthorityUnavailable
+            )
+        );
+        assert_eq!(transport.link_identity_admissions(), 0);
+        assert_no_netlink_traffic(&transport);
+        drop(topology_lease);
+
+        // Per-device authority held by a concurrent writer.
+        let device_lease = acquire_pdp_recovery_lease(&root, 42).unwrap();
+        assert_eq!(
+            backend
+                .acquire_retained_device_identity(retained_device_request())
+                .await
+                .unwrap(),
+            RetainedDeviceIdentityOutcome::Indeterminate(
+                RetainedDeviceIndeterminateReason::AuthorityUnavailable
+            )
+        );
+        assert_eq!(transport.link_identity_admissions(), 0);
+        assert_no_netlink_traffic(&transport);
+        drop(device_lease);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_retry_is_idempotent() {
+        // The acquisition never mutates, so an identical retry reclassifies
+        // the same live state on both the retained and the absent paths.
+        let root = unique_recovery_root("acquire-idempotent");
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                backend
+                    .acquire_retained_device_identity(retained_device_request())
+                    .await
+                    .unwrap(),
+                RetainedDeviceIdentityOutcome::Retained
+            );
+        }
+        transport.push_ifindex_response(IfindexResponse::NotFound);
+        transport.push_ifindex_response(IfindexResponse::NotFound);
+        for _ in 0..2 {
+            assert_eq!(
+                backend
+                    .acquire_retained_device_identity(retained_device_request())
+                    .await
+                    .unwrap(),
+                RetainedDeviceIdentityOutcome::Absent
+            );
+        }
+        assert_eq!(transport.link_identity_admissions(), 2);
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_request_and_outcomes_are_redaction_safe() {
+        let request = retained_device_request();
+        let rendered = format!("{request:?}");
+        for secret in ["gtp0", "42", "a5a5", "[165, 165"] {
+            assert!(
+                !rendered.contains(secret),
+                "request debug leaked {secret}: {rendered}"
+            );
+        }
+        for outcome in [
+            RetainedDeviceIdentityOutcome::Retained,
+            RetainedDeviceIdentityOutcome::Absent,
+            RetainedDeviceIdentityOutcome::Conflict(
+                RetainedDeviceConflictReason::ReplacementIdentity,
+            ),
+            RetainedDeviceIdentityOutcome::Indeterminate(
+                RetainedDeviceIndeterminateReason::AuthorityUnavailable,
+            ),
+            RetainedDeviceIdentityOutcome::RepairRequired(RetainedDeviceRepairReason::Unstamped),
+        ] {
+            let rendered = format!("{outcome:?}");
+            for secret in ["gtp0", "a5a5", "[165, 165"] {
+                assert!(
+                    !rendered.contains(secret),
+                    "outcome debug leaked {secret}: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linux_retained_device_identity_completes_without_overlap_when_future_is_dropped() {
+        // Acceptance: cancellation at the admitted identity-read boundary
+        // retains completion authority and prevents an overlapping
+        // acquisition. The latched link-identity response holds the worker
+        // exactly at that boundary so the caller's future can be dropped
+        // there; the spawn_blocking worker must still run the classification
+        // to completion under both held leases.
+        let transport = CapturingTransport::new();
+        let latch = Arc::new(ResponseLatch::new());
+        let mut latch_guard = ResponseLatchReleaseGuard::new(latch.clone());
+        let root = unique_recovery_root("acquire-drop-at-admission");
+        transport
+            .push_latched_link_identity_response(latch.clone(), Ok(Some(test_link_identity())));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        // Move the owned backend into the task so the future is 'static.
+        let handle = tokio::spawn(async move {
+            backend
+                .acquire_retained_device_identity(retained_device_request())
+                .await
+        });
+
+        // Wait until the worker admits the identity read and blocks on the
+        // latch while holding both writer authorities.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if transport.link_identity_admissions() >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the identity read was never admitted"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Cancel the caller's future at the admitted boundary. It cannot have
+        // completed normally: the worker is still blocked on the unreleased
+        // latch, so the JoinHandle it is awaited on cannot resolve.
+        handle.abort();
+        let join_error = handle
+            .await
+            .expect_err("the aborted acquisition future must not complete");
+        assert!(join_error.is_cancelled());
+
+        // An independent backend using the same authority root cannot overlap
+        // the detached acquisition, and no other supported writer can admit a
+        // mutation on the same device while it is latched.
+        let retry_backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+        assert_eq!(
+            retry_backend
+                .acquire_retained_device_identity(retained_device_request())
+                .await
+                .unwrap(),
+            RetainedDeviceIdentityOutcome::Indeterminate(
+                RetainedDeviceIndeterminateReason::AuthorityUnavailable
+            )
+        );
+        assert!(matches!(
+            retry_backend
+                .install_pdp_context(pdp_context())
+                .await
+                .unwrap_err(),
+            GtpuError::RetryRequired {
+                operation: "pdp_writer_authority"
+            }
+        ));
+        assert!(matches!(
+            retry_backend
+                .create_recoverable_device(
+                    CreateGtpDeviceRequest::new("gtp-new"),
+                    test_device_incarnation(),
+                )
+                .await
+                .unwrap_err(),
+            GtpuError::RetryRequired {
+                operation: "pdp_writer_authority"
+            }
+        ));
+        // Exactly one identity read was ever admitted.
+        assert_eq!(transport.link_identity_admissions(), 1);
+
+        // Release the original worker. The guard also releases on any earlier
+        // assertion panic.
+        latch_guard.release_now();
+
+        // Prove the detached worker has actually released topology authority
+        // before testing the durable retry.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match acquire_pdp_topology_lease(&root) {
+                Ok(lease) => {
+                    drop(lease);
+                    break;
+                }
+                Err(GtpuError::AlreadyExists) => {}
+                Err(error) => panic!("unexpected authority probe failure: {error}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached worker did not release recovery authority"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // The idempotent retry reclassifies the unchanged state and returns
+        // the same retained identity.
+        assert_eq!(
+            retry_backend
+                .acquire_retained_device_identity(retained_device_request())
+                .await
+                .unwrap(),
+            RetainedDeviceIdentityOutcome::Retained
+        );
+        assert_eq!(transport.link_identity_admissions(), 2);
+        assert_no_netlink_traffic(&transport);
+        drop(retry_backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linux_retained_device_identity_cancellation_at_name_lookup_boundary() {
+        // The second admitted boundary: the latched name lookup holds the
+        // worker before the link-identity probe, with both writer authorities
+        // already held. Dropping the future there must still retain
+        // completion authority and prevent an overlapping acquisition.
+        let transport = CapturingTransport::new();
+        let latch = Arc::new(ResponseLatch::new());
+        let mut latch_guard = ResponseLatchReleaseGuard::new(latch.clone());
+        let root = unique_recovery_root("acquire-drop-at-name-lookup");
+        transport.push_latched_ifindex_response(latch.clone(), IfindexResponse::Found(42));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let handle = tokio::spawn(async move {
+            backend
+                .acquire_retained_device_identity(retained_device_request())
+                .await
+        });
+
+        // Wait until the worker admits the name lookup and blocks on the
+        // latch while holding both writer authorities.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if transport.ifindex_admissions() >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the name lookup was never admitted"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        handle.abort();
+        let join_error = handle
+            .await
+            .expect_err("the aborted acquisition future must not complete");
+        assert!(join_error.is_cancelled());
+
+        // The detached worker still fences every overlapping acquisition.
+        let retry_backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+        assert_eq!(
+            retry_backend
+                .acquire_retained_device_identity(retained_device_request())
+                .await
+                .unwrap(),
+            RetainedDeviceIdentityOutcome::Indeterminate(
+                RetainedDeviceIndeterminateReason::AuthorityUnavailable
+            )
+        );
+        // The original worker never reached the link probe.
+        assert_eq!(transport.link_identity_admissions(), 0);
+
+        // Release the original worker. The guard also releases on any
+        // earlier assertion panic.
+        latch_guard.release_now();
+
+        // Prove the detached worker has actually released topology authority
+        // before testing the durable retry.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match acquire_pdp_topology_lease(&root) {
+                Ok(lease) => {
+                    drop(lease);
+                    break;
+                }
+                Err(GtpuError::AlreadyExists) => {}
+                Err(error) => panic!("unexpected authority probe failure: {error}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached worker did not release recovery authority"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // The detached worker completed the classification and the retry
+        // idempotently re-reads the unchanged state.
+        assert_eq!(transport.ifindex_admissions(), 1);
+        assert_eq!(transport.link_identity_admissions(), 1);
+        assert_eq!(
+            retry_backend
+                .acquire_retained_device_identity(retained_device_request())
+                .await
+                .unwrap(),
+            RetainedDeviceIdentityOutcome::Retained
+        );
+        assert_no_netlink_traffic(&transport);
+        drop(retry_backend);
         let _ = std::fs::remove_dir_all(root);
     }
 

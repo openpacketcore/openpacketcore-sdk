@@ -2075,12 +2075,13 @@ impl fmt::Debug for PdpDeviceIncarnation {
 }
 
 /// Explicit caller attestation that the process which previously owned a
-/// durable Linux kernel-GTP PDP context has stopped.
+/// durable Linux kernel-GTP device and its PDP state has stopped.
 ///
-/// Supplying this value authorizes restart recovery over the exact context.
-/// It never bypasses device-identity, dual-selector, or cross-process
-/// authority validation; it only records the caller's assertion that the
-/// prior writer is gone and its durable descriptor may be reconciled.
+/// Supplying this value authorizes restart recovery over an exact PDP
+/// context and identity acquisition of a retained device. It never bypasses
+/// device-identity, dual-selector, or cross-process authority validation; it
+/// only records the caller's assertion that the prior writer is gone and its
+/// durable descriptors may be reconciled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PdpRestartRecoveryProof {
     _private: (),
@@ -2171,6 +2172,153 @@ impl fmt::Debug for PdpRestartRecoveryRequest {
             .field("writer_proof", &self.writer_proof)
             .finish()
     }
+}
+
+/// Request to acquire the identity of one retained Linux kernel-GTP device
+/// after its previous writer stopped.
+///
+/// This is the identity-bearing, mutation-free companion of
+/// [`PdpRestartRecoveryRequest`]: an ePDG-style consumer that restarts after
+/// process loss may hold a durable record of a shared recoverable device that
+/// was created but never admitted a PDP effect. Before choosing between
+/// serving reuse and fresh creation, the consumer must learn whether the
+/// exact device identity survived without reading, installing, or deleting
+/// any PDP context and without mutating the device. The request binds the
+/// complete expected identity — the durable device record (`device`) and its
+/// non-reusable incarnation (`incarnation`) — together with the prior-writer
+/// stop attestation (`writer_proof`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct RetainedDeviceIdentityRequest {
+    device: GtpDevice,
+    incarnation: PdpDeviceIncarnation,
+    writer_proof: PdpRestartRecoveryProof,
+}
+
+impl RetainedDeviceIdentityRequest {
+    /// Build an identity-acquisition request for one exact retained device.
+    ///
+    /// `device` is the durable GTP device record (name and ifindex) persisted
+    /// when the device was created. `incarnation` is the cryptographically
+    /// unpredictable, durably persisted identity minted before that device
+    /// was created and never reused. `writer_proof` attests that the prior
+    /// writer has stopped.
+    #[must_use]
+    pub const fn new(
+        device: GtpDevice,
+        incarnation: PdpDeviceIncarnation,
+        writer_proof: PdpRestartRecoveryProof,
+    ) -> Self {
+        Self {
+            device,
+            incarnation,
+            writer_proof,
+        }
+    }
+
+    /// Return the expected durable device identity.
+    #[must_use]
+    pub const fn device(&self) -> &GtpDevice {
+        &self.device
+    }
+
+    /// Return the non-reusable identity of the expected device incarnation.
+    #[must_use]
+    pub const fn incarnation(&self) -> PdpDeviceIncarnation {
+        self.incarnation
+    }
+
+    /// Return the prior-writer stop attestation.
+    #[must_use]
+    pub const fn writer_proof(&self) -> PdpRestartRecoveryProof {
+        self.writer_proof
+    }
+}
+
+impl fmt::Debug for RetainedDeviceIdentityRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetainedDeviceIdentityRequest")
+            .field("device", &"<redacted-device-identity>")
+            .field("incarnation", &"<redacted-device-incarnation>")
+            .field("writer_proof", &self.writer_proof)
+            .finish()
+    }
+}
+
+/// Structural reason a retained-device identity conflicts with the expected
+/// identity.
+///
+/// These outcomes are fail-closed and deliberately distinct from the
+/// retryable [`RetainedDeviceIndeterminateReason`]s and from the structural
+/// [`RetainedDeviceRepairReason`]s: a live, readable link occupies the
+/// expected identity slot but is provably not the expected incarnation.
+/// Values are never carried.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetainedDeviceConflictReason {
+    /// The expected name is occupied by a link with a different ifindex, or
+    /// the expected name and ifindex are occupied by a link whose
+    /// kernel-bound `IFLA_IFALIAS` identity differs from the expected
+    /// incarnation (including foreign or malformed alias content). The live
+    /// state was left untouched; the durable record must be reconciled
+    /// against the replacement identity.
+    ReplacementIdentity,
+}
+
+/// Stable reason a retained-device identity acquisition could not prove a
+/// final state.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetainedDeviceIndeterminateReason {
+    /// Topology or per-device writer authority is held by a concurrent
+    /// cooperating writer; retry the identical request.
+    AuthorityUnavailable,
+}
+
+/// Structural reason a retained-device identity acquisition failed closed
+/// even though a link matching the expected name and ifindex exists.
+///
+/// These outcomes are fail-closed and deliberately distinct from the
+/// retryable [`RetainedDeviceIndeterminateReason`]s: retrying the identical
+/// request cannot succeed until the underlying structural condition is
+/// repaired (for example, by removing the unpublished link and creating a
+/// fresh recoverable device). Values are never carried.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetainedDeviceRepairReason {
+    /// The live link matching the expected name and ifindex carries no
+    /// incarnation stamp in `IFLA_IFALIAS`: it was never published as a
+    /// recoverable device, so ownership cannot be proven.
+    Unstamped,
+}
+
+/// Classified result of an identity-bearing retained-device acquisition.
+///
+/// The acquisition is mutation-free: no device or PDP context is created,
+/// read, installed, renamed, or removed on any path. Every variant is
+/// value-free so diagnostics cannot carry device identity, incarnation,
+/// endpoint, TEID, packet, or descriptor values.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetainedDeviceIdentityOutcome {
+    /// The expected name, ifindex, and kernel-bound incarnation were all
+    /// proven live under writer authority. The retained device may be reused
+    /// as-is; no mutation occurred.
+    Retained,
+    /// The expected name was proven authoritatively absent under writer
+    /// authority. The durable record did not survive as a live device; one
+    /// fresh `create_recoverable_device` call with a newly minted incarnation
+    /// is the supported next step. No mutation occurred.
+    Absent,
+    /// Live state conflicts with the expected identity and was left
+    /// untouched.
+    Conflict(RetainedDeviceConflictReason),
+    /// The acquisition could not be completed; a retry of the identical
+    /// request may succeed.
+    Indeterminate(RetainedDeviceIndeterminateReason),
+    /// A structural precondition failed closed before any classification
+    /// could authorize reuse; retrying the identical request cannot succeed
+    /// without repair.
+    RepairRequired(RetainedDeviceRepairReason),
 }
 
 /// Capabilities of the explicit PDP-context reconciliation contract.
@@ -2863,6 +3011,80 @@ mod tests {
             assert!(!debug.contains(sensitive));
         }
         assert!(debug.contains("<redacted-device-incarnation>"));
+    }
+
+    #[test]
+    fn retained_device_identity_request_binds_identity_and_redacts_values() {
+        let device = GtpDevice {
+            name: "tenant-sensitive-gtp".to_string(),
+            ifindex: 41,
+        };
+        let incarnation = PdpDeviceIncarnation::from_bytes([0xa5; 16]).unwrap();
+        let writer_proof = PdpRestartRecoveryProof::previous_writer_stopped();
+        let request = RetainedDeviceIdentityRequest::new(device.clone(), incarnation, writer_proof);
+
+        assert_eq!(request.device(), &device);
+        assert_eq!(request.incarnation(), incarnation);
+        assert_eq!(request.writer_proof(), writer_proof);
+
+        let debug = format!("{request:?}");
+        for sensitive in ["tenant-sensitive-gtp", "41", "[165, 165"] {
+            assert!(
+                !debug.contains(sensitive),
+                "request debug leaked {sensitive}: {debug}"
+            );
+        }
+        assert!(debug.contains("<redacted-device-identity>"));
+        assert!(debug.contains("<redacted-device-incarnation>"));
+    }
+
+    #[test]
+    fn retained_device_identity_outcomes_are_value_free_and_structurally_distinct() {
+        let retained = RetainedDeviceIdentityOutcome::Retained;
+        let absent = RetainedDeviceIdentityOutcome::Absent;
+        let conflict = RetainedDeviceIdentityOutcome::Conflict(
+            RetainedDeviceConflictReason::ReplacementIdentity,
+        );
+        let indeterminate = RetainedDeviceIdentityOutcome::Indeterminate(
+            RetainedDeviceIndeterminateReason::AuthorityUnavailable,
+        );
+        let repair =
+            RetainedDeviceIdentityOutcome::RepairRequired(RetainedDeviceRepairReason::Unstamped);
+
+        // Every classification is pairwise distinct: no structural, conflict,
+        // or absent state can collapse into transient authority unavailability.
+        let outcomes = [
+            retained.clone(),
+            absent.clone(),
+            conflict.clone(),
+            indeterminate.clone(),
+            repair.clone(),
+        ];
+        for (i, lhs) in outcomes.iter().enumerate() {
+            for rhs in &outcomes[i + 1..] {
+                assert_ne!(lhs, rhs);
+            }
+        }
+
+        // Reasons are copyable, hashable, and redaction-safe by
+        // construction: their debug carries no device identity or
+        // incarnation values.
+        let copied = RetainedDeviceConflictReason::ReplacementIdentity;
+        assert_eq!(conflict, RetainedDeviceIdentityOutcome::Conflict(copied));
+        for rendered in [
+            format!("{retained:?}"),
+            format!("{absent:?}"),
+            format!("{conflict:?}"),
+            format!("{indeterminate:?}"),
+            format!("{repair:?}"),
+        ] {
+            for sensitive in ["tenant-sensitive-gtp", "41", "a5a5"] {
+                assert!(
+                    !rendered.contains(sensitive),
+                    "outcome debug leaked {sensitive}: {rendered}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -17,7 +17,12 @@
 //! `GETPDP` inspection and, once a durable recovery root is bound, exact
 //! restart-recovery authority: a cross-process per-device lease plus the
 //! authoritative dual-axis readback that together compensate for the kernel's
-//! missing compare-delete primitive.
+//! missing compare-delete primitive. A separate identity-bearing,
+//! mutation-free retained-device acquisition classifies a durable Linux
+//! kernel-GTP device record after process loss — exact retained identity,
+//! authoritative absence, conflicting replacement identity, structural
+//! repair, or retryable authority unavailability — without reading,
+//! installing, or deleting any PDP context.
 //!
 //! A separate maintenance-only drained-v2 teardown accepts an explicit typed
 //! drain attestation, proves the complete frozen legacy program/map identity,
@@ -85,8 +90,11 @@ pub use model::{
     PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextRepairReason,
     PdpContextSelector, PdpContextSelectorOccupancy, PdpContextUplinkIdentity,
     PdpContextUplinkSelector, PdpDeviceIncarnation, PdpRestartRecoveryProof,
-    PdpRestartRecoveryRequest, RemovePdpContextRequest, RetainedGraphCleanupClassification,
-    RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest, Teid, GTPU_PORT,
+    PdpRestartRecoveryRequest, RemovePdpContextRequest, RetainedDeviceConflictReason,
+    RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest,
+    RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
+    RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest,
+    Teid, GTPU_PORT,
 };
 pub use opc_types::DscpCodepoint;
 #[cfg(target_os = "linux")]

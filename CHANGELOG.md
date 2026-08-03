@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Retained Linux GTP device identity acquisition — `opc-gtpu-dataplane`:**
+  `LinuxGtpuDataplaneBackend::acquire_retained_device_identity` takes the
+  exact durable `GtpDevice`, the non-reusable `PdpDeviceIncarnation`, and the
+  prior-writer stop attestation, then acquires the existing topology-then-
+  device cross-process writer authorities rooted at the bound recovery path
+  and proves the live name, ifindex, and kernel `IFLA_IFALIAS` incarnation
+  with one read-only `RTM_GETLINK` probe. The acquisition never reads,
+  installs, or deletes a PDP context and never mutates the device, closing
+  the restart gap where a process stops after creating a shared recoverable
+  device but before admitting any PDP effect: `create_recoverable_device`
+  refuses a retained device, `resolve_device` proves only name and ifindex,
+  and `recover_pdp_context_exact` proves the incarnation only as part of a
+  PDP-context recovery request that may remove an exact resident context.
+  Typed value-free outcomes distinguish exact `Retained` identity,
+  authoritative `Absent` (safe to follow with one fresh
+  `create_recoverable_device` call), untouched
+  `Conflict(ReplacementIdentity)` for a same name with a different ifindex or
+  a different/foreign/malformed kernel-bound identity, retryable
+  `Indeterminate(AuthorityUnavailable)`, and structural
+  `RepairRequired(Unstamped)`; renamed, removed, unstamped, malformed-alias,
+  and unrepresentable states are all structurally distinct from transient
+  authority unavailability. The detached blocking worker retains both
+  authorities to completion, so cancellation cannot overlap an admitted
+  acquisition, and the mutation-free classification is idempotent under
+  retry. Request and outcome diagnostics redact device identity, incarnation,
+  endpoint, TEID, packet, and descriptor values.
 - **Exact Linux PDP restart recovery authority — `opc-gtpu-dataplane`:**
   `with_pdp_recovery_root` now returns `Result` and binds one validated absolute,
   non-rebindable authority root shared by all backend clones. Every cooperating
