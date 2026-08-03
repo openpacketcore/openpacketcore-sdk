@@ -5731,6 +5731,7 @@ mod aya_runtime {
     use std::fs::{self, File};
     use std::io;
     use std::mem::ManuallyDrop;
+    use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
@@ -6470,9 +6471,10 @@ mod aya_runtime {
         ebpf: Ebpf,
         marked_owner_by_teid: HashMap<[u8; 4], [u8; UPLINK_MARK_KEY_LEN]>,
         default_teid_by_ue: HashMap<[u8; 4], [u8; 4]>,
-        // Aya's netlink tc link drops by priority/handle rather than by
-        // program ID. Keep the links kernel-owned and detach them only after
-        // proving that both live slots still contain our exact program IDs.
+        // Netlink tc links delete by interface/priority/handle rather than by
+        // program ID. Keep both Aya/name-created and cleanup/index-created
+        // links inert on drop, and detach them only after proving that both
+        // live slots still contain our exact program IDs.
         //
         // `None` while the device is held cleanup-only: the maps and the
         // namespace lease are loaded, but no forwarding hook is attached.
@@ -7325,8 +7327,38 @@ mod aya_runtime {
 
     #[derive(Debug)]
     struct DatapathLinks {
-        uplink: ManuallyDrop<SchedClassifierLink>,
-        downlink: ManuallyDrop<SchedClassifierLink>,
+        uplink: DatapathLink,
+        downlink: DatapathLink,
+    }
+
+    /// An owned tc attachment that is detached only after exact slot
+    /// ownership has been re-proven.
+    ///
+    /// Aya's netlink link is kept in `ManuallyDrop` because its destructor
+    /// deletes by slot rather than program ID. Cleanup activation instead owns
+    /// a numeric link descriptor: constructing an Aya link would resolve a
+    /// mutable interface name again and reintroduce the identity race this
+    /// path must avoid. Both variants are deliberately inert on drop.
+    enum DatapathLink {
+        Aya(ManuallyDrop<SchedClassifierLink>),
+        Ifindex(IfindexDatapathLink),
+    }
+
+    struct IfindexDatapathLink {
+        ifindex: u32,
+        attach_type: TcAttachType,
+        priority: u16,
+        handle: TcHandle,
+    }
+
+    impl fmt::Debug for DatapathLink {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let variant = match self {
+                Self::Aya(_) => "Aya",
+                Self::Ifindex(_) => "Ifindex",
+            };
+            write!(formatter, "DatapathLink::{variant}(<redacted>)")
+        }
     }
 
     #[derive(Debug)]
@@ -11194,10 +11226,50 @@ mod aya_runtime {
             pin_dir: &Path,
             tc_priority: u16,
         ) -> Result<AttachedDatapath, GtpuError> {
+            self.attach_programs_to(
+                ebpf,
+                TcAttachTarget::Interface(interface),
+                ifindex,
+                pin_dir,
+                tc_priority,
+            )
+        }
+
+        /// Attach cleanup-recovery programs to the already-proven numeric
+        /// interface identity without resolving its mutable name again.
+        fn attach_programs_by_ifindex(
+            &self,
+            ebpf: &mut Ebpf,
+            ifindex: u32,
+            pin_dir: &Path,
+            tc_priority: u16,
+        ) -> Result<AttachedDatapath, GtpuError> {
+            self.attach_programs_to(ebpf, TcAttachTarget::Ifindex, ifindex, pin_dir, tc_priority)
+        }
+
+        fn attach_programs_to(
+            &self,
+            ebpf: &mut Ebpf,
+            target: TcAttachTarget<'_>,
+            ifindex: u32,
+            pin_dir: &Path,
+            tc_priority: u16,
+        ) -> Result<AttachedDatapath, GtpuError> {
             // clsact may already exist (EEXIST); that is fine.
-            if let Err(error) = tc::qdisc_add_clsact(interface) {
-                if !is_qdisc_already_present(&error) {
-                    return Err(tc_error("ebpf_qdisc_add_clsact", &error));
+            match target {
+                TcAttachTarget::Interface(interface) => {
+                    if let Err(error) = tc::qdisc_add_clsact(interface) {
+                        if !is_qdisc_already_present(&error) {
+                            return Err(tc_error("ebpf_qdisc_add_clsact", &error));
+                        }
+                    }
+                }
+                TcAttachTarget::Ifindex => {
+                    if let Err(error) = tc_qdisc_add_clsact_by_ifindex(ifindex) {
+                        if error.raw_os_error() != Some(libc_eexist()) {
+                            return Err(GtpuError::io("ebpf_qdisc_add_clsact", error));
+                        }
+                    }
                 }
             }
             let uplink_artifact = load_program(ebpf, PROG_UPLINK)?;
@@ -11225,7 +11297,7 @@ mod aya_runtime {
             )?;
             let uplink = attach_loaded_program(
                 ebpf,
-                interface,
+                target,
                 ifindex,
                 tc_priority,
                 uplink_slot,
@@ -11237,7 +11309,7 @@ mod aya_runtime {
             )?;
             let downlink = match attach_loaded_program(
                 ebpf,
-                interface,
+                target,
                 ifindex,
                 tc_priority,
                 downlink_slot,
@@ -11348,6 +11420,12 @@ mod aya_runtime {
     enum SlotDisposition {
         Empty,
         ReplaceExact { current_program_id: u32 },
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum TcAttachTarget<'a> {
+        Interface(&'a str),
+        Ifindex,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -11492,12 +11570,30 @@ mod aya_runtime {
 
     fn attach_loaded_program(
         ebpf: &mut Ebpf,
+        target: TcAttachTarget<'_>,
+        ifindex: u32,
+        tc_priority: u16,
+        slot: SlotDisposition,
+        hook: ProgramHook<'_>,
+    ) -> Result<DatapathLink, GtpuError> {
+        match target {
+            TcAttachTarget::Interface(interface) => {
+                attach_loaded_program_by_name(ebpf, interface, ifindex, tc_priority, slot, hook)
+            }
+            TcAttachTarget::Ifindex => {
+                attach_loaded_program_by_ifindex(ebpf, ifindex, tc_priority, slot, hook)
+            }
+        }
+    }
+
+    fn attach_loaded_program_by_name(
+        ebpf: &mut Ebpf,
         interface: &str,
         ifindex: u32,
         tc_priority: u16,
         slot: SlotDisposition,
         hook: ProgramHook<'_>,
-    ) -> Result<ManuallyDrop<SchedClassifierLink>, GtpuError> {
+    ) -> Result<DatapathLink, GtpuError> {
         let program: &mut SchedClassifier = ebpf
             .program_mut(hook.name)
             .ok_or_else(|| GtpuError::io("ebpf_program_lookup", invalid_data("program missing")))?
@@ -11552,7 +11648,7 @@ mod aya_runtime {
                         TC_HANDLE,
                         None,
                     )
-                    .map(ManuallyDrop::new)
+                    .map(|link| DatapathLink::Aya(ManuallyDrop::new(link)))
                     .map_err(|_| state_indeterminate("ebpf_tc_attach")),
                     FailedAttachReadback::ProvenAbsent => {
                         Err(program_error("ebpf_tc_attach", &error))
@@ -11567,12 +11663,88 @@ mod aya_runtime {
             }
         };
         let link = mutation_or_indeterminate(program.take_link(link_id), "ebpf_tc_link_ownership")?;
-        let link = ManuallyDrop::new(link);
+        let link = DatapathLink::Aya(ManuallyDrop::new(link));
         match slot_owner(ifindex, hook.attach_type, tc_priority) {
             Ok(Some(owner)) if owner_matches_hook(&owner, hook) => Ok(link),
             // `link` is already kernel-owned. Do not let a stale slot handle
             // detach an external replacement while this error unwinds, and do
             // not let the caller unlink pins beneath an unproven live hook.
+            Ok(_) | Err(_) => Err(state_indeterminate("ebpf_tc_attach_readback")),
+        }
+    }
+
+    fn attach_loaded_program_by_ifindex(
+        ebpf: &mut Ebpf,
+        ifindex: u32,
+        tc_priority: u16,
+        slot: SlotDisposition,
+        hook: ProgramHook<'_>,
+    ) -> Result<DatapathLink, GtpuError> {
+        if let SlotDisposition::ReplaceExact { current_program_id } = slot {
+            let still_current = slot_has_program(
+                ifindex,
+                hook.attach_type,
+                tc_priority,
+                hook.name,
+                current_program_id,
+            )
+            .map_err(|_| state_indeterminate("ebpf_tc_replace"))?;
+            if !still_current {
+                return Err(GtpuError::AlreadyExists);
+            }
+        }
+
+        let program: &mut SchedClassifier = ebpf
+            .program_mut(hook.name)
+            .ok_or_else(|| GtpuError::io("ebpf_program_lookup", invalid_data("program missing")))?
+            .try_into()
+            .map_err(|_: ProgramError| {
+                GtpuError::io("ebpf_program_type", invalid_data("not a classifier"))
+            })?;
+        let program_fd = program
+            .fd()
+            .map_err(|error| program_error("ebpf_program_fd", &error))?
+            .as_fd()
+            .as_raw_fd();
+        let create = slot == SlotDisposition::Empty;
+        if let Err(error) = tc_filter_attach_by_ifindex(
+            ifindex,
+            hook.attach_type,
+            tc_priority,
+            TC_HANDLE,
+            program_fd,
+            hook.name,
+            create,
+        ) {
+            let owner = slot_owner(ifindex, hook.attach_type, tc_priority);
+            return match classify_failed_attach_readback(slot, hook, &owner) {
+                FailedAttachReadback::AdoptExact => {
+                    Ok(DatapathLink::Ifindex(IfindexDatapathLink {
+                        ifindex,
+                        attach_type: hook.attach_type,
+                        priority: tc_priority,
+                        handle: TC_HANDLE,
+                    }))
+                }
+                FailedAttachReadback::ProvenAbsent => Err(GtpuError::io("ebpf_tc_attach", error)),
+                FailedAttachReadback::ProvenOriginal => {
+                    Err(GtpuError::io("ebpf_tc_replace", error))
+                }
+                FailedAttachReadback::Indeterminate => Err(state_indeterminate("ebpf_tc_attach")),
+            };
+        }
+        let link = DatapathLink::Ifindex(IfindexDatapathLink {
+            ifindex,
+            attach_type: hook.attach_type,
+            priority: tc_priority,
+            handle: TC_HANDLE,
+        });
+        match slot_owner(ifindex, hook.attach_type, tc_priority) {
+            Ok(Some(owner)) if owner_matches_hook(&owner, hook) => Ok(link),
+            // The numeric link is deliberately inert on drop. A stale slot
+            // handle must not detach an external replacement while this error
+            // unwinds, and the caller must not unlink pins beneath an
+            // unproven live hook.
             Ok(_) | Err(_) => Err(state_indeterminate("ebpf_tc_attach_readback")),
         }
     }
@@ -11591,7 +11763,7 @@ mod aya_runtime {
     }
 
     fn detach_link_if_current(
-        link: ManuallyDrop<SchedClassifierLink>,
+        link: DatapathLink,
         ifindex: u32,
         attach_type: TcAttachType,
         tc_priority: u16,
@@ -11602,9 +11774,25 @@ mod aya_runtime {
         if !slot_has_program(ifindex, attach_type, tc_priority, name, program_id)? {
             return Err(GtpuError::AlreadyExists);
         }
-        ManuallyDrop::into_inner(link)
-            .detach()
-            .map_err(|error| program_error(operation, &error))
+        match link {
+            DatapathLink::Aya(link) => ManuallyDrop::into_inner(link)
+                .detach()
+                .map_err(|error| program_error(operation, &error)),
+            DatapathLink::Ifindex(link)
+                if link.ifindex == ifindex
+                    && link.attach_type == attach_type
+                    && link.priority == tc_priority =>
+            {
+                tc_filter_detach_by_ifindex(
+                    link.ifindex,
+                    link.attach_type,
+                    link.priority,
+                    link.handle,
+                )
+                .map_err(|error| GtpuError::io(operation, error))
+            }
+            DatapathLink::Ifindex(_) => Err(state_indeterminate(operation)),
+        }
     }
 
     fn detach_datapath_if_current(
@@ -11799,6 +11987,446 @@ mod aya_runtime {
             TcAttachType::Egress => sys::TC_H_CLSACT_EGRESS,
             _ => sys::TC_H_CLSACT_INGRESS,
         }
+    }
+
+    // Linux traffic-control UAPI values not otherwise exposed by the narrow
+    // sys crate. Requests below are encoded in native byte order, as rtnetlink
+    // expects for tcmsg and route attributes.
+    const RTM_NEWQDISC: u16 = 36;
+    const TCA_BPF_FD: u16 = 6;
+    const TCA_BPF_FLAGS: u16 = 8;
+    const TCA_BPF_FLAG_ACT_DIRECT: u32 = 1;
+    const NLA_F_NESTED: u16 = 1 << 15;
+    const TC_H_CLSACT: u32 = 0xffff_fff1;
+    const TC_H_CLSACT_MAJOR: u32 = 0xffff_0000;
+    const TC_NETLINK_SEQUENCE: u32 = 1;
+    const NETLINK_HEADER_LEN: usize = 16;
+    const TC_MESSAGE_LEN: usize = 20;
+    const TC_REQUEST_PREFIX_LEN: usize = NETLINK_HEADER_LEN + TC_MESSAGE_LEN;
+    const CLS_BPF_NAME_LEN: usize = 256;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TcMutationEcho {
+        ifindex: i32,
+        handle: u32,
+        parent: u32,
+        info: u32,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TcMutationExpectation {
+        sequence: u32,
+        port_id: u32,
+        request_type: u16,
+        echo: Option<TcMutationEcho>,
+    }
+
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct TcMutationResponseState {
+        acknowledged: bool,
+        echo_observed: bool,
+    }
+
+    impl TcMutationResponseState {
+        fn complete(self, expect_echo: bool) -> bool {
+            self.acknowledged && (!expect_echo || self.echo_observed)
+        }
+    }
+
+    fn tc_qdisc_add_clsact_by_ifindex(ifindex: u32) -> io::Result<()> {
+        let socket = sys::open_route_netlink_socket()?;
+        let request = build_tc_qdisc_request(ifindex, TC_NETLINK_SEQUENCE, socket.port_id())?;
+        execute_tc_mutation(
+            &socket,
+            &request,
+            TcMutationExpectation {
+                sequence: TC_NETLINK_SEQUENCE,
+                port_id: socket.port_id(),
+                request_type: RTM_NEWQDISC,
+                echo: None,
+            },
+        )
+    }
+
+    fn tc_filter_attach_by_ifindex(
+        ifindex: u32,
+        attach_type: TcAttachType,
+        priority: u16,
+        handle: TcHandle,
+        program_fd: i32,
+        program_name: &str,
+        create: bool,
+    ) -> io::Result<()> {
+        let socket = sys::open_route_netlink_socket()?;
+        let request = build_tc_filter_attach_request(
+            ifindex,
+            attach_type,
+            priority,
+            handle,
+            program_fd,
+            program_name,
+            create,
+            TC_NETLINK_SEQUENCE,
+            socket.port_id(),
+        )?;
+        let ifindex = tc_ifindex(ifindex)?;
+        let echo = TcMutationEcho {
+            ifindex,
+            handle: handle.into(),
+            parent: clsact_parent(attach_type),
+            info: tc_filter_info(priority),
+        };
+        execute_tc_mutation(
+            &socket,
+            &request,
+            TcMutationExpectation {
+                sequence: TC_NETLINK_SEQUENCE,
+                port_id: socket.port_id(),
+                request_type: sys::RTM_NEWTFILTER,
+                echo: Some(echo),
+            },
+        )
+    }
+
+    fn tc_filter_detach_by_ifindex(
+        ifindex: u32,
+        attach_type: TcAttachType,
+        priority: u16,
+        handle: TcHandle,
+    ) -> io::Result<()> {
+        let socket = sys::open_route_netlink_socket()?;
+        let request = build_tc_filter_detach_request(
+            ifindex,
+            attach_type,
+            priority,
+            handle,
+            TC_NETLINK_SEQUENCE,
+            socket.port_id(),
+        )?;
+        execute_tc_mutation(
+            &socket,
+            &request,
+            TcMutationExpectation {
+                sequence: TC_NETLINK_SEQUENCE,
+                port_id: socket.port_id(),
+                request_type: sys::RTM_DELTFILTER,
+                echo: None,
+            },
+        )
+    }
+
+    fn execute_tc_mutation(
+        socket: &sys::NetlinkSocket,
+        request: &[u8],
+        expected: TcMutationExpectation,
+    ) -> io::Result<()> {
+        let sent = sys::send_message(socket, request)?;
+        if sent != request.len() {
+            return Err(invalid_data("short tc netlink send"));
+        }
+
+        let mut buffer = vec![0_u8; 65_536];
+        let mut state = TcMutationResponseState::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "tc netlink mutation timeout",
+                ));
+            }
+            let length = match sys::receive_message(socket, &mut buffer) {
+                Ok(0) => continue,
+                Ok(length) => length,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            parse_tc_mutation_response(&buffer[..length], expected, &mut state)?;
+            if state.complete(expected.echo.is_some()) {
+                return Ok(());
+            }
+        }
+    }
+
+    fn build_tc_qdisc_request(ifindex: u32, sequence: u32, port_id: u32) -> io::Result<Vec<u8>> {
+        let mut attributes = Vec::new();
+        append_tc_attribute(&mut attributes, sys::TCA_KIND, b"clsact\0")?;
+        build_tc_request(
+            RTM_NEWQDISC,
+            sys::NLM_F_REQUEST | sys::NLM_F_ACK | sys::NLM_F_EXCL | sys::NLM_F_CREATE,
+            sequence,
+            port_id,
+            tc_ifindex(ifindex)?,
+            TC_H_CLSACT_MAJOR,
+            TC_H_CLSACT,
+            0,
+            &attributes,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "request builder mirrors the exact tc mutation contract"
+    )]
+    fn build_tc_filter_attach_request(
+        ifindex: u32,
+        attach_type: TcAttachType,
+        priority: u16,
+        handle: TcHandle,
+        program_fd: i32,
+        program_name: &str,
+        create: bool,
+        sequence: u32,
+        port_id: u32,
+    ) -> io::Result<Vec<u8>> {
+        if program_fd < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid BPF program descriptor",
+            ));
+        }
+        if program_name.as_bytes().contains(&0)
+            || program_name
+                .len()
+                .checked_add(1)
+                .is_none_or(|length| length > CLS_BPF_NAME_LEN)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid BPF program name",
+            ));
+        }
+
+        let mut attributes = Vec::new();
+        append_tc_attribute(&mut attributes, sys::TCA_KIND, b"bpf\0")?;
+        let mut options = Vec::new();
+        append_tc_attribute(&mut options, TCA_BPF_FD, &program_fd.to_ne_bytes())?;
+        let mut nul_terminated_name = Vec::with_capacity(program_name.len() + 1);
+        nul_terminated_name.extend_from_slice(program_name.as_bytes());
+        nul_terminated_name.push(0);
+        append_tc_attribute(&mut options, sys::TCA_BPF_NAME, &nul_terminated_name)?;
+        append_tc_attribute(
+            &mut options,
+            TCA_BPF_FLAGS,
+            &TCA_BPF_FLAG_ACT_DIRECT.to_ne_bytes(),
+        )?;
+        append_tc_attribute(&mut attributes, sys::TCA_OPTIONS | NLA_F_NESTED, &options)?;
+
+        let create_flags = if create {
+            sys::NLM_F_CREATE | sys::NLM_F_EXCL
+        } else {
+            0
+        };
+        build_tc_request(
+            sys::RTM_NEWTFILTER,
+            sys::NLM_F_REQUEST | sys::NLM_F_ACK | sys::NLM_F_ECHO | create_flags,
+            sequence,
+            port_id,
+            tc_ifindex(ifindex)?,
+            handle.into(),
+            clsact_parent(attach_type),
+            tc_filter_info(priority),
+            &attributes,
+        )
+    }
+
+    fn build_tc_filter_detach_request(
+        ifindex: u32,
+        attach_type: TcAttachType,
+        priority: u16,
+        handle: TcHandle,
+        sequence: u32,
+        port_id: u32,
+    ) -> io::Result<Vec<u8>> {
+        build_tc_request(
+            sys::RTM_DELTFILTER,
+            sys::NLM_F_REQUEST | sys::NLM_F_ACK,
+            sequence,
+            port_id,
+            tc_ifindex(ifindex)?,
+            handle.into(),
+            clsact_parent(attach_type),
+            tc_filter_info(priority),
+            &[],
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "tcmsg has four independent identity fields"
+    )]
+    fn build_tc_request(
+        message_type: u16,
+        flags: u16,
+        sequence: u32,
+        port_id: u32,
+        ifindex: i32,
+        handle: u32,
+        parent: u32,
+        info: u32,
+        attributes: &[u8],
+    ) -> io::Result<Vec<u8>> {
+        let length = TC_REQUEST_PREFIX_LEN
+            .checked_add(attributes.len())
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tc request too large"))?;
+        let mut request = Vec::with_capacity(length as usize);
+        request.extend_from_slice(&length.to_ne_bytes());
+        request.extend_from_slice(&message_type.to_ne_bytes());
+        request.extend_from_slice(&flags.to_ne_bytes());
+        request.extend_from_slice(&sequence.to_ne_bytes());
+        request.extend_from_slice(&port_id.to_ne_bytes());
+        request.push(sys::AF_UNSPEC);
+        request.extend_from_slice(&[0; 3]);
+        request.extend_from_slice(&ifindex.to_ne_bytes());
+        request.extend_from_slice(&handle.to_ne_bytes());
+        request.extend_from_slice(&parent.to_ne_bytes());
+        request.extend_from_slice(&info.to_ne_bytes());
+        request.extend_from_slice(attributes);
+        Ok(request)
+    }
+
+    fn append_tc_attribute(
+        attributes: &mut Vec<u8>,
+        attribute_type: u16,
+        value: &[u8],
+    ) -> io::Result<()> {
+        const ATTRIBUTE_HEADER_LEN: usize = 4;
+        let length = ATTRIBUTE_HEADER_LEN
+            .checked_add(value.len())
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tc attribute too large"))?;
+        let aligned = sys::align_to_netlink(usize::from(length))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tc attribute too large"))?;
+        let start = attributes.len();
+        attributes.resize(
+            start.checked_add(aligned).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "tc request too large")
+            })?,
+            0,
+        );
+        attributes[start..start + 2].copy_from_slice(&length.to_ne_bytes());
+        attributes[start + 2..start + 4].copy_from_slice(&attribute_type.to_ne_bytes());
+        attributes[start + ATTRIBUTE_HEADER_LEN..start + usize::from(length)]
+            .copy_from_slice(value);
+        Ok(())
+    }
+
+    fn parse_tc_mutation_response(
+        datagram: &[u8],
+        expected: TcMutationExpectation,
+        state: &mut TcMutationResponseState,
+    ) -> io::Result<()> {
+        let malformed = || invalid_data("malformed tc mutation response");
+        let mut offset = 0;
+        while offset < datagram.len() {
+            if datagram.len() - offset < NETLINK_HEADER_LEN {
+                return Err(malformed());
+            }
+            let read_u16 = |at: usize| -> io::Result<u16> {
+                let bytes = datagram.get(at..at + 2).ok_or_else(malformed)?;
+                Ok(u16::from_ne_bytes([bytes[0], bytes[1]]))
+            };
+            let read_u32 = |at: usize| -> io::Result<u32> {
+                let bytes = datagram.get(at..at + 4).ok_or_else(malformed)?;
+                Ok(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            };
+            let length = usize::try_from(read_u32(offset)?).map_err(|_| malformed())?;
+            let end = offset.checked_add(length).ok_or_else(malformed)?;
+            if length < NETLINK_HEADER_LEN || end > datagram.len() {
+                return Err(malformed());
+            }
+            let message_type = read_u16(offset + 4)?;
+            let flags = read_u16(offset + 6)?;
+            let sequence = read_u32(offset + 8)?;
+            let port_id = read_u32(offset + 12)?;
+            if sequence != expected.sequence
+                || port_id != expected.port_id
+                || flags & sys::NLM_F_DUMP_INTR != 0
+            {
+                return Err(malformed());
+            }
+            let body = &datagram[offset + NETLINK_HEADER_LEN..end];
+            match message_type {
+                sys::NLMSG_ERROR => {
+                    if body.len() < 4 + NETLINK_HEADER_LEN {
+                        return Err(malformed());
+                    }
+                    let status = i32::from_ne_bytes([body[0], body[1], body[2], body[3]]);
+                    let original_type = u16::from_ne_bytes([body[8], body[9]]);
+                    let original_sequence =
+                        u32::from_ne_bytes([body[12], body[13], body[14], body[15]]);
+                    if original_type != expected.request_type
+                        || original_sequence != expected.sequence
+                    {
+                        return Err(malformed());
+                    }
+                    if status == 0 {
+                        if state.acknowledged {
+                            return Err(malformed());
+                        }
+                        state.acknowledged = true;
+                    } else {
+                        let errno = status
+                            .checked_neg()
+                            .filter(|errno| *errno > 0)
+                            .ok_or_else(malformed)?;
+                        return Err(io::Error::from_raw_os_error(errno));
+                    }
+                }
+                sys::NLMSG_NOOP => {}
+                sys::NLMSG_OVERRUN | sys::NLMSG_DONE => return Err(malformed()),
+                response_type
+                    if Some(response_type) == expected.echo.map(|_| expected.request_type) =>
+                {
+                    let echo = expected.echo.ok_or_else(malformed)?;
+                    if state.echo_observed || body.len() < TC_MESSAGE_LEN {
+                        return Err(malformed());
+                    }
+                    let response_ifindex = i32::from_ne_bytes([body[4], body[5], body[6], body[7]]);
+                    let handle = u32::from_ne_bytes([body[8], body[9], body[10], body[11]]);
+                    let parent = u32::from_ne_bytes([body[12], body[13], body[14], body[15]]);
+                    let info = u32::from_ne_bytes([body[16], body[17], body[18], body[19]]);
+                    if body[0] != sys::AF_UNSPEC
+                        || response_ifindex != echo.ifindex
+                        || handle != echo.handle
+                        || parent != echo.parent
+                        || info != echo.info
+                    {
+                        return Err(malformed());
+                    }
+                    state.echo_observed = true;
+                }
+                _ => return Err(malformed()),
+            }
+            let aligned = sys::align_to_netlink(length).ok_or_else(malformed)?;
+            offset = offset.checked_add(aligned).ok_or_else(malformed)?;
+            if offset > datagram.len() {
+                return Err(malformed());
+            }
+        }
+        Ok(())
+    }
+
+    fn tc_ifindex(ifindex: u32) -> io::Result<i32> {
+        i32::try_from(ifindex).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "interface index exceeds i32 range",
+            )
+        })
+    }
+
+    const fn tc_filter_info(priority: u16) -> u32 {
+        (priority as u32) << 16 | TC_PROTOCOL_ALL as u32
     }
 
     // `tc` stores the Ethernet protocol in network byte order in the low half
@@ -12268,7 +12896,6 @@ mod aya_runtime {
         /// occupant, so the fence converges. Between the failure and the retry
         /// at most one hook can forward, never more than before the attempt.
         fn fence_current_hooks(
-            interface: &str,
             ifindex: u32,
             tc_priority: u16,
             current_programs: &[CurrentSdkProgram],
@@ -12289,15 +12916,8 @@ mod aya_runtime {
                 if !still_ours {
                     return Err(indeterminate());
                 }
-                let link = SchedClassifierLink::attached(
-                    interface,
-                    attach_type,
-                    tc_priority,
-                    TC_HANDLE,
-                    None,
-                )
-                .map_err(|_| indeterminate())?;
-                link.detach().map_err(|_| indeterminate())?;
+                tc_filter_detach_by_ifindex(ifindex, attach_type, tc_priority, TC_HANDLE)
+                    .map_err(|_| indeterminate())?;
                 fenced = true;
             }
             // Both slots must now be authoritatively empty. Any residual
@@ -12874,7 +13494,7 @@ mod aya_runtime {
 
         fn adopt_cleanup_only(
             &self,
-            interface: &str,
+            _interface: &str,
             ifindex: u32,
             pin_dir: &Path,
             tc_priority: u16,
@@ -12990,8 +13610,7 @@ mod aya_runtime {
             // Fence any retained live hook before stale PDP cleanup so
             // forwarding is disabled. This never reattaches.
             let hooks_fenced =
-                match Self::fence_current_hooks(interface, ifindex, tc_priority, &current_programs)
-                {
+                match Self::fence_current_hooks(ifindex, tc_priority, &current_programs) {
                     Ok(fenced) => fenced,
                     Err(refusal) => return Ok(refusal),
                 };
@@ -13038,7 +13657,7 @@ mod aya_runtime {
 
         fn activate_cleanup_only(
             &self,
-            interface: &str,
+            _interface: &str,
             ifindex: u32,
             _pin_dir: &Path,
             tc_priority: u16,
@@ -13055,9 +13674,8 @@ mod aya_runtime {
             if schema_state != BearerSchemaState::PmtuV5 {
                 return Err(state_indeterminate("ebpf_cleanup_schema"));
             }
-            let attached = self.attach_programs(
+            let attached = self.attach_programs_by_ifindex(
                 &mut device.ebpf,
-                interface,
                 ifindex,
                 &device.pin_dir,
                 tc_priority,
@@ -16670,6 +17288,312 @@ mod aya_runtime {
         const TEST_DUMP_PORT_ID: u32 = 91;
         const TEST_DUMP_IFINDEX: i32 = 7;
         const TEST_DUMP_PARENT: u32 = sys::TC_H_CLSACT_INGRESS;
+
+        #[test]
+        fn datapath_link_debug_redacts_attachment_identity() {
+            let link = DatapathLink::Ifindex(IfindexDatapathLink {
+                ifindex: 0x0102_0304,
+                attach_type: TcAttachType::Egress,
+                priority: 0x4142,
+                handle: TcHandle::new(0x5152, 0x5354),
+            });
+
+            assert_eq!(format!("{link:?}"), "DatapathLink::Ifindex(<redacted>)");
+        }
+
+        #[test]
+        fn cleanup_tc_request_builders_bind_every_mutation_to_numeric_ifindex() {
+            const IFINDEX: u32 = 0x0102_0304;
+            const SEQUENCE: u32 = 0x1112_1314;
+            const PORT_ID: u32 = 0x2122_2324;
+            const PROGRAM_FD: i32 = 0x3132_3334;
+            const PRIORITY: u16 = 0x4142;
+            let handle = TcHandle::new(0, 1);
+
+            let qdisc = build_tc_qdisc_request(IFINDEX, SEQUENCE, PORT_ID).unwrap();
+            assert_eq!(
+                u32::from_ne_bytes(qdisc[..4].try_into().unwrap()) as usize,
+                qdisc.len()
+            );
+            assert_eq!(
+                u16::from_ne_bytes(qdisc[4..6].try_into().unwrap()),
+                RTM_NEWQDISC
+            );
+            assert_eq!(
+                u16::from_ne_bytes(qdisc[6..8].try_into().unwrap()),
+                sys::NLM_F_REQUEST | sys::NLM_F_ACK | sys::NLM_F_EXCL | sys::NLM_F_CREATE
+            );
+            assert_eq!(
+                i32::from_ne_bytes(qdisc[20..24].try_into().unwrap()),
+                IFINDEX as i32
+            );
+            assert_eq!(
+                u32::from_ne_bytes(qdisc[24..28].try_into().unwrap()),
+                TC_H_CLSACT_MAJOR
+            );
+            assert_eq!(
+                u32::from_ne_bytes(qdisc[28..32].try_into().unwrap()),
+                TC_H_CLSACT
+            );
+            assert_eq!(
+                find_attribute(&qdisc[TC_REQUEST_PREFIX_LEN..], sys::TCA_KIND),
+                Some(&b"clsact\0"[..])
+            );
+
+            let attach = build_tc_filter_attach_request(
+                IFINDEX,
+                TcAttachType::Egress,
+                PRIORITY,
+                handle,
+                PROGRAM_FD,
+                PROG_UPLINK,
+                true,
+                SEQUENCE,
+                PORT_ID,
+            )
+            .unwrap();
+            assert_eq!(
+                u16::from_ne_bytes(attach[4..6].try_into().unwrap()),
+                sys::RTM_NEWTFILTER
+            );
+            assert_eq!(
+                u16::from_ne_bytes(attach[6..8].try_into().unwrap()),
+                sys::NLM_F_REQUEST
+                    | sys::NLM_F_ACK
+                    | sys::NLM_F_ECHO
+                    | sys::NLM_F_CREATE
+                    | sys::NLM_F_EXCL
+            );
+            assert_eq!(
+                i32::from_ne_bytes(attach[20..24].try_into().unwrap()),
+                IFINDEX as i32
+            );
+            assert_eq!(
+                u32::from_ne_bytes(attach[28..32].try_into().unwrap()),
+                sys::TC_H_CLSACT_EGRESS
+            );
+            assert_eq!(
+                u32::from_ne_bytes(attach[32..36].try_into().unwrap()),
+                tc_filter_info(PRIORITY)
+            );
+            let attributes = &attach[TC_REQUEST_PREFIX_LEN..];
+            assert_eq!(
+                find_attribute(attributes, sys::TCA_KIND),
+                Some(&b"bpf\0"[..])
+            );
+            let options = find_attribute(attributes, sys::TCA_OPTIONS).unwrap();
+            assert_eq!(
+                find_attribute(options, TCA_BPF_FD),
+                Some(&PROGRAM_FD.to_ne_bytes()[..])
+            );
+            assert_eq!(
+                find_attribute(options, sys::TCA_BPF_NAME),
+                Some(&[PROG_UPLINK.as_bytes(), b"\0"].concat()[..])
+            );
+            assert_eq!(
+                find_attribute(options, TCA_BPF_FLAGS),
+                Some(&TCA_BPF_FLAG_ACT_DIRECT.to_ne_bytes()[..])
+            );
+
+            let replace = build_tc_filter_attach_request(
+                IFINDEX,
+                TcAttachType::Ingress,
+                PRIORITY,
+                handle,
+                PROGRAM_FD,
+                PROG_DOWNLINK,
+                false,
+                SEQUENCE,
+                PORT_ID,
+            )
+            .unwrap();
+            assert_eq!(
+                u16::from_ne_bytes(replace[6..8].try_into().unwrap()),
+                sys::NLM_F_REQUEST | sys::NLM_F_ACK | sys::NLM_F_ECHO
+            );
+            assert_eq!(
+                i32::from_ne_bytes(replace[20..24].try_into().unwrap()),
+                IFINDEX as i32
+            );
+
+            let detach = build_tc_filter_detach_request(
+                IFINDEX,
+                TcAttachType::Ingress,
+                PRIORITY,
+                handle,
+                SEQUENCE,
+                PORT_ID,
+            )
+            .unwrap();
+            assert_eq!(detach.len(), TC_REQUEST_PREFIX_LEN);
+            assert_eq!(
+                u16::from_ne_bytes(detach[4..6].try_into().unwrap()),
+                sys::RTM_DELTFILTER
+            );
+            assert_eq!(
+                i32::from_ne_bytes(detach[20..24].try_into().unwrap()),
+                IFINDEX as i32
+            );
+            assert_eq!(
+                u32::from_ne_bytes(detach[28..32].try_into().unwrap()),
+                sys::TC_H_CLSACT_INGRESS
+            );
+        }
+
+        fn tc_ack_message(request: &[u8], status: i32) -> Vec<u8> {
+            let mut body = Vec::with_capacity(4 + NETLINK_HEADER_LEN);
+            body.extend_from_slice(&status.to_ne_bytes());
+            body.extend_from_slice(&request[..NETLINK_HEADER_LEN]);
+            dump_message(
+                sys::NLMSG_ERROR,
+                0,
+                u32::from_ne_bytes(request[8..12].try_into().unwrap()),
+                u32::from_ne_bytes(request[12..16].try_into().unwrap()),
+                &body,
+            )
+        }
+
+        #[test]
+        fn cleanup_tc_mutation_parser_requires_exact_echo_and_ack() {
+            const IFINDEX: u32 = 17;
+            const PRIORITY: u16 = 50;
+            const SEQUENCE: u32 = 37;
+            const PORT_ID: u32 = 91;
+            let request = build_tc_filter_attach_request(
+                IFINDEX,
+                TcAttachType::Egress,
+                PRIORITY,
+                TC_HANDLE,
+                7,
+                PROG_UPLINK,
+                true,
+                SEQUENCE,
+                PORT_ID,
+            )
+            .unwrap();
+            let expected = TcMutationExpectation {
+                sequence: SEQUENCE,
+                port_id: PORT_ID,
+                request_type: sys::RTM_NEWTFILTER,
+                echo: Some(TcMutationEcho {
+                    ifindex: IFINDEX as i32,
+                    handle: TC_HANDLE.into(),
+                    parent: sys::TC_H_CLSACT_EGRESS,
+                    info: tc_filter_info(PRIORITY),
+                }),
+            };
+            let echo = dump_message(
+                sys::RTM_NEWTFILTER,
+                0,
+                SEQUENCE,
+                PORT_ID,
+                &request[NETLINK_HEADER_LEN..],
+            );
+            let ack = tc_ack_message(&request, 0);
+
+            for (first, second) in [(&echo, &ack), (&ack, &echo)] {
+                let mut state = TcMutationResponseState::default();
+                parse_tc_mutation_response(first, expected, &mut state).unwrap();
+                assert!(!state.complete(true));
+                parse_tc_mutation_response(second, expected, &mut state).unwrap();
+                assert!(state.complete(true));
+            }
+
+            let mut wrong_ifindex = echo.clone();
+            wrong_ifindex[NETLINK_HEADER_LEN + 4..NETLINK_HEADER_LEN + 8]
+                .copy_from_slice(&(IFINDEX as i32 + 1).to_ne_bytes());
+            assert_eq!(
+                parse_tc_mutation_response(
+                    &wrong_ifindex,
+                    expected,
+                    &mut TcMutationResponseState::default(),
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::InvalidData
+            );
+
+            let error = parse_tc_mutation_response(
+                &tc_ack_message(&request, -libc_eexist()),
+                expected,
+                &mut TcMutationResponseState::default(),
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc_eexist()));
+        }
+
+        #[test]
+        #[ignore = "requires CAP_NET_ADMIN in an isolated network namespace"]
+        fn cleanup_tc_qdisc_and_detach_follow_ifindex_across_name_rebind() {
+            if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+                return;
+            }
+
+            struct LinkCleanup([String; 2]);
+            impl Drop for LinkCleanup {
+                fn drop(&mut self) {
+                    for interface in &self.0 {
+                        let _ = std::process::Command::new("ip")
+                            .args(["link", "del", interface])
+                            .output();
+                    }
+                }
+            }
+
+            fn run_probe(program: &str, arguments: &[&str]) -> String {
+                let output = std::process::Command::new(program)
+                    .args(arguments)
+                    .output()
+                    .unwrap_or_else(|error| panic!("failed to run probe command: {error}"));
+                assert!(
+                    output.status.success(),
+                    "probe command failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            }
+
+            let suffix = format!("{:x}", std::process::id());
+            let requested = format!("or{suffix}");
+            let retained = format!("ot{suffix}");
+            assert!(requested.len() <= 15 && retained.len() <= 15);
+            let _cleanup = LinkCleanup([requested.clone(), retained.clone()]);
+
+            run_probe("ip", &["link", "add", &requested, "type", "dummy"]);
+            let retained_ifindex = sys::ifindex_by_name(&requested).unwrap();
+            run_probe("ip", &["link", "set", &requested, "name", &retained]);
+            run_probe("ip", &["link", "add", &requested, "type", "dummy"]);
+            let replacement_ifindex = sys::ifindex_by_name(&requested).unwrap();
+            assert_ne!(retained_ifindex, replacement_ifindex);
+
+            // The name now identifies the replacement, but the numeric qdisc
+            // mutation must still reach only the retained interface.
+            tc_qdisc_add_clsact_by_ifindex(retained_ifindex).unwrap();
+            assert!(run_probe("tc", &["qdisc", "show", "dev", &retained]).contains("clsact"));
+            assert!(!run_probe("tc", &["qdisc", "show", "dev", &requested]).contains("clsact"));
+
+            run_probe("tc", &["qdisc", "add", "dev", &requested, "clsact"]);
+            for interface in [&retained, &requested] {
+                run_probe(
+                    "tc",
+                    &[
+                        "filter", "add", "dev", interface, "egress", "protocol", "all", "pref",
+                        "50", "handle", "1", "flower", "action", "pass",
+                    ],
+                );
+            }
+            tc_filter_detach_by_ifindex(retained_ifindex, TcAttachType::Egress, 50, TC_HANDLE)
+                .unwrap();
+            assert!(
+                run_probe("tc", &["filter", "show", "dev", &retained, "egress"])
+                    .trim()
+                    .is_empty()
+            );
+            assert!(
+                run_probe("tc", &["filter", "show", "dev", &requested, "egress"])
+                    .contains("pref 50")
+            );
+        }
 
         fn dump_message(
             message_type: u16,
