@@ -69,7 +69,7 @@ jobs:
             "OPC_GTPU_RUN_PRIVILEGED=1" \
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up
-              cargo test --locked -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture
+              cargo test --locked -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture --test-threads=1
             '
 
       - name: Build privileged eBPF GTP-U test

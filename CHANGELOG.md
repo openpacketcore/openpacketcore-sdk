@@ -8,6 +8,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Retained Linux GTP device identity acquisition — `opc-gtpu-dataplane`:**
+  `LinuxGtpuDataplaneBackend::acquire_retained_device_identity` takes the
+  durable name, optional exact expected ifindex, non-reusable
+  `PdpDeviceIncarnation`, and prior-writer stop attestation. A prepared record
+  with no published ifindex resolves the name under topology authority,
+  acquires the discovered device authority, and re-proves the name, ifindex,
+  and kernel `IFLA_IFALIAS` incarnation with read-only `RTM_GETLINK` probes;
+  an active record additionally proves its exact committed ifindex. A
+  successful acquisition returns the exact retained `GtpDevice`, allowing a
+  process that stopped after link creation and stamping but before ifindex
+  publication to durably complete its prepared record. The acquisition never
+  reads, installs, or deletes a PDP context and never mutates the device,
+  closing the gap left by `create_recoverable_device`, `resolve_device`, and
+  `recover_pdp_context_exact`. Recoverable creation now uses kernel-owned GTP
+  sockets (`IFLA_GTP_CREATE_SOCKETS`) so the retained device remains
+  serviceable after its creator exits. Its deliberately narrow profile
+  requires wildcard IPv4 and GTP-U port 2152, also reserves the kernel's GTPv0
+  port 3386, and has no userspace-socket fallback; ordinary device creation
+  keeps its existing custom-address/port behavior. The versioned kernel alias
+  is now `opc-pdp-recovery-v2`, attesting that socket-lifetime contract as well
+  as the incarnation. Legacy `v1` links fail closed and must be drained,
+  removed, and freshly created rather than adopted or mutated in place. Typed
+  value-free outcomes distinguish exact `Retained` identity,
+  authoritative `Absent` (safe to follow with one fresh
+  `create_recoverable_device` call), untouched
+  `Conflict(ReplacementIdentity)` for a same name with a different ifindex or
+  a different/foreign/malformed kernel-bound identity, retryable
+  `Indeterminate(AuthorityUnavailable)`, and structural
+  `RepairRequired(Unstamped)`; renamed, removed, unstamped, malformed-alias,
+  and unrepresentable states are all structurally distinct from transient
+  authority unavailability. Authoritative absence uses route netlink rather
+  than libc name lookup, so descriptor/resource failures remain errors, and
+  contradictory, duplicate, or unterminated netlink evidence fails closed.
+  The detached blocking worker retains acquired authorities to completion, so
+  cancellation cannot overlap an admitted acquisition, and the mutation-free
+  classification is idempotent under retry. Request, acquisition, and outcome
+  diagnostics redact device identity, incarnation, endpoint, TEID, packet,
+  and descriptor values.
 - **Exact Linux PDP restart recovery authority — `opc-gtpu-dataplane`:**
   `with_pdp_recovery_root` now returns `Result` and binds one validated absolute,
   non-rebindable authority root shared by all backend clones. Every cooperating

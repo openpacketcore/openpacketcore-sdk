@@ -8,7 +8,9 @@ use opc_gtpu_dataplane::{
     GtpuDataplaneBackend, LinuxGtpuDataplaneBackend, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector,
     PdpContextSelectorOccupancy, PdpContextUplinkSelector, PdpDeviceIncarnation,
-    PdpRestartRecoveryProof, PdpRestartRecoveryRequest, RemovePdpContextRequest, Teid,
+    PdpRestartRecoveryProof, PdpRestartRecoveryRequest, RemovePdpContextRequest,
+    RetainedDeviceConflictReason, RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest,
+    Teid,
 };
 
 #[tokio::test]
@@ -22,9 +24,11 @@ async fn create_install_remove_destroy_gtpu_device_in_current_netns(
 
     let backend = LinuxGtpuDataplaneBackend::new();
     let name = format!("gtp{}", std::process::id() % 10_000);
-    let device = backend
-        .create_device(CreateGtpDeviceRequest::new(name.clone()))
-        .await?;
+    let mut create = CreateGtpDeviceRequest::new(name.clone());
+    // Recoverable fixtures in this binary use the kernel-owned standard GTP
+    // ports. Keep this ordinary userspace-socket fixture independent.
+    create.bind_port = 32_151;
+    let device = backend.create_device(create).await?;
 
     let local_teid = Teid::new(0x1000_0001).ok_or("local TEID must be nonzero")?;
     let peer_teid = Teid::new(0x2000_0001).ok_or("peer TEID must be nonzero")?;
@@ -251,13 +255,28 @@ async fn restart_recovery_removes_exact_pdp_and_is_idempotent_in_current_netns(
     let incarnation = PdpDeviceIncarnation::from_bytes([0xa5; 16])
         .ok_or("privileged fixture incarnation must be nonzero")?;
     let name = format!("gr{}", std::process::id() % 10_000);
-    let mut create = CreateGtpDeviceRequest::new(name.clone());
-    // Keep this independently runnable alongside the established fixtures,
-    // which own the default GTP-U port and 32_152 in the same namespace.
-    create.bind_port = 32_153;
-    let device = backend
-        .create_recoverable_device(create, incarnation)
-        .await?;
+    let create = CreateGtpDeviceRequest::new(name.clone());
+    let prepared_request = RetainedDeviceIdentityRequest::new(
+        name,
+        None,
+        incarnation,
+        PdpRestartRecoveryProof::previous_writer_stopped(),
+    );
+    let device = match backend.create_recoverable_device(create, incarnation).await {
+        Ok(device) => device,
+        Err(error) => {
+            if let Ok(acquisition) = backend
+                .acquire_retained_device_identity(prepared_request)
+                .await
+            {
+                if let Some(orphan) = acquisition.into_retained_device() {
+                    let _ = backend.remove_device(&orphan).await;
+                }
+            }
+            let _ = std::fs::remove_dir_all(&recovery_root);
+            return Err(error.into());
+        }
+    };
     let context = privileged_recovery_context(&device)?;
 
     let result = async {
@@ -362,5 +381,208 @@ async fn restart_recovery_removes_exact_pdp_and_is_idempotent_in_current_netns(
     let _ = std::fs::remove_dir_all(&recovery_root);
     result?;
     cleanup?;
+    Ok(())
+}
+
+fn privileged_retained_device_root() -> PathBuf {
+    std::env::temp_dir().join(format!("opc-gtpu-634-priv-retained-{}", std::process::id()))
+}
+
+fn require_equal<T: PartialEq>(
+    actual: T,
+    expected: T,
+    failure: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(failure.into())
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
+async fn retained_device_identity_acquisition_classifies_without_mutation_in_current_netns(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh CAP_NET_ADMIN netns");
+        return Ok(());
+    }
+
+    // A separate authority root keeps this fixture's writer group independent
+    // of the restart-recovery fixture running in the same test binary.
+    let recovery_root = privileged_retained_device_root();
+    let creator = LinuxGtpuDataplaneBackend::new().with_pdp_recovery_root(recovery_root.clone())?;
+    let incarnation = PdpDeviceIncarnation::from_bytes([0xc3; 16])
+        .ok_or("privileged fixture incarnation must be nonzero")?;
+    let name = format!("ga{}", std::process::id() % 10_000);
+    let create = CreateGtpDeviceRequest::new(name.clone());
+    let prepared_request = RetainedDeviceIdentityRequest::new(
+        name.clone(),
+        None,
+        incarnation,
+        PdpRestartRecoveryProof::previous_writer_stopped(),
+    );
+    let device = match creator.create_recoverable_device(create, incarnation).await {
+        Ok(device) => device,
+        Err(error) => {
+            // An ambiguous create may have published a fully stamped link.
+            // Recover and remove only when the durable identity proves it is
+            // this fixture's device; never delete a merely matching name.
+            if let Ok(acquisition) = creator
+                .acquire_retained_device_identity(prepared_request.clone())
+                .await
+            {
+                if let Some(orphan) = acquisition.into_retained_device() {
+                    let _ = creator.remove_device(&orphan).await;
+                }
+            }
+            let _ = std::fs::remove_dir_all(&recovery_root);
+            return Err(error.into());
+        }
+    };
+    // The durable consumer still has only the prepared request. Dropping the
+    // creator models process loss after the link was created and stamped but
+    // before its returned ifindex was durably published.
+    drop(creator);
+    let backend = LinuxGtpuDataplaneBackend::new().with_pdp_recovery_root(recovery_root.clone())?;
+
+    let retained_request = RetainedDeviceIdentityRequest::new(
+        device.name.clone(),
+        Some(device.ifindex),
+        incarnation,
+        PdpRestartRecoveryProof::previous_writer_stopped(),
+    );
+
+    let result = async {
+        // Exact retained name, ifindex, and kernel-bound incarnation return
+        // the retained identity, and the classification is idempotent.
+        let prepared = backend
+            .acquire_retained_device_identity(prepared_request.clone())
+            .await?;
+        require_equal(
+            prepared.outcome(),
+            RetainedDeviceIdentityOutcome::Retained,
+            "prepared acquisition was not retained",
+        )?;
+        require_equal(
+            prepared.into_retained_device(),
+            Some(device.clone()),
+            "prepared acquisition returned the wrong device",
+        )?;
+        require_equal(
+            backend
+                .acquire_retained_device_identity(retained_request.clone())
+                .await?
+                .outcome(),
+            RetainedDeviceIdentityOutcome::Retained,
+            "exact acquisition was not retained",
+        )?;
+
+        // The acquisition is mutation-free against live PDP state: it neither
+        // installs nor removes the resident context.
+        let context = privileged_recovery_context(&device)?;
+        backend.install_pdp_context(context.clone()).await?;
+        require_equal(
+            backend
+                .acquire_retained_device_identity(retained_request.clone())
+                .await?
+                .outcome(),
+            RetainedDeviceIdentityOutcome::Retained,
+            "resident PDP changed retained classification",
+        )?;
+        require_equal(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&context)
+                        .ok_or("local selector requires nonzero ifindex")?,
+                ))
+                .await?,
+            PdpContextReadback::Present(context.clone()),
+            "retained acquisition mutated resident PDP context",
+        )?;
+
+        // A different incarnation at the same name and ifindex fails closed
+        // and leaves the resident context untouched.
+        let replacement = PdpDeviceIncarnation::from_bytes([0x3c; 16])
+            .ok_or("replacement incarnation must be nonzero")?;
+        let foreign_request = RetainedDeviceIdentityRequest::new(
+            device.name.clone(),
+            Some(device.ifindex),
+            replacement,
+            PdpRestartRecoveryProof::previous_writer_stopped(),
+        );
+        require_equal(
+            backend
+                .acquire_retained_device_identity(foreign_request)
+                .await?
+                .outcome(),
+            RetainedDeviceIdentityOutcome::Conflict(
+                RetainedDeviceConflictReason::ReplacementIdentity,
+            ),
+            "foreign incarnation was not rejected",
+        )?;
+        require_equal(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&context)
+                        .ok_or("local selector requires nonzero ifindex")?,
+                ))
+                .await?,
+            PdpContextReadback::Present(context.clone()),
+            "foreign acquisition mutated resident PDP context",
+        )?;
+
+        // The same name recorded against a different ifindex fails closed.
+        let replaced_ifindex_request = RetainedDeviceIdentityRequest::new(
+            device.name.clone(),
+            Some(device.ifindex.checked_add(1).ok_or("ifindex overflow")?),
+            incarnation,
+            PdpRestartRecoveryProof::previous_writer_stopped(),
+        );
+        require_equal(
+            backend
+                .acquire_retained_device_identity(replaced_ifindex_request)
+                .await?
+                .outcome(),
+            RetainedDeviceIdentityOutcome::Conflict(
+                RetainedDeviceConflictReason::ReplacementIdentity,
+            ),
+            "replacement ifindex was not rejected",
+        )?;
+
+        backend
+            .remove_pdp_context(RemovePdpContextRequest::from_context(&context))
+            .await?;
+
+        // After the device is removed, the recorded name is authoritatively
+        // absent; the classification is idempotent and authorizes one fresh
+        // create_recoverable_device call.
+        backend.remove_device(&device).await?;
+        require_equal(
+            backend
+                .acquire_retained_device_identity(retained_request.clone())
+                .await?
+                .outcome(),
+            RetainedDeviceIdentityOutcome::Absent,
+            "removed exact device was not absent",
+        )?;
+        require_equal(
+            backend
+                .acquire_retained_device_identity(prepared_request)
+                .await?
+                .outcome(),
+            RetainedDeviceIdentityOutcome::Absent,
+            "removed prepared device was not absent",
+        )?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = backend.remove_device(&device).await;
+    }
+    let _ = std::fs::remove_dir_all(&recovery_root);
+    result?;
     Ok(())
 }

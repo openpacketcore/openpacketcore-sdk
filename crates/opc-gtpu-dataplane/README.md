@@ -266,11 +266,26 @@ an incarnation. Create the device through
 `create_recoverable_device(request, incarnation)`, which stamps and verifies the
 incarnation in the kernel link's `IFLA_IFALIAS` while holding topology
 authority. It first proves the requested name absent, and reconciles an
-ambiguous create acknowledgement before publishing the verified link. Process
-loss before the method returns can leave an unstamped link; exact recovery
-classifies that as structural repair and never treats it as owned PDP state.
-Ordinary `create_device` does not establish the identity needed for later exact
-restart recovery.
+ambiguous create acknowledgement before publishing the verified link. It uses
+`IFLA_GTP_CREATE_SOCKETS`, so the netdevice rather than the creating process
+owns the GTP sockets and a retained link remains serviceable after process
+loss. The supported recoverable profile is intentionally limited to
+`0.0.0.0:2152` with no userspace-socket fallback; the kernel also reserves its
+standard GTPv0 port 3386. Consequently only one wildcard kernel-owned GTP
+device can own those ports in a network namespace at a time. A kernel without
+`IFLA_GTP_CREATE_SOCKETS` support rejects creation rather than weakening the
+contract. Ordinary `create_device` retains its userspace-FD socket and custom
+bind-address/port behavior, but does not establish the identity needed for
+later exact restart recovery.
+
+The published `opc-pdp-recovery-v2` alias attests this kernel-owned socket
+profile as well as the incarnation. A legacy `v1` alias can name a link whose
+userspace socket was detached when its creator exited, so retained acquisition
+and exact recovery fail closed for it. There is no in-place adoption or alias
+upgrade: drain/remove the legacy link and create a fresh recoverable device
+with a newly minted incarnation. Process loss before the method returns can
+still leave an unstamped link; exact recovery classifies that as structural
+repair and never treats it as owned PDP state.
 
 Build `PdpRestartRecoveryRequest` from the durably recorded device name and
 ifindex, incarnation, complete expected PDP context, and
@@ -338,6 +353,83 @@ capability, and permission errors remain errors, while ACK-uncertain or partial
 mutation failures are re-read and returned as exact, conflict, or indeterminate
 state. Product policy decides which stale context it owns, coordinates drain,
 and sequences route/XFRM/session changes.
+
+### Linux retained device identity acquisition
+
+`LinuxGtpuDataplaneBackend::acquire_retained_device_identity` is the
+identity-bearing, mutation-free companion of the restart-recovery primitive.
+An ePDG-style consumer that stops after creating a shared recoverable device
+but before admitting any PDP effect can restart to find the device retained by
+the kernel with no effect-possible PDP descriptor. The consumer must clear
+provably unpolled work without an adapter call, then choose between serving
+reuse and fresh creation. `create_recoverable_device` correctly refuses a
+retained device, `resolve_device` proves only name and ifindex, and
+`recover_pdp_context_exact` proves the incarnation only as part of a
+PDP-context recovery request that may remove an exact resident context. This
+primitive closes that gap without a compatibility path, name-only fallback, or
+any device mutation.
+
+Build `RetainedDeviceIdentityRequest` from the durably recorded device name,
+the optional exact ifindex, the non-reusable `PdpDeviceIncarnation` minted
+before the create effect, and
+`PdpRestartRecoveryProof::previous_writer_stopped()`. Pass `None` for the
+ifindex while the durable record is still prepared: this includes process loss
+after `create_recoverable_device` created and stamped the link but before its
+result was durably published. Pass `Some(ifindex)` only after that exact result
+was committed. The recovery root must already be bound.
+
+Under shared topology authority, a prepared acquisition performs an
+authoritative read-only `RTM_GETLINK` lookup by name, acquires the discovered
+per-device authority, then re-proves the exact name, ifindex, and kernel
+`IFLA_IFALIAS` incarnation by ifindex. An active-record acquisition takes its
+committed per-device authority directly and proves that exact link; if the
+ifindex is absent, it also proves whether the name is absent or occupied by a
+replacement. Resource or transport errors never become `Absent`, and
+contradictory or malformed netlink evidence fails closed. The operation never
+reads, installs, or deletes a PDP context and never mutates the device.
+
+Only the `v2` alias written by the kernel-owned recoverable creation path can
+authorize `Retained`. A `v1` userspace-socket alias is a conflicting identity,
+even when its name, ifindex, and incarnation bytes otherwise match, because
+link identity alone cannot prove that its GTP socket survived process loss.
+
+`RetainedDeviceIdentityAcquisition::outcome()` returns a typed, value-free
+classification:
+
+- `Retained` — the exact name, ifindex, and kernel-bound incarnation were all
+  proven live. `retained_device()` or `into_retained_device()` returns the
+  exact `GtpDevice`; a prepared caller must durably publish its discovered
+  ifindex before serving reuse.
+- `Absent` — the recorded name is authoritatively absent under topology
+  authority and, when supplied, the exact expected ifindex is absent too. One
+  fresh `create_recoverable_device` call with a newly minted incarnation is
+  the supported next step; no name-only adoption occurs.
+- `Conflict(ReplacementIdentity)` — the name is occupied by a different
+  ifindex, or the name and ifindex are occupied with a different kernel-bound
+  identity (including a renamed expected-ifindex link and foreign or malformed
+  alias content). The live state is left untouched; the durable record must be
+  reconciled against the replacement.
+- `Indeterminate(AuthorityUnavailable)` — a concurrent cooperating writer
+  holds the topology or per-device authority; retry the identical request.
+- `RepairRequired(Unstamped)` — a link matching the expected name and ifindex
+  carries no incarnation stamp: it was never published as recoverable (for
+  example, process loss interrupted provisioning before publication). Retrying
+  cannot succeed without repair.
+
+Renamed, removed, unstamped, malformed-alias, and unrepresentable states are
+all structurally distinct from transient authority unavailability:
+unrepresentable link evidence fails closed as an error rather than any
+classification. Because the operation never mutates, an idempotent retry
+returns the same classified identity state while live state is unchanged.
+
+Dropping the returned future does not cancel its detached blocking worker: the
+worker retains every acquired writer authority until the classification
+finishes, so a retry cannot overlap an admitted acquisition (it may observe
+authority unavailable) and later re-reads the unchanged state. The acquisition
+does not extend the writer authorities past its return; subsequent device and
+PDP mutations are fenced independently by the existing lease hierarchy.
+Request, acquisition, and outcome diagnostics are redaction-safe: they expose
+no device identity, incarnation, endpoint, TEID, packet, or descriptor values.
 
 ### Downlink outer-envelope validation
 
@@ -1718,6 +1810,6 @@ rustup target add x86_64-unknown-freebsd
 cargo clippy -p opc-gtpu-dataplane --all-targets --target x86_64-unknown-freebsd -- -D warnings
 sudo modprobe gtp
 sudo modprobe wireguard
-sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture'
+sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture --test-threads=1'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture'
 ```
