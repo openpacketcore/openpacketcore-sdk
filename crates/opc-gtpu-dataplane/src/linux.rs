@@ -17,10 +17,11 @@ use opc_linux_gtpu_sys::{
     CTRL_ATTR_FAMILY_NAME, CTRL_CMD_GETFAMILY, CTRL_VERSION, GENL_ID_CTRL, GTPA_FAMILY, GTPA_I_TEI,
     GTPA_LINK, GTPA_MS_ADDR6, GTPA_MS_ADDRESS, GTPA_O_TEI, GTPA_PEER_ADDR6, GTPA_PEER_ADDRESS,
     GTPA_VERSION, GTP_CMD_DELPDP, GTP_CMD_GETPDP, GTP_CMD_NEWPDP, GTP_GENL_NAME, GTP_GENL_VERSION,
-    GTP_ROLE_GGSN, GTP_ROLE_SGSN, GTP_V1, IFF_UP, IFLA_GTP_FD1, IFLA_GTP_LOCAL, IFLA_GTP_LOCAL6,
-    IFLA_GTP_PDP_HASHSIZE, IFLA_GTP_ROLE, IFLA_IFALIAS, IFLA_IFNAME, IFLA_INFO_DATA,
-    IFLA_INFO_KIND, IFLA_LINKINFO, NLMSG_DONE, NLMSG_ERROR, NLMSG_NOOP, NLM_F_ACK, NLM_F_CREATE,
-    NLM_F_EXCL, NLM_F_REQUEST, RTM_DELLINK, RTM_GETLINK, RTM_NEWLINK,
+    GTP_ROLE_GGSN, GTP_ROLE_SGSN, GTP_V1, IFF_UP, IFLA_GTP_CREATE_SOCKETS, IFLA_GTP_FD1,
+    IFLA_GTP_LOCAL, IFLA_GTP_LOCAL6, IFLA_GTP_PDP_HASHSIZE, IFLA_GTP_ROLE, IFLA_IFALIAS,
+    IFLA_IFNAME, IFLA_INFO_DATA, IFLA_INFO_KIND, IFLA_LINKINFO, NLMSG_DONE, NLMSG_ERROR,
+    NLMSG_NOOP, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_MULTI, NLM_F_REQUEST, RTM_DELLINK,
+    RTM_GETLINK, RTM_NEWLINK,
 };
 
 use crate::backend::error_proves_no_requested_mutation;
@@ -32,7 +33,7 @@ use crate::{
     PdpContextLocalTeidSelector, PdpContextReadback, PdpContextReconciliationCapabilities,
     PdpContextRemovalOutcome, PdpContextRepairReason, PdpContextSelector, PdpContextUplinkSelector,
     PdpDeviceIncarnation, PdpRestartRecoveryRequest, RemovePdpContextRequest,
-    RetainedDeviceConflictReason, RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest,
+    RetainedDeviceConflictReason, RetainedDeviceIdentityAcquisition, RetainedDeviceIdentityRequest,
     RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason, Teid, GTPU_PORT,
 };
 
@@ -47,7 +48,10 @@ const ESRCH: i32 = 3;
 const ENODEV: i32 = 19;
 #[cfg(target_os = "linux")]
 const PDP_TOPOLOGY_LEASE_NAME: &str = "pdp-recovery-topology.lock";
-const PDP_DEVICE_ALIAS_PREFIX: &str = "opc-pdp-recovery-v1:";
+// Version 2 also attests that recoverable creation used kernel-owned GTP
+// sockets. A version-1 stamp may name a link whose userspace-owned socket was
+// detached by process loss, so it is not safe evidence for retained reuse.
+const PDP_DEVICE_ALIAS_PREFIX: &str = "opc-pdp-recovery-v2:";
 
 /// Runtime behavior for the safe Linux GTP-U backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,10 +194,16 @@ impl LinuxGtpuDataplaneBackend {
     /// first proves the requested name absent. It stamps and verifies the
     /// incarnation in `IFLA_IFALIAS` before publishing the device; an
     /// ambiguous create acknowledgement is reconciled under that same
-    /// authority. Exact restart recovery later proves the alias together with
-    /// the device name and ifindex. Process loss before this method returns
-    /// can leave an unpublished, unstamped link, which recovery reports as
-    /// structural repair rather than treating it as owned PDP state.
+    /// authority. Recoverable creation asks the kernel GTP driver to own its
+    /// sockets, so process loss cannot detach the retained link from its GTP-U
+    /// socket. The SDK's supported recoverable profile deliberately uses
+    /// wildcard IPv4 and the kernel driver's fixed GTP ports (3386 and 2152),
+    /// therefore this method requires `bind_address == 0.0.0.0` and
+    /// `bind_port == 2152` with no fallback. Exact restart recovery later
+    /// proves the versioned alias together with the device name and ifindex.
+    /// Process loss before this method returns can leave an unpublished,
+    /// unstamped link, which recovery reports as structural repair rather than
+    /// treating it as owned PDP state.
     pub async fn create_recoverable_device(
         &self,
         request: CreateGtpDeviceRequest,
@@ -354,30 +364,45 @@ impl LinuxGtpuDataplaneBackend {
         incarnation: Option<PdpDeviceIncarnation>,
     ) -> Result<GtpDevice, GtpuError> {
         validate_create_device_request(&request)?;
+        let recoverable = incarnation.is_some();
+        if recoverable {
+            validate_recoverable_create_device_request(&request)?;
+        }
         let _operation = self.pdp_operation_guard()?;
-        if incarnation.is_some() && self.bound_pdp_recovery_root().is_none() {
+        if recoverable && self.bound_pdp_recovery_root().is_none() {
             return Err(GtpuError::UnsupportedFeature {
                 feature: "pdp_restart_recovery_authority",
             });
         }
         let _topology_lease = self.acquire_optional_pdp_topology_writer_lease()?;
-        if incarnation.is_some() {
+        if recoverable {
             // Establish absence while the shared topology authority is held.
             // That makes a link which appears after an ambiguous create ACK
             // attributable to this request within the supported cooperating-
             // writer model, so it is safe to finish stamping and verifying it.
-            match self.inner.transport.ifindex_by_name(&request.name) {
-                Err(GtpuError::NotFound) => {}
-                Ok(_) => return Err(GtpuError::AlreadyExists),
-                Err(error) => return Err(error),
+            match self
+                .inner
+                .transport
+                .link_identity_by_name(&request.name, self.inner.config)?
+            {
+                None => {}
+                Some(_) => return Err(GtpuError::AlreadyExists),
             }
         }
-        let socket = self.inner.transport.open_gtpu_socket(
-            request.bind_address,
-            request.bind_port,
-            "gtpu_udp_bind",
-        )?;
-        let body = encode_create_device_request(&request, socket.raw_fd())?;
+        let socket = if recoverable {
+            None
+        } else {
+            Some(self.inner.transport.open_gtpu_socket(
+                request.bind_address,
+                request.bind_port,
+                "gtpu_udp_bind",
+            )?)
+        };
+        let socket_provisioning = match socket.as_ref() {
+            Some(socket) => GtpSocketProvisioning::UserspaceFd(socket.raw_fd()),
+            None => GtpSocketProvisioning::KernelOwned,
+        };
+        let body = encode_create_device_request(&request, socket_provisioning)?;
         let create_result = self.route_transact(
             "create_device",
             RTM_NEWLINK,
@@ -386,12 +411,21 @@ impl LinuxGtpuDataplaneBackend {
         );
         let create_was_ambiguous = match create_result {
             Ok(_) => false,
+            // RTM_NEWLINK with NLM_F_CREATE | NLM_F_EXCL did not create a
+            // link when the kernel reports EEXIST. Never reconcile that
+            // preexisting link as if it belonged to this request.
+            Err(GtpuError::AlreadyExists) => return Err(GtpuError::AlreadyExists),
             Err(error) if incarnation.is_none() || error_proves_no_requested_mutation(&error) => {
                 return Err(error);
             }
             Err(_) => true,
         };
-        let ifindex = match self.ifindex_by_name_after_create(&request.name) {
+        let ifindex_result = if recoverable {
+            self.recoverable_ifindex_by_name_after_create(&request.name)
+        } else {
+            self.ifindex_by_name_after_create(&request.name)
+        };
+        let ifindex = match ifindex_result {
             Ok(ifindex) => ifindex,
             Err(_error) if create_was_ambiguous => {
                 return Err(GtpuError::StateIndeterminate {
@@ -420,13 +454,15 @@ impl LinuxGtpuDataplaneBackend {
                 };
             }
         }
-        if let Err(retain_error) = self.retain_device_socket(ifindex, socket) {
-            if incarnation.is_some() && self.remove_unpublished_device_sync(&device).is_err() {
-                return Err(GtpuError::StateIndeterminate {
-                    operation: "recoverable_device_provision",
-                });
+        if let Some(socket) = socket {
+            if let Err(retain_error) = self.retain_device_socket(ifindex, socket) {
+                if recoverable && self.remove_unpublished_device_sync(&device).is_err() {
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "recoverable_device_provision",
+                    });
+                }
+                return Err(retain_error);
             }
-            return Err(retain_error);
         }
         Ok(device)
     }
@@ -520,6 +556,35 @@ impl LinuxGtpuDataplaneBackend {
         }
 
         Err(GtpuError::io("ifindex_lookup", not_found("gtp device")))
+    }
+
+    fn recoverable_ifindex_by_name_after_create(&self, name: &str) -> Result<u32, GtpuError> {
+        let attempts = self.inner.config.receive_attempts.max(1);
+        for attempt in 0..attempts {
+            match self
+                .inner
+                .transport
+                .link_identity_by_name(name, self.inner.config)?
+            {
+                Some(probe) => return Ok(probe.ifindex),
+                None if attempt + 1 < attempts => {
+                    if !self.inner.config.retry_delay.is_zero() {
+                        std::thread::sleep(self.inner.config.retry_delay);
+                    }
+                }
+                None => {
+                    return Err(GtpuError::io(
+                        "recoverable_device_identity_read",
+                        not_found("gtp device"),
+                    ));
+                }
+            }
+        }
+
+        Err(GtpuError::io(
+            "recoverable_device_identity_read",
+            not_found("gtp device"),
+        ))
     }
 
     fn retain_device_socket(
@@ -832,28 +897,21 @@ impl LinuxGtpuDataplaneBackend {
         };
         // Prove the complete device incarnation only after both authorities
         // are held. Name and ifindex alone are reusable after link deletion.
-        match self.inner.transport.ifindex_by_name(&device.name) {
-            Ok(ifindex) if ifindex == device.ifindex => {}
-            Ok(_) | Err(GtpuError::NotFound) => {
-                return Ok(PdpContextRemovalOutcome::RepairRequired(
-                    PdpContextRepairReason::DeviceIdentityChanged,
-                ));
-            }
-            Err(error) => return Err(error),
-        }
         let expected_alias = encode_pdp_device_alias(request.incarnation());
         match self
             .inner
             .transport
-            .device_alias(&device, self.inner.config)
+            .link_identity(device.ifindex, self.inner.config)?
         {
-            Ok(Some(alias)) if alias == expected_alias.as_bytes() => {}
-            Ok(_) | Err(GtpuError::NotFound) => {
+            Some(probe)
+                if probe.ifindex == device.ifindex
+                    && probe.name == device.name.as_bytes()
+                    && probe.alias.as_deref() == Some(expected_alias.as_bytes()) => {}
+            Some(_) | None => {
                 return Ok(PdpContextRemovalOutcome::RepairRequired(
                     PdpContextRepairReason::DeviceIdentityChanged,
                 ));
             }
-            Err(error) => return Err(error),
         }
         let family_id = self
             .resolve_gtp_family_id()
@@ -878,37 +936,42 @@ impl LinuxGtpuDataplaneBackend {
     /// reuse or authoritative absence followed by one
     /// [`Self::create_recoverable_device`] call.
     ///
-    /// The request carries the exact durable [`GtpDevice`], the non-reusable
-    /// [`PdpDeviceIncarnation`], and the prior-writer stop attestation. The
-    /// recovery root must already be bound. The acquisition acquires the
-    /// shared topology authority and then the per-device writer authority for
-    /// the expected ifindex, proves the live name still resolves to that
-    /// ifindex, and proves the kernel `IFLA_IFALIAS` incarnation with one
-    /// read-only `RTM_GETLINK` probe. Outcomes:
+    /// The request carries the durable name, optional exact expected ifindex,
+    /// non-reusable [`PdpDeviceIncarnation`], and prior-writer stop
+    /// attestation. A prepared record passes no ifindex; an active record
+    /// passes the exact ifindex it durably committed. The recovery root must
+    /// already be bound. The acquisition holds shared topology authority,
+    /// acquires the exact or discovered per-device writer authority, then
+    /// proves the live name, ifindex, and kernel `IFLA_IFALIAS` incarnation
+    /// with read-only `RTM_GETLINK` probes. Outcomes:
     ///
-    /// - [`RetainedDeviceIdentityOutcome::Retained`] — name, ifindex, and
-    ///   incarnation all match; the retained device may be reused.
-    /// - [`RetainedDeviceIdentityOutcome::Absent`] — the name is
+    /// - [`crate::RetainedDeviceIdentityOutcome::Retained`] — name, optional
+    ///   expected ifindex, and incarnation all match; the acquisition returns
+    ///   the exact retained [`GtpDevice`] for reuse and prepared-record
+    ///   completion.
+    /// - [`crate::RetainedDeviceIdentityOutcome::Absent`] — the name is
     ///   authoritatively absent under the topology authority; one fresh
     ///   [`Self::create_recoverable_device`] call with a newly minted
     ///   incarnation is the supported next step.
-    /// - [`RetainedDeviceIdentityOutcome::Conflict`] — the name is occupied by
-    ///   a different ifindex, or the name and ifindex are occupied with a
-    ///   different (including foreign or malformed) kernel-bound identity;
-    ///   the live state is left untouched.
-    /// - [`RetainedDeviceIdentityOutcome::Indeterminate`] — a concurrent
-    ///   cooperating writer holds the writer authority; retry the identical
-    ///   request.
-    /// - [`RetainedDeviceIdentityOutcome::RepairRequired`] — a link matching
-    ///   the expected name and ifindex is unstamped; retrying cannot succeed
-    ///   without repair.
+    /// - [`crate::RetainedDeviceIdentityOutcome::Conflict`] — the name is
+    ///   occupied by a different ifindex, or the name and ifindex are occupied
+    ///   with a different (including foreign or malformed) kernel-bound
+    ///   identity; the live state is left untouched.
+    /// - [`crate::RetainedDeviceIdentityOutcome::Indeterminate`] — a
+    ///   concurrent cooperating writer holds the writer authority; retry the
+    ///   identical request.
+    /// - [`crate::RetainedDeviceIdentityOutcome::RepairRequired`] — a link
+    ///   matching the expected name and ifindex is unstamped; retrying cannot
+    ///   succeed without repair.
     ///
-    /// Renamed and removed devices present as authoritative name absence;
-    /// structurally unreadable link evidence fails closed as an error. Every
-    /// classification is structurally distinct from transient authority
-    /// unavailability. The operation never reads, installs, or deletes a PDP
-    /// context and never mutates the device, so an idempotent retry returns
-    /// the same classified identity state while live state is unchanged.
+    /// With an expected ifindex, a live link at that index under another name
+    /// is a conflict rather than absence. Absence is authoritative only after
+    /// read-only route-netlink proves both the expected ifindex (when present)
+    /// and name absent; socket/resource failures remain errors. Structurally
+    /// unreadable link evidence also fails closed as an error. The operation
+    /// never reads, installs, or deletes a PDP context and never mutates the
+    /// device, so an idempotent retry returns the same classified identity
+    /// state while live state is unchanged.
     ///
     /// Like [`Self::recover_pdp_context_exact`], the blocking worker runs to
     /// completion even if the returned future is dropped: it retains both
@@ -919,7 +982,7 @@ impl LinuxGtpuDataplaneBackend {
     pub async fn acquire_retained_device_identity(
         &self,
         request: RetainedDeviceIdentityRequest,
-    ) -> Result<RetainedDeviceIdentityOutcome, GtpuError> {
+    ) -> Result<RetainedDeviceIdentityAcquisition, GtpuError> {
         self.run_blocking("acquire_retained_device_identity", move |backend| {
             backend.acquire_retained_device_identity_sync(request)
         })
@@ -929,78 +992,130 @@ impl LinuxGtpuDataplaneBackend {
     fn acquire_retained_device_identity_sync(
         &self,
         request: RetainedDeviceIdentityRequest,
-    ) -> Result<RetainedDeviceIdentityOutcome, GtpuError> {
-        let device = request.device().clone();
-        validate_device(&device)?;
+    ) -> Result<RetainedDeviceIdentityAcquisition, GtpuError> {
+        let name = request.name().to_string();
+        validate_interface_name(&name, "device.name")?;
+        if let Some(ifindex) = request.expected_ifindex() {
+            validate_ifindex(ifindex, "device.ifindex")?;
+        }
         let _operation = self.pdp_operation_guard()?;
         let root = self.pdp_recovery_root_or_unsupported()?;
         let _topology_lease = match acquire_pdp_topology_lease(&root) {
             Ok(lease) => lease,
             Err(GtpuError::AlreadyExists) => {
-                return Ok(RetainedDeviceIdentityOutcome::Indeterminate(
+                return Ok(RetainedDeviceIdentityAcquisition::indeterminate(
                     RetainedDeviceIndeterminateReason::AuthorityUnavailable,
                 ));
             }
             Err(error) => return Err(error),
         };
-        let _device_lease = match acquire_pdp_recovery_lease(&root, device.ifindex) {
+        if let Some(expected_ifindex) = request.expected_ifindex() {
+            let _device_lease = match acquire_pdp_recovery_lease(&root, expected_ifindex) {
+                Ok(lease) => lease,
+                Err(GtpuError::AlreadyExists) => {
+                    return Ok(RetainedDeviceIdentityAcquisition::indeterminate(
+                        RetainedDeviceIndeterminateReason::AuthorityUnavailable,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            return match self
+                .inner
+                .transport
+                .link_identity(expected_ifindex, self.inner.config)?
+            {
+                Some(probe) => self.classify_retained_device_probe(
+                    &name,
+                    expected_ifindex,
+                    request.incarnation(),
+                    probe,
+                ),
+                None => match self
+                    .inner
+                    .transport
+                    .link_identity_by_name(&name, self.inner.config)?
+                {
+                    None => Ok(RetainedDeviceIdentityAcquisition::absent()),
+                    Some(probe) if probe.ifindex != expected_ifindex => {
+                        Ok(RetainedDeviceIdentityAcquisition::conflict(
+                            RetainedDeviceConflictReason::ReplacementIdentity,
+                        ))
+                    }
+                    Some(_) => Err(GtpuError::StateIndeterminate {
+                        operation: "retained_device_identity",
+                    }),
+                },
+            };
+        }
+
+        // A prepared record has no ifindex to lock. Resolve its name under
+        // topology authority, then lock the discovered device and re-prove
+        // the complete identity before returning that ifindex to the caller.
+        let Some(initial_probe) = self
+            .inner
+            .transport
+            .link_identity_by_name(&name, self.inner.config)?
+        else {
+            return Ok(RetainedDeviceIdentityAcquisition::absent());
+        };
+        let discovered_ifindex = initial_probe.ifindex;
+        let _device_lease = match acquire_pdp_recovery_lease(&root, discovered_ifindex) {
             Ok(lease) => lease,
             Err(GtpuError::AlreadyExists) => {
-                return Ok(RetainedDeviceIdentityOutcome::Indeterminate(
+                return Ok(RetainedDeviceIdentityAcquisition::indeterminate(
                     RetainedDeviceIndeterminateReason::AuthorityUnavailable,
                 ));
             }
             Err(error) => return Err(error),
         };
-        // Prove the complete device identity only after both authorities are
-        // held, and never touch PDP state. Name and ifindex alone are
-        // reusable after link deletion.
-        match self.inner.transport.ifindex_by_name(&device.name) {
-            Err(GtpuError::NotFound) => return Ok(RetainedDeviceIdentityOutcome::Absent),
-            Ok(ifindex) if ifindex != device.ifindex => {
-                return Ok(RetainedDeviceIdentityOutcome::Conflict(
-                    RetainedDeviceConflictReason::ReplacementIdentity,
-                ));
-            }
-            Ok(_) => {}
-            Err(error) => return Err(error),
-        }
         match self
             .inner
             .transport
-            .link_identity(device.ifindex, self.inner.config)
+            .link_identity(discovered_ifindex, self.inner.config)?
         {
-            Ok(Some(probe)) => {
-                if probe.name != device.name.as_bytes() {
-                    // The name resolved to this ifindex but the authoritative
-                    // link readback disagrees. No cooperating writer can
-                    // rename a link while both authorities are held, so fail
-                    // closed rather than classify contested state.
-                    return Err(GtpuError::StateIndeterminate {
-                        operation: "retained_device_identity",
-                    });
-                }
-                let expected_alias = encode_pdp_device_alias(request.incarnation());
-                match probe.alias {
-                    Some(alias) if alias == expected_alias.as_bytes() => {
-                        Ok(RetainedDeviceIdentityOutcome::Retained)
-                    }
-                    Some(_) => Ok(RetainedDeviceIdentityOutcome::Conflict(
-                        RetainedDeviceConflictReason::ReplacementIdentity,
-                    )),
-                    None => Ok(RetainedDeviceIdentityOutcome::RepairRequired(
-                        RetainedDeviceRepairReason::Unstamped,
-                    )),
-                }
-            }
-            // The name just resolved to this ifindex, so a live link must own
-            // it. Absent link evidence at this point is unrepresentable
-            // state; fail closed without classifying it as owned, absent, or
-            // retryable authority unavailability.
-            Ok(None) => Err(GtpuError::StateIndeterminate {
+            Some(probe) => self.classify_retained_device_probe(
+                &name,
+                discovered_ifindex,
+                request.incarnation(),
+                probe,
+            ),
+            None => Err(GtpuError::StateIndeterminate {
                 operation: "retained_device_identity",
             }),
-            Err(error) => Err(error),
+        }
+    }
+
+    fn classify_retained_device_probe(
+        &self,
+        expected_name: &str,
+        expected_ifindex: u32,
+        expected_incarnation: PdpDeviceIncarnation,
+        probe: LinkIdentityProbe,
+    ) -> Result<RetainedDeviceIdentityAcquisition, GtpuError> {
+        if probe.ifindex != expected_ifindex {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "retained_device_identity",
+            });
+        }
+        if probe.name != expected_name.as_bytes() {
+            return Ok(RetainedDeviceIdentityAcquisition::conflict(
+                RetainedDeviceConflictReason::ReplacementIdentity,
+            ));
+        }
+        let expected_alias = encode_pdp_device_alias(expected_incarnation);
+        match probe.alias {
+            Some(alias) if alias == expected_alias.as_bytes() => {
+                Ok(RetainedDeviceIdentityAcquisition::retained(GtpDevice {
+                    name: expected_name.to_string(),
+                    ifindex: expected_ifindex,
+                }))
+            }
+            Some(_) => Ok(RetainedDeviceIdentityAcquisition::conflict(
+                RetainedDeviceConflictReason::ReplacementIdentity,
+            )),
+            None => Ok(RetainedDeviceIdentityAcquisition::repair_required(
+                RetainedDeviceRepairReason::Unstamped,
+            )),
         }
     }
 
@@ -1332,6 +1447,12 @@ impl GtpuSocketHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GtpSocketProvisioning {
+    UserspaceFd(i32),
+    KernelOwned,
+}
+
 trait LinuxGtpuTransport: Send + Sync + fmt::Debug {
     fn transact(
         &self,
@@ -1367,6 +1488,18 @@ trait LinuxGtpuTransport: Send + Sync + fmt::Debug {
     fn link_identity(
         &self,
         ifindex: u32,
+        config: LinuxGtpuDataplaneBackendConfig,
+    ) -> Result<Option<LinkIdentityProbe>, GtpuError>;
+
+    /// Read one live link identity by its exact interface name.
+    ///
+    /// Unlike libc `if_nametoindex`, this route-netlink query preserves
+    /// resource and transport failures instead of flattening them into name
+    /// absence. It is therefore suitable for authoritative recovery
+    /// classification.
+    fn link_identity_by_name(
+        &self,
+        name: &str,
         config: LinuxGtpuDataplaneBackendConfig,
     ) -> Result<Option<LinkIdentityProbe>, GtpuError>;
 
@@ -1520,7 +1653,49 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
             }) => return Ok(None),
             Err(error) => return Err(error),
         };
-        parse_link_identity_response(&response, ifindex, "retained_device_identity_read").map(Some)
+        parse_link_identity_response(&response, Some(ifindex), "retained_device_identity_read")
+            .map(Some)
+    }
+
+    fn link_identity_by_name(
+        &self,
+        name: &str,
+        config: LinuxGtpuDataplaneBackendConfig,
+    ) -> Result<Option<LinkIdentityProbe>, GtpuError> {
+        const IDENTITY_QUERY_SEQUENCE: u32 = 1;
+        let body = encode_get_device_by_name_request(name)?;
+        let request =
+            encode_netlink_message(RTM_GETLINK, NLM_F_REQUEST, IDENTITY_QUERY_SEQUENCE, &body)?;
+        let response = match self.transact(
+            NetlinkProtocol::Route,
+            "retained_device_name_identity_read",
+            &request,
+            IDENTITY_QUERY_SEQUENCE,
+            config,
+        ) {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                return Err(GtpuError::io(
+                    "retained_device_name_identity_read",
+                    invalid_data("missing named link identity response"),
+                ));
+            }
+            Err(GtpuError::NotFound) => return Ok(None),
+            Err(GtpuError::Io {
+                raw_os_error: Some(ENODEV),
+                ..
+            }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let probe =
+            parse_link_identity_response(&response, None, "retained_device_name_identity_read")?;
+        if probe.name != name.as_bytes() {
+            return Err(GtpuError::io(
+                "retained_device_name_identity_read",
+                invalid_data("named link identity mismatch"),
+            ));
+        }
+        Ok(Some(probe))
     }
 
     fn probe(&self, config: LinuxGtpuDataplaneBackendConfig) -> GtpuProbe {
@@ -1693,6 +1868,24 @@ fn validate_create_device_request(request: &CreateGtpDeviceRequest) -> Result<()
     Ok(())
 }
 
+fn validate_recoverable_create_device_request(
+    request: &CreateGtpDeviceRequest,
+) -> Result<(), GtpuError> {
+    if request.bind_port != GTPU_PORT {
+        return Err(GtpuError::invalid_config(
+            "device.bind_port",
+            "recoverable Linux GTP devices require the standard GTP-U port",
+        ));
+    }
+    if request.bind_address != IpAddr::V4(Ipv4Addr::UNSPECIFIED) {
+        return Err(GtpuError::invalid_config(
+            "device.bind_address",
+            "recoverable Linux GTP devices require the wildcard IPv4 bind address",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_device(device: &GtpDevice) -> Result<(), GtpuError> {
     validate_interface_name(&device.name, "device.name")?;
     validate_ifindex(device.ifindex, "device.ifindex")?;
@@ -1850,10 +2043,11 @@ fn encode_netlink_message(
 
 fn encode_create_device_request(
     request: &CreateGtpDeviceRequest,
-    fd: i32,
+    socket_provisioning: GtpSocketProvisioning,
 ) -> Result<Vec<u8>, GtpuError> {
-    let fd = u32::try_from(fd)
-        .map_err(|_| GtpuError::invalid_config("device.fd1", "fd must be nonnegative"))?;
+    if socket_provisioning == GtpSocketProvisioning::KernelOwned {
+        validate_recoverable_create_device_request(request)?;
+    }
     let mut out = Vec::with_capacity(IF_INFO_MESSAGE_LEN + 128);
     push_u8(&mut out, AF_INET);
     push_u8(&mut out, 0);
@@ -1867,12 +2061,23 @@ fn encode_create_device_request(
     let linkinfo = start_attr(&mut out, IFLA_LINKINFO);
     append_attr_string(&mut out, IFLA_INFO_KIND, "gtp")?;
     let info_data = start_attr(&mut out, IFLA_INFO_DATA);
-    append_attr_u32_ne(&mut out, IFLA_GTP_FD1, fd)?;
+    match socket_provisioning {
+        GtpSocketProvisioning::UserspaceFd(fd) => {
+            let fd = u32::try_from(fd)
+                .map_err(|_| GtpuError::invalid_config("device.fd1", "fd must be nonnegative"))?;
+            append_attr_u32_ne(&mut out, IFLA_GTP_FD1, fd)?;
+        }
+        GtpSocketProvisioning::KernelOwned => {
+            append_attr_u8(&mut out, IFLA_GTP_CREATE_SOCKETS, 1)?;
+        }
+    }
     if let Some(hashsize) = request.pdp_hashsize {
         append_attr_u32_ne(&mut out, IFLA_GTP_PDP_HASHSIZE, hashsize)?;
     }
     append_attr_u32_ne(&mut out, IFLA_GTP_ROLE, encode_role(request.role))?;
-    append_local_address_attr(&mut out, request.bind_address)?;
+    if matches!(socket_provisioning, GtpSocketProvisioning::UserspaceFd(_)) {
+        append_local_address_attr(&mut out, request.bind_address)?;
+    }
     finish_attr(&mut out, info_data)?;
     finish_attr(&mut out, linkinfo)?;
     Ok(out)
@@ -1903,6 +2108,19 @@ fn encode_get_device_request(ifindex: u32) -> Result<Vec<u8>, GtpuError> {
     push_u32_ne(&mut out, 0);
     push_u32_ne(&mut out, 0);
     debug_assert_eq!(out.len(), IF_INFO_MESSAGE_LEN);
+    Ok(out)
+}
+
+fn encode_get_device_by_name_request(name: &str) -> Result<Vec<u8>, GtpuError> {
+    let mut out = Vec::with_capacity(IF_INFO_MESSAGE_LEN + IFNAMSIZ + ROUTE_ATTRIBUTE_HEADER_LEN);
+    push_u8(&mut out, AF_UNSPEC);
+    push_u8(&mut out, 0);
+    push_u16_ne(&mut out, 0);
+    push_i32_ne(&mut out, 0);
+    push_u32_ne(&mut out, 0);
+    push_u32_ne(&mut out, 0);
+    debug_assert_eq!(out.len(), IF_INFO_MESSAGE_LEN);
+    append_attr_string(&mut out, IFLA_IFNAME, name)?;
     Ok(out)
 }
 
@@ -2307,13 +2525,26 @@ fn parse_netlink_response(
             ));
         }
         let length = read_u32_ne(response, offset)? as usize;
-        if length < NETLINK_HEADER_LEN || offset + length > response.len() {
+        if length < NETLINK_HEADER_LEN {
+            return Err(GtpuError::io(
+                "netlink_receive",
+                invalid_data("invalid netlink length"),
+            ));
+        }
+        let message_end = offset.checked_add(length).ok_or_else(|| {
+            GtpuError::io(
+                "netlink_receive",
+                invalid_data("netlink message length overflow"),
+            )
+        })?;
+        if message_end > response.len() {
             return Err(GtpuError::io(
                 "netlink_receive",
                 invalid_data("invalid netlink length"),
             ));
         }
         let message_type = read_u16_ne(response, offset + 4)?;
+        let flags = read_u16_ne(response, offset + 6)?;
         let sequence = read_u32_ne(response, offset + 8)?;
         if sequence != expected_sequence {
             return Err(GtpuError::io(
@@ -2321,30 +2552,20 @@ fn parse_netlink_response(
                 invalid_data("unexpected netlink sequence"),
             ));
         }
-
-        let body = &response[offset + NETLINK_HEADER_LEN..offset + length];
-        match message_type {
-            NLMSG_ERROR => {
-                parse_netlink_error(body)?;
-                if payload.is_some() {
-                    return Ok(payload);
-                }
-            }
-            NLMSG_DONE => return Ok(payload),
-            NLMSG_NOOP => {}
-            _ => {
-                if message_type != expected_payload_type {
-                    return Err(GtpuError::io(
-                        "netlink_receive",
-                        invalid_data("unexpected netlink payload family"),
-                    ));
-                }
-                if payload.is_none() {
-                    payload = Some(body.to_vec());
-                }
-            }
+        if flags & NLM_F_MULTI != 0 {
+            return Err(GtpuError::io(
+                "netlink_receive",
+                invalid_data("unexpected multipart netlink response"),
+            ));
         }
 
+        let body_start = offset.checked_add(NETLINK_HEADER_LEN).ok_or_else(|| {
+            GtpuError::io(
+                "netlink_receive",
+                invalid_data("netlink header offset overflow"),
+            )
+        })?;
+        let body = &response[body_start..message_end];
         let aligned = align_to_netlink(length).ok_or_else(|| {
             GtpuError::io(
                 "netlink_receive",
@@ -2357,7 +2578,52 @@ fn parse_netlink_response(
                 invalid_data("zero netlink alignment"),
             ));
         }
-        offset += aligned;
+        let next_offset = offset.checked_add(aligned).ok_or_else(|| {
+            GtpuError::io(
+                "netlink_receive",
+                invalid_data("netlink alignment overflow"),
+            )
+        })?;
+        if next_offset > response.len() {
+            return Err(GtpuError::io(
+                "netlink_receive",
+                invalid_data("truncated aligned netlink message"),
+            ));
+        }
+        match message_type {
+            NLMSG_ERROR => {
+                parse_netlink_error(body)?;
+                if next_offset != response.len() {
+                    return Err(GtpuError::io(
+                        "netlink_receive",
+                        invalid_data("invalid netlink acknowledgement termination"),
+                    ));
+                }
+                return Ok(payload);
+            }
+            NLMSG_DONE => {
+                return Err(GtpuError::io(
+                    "netlink_receive",
+                    invalid_data("unexpected netlink done message"),
+                ));
+            }
+            NLMSG_NOOP => {}
+            _ => {
+                if message_type != expected_payload_type {
+                    return Err(GtpuError::io(
+                        "netlink_receive",
+                        invalid_data("unexpected netlink payload family"),
+                    ));
+                }
+                if payload.replace(body.to_vec()).is_some() {
+                    return Err(GtpuError::io(
+                        "netlink_receive",
+                        invalid_data("duplicate netlink payload"),
+                    ));
+                }
+            }
+        }
+        offset = next_offset;
     }
     Ok(payload)
 }
@@ -2436,13 +2702,14 @@ fn parse_generic_family_id(body: &[u8]) -> Result<u16, GtpuError> {
 /// classified instead of surfacing as a decode failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LinkIdentityProbe {
+    ifindex: u32,
     name: Vec<u8>,
     alias: Option<Vec<u8>>,
 }
 
 fn parse_link_identity_response(
     body: &[u8],
-    expected_ifindex: u32,
+    expected_ifindex: Option<u32>,
     operation: &'static str,
 ) -> Result<LinkIdentityProbe, GtpuError> {
     let invalid = |reason| GtpuError::io(operation, invalid_data(reason));
@@ -2454,8 +2721,14 @@ fn parse_link_identity_response(
             .try_into()
             .map_err(|_| invalid("short link ifindex"))?,
     );
-    if index != ifindex_i32(expected_ifindex, "pdp_recovery.device_ifindex")? {
-        return Err(invalid("link identity ifindex mismatch"));
+    let ifindex = u32::try_from(index)
+        .ok()
+        .filter(|ifindex| *ifindex != 0)
+        .ok_or_else(|| invalid("invalid link identity ifindex"))?;
+    if let Some(expected_ifindex) = expected_ifindex {
+        if index != ifindex_i32(expected_ifindex, "pdp_recovery.device_ifindex")? {
+            return Err(invalid("link identity ifindex mismatch"));
+        }
     }
 
     let mut offset = IF_INFO_MESSAGE_LEN;
@@ -2499,7 +2772,11 @@ fn parse_link_identity_response(
     }
 
     let name = name.ok_or_else(|| invalid("missing link name attribute"))?;
-    Ok(LinkIdentityProbe { name, alias })
+    Ok(LinkIdentityProbe {
+        ifindex,
+        name,
+        alias,
+    })
 }
 
 fn parse_device_alias_response(
@@ -2507,7 +2784,8 @@ fn parse_device_alias_response(
     expected: &GtpDevice,
 ) -> Result<Option<Vec<u8>>, GtpuError> {
     let invalid = |reason| GtpuError::io("pdp_device_identity_read", invalid_data(reason));
-    let probe = parse_link_identity_response(body, expected.ifindex, "pdp_device_identity_read")?;
+    let probe =
+        parse_link_identity_response(body, Some(expected.ifindex), "pdp_device_identity_read")?;
     if probe.name != expected.name.as_bytes() {
         return Err(invalid("link identity name mismatch"));
     }
@@ -2645,7 +2923,8 @@ mod tests {
     use crate::model::{Teid, DEFAULT_PDP_HASHSIZE};
     use crate::{
         PdpContextMismatchField, PdpContextSelectorOccupancy, PdpRestartRecoveryProof,
-        RetainedDeviceConflictReason, RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest,
+        RetainedDeviceConflictReason, RetainedDeviceIdentityAcquisition,
+        RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest,
         RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
     };
 
@@ -2849,15 +3128,17 @@ mod tests {
 
     fn test_link_identity() -> LinkIdentityProbe {
         LinkIdentityProbe {
+            ifindex: 42,
             name: b"gtp0".to_vec(),
             alias: Some(encode_pdp_device_alias(test_device_incarnation()).into_bytes()),
         }
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone)]
     enum IfindexResponse {
         Found(u32),
         NotFound,
+        Error(GtpuError),
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3060,6 +3341,7 @@ mod tests {
             match response {
                 IfindexResponse::Found(ifindex) => Ok(ifindex),
                 IfindexResponse::NotFound => Err(GtpuError::NotFound),
+                IfindexResponse::Error(error) => Err(error),
             }
         }
 
@@ -3093,6 +3375,26 @@ mod tests {
                     response
                 }
                 None => Ok(self.link_identity.clone()),
+            }
+        }
+
+        fn link_identity_by_name(
+            &self,
+            name: &str,
+            _config: LinuxGtpuDataplaneBackendConfig,
+        ) -> Result<Option<LinkIdentityProbe>, GtpuError> {
+            match self.ifindex_by_name(name) {
+                Ok(ifindex) => Ok(Some(LinkIdentityProbe {
+                    ifindex,
+                    name: name.as_bytes().to_vec(),
+                    alias: self
+                        .link_identity
+                        .as_ref()
+                        .and_then(|probe| probe.alias.clone())
+                        .or_else(|| self.device_alias.clone()),
+                })),
+                Err(GtpuError::NotFound) => Ok(None),
+                Err(error) => Err(error),
             }
         }
 
@@ -3277,7 +3579,8 @@ mod tests {
     #[test]
     fn encodes_create_device_with_fd1_role_and_hashsize() {
         let request = CreateGtpDeviceRequest::new("gtp0");
-        let body = encode_create_device_request(&request, 9).unwrap();
+        let body =
+            encode_create_device_request(&request, GtpSocketProvisioning::UserspaceFd(9)).unwrap();
 
         assert_eq!(body[0], AF_INET);
         assert_eq!(i32::from_ne_bytes([body[4], body[5], body[6], body[7]]), 0);
@@ -3304,6 +3607,20 @@ mod tests {
     }
 
     #[test]
+    fn encodes_recoverable_device_with_kernel_owned_sockets() {
+        let request = CreateGtpDeviceRequest::new("gtp0");
+        let body =
+            encode_create_device_request(&request, GtpSocketProvisioning::KernelOwned).unwrap();
+        let linkinfo = attr_payload_from(&body, IF_INFO_MESSAGE_LEN, IFLA_LINKINFO).unwrap();
+        let info_data = attr_payload(linkinfo, IFLA_INFO_DATA).unwrap();
+
+        assert_eq!(attr_u8(info_data, IFLA_GTP_CREATE_SOCKETS), 1);
+        assert!(attr_payload(info_data, IFLA_GTP_FD1).is_none());
+        assert!(attr_payload(info_data, IFLA_GTP_LOCAL).is_none());
+        assert!(attr_payload(info_data, IFLA_GTP_LOCAL6).is_none());
+    }
+
+    #[test]
     fn encodes_recoverable_device_incarnation_stamp_in_kernel_alias() {
         let device = GtpDevice {
             name: "gtp0".to_string(),
@@ -3313,6 +3630,8 @@ mod tests {
         let body = encode_set_device_alias_request(&device, incarnation).unwrap();
         let mut expected = encode_pdp_device_alias(incarnation).into_bytes();
         expected.push(0);
+
+        assert!(expected.starts_with(b"opc-pdp-recovery-v2:"));
 
         assert_eq!(
             attr_payload_from(&body, IF_INFO_MESSAGE_LEN, IFLA_IFALIAS),
@@ -3330,7 +3649,8 @@ mod tests {
         request.role = GtpRole::Sgsn;
         request.bind_address = IpAddr::V6(Ipv6Addr::LOCALHOST);
         request.pdp_hashsize = None;
-        let body = encode_create_device_request(&request, 10).unwrap();
+        let body =
+            encode_create_device_request(&request, GtpSocketProvisioning::UserspaceFd(10)).unwrap();
         let linkinfo = attr_payload_from(&body, IF_INFO_MESSAGE_LEN, IFLA_LINKINFO).unwrap();
         let info_data = attr_payload(linkinfo, IFLA_INFO_DATA).unwrap();
         assert_eq!(attr_u32(info_data, IFLA_GTP_ROLE), GTP_ROLE_SGSN);
@@ -3498,6 +3818,18 @@ mod tests {
     }
 
     #[test]
+    fn encodes_authoritative_link_identity_query_by_name() {
+        let body = encode_get_device_by_name_request("gtp0").unwrap();
+
+        assert_eq!(body[0], AF_UNSPEC);
+        assert_eq!(i32::from_ne_bytes(body[4..8].try_into().unwrap()), 0);
+        assert_eq!(
+            attr_payload_from(&body, IF_INFO_MESSAGE_LEN, IFLA_IFNAME),
+            Some(&b"gtp0\0"[..])
+        );
+    }
+
+    #[test]
     fn parses_ack_and_errno_mapping() {
         assert_eq!(parse_netlink_response(&ack(7), 7, 31).unwrap(), None);
 
@@ -3527,6 +3859,42 @@ mod tests {
         let wrong_family =
             encode_netlink_message(30, 0, 1, &encode_gtp_genl_header(GTP_CMD_GETPDP)).unwrap();
         let err = parse_netlink_response(&wrong_family, 1, 31).unwrap_err();
+        assert_eq!(err.io_kind(), Some(io::ErrorKind::InvalidData));
+
+        let first = encode_netlink_message(31, 0, 1, b"one!").unwrap();
+        let second = encode_netlink_message(31, 0, 1, b"two!").unwrap();
+        let mut duplicate = first.clone();
+        duplicate.extend_from_slice(&second);
+        let err = parse_netlink_response(&duplicate, 1, 31).unwrap_err();
+        assert_eq!(err.io_kind(), Some(io::ErrorKind::InvalidData));
+
+        let mut trailing_after_ack = first;
+        trailing_after_ack.extend_from_slice(&ack(1));
+        trailing_after_ack.push(0);
+        let err = parse_netlink_response(&trailing_after_ack, 1, 31).unwrap_err();
+        assert_eq!(err.io_kind(), Some(io::ErrorKind::InvalidData));
+
+        let unterminated_multipart = encode_netlink_message(31, NLM_F_MULTI, 1, b"only").unwrap();
+        let err = parse_netlink_response(&unterminated_multipart, 1, 31).unwrap_err();
+        assert_eq!(err.io_kind(), Some(io::ErrorKind::InvalidData));
+
+        let mut terminal_error = encode_netlink_message(31, 0, 1, b"same").unwrap();
+        terminal_error.extend_from_slice(
+            &encode_netlink_message(NLMSG_DONE, 0, 1, &(-ENODEV).to_ne_bytes()).unwrap(),
+        );
+        let err = parse_netlink_response(&terminal_error, 1, 31).unwrap_err();
+        assert_eq!(err.io_kind(), Some(io::ErrorKind::InvalidData));
+
+        // On 32-bit targets the second frame's declared u32::MAX length would
+        // overflow an unchecked `offset + length`; it must remain a typed
+        // decode error on every supported architecture.
+        let mut oversized_second = encode_netlink_message(NLMSG_NOOP, 0, 1, &[]).unwrap();
+        let mut oversized_header = vec![0_u8; NETLINK_HEADER_LEN];
+        oversized_header[0..4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        oversized_header[4..6].copy_from_slice(&31_u16.to_ne_bytes());
+        oversized_header[8..12].copy_from_slice(&1_u32.to_ne_bytes());
+        oversized_second.extend_from_slice(&oversized_header);
+        let err = parse_netlink_response(&oversized_second, 1, 31).unwrap_err();
         assert_eq!(err.io_kind(), Some(io::ErrorKind::InvalidData));
     }
 
@@ -3716,6 +4084,11 @@ mod tests {
             parse_device_alias_response(&body, &device).unwrap(),
             Some(alias.as_bytes().to_vec())
         );
+        let probe = parse_link_identity_response(&body, None, "retained_device_name_identity_read")
+            .unwrap();
+        assert_eq!(probe.ifindex, device.ifindex);
+        assert_eq!(probe.name, device.name.as_bytes());
+        assert_eq!(probe.alias, Some(alias.as_bytes().to_vec()));
 
         let replaced = GtpDevice {
             name: device.name.clone(),
@@ -3776,10 +4149,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(device.ifindex, 42);
-        assert_eq!(retained_socket_count(&backend), 1);
+        assert_eq!(retained_socket_count(&backend), 0);
+        let requests = transport.requests();
+        let create_body = netlink_body(&requests[0].request);
+        let linkinfo = attr_payload_from(create_body, IF_INFO_MESSAGE_LEN, IFLA_LINKINFO).unwrap();
+        let info_data = attr_payload(linkinfo, IFLA_INFO_DATA).unwrap();
+        assert_eq!(attr_u8(info_data, IFLA_GTP_CREATE_SOCKETS), 1);
+        assert!(attr_payload(info_data, IFLA_GTP_FD1).is_none());
         assert_eq!(
-            transport
-                .requests()
+            requests
                 .iter()
                 .map(|request| request.operation)
                 .collect::<Vec<_>>(),
@@ -3813,7 +4191,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(device.ifindex, 42);
-        assert_eq!(retained_socket_count(&backend), 1);
+        assert_eq!(retained_socket_count(&backend), 0);
         assert_eq!(
             transport
                 .requests()
@@ -3846,6 +4224,71 @@ mod tests {
         ));
         assert_eq!(retained_socket_count(&backend), 0);
         assert!(transport.requests().is_empty());
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_recoverable_device_propagates_name_probe_failure_before_effect() {
+        let root = unique_recovery_root("create-recoverable-name-probe-error");
+        let transport = CapturingTransport::new();
+        transport.push_ifindex_response(IfindexResponse::Error(GtpuError::io(
+            "retained_device_name_identity_read",
+            io::Error::from_raw_os_error(24),
+        )));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        assert!(matches!(
+            backend
+                .create_recoverable_device(
+                    CreateGtpDeviceRequest::new("gtp0"),
+                    test_device_incarnation(),
+                )
+                .await
+                .unwrap_err(),
+            GtpuError::Io { .. }
+        ));
+        assert_eq!(transport.ifindex_admissions(), 1);
+        assert!(transport.requests().is_empty());
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_recoverable_device_never_stamps_after_exclusive_create_conflict() {
+        let root = unique_recovery_root("create-recoverable-exclusive-conflict");
+        let transport = CapturingTransport::new();
+        transport.push_ifindex_response(IfindexResponse::NotFound);
+        transport.push_response(Err(GtpuError::AlreadyExists));
+        // A later lookup would find the preexisting link. The EEXIST result is
+        // definitive for this exclusive transaction, so it must not occur.
+        transport.push_ifindex_response(IfindexResponse::Found(42));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        assert!(matches!(
+            backend
+                .create_recoverable_device(
+                    CreateGtpDeviceRequest::new("gtp0"),
+                    test_device_incarnation(),
+                )
+                .await
+                .unwrap_err(),
+            GtpuError::AlreadyExists
+        ));
+        assert_eq!(transport.ifindex_admissions(), 1);
+        assert_eq!(
+            transport
+                .requests()
+                .iter()
+                .map(|request| request.operation)
+                .collect::<Vec<_>>(),
+            vec!["create_device"]
+        );
+        assert_eq!(retained_socket_count(&backend), 0);
         drop(backend);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3907,6 +4350,58 @@ mod tests {
             }
         ));
         assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn linux_recoverable_device_rejects_nonstandard_gtpu_port_before_effect() {
+        let root = unique_recovery_root("create-recoverable-nonstandard-port");
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+        let mut request = CreateGtpDeviceRequest::new("gtp0");
+        request.bind_port = GTPU_PORT + 1;
+
+        assert!(matches!(
+            backend
+                .create_recoverable_device(request, test_device_incarnation())
+                .await
+                .unwrap_err(),
+            GtpuError::InvalidConfig {
+                field: "device.bind_port",
+                ..
+            }
+        ));
+        assert!(transport.requests().is_empty());
+        assert_eq!(retained_socket_count(&backend), 0);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_recoverable_device_rejects_non_wildcard_ipv4_bind_before_effect() {
+        let root = unique_recovery_root("create-recoverable-non-wildcard-bind");
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+        let mut request = CreateGtpDeviceRequest::new("gtp0");
+        request.bind_address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        assert!(matches!(
+            backend
+                .create_recoverable_device(request, test_device_incarnation())
+                .await
+                .unwrap_err(),
+            GtpuError::InvalidConfig {
+                field: "device.bind_address",
+                ..
+            }
+        ));
+        assert!(transport.requests().is_empty());
+        assert_eq!(retained_socket_count(&backend), 0);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -4952,9 +5447,8 @@ mod tests {
     #[tokio::test]
     async fn linux_restart_recovery_refuses_replaced_device_identity() {
         let mut transport = CapturingTransport::new();
-        // The recorded name now resolves to a different ifindex: the device
-        // was replaced, so the durable descriptor is stale.
-        transport.ifindex = 99;
+        // No link owns the recorded ifindex: the durable descriptor is stale.
+        transport.link_identity = None;
         let request = recovery_request(pdp_context());
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
             .with_pdp_recovery_root(unique_recovery_root("recover-replaced"))
@@ -4976,7 +5470,11 @@ mod tests {
         // still match, but the replacement's kernel-bound incarnation does
         // not, so no PDP read or mutation is authorized.
         let replacement = PdpDeviceIncarnation::from_bytes([0x5a; 16]).unwrap();
-        transport.device_alias = Some(encode_pdp_device_alias(replacement).into_bytes());
+        transport.link_identity = Some(LinkIdentityProbe {
+            ifindex: 42,
+            name: b"gtp0".to_vec(),
+            alias: Some(encode_pdp_device_alias(replacement).into_bytes()),
+        });
         let request = recovery_request(pdp_context());
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
             .with_pdp_recovery_root(unique_recovery_root("recover-incarnation-replaced"))
@@ -4989,6 +5487,30 @@ mod tests {
             PdpContextRemovalOutcome::RepairRequired(PdpContextRepairReason::DeviceIdentityChanged)
         );
         assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn linux_restart_recovery_propagates_device_identity_read_failure() {
+        let root = unique_recovery_root("recover-identity-read-error");
+        let transport = CapturingTransport::new();
+        transport.push_link_identity_response(Err(GtpuError::io(
+            "pdp_device_identity_read",
+            io::Error::from_raw_os_error(24),
+        )));
+        let request = recovery_request(pdp_context());
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let error = backend
+            .recover_pdp_context_exact(request)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, GtpuError::Io { .. }));
+        assert!(transport.requests().is_empty());
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -5135,7 +5657,8 @@ mod tests {
             backend
                 .acquire_retained_device_identity(retained_device_request())
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome(),
             RetainedDeviceIdentityOutcome::Indeterminate(
                 RetainedDeviceIndeterminateReason::AuthorityUnavailable
             )
@@ -5166,7 +5689,8 @@ mod tests {
             backend
                 .acquire_retained_device_identity(retained_device_request())
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome(),
             RetainedDeviceIdentityOutcome::Indeterminate(
                 RetainedDeviceIndeterminateReason::AuthorityUnavailable
             )
@@ -5179,10 +5703,17 @@ mod tests {
 
     fn retained_device_request() -> RetainedDeviceIdentityRequest {
         RetainedDeviceIdentityRequest::new(
-            GtpDevice {
-                name: "gtp0".to_string(),
-                ifindex: 42,
-            },
+            "gtp0",
+            Some(42),
+            test_device_incarnation(),
+            PdpRestartRecoveryProof::previous_writer_stopped(),
+        )
+    }
+
+    fn prepared_retained_device_request() -> RetainedDeviceIdentityRequest {
+        RetainedDeviceIdentityRequest::new(
+            "gtp0",
+            None,
             test_device_incarnation(),
             PdpRestartRecoveryProof::previous_writer_stopped(),
         )
@@ -5217,7 +5748,45 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome, RetainedDeviceIdentityOutcome::Retained);
+        assert_eq!(outcome.outcome(), RetainedDeviceIdentityOutcome::Retained);
+        assert_eq!(
+            outcome.retained_device(),
+            Some(&GtpDevice {
+                name: "gtp0".to_string(),
+                ifindex: 42,
+            })
+        );
+        assert_eq!(transport.ifindex_admissions(), 0);
+        assert_eq!(transport.link_identity_admissions(), 1);
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_prepared_retained_device_identity_returns_discovered_device_without_mutation() {
+        let root = unique_recovery_root("acquire-prepared-retained");
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let acquisition = backend
+            .acquire_retained_device_identity(prepared_retained_device_request())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            acquisition.outcome(),
+            RetainedDeviceIdentityOutcome::Retained
+        );
+        assert_eq!(
+            acquisition.into_retained_device(),
+            Some(GtpDevice {
+                name: "gtp0".to_string(),
+                ifindex: 42,
+            })
+        );
         assert_eq!(transport.ifindex_admissions(), 1);
         assert_eq!(transport.link_identity_admissions(), 1);
         assert_no_netlink_traffic(&transport);
@@ -5226,13 +5795,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn linux_retained_device_identity_removed_or_renamed_name_is_absent_without_mutation() {
-        // A removed device and a renamed device both present as authoritative
-        // absence of the recorded name. Under the held topology authority no
-        // cooperating writer can create the name concurrently, so absence
-        // authorizes exactly one fresh create_recoverable_device call.
+    async fn linux_retained_device_identity_removed_name_and_ifindex_is_absent_without_mutation() {
+        // With a durably recorded ifindex, absence is authoritative only when
+        // both that exact link and the recorded name are absent.
         let root = unique_recovery_root("acquire-absent");
-        let transport = CapturingTransport::new();
+        let mut transport = CapturingTransport::new();
+        transport.link_identity = None;
         transport.push_ifindex_response(IfindexResponse::NotFound);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
             .with_pdp_recovery_root(root.clone())
@@ -5243,10 +5811,65 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome, RetainedDeviceIdentityOutcome::Absent);
-        // Absence is proven by the name lookup alone: no link probe follows.
+        assert_eq!(outcome.outcome(), RetainedDeviceIdentityOutcome::Absent);
+        assert_eq!(transport.ifindex_admissions(), 1);
+        assert_eq!(transport.link_identity_admissions(), 1);
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_prepared_retained_device_identity_lookup_failure_is_not_absence() {
+        let root = unique_recovery_root("acquire-name-lookup-error");
+        let transport = CapturingTransport::new();
+        transport.push_ifindex_response(IfindexResponse::Error(GtpuError::io(
+            "retained_device_name_identity_read",
+            io::Error::other("redacted"),
+        )));
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let error = backend
+            .acquire_retained_device_identity(prepared_retained_device_request())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, GtpuError::Io { .. }));
         assert_eq!(transport.ifindex_admissions(), 1);
         assert_eq!(transport.link_identity_admissions(), 0);
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_renamed_expected_ifindex_is_conflict() {
+        let root = unique_recovery_root("acquire-renamed");
+        let mut transport = CapturingTransport::new();
+        transport.link_identity = Some(LinkIdentityProbe {
+            ifindex: 42,
+            name: b"gtp-renamed".to_vec(),
+            alias: Some(encode_pdp_device_alias(test_device_incarnation()).into_bytes()),
+        });
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let acquisition = backend
+            .acquire_retained_device_identity(retained_device_request())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            acquisition.outcome(),
+            RetainedDeviceIdentityOutcome::Conflict(
+                RetainedDeviceConflictReason::ReplacementIdentity
+            )
+        );
+        assert_eq!(transport.ifindex_admissions(), 0);
+        assert_eq!(transport.link_identity_admissions(), 1);
         assert_no_netlink_traffic(&transport);
         drop(backend);
         let _ = std::fs::remove_dir_all(root);
@@ -5257,6 +5880,7 @@ mod tests {
         let root = unique_recovery_root("acquire-replaced-ifindex");
         let mut transport = CapturingTransport::new();
         // The recorded name is occupied by a different link.
+        transport.link_identity = None;
         transport.ifindex = 99;
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
             .with_pdp_recovery_root(root.clone())
@@ -5268,12 +5892,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            outcome,
+            outcome.outcome(),
             RetainedDeviceIdentityOutcome::Conflict(
                 RetainedDeviceConflictReason::ReplacementIdentity
             )
         );
-        assert_eq!(transport.link_identity_admissions(), 0);
+        assert_eq!(transport.link_identity_admissions(), 1);
         assert_no_netlink_traffic(&transport);
         drop(backend);
         let _ = std::fs::remove_dir_all(root);
@@ -5288,6 +5912,7 @@ mod tests {
         let mut transport = CapturingTransport::new();
         let replacement = PdpDeviceIncarnation::from_bytes([0x5a; 16]).unwrap();
         transport.link_identity = Some(LinkIdentityProbe {
+            ifindex: 42,
             name: b"gtp0".to_vec(),
             alias: Some(encode_pdp_device_alias(replacement).into_bytes()),
         });
@@ -5301,11 +5926,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            outcome,
+            outcome.outcome(),
             RetainedDeviceIdentityOutcome::Conflict(
                 RetainedDeviceConflictReason::ReplacementIdentity
             )
         );
+        assert_no_netlink_traffic(&transport);
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_retained_device_identity_refuses_legacy_userspace_socket_stamp() {
+        // Version 1 did not attest kernel-owned sockets. After its creator
+        // exits, the Linux driver detaches the userspace socket while leaving
+        // the netdevice live, so that stamp can never authorize serving reuse.
+        let root = unique_recovery_root("acquire-legacy-socket-stamp");
+        let mut transport = CapturingTransport::new();
+        transport.link_identity = Some(LinkIdentityProbe {
+            ifindex: 42,
+            name: b"gtp0".to_vec(),
+            alias: Some(format!("opc-pdp-recovery-v1:{}", "a5".repeat(16)).into_bytes()),
+        });
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+
+        let acquisition = backend
+            .acquire_retained_device_identity(retained_device_request())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            acquisition.outcome(),
+            RetainedDeviceIdentityOutcome::Conflict(
+                RetainedDeviceConflictReason::ReplacementIdentity
+            )
+        );
+        assert!(acquisition.retained_device().is_none());
         assert_no_netlink_traffic(&transport);
         drop(backend);
         let _ = std::fs::remove_dir_all(root);
@@ -5319,6 +5977,7 @@ mod tests {
         let root = unique_recovery_root("acquire-unstamped");
         let mut transport = CapturingTransport::new();
         transport.link_identity = Some(LinkIdentityProbe {
+            ifindex: 42,
             name: b"gtp0".to_vec(),
             alias: None,
         });
@@ -5332,11 +5991,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            outcome,
+            outcome.outcome(),
             RetainedDeviceIdentityOutcome::RepairRequired(RetainedDeviceRepairReason::Unstamped)
         );
         assert_ne!(
-            outcome,
+            outcome.outcome(),
             RetainedDeviceIdentityOutcome::Indeterminate(
                 RetainedDeviceIndeterminateReason::AuthorityUnavailable
             )
@@ -5354,6 +6013,7 @@ mod tests {
         let root = unique_recovery_root("acquire-malformed-alias");
         let mut transport = CapturingTransport::new();
         transport.link_identity = Some(LinkIdentityProbe {
+            ifindex: 42,
             name: b"gtp0".to_vec(),
             alias: Some(b"operator-assigned alias".to_vec()),
         });
@@ -5367,7 +6027,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            outcome,
+            outcome.outcome(),
             RetainedDeviceIdentityOutcome::Conflict(
                 RetainedDeviceConflictReason::ReplacementIdentity
             )
@@ -5407,13 +6067,12 @@ mod tests {
 
     #[tokio::test]
     async fn linux_retained_device_identity_contested_name_readback_fails_closed() {
-        // The authoritative link readback disagrees with the name that just
-        // resolved to the expected ifindex. No cooperating writer can rename
-        // a link while both authorities are held, so the contested state is a
-        // structural error rather than a classification.
+        // A prepared lookup that discovers the recorded name and then reads a
+        // different name after taking device authority is never retained.
         let root = unique_recovery_root("acquire-contested-name");
         let transport = CapturingTransport::new();
         transport.push_link_identity_response(Ok(Some(LinkIdentityProbe {
+            ifindex: 42,
             name: b"gtp-renamed".to_vec(),
             alias: Some(encode_pdp_device_alias(test_device_incarnation()).into_bytes()),
         })));
@@ -5421,17 +6080,17 @@ mod tests {
             .with_pdp_recovery_root(root.clone())
             .unwrap();
 
-        let error = backend
-            .acquire_retained_device_identity(retained_device_request())
+        let acquisition = backend
+            .acquire_retained_device_identity(prepared_retained_device_request())
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            error,
-            GtpuError::StateIndeterminate {
-                operation: "retained_device_identity"
-            }
-        ));
+        assert_eq!(
+            acquisition.outcome(),
+            RetainedDeviceIdentityOutcome::Conflict(
+                RetainedDeviceConflictReason::ReplacementIdentity
+            )
+        );
         assert_no_netlink_traffic(&transport);
         drop(backend);
         let _ = std::fs::remove_dir_all(root);
@@ -5496,13 +6155,10 @@ mod tests {
             .with_pdp_recovery_root(root.clone())
             .unwrap();
 
-        let mut device = GtpDevice {
-            name: "gtp0".to_string(),
-            ifindex: 0,
-        };
         let error = backend
             .acquire_retained_device_identity(RetainedDeviceIdentityRequest::new(
-                device.clone(),
+                "gtp0",
+                Some(0),
                 test_device_incarnation(),
                 PdpRestartRecoveryProof::previous_writer_stopped(),
             ))
@@ -5510,11 +6166,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, GtpuError::InvalidConfig { .. }));
 
-        device.name = String::new();
-        device.ifindex = 42;
         let error = backend
             .acquire_retained_device_identity(RetainedDeviceIdentityRequest::new(
-                device,
+                "",
+                Some(42),
                 test_device_incarnation(),
                 PdpRestartRecoveryProof::previous_writer_stopped(),
             ))
@@ -5544,7 +6199,8 @@ mod tests {
             backend
                 .acquire_retained_device_identity(retained_device_request())
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome(),
             RetainedDeviceIdentityOutcome::Indeterminate(
                 RetainedDeviceIndeterminateReason::AuthorityUnavailable
             )
@@ -5559,7 +6215,8 @@ mod tests {
             backend
                 .acquire_retained_device_identity(retained_device_request())
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome(),
             RetainedDeviceIdentityOutcome::Indeterminate(
                 RetainedDeviceIndeterminateReason::AuthorityUnavailable
             )
@@ -5584,9 +6241,10 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(
                 backend
-                    .acquire_retained_device_identity(retained_device_request())
+                    .acquire_retained_device_identity(prepared_retained_device_request())
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .outcome(),
                 RetainedDeviceIdentityOutcome::Retained
             );
         }
@@ -5595,9 +6253,10 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(
                 backend
-                    .acquire_retained_device_identity(retained_device_request())
+                    .acquire_retained_device_identity(prepared_retained_device_request())
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .outcome(),
                 RetainedDeviceIdentityOutcome::Absent
             );
         }
@@ -5635,6 +6294,17 @@ mod tests {
                     "outcome debug leaked {secret}: {rendered}"
                 );
             }
+        }
+        let acquisition = RetainedDeviceIdentityAcquisition::retained(GtpDevice {
+            name: "gtp0".to_string(),
+            ifindex: 42,
+        });
+        let rendered = format!("{acquisition:?}");
+        for secret in ["gtp0", "42", "a5a5", "[165, 165"] {
+            assert!(
+                !rendered.contains(secret),
+                "acquisition debug leaked {secret}: {rendered}"
+            );
         }
     }
 
@@ -5697,7 +6367,8 @@ mod tests {
             retry_backend
                 .acquire_retained_device_identity(retained_device_request())
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome(),
             RetainedDeviceIdentityOutcome::Indeterminate(
                 RetainedDeviceIndeterminateReason::AuthorityUnavailable
             )
@@ -5755,7 +6426,8 @@ mod tests {
             retry_backend
                 .acquire_retained_device_identity(retained_device_request())
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome(),
             RetainedDeviceIdentityOutcome::Retained
         );
         assert_eq!(transport.link_identity_admissions(), 2);
@@ -5768,9 +6440,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn linux_retained_device_identity_cancellation_at_name_lookup_boundary() {
         // The second admitted boundary: the latched name lookup holds the
-        // worker before the link-identity probe, with both writer authorities
-        // already held. Dropping the future there must still retain
-        // completion authority and prevent an overlapping acquisition.
+        // prepared worker before it can discover and lock the device. The
+        // topology authority is already held, so dropping the future must
+        // still prevent an overlapping acquisition until the worker finishes.
         let transport = CapturingTransport::new();
         let latch = Arc::new(ResponseLatch::new());
         let mut latch_guard = ResponseLatchReleaseGuard::new(latch.clone());
@@ -5782,12 +6454,12 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             backend
-                .acquire_retained_device_identity(retained_device_request())
+                .acquire_retained_device_identity(prepared_retained_device_request())
                 .await
         });
 
         // Wait until the worker admits the name lookup and blocks on the
-        // latch while holding both writer authorities.
+        // latch while holding topology authority.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             if transport.ifindex_admissions() >= 1 {
@@ -5812,9 +6484,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             retry_backend
-                .acquire_retained_device_identity(retained_device_request())
+                .acquire_retained_device_identity(prepared_retained_device_request())
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome(),
             RetainedDeviceIdentityOutcome::Indeterminate(
                 RetainedDeviceIndeterminateReason::AuthorityUnavailable
             )
@@ -5851,11 +6524,14 @@ mod tests {
         assert_eq!(transport.link_identity_admissions(), 1);
         assert_eq!(
             retry_backend
-                .acquire_retained_device_identity(retained_device_request())
+                .acquire_retained_device_identity(prepared_retained_device_request())
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome(),
             RetainedDeviceIdentityOutcome::Retained
         );
+        assert_eq!(transport.ifindex_admissions(), 2);
+        assert_eq!(transport.link_identity_admissions(), 2);
         assert_no_netlink_traffic(&transport);
         drop(retry_backend);
         let _ = std::fs::remove_dir_all(root);

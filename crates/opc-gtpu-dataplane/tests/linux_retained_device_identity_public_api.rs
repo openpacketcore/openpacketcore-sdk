@@ -9,16 +9,23 @@ use std::path::PathBuf;
 
 use opc_gtpu_dataplane::{
     GtpDevice, GtpuError, LinuxGtpuDataplaneBackend, PdpDeviceIncarnation, PdpRestartRecoveryProof,
-    RetainedDeviceConflictReason, RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest,
-    RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
+    RetainedDeviceConflictReason, RetainedDeviceIdentityAcquisition, RetainedDeviceIdentityOutcome,
+    RetainedDeviceIdentityRequest, RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
 };
 
 fn assert_send_sync<T: Send + Sync>() {}
 
 fn assert_identity_request_accessors(request: &RetainedDeviceIdentityRequest) {
-    let _: &GtpDevice = request.device();
+    let _: &str = request.name();
+    let _: Option<u32> = request.expected_ifindex();
     let _: PdpDeviceIncarnation = request.incarnation();
     let _: PdpRestartRecoveryProof = request.writer_proof();
+}
+
+fn assert_acquisition_accessors(acquisition: RetainedDeviceIdentityAcquisition) {
+    let _: RetainedDeviceIdentityOutcome = acquisition.outcome();
+    let _: Option<&GtpDevice> = acquisition.retained_device();
+    let _: Option<GtpDevice> = acquisition.into_retained_device();
 }
 
 // Compile-time proof that the acquisition entry point exists with the
@@ -27,13 +34,14 @@ fn assert_identity_request_accessors(request: &RetainedDeviceIdentityRequest) {
 async fn acquire_returns_classified_identity_outcome(
     backend: &LinuxGtpuDataplaneBackend,
     request: RetainedDeviceIdentityRequest,
-) -> Result<RetainedDeviceIdentityOutcome, GtpuError> {
+) -> Result<RetainedDeviceIdentityAcquisition, GtpuError> {
     backend.acquire_retained_device_identity(request).await
 }
 
 #[test]
 fn linux_retained_device_identity_surface_is_public_and_typed() {
     assert_send_sync::<RetainedDeviceIdentityRequest>();
+    assert_send_sync::<RetainedDeviceIdentityAcquisition>();
     assert_send_sync::<RetainedDeviceIdentityOutcome>();
     assert_send_sync::<RetainedDeviceConflictReason>();
     assert_send_sync::<RetainedDeviceIndeterminateReason>();
@@ -89,15 +97,15 @@ fn linux_retained_device_identity_surface_is_public_and_typed() {
         |backend, root| backend.with_pdp_recovery_root(root);
 
     let _accessors: fn(&RetainedDeviceIdentityRequest) = assert_identity_request_accessors;
+    let _acquisition_accessors: fn(RetainedDeviceIdentityAcquisition) =
+        assert_acquisition_accessors;
 }
 
 #[test]
 fn linux_retained_device_identity_request_is_redaction_safe() {
     let request = RetainedDeviceIdentityRequest::new(
-        GtpDevice {
-            name: "gtp0".to_string(),
-            ifindex: 7,
-        },
+        "gtp0",
+        Some(7),
         PdpDeviceIncarnation::from_bytes([0xa5; 16]).unwrap(),
         PdpRestartRecoveryProof::previous_writer_stopped(),
     );
@@ -108,4 +116,12 @@ fn linux_retained_device_identity_request_is_redaction_safe() {
             "identity request debug leaked {secret}: {rendered}"
         );
     }
+
+    let prepared = RetainedDeviceIdentityRequest::new(
+        "gtp0",
+        None,
+        PdpDeviceIncarnation::from_bytes([0xa5; 16]).unwrap(),
+        PdpRestartRecoveryProof::previous_writer_stopped(),
+    );
+    assert_eq!(prepared.expected_ifindex(), None);
 }

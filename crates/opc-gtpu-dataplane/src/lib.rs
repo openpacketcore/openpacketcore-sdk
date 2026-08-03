@@ -91,8 +91,8 @@ pub use model::{
     PdpContextSelector, PdpContextSelectorOccupancy, PdpContextUplinkIdentity,
     PdpContextUplinkSelector, PdpDeviceIncarnation, PdpRestartRecoveryProof,
     PdpRestartRecoveryRequest, RemovePdpContextRequest, RetainedDeviceConflictReason,
-    RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest,
-    RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
+    RetainedDeviceIdentityAcquisition, RetainedDeviceIdentityOutcome,
+    RetainedDeviceIdentityRequest, RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
     RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest,
     Teid, GTPU_PORT,
 };
