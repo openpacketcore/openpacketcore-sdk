@@ -3490,8 +3490,15 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        // Cancel the caller's future at the admitted-mutation boundary.
+        // Cancel the caller's future at the admitted-mutation boundary, and
+        // record in-test that the outer task really was cancelled. It cannot
+        // have completed normally: the worker is still blocked on the
+        // unreleased latch, so the JoinHandle it is awaited on cannot resolve.
         handle.abort();
+        let join_error = handle
+            .await
+            .expect_err("the aborted recovery future must not complete");
+        assert!(join_error.is_cancelled());
 
         // The worker is still blocked on the latch; release it and let the
         // transaction converge.
@@ -3544,14 +3551,18 @@ mod tests {
         let outcome = backend.remove_pdp_context_exact(context).await.unwrap();
 
         assert_eq!(outcome, PdpContextRemovalOutcome::Removed);
-        assert_eq!(
-            transport
-                .requests()
-                .iter()
-                .filter(|request| request.operation == "remove_pdp_context_exact")
-                .count(),
-            1
-        );
+        let deletes: Vec<_> = transport
+            .requests()
+            .into_iter()
+            .filter(|request| request.operation == "remove_pdp_context_exact")
+            .collect();
+        assert_eq!(deletes.len(), 1);
+        // Axis purity holds for the IPv6 family too: the delete selects the
+        // I_TEI axis with an AF_INET6 lookup family and carries no MS address.
+        let attrs = &netlink_body(&deletes[0].request)[GENERIC_NETLINK_HEADER_LEN..];
+        assert_eq!(attr_u8(attrs, GTPA_FAMILY), AF_INET6);
+        assert!(attr_payload(attrs, GTPA_MS_ADDRESS).is_none());
+        assert!(attr_payload(attrs, GTPA_MS_ADDR6).is_none());
     }
 
     #[tokio::test]
@@ -3761,9 +3772,7 @@ mod tests {
         let ready_path = std::env::var("OPC_GTPU_627_LEASE_READY").expect("ready path env");
         let file = rustix::fs::open(
             std::path::Path::new(&lock_path),
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::CREATE
-                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::CLOEXEC,
             rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
         )
         .map(std::fs::File::from)
