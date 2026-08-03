@@ -5,11 +5,12 @@ use std::fmt;
 use crate::durable_object::{
     DurableObjectRecord, XfrmObjectInstallDurableError, XfrmObjectInstallDurablePhase,
     XfrmObjectInstallOperationGeneration, XfrmObjectInstallOperationId,
-    XfrmObjectInstallRecoveryHandle, XfrmObjectInstallRecoveryStore,
+    XfrmObjectInstallPreEffectProof, XfrmObjectInstallRecoveryHandle,
+    XfrmObjectInstallRecoveryStore,
 };
 use crate::{
-    ExactRemovePolicyRequest, XfrmBackend, XfrmError, XfrmObjectInstallRequest,
-    XfrmObjectRemovalRequest,
+    ExactRemovePolicyRequest, QueryPolicyRequest, QuerySaRequest, XfrmBackend, XfrmError,
+    XfrmObjectInstallRequest, XfrmObjectRemovalRequest,
 };
 
 /// Durable terminal result of one create-exclusive staged-object install.
@@ -93,6 +94,16 @@ pub enum XfrmObjectInstallRestartOutcome {
         /// Redaction-safe backend failure.
         source: XfrmError,
     },
+    /// A pre-effect proof proved the exact identity present before the effect
+    /// was admitted, and that same foreign/conflicting identity is still
+    /// present. The record was retired without any deletion; the foreign state
+    /// was left untouched.
+    ForeignUntouched,
+    /// The durable record is inconsistent in a way this boundary cannot safely
+    /// repair (for example a stale writer epoch or a missing proof). The record
+    /// is retained and continues to gate cooperating writers; product repair is
+    /// required before any deletion may be considered.
+    RepairRequired,
 }
 
 impl XfrmObjectInstallRestartOutcome {
@@ -105,6 +116,8 @@ impl XfrmObjectInstallRestartOutcome {
             Self::Committed => "committed",
             Self::Retired => "retired",
             Self::RemovalPending { .. } => "removal_pending",
+            Self::ForeignUntouched => "foreign_untouched",
+            Self::RepairRequired => "repair_required",
         }
     }
 
@@ -183,6 +196,7 @@ pub(crate) async fn issue_durable_object_install<B>(
     operation_generation: XfrmObjectInstallOperationGeneration,
     request: &XfrmObjectInstallRequest,
     backend: &B,
+    pre_effect_proof: XfrmObjectInstallPreEffectProof,
 ) -> Result<XfrmObjectInstallDurableOutcome, XfrmObjectInstallDurableError>
 where
     B: XfrmBackend + ?Sized,
@@ -199,6 +213,7 @@ where
         prepared,
         XfrmObjectInstallDurablePhase::Prepared,
         XfrmObjectInstallDurablePhase::Issuing,
+        Some(pre_effect_proof),
     )?;
     let result = install(backend, request).await;
     let (phase, source) = match result {
@@ -210,6 +225,7 @@ where
         &store.handle_for_record(&issuing)?,
         XfrmObjectInstallDurablePhase::Issuing,
         phase,
+        None,
     )?;
     let handle = store.handle_for_record(&terminal)?;
     Ok(match phase {
@@ -224,6 +240,54 @@ where
         }
         _ => return Err(XfrmObjectInstallDurableError::InvalidTransition),
     })
+}
+
+/// Process-loss detector seam: drive a prepared operation to a durable
+/// `Issuing` record and stop before the terminal publication.
+///
+/// This reproduces the exact crash window that `issue_durable_object_install`
+/// would leave if the process died between the `Issuing` publication and the
+/// terminal record. When `admit_backend_effect` is true the install is invoked
+/// exactly as the real effect admission does (the writer epoch was already
+/// burned by the `Issuing` transition), so the kernel object exists while the
+/// record remains `Issuing`; when false the backend is never touched. No
+/// terminal phase is published, so the record stays unresolved and
+/// recoverable. This is only used by privileged crash detectors and never
+/// grants deletion authority.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cut_durable_object_install_at_issuing<B>(
+    store: &XfrmObjectInstallRecoveryStore,
+    prepared: &XfrmObjectInstallRecoveryHandle,
+    operation_id: XfrmObjectInstallOperationId,
+    operation_generation: XfrmObjectInstallOperationGeneration,
+    request: &XfrmObjectInstallRequest,
+    backend: &B,
+    pre_effect_proof: XfrmObjectInstallPreEffectProof,
+    admit_backend_effect: bool,
+) -> Result<(), XfrmObjectInstallDurableError>
+where
+    B: XfrmBackend + ?Sized,
+{
+    validate_durable_object_install_admission(
+        store,
+        prepared,
+        operation_id,
+        operation_generation,
+        request,
+    )?;
+    store.transition(
+        prepared,
+        XfrmObjectInstallDurablePhase::Prepared,
+        XfrmObjectInstallDurablePhase::Issuing,
+        Some(pre_effect_proof),
+    )?;
+    if admit_backend_effect {
+        // Simulate the kernel accepting the effect before the terminal record
+        // is published. The outcome is intentionally ignored: a crash here
+        // leaves no durable terminal result regardless of success.
+        let _ = install(backend, request).await;
+    }
+    Ok(())
 }
 
 pub(crate) fn finalize_durable_object_install(
@@ -246,6 +310,7 @@ pub(crate) fn finalize_durable_object_install(
                 &handle,
                 XfrmObjectInstallDurablePhase::Acquired,
                 XfrmObjectInstallDurablePhase::Committed,
+                None,
             )
             .map(|record| record.phase),
         XfrmObjectInstallDurablePhase::NoMutation => store
@@ -253,6 +318,7 @@ pub(crate) fn finalize_durable_object_install(
                 &handle,
                 XfrmObjectInstallDurablePhase::NoMutation,
                 XfrmObjectInstallDurablePhase::Retired,
+                None,
             )
             .map(|record| record.phase),
         XfrmObjectInstallDurablePhase::Committed | XfrmObjectInstallDurablePhase::Retired => {
@@ -287,6 +353,7 @@ where
                 &store.handle_for_record(&record)?,
                 XfrmObjectInstallDurablePhase::Prepared,
                 XfrmObjectInstallDurablePhase::Retired,
+                None,
             )?;
             Ok(XfrmObjectInstallRestartOutcome::NoMutation)
         }
@@ -295,6 +362,7 @@ where
                 &store.handle_for_record(&record)?,
                 XfrmObjectInstallDurablePhase::NoMutation,
                 XfrmObjectInstallDurablePhase::Retired,
+                None,
             )?;
             Ok(XfrmObjectInstallRestartOutcome::NoMutation)
         }
@@ -303,6 +371,7 @@ where
                 &store.handle_for_record(&record)?,
                 XfrmObjectInstallDurablePhase::Acquired,
                 XfrmObjectInstallDurablePhase::RemovalAdmitted,
+                None,
             )?;
             retire_admitted(store, admitted, &removal, request.policy_if_id(), backend).await
         }
@@ -310,10 +379,144 @@ where
             retire_admitted(store, record, &removal, request.policy_if_id(), backend).await
         }
         XfrmObjectInstallDurablePhase::Issuing | XfrmObjectInstallDurablePhase::Indeterminate => {
-            Ok(XfrmObjectInstallRestartOutcome::Indeterminate)
+            reconcile_unresolved(store, record, request, &removal, backend).await
         }
         XfrmObjectInstallDurablePhase::Committed => Ok(XfrmObjectInstallRestartOutcome::Committed),
         XfrmObjectInstallDurablePhase::Retired => Ok(XfrmObjectInstallRestartOutcome::Retired),
+    }
+}
+
+/// Reconcile an `Issuing` or `Indeterminate` record by combining its durable
+/// pre-effect proof with a fresh exact readback of the deletion identity.
+///
+/// The proof was witnessed before the backend effect was admitted. Because the
+/// extended writer gate excluded every other cooperating writer for the whole
+/// time the record remained unresolved, the proof plus the current readback is
+/// sufficient to classify the exact identity:
+///
+/// - absent + `Absent`: the effect provably never happened; retire as
+///   no-mutation without any deletion.
+/// - present + `Absent`: the identity appeared inside this operation's effect
+///   window and can only be this operation's residue; admit and remove it.
+/// - present + `Conflict`: the identity predates the effect, so the
+///   create-exclusive install cannot have created it; leave the foreign state
+///   untouched and retire.
+/// - absent + `Conflict`: the pre-existing conflict is gone and this operation
+///   made no mutation; retire as no-mutation.
+///
+/// A readback failure leaves the record unresolved and retryable. A durable
+/// anomaly (stale epoch or missing proof) is classified for repair and the
+/// record keeps gating cooperating writers.
+async fn reconcile_unresolved<B>(
+    store: &XfrmObjectInstallRecoveryStore,
+    record: DurableObjectRecord,
+    request: &XfrmObjectInstallRequest,
+    removal: &XfrmObjectRemovalRequest,
+    backend: &B,
+) -> Result<XfrmObjectInstallRestartOutcome, XfrmObjectInstallDurableError>
+where
+    B: XfrmBackend + ?Sized,
+{
+    let phase = record.phase;
+    let Some(proof) = record.pre_effect_proof else {
+        return Ok(XfrmObjectInstallRestartOutcome::RepairRequired);
+    };
+    if !store.record_writer_epoch_is_current(&record)? {
+        return Ok(XfrmObjectInstallRestartOutcome::RepairRequired);
+    }
+    let present = match readback_object_present(backend, request).await {
+        Ok(present) => present,
+        Err(_) => return Ok(XfrmObjectInstallRestartOutcome::Indeterminate),
+    };
+    let handle = store.handle_for_record(&record)?;
+    match (present, proof) {
+        (false, XfrmObjectInstallPreEffectProof::Absent)
+        | (false, XfrmObjectInstallPreEffectProof::Conflict) => {
+            retire_through_no_mutation(store, &handle, phase)?;
+            Ok(XfrmObjectInstallRestartOutcome::NoMutation)
+        }
+        (true, XfrmObjectInstallPreEffectProof::Absent) => {
+            let admitted = store.transition(
+                &handle,
+                phase,
+                XfrmObjectInstallDurablePhase::RemovalAdmitted,
+                None,
+            )?;
+            retire_admitted(store, admitted, removal, request.policy_if_id(), backend).await
+        }
+        (true, XfrmObjectInstallPreEffectProof::Conflict) => {
+            retire_through_no_mutation(store, &handle, phase)?;
+            Ok(XfrmObjectInstallRestartOutcome::ForeignUntouched)
+        }
+    }
+}
+
+fn retire_through_no_mutation(
+    store: &XfrmObjectInstallRecoveryStore,
+    handle: &XfrmObjectInstallRecoveryHandle,
+    phase: XfrmObjectInstallDurablePhase,
+) -> Result<(), XfrmObjectInstallDurableError> {
+    let no_mutation = store.transition(
+        handle,
+        phase,
+        XfrmObjectInstallDurablePhase::NoMutation,
+        None,
+    )?;
+    store.transition(
+        &store.handle_for_record(&no_mutation)?,
+        XfrmObjectInstallDurablePhase::NoMutation,
+        XfrmObjectInstallDurablePhase::Retired,
+        None,
+    )?;
+    Ok(())
+}
+
+/// Exact presence readback of the deletion identity for an install request.
+///
+/// Returns `Ok(true)` when the identity is present, `Ok(false)` when it is
+/// definitively absent, and `Err` when the readback itself cannot be trusted.
+/// This is observation only; it never authorizes a mutation on its own.
+pub(crate) async fn readback_object_present<B>(
+    backend: &B,
+    request: &XfrmObjectInstallRequest,
+) -> Result<bool, XfrmError>
+where
+    B: XfrmBackend + ?Sized,
+{
+    match request {
+        XfrmObjectInstallRequest::Sa(request) => {
+            let parameters = &request.parameters;
+            let mut query = QuerySaRequest::new(
+                parameters.id.destination,
+                parameters.id.protocol,
+                parameters.id.spi,
+            );
+            if let Some(mark) = parameters.mark {
+                query = query.with_mark(mark);
+            }
+            match backend.query_sa(query).await {
+                Ok(_) => Ok(true),
+                Err(XfrmError::NotFound) => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+        XfrmObjectInstallRequest::Policy(request) => {
+            let parameters = &request.parameters;
+            let mut query =
+                QueryPolicyRequest::new(parameters.selector.clone(), parameters.direction);
+            if let Some(mark) = parameters.mark {
+                query = query.with_mark(mark);
+            }
+            query = query.with_optional_if_id(match parameters.if_id {
+                Some(if_id) if if_id != 0 => Some(if_id),
+                _ => None,
+            });
+            match backend.query_policy(query).await {
+                Ok(_) => Ok(true),
+                Err(XfrmError::NotFound) => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
     }
 }
 
@@ -333,6 +536,7 @@ where
                 &store.handle_for_record(&admitted)?,
                 XfrmObjectInstallDurablePhase::RemovalAdmitted,
                 XfrmObjectInstallDurablePhase::Retired,
+                None,
             )?;
             Ok(XfrmObjectInstallRestartOutcome::OwnedResidueRetired)
         }
@@ -371,6 +575,42 @@ where
             None => backend.remove_policy(request.clone()).await,
         },
     }
+}
+
+/// SA-only install request used by sibling-module recovery tests that need a
+/// fingerprintable request without depending on this module's private helpers.
+#[cfg(test)]
+pub(crate) fn tests_sa_request_for_repair() -> XfrmObjectInstallRequest {
+    use crate::{InstallSaRequest, IpAddress, SaParameters, XfrmId, XfrmMode, XfrmSelector};
+    let selector = XfrmSelector::new(
+        IpAddress::Ipv4([10, 67, 0, 1]),
+        IpAddress::Ipv4([198, 51, 100, 19]),
+        50,
+    );
+    XfrmObjectInstallRequest::Sa(InstallSaRequest {
+        parameters: SaParameters {
+            selector,
+            id: XfrmId {
+                destination: IpAddress::Ipv4([198, 51, 100, 19]),
+                spi: 0x6160_0001,
+                protocol: 50,
+            },
+            source_address: IpAddress::Ipv4([10, 67, 0, 1]),
+            request_id: None,
+            auth: None,
+            crypt: None,
+            aead: None,
+            mode: XfrmMode::Tunnel,
+            lifetime: Default::default(),
+            replay_window: 32,
+            replay_state: None,
+            encap: None,
+            mark: None,
+            output_mark: None,
+            if_id: None,
+            egress_dscp: None,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -526,8 +766,16 @@ mod tests {
         request: &XfrmObjectInstallRequest,
         backend: &MockXfrmBackend,
     ) -> Result<XfrmObjectInstallDurableOutcome, XfrmObjectInstallDurableError> {
+        // Mirror the namespace actor: prepare (which validates the removal
+        // identity), then witness the exact deletion identity before admitting
+        // the effect, then issue with that proof.
         let prepared =
             prepare_durable_object_install(store, operation_id, operation_generation, request)?;
+        let proof = match readback_object_present(backend, request).await {
+            Ok(true) => XfrmObjectInstallPreEffectProof::Conflict,
+            Ok(false) => XfrmObjectInstallPreEffectProof::Absent,
+            Err(source) => panic!("pre-effect readback failed in test helper: {source}"),
+        };
         issue_durable_object_install(
             store,
             &prepared,
@@ -535,8 +783,33 @@ mod tests {
             operation_generation,
             request,
             backend,
+            proof,
         )
         .await
+    }
+
+    /// Drive an operation to `Issuing` with a witnessed proof but without
+    /// admitting the backend effect, simulating a crash cut after the durable
+    /// `Issuing` publication and before the install call.
+    fn issuing_cut(
+        store: &XfrmObjectInstallRecoveryStore,
+        operation_id: XfrmObjectInstallOperationId,
+        operation_generation: XfrmObjectInstallOperationGeneration,
+        request: &XfrmObjectInstallRequest,
+        proof: XfrmObjectInstallPreEffectProof,
+    ) -> XfrmObjectInstallRecoveryHandle {
+        let prepared =
+            prepare_durable_object_install(store, operation_id, operation_generation, request)
+                .unwrap();
+        store
+            .transition(
+                &prepared,
+                XfrmObjectInstallDurablePhase::Prepared,
+                XfrmObjectInstallDurablePhase::Issuing,
+                Some(proof),
+            )
+            .unwrap();
+        prepared
     }
 
     #[tokio::test]
@@ -639,21 +912,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indeterminate_sa_and_policy_fail_closed_across_restart() {
+    async fn failed_install_after_witnessed_absence_recovers_no_mutation() {
         for (case, request) in [(0x31, sa_request()), (0x32, policy_request(None))] {
             let root = TestRoot::new();
             let backend = MockXfrmBackend::new();
-            backend.set_failure(XfrmError::Unavailable);
             let operation_id = operation(case);
             let operation_generation = generation(3);
             let store = open_store(&root);
 
-            let outcome = run_durable_object_install(
+            // Witness absence before the effect, then make the install itself
+            // fail with a non-definitive error so the durable terminal phase is
+            // `Indeterminate`.
+            let proof = match readback_object_present(&backend, &request).await {
+                Ok(false) => XfrmObjectInstallPreEffectProof::Absent,
+                other => panic!("expected absent pre-effect readback, got {other:?}"),
+            };
+            backend.set_failure(XfrmError::Unavailable);
+            let prepared = prepare_durable_object_install(
                 &store,
                 operation_id,
                 operation_generation,
                 &request,
+            )
+            .unwrap();
+            let outcome = issue_durable_object_install(
+                &store,
+                &prepared,
+                operation_id,
+                operation_generation,
+                &request,
                 &backend,
+                proof,
             )
             .await
             .unwrap();
@@ -664,22 +953,81 @@ mod tests {
             backend.clear_failure();
             backend.clear_operations();
             let reopened = open_store(&root);
-            for _ in 0..2 {
-                assert_eq!(
-                    recover_durable_object_install(
-                        &reopened,
-                        operation_id,
-                        operation_generation,
-                        &request,
-                        &backend,
-                    )
-                    .await
-                    .unwrap()
-                    .as_str(),
-                    "indeterminate"
-                );
-                assert_no_removal(&backend);
-            }
+            // The failed install never mutated the backend, so the fresh
+            // readback proves absence and the record retires as no-mutation
+            // without any deletion.
+            assert_eq!(
+                recover_durable_object_install(
+                    &reopened,
+                    operation_id,
+                    operation_generation,
+                    &request,
+                    &backend,
+                )
+                .await
+                .unwrap()
+                .as_str(),
+                "no_mutation"
+            );
+            assert_no_removal(&backend);
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_recovery_with_failing_readback_stays_indeterminate_and_retryable() {
+        for (case, request) in [(0x33, sa_request()), (0x34, policy_request(None))] {
+            let root = TestRoot::new();
+            let backend = MockXfrmBackend::new();
+            let operation_id = operation(case);
+            let operation_generation = generation(3);
+            let store = open_store(&root);
+            issuing_cut(
+                &store,
+                operation_id,
+                operation_generation,
+                &request,
+                XfrmObjectInstallPreEffectProof::Absent,
+            );
+            drop(store);
+
+            let reopened = open_store(&root);
+            backend.set_failure(XfrmError::Unavailable);
+            assert_eq!(
+                recover_durable_object_install(
+                    &reopened,
+                    operation_id,
+                    operation_generation,
+                    &request,
+                    &backend,
+                )
+                .await
+                .unwrap()
+                .as_str(),
+                "indeterminate"
+            );
+            assert_no_removal(&backend);
+            // The record is still unresolved and keeps gating writers.
+            assert_eq!(
+                reopened.advance_writer_epoch(),
+                Err(XfrmObjectInstallDurableError::InvalidTransition)
+            );
+            // Once readback is trustworthy again the same record converges.
+            backend.clear_failure();
+            backend.clear_operations();
+            assert_eq!(
+                recover_durable_object_install(
+                    &reopened,
+                    operation_id,
+                    operation_generation,
+                    &request,
+                    &backend,
+                )
+                .await
+                .unwrap()
+                .as_str(),
+                "no_mutation"
+            );
+            assert_no_removal(&backend);
         }
     }
 
@@ -723,29 +1071,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_in_issuing_after_a_successful_mutation_never_deletes() {
+    async fn crash_in_issuing_after_a_successful_mutation_retires_owned_residue() {
         for (case, request) in [(0x41, sa_request()), (0x42, policy_request(None))] {
             let root = TestRoot::new();
             let backend = MockXfrmBackend::new();
             let operation_id = operation(case);
             let operation_generation = generation(4);
             let store = open_store(&root);
-            let fingerprints = store.fingerprints_for_request(&request).unwrap();
-            let prepared = store
-                .prepare(
-                    operation_id,
-                    operation_generation,
-                    request.object(),
-                    fingerprints,
-                )
-                .unwrap();
-            store
-                .transition(
-                    &prepared,
-                    XfrmObjectInstallDurablePhase::Prepared,
-                    XfrmObjectInstallDurablePhase::Issuing,
-                )
-                .unwrap();
+            // Durable `Issuing` with a witnessed absence proof, then the kernel
+            // object is created but the terminal publication never happens.
+            issuing_cut(
+                &store,
+                operation_id,
+                operation_generation,
+                &request,
+                XfrmObjectInstallPreEffectProof::Absent,
+            );
             install(&backend, &request).await.unwrap();
             drop(store);
 
@@ -762,10 +1103,107 @@ mod tests {
                 .await
                 .unwrap()
                 .as_str(),
-                "indeterminate"
+                "owned_residue_retired"
+            );
+            // The owned residue was removed exactly; installing again must now
+            // succeed, and a repeat recovery is idempotent.
+            install(&backend, &request)
+                .await
+                .expect("recovery must remove exactly the owned residue");
+            assert_eq!(
+                recover_durable_object_install(
+                    &reopened,
+                    operation_id,
+                    operation_generation,
+                    &request,
+                    &backend,
+                )
+                .await
+                .unwrap()
+                .as_str(),
+                "retired"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_in_issuing_with_conflict_proof_leaves_foreign_state_untouched() {
+        for (case, request) in [(0x43, sa_request()), (0x44, policy_request(None))] {
+            let root = TestRoot::new();
+            let backend = MockXfrmBackend::new();
+            // Pre-existing exact state witnessed as a conflict before the
+            // effect was admitted.
+            install(&backend, &request).await.unwrap();
+            let operation_id = operation(case);
+            let operation_generation = generation(4);
+            let store = open_store(&root);
+            issuing_cut(
+                &store,
+                operation_id,
+                operation_generation,
+                &request,
+                XfrmObjectInstallPreEffectProof::Conflict,
+            );
+            drop(store);
+
+            backend.clear_operations();
+            let reopened = open_store(&root);
+            assert_eq!(
+                recover_durable_object_install(
+                    &reopened,
+                    operation_id,
+                    operation_generation,
+                    &request,
+                    &backend,
+                )
+                .await
+                .unwrap()
+                .as_str(),
+                "foreign_untouched"
             );
             assert_no_removal(&backend);
             assert_present(&backend, &request).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_before_effect_with_absent_proof_recovers_without_deletion() {
+        for (case, request) in [(0x45, sa_request()), (0x46, policy_request(None))] {
+            let root = TestRoot::new();
+            let backend = MockXfrmBackend::new();
+            let operation_id = operation(case);
+            let operation_generation = generation(4);
+            let store = open_store(&root);
+            // Crash after durable `Issuing` but before the backend call. The
+            // object was never created.
+            issuing_cut(
+                &store,
+                operation_id,
+                operation_generation,
+                &request,
+                XfrmObjectInstallPreEffectProof::Absent,
+            );
+            drop(store);
+
+            backend.clear_operations();
+            let reopened = open_store(&root);
+            assert_eq!(
+                recover_durable_object_install(
+                    &reopened,
+                    operation_id,
+                    operation_generation,
+                    &request,
+                    &backend,
+                )
+                .await
+                .unwrap()
+                .as_str(),
+                "no_mutation"
+            );
+            assert_no_removal(&backend);
+            install(&backend, &request)
+                .await
+                .expect("no object may have been removed");
         }
     }
 
@@ -915,7 +1353,19 @@ mod tests {
                 .as_str(),
                 "acquired"
             );
-            assert_eq!(backend.operations().len(), 1);
+            // Exactly one backend mutation; a pre-effect SA readback may also
+            // be recorded as an observation, so count mutations only.
+            let mutations = backend
+                .operations()
+                .iter()
+                .filter(|operation| {
+                    matches!(
+                        operation,
+                        MockOperation::InstallSa { .. } | MockOperation::InstallPolicy { .. }
+                    )
+                })
+                .count();
+            assert_eq!(mutations, 1);
         }
     }
 
@@ -1123,5 +1573,282 @@ mod tests {
         install(&backend, &request)
             .await
             .expect("retry must remove the admitted residue");
+    }
+
+    #[tokio::test]
+    async fn conflict_object_removed_before_recovery_recovers_no_mutation() {
+        for (case, request) in [(0x91, sa_request()), (0x92, policy_request(None))] {
+            let root = TestRoot::new();
+            let backend = MockXfrmBackend::new();
+            // A conflict is witnessed before the effect, then the foreign
+            // object disappears before recovery runs.
+            install(&backend, &request).await.unwrap();
+            let operation_id = operation(case);
+            let operation_generation = generation(9);
+            let store = open_store(&root);
+            issuing_cut(
+                &store,
+                operation_id,
+                operation_generation,
+                &request,
+                XfrmObjectInstallPreEffectProof::Conflict,
+            );
+            remove(&backend, &request.removal(), request.policy_if_id())
+                .await
+                .unwrap();
+            drop(store);
+
+            backend.clear_operations();
+            let reopened = open_store(&root);
+            assert_eq!(
+                recover_durable_object_install(
+                    &reopened,
+                    operation_id,
+                    operation_generation,
+                    &request,
+                    &backend,
+                )
+                .await
+                .unwrap()
+                .as_str(),
+                "no_mutation"
+            );
+            assert_no_removal(&backend);
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_record_gates_a_second_operation_until_recovered() {
+        let root = TestRoot::new();
+        let backend = MockXfrmBackend::new();
+        let request = sa_request();
+        let operation_id = operation(0x93);
+        let operation_generation = generation(9);
+        let store = open_store(&root);
+        issuing_cut(
+            &store,
+            operation_id,
+            operation_generation,
+            &request,
+            XfrmObjectInstallPreEffectProof::Absent,
+        );
+        // A distinct operation cannot be prepared or admitted while the
+        // unresolved record remains.
+        assert_eq!(
+            prepare_durable_object_install(
+                &store,
+                operation(0x94),
+                generation(9),
+                &policy_request(None),
+            ),
+            Err(XfrmObjectInstallDurableError::InvalidTransition)
+        );
+        assert_eq!(
+            store.advance_writer_epoch(),
+            Err(XfrmObjectInstallDurableError::InvalidTransition)
+        );
+        // Recovery retires the record and reopens the gate.
+        assert_eq!(
+            recover_durable_object_install(
+                &store,
+                operation_id,
+                operation_generation,
+                &request,
+                &backend,
+            )
+            .await
+            .unwrap()
+            .as_str(),
+            "no_mutation"
+        );
+        assert!(store.advance_writer_epoch().is_ok());
+        assert!(prepare_durable_object_install(
+            &store,
+            operation(0x94),
+            generation(9),
+            &policy_request(None),
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn replacement_installed_after_owned_residue_retirement_survives_idempotent_recovery() {
+        for (case, request) in [(0x95, sa_request()), (0x96, policy_request(None))] {
+            let root = TestRoot::new();
+            let backend = MockXfrmBackend::new();
+            let operation_id = operation(case);
+            let operation_generation = generation(10);
+            let store = open_store(&root);
+            issuing_cut(
+                &store,
+                operation_id,
+                operation_generation,
+                &request,
+                XfrmObjectInstallPreEffectProof::Absent,
+            );
+            install(&backend, &request).await.unwrap();
+            drop(store);
+
+            backend.clear_operations();
+            let reopened = open_store(&root);
+            assert_eq!(
+                recover_durable_object_install(
+                    &reopened,
+                    operation_id,
+                    operation_generation,
+                    &request,
+                    &backend,
+                )
+                .await
+                .unwrap()
+                .as_str(),
+                "owned_residue_retired"
+            );
+
+            // The product replaces the retired identity. A repeated recovery
+            // must be idempotent and must never touch the replacement.
+            install(&backend, &request).await.unwrap();
+            backend.clear_operations();
+            assert_eq!(
+                recover_durable_object_install(
+                    &reopened,
+                    operation_id,
+                    operation_generation,
+                    &request,
+                    &backend,
+                )
+                .await
+                .unwrap()
+                .as_str(),
+                "retired"
+            );
+            assert_no_removal(&backend);
+            assert_present(&backend, &request).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn removal_failure_after_issuing_admission_is_durable_and_retryable_after_restart() {
+        for (case, request) in [(0x97, sa_request()), (0x98, policy_request(None))] {
+            let root = TestRoot::new();
+            let backend = MockXfrmBackend::new();
+            let operation_id = operation(case);
+            let operation_generation = generation(11);
+            let store = open_store(&root);
+            issuing_cut(
+                &store,
+                operation_id,
+                operation_generation,
+                &request,
+                XfrmObjectInstallPreEffectProof::Absent,
+            );
+            install(&backend, &request).await.unwrap();
+            // Reconciliation admitted the owned residue through the Issuing
+            // entry edge; the process then dies during the durable deletion.
+            let fingerprints = store.fingerprints_for_request(&request).unwrap();
+            let issuing_record = store
+                .restore(
+                    operation_id,
+                    operation_generation,
+                    request.object(),
+                    fingerprints,
+                )
+                .unwrap();
+            let issuing_handle = store.handle_for_record(&issuing_record).unwrap();
+            let admitted = store
+                .transition(
+                    &issuing_handle,
+                    XfrmObjectInstallDurablePhase::Issuing,
+                    XfrmObjectInstallDurablePhase::RemovalAdmitted,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                admitted.pre_effect_proof,
+                Some(XfrmObjectInstallPreEffectProof::Absent)
+            );
+            backend.set_failure(XfrmError::Unavailable);
+            let first = recover_durable_object_install(
+                &store,
+                operation_id,
+                operation_generation,
+                &request,
+                &backend,
+            )
+            .await
+            .unwrap();
+            assert_eq!(first.as_str(), "removal_pending");
+            assert!(matches!(first.source(), Some(XfrmError::Unavailable)));
+            assert_eq!(
+                store
+                    .restore(
+                        operation_id,
+                        operation_generation,
+                        request.object(),
+                        fingerprints,
+                    )
+                    .unwrap()
+                    .phase,
+                XfrmObjectInstallDurablePhase::RemovalAdmitted
+            );
+            drop(store);
+
+            backend.clear_failure();
+            backend.clear_operations();
+            let reopened = open_store(&root);
+            assert_eq!(
+                recover_durable_object_install(
+                    &reopened,
+                    operation_id,
+                    operation_generation,
+                    &request,
+                    &backend,
+                )
+                .await
+                .unwrap()
+                .as_str(),
+                "owned_residue_retired"
+            );
+            install(&backend, &request)
+                .await
+                .expect("retry must remove the admitted residue");
+        }
+    }
+
+    #[test]
+    fn recovery_outcome_labels_and_diagnostics_are_value_free() {
+        for (outcome, label) in [
+            (XfrmObjectInstallRestartOutcome::NoMutation, "no_mutation"),
+            (
+                XfrmObjectInstallRestartOutcome::OwnedResidueRetired,
+                "owned_residue_retired",
+            ),
+            (
+                XfrmObjectInstallRestartOutcome::Indeterminate,
+                "indeterminate",
+            ),
+            (
+                XfrmObjectInstallRestartOutcome::ForeignUntouched,
+                "foreign_untouched",
+            ),
+            (
+                XfrmObjectInstallRestartOutcome::RepairRequired,
+                "repair_required",
+            ),
+        ] {
+            assert_eq!(outcome.as_str(), label);
+            let debug = format!("{outcome:?}");
+            assert!(debug.contains(label), "debug must carry only the label");
+        }
+        // Diagnostics must not leak identity material.
+        let rendered = format!(
+            "{:?} {:?} {:?}",
+            XfrmObjectInstallRestartOutcome::ForeignUntouched,
+            XfrmObjectInstallRestartOutcome::RepairRequired,
+            XfrmObjectInstallPreEffectProof::Conflict,
+        );
+        for leaked in ["10.67", "198.51", "6160", "0x6160"] {
+            assert!(!rendered.contains(leaked), "diagnostic leaked {leaked}");
+        }
     }
 }

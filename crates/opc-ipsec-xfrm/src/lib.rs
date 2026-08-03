@@ -65,19 +65,23 @@
 //! consumer first durably records poll admission, then
 //! `NamespaceBoundLinuxXfrmBackend::run_durable_object_install` consumes that
 //! exact actor-, store-, correlation-, generation-, and request-bound authority
-//! and persists `Issuing` before invoking the backend. The consumer finalizes
-//! only after its adoption decision is durable; otherwise restart recovery
-//! treats `Prepared` as authoritative no-mutation and removes residue solely
-//! from authenticated, epoch-current acquisition authority. Linux has no
-//! conditional SA/policy delete, so unresolved cleanup authority blocks every
-//! later cooperating actor mutation. Deployments must exclude all raw or
-//! independently stored XFRM writers in that namespace and keep the proof key
-//! in durable secret configuration. Store records retain independent keyed
-//! fingerprints of the deletion identity and complete install request, but no
-//! request identity values or key material; public diagnostics remain
-//! value-free. The leased root is trusted authoritative non-rollback storage
-//! under the documented POSIX crash model. A deployment whose storage can
-//! restore an older complete authenticated snapshot needs an external
+//! and persists `Issuing` before invoking the backend. Immediately before the
+//! effect is admitted, the actor witnesses the exact deletion identity and
+//! stores that presence as a durable pre-effect proof in the same record. The
+//! consumer finalizes only after its adoption decision is durable; otherwise
+//! restart recovery treats `Prepared` as authoritative no-mutation, removes
+//! residue solely from authenticated, epoch-current acquisition authority, and
+//! reconciles `Issuing`/`Indeterminate` records from their pre-effect proof
+//! plus a fresh exact readback. Linux has no conditional SA/policy delete, so
+//! an unresolved `Issuing`, `Indeterminate`, `Acquired`, or `RemovalAdmitted`
+//! record blocks every later cooperating actor mutation. Deployments must
+//! exclude all raw or independently stored XFRM writers in that namespace and
+//! keep the proof key in durable secret configuration. Store records retain
+//! independent keyed fingerprints of the deletion identity and complete install
+//! request, but no request identity values or key material; public diagnostics
+//! remain value-free. The leased root is trusted authoritative non-rollback
+//! storage under the documented POSIX crash model. A deployment whose storage
+//! can restore an older complete authenticated snapshot needs an external
 //! monotonic witness.
 //!
 //! Same-SPI successor activation uses
@@ -179,12 +183,12 @@ pub use mock::{MockOperation, MockSaRelocation, MockXfrmBackend};
 pub use model::{
     AeadAlgorithm, Algorithm, AllocateSpiRequest, AuthAlgorithm, ExactRemovePolicyRequest,
     InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig,
-    LifetimeCurrent, PolicyParameters, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest,
-    RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters, SaRelocationDirection,
-    SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector, SaReplayState, SaState,
-    SaStatistics, SpiAllocation, UdpEncap, UdpEncapError, XfrmAction, XfrmBackendKind,
-    XfrmCapability, XfrmDirection, XfrmId, XfrmLookupMark, XfrmLookupMarkError, XfrmMark, XfrmMode,
-    XfrmProbe, XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP,
+    LifetimeCurrent, PolicyParameters, QueryPolicyRequest, QuerySaRequest, RekeyPolicyRequest,
+    RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters,
+    SaRelocationDirection, SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector,
+    SaReplayState, SaState, SaStatistics, SpiAllocation, UdpEncap, UdpEncapError, XfrmAction,
+    XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmLookupMark, XfrmLookupMarkError,
+    XfrmMark, XfrmMode, XfrmProbe, XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP,
     XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA1, XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384,
     XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
 };

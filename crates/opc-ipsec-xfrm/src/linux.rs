@@ -31,8 +31,9 @@ use crate::dscp::{production_runtime, LinuxXfrmDscpMarkingConfig, XfrmDscpRuntim
 #[cfg(unix)]
 use crate::durable_object::{XfrmObjectInstallRecoveryStore, XfrmObjectRecoveryProofKey};
 use crate::model::{
-    sa_uses_esn, validate_exact_remove_policy_request, validate_relocate_sa_request,
-    validate_sa_output_mark, validate_sa_query, ExactRemovePolicyRequest,
+    sa_uses_esn, validate_exact_remove_policy_request, validate_policy_query,
+    validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query,
+    ExactRemovePolicyRequest, QueryPolicyRequest,
 };
 #[cfg(unix)]
 use crate::namespace::XfrmObjectRecoveryBindError;
@@ -1052,6 +1053,46 @@ impl XfrmBackend for LinuxXfrmBackend {
                 .store(true, Ordering::Release);
         }
         Ok(state)
+    }
+
+    async fn query_policy(
+        &self,
+        request: QueryPolicyRequest,
+    ) -> Result<PolicyParameters, XfrmError> {
+        validate_policy_query(&request)?;
+        let body = encode_policy_id(
+            request.selector(),
+            request.direction(),
+            request.mark(),
+            request.if_id(),
+        )?;
+        let response = self
+            .transact_blocking(
+                "query_policy",
+                XFRM_MSG_GETPOLICY,
+                NLM_F_REQUEST | NLM_F_ACK,
+                body,
+            )
+            .await?
+            .ok_or_else(|| {
+                XfrmError::io("query_policy", invalid_data("missing getpolicy response"))
+            })?;
+        let state = parse_policy_state(&response)?;
+        // GETPOLICY may answer with a policy whose identity only overlaps the
+        // request. Prove the exact selector/direction/mark/interface identity
+        // before reporting presence; any deviation means the requested exact
+        // identity is absent.
+        let observed = &state.parameters;
+        let observed_if_id = observed.if_id.filter(|if_id| *if_id != 0);
+        let requested_if_id = request.if_id().filter(|if_id| *if_id != 0);
+        if observed.selector != *request.selector()
+            || observed.direction != request.direction()
+            || observed.mark != request.mark()
+            || observed_if_id != requested_if_id
+        {
+            return Err(XfrmError::NotFound);
+        }
+        Ok(state.parameters)
     }
 
     async fn query_sa_relocation_identity(

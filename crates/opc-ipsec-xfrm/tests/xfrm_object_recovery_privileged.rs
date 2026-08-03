@@ -15,15 +15,15 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use opc_ipsec_xfrm::{
-    Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
-    LifetimeConfig, LinuxXfrmBackend, NamespaceBoundLinuxXfrmBackend, PolicyParameters,
-    QuerySaRequest, RemoveSaRequest, SaParameters, XfrmAction, XfrmBackend, XfrmDirection,
-    XfrmError, XfrmId, XfrmMode, XfrmObjectInstallDurableError, XfrmObjectInstallDurableOutcome,
-    XfrmObjectInstallDurablePhase, XfrmObjectInstallOperationGeneration,
-    XfrmObjectInstallOperationId, XfrmObjectInstallRecoveryHandle, XfrmObjectInstallRecoveryStore,
-    XfrmObjectInstallRequest, XfrmObjectInstallRestartOutcome, XfrmObjectRecoveryBindError,
-    XfrmObjectRecoveryProofKey, XfrmRequestId, XfrmSelector, XfrmTemplate,
-    XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES,
+    Algorithm, AuthAlgorithm, ExactRemovePolicyRequest, InstallPolicyRequest, InstallSaRequest,
+    IpAddress, KeyMaterial, LifetimeConfig, LinuxXfrmBackend, NamespaceBoundLinuxXfrmBackend,
+    PolicyParameters, QuerySaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters,
+    XfrmAction, XfrmBackend, XfrmDirection, XfrmError, XfrmId, XfrmMode,
+    XfrmObjectInstallDurableError, XfrmObjectInstallDurableOutcome, XfrmObjectInstallDurablePhase,
+    XfrmObjectInstallOperationGeneration, XfrmObjectInstallOperationId,
+    XfrmObjectInstallRecoveryHandle, XfrmObjectInstallRecoveryStore, XfrmObjectInstallRequest,
+    XfrmObjectInstallRestartOutcome, XfrmObjectRecoveryBindError, XfrmObjectRecoveryProofKey,
+    XfrmRequestId, XfrmSelector, XfrmTemplate, XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -50,6 +50,12 @@ const ROLE_SA_PREPARED_BEFORE_ADMISSION: &str = "sa-prepared-before-admission-62
 const ROLE_SA_PREPARED_POLL_ADMITTED: &str = "sa-prepared-poll-admitted-621";
 const ROLE_POLICY_PREPARED_BEFORE_ADMISSION: &str = "policy-prepared-before-admission-621";
 const ROLE_POLICY_PREPARED_POLL_ADMITTED: &str = "policy-prepared-poll-admitted-621";
+const ROLE_SA_ISSUING_CUT_BEFORE_EFFECT: &str = "sa-issuing-cut-before-effect-628";
+const ROLE_POLICY_ISSUING_CUT_BEFORE_EFFECT: &str = "policy-issuing-cut-before-effect-628";
+const ROLE_SA_ISSUING_CUT_AFTER_EFFECT: &str = "sa-issuing-cut-after-effect-628";
+const ROLE_POLICY_ISSUING_CUT_AFTER_EFFECT: &str = "policy-issuing-cut-after-effect-628";
+const ROLE_SA_ISSUING_CUT_CONFLICT: &str = "sa-issuing-cut-conflict-628";
+const ROLE_POLICY_ISSUING_CUT_CONFLICT: &str = "policy-issuing-cut-conflict-628";
 
 const RECORD_BODY_BYTES: usize = 176;
 const ACTOR_INCARNATION_RANGE: std::ops::Range<usize> = 64..80;
@@ -747,12 +753,69 @@ fn durable_child_request(role: &str) -> TestResult<XfrmObjectInstallRequest> {
         ROLE_SA_ACQUIRED
         | ROLE_SA_NO_MUTATION
         | ROLE_SA_PREPARED_BEFORE_ADMISSION
-        | ROLE_SA_PREPARED_POLL_ADMITTED => Ok(sa_object_request()),
+        | ROLE_SA_PREPARED_POLL_ADMITTED
+        | ROLE_SA_ISSUING_CUT_BEFORE_EFFECT
+        | ROLE_SA_ISSUING_CUT_AFTER_EFFECT
+        | ROLE_SA_ISSUING_CUT_CONFLICT => Ok(sa_object_request()),
         ROLE_POLICY_ACQUIRED
         | ROLE_POLICY_PREPARED_BEFORE_ADMISSION
-        | ROLE_POLICY_PREPARED_POLL_ADMITTED => Ok(policy_object_request(POLICY_IF_ID_OWNED)),
+        | ROLE_POLICY_PREPARED_POLL_ADMITTED
+        | ROLE_POLICY_ISSUING_CUT_BEFORE_EFFECT
+        | ROLE_POLICY_ISSUING_CUT_AFTER_EFFECT
+        | ROLE_POLICY_ISSUING_CUT_CONFLICT => Ok(policy_object_request(POLICY_IF_ID_OWNED)),
         _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown durable child role").into()),
     }
+}
+
+/// Whether the issuing-cut child installs the object before cutting, so the
+/// readback witnesses a conflict. Used for the foreign-untouched detectors.
+fn issuing_cut_preinstalls_conflict(role: &str) -> bool {
+    matches!(
+        role,
+        ROLE_SA_ISSUING_CUT_CONFLICT | ROLE_POLICY_ISSUING_CUT_CONFLICT
+    )
+}
+
+/// Whether the issuing-cut child admits the backend effect after the durable
+/// `Issuing` publication, modelling a crash after kernel creation.
+fn issuing_cut_admits_effect(role: &str) -> bool {
+    matches!(
+        role,
+        ROLE_SA_ISSUING_CUT_AFTER_EFFECT | ROLE_POLICY_ISSUING_CUT_AFTER_EFFECT
+    )
+}
+
+fn run_issuing_cut_crash_child(role: &str, root: &Path, token: &str) -> TestResult {
+    let (backend, store) = LinuxXfrmBackend::new()
+        .bind_current_network_namespace_with_object_recovery(
+            root.join("store"),
+            proof_key(token)?,
+        )?;
+    let request = durable_child_request(role)?;
+
+    // For the conflict detectors the exact identity already exists, so the
+    // pre-effect readback witnesses `Conflict` and the install cannot create it.
+    if issuing_cut_preinstalls_conflict(role) {
+        match &request {
+            XfrmObjectInstallRequest::Sa(request) => block_on(backend.install_sa(request.clone()))?,
+            XfrmObjectInstallRequest::Policy(request) => {
+                block_on(backend.install_policy(request.clone()))?
+            }
+        }
+    }
+
+    let authority = block_on(backend.prepare_durable_object_install(
+        &store,
+        operation_id(token)?,
+        operation_generation(),
+        request,
+    ))?;
+    block_on(backend.detector_cut_prepared_issuing(authority, issuing_cut_admits_effect(role)))?;
+
+    let ready_path = root.join("coordination").join(format!("{role}.ready"));
+    let evidence = format!("{token}:{role}:{}:ready\n", std::process::id());
+    publish_readiness(&ready_path, evidence.as_bytes())?;
+    child_wait_for_sigkill()
 }
 
 fn run_durable_crash_child(role: &str, root: &Path, token: &str) -> TestResult {
@@ -946,6 +1009,20 @@ fn crash_durable_operation(
     Ok(read_recovery_handle(&handle_path)?)
 }
 
+fn crash_issuing_cut_operation(
+    fixture: &PrivilegedFixture,
+    namespace: &str,
+    role: &str,
+) -> TestResult {
+    let ready_path = fixture.ready_path(role);
+    let mut child = TestChild::spawn(fixture.child_command(namespace, role)?)?;
+    let ready_bytes = fixture.readiness_bytes(role, child.id()?);
+    child.wait_for_readiness(&ready_path, &ready_bytes)?;
+    let output = child.kill_and_reap()?;
+    assert_sigkill(&output)?;
+    Ok(())
+}
+
 fn crash_prepared_operation(
     fixture: &PrivilegedFixture,
     namespace: &str,
@@ -1034,6 +1111,12 @@ fn xfrm_object_recovery_privileged_child() -> TestResult {
         ROLE_SA_ACQUIRED | ROLE_SA_NO_MUTATION | ROLE_POLICY_ACQUIRED => {
             run_durable_crash_child(&role, &root, &token)
         }
+        ROLE_SA_ISSUING_CUT_BEFORE_EFFECT
+        | ROLE_POLICY_ISSUING_CUT_BEFORE_EFFECT
+        | ROLE_SA_ISSUING_CUT_AFTER_EFFECT
+        | ROLE_POLICY_ISSUING_CUT_AFTER_EFFECT
+        | ROLE_SA_ISSUING_CUT_CONFLICT
+        | ROLE_POLICY_ISSUING_CUT_CONFLICT => run_issuing_cut_crash_child(&role, &root, &token),
         ROLE_SA_PREPARED_BEFORE_ADMISSION
         | ROLE_SA_PREPARED_POLL_ADMITTED
         | ROLE_POLICY_PREPARED_BEFORE_ADMISSION
@@ -1323,6 +1406,195 @@ fn already_exists_crash_never_removes_preexisting_sa() -> TestResult {
     drop(backend);
     fixture.cleanup()?;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum IssuingCutObject {
+    Sa,
+    Policy,
+}
+
+fn issuing_cut_request(kind: IssuingCutObject) -> XfrmObjectInstallRequest {
+    match kind {
+        IssuingCutObject::Sa => sa_object_request(),
+        IssuingCutObject::Policy => policy_object_request(POLICY_IF_ID_OWNED),
+    }
+}
+
+fn issuing_cut_object_present(
+    backend: &NamespaceBoundLinuxXfrmBackend,
+    namespace: &str,
+    kind: IssuingCutObject,
+) -> TestResult<bool> {
+    match kind {
+        IssuingCutObject::Sa => match block_on(backend.query_sa(sa_query_request())) {
+            Ok(_) => Ok(true),
+            Err(XfrmError::NotFound) => Ok(false),
+            Err(error) => Err(error.into()),
+        },
+        IssuingCutObject::Policy => Ok(policy_if_id_count(namespace, POLICY_IF_ID_OWNED)? > 0),
+    }
+}
+
+/// Real-process detector for one `Issuing` reconciliation verdict. The child
+/// cuts the durable record at `Issuing` (optionally after admitting the kernel
+/// effect), is SIGKILLed, and the parent rebinds and reconciles against the
+/// live kernel.
+fn issuing_cut_recovery_detector(
+    role: &str,
+    kind: IssuingCutObject,
+    expected_outcome: &'static str,
+    present_before: bool,
+    present_after: bool,
+) -> TestResult {
+    if !privileged_enabled() {
+        return Ok(());
+    }
+
+    let fixture = PrivilegedFixture::provision()?;
+    crash_issuing_cut_operation(&fixture, fixture.namespace_a(), role)?;
+    let (backend, store) = bind_namespace_with_recovery(fixture.namespace_a(), &fixture)?;
+    assert_eq!(
+        issuing_cut_object_present(&backend, fixture.namespace_a(), kind)?,
+        present_before,
+        "unexpected kernel state before reconciliation"
+    );
+
+    // While the cut record stays unresolved, the writer gate must reject
+    // every cooperating mutation before any kernel effect.
+    let gated = match kind {
+        IssuingCutObject::Sa => block_on(backend.install_sa(sa_install_request())),
+        IssuingCutObject::Policy => {
+            block_on(backend.install_policy(policy_install_request(POLICY_IF_ID_OWNED)))
+        }
+    };
+    assert!(
+        matches!(gated, Err(XfrmError::Unavailable)),
+        "unresolved Issuing record must gate cooperating mutations"
+    );
+    assert_eq!(
+        issuing_cut_object_present(&backend, fixture.namespace_a(), kind)?,
+        present_before,
+        "the gated mutation must not reach the kernel"
+    );
+
+    let outcome = block_on(backend.recover_durable_object_install(
+        &store,
+        operation_id(&fixture.token)?,
+        operation_generation(),
+        issuing_cut_request(kind),
+    ))?;
+    assert_eq!(outcome.as_str(), expected_outcome);
+    assert_eq!(
+        issuing_cut_object_present(&backend, fixture.namespace_a(), kind)?,
+        present_after,
+        "reconciliation verdict did not leave the expected kernel state"
+    );
+
+    // Recovery retired the record, so the gate reopens for cooperating
+    // mutations. Prove admission with an exact same-identity mutation: when
+    // the verdict left the identity absent, install and remove it; when a
+    // foreign conflict object remains, remove it. Both paths leave the
+    // namespace clean.
+    match kind {
+        IssuingCutObject::Sa => {
+            if !present_after {
+                block_on(backend.install_sa(sa_install_request()))?;
+            }
+            block_on(backend.remove_sa(sa_remove_request()))?;
+        }
+        IssuingCutObject::Policy => {
+            let install = policy_install_request(POLICY_IF_ID_OWNED);
+            if !present_after {
+                block_on(backend.install_policy(install.clone()))?;
+            }
+            let removal = RemovePolicyRequest {
+                selector: install.parameters.selector,
+                direction: install.parameters.direction,
+                mark: None,
+            };
+            block_on(backend.remove_policy_exact(
+                ExactRemovePolicyRequest::new(removal).with_if_id(POLICY_IF_ID_OWNED),
+            ))?;
+        }
+    }
+
+    drop(store);
+    drop(backend);
+    fixture.cleanup()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn issuing_cut_before_effect_recovers_sa_no_mutation() -> TestResult {
+    issuing_cut_recovery_detector(
+        ROLE_SA_ISSUING_CUT_BEFORE_EFFECT,
+        IssuingCutObject::Sa,
+        "no_mutation",
+        false,
+        false,
+    )
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn issuing_cut_before_effect_recovers_policy_no_mutation() -> TestResult {
+    issuing_cut_recovery_detector(
+        ROLE_POLICY_ISSUING_CUT_BEFORE_EFFECT,
+        IssuingCutObject::Policy,
+        "no_mutation",
+        false,
+        false,
+    )
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn issuing_cut_after_effect_retires_owned_sa_residue() -> TestResult {
+    issuing_cut_recovery_detector(
+        ROLE_SA_ISSUING_CUT_AFTER_EFFECT,
+        IssuingCutObject::Sa,
+        "owned_residue_retired",
+        true,
+        false,
+    )
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn issuing_cut_after_effect_retires_owned_policy_residue() -> TestResult {
+    issuing_cut_recovery_detector(
+        ROLE_POLICY_ISSUING_CUT_AFTER_EFFECT,
+        IssuingCutObject::Policy,
+        "owned_residue_retired",
+        true,
+        false,
+    )
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn issuing_cut_with_conflict_leaves_foreign_sa_untouched() -> TestResult {
+    issuing_cut_recovery_detector(
+        ROLE_SA_ISSUING_CUT_CONFLICT,
+        IssuingCutObject::Sa,
+        "foreign_untouched",
+        true,
+        true,
+    )
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn issuing_cut_with_conflict_leaves_foreign_policy_untouched() -> TestResult {
+    issuing_cut_recovery_detector(
+        ROLE_POLICY_ISSUING_CUT_CONFLICT,
+        IssuingCutObject::Policy,
+        "foreign_untouched",
+        true,
+        true,
+    )
 }
 
 #[test]

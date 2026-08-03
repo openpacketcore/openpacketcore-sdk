@@ -156,21 +156,25 @@ The required ordering after that atomic bind is:
    `XfrmObjectInstallAdmissionAuthority`. No backend effect has been admitted
    when this call returns.
 2. Durably commit the consumer's poll-admitted transition.
-3. Pass the authority to `run_durable_object_install`. This consumes the
-   authority exactly once, durably publishes `Issuing`, and only then admits
-   the actor-serialized backend effect. The method durably publishes
-   `Acquired`, `NoMutation`, or `Indeterminate` before returning its outcome.
-   The sole pre-consumption exception is a deferred DSCP activation gate: its
-   typed error returns the same authenticated authority and retains
-   `Prepared`, so activation can be followed by an exact retry.
+3. Pass the authority to `run_durable_object_install`. After the deferred-DSCP
+   gate, the actor performs an exact readback of the deletion identity and
+   embeds the witnessed presence (`Absent` or `Conflict`) as a durable
+   pre-effect proof in the same authenticated record, then publishes
+   `Issuing`, and only then admits the actor-serialized backend effect. The
+   method durably publishes `Acquired`, `NoMutation`, or `Indeterminate`
+   before returning its outcome. Two pre-consumption rejections return the
+   same authenticated authority and retain `Prepared` for an exact retry: a
+   deferred DSCP activation gate, and a pre-effect readback that could not be
+   trusted (reported as `xfrm_object_install_pre_effect_readback_failed`).
 4. Durably record the consumer decision. If an acquired object is adopted,
    call `finalize_durable_object_install` only after that adoption is durable.
    Finalization surrenders cleanup authority and leaves the object installed.
 5. After restart, consult the consumer record. Finalize an adoption that was
    already committed; otherwise call `recover_durable_object_install` with the
    exact retained operation ID, generation, and request. Recovery retires a
-   definitive no-mutation result without removal and removes only residue with
-   authenticated, current `Acquired` authority.
+   definitive no-mutation result without removal, removes only residue with
+   authenticated, current `Acquired` authority, and additionally reconciles
+   `Issuing` and `Indeterminate` records using their pre-effect proof.
 
 A crash after preparation, whether before or after the consumer commits poll
 admission, leaves authenticated `Prepared` truth. Restart recovery retires that
@@ -193,28 +197,56 @@ duplicated, unauthenticated, wrong-namespace, or wrong-incarnation state
 remains fail-closed. Callers reconcile a lost run result from the durable
 record; they do not invent new correlation or bypass the authority boundary.
 
-A crash after durable `Issuing`, including before the syscall or after a kernel
-acknowledgement but before terminal record publication, is deliberately
-indeterminate and authorizes no deletion. An `AlreadyExists` acknowledgement
-becomes durable `NoMutation` and never authorizes removal.
+A crash after durable `Issuing` — before the syscall, after a kernel
+acknowledgement but before terminal publication, or after an indeterminate
+backend result — leaves an `Issuing` or `Indeterminate` record that carries
+the pre-effect proof. `recover_durable_object_install` reconciles it by
+combining that proof with a fresh exact readback of the deletion identity
+(`GETSA` for an SA, exact `GETPOLICY` for a policy). Because the writer gate
+excluded every other cooperating writer for the whole time the record stayed
+unresolved, the proof plus the current presence is a complete classification:
+
+| Readback | Pre-effect proof | Verdict | Deletion |
+| --- | --- | --- | --- |
+| absent | `Absent` | effect provably never happened | none; retired no-mutation |
+| present | `Absent` | residue can only be this operation's | exact removal; `owned_residue_retired` |
+| present | `Conflict` | identity predates the effect (foreign) | none; `foreign_untouched` |
+| absent | `Conflict` | the prior conflict is gone | none; retired no-mutation |
+| unreadable | either | retryable; record unchanged | none; `indeterminate` |
+| stale epoch / missing proof | either | durable anomaly, product repair | none; `repair_required` |
+
+Retained intent or a matching readback alone is never deletion authority: the
+owned-residue verdict additionally requires the `Absent` proof, an
+epoch-current record, and exact binding re-validation. An `AlreadyExists`
+acknowledgement still becomes durable `NoMutation` and never authorizes
+removal. Recovery is idempotent after a record retires, and a retryable
+outcome leaves the record gating until it converges.
 
 Linux has no owner- or generation-conditional `DELSA` or `DELPOLICY`. The
 store therefore implements a cooperating-writer protocol: an unresolved
-`Acquired` or `RemovalAdmitted` record blocks every later mutation admitted by
-that namespace actor, including ordinary `XfrmBackend` operations, until it is
-finalized or recovered. Entering `Issuing` and every independent actor mutation
-burns a durable global writer epoch. Prepared authority remains actor-local and
-one-shot; the current-epoch deletion check continues to apply only to
-`Acquired` and `RemovalAdmitted`. `Acquired` already holds the writer gate,
-so publishing `RemovalAdmitted` stays at that current epoch before deletion and
-has no ambiguous half-advanced epoch crash cut. A scoped policy recovery
-additionally proves the exact
-nonzero `XFRMA_IF_ID` with `GETPOLICY` before deletion. These guarantees do not
-exclude another raw-netlink socket, another namespace actor with a different
-store, or packet/product activity outside this protocol. A deployment must use
-one store and one cooperating writer domain for all XFRM identity mutations in
-the namespace; violating that exclusion can let an unconditional delete race a
-same-identity replacement.
+`Issuing`, `Indeterminate`, `Acquired`, or `RemovalAdmitted` record blocks
+every later cooperating mutation admitted by that namespace actor — including
+ordinary `XfrmBackend` operations, new preparation, and any other
+`Prepared -> Issuing` transition — until it is finalized or recovered.
+Entering `Issuing` and every independent actor mutation burns a durable global
+writer epoch. Prepared authority remains actor-local and one-shot; the
+current-epoch deletion check applies to `Acquired` and `RemovalAdmitted`, and
+the same epoch-currency predicate guards `Issuing`/`Indeterminate`
+reconciliation. `Acquired` already holds the writer gate, so publishing
+`RemovalAdmitted` stays at that current epoch before deletion and has no
+ambiguous half-advanced epoch crash cut. A scoped policy recovery additionally
+proves the exact nonzero `XFRMA_IF_ID` with `GETPOLICY` before deletion. These
+guarantees do not exclude another raw-netlink socket, another namespace actor
+with a different store, or packet/product activity outside this protocol. A
+deployment must use one store and one cooperating writer domain for all XFRM
+identity mutations in the namespace; violating that exclusion can let an
+unconditional delete race a same-identity replacement.
+
+Durable records use format version 2, which carries the pre-effect proof in a
+byte that version 1 reserved as zero. Version 1 records fail closed as
+malformed; there is no compatibility path, migration bridge, or
+unconditional-delete escape hatch. A store that still contains version 1
+records must be repaired out-of-band before recovery is attempted.
 
 As with the process-local staged-object boundary, a durable SA or policy
 removal identity may be unmarked or use only a full-mask lookup mark. A narrow
