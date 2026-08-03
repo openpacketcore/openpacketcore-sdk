@@ -509,13 +509,13 @@ impl RetainedGraphCleanupRefusal {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RetainedGraphCleanupClassification {
-    /// Cleanup authority was acquired. Forwarding hooks are fenced (detached
-    /// if they were live) or were already absent; exact readback and removal
-    /// are now permitted while forwarding stays disabled.
+    /// Cleanup authority was acquired. Both forwarding hooks are
+    /// authoritatively absent; exact readback and removal are now permitted
+    /// while forwarding stays disabled.
     Acquired,
-    /// No retained graph exists for the requested namespace and the interface
-    /// hooks are authoritatively empty. Nothing was manufactured to prove
-    /// absence.
+    /// No retained graph exists for the requested namespace, both reserved
+    /// hook slots are empty, and no SDK forwarding hook exists at another tc
+    /// placement. Nothing was manufactured to prove absence.
     AlreadyAbsent,
     /// Cleanup authority was not granted. Identity, configuration, and schema
     /// refusals leave the retained graph untouched. A retryable indeterminate

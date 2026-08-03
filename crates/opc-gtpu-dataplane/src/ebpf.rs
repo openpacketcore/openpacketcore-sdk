@@ -3663,29 +3663,39 @@ impl EbpfGtpuDataplaneBackend {
         // managed name is part of the identity: a renamed interface that still
         // resolves to this ifindex is not the same attachment the registry
         // holds, so it is refused rather than silently re-acquired.
-        {
+        let managed = {
             let devices = self.devices()?;
-            if let Some(managed) = devices.get(&ifindex) {
-                return if managed.cleanup_only {
-                    if managed.name == device.name
-                        && managed.local_ip == Some(request.local_endpoint())
-                    {
-                        Ok(RetainedGraphCleanupClassification::Acquired)
-                    } else if managed.name != device.name {
-                        Ok(RetainedGraphCleanupClassification::Refused(
-                            RetainedGraphCleanupRefusal::InterfaceIdentityChanged,
-                        ))
-                    } else {
-                        Ok(RetainedGraphCleanupClassification::Refused(
-                            RetainedGraphCleanupRefusal::LocalEndpointMismatch,
-                        ))
-                    }
-                } else {
-                    Ok(RetainedGraphCleanupClassification::Refused(
-                        RetainedGraphCleanupRefusal::ManagedAttachment,
-                    ))
-                };
-            }
+            devices.get(&ifindex).map(|managed| {
+                (
+                    managed.cleanup_only,
+                    managed.name == device.name,
+                    managed.local_ip == Some(request.local_endpoint()),
+                )
+            })
+        };
+        if let Some((cleanup_only, same_name, same_endpoint)) = managed {
+            return if !cleanup_only {
+                Ok(RetainedGraphCleanupClassification::Refused(
+                    RetainedGraphCleanupRefusal::ManagedAttachment,
+                ))
+            } else if !same_name {
+                Ok(RetainedGraphCleanupClassification::Refused(
+                    RetainedGraphCleanupRefusal::InterfaceIdentityChanged,
+                ))
+            } else if !same_endpoint {
+                Ok(RetainedGraphCleanupClassification::Refused(
+                    RetainedGraphCleanupRefusal::LocalEndpointMismatch,
+                ))
+            } else if self.inner.runtime.pdp_cleanup_datapath_usable(ifindex) {
+                Ok(RetainedGraphCleanupClassification::Acquired)
+            } else {
+                // Idempotent acquisition must re-prove the fence. Returning
+                // Acquired after an out-of-band hook reappeared would publish
+                // authority while forwarding was live.
+                Ok(RetainedGraphCleanupClassification::Refused(
+                    RetainedGraphCleanupRefusal::IndeterminateState,
+                ))
+            };
         }
         match self.inner.runtime.adopt_cleanup_only(
             &device.name,
@@ -20711,7 +20721,8 @@ mod tests {
                 && !state.downlink_filter_foreign.contains(&ifindex)
                 && (!state.cleanup_only.contains(&ifindex)
                     || !state.uplink_filter_ready.contains(&ifindex)
-                        && !state.downlink_filter_ready.contains(&ifindex))
+                        && !state.downlink_filter_ready.contains(&ifindex)
+                        && !state.off_slot_sdk_hooks.contains(&ifindex))
         }
     }
 
@@ -26708,6 +26719,19 @@ mod tests {
                 }
             }
 
+            assert_eq!(
+                recovered
+                    .acquire_cleanup_only_recovery(cleanup_request(
+                        Ipv4Addr::new(192, 0, 2, 1),
+                        S2BU_IFINDEX,
+                    ))
+                    .await
+                    .unwrap(),
+                RetainedGraphCleanupClassification::Refused(
+                    RetainedGraphCleanupRefusal::IndeterminateState
+                ),
+                "reappeared_hook={reappeared_hook}"
+            );
             assert_eq!(
                 recovered.pdp_context_reconciliation_capabilities(),
                 PdpContextReconciliationCapabilities {
