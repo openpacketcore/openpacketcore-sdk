@@ -3594,17 +3594,28 @@ impl<'a> S2bMessage<'a> {
         // malformed octets are already in the message being built -- silently
         // dropping the IE from the typed view would emit them anyway.
         //
-        // Declared residual: `Discard` is selected from `purpose` alone. The
-        // two non-`ProcedureAware` branches below know the procedure and the
-        // direction but never consult `receive_ie_disposition`, so on those
-        // paths presence rests on the type allowlist in `ie::typed` rather than
-        // on a resolved per-IE profile. Deliberately unchanged in this cut:
-        // failing closed at the default validation level would turn two
-        // peer-controlled octets into a dropped session.
+        // The discard is conditioned on the IE being presence-Optional at the
+        // slot it arrived in, so the receive path resolves presence from the
+        // grammar at every validation level -- the profile owns (procedure,
+        // direction) and the grammar regardless of level -- and threads the
+        // resolver into all three decode entry points. The canonical builder
+        // has no receive grammar and passes no resolver; its `Reject` policy
+        // gates the discard off regardless.
         let malformed_optional = match purpose {
             S2bDecodePurpose::Receive => MalformedOptionalIePolicy::Discard,
             S2bDecodePurpose::CanonicalBuilder => MalformedOptionalIePolicy::Reject,
         };
+        let slot_is_optional = |ie_type, instance, depth, parent_ie| {
+            receive_slot_is_optional(
+                procedure,
+                direction,
+                receive_ie_scope(depth, parent_ie),
+                ie_type,
+                instance,
+            )
+        };
+        let presence_resolver = matches!(purpose, S2bDecodePurpose::Receive)
+            .then_some(&slot_is_optional as &dyn Fn(u8, u8, usize, Option<(u8, u8)>) -> bool);
         let decoded_ies = if is_procedure_aware(ctx.validation_level)
             && matches!(purpose, S2bDecodePurpose::Receive)
         {
@@ -3635,12 +3646,14 @@ impl<'a> S2bMessage<'a> {
                 &filter,
                 &repeatable_limit,
                 malformed_optional,
+                presence_resolver,
             )
         } else if pgw_triggered_request {
             decode_pgw_triggered_request_ie_sequence_with_evidence(
                 message.raw_ies,
                 typed_ctx,
                 malformed_optional,
+                presence_resolver,
             )
         } else {
             decode_typed_ie_sequence_with_evidence(
@@ -3648,6 +3661,7 @@ impl<'a> S2bMessage<'a> {
                 typed_ctx,
                 0,
                 malformed_optional,
+                presence_resolver,
             )
         }
         .map_err(Gtpv2cDecodeError::mark_message_top_level)?;
@@ -4753,6 +4767,114 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
     },
 ];
 
+/// A receive slot whose presence column is Optional in the profiled grammar.
+///
+/// TS 29.274 clause 7.7.8 discards a malformed IE only where it is
+/// presence-Optional at the slot it arrived in, so the discard gate keys on
+/// this table rather than on IE type. Presence varies by slot -- IP Address is
+/// CO at instance 0 (UE Local IP) but O at instance 3 (ePDG IP) in the same
+/// Create Session Request -- which is why the slot, not the type, is the key.
+#[derive(Clone, Copy)]
+struct OptionalReceiveSlot {
+    procedure: Procedure,
+    direction: MessageDirection,
+    scope: ReceiveIeScope,
+    ie_type: u8,
+    instances: &'static [u8],
+}
+
+/// Presence-O slots admitted by the receive grammar, verified against TS
+/// 29.274 V18.8.0 Tables 7.2.1-1, 7.2.2-1, 7.2.3-1, 7.2.3-2, 7.2.9.1-1 and
+/// 7.2.9.2-1.
+///
+/// The Create Session IP Address, Node Identifier and response APCO rows, plus
+/// the Delete Session Sender F-TEID row, are S2b-applicable. The Bearer TFT,
+/// PCO and Failed Bearer Context rows retained for issue #585 are the
+/// cross-interface compatibility surface already admitted by
+/// [`RECEIVE_IE_RULES`]; their table conditions name S4/S11 or S5/S8/S11, not
+/// S2b. Keeping every entry as an exact tuple prevents that compatibility
+/// surface from licensing malformed-value discard at any unlisted slot.
+const OPTIONAL_RECEIVE_SLOTS: &[OptionalReceiveSlot] = &[
+    // ePDG IP Address, Create Session Request top level, instance 3
+    // (Table 7.2.1-1). Instance 0 is UE Local IP Address, presence CO, and is
+    // deliberately not listed.
+    OptionalReceiveSlot {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_type: IE_TYPE_IP_ADDRESS,
+        instances: &[3],
+    },
+    // 3GPP AAA Server Identifier, Create Session Request top level, instance 0
+    // (Table 7.2.1-1). No other S2b grammar slot admits Node Identifier.
+    OptionalReceiveSlot {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_type: IE_TYPE_NODE_IDENTIFIER,
+        instances: &[0],
+    },
+    // APCO, Create Session Response top level, instance 0
+    // (Table 7.2.2-1). Its S2b-applicable rows are presence O.
+    OptionalReceiveSlot {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_type: IE_TYPE_APCO,
+        instances: &[0],
+    },
+    // Bearer TFT, Create Session Request Bearer Context, instance 0
+    // (Table 7.2.1-1, S4/S11 compatibility row). The same IE is Mandatory in
+    // the Create Bearer Request Bearer Context (Table 7.2.3-2) and is not
+    // listed there.
+    OptionalReceiveSlot {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_type: IE_TYPE_BEARER_TFT,
+        instances: &[0],
+    },
+    // PCO, Create Bearer Request top level, instance 0 (Table 7.2.3-1,
+    // S5/S8 and S4/S11 compatibility row).
+    OptionalReceiveSlot {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_type: IE_TYPE_PCO,
+        instances: &[0],
+    },
+    // PCO, Create Bearer Request Bearer Context, instance 0 (Table 7.2.3-2,
+    // S5/S8 and S4/S11 compatibility row).
+    OptionalReceiveSlot {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_type: IE_TYPE_PCO,
+        instances: &[0],
+    },
+    // Failed Bearer Contexts, Delete Bearer Request top level, instance 0
+    // (Table 7.2.9.2-1, S5/S8 and S11 compatibility row).
+    OptionalReceiveSlot {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_type: IE_TYPE_BEARER_CONTEXT,
+        instances: &[0],
+    },
+    // Sender F-TEID, Delete Session Request top level, instance 0
+    // (Table 7.2.9.1-1). The table carries three interface-conditioned rows
+    // for F-TEID instance 0; on the S2b profile the applicable row is the
+    // "S5/S8 and S2a/S2b" one, presence O. The CO row is SGW/S5-S8
+    // hanging-context cleanup and does not apply to S2b.
+    OptionalReceiveSlot {
+        procedure: Procedure::DeleteSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_type: IE_TYPE_F_TEID,
+        instances: &[0],
+    },
+];
+
 fn receive_ie_scope(depth: usize, parent_ie: Option<(u8, u8)>) -> Option<ReceiveIeScope> {
     match (depth, parent_ie) {
         (0, None) => Some(ReceiveIeScope::TopLevel),
@@ -4806,6 +4928,33 @@ fn receive_repeatable_limit(
 ) -> Option<usize> {
     let rule = receive_ie_rule(procedure, direction, scope?, ie_type, instance)?;
     (rule.max_occurrences > ONE).then_some(rule.max_occurrences)
+}
+
+/// TS 29.274 clause 7.7.8: whether the IE at this receive slot is
+/// presence-Optional in the profiled receive grammar.
+///
+/// A slot is Optional only where [`OPTIONAL_RECEIVE_SLOTS`] says so and the
+/// same exact tuple is admitted by [`RECEIVE_IE_RULES`]. Mandatory,
+/// Conditional and unlisted slots resolve false, and a slot whose scope cannot
+/// be resolved (`scope` is `None`) fails closed the same way.
+fn receive_slot_is_optional(
+    procedure: Procedure,
+    direction: MessageDirection,
+    scope: Option<ReceiveIeScope>,
+    ie_type: u8,
+    instance: u8,
+) -> bool {
+    let Some(scope) = scope else {
+        return false;
+    };
+    receive_ie_rule(procedure, direction, scope, ie_type, instance).is_some()
+        && OPTIONAL_RECEIVE_SLOTS.iter().any(|slot| {
+            slot.procedure == procedure
+                && slot.direction == direction
+                && slot.scope == scope
+                && slot.ie_type == ie_type
+                && slot.instances.contains(&instance)
+        })
 }
 
 fn is_known_s2b_ie_type(ie_type: u8) -> bool {
@@ -5493,6 +5642,36 @@ mod tests {
     use crate::header::{HEADER_LEN_WITHOUT_TEID, HEADER_LEN_WITH_TEID};
     use crate::ie::{PlmnId, RatTypeValue, Recovery, SelectionModeValue};
     use opc_protocol::{DecodeContext, Encode, EncodeContext};
+
+    /// Drift guard for the clause 7.7.8 discard table: every slot listed as
+    /// presence-Optional must actually be admitted by the receive grammar. If an
+    /// entry drifts out of `RECEIVE_IE_RULES`, the profiled receiver would
+    /// clause-7.7.9-discard the IE before its value is ever interpreted, so the
+    /// malformed-value discard the entry exists to license could never fire --
+    /// and a peer-controlled IE would silently change disposition.
+    #[test]
+    fn optional_receive_slots_are_admitted_by_the_grammar() {
+        for slot in OPTIONAL_RECEIVE_SLOTS {
+            for instance in slot.instances {
+                assert_eq!(
+                    receive_ie_disposition(
+                        slot.procedure,
+                        slot.direction,
+                        Some(slot.scope),
+                        slot.ie_type,
+                        *instance,
+                    ),
+                    ReceiveIeDisposition::AllowedKnown,
+                    "optional slot {:?}/{:?}/{:?} type {} instance {} is not an admitted grammar slot",
+                    slot.procedure,
+                    slot.direction,
+                    slot.scope,
+                    slot.ie_type,
+                    instance,
+                );
+            }
+        }
+    }
 
     #[test]
     fn receive_ie_grammar_matrix_is_complete_and_unambiguous() {
