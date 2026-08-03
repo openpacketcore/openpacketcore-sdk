@@ -740,13 +740,31 @@ impl LinuxGtpuDataplaneBackend {
 
 /// Cross-process lease guarding one GTP device's PDP restart recovery.
 ///
-/// The lease is an exclusive `flock` on a per-device file beneath the bound
-/// recovery root. It is host-global, released by the kernel on process exit,
-/// and held for exactly one exact-removal transaction, so a dying writer and a
-/// restarting reconciler cannot overlap on the same device. Dropping the lease
-/// (or process loss) releases it.
+/// On Linux the lease is an exclusive `flock` on a per-device file beneath the
+/// bound recovery root. It is host-global, released by the kernel on process
+/// exit, and held for exactly one exact-removal transaction, so a dying writer
+/// and a restarting reconciler cannot overlap on the same device. Dropping the
+/// lease (or process loss) releases it. Off Linux there is no kernel GTP
+/// device to serialize against, so the lease is vacuously held (`_lock` is
+/// `None`); every actual mutation is still fenced by the Linux-only netlink
+/// transport, which fails closed on other platforms.
 struct PdpRecoveryLease {
-    _lock: std::fs::File,
+    _lock: Option<std::fs::File>,
+}
+
+impl Drop for PdpRecoveryLease {
+    fn drop(&mut self) {
+        // Release the lock explicitly rather than relying solely on
+        // close-on-drop: under concurrent load, an immediate re-acquisition of
+        // the same lease could otherwise observe the still-held lock
+        // intermittently before the descriptor teardown completed. Unlocking
+        // first makes the release deterministic; the subsequent close then has
+        // no lock left to release.
+        #[cfg(target_os = "linux")]
+        if let Some(file) = self._lock.as_ref() {
+            let _ = rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -790,12 +808,16 @@ fn acquire_pdp_recovery_lease(root: &Path, ifindex: u32) -> Result<PdpRecoveryLe
             operation: "pdp_restart_recovery_lease",
         });
     }
-    Ok(PdpRecoveryLease { _lock: file })
+    Ok(PdpRecoveryLease { _lock: Some(file) })
 }
 
 #[cfg(not(target_os = "linux"))]
 fn acquire_pdp_recovery_lease(_root: &Path, _ifindex: u32) -> Result<PdpRecoveryLease, GtpuError> {
-    Err(GtpuError::UnsupportedPlatform)
+    // Off Linux there is no kernel GTP device for the lease to serialize
+    // against, so the lease is vacuously held. Actual mutation still requires
+    // the Linux-only netlink transport, which fails closed on this platform,
+    // so a vacuous lease admits no real removal here.
+    Ok(PdpRecoveryLease { _lock: None })
 }
 
 #[async_trait]
@@ -889,7 +911,13 @@ impl GtpuDataplaneBackend for LinuxGtpuDataplaneBackend {
             },
             exact_removal: if self.inner.pdp_recovery_root.is_none() {
                 GtpuCapability::Missing
-            } else if probe.mutation_ready {
+            } else if matches!(readback, GtpuCapability::Available) {
+                // Exact removal is a generic-netlink readback + DELPDP
+                // transaction; it needs the same netlink/gtp/CAP_NET_ADMIN
+                // authority as readback but, unlike datapath installation, no
+                // GTP-U UDP socket, so it is gated on readback rather than the
+                // full mutation_ready conjunction (whose UDP-bind probe can be
+                // transiently false when the GTP-U port is held elsewhere).
                 GtpuCapability::Available
             } else if matches!(readback, GtpuCapability::PermissionDenied) {
                 GtpuCapability::PermissionDenied
