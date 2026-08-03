@@ -31,8 +31,9 @@ use crate::dscp::{production_runtime, LinuxXfrmDscpMarkingConfig, XfrmDscpRuntim
 #[cfg(unix)]
 use crate::durable_object::{XfrmObjectInstallRecoveryStore, XfrmObjectRecoveryProofKey};
 use crate::model::{
-    sa_uses_esn, validate_exact_remove_policy_request, validate_relocate_sa_request,
-    validate_sa_output_mark, validate_sa_query, ExactRemovePolicyRequest,
+    sa_uses_esn, validate_exact_remove_policy_request, validate_policy_query,
+    validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query,
+    ExactRemovePolicyRequest, QueryPolicyRequest,
 };
 #[cfg(unix)]
 use crate::namespace::XfrmObjectRecoveryBindError;
@@ -64,6 +65,7 @@ const XFRM_USER_SA_ID_LEN: usize = 24;
 const XFRM_USER_POLICY_INFO_LEN: usize = 168;
 const XFRM_USER_POLICY_ID_LEN: usize = 64;
 const XFRM_USER_TEMPLATE_LEN: usize = 64;
+const XFRM_POLICY_TEMPLATE_LIMIT: usize = 6;
 const XFRM_USER_SPI_INFO_LEN: usize = 232;
 const XFRM_USER_MIGRATE_STATE_LEN: usize = 132;
 const XFRM_AEVENT_ID_LEN: usize = 48;
@@ -1054,6 +1056,46 @@ impl XfrmBackend for LinuxXfrmBackend {
         Ok(state)
     }
 
+    async fn query_policy(
+        &self,
+        request: QueryPolicyRequest,
+    ) -> Result<PolicyParameters, XfrmError> {
+        validate_policy_query(&request)?;
+        let body = encode_policy_id(
+            request.selector(),
+            request.direction(),
+            request.mark(),
+            request.if_id(),
+        )?;
+        let response = self
+            .transact_blocking(
+                "query_policy",
+                XFRM_MSG_GETPOLICY,
+                NLM_F_REQUEST | NLM_F_ACK,
+                body,
+            )
+            .await?
+            .ok_or_else(|| {
+                XfrmError::io("query_policy", invalid_data("missing getpolicy response"))
+            })?;
+        let state = parse_policy_state(&response)?;
+        // GETPOLICY may answer with a policy whose identity only overlaps the
+        // request. Prove the exact selector/direction/mark/interface identity
+        // before reporting presence; any deviation means the requested exact
+        // identity is absent.
+        let observed = &state.parameters;
+        let observed_if_id = observed.if_id.filter(|if_id| *if_id != 0);
+        let requested_if_id = request.if_id().filter(|if_id| *if_id != 0);
+        if observed.selector != *request.selector()
+            || observed.direction != request.direction()
+            || observed.mark != request.mark()
+            || observed_if_id != requested_if_id
+        {
+            return Err(XfrmError::NotFound);
+        }
+        Ok(state.parameters)
+    }
+
     async fn query_sa_relocation_identity(
         &self,
         request: QuerySaRequest,
@@ -1437,6 +1479,7 @@ fn receive_netlink_response(
                     },
                 });
             }
+            Ok(ReceiveMessageOutcome::RejectedNonKernel) => {}
             Err(error)
                 if matches!(
                     error.kind(),
@@ -3249,20 +3292,25 @@ fn parse_policy_state(payload: &[u8]) -> Result<PolicyState, XfrmError> {
         XFRM_USER_POLICY_INFO_LEN,
         XFRMA_TMPL,
         "query_outbound_policy_binding",
-    )?
-    .ok_or_else(|| {
-        XfrmError::io(
-            "query_outbound_policy_binding",
-            invalid_data("missing policy template"),
-        )
-    })?;
-    if templates.len() != XFRM_USER_TEMPLATE_LEN {
-        return Err(XfrmError::io(
-            "query_outbound_policy_binding",
-            invalid_data("policy must contain exactly one template"),
-        ));
-    }
-    let template = decode_exact_template(templates)?;
+    )?;
+    let templates = match templates {
+        None => Vec::new(),
+        Some(encoded) => {
+            if encoded.is_empty()
+                || encoded.len() % XFRM_USER_TEMPLATE_LEN != 0
+                || encoded.len() / XFRM_USER_TEMPLATE_LEN > XFRM_POLICY_TEMPLATE_LIMIT
+            {
+                return Err(XfrmError::io(
+                    "query_outbound_policy_binding",
+                    invalid_data("invalid policy template vector"),
+                ));
+            }
+            encoded
+                .chunks_exact(XFRM_USER_TEMPLATE_LEN)
+                .map(decode_exact_template)
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
     let mark = parse_exact_mark_attribute(
         payload,
         XFRM_USER_POLICY_INFO_LEN,
@@ -3295,7 +3343,7 @@ fn parse_policy_state(payload: &[u8]) -> Result<PolicyState, XfrmError> {
             direction: decode_policy_direction(read_u8(payload, 160)?)?,
             action: decode_policy_action(read_u8(payload, 161)?)?,
             priority: read_u32_ne(payload, 152)?,
-            templates: vec![template],
+            templates,
             mark,
             if_id,
         },
@@ -4070,6 +4118,12 @@ fn is_known_aead_algorithm(name: &str) -> bool {
 
 fn validate_policy_parameters(parameters: &PolicyParameters) -> Result<(), XfrmError> {
     validate_selector_family(&parameters.selector)?;
+    if parameters.templates.len() > XFRM_POLICY_TEMPLATE_LIMIT {
+        return Err(XfrmError::invalid_config(
+            "templates",
+            "policy supports at most six templates",
+        ));
+    }
     if matches!(parameters.action, XfrmAction::Allow) && parameters.templates.is_empty() {
         return Err(XfrmError::invalid_config(
             "templates",
@@ -4518,6 +4572,20 @@ pub(crate) fn test_dscp_sa_readback_body(
     config: &LinuxXfrmDscpMarkingConfig,
 ) -> Result<SensitiveBuffer, XfrmError> {
     encode_sa_info_with_dscp(parameters, Some(config.profile()?))
+}
+
+#[cfg(test)]
+pub(crate) fn test_sa_readback_body(
+    parameters: &SaParameters,
+) -> Result<SensitiveBuffer, XfrmError> {
+    encode_sa_info(parameters)
+}
+
+#[cfg(test)]
+pub(crate) fn test_policy_readback_body(
+    parameters: &PolicyParameters,
+) -> Result<SensitiveBuffer, XfrmError> {
+    encode_policy_info(parameters)
 }
 
 #[cfg(test)]
@@ -5410,6 +5478,73 @@ mod tests {
         .unwrap();
         let observed = parse_policy_state(&policy_body).unwrap();
         assert_eq!(observed.parameters, request.policy.parameters);
+    }
+
+    #[test]
+    fn policy_parser_accepts_every_supported_template_cardinality() {
+        let mut block = policy_parameters();
+        block.action = XfrmAction::Block;
+        block.templates.clear();
+        let block_body = encode_policy_info(&block).unwrap();
+        assert_eq!(parse_policy_state(&block_body).unwrap().parameters, block);
+
+        let mut multiple = policy_parameters();
+        let mut second = multiple.templates[0];
+        second.id.spi = second.id.spi.checked_add(1).unwrap();
+        multiple.templates.push(second);
+        let multiple_body = encode_policy_info(&multiple).unwrap();
+        assert_eq!(
+            parse_policy_state(&multiple_body).unwrap().parameters,
+            multiple
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_policy_query_recovers_zero_and_multiple_template_policies() {
+        let mut cases = Vec::new();
+        let mut block = policy_parameters();
+        block.action = XfrmAction::Block;
+        block.templates.clear();
+        cases.push(block);
+
+        let mut multiple = policy_parameters();
+        let mut second = multiple.templates[0];
+        second.id.spi = second.id.spi.checked_add(1).unwrap();
+        multiple.templates.push(second);
+        cases.push(multiple);
+
+        for parameters in cases {
+            let response = encode_policy_info(&parameters).unwrap().to_vec();
+            let backend =
+                LinuxXfrmBackend::with_transport(CapturingTransport::with_response(response));
+            let mut query =
+                QueryPolicyRequest::new(parameters.selector.clone(), parameters.direction);
+            if let Some(mark) = parameters.mark {
+                query = query.with_mark(mark);
+            }
+            query = query.with_optional_if_id(parameters.if_id.filter(|if_id| *if_id != 0));
+
+            assert_eq!(backend.query_policy(query).await.unwrap(), parameters);
+        }
+    }
+
+    #[test]
+    fn policy_template_vectors_fail_closed_outside_kernel_bounds() {
+        let mut too_many = policy_parameters();
+        too_many.templates = vec![too_many.templates[0]; XFRM_POLICY_TEMPLATE_LIMIT + 1];
+        assert!(matches!(
+            encode_policy_info(&too_many),
+            Err(XfrmError::InvalidConfig {
+                field: "templates",
+                reason: "policy supports at most six templates"
+            })
+        ));
+
+        let mut malformed = encode_policy_info(&policy_parameters()).unwrap();
+        let template_length = ROUTE_ATTRIBUTE_HEADER_LEN + XFRM_USER_TEMPLATE_LEN - 1;
+        malformed[168..170].copy_from_slice(&(template_length as u16).to_ne_bytes());
+        malformed.truncate(168 + align_to_netlink(template_length).unwrap());
+        assert!(parse_policy_state(&malformed).is_err());
     }
 
     #[test]

@@ -37,9 +37,12 @@ use crate::observation::{
 #[cfg(unix)]
 use crate::{
     durable_install::{
+        cut_durable_object_install_at_indeterminate_after_effect as cut_object_install_at_indeterminate_after_effect,
+        cut_durable_object_install_at_issuing as cut_object_install_at_issuing,
+        cut_durable_object_install_at_removal_admitted as cut_object_install_at_removal_admitted,
         durable_object_install_phase, finalize_durable_object_install as finalize_object_install,
         issue_durable_object_install as run_object_install,
-        prepare_durable_object_install as prepare_object_install,
+        prepare_durable_object_install as prepare_object_install, readback_object_present,
         recover_durable_object_install as recover_object_install,
         validate_durable_object_install_admission as validate_object_install_admission,
         XfrmObjectInstallDurableOutcome, XfrmObjectInstallRestartOutcome,
@@ -47,8 +50,8 @@ use crate::{
     durable_object::{
         XfrmObjectInstallDurableError, XfrmObjectInstallDurablePhase,
         XfrmObjectInstallOperationGeneration, XfrmObjectInstallOperationId,
-        XfrmObjectInstallRecoveryHandle, XfrmObjectInstallRecoveryStore,
-        XfrmObjectRecoveryProofKey,
+        XfrmObjectInstallPreEffectProof, XfrmObjectInstallRecoveryHandle,
+        XfrmObjectInstallRecoveryStore, XfrmObjectRecoveryProofKey,
     },
     XfrmObjectInstallRequest,
 };
@@ -60,9 +63,10 @@ use crate::{
 };
 use crate::{
     AllocateSpiRequest, ExactRemovePolicyRequest, InstallPolicyRequest, InstallSaRequest,
-    LinuxXfrmBackend, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest,
-    RemovePolicyRequest, RemoveSaRequest, SaParameters, SaRelocationIdentity, SaState,
-    SpiAllocation, XfrmBackend, XfrmCapability, XfrmCompositeInstallRequest, XfrmError, XfrmProbe,
+    LinuxXfrmBackend, PolicyParameters, QueryPolicyRequest, QuerySaRequest, RekeyPolicyRequest,
+    RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters,
+    SaRelocationIdentity, SaState, SpiAllocation, XfrmBackend, XfrmCapability,
+    XfrmCompositeInstallRequest, XfrmError, XfrmProbe,
 };
 
 /// Maximum number of admitted Linux XFRM operations waiting for the dedicated
@@ -350,11 +354,12 @@ impl fmt::Debug for XfrmObjectInstallAdmissionAuthority {
 /// Value-free failure while admitting one prepared durable object install.
 ///
 /// A DSCP-bearing SA rejected only because deferred activation is still
-/// closed returns the original affine authority through
-/// [`Self::into_retry_authority`]. No durable phase or writer epoch has
-/// changed, so the caller may activate the same namespace actor and retry that
-/// exact authority. Every other failure consumes the authority under the
-/// durable protocol's existing fail-closed recovery contract.
+/// closed, and a pre-effect readback that could not be trusted, both return
+/// the original affine authority through [`Self::into_retry_authority`]. In
+/// either case no durable phase or writer epoch has changed, so the caller may
+/// activate the same namespace actor and retry that exact authority. Every
+/// other failure consumes the authority under the durable protocol's existing
+/// fail-closed recovery contract.
 #[cfg(unix)]
 pub struct XfrmObjectInstallRunError {
     kind: XfrmObjectInstallRunErrorKind,
@@ -364,15 +369,30 @@ pub struct XfrmObjectInstallRunError {
 enum XfrmObjectInstallRunErrorKind {
     Durable(XfrmObjectInstallDurableError),
     DscpActivationRequired(Box<XfrmObjectInstallAdmissionAuthority>),
+    PreEffectReadbackFailed {
+        authority: Box<XfrmObjectInstallAdmissionAuthority>,
+        source: XfrmError,
+    },
 }
 
 #[cfg(unix)]
 impl XfrmObjectInstallRunError {
     const DSCP_ACTIVATION_REQUIRED: &'static str = "xfrm_object_install_dscp_activation_required";
+    const PRE_EFFECT_READBACK_FAILED: &'static str =
+        "xfrm_object_install_pre_effect_readback_failed";
 
     fn dscp_activation_required(authority: Box<XfrmObjectInstallAdmissionAuthority>) -> Self {
         Self {
             kind: XfrmObjectInstallRunErrorKind::DscpActivationRequired(authority),
+        }
+    }
+
+    fn pre_effect_readback_failed(
+        authority: Box<XfrmObjectInstallAdmissionAuthority>,
+        source: XfrmError,
+    ) -> Self {
+        Self {
+            kind: XfrmObjectInstallRunErrorKind::PreEffectReadbackFailed { authority, source },
         }
     }
 
@@ -384,20 +404,34 @@ impl XfrmObjectInstallRunError {
             XfrmObjectInstallRunErrorKind::DscpActivationRequired(_) => {
                 Self::DSCP_ACTIVATION_REQUIRED
             }
+            XfrmObjectInstallRunErrorKind::PreEffectReadbackFailed { .. } => {
+                Self::PRE_EFFECT_READBACK_FAILED
+            }
         }
     }
 
     /// Return the underlying durable-protocol error, when this was not a
-    /// clean deferred-activation rejection.
+    /// clean deferred-activation or pre-effect readback rejection.
     #[must_use]
     pub const fn durable_error(&self) -> Option<XfrmObjectInstallDurableError> {
         match &self.kind {
             XfrmObjectInstallRunErrorKind::Durable(error) => Some(*error),
-            XfrmObjectInstallRunErrorKind::DscpActivationRequired(_) => None,
+            XfrmObjectInstallRunErrorKind::DscpActivationRequired(_)
+            | XfrmObjectInstallRunErrorKind::PreEffectReadbackFailed { .. } => None,
         }
     }
 
-    /// Recover retry authority from a proved pre-effect DSCP activation gate.
+    /// Return the redaction-safe readback failure, when this was a proved
+    /// pre-effect readback rejection.
+    #[must_use]
+    pub fn readback_source(&self) -> Option<&XfrmError> {
+        match &self.kind {
+            XfrmObjectInstallRunErrorKind::PreEffectReadbackFailed { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+
+    /// Recover retry authority from a proved pre-effect rejection.
     ///
     /// `None` means the error follows the ordinary durable recovery contract
     /// and no authority may be replayed.
@@ -405,6 +439,9 @@ impl XfrmObjectInstallRunError {
     pub fn into_retry_authority(self) -> Option<XfrmObjectInstallAdmissionAuthority> {
         match self.kind {
             XfrmObjectInstallRunErrorKind::DscpActivationRequired(authority) => Some(*authority),
+            XfrmObjectInstallRunErrorKind::PreEffectReadbackFailed { authority, .. } => {
+                Some(*authority)
+            }
             XfrmObjectInstallRunErrorKind::Durable(_) => None,
         }
     }
@@ -449,6 +486,7 @@ impl Error for XfrmObjectInstallRunError {
         match &self.kind {
             XfrmObjectInstallRunErrorKind::Durable(error) => Some(error),
             XfrmObjectInstallRunErrorKind::DscpActivationRequired(_) => None,
+            XfrmObjectInstallRunErrorKind::PreEffectReadbackFailed { source, .. } => Some(source),
         }
     }
 }
@@ -962,6 +1000,119 @@ impl NamespaceBoundLinuxXfrmBackend {
             .map_err(|_| XfrmObjectInstallRunError::from(XfrmObjectInstallDurableError::Storage))?
     }
 
+    /// Crash-detector seam: consume a prepared authority and leave the durable
+    /// record at `Issuing` without any terminal publication.
+    ///
+    /// This reproduces, deterministically, the exact crash window that
+    /// [`Self::run_durable_object_install`] would leave if the process died
+    /// between the `Issuing` publication and its terminal record. It performs
+    /// the same validation, deferred-DSCP gate, pre-effect readback, and
+    /// admission consumption as the run path. When `admit_backend_effect` is
+    /// true the install is additionally admitted (as the real effect is), so
+    /// the kernel object exists while the record remains `Issuing`; when false
+    /// the backend is never touched. The record stays unresolved and
+    /// recoverable. This grants no deletion authority and exists solely so
+    /// privileged process-loss detectors can exercise `Issuing` reconciliation
+    /// against the real kernel. The returned handle authenticates the exact
+    /// cut phase across the detector's process restart.
+    #[cfg(unix)]
+    #[doc(hidden)]
+    pub async fn detector_cut_prepared_issuing(
+        &self,
+        authority: XfrmObjectInstallAdmissionAuthority,
+        admit_backend_effect: bool,
+    ) -> Result<XfrmObjectInstallRecoveryHandle, XfrmObjectInstallRunError> {
+        if authority.actor_binding != self.inner.actor_binding {
+            return Err(XfrmObjectInstallDurableError::WrongBinding.into());
+        }
+        let permit =
+            self.inner.sender.reserve().await.map_err(|_| {
+                XfrmObjectInstallRunError::from(XfrmObjectInstallDurableError::Storage)
+            })?;
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        permit.send(NamespaceCommand::DetectorCutPrepared(
+            Box::new(authority),
+            DetectorPreparedCut::Issuing {
+                admit_backend_effect,
+            },
+            reply_sender,
+        ));
+        reply_receiver
+            .await
+            .map_err(|_| XfrmObjectInstallRunError::from(XfrmObjectInstallDurableError::Storage))?
+    }
+
+    /// Crash-detector seam: consume a prepared authority, admit the backend
+    /// effect, and leave the authenticated durable record at `Indeterminate`.
+    ///
+    /// This is the process-loss counterpart to an install whose backend reply
+    /// cannot be trusted. It follows the production validation, pre-effect
+    /// proof, writer-epoch, and admission path, then deliberately stops before
+    /// reconciliation. The returned handle authenticates the cut phase for a
+    /// privileged restart detector.
+    #[cfg(unix)]
+    #[doc(hidden)]
+    pub async fn detector_cut_prepared_indeterminate_after_effect(
+        &self,
+        authority: XfrmObjectInstallAdmissionAuthority,
+    ) -> Result<XfrmObjectInstallRecoveryHandle, XfrmObjectInstallRunError> {
+        if authority.actor_binding != self.inner.actor_binding {
+            return Err(XfrmObjectInstallDurableError::WrongBinding.into());
+        }
+        let permit =
+            self.inner.sender.reserve().await.map_err(|_| {
+                XfrmObjectInstallRunError::from(XfrmObjectInstallDurableError::Storage)
+            })?;
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        permit.send(NamespaceCommand::DetectorCutPrepared(
+            Box::new(authority),
+            DetectorPreparedCut::IndeterminateAfterEffect,
+            reply_sender,
+        ));
+        reply_receiver
+            .await
+            .map_err(|_| XfrmObjectInstallRunError::from(XfrmObjectInstallDurableError::Storage))?
+    }
+
+    /// Crash-detector seam: leave an authenticated acquired operation at
+    /// `RemovalAdmitted`, optionally after issuing its exact deletion.
+    ///
+    /// This models process loss during durable removal. The operation remains
+    /// the only cleanup authority and continues to gate cooperating writers;
+    /// restart recovery must retry the exact delete or confirm absence before
+    /// retiring it.
+    #[cfg(unix)]
+    #[doc(hidden)]
+    pub async fn detector_cut_acquired_removal_admitted(
+        &self,
+        store: &XfrmObjectInstallRecoveryStore,
+        operation_id: XfrmObjectInstallOperationId,
+        operation_generation: XfrmObjectInstallOperationGeneration,
+        request: XfrmObjectInstallRequest,
+        admit_backend_effect: bool,
+    ) -> Result<XfrmObjectInstallRecoveryHandle, XfrmObjectInstallDurableError> {
+        let permit = self
+            .inner
+            .sender
+            .reserve()
+            .await
+            .map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        permit.send(NamespaceCommand::DetectorCutAcquiredRemovalAdmitted(
+            Box::new(DurableObjectOperation {
+                store: store.clone(),
+                operation_id,
+                operation_generation,
+                request,
+            }),
+            admit_backend_effect,
+            reply_sender,
+        ));
+        reply_receiver
+            .await
+            .map_err(|_| XfrmObjectInstallDurableError::Storage)?
+    }
+
     /// Surrender durable cleanup authority after the product has adopted an
     /// acquired object, or retire an explicit no-mutation result.
     #[cfg(unix)]
@@ -986,9 +1137,12 @@ impl NamespaceBoundLinuxXfrmBackend {
 
     /// Reconcile one retained durable operation after process loss.
     ///
-    /// Only an authenticated, epoch-current acquired record authorizes exact
-    /// deletion. Prepared, explicit no-mutation, indeterminate, stale,
-    /// malformed, and mismatched records never authorize deletion.
+    /// An authenticated, epoch-current acquired record authorizes exact
+    /// deletion. An `Issuing` or `Indeterminate` record can authorize deletion
+    /// only when its durable pre-effect proof witnessed exact absence and a
+    /// fresh exact readback now proves presence under the same writer gate.
+    /// Prepared, explicit no-mutation, stale, malformed, mismatched, and
+    /// pre-effect-conflict records never authorize deletion.
     #[cfg(unix)]
     pub async fn recover_durable_object_install(
         &self,
@@ -1306,6 +1460,12 @@ struct DurableObjectOperation {
     request: XfrmObjectInstallRequest,
 }
 
+#[cfg(unix)]
+enum DetectorPreparedCut {
+    Issuing { admit_backend_effect: bool },
+    IndeterminateAfterEffect,
+}
+
 enum NamespaceCommand {
     #[cfg(unix)]
     PrepareDurableObjectInstall(
@@ -1316,6 +1476,18 @@ enum NamespaceCommand {
     RunDurableObjectInstall(
         Box<XfrmObjectInstallAdmissionAuthority>,
         oneshot::Sender<Result<XfrmObjectInstallDurableOutcome, XfrmObjectInstallRunError>>,
+    ),
+    #[cfg(unix)]
+    DetectorCutPrepared(
+        Box<XfrmObjectInstallAdmissionAuthority>,
+        DetectorPreparedCut,
+        oneshot::Sender<Result<XfrmObjectInstallRecoveryHandle, XfrmObjectInstallRunError>>,
+    ),
+    #[cfg(unix)]
+    DetectorCutAcquiredRemovalAdmitted(
+        Box<DurableObjectOperation>,
+        bool,
+        oneshot::Sender<Result<XfrmObjectInstallRecoveryHandle, XfrmObjectInstallDurableError>>,
     ),
     #[cfg(unix)]
     FinalizeDurableObjectInstall(
@@ -1340,6 +1512,10 @@ enum NamespaceCommand {
     QuerySaRelocationIdentity(
         QuerySaRequest,
         oneshot::Sender<Result<SaRelocationIdentity, XfrmError>>,
+    ),
+    QueryPolicy(
+        QueryPolicyRequest,
+        oneshot::Sender<Result<PolicyParameters, XfrmError>>,
     ),
     #[cfg(target_os = "linux")]
     QueryEspPeerObservationRegistration(
@@ -1386,6 +1562,22 @@ enum NamespaceCommand {
     ),
     Probe(oneshot::Sender<Result<XfrmProbe, XfrmError>>),
     SaRelocationCapability(oneshot::Sender<Result<XfrmCapability, XfrmError>>),
+}
+
+#[cfg(unix)]
+async fn witness_object_install_pre_effect(
+    backend: &LinuxXfrmBackend,
+    request: &XfrmObjectInstallRequest,
+) -> Result<XfrmObjectInstallPreEffectProof, XfrmError> {
+    readback_object_present(backend, request)
+        .await
+        .map(|present| {
+            if present {
+                XfrmObjectInstallPreEffectProof::Conflict
+            } else {
+                XfrmObjectInstallPreEffectProof::Absent
+            }
+        })
 }
 
 impl NamespaceCommand {
@@ -1453,6 +1645,24 @@ impl NamespaceCommand {
                     )));
                     return;
                 }
+                // Witness the exact deletion identity before admitting the
+                // effect. The readback is read-only, so a failure neither burns
+                // an epoch nor consumes the admission; the authority is
+                // returned for an exact retry, exactly like the DSCP gate.
+                let pre_effect_proof =
+                    match witness_object_install_pre_effect(backend, &authority.operation.request)
+                        .await
+                    {
+                        Ok(proof) => proof,
+                        Err(source) => {
+                            let _ = reply.send(Err(
+                                XfrmObjectInstallRunError::pre_effect_readback_failed(
+                                    authority, source,
+                                ),
+                            ));
+                            return;
+                        }
+                    };
                 let result = match state.consume_object_install_admission(&authority) {
                     Ok(()) => {
                         state.invalidate_counter_receipts();
@@ -1463,12 +1673,136 @@ impl NamespaceCommand {
                             authority.operation.operation_generation,
                             &authority.operation.request,
                             backend,
+                            pre_effect_proof,
                         )
                         .await
                     }
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result.map_err(XfrmObjectInstallRunError::from));
+            }
+            #[cfg(unix)]
+            Self::DetectorCutPrepared(authority, cut, reply) => {
+                // Crash-detector seams share the run path's validation, DSCP
+                // gate, pre-effect readback, and admission consumption. They
+                // stop at the selected unresolved phase before recovery.
+                let validation = state
+                    .require_object_recovery_store(&authority.operation.store)
+                    .and_then(|()| state.require_object_install_admission(&authority))
+                    .and_then(|()| {
+                        validate_object_install_admission(
+                            &authority.operation.store,
+                            &authority.prepared,
+                            authority.operation.operation_id,
+                            authority.operation.operation_generation,
+                            &authority.operation.request,
+                        )
+                    });
+                if let Err(error) = validation {
+                    let _ = reply.send(Err(error.into()));
+                    return;
+                }
+                let activation_required = match &authority.operation.request {
+                    XfrmObjectInstallRequest::Sa(request) => matches!(
+                        backend.ensure_dscp_mutation_activated(&request.parameters),
+                        Err(XfrmError::Unavailable)
+                    ),
+                    XfrmObjectInstallRequest::Policy(_) => false,
+                };
+                if activation_required {
+                    let _ = reply.send(Err(XfrmObjectInstallRunError::dscp_activation_required(
+                        authority,
+                    )));
+                    return;
+                }
+                let pre_effect_proof =
+                    match witness_object_install_pre_effect(backend, &authority.operation.request)
+                        .await
+                    {
+                        Ok(proof) => proof,
+                        Err(source) => {
+                            let _ = reply.send(Err(
+                                XfrmObjectInstallRunError::pre_effect_readback_failed(
+                                    authority, source,
+                                ),
+                            ));
+                            return;
+                        }
+                    };
+                let result = match state.consume_object_install_admission(&authority) {
+                    Ok(()) => {
+                        state.invalidate_counter_receipts();
+                        match cut {
+                            DetectorPreparedCut::Issuing {
+                                admit_backend_effect,
+                            } => {
+                                cut_object_install_at_issuing(
+                                    &authority.operation.store,
+                                    &authority.prepared,
+                                    authority.operation.operation_id,
+                                    authority.operation.operation_generation,
+                                    &authority.operation.request,
+                                    backend,
+                                    pre_effect_proof,
+                                    admit_backend_effect,
+                                )
+                                .await
+                            }
+                            DetectorPreparedCut::IndeterminateAfterEffect => {
+                                cut_object_install_at_indeterminate_after_effect(
+                                    &authority.operation.store,
+                                    &authority.prepared,
+                                    authority.operation.operation_id,
+                                    authority.operation.operation_generation,
+                                    &authority.operation.request,
+                                    backend,
+                                    pre_effect_proof,
+                                )
+                                .await
+                            }
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result.map_err(XfrmObjectInstallRunError::from));
+            }
+            #[cfg(unix)]
+            Self::DetectorCutAcquiredRemovalAdmitted(operation, admit_backend_effect, reply) => {
+                // Reproduce a process cut after durable cleanup admission and
+                // optionally after the exact kernel delete, while retaining
+                // the same restart gate and cleanup authority as production.
+                let validation = state
+                    .require_object_recovery_store(&operation.store)
+                    .and_then(|()| {
+                        durable_object_install_phase(
+                            &operation.store,
+                            operation.operation_id,
+                            operation.operation_generation,
+                            &operation.request,
+                        )
+                    })
+                    .and_then(|_| {
+                        state.reconcile_object_install_admission(
+                            operation.operation_id,
+                            operation.operation_generation,
+                        )
+                    });
+                let result = match validation {
+                    Ok(()) => {
+                        state.invalidate_counter_receipts();
+                        cut_object_install_at_removal_admitted(
+                            &operation.store,
+                            operation.operation_id,
+                            operation.operation_generation,
+                            &operation.request,
+                            backend,
+                            admit_backend_effect,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             #[cfg(unix)]
             Self::FinalizeDurableObjectInstall(operation, reply) => {
@@ -1560,6 +1894,9 @@ impl NamespaceCommand {
             }
             Self::QuerySaRelocationIdentity(request, reply) => {
                 let _ = reply.send(backend.query_sa_relocation_identity(request).await);
+            }
+            Self::QueryPolicy(request, reply) => {
+                let _ = reply.send(backend.query_policy(request).await);
             }
             #[cfg(target_os = "linux")]
             Self::QueryEspPeerObservationRegistration(key, reply) => {
@@ -1705,6 +2042,14 @@ impl NamespaceCommand {
                 let _ = reply.send(Err(XfrmObjectInstallDurableError::WrongBinding.into()));
             }
             #[cfg(unix)]
+            Self::DetectorCutPrepared(_, _, reply) => {
+                let _ = reply.send(Err(XfrmObjectInstallDurableError::WrongBinding.into()));
+            }
+            #[cfg(unix)]
+            Self::DetectorCutAcquiredRemovalAdmitted(_, _, reply) => {
+                let _ = reply.send(Err(XfrmObjectInstallDurableError::WrongBinding));
+            }
+            #[cfg(unix)]
             Self::FinalizeDurableObjectInstall(_, reply) => {
                 let _ = reply.send(Err(XfrmObjectInstallDurableError::WrongBinding));
             }
@@ -1732,6 +2077,9 @@ impl NamespaceCommand {
                 let _ = reply.send(Err(error));
             }
             Self::QuerySaRelocationIdentity(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::QueryPolicy(_, reply) => {
                 let _ = reply.send(Err(error));
             }
             #[cfg(target_os = "linux")]
@@ -1797,6 +2145,16 @@ impl XfrmBackend for NamespaceBoundLinuxXfrmBackend {
     ) -> Result<SaRelocationIdentity, XfrmError> {
         self.dispatch(LostReply::ReadOnly, |reply| {
             NamespaceCommand::QuerySaRelocationIdentity(request, reply)
+        })
+        .await
+    }
+
+    async fn query_policy(
+        &self,
+        request: QueryPolicyRequest,
+    ) -> Result<PolicyParameters, XfrmError> {
+        self.dispatch(LostReply::ReadOnly, |reply| {
+            NamespaceCommand::QueryPolicy(request, reply)
         })
         .await
     }
@@ -1984,7 +2342,7 @@ mod tests {
         fn transact(
             &self,
             operation: &'static str,
-            _operation_class: crate::linux::NetlinkOperationClass,
+            operation_class: crate::linux::NetlinkOperationClass,
             _request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
@@ -1993,7 +2351,12 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(operation);
-            Ok(None)
+            // Read-only exact queries model an absent identity so pre-effect
+            // readback witnesses `Absent`; mutations succeed with an ACK.
+            match operation_class {
+                crate::linux::NetlinkOperationClass::ReadOnly => Err(XfrmError::NotFound),
+                crate::linux::NetlinkOperationClass::Mutation => Ok(None),
+            }
         }
 
         fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
@@ -2097,6 +2460,18 @@ mod tests {
                 parameters: policy_parameters(),
             }),
         ]
+    }
+
+    #[cfg(unix)]
+    fn durable_object_readback_body(request: &XfrmObjectInstallRequest) -> SensitiveBuffer {
+        match request {
+            XfrmObjectInstallRequest::Sa(request) => {
+                crate::linux::test_sa_readback_body(&request.parameters).unwrap()
+            }
+            XfrmObjectInstallRequest::Policy(request) => {
+                crate::linux::test_policy_readback_body(&request.parameters).unwrap()
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -2407,7 +2782,7 @@ mod tests {
         assert!(transport.operations().is_empty());
         let outcome = backend.run_durable_object_install(authority).await.unwrap();
         assert_eq!(outcome.as_str(), "acquired");
-        assert_eq!(transport.operations(), vec!["install_sa"]);
+        assert_eq!(transport.operations(), vec!["query_sa", "install_sa"]);
 
         assert!(matches!(
             backend.remove_sa(remove_request()).await,
@@ -2421,7 +2796,64 @@ mod tests {
                 .await,
             Err(XfrmError::Unavailable)
         ));
-        assert_eq!(transport.operations(), vec!["install_sa"]);
+        assert_eq!(transport.operations(), vec!["query_sa", "install_sa"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_run_conflict_proof_admits_no_effect_for_preexisting_sa_and_policy() {
+        for request in durable_object_requests() {
+            let root = DurableTestRoot::new();
+            let state = Arc::new(BlockingState::new());
+            let readback = durable_object_readback_body(&request);
+            let transport =
+                BlockingBindingTransport::new_at_call(state, usize::MAX, [Ok(Some(readback))]);
+            let capture = transport.clone();
+            let (backend, store) = LinuxXfrmBackend::with_transport(transport)
+                .bind_current_network_namespace_with_object_recovery(
+                    root.path().to_path_buf(),
+                    XfrmObjectRecoveryProofKey::new([0x63; 32]).unwrap(),
+                )
+                .unwrap();
+            let operation_id = XfrmObjectInstallOperationId::generate().unwrap();
+            let generation = XfrmObjectInstallOperationGeneration::new(2).unwrap();
+            let authority = backend
+                .prepare_durable_object_install(&store, operation_id, generation, request.clone())
+                .await
+                .unwrap();
+
+            let outcome = backend.run_durable_object_install(authority).await.unwrap();
+            assert!(matches!(
+                outcome,
+                XfrmObjectInstallDurableOutcome::NoMutation(_)
+            ));
+            let fingerprints = store.fingerprints_for_request(&request).unwrap();
+            let record = store
+                .restore(operation_id, generation, request.object(), fingerprints)
+                .unwrap();
+            assert_eq!(record.phase, XfrmObjectInstallDurablePhase::NoMutation);
+            assert_eq!(
+                record.pre_effect_proof,
+                Some(XfrmObjectInstallPreEffectProof::Conflict)
+            );
+            let expected_readback = match &request {
+                XfrmObjectInstallRequest::Sa(_) => "query_sa",
+                XfrmObjectInstallRequest::Policy(_) => "query_policy",
+            };
+            assert_eq!(
+                capture.operations(),
+                vec![expected_readback],
+                "a witnessed conflict must never admit an install effect"
+            );
+            assert!(matches!(
+                backend
+                    .recover_durable_object_install(&store, operation_id, generation, request,)
+                    .await
+                    .unwrap(),
+                XfrmObjectInstallRestartOutcome::NoMutation
+            ));
+            assert_eq!(capture.operations(), vec![expected_readback]);
+        }
     }
 
     #[cfg(unix)]
@@ -2576,6 +3008,240 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lost_recover_reply_leaves_reconciliation_retryable_without_overlap() {
+        for request in durable_object_requests() {
+            let root = DurableTestRoot::new();
+            let blocking = Arc::new(BlockingState::new());
+            let (backend, store) = bind_with_capacity_and_recovery(
+                LinuxXfrmBackend::with_transport(BlockingTransport {
+                    state: Arc::clone(&blocking),
+                }),
+                1,
+                Some((
+                    root.path().to_path_buf(),
+                    XfrmObjectRecoveryProofKey::new([0x6e; 32]).unwrap(),
+                )),
+            )
+            .unwrap();
+            let store = store.unwrap();
+            let operation_id = XfrmObjectInstallOperationId::generate().unwrap();
+            let generation = XfrmObjectInstallOperationGeneration::new(11).unwrap();
+            let authority = backend
+                .prepare_durable_object_install(&store, operation_id, generation, request.clone())
+                .await
+                .unwrap();
+            // Cut the durable record at `Issuing` without any backend effect;
+            // the scripted readback witnessed absence, so reconciliation must
+            // converge as no-mutation without any kernel mutation.
+            backend
+                .detector_cut_prepared_issuing(authority, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                durable_object_install_phase(&store, operation_id, generation, &request),
+                Ok(XfrmObjectInstallDurablePhase::Issuing)
+            );
+
+            // Admit one reconciliation and lose its reply. The actor still
+            // owns completion of the admitted work.
+            let operation = DurableObjectOperation {
+                store: store.clone(),
+                operation_id,
+                operation_generation: generation,
+                request: request.clone(),
+            };
+            let (reply, lost_observer) = oneshot::channel();
+            let permit = backend.inner.sender.reserve().await.unwrap();
+            permit.send(NamespaceCommand::RecoverDurableObjectInstall(
+                Box::new(operation),
+                reply,
+            ));
+            drop(lost_observer);
+
+            // The retry is serialized behind the lost admission and observes
+            // its converged terminal state; no overlapping work or deletion.
+            assert!(matches!(
+                backend
+                    .recover_durable_object_install(&store, operation_id, generation, request,)
+                    .await
+                    .unwrap(),
+                XfrmObjectInstallRestartOutcome::Retired
+            ));
+            assert_eq!(blocking.mutation_calls.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lost_recover_reply_during_owned_removal_completes_once_and_retry_is_idempotent() {
+        for request in durable_object_requests() {
+            let root = DurableTestRoot::new();
+            let blocking = Arc::new(BlockingState::new());
+            let readback = durable_object_readback_body(&request);
+            let transport = BlockingBindingTransport::new_at_call(
+                Arc::clone(&blocking),
+                3,
+                [
+                    Err(XfrmError::NotFound),
+                    Ok(None),
+                    Ok(Some(readback)),
+                    Ok(None),
+                ],
+            );
+            let capture = transport.clone();
+            let (backend, store) = LinuxXfrmBackend::with_transport(transport)
+                .bind_current_network_namespace_with_object_recovery(
+                    root.path().to_path_buf(),
+                    XfrmObjectRecoveryProofKey::new([0x6f; 32]).unwrap(),
+                )
+                .unwrap();
+            let operation_id = XfrmObjectInstallOperationId::generate().unwrap();
+            let generation = XfrmObjectInstallOperationGeneration::new(12).unwrap();
+            let authority = backend
+                .prepare_durable_object_install(&store, operation_id, generation, request.clone())
+                .await
+                .unwrap();
+            backend
+                .detector_cut_prepared_issuing(authority, true)
+                .await
+                .unwrap();
+
+            let operation = DurableObjectOperation {
+                store: store.clone(),
+                operation_id,
+                operation_generation: generation,
+                request: request.clone(),
+            };
+            let (reply, lost_observer) = oneshot::channel();
+            let permit = backend.inner.sender.reserve().await.unwrap();
+            permit.send(NamespaceCommand::RecoverDurableObjectInstall(
+                Box::new(operation),
+                reply,
+            ));
+            drop(lost_observer);
+
+            wait_until(|| blocking.calls.load(Ordering::Acquire) == 4).await;
+            assert_eq!(
+                durable_object_install_phase(&store, operation_id, generation, &request),
+                Ok(XfrmObjectInstallDurablePhase::RemovalAdmitted),
+                "deletion authority must be durable before the blocked remove"
+            );
+
+            let mut retry = tokio::spawn({
+                let backend = backend.clone();
+                let store = store.clone();
+                let request = request.clone();
+                async move {
+                    backend
+                        .recover_durable_object_install(&store, operation_id, generation, request)
+                        .await
+                }
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut retry)
+                    .await
+                    .is_err(),
+                "retry must serialize behind the still-live admitted removal"
+            );
+
+            blocking.release();
+            assert!(matches!(
+                retry.await.unwrap().unwrap(),
+                XfrmObjectInstallRestartOutcome::Retired
+            ));
+            let operations = capture.operations();
+            assert_eq!(
+                operations
+                    .iter()
+                    .filter(|operation| matches!(
+                        **operation,
+                        "remove_sa" | "remove_policy" | "remove_policy_exact"
+                    ))
+                    .count(),
+                1,
+                "lost completion observer must not duplicate the removal"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_ack_loss_retains_removal_authority_and_not_found_retry_retires_it() {
+        for request in durable_object_requests() {
+            let root = DurableTestRoot::new();
+            let readback = durable_object_readback_body(&request);
+            let transport = BlockingBindingTransport::new_at_call(
+                Arc::new(BlockingState::new()),
+                usize::MAX,
+                [
+                    Err(XfrmError::NotFound),
+                    Ok(None),
+                    Ok(Some(readback)),
+                    Err(XfrmError::StateIndeterminate {
+                        operation: "test_remove_ack_loss",
+                    }),
+                    Err(XfrmError::NotFound),
+                ],
+            );
+            let capture = transport.clone();
+            let (backend, store) = LinuxXfrmBackend::with_transport(transport)
+                .bind_current_network_namespace_with_object_recovery(
+                    root.path().to_path_buf(),
+                    XfrmObjectRecoveryProofKey::new([0x70; 32]).unwrap(),
+                )
+                .unwrap();
+            let operation_id = XfrmObjectInstallOperationId::generate().unwrap();
+            let generation = XfrmObjectInstallOperationGeneration::new(13).unwrap();
+            let authority = backend
+                .prepare_durable_object_install(&store, operation_id, generation, request.clone())
+                .await
+                .unwrap();
+            backend
+                .detector_cut_prepared_issuing(authority, true)
+                .await
+                .unwrap();
+
+            let first = backend
+                .recover_durable_object_install(&store, operation_id, generation, request.clone())
+                .await
+                .unwrap();
+            assert!(matches!(
+                first,
+                XfrmObjectInstallRestartOutcome::RemovalPending {
+                    source: XfrmError::StateIndeterminate {
+                        operation: "test_remove_ack_loss"
+                    }
+                }
+            ));
+            assert_eq!(
+                durable_object_install_phase(&store, operation_id, generation, &request),
+                Ok(XfrmObjectInstallDurablePhase::RemovalAdmitted)
+            );
+
+            assert!(matches!(
+                backend
+                    .recover_durable_object_install(&store, operation_id, generation, request,)
+                    .await
+                    .unwrap(),
+                XfrmObjectInstallRestartOutcome::OwnedResidueRetired
+            ));
+            let operations = capture.operations();
+            assert_eq!(
+                operations
+                    .iter()
+                    .filter(|operation| matches!(
+                        **operation,
+                        "remove_sa" | "remove_policy" | "remove_policy_exact"
+                    ))
+                    .count(),
+                2,
+                "the exact admitted removal is retried once after ACK loss"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admitted_durable_issue_finishes_after_observer_cancellation() {
         for request in durable_object_requests() {
             let root = DurableTestRoot::new();
@@ -2602,7 +3268,10 @@ mod tests {
                 let backend = backend.clone();
                 async move { backend.run_durable_object_install(authority).await }
             });
-            wait_until(|| blocking.calls.load(Ordering::Acquire) == 1).await;
+            // The pre-effect readback resolves without blocking; the install
+            // mutation is the call held at the barrier, and it runs only after
+            // the durable `Issuing` publication.
+            wait_until(|| blocking.mutation_calls.load(Ordering::Acquire) == 1).await;
             assert_eq!(
                 durable_object_install_phase(&store, operation_id, generation, &request),
                 Ok(XfrmObjectInstallDurablePhase::Issuing)
@@ -2618,7 +3287,7 @@ mod tests {
                     .unwrap(),
                 XfrmObjectInstallDurablePhase::Committed
             );
-            assert_eq!(blocking.calls.load(Ordering::Acquire), 1);
+            assert_eq!(blocking.mutation_calls.load(Ordering::Acquire), 1);
         }
     }
 
@@ -2649,12 +3318,12 @@ mod tests {
 
             let first = tokio::spawn({
                 let backend = backend.clone();
-                async move { backend.query_sa(query_request()).await }
+                async move { backend.remove_sa(remove_request()).await }
             });
-            wait_until(|| blocking.calls.load(Ordering::Acquire) == 1).await;
+            wait_until(|| blocking.mutation_calls.load(Ordering::Acquire) == 1).await;
             let second = tokio::spawn({
                 let backend = backend.clone();
-                async move { backend.query_sa(query_request()).await }
+                async move { backend.remove_sa(remove_request()).await }
             });
             wait_until(|| backend.inner.sender.capacity() == 0).await;
 
@@ -2666,7 +3335,7 @@ mod tests {
             blocking.release();
             let _ = first.await;
             let _ = second.await;
-            assert_eq!(blocking.calls.load(Ordering::Acquire), 2);
+            assert_eq!(blocking.mutation_calls.load(Ordering::Acquire), 2);
             assert!(matches!(
                 backend
                     .recover_durable_object_install(&store, operation_id, generation, request,)
@@ -2674,7 +3343,7 @@ mod tests {
                     .unwrap(),
                 XfrmObjectInstallRestartOutcome::NoMutation
             ));
-            assert_eq!(blocking.calls.load(Ordering::Acquire), 2);
+            assert_eq!(blocking.mutation_calls.load(Ordering::Acquire), 2);
         }
     }
 
@@ -2771,7 +3440,7 @@ mod tests {
                 outcome,
                 XfrmObjectInstallDurableOutcome::Acquired(_)
             ));
-            assert_eq!(transport.operations().len(), 1);
+            assert_eq!(transport.operations().len(), 2);
             assert_eq!(
                 backend
                     .run_durable_object_install(authority)
@@ -2779,7 +3448,7 @@ mod tests {
                     .unwrap_err(),
                 XfrmObjectInstallDurableError::Stale
             );
-            assert_eq!(transport.operations().len(), 1);
+            assert_eq!(transport.operations().len(), 2);
             assert_eq!(
                 backend
                     .finalize_durable_object_install(
@@ -2856,7 +3525,7 @@ mod tests {
             backend.run_durable_object_install(authority).await.unwrap(),
             XfrmObjectInstallDurableOutcome::Acquired(_)
         ));
-        assert_eq!(transport.operations(), vec!["install_sa"]);
+        assert_eq!(transport.operations(), vec!["query_sa", "install_sa"]);
         assert_eq!(
             backend
                 .finalize_durable_object_install(
@@ -2988,7 +3657,7 @@ mod tests {
                     .unwrap(),
                 XfrmObjectInstallDurableOutcome::Acquired(_)
             ));
-            assert_eq!(transport.operations().len(), 2);
+            assert_eq!(transport.operations().len(), 3);
             assert_eq!(
                 backend
                     .finalize_durable_object_install(&store, operation_id, generation, request,)
@@ -3052,7 +3721,10 @@ mod tests {
                 .unwrap(),
             XfrmObjectInstallDurablePhase::Committed
         );
-        assert_eq!(transport.operations(), vec!["install_sa", "install_policy"]);
+        assert_eq!(
+            transport.operations(),
+            vec!["query_sa", "install_sa", "query_policy", "install_policy"]
+        );
     }
 
     #[cfg(unix)]
@@ -3083,6 +3755,7 @@ mod tests {
                 &prepared,
                 XfrmObjectInstallDurablePhase::Prepared,
                 XfrmObjectInstallDurablePhase::Issuing,
+                Some(crate::durable_object::XfrmObjectInstallPreEffectProof::Absent),
             )
             .unwrap();
         let issuing = store.handle_for_record(&issuing).unwrap();
@@ -3091,6 +3764,7 @@ mod tests {
                 &issuing,
                 XfrmObjectInstallDurablePhase::Issuing,
                 XfrmObjectInstallDurablePhase::Acquired,
+                None,
             )
             .unwrap();
 
@@ -3216,6 +3890,7 @@ mod tests {
     #[derive(Debug)]
     struct BlockingState {
         calls: AtomicUsize,
+        mutation_calls: AtomicUsize,
         released: AtomicBool,
         lock: Mutex<()>,
         wake: Condvar,
@@ -3225,6 +3900,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                mutation_calls: AtomicUsize::new(0),
                 released: AtomicBool::new(false),
                 lock: Mutex::new(()),
                 wake: Condvar::new(),
@@ -3246,27 +3922,35 @@ mod tests {
         fn transact(
             &self,
             _operation: &'static str,
-            _operation_class: crate::linux::NetlinkOperationClass,
+            operation_class: crate::linux::NetlinkOperationClass,
             _request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
         ) -> Result<Option<SensitiveBuffer>, XfrmError> {
-            let call = self.state.calls.fetch_add(1, Ordering::AcqRel);
-            if call == 0 {
-                let mut guard = self
-                    .state
-                    .lock
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                while !self.state.released.load(Ordering::Acquire) {
-                    guard = self
-                        .state
-                        .wake
-                        .wait(guard)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.state.calls.fetch_add(1, Ordering::AcqRel);
+            match operation_class {
+                // Pre-effect and recovery readback resolve immediately as an
+                // absent identity; only mutations are held by the barrier.
+                crate::linux::NetlinkOperationClass::ReadOnly => Err(XfrmError::NotFound),
+                crate::linux::NetlinkOperationClass::Mutation => {
+                    let mutation = self.state.mutation_calls.fetch_add(1, Ordering::AcqRel);
+                    if mutation == 0 {
+                        let mut guard = self
+                            .state
+                            .lock
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        while !self.state.released.load(Ordering::Acquire) {
+                            guard = self
+                                .state
+                                .wake
+                                .wait(guard)
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        }
+                    }
+                    Ok(None)
                 }
             }
-            Ok(None)
         }
 
         fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
@@ -3389,6 +4073,12 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(operation);
+            // The durable pre-effect/recovery exact readback models an absent
+            // identity without consuming a scripted mutation response. The
+            // outbound-binding readback queries keep their scripted bodies.
+            if matches!(operation, "query_sa" | "query_policy") {
+                return Err(XfrmError::NotFound);
+            }
             self.responses
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4818,7 +5508,7 @@ mod tests {
         ));
         assert_eq!(
             transport.operations(),
-            vec!["install_sa", "install_sa_dscp_readback"]
+            vec!["query_sa", "install_sa", "install_sa_dscp_readback"]
         );
         assert_eq!(
             backend
