@@ -30,12 +30,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+#[cfg(any(target_os = "linux", test))]
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", test))]
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+#[cfg(any(target_os = "linux", test))]
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
@@ -69,8 +72,11 @@ use crate::{
     GtpuUplinkChecksumOffloadContract, PdpContextIndeterminateReason, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextReadback, PdpContextReconciliationCapabilities,
     PdpContextRemovalOutcome, PdpContextSelector, PdpContextUplinkSelector,
-    RemovePdpContextRequest, RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal,
-    RetainedGraphCleanupRequest, Teid,
+    RemovePdpContextRequest, Teid,
+};
+#[cfg(any(target_os = "linux", test))]
+use crate::{
+    RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest,
 };
 
 /// Default bpffs directory under which per-interface map pins are created.
@@ -470,6 +476,10 @@ pub(crate) enum EbpfAttachmentDisposition {
 /// graph's tc hooks fenced (detached if they were live) or already absent, so
 /// forwarding stays disabled while the caller reads back and removes stale PDP
 /// contexts.
+///
+/// Cleanup-only recovery is an eBPF datapath feature, so the adoption result is
+/// only constructed by the Linux kernel runtime and the test fake.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EbpfCleanupOnlyAdoption {
     /// The retained graph was adopted for cleanup only.
@@ -487,6 +497,7 @@ pub(crate) enum EbpfCleanupOnlyAdoption {
     Refused(RetainedGraphCleanupRefusal),
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl fmt::Debug for EbpfCleanupOnlyAdoption {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -588,6 +599,7 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// this graph is fenced (detached) so forwarding is disabled before the
     /// caller removes stale PDP contexts. The expected local endpoint identity
     /// is validated against the retained config before mutation.
+    #[cfg(any(target_os = "linux", test))]
     fn adopt_cleanup_only(
         &self,
         interface: &str,
@@ -599,6 +611,7 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
 
     /// Activate a cleanup-only managed device: attach the forwarding programs
     /// and links, transitioning it to a normal active attachment.
+    #[cfg(any(target_os = "linux", test))]
     fn activate_cleanup_only(
         &self,
         interface: &str,
@@ -1357,11 +1370,13 @@ struct MarkedPdpState {
 /// The worker writes the terminal classification here and wakes the observer.
 /// The authoritative graph state lives in the backend, so a dropped observer
 /// loses only this observation, never the convergence itself.
+#[cfg(any(target_os = "linux", test))]
 struct CleanupAcquisitionShared {
     state: CleanupAcquisitionState,
     waker: Option<std::task::Waker>,
 }
 
+#[cfg(any(target_os = "linux", test))]
 enum CleanupAcquisitionState {
     NotStarted,
     Running,
@@ -1376,6 +1391,7 @@ enum CleanupAcquisitionState {
 /// from one handle; dropping the observing future does not cancel the worker,
 /// which runs to completion under the namespace lease and operation lock and
 /// converges the graph state regardless.
+#[cfg(any(target_os = "linux", test))]
 #[must_use]
 pub struct RetainedGraphCleanupAcquisition {
     backend: EbpfGtpuDataplaneBackend,
@@ -1383,6 +1399,7 @@ pub struct RetainedGraphCleanupAcquisition {
     shared: Arc<Mutex<CleanupAcquisitionShared>>,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl fmt::Debug for RetainedGraphCleanupAcquisition {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1392,6 +1409,7 @@ impl fmt::Debug for RetainedGraphCleanupAcquisition {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl Future for RetainedGraphCleanupAcquisition {
     type Output = Result<RetainedGraphCleanupClassification, GtpuError>;
 
@@ -1618,6 +1636,10 @@ impl EbpfGtpuDataplaneBackend {
     /// against the cleanup-only attachment while forwarding stays disabled, and
     /// [`Self::activate_cleanup_recovery`] is the sole step that reattaches the
     /// forwarding hooks.
+    ///
+    /// Cleanup-only recovery drives the eBPF datapath and is therefore only
+    /// available where that runtime exists (Linux, or the test fake).
+    #[cfg(any(target_os = "linux", test))]
     pub fn acquire_cleanup_only_recovery(
         &self,
         request: RetainedGraphCleanupRequest,
@@ -1649,6 +1671,7 @@ impl EbpfGtpuDataplaneBackend {
     ///
     /// Returns [`GtpuError::NotFound`] when `device` is not managed by this
     /// backend and [`GtpuError::AlreadyExists`] when it is already active.
+    #[cfg(any(target_os = "linux", test))]
     pub async fn activate_cleanup_recovery(
         &self,
         device: &GtpDevice,
@@ -3598,6 +3621,7 @@ impl EbpfGtpuDataplaneBackend {
         )
     }
 
+    #[cfg(any(target_os = "linux", test))]
     fn acquire_cleanup_only_recovery_sync(
         &self,
         request: RetainedGraphCleanupRequest,
@@ -3701,6 +3725,7 @@ impl EbpfGtpuDataplaneBackend {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     fn activate_cleanup_recovery_sync(&self, device: GtpDevice) -> Result<GtpDevice, GtpuError> {
         let _operation = self.operation_guard()?;
         validate_interface_name(&device.name)?;
