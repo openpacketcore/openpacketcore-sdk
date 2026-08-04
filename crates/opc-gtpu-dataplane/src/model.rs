@@ -2178,6 +2178,115 @@ impl fmt::Debug for PdpRestartRecoveryRequest {
     }
 }
 
+/// Explicit caller attestation that the caller is the current cooperating
+/// live writer of a durable Linux kernel-GTP device and its PDP state.
+///
+/// Supplying this value authorizes live-writer exact removal over an exact PDP
+/// context while the writer remains live and continues to own the mutation
+/// namespace. Unlike [`PdpRestartRecoveryProof`], it never asserts that a
+/// prior writer stopped, so it is the only honest authority for same-process
+/// session replacement. It never bypasses recovery-root binding, device
+/// identity, dual-selector, incarnation, or writer-lease validation; it only
+/// records the caller's assertion that it is the cooperating writer whose
+/// durable descriptors are being reconciled. The restart-recovery authority
+/// remains strict and distinct; constructing this proof does not weaken it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PdpLiveWriterProof {
+    _private: (),
+}
+
+impl PdpLiveWriterProof {
+    /// Attest that the caller is the current cooperating writer and owns the
+    /// live mutation namespace.
+    #[must_use]
+    pub const fn current_writer_owns_live_namespace() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Request to remove one exact Linux kernel-GTP PDP context under the
+/// authority of the current cooperating live writer.
+///
+/// This is the same-process replacement primitive an ePDG-style consumer uses
+/// while it remains the live writer: a subscriber-session replacement must
+/// remove the prior session's kernel-GTP PDP context with exact authority
+/// before the replacement dataplane can be proven converged, and the
+/// cooperating writer is still live, so the prior-writer stop attestation
+/// required by [`PdpRestartRecoveryRequest`] would be false. The request
+/// binds the complete expected identity — the device identity (`device`), its
+/// non-reusable incarnation (`incarnation`), and both selector axes and full
+/// context (`expected`) — so a resident context is only ever removed when it
+/// matches exactly. The durable PDP recovery root must already be bound, and
+/// the removal serializes under the same topology and per-device writer
+/// gates as every other cooperating mutation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PdpLiveWriterRemovalRequest {
+    device: GtpDevice,
+    incarnation: PdpDeviceIncarnation,
+    expected: GtpPdpContext,
+    writer_proof: PdpLiveWriterProof,
+}
+
+impl PdpLiveWriterRemovalRequest {
+    /// Build a live-writer exact-removal request for one exact PDP context.
+    ///
+    /// `device` is the expected GTP device identity (name and ifindex) of the
+    /// live writer's device. `incarnation` is the cryptographically
+    /// unpredictable, durably persisted identity minted before that device
+    /// was created and never reused. `expected` is the complete expected PDP
+    /// context (both selector axes and every identity field). `writer_proof`
+    /// attests that the caller is the current cooperating writer.
+    #[must_use]
+    pub const fn new(
+        device: GtpDevice,
+        incarnation: PdpDeviceIncarnation,
+        expected: GtpPdpContext,
+        writer_proof: PdpLiveWriterProof,
+    ) -> Self {
+        Self {
+            device,
+            incarnation,
+            expected,
+            writer_proof,
+        }
+    }
+
+    /// Return the expected GTP device identity of the live writer's device.
+    #[must_use]
+    pub const fn device(&self) -> &GtpDevice {
+        &self.device
+    }
+
+    /// Return the non-reusable identity of the expected device incarnation.
+    #[must_use]
+    pub const fn incarnation(&self) -> PdpDeviceIncarnation {
+        self.incarnation
+    }
+
+    /// Return the complete expected PDP context identity.
+    #[must_use]
+    pub const fn expected(&self) -> &GtpPdpContext {
+        &self.expected
+    }
+
+    /// Return the live-writer ownership attestation.
+    #[must_use]
+    pub const fn writer_proof(&self) -> PdpLiveWriterProof {
+        self.writer_proof
+    }
+}
+
+impl fmt::Debug for PdpLiveWriterRemovalRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PdpLiveWriterRemovalRequest")
+            .field("device", &"<redacted-device-identity>")
+            .field("incarnation", &"<redacted-device-incarnation>")
+            .field("expected", &"<redacted-pdp-context>")
+            .field("writer_proof", &self.writer_proof)
+            .finish()
+    }
+}
+
 /// Request to acquire the identity of one retained Linux kernel-GTP device
 /// after its previous writer stopped.
 ///
@@ -3115,6 +3224,50 @@ mod tests {
             assert!(!debug.contains(sensitive));
         }
         assert!(debug.contains("<redacted-device-incarnation>"));
+    }
+
+    #[test]
+    fn pdp_live_writer_removal_request_binds_incarnation_and_redacts_identity() {
+        let device = GtpDevice {
+            name: "tenant-sensitive-gtp".to_string(),
+            ifindex: 41,
+        };
+        let incarnation = PdpDeviceIncarnation::from_bytes([0x5a; 16]).unwrap();
+        let expected = reconciliation_context();
+        let writer_proof = PdpLiveWriterProof::current_writer_owns_live_namespace();
+        let request = PdpLiveWriterRemovalRequest::new(
+            device.clone(),
+            incarnation,
+            expected.clone(),
+            writer_proof,
+        );
+
+        assert_eq!(request.device(), &device);
+        assert_eq!(request.incarnation(), incarnation);
+        assert_eq!(request.expected(), &expected);
+        assert_eq!(request.writer_proof(), writer_proof);
+        assert_eq!(
+            writer_proof,
+            PdpLiveWriterProof::current_writer_owns_live_namespace()
+        );
+
+        let debug = format!("{request:?}");
+        for sensitive in [
+            "tenant-sensitive-gtp",
+            "10.23.0.2",
+            "192.0.2.10",
+            "12345678",
+            "87654321",
+            "[90, 90",
+        ] {
+            assert!(
+                !debug.contains(sensitive),
+                "request debug leaked {sensitive}: {debug}"
+            );
+        }
+        assert!(debug.contains("<redacted-device-identity>"));
+        assert!(debug.contains("<redacted-device-incarnation>"));
+        assert!(debug.contains("<redacted-pdp-context>"));
     }
 
     #[test]

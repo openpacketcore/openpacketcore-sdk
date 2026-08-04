@@ -17,7 +17,10 @@
 //! `GETPDP` inspection and, once a durable recovery root is bound, exact
 //! restart-recovery authority: a cross-process per-device lease plus the
 //! authoritative dual-axis readback that together compensate for the kernel's
-//! missing compare-delete primitive. A separate identity-bearing,
+//! missing compare-delete primitive. A distinct live-writer authority removes
+//! one exact PDP context while the cooperating writer remains live for
+//! same-process session replacement, without weakening the strict
+//! prior-writer-stopped restart contract. A separate identity-bearing,
 //! mutation-free retained-device acquisition classifies a durable Linux
 //! kernel-GTP device record after process loss — exact retained identity,
 //! authoritative absence, conflicting replacement identity, structural
@@ -89,10 +92,11 @@ pub use model::{
     PdpContextLocalTeidSelector, PdpContextMismatchField, PdpContextReadback,
     PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextRepairReason,
     PdpContextSelector, PdpContextSelectorOccupancy, PdpContextUplinkIdentity,
-    PdpContextUplinkSelector, PdpDeviceIncarnation, PdpRestartRecoveryProof,
-    PdpRestartRecoveryRequest, RemovePdpContextRequest, RetainedDeviceConflictReason,
-    RetainedDeviceIdentityAcquisition, RetainedDeviceIdentityOutcome,
-    RetainedDeviceIdentityRequest, RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
+    PdpContextUplinkSelector, PdpDeviceIncarnation, PdpLiveWriterProof,
+    PdpLiveWriterRemovalRequest, PdpRestartRecoveryProof, PdpRestartRecoveryRequest,
+    RemovePdpContextRequest, RetainedDeviceConflictReason, RetainedDeviceIdentityAcquisition,
+    RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest,
+    RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
     RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest,
     Teid, GTPU_PORT,
 };

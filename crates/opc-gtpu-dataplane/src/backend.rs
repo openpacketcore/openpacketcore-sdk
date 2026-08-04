@@ -11,7 +11,8 @@ use crate::model::{
     GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, PdpContextInstallOutcome,
     PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
-    PdpContextSelector, PdpRestartRecoveryRequest, RemovePdpContextRequest,
+    PdpContextSelector, PdpLiveWriterRemovalRequest, PdpRestartRecoveryRequest,
+    RemovePdpContextRequest,
 };
 use crate::GtpuError;
 
@@ -157,6 +158,31 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Remove only state that both selector axes prove exactly matches the
+    /// request under the current cooperating live writer's authority.
+    ///
+    /// This is the same-process replacement companion of
+    /// [`Self::recover_pdp_context_exact`]: the caller is the live writer
+    /// and remains live, so the request carries a live-writer ownership proof
+    /// instead of the prior-writer stop attestation, which would be false.
+    /// The restart-recovery contract stays strict and distinct; neither
+    /// authority substitutes for the other. Like
+    /// [`Self::recover_pdp_context_exact`], the request binds the expected
+    /// device identity, a non-reusable device incarnation, and the complete
+    /// expected context, and implementations must serialize under the
+    /// topology and per-device writer gates. Cancellation does not prove
+    /// that a backend's blocking kernel operation stopped; the blocking
+    /// mutation is owned to a terminal classified result even if the caller
+    /// future is dropped.
+    async fn remove_pdp_context_exact_live_writer(
+        &self,
+        _request: PdpLiveWriterRemovalRequest,
+    ) -> Result<PdpContextRemovalOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "pdp_live_writer_exact_removal",
+        })
+    }
+
     /// Read one complete grouped session by stable group and device identity.
     ///
     /// Implementations revalidate the full selector/index graph, group
@@ -233,6 +259,13 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// Report support for the authority-bearing durable restart-recovery
     /// request independently of generationless exact removal.
     fn pdp_restart_recovery_capability(&self) -> GtpuCapability {
+        GtpuCapability::Missing
+    }
+
+    /// Report support for the authority-bearing live-writer exact-removal
+    /// request independently of restart recovery and generationless exact
+    /// removal.
+    fn pdp_live_writer_removal_capability(&self) -> GtpuCapability {
         GtpuCapability::Missing
     }
 
@@ -331,6 +364,10 @@ mod tests {
             backend.pdp_restart_recovery_capability(),
             GtpuCapability::Missing
         );
+        assert_eq!(
+            backend.pdp_live_writer_removal_capability(),
+            GtpuCapability::Missing
+        );
         let group_id = crate::GtpuSessionGroupId::new([1; 16]).unwrap();
         let device_id = crate::GtpuSessionDeviceId::new([2; 16]).unwrap();
         let local_outer = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
@@ -382,6 +419,23 @@ mod tests {
             egress_dscp: None,
             uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
         };
+        let live_writer_request = crate::PdpLiveWriterRemovalRequest::new(
+            GtpDevice {
+                name: String::from("gtp0"),
+                ifindex: 7,
+            },
+            crate::PdpDeviceIncarnation::from_bytes([3; 16]).unwrap(),
+            context.clone(),
+            crate::PdpLiveWriterProof::current_writer_owns_live_namespace(),
+        );
+        assert!(matches!(
+            backend
+                .remove_pdp_context_exact_live_writer(live_writer_request)
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "pdp_live_writer_exact_removal"
+            })
+        ));
         let entry = crate::GtpuSessionEntry::new(context, local_outer).unwrap();
         let group = GtpuSessionGroup::new(group_id, device_id, vec![entry]).unwrap();
         let reconcile_request = GtpuSessionGroupReconcileRequest::new(
