@@ -3,6 +3,7 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 
 use opc_gtpu_ebpf_common::GtpuEndpointAddress;
 pub use opc_gtpu_ebpf_common::{
@@ -2186,21 +2187,76 @@ impl fmt::Debug for PdpRestartRecoveryRequest {
 /// namespace. Unlike [`PdpRestartRecoveryProof`], it never asserts that a
 /// prior writer stopped, so it is the only honest authority for same-process
 /// session replacement. It never bypasses recovery-root binding, device
-/// identity, dual-selector, incarnation, or writer-lease validation; it only
-/// records the caller's assertion that it is the cooperating writer whose
-/// durable descriptors are being reconciled. The restart-recovery authority
-/// remains strict and distinct; constructing this proof does not weaken it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// identity, dual-selector, incarnation, or writer-lease validation. It records
+/// the caller's assertion and binds it to the backend's exact recovery root and
+/// network-namespace identity for revalidation before mutation. The
+/// restart-recovery authority remains strict and distinct; acquiring this proof
+/// does not weaken it.
+///
+/// A proof is issued only by a backend's attestation boundary. It is affine:
+/// callers must move the proof into exactly one removal request, and cannot
+/// duplicate or manufacture it through the public API.
+///
+/// ```compile_fail
+/// # use opc_gtpu_dataplane::PdpLiveWriterProof;
+/// fn cannot_clone(proof: PdpLiveWriterProof) -> PdpLiveWriterProof {
+///     proof.clone()
+/// }
+/// ```
+#[must_use = "carry the live-writer proof into exactly one removal request"]
 pub struct PdpLiveWriterProof {
-    _private: (),
+    recovery_root: PathBuf,
+    namespace: PdpLiveWriterNamespaceIdentity,
 }
 
 impl PdpLiveWriterProof {
-    /// Attest that the caller is the current cooperating writer and owns the
-    /// live mutation namespace.
-    #[must_use]
-    pub const fn current_writer_owns_live_namespace() -> Self {
-        Self { _private: () }
+    pub(crate) fn bound_to(
+        recovery_root: PathBuf,
+        namespace: PdpLiveWriterNamespaceIdentity,
+    ) -> Self {
+        Self {
+            recovery_root,
+            namespace,
+        }
+    }
+
+    pub(crate) fn matches(
+        &self,
+        recovery_root: &Path,
+        namespace: PdpLiveWriterNamespaceIdentity,
+    ) -> bool {
+        self.recovery_root == recovery_root && self.namespace == namespace
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        recovery_root: PathBuf,
+        namespace: PdpLiveWriterNamespaceIdentity,
+    ) -> Self {
+        Self::bound_to(recovery_root, namespace)
+    }
+}
+
+/// Exact identity of the network namespace in which a live-writer proof was
+/// acquired. Linux derives this from `/proc/thread-self/ns/net` metadata.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PdpLiveWriterNamespaceIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl PdpLiveWriterNamespaceIdentity {
+    pub(crate) const fn from_dev_ino(device: u64, inode: u64) -> Self {
+        Self { device, inode }
+    }
+}
+
+impl fmt::Debug for PdpLiveWriterProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PdpLiveWriterProof")
+            .field("recovery_root", &"<redacted-recovery-root>")
+            .field("namespace", &"<redacted-network-namespace>")
+            .finish()
     }
 }
 
@@ -2219,7 +2275,13 @@ impl PdpLiveWriterProof {
 /// matches exactly. The durable PDP recovery root must already be bound, and
 /// the removal serializes under the same topology and per-device writer
 /// gates as every other cooperating mutation.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// ```compile_fail
+/// # use opc_gtpu_dataplane::PdpLiveWriterRemovalRequest;
+/// fn cannot_clone(request: PdpLiveWriterRemovalRequest) -> PdpLiveWriterRemovalRequest {
+///     request.clone()
+/// }
+/// ```
 pub struct PdpLiveWriterRemovalRequest {
     device: GtpDevice,
     incarnation: PdpDeviceIncarnation,
@@ -2270,9 +2332,25 @@ impl PdpLiveWriterRemovalRequest {
     }
 
     /// Return the live-writer ownership attestation.
-    #[must_use]
-    pub const fn writer_proof(&self) -> PdpLiveWriterProof {
-        self.writer_proof
+    #[must_use = "inspect the affine live-writer proof reference"]
+    pub const fn writer_proof(&self) -> &PdpLiveWriterProof {
+        &self.writer_proof
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        GtpDevice,
+        PdpDeviceIncarnation,
+        GtpPdpContext,
+        PdpLiveWriterProof,
+    ) {
+        (
+            self.device,
+            self.incarnation,
+            self.expected,
+            self.writer_proof,
+        )
     }
 }
 
@@ -3215,6 +3293,7 @@ mod tests {
         let debug = format!("{request:?}");
         for sensitive in [
             "tenant-sensitive-gtp",
+            "/var/lib/opc/recovery",
             "10.23.0.2",
             "192.0.2.10",
             "12345678",
@@ -3234,7 +3313,10 @@ mod tests {
         };
         let incarnation = PdpDeviceIncarnation::from_bytes([0x5a; 16]).unwrap();
         let expected = reconciliation_context();
-        let writer_proof = PdpLiveWriterProof::current_writer_owns_live_namespace();
+        let writer_proof = PdpLiveWriterProof::for_test(
+            PathBuf::from("/var/lib/opc/recovery"),
+            PdpLiveWriterNamespaceIdentity::from_dev_ino(7, 11),
+        );
         let request = PdpLiveWriterRemovalRequest::new(
             device.clone(),
             incarnation,
@@ -3245,11 +3327,7 @@ mod tests {
         assert_eq!(request.device(), &device);
         assert_eq!(request.incarnation(), incarnation);
         assert_eq!(request.expected(), &expected);
-        assert_eq!(request.writer_proof(), writer_proof);
-        assert_eq!(
-            writer_proof,
-            PdpLiveWriterProof::current_writer_owns_live_namespace()
-        );
+        assert!(format!("{:?}", request.writer_proof()).contains("PdpLiveWriterProof"));
 
         let debug = format!("{request:?}");
         for sensitive in [

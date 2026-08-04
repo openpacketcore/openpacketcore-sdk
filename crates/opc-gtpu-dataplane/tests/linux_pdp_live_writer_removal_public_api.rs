@@ -21,7 +21,21 @@ fn assert_live_writer_request_accessors(request: &PdpLiveWriterRemovalRequest) {
     let _: &GtpDevice = request.device();
     let _: PdpDeviceIncarnation = request.incarnation();
     let _: &GtpPdpContext = request.expected();
-    let _: PdpLiveWriterProof = request.writer_proof();
+    let _: &PdpLiveWriterProof = request.writer_proof();
+}
+
+#[allow(dead_code)]
+async fn concrete_live_writer_proof_acquisition(
+    backend: &LinuxGtpuDataplaneBackend,
+) -> Result<PdpLiveWriterProof, GtpuError> {
+    backend.acquire_pdp_live_writer_proof().await
+}
+
+#[allow(dead_code)]
+async fn trait_object_live_writer_proof_acquisition(
+    backend: &dyn GtpuDataplaneBackend,
+) -> Result<PdpLiveWriterProof, GtpuError> {
+    backend.acquire_pdp_live_writer_proof().await
 }
 
 // Compile-time proof that the live-writer entry point exists with the
@@ -71,15 +85,6 @@ fn linux_live_writer_removal_surface_is_public_and_typed() {
     assert_ne!(repair, indeterminate);
     let _ = format!("{repair:?} {indeterminate:?}");
 
-    // The live-writer proof is a value-free capability distinct from the
-    // restart-recovery prior-writer stop attestation.
-    let proof = PdpLiveWriterProof::current_writer_owns_live_namespace();
-    assert_eq!(
-        proof,
-        PdpLiveWriterProof::current_writer_owns_live_namespace()
-    );
-    let _ = format!("{proof:?}");
-
     // Construction-time recovery-root binding is public.
     let _bind: fn(
         LinuxGtpuDataplaneBackend,
@@ -90,8 +95,16 @@ fn linux_live_writer_removal_surface_is_public_and_typed() {
     let _accessors: fn(&PdpLiveWriterRemovalRequest) = assert_live_writer_request_accessors;
 }
 
-#[test]
-fn linux_live_writer_removal_request_is_redaction_safe() {
+#[tokio::test]
+async fn linux_live_writer_removal_request_is_redaction_safe() {
+    let recovery_root = std::env::temp_dir().join(format!(
+        "tenant-secret-live-writer-root-{}",
+        std::process::id()
+    ));
+    let backend = LinuxGtpuDataplaneBackend::new()
+        .with_pdp_recovery_root(recovery_root.clone())
+        .unwrap();
+    let proof = backend.acquire_pdp_live_writer_proof().await.unwrap();
     let request = PdpLiveWriterRemovalRequest::new(
         GtpDevice {
             name: "gtp0".to_string(),
@@ -111,13 +124,25 @@ fn linux_live_writer_removal_request_is_redaction_safe() {
             uplink_source_port_policy:
                 opc_gtpu_dataplane::GtpuUplinkSourcePortPolicy::LegacyServicePort,
         },
-        PdpLiveWriterProof::current_writer_owns_live_namespace(),
+        proof,
     );
     let rendered = format!("{request:?}");
-    for secret in ["11223344", "55667788", "10.23.0.2", "192.0.2.10", "gtp0"] {
+    for secret in [
+        "11223344",
+        "55667788",
+        "10.23.0.2",
+        "192.0.2.10",
+        "gtp0",
+        "tenant-secret-live-writer-root",
+    ] {
         assert!(
             !rendered.contains(secret),
             "live-writer removal request debug leaked {secret}: {rendered}"
         );
     }
+    let proof_rendered = format!("{:?}", request.writer_proof());
+    assert!(!proof_rendered.contains("tenant-secret-live-writer-root"));
+    assert!(proof_rendered.contains("<redacted-recovery-root>"));
+    assert!(proof_rendered.contains("<redacted-network-namespace>"));
+    let _ = std::fs::remove_dir_all(recovery_root);
 }

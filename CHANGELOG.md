@@ -15,11 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writer, for same-process subscriber-session replacement where the restart
   contract's prior-writer stop attestation would be false. The request binds
   the expected device name and ifindex, the device's non-reusable
-  `PdpDeviceIncarnation`, the complete expected PDP context, and a
-  `PdpLiveWriterProof::current_writer_owns_live_namespace()` attestation that
-  never asserts a writer stopped. The durable recovery root must already be
-  bound; the removal serializes under the same topology-then-device `flock`
-  writer gates as every other cooperating mutation, proves the kernel-bound
+  `PdpDeviceIncarnation`, the complete expected PDP context, and an affine
+  `PdpLiveWriterProof` acquired from
+  `GtpuDataplaneBackend::acquire_pdp_live_writer_proof`. Acquisition binds the
+  proof to the exact configured recovery root and current network-namespace
+  identity; it cannot be cloned or statically constructed and never asserts a
+  writer stopped. The durable recovery root must already be bound; the removal
+  revalidates the proof before any netlink operation and serializes under the
+  same topology-then-device `flock` writer gates as every other cooperating
+  mutation, proves the kernel-bound
   incarnation, and runs the identical dual-axis `GETPDP` admission and
   post-mutation readback classification as restart recovery. Typed outcomes
   distinguish `Removed`, idempotent `AlreadyAbsent`, untouched `Conflict`,

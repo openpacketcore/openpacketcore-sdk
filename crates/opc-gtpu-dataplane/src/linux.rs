@@ -25,17 +25,19 @@ use opc_linux_gtpu_sys::{
 };
 
 use crate::backend::error_proves_no_requested_mutation;
-use crate::model::{classify_dual_selector_state, DualSelectorState};
+use crate::model::{
+    classify_dual_selector_state, DualSelectorState, PdpLiveWriterNamespaceIdentity,
+};
 use crate::{
     CreateGtpDeviceRequest, GtpAddressFamily, GtpDevice, GtpPdpContext, GtpRole, GtpVersion,
     GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuDownlinkFragmentContract, GtpuError,
     GtpuProbe, PdpContextIndeterminateReason, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextReadback, PdpContextReconciliationCapabilities,
     PdpContextRemovalOutcome, PdpContextRepairReason, PdpContextSelector, PdpContextUplinkSelector,
-    PdpDeviceIncarnation, PdpLiveWriterRemovalRequest, PdpRestartRecoveryRequest,
-    RemovePdpContextRequest, RetainedDeviceConflictReason, RetainedDeviceIdentityAcquisition,
-    RetainedDeviceIdentityRequest, RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
-    Teid, GTPU_PORT,
+    PdpDeviceIncarnation, PdpLiveWriterProof, PdpLiveWriterRemovalRequest,
+    PdpRestartRecoveryRequest, RemovePdpContextRequest, RetainedDeviceConflictReason,
+    RetainedDeviceIdentityAcquisition, RetainedDeviceIdentityRequest,
+    RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason, Teid, GTPU_PORT,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -882,6 +884,32 @@ impl LinuxGtpuDataplaneBackend {
         .await
     }
 
+    /// Acquire one affine proof that binds the exact configured recovery root
+    /// and this worker thread's network namespace.
+    ///
+    /// Calling this method explicitly attests that the caller is the current
+    /// cooperating writer and owns that live mutation namespace. It does not
+    /// assert that any previous writer stopped.
+    ///
+    /// The proof is intentionally acquired through the backend rather than a
+    /// freely callable constructor. It must be moved into one live-writer
+    /// removal request and is consumed by the blocking removal transaction.
+    /// An unbound recovery root, or an unreadable namespace identity, fails
+    /// closed before any netlink operation can occur.
+    pub async fn acquire_pdp_live_writer_proof(&self) -> Result<PdpLiveWriterProof, GtpuError> {
+        self.run_blocking("acquire_pdp_live_writer_proof", move |backend| {
+            backend.acquire_pdp_live_writer_proof_sync()
+        })
+        .await
+    }
+
+    fn acquire_pdp_live_writer_proof_sync(&self) -> Result<PdpLiveWriterProof, GtpuError> {
+        let _operation = self.pdp_operation_guard()?;
+        let root = self.pdp_recovery_root_or_feature("pdp_live_writer_exact_removal")?;
+        let namespace = current_pdp_live_writer_namespace_identity()?;
+        Ok(PdpLiveWriterProof::bound_to(root, namespace))
+    }
+
     fn recover_pdp_context_exact_sync(
         &self,
         request: PdpRestartRecoveryRequest,
@@ -907,6 +935,12 @@ impl LinuxGtpuDataplaneBackend {
     /// Remove one exact durable PDP context under the authority of the
     /// current cooperating live writer, without asserting that any writer
     /// stopped.
+    ///
+    /// Call [`Self::acquire_pdp_live_writer_proof`] first on the same bound
+    /// backend and move the returned affine proof into `request`; static proof
+    /// construction is intentionally unavailable. Before any netlink access,
+    /// the blocking worker revalidates that proof against the exact bound root
+    /// and its current network namespace.
     ///
     /// This is the same-process replacement entry point an ePDG-style
     /// consumer uses while it remains the live writer: a subscriber-session
@@ -939,8 +973,22 @@ impl LinuxGtpuDataplaneBackend {
         &self,
         request: PdpLiveWriterRemovalRequest,
     ) -> Result<PdpContextRemovalOutcome, GtpuError> {
-        let device = request.device().clone();
-        let expected = request.expected().clone();
+        let (device, incarnation, expected, proof) = request.into_parts();
+        let _operation = self.pdp_operation_guard()?;
+        let root = self.pdp_recovery_root_or_feature("pdp_live_writer_exact_removal")?;
+        let namespace = match current_pdp_live_writer_namespace_identity() {
+            Ok(namespace) => namespace,
+            Err(_) => {
+                return Ok(PdpContextRemovalOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::AuthorityUnavailable,
+                ));
+            }
+        };
+        if !proof.matches(&root, namespace) {
+            return Ok(PdpContextRemovalOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable,
+            ));
+        }
         validate_device(&device)?;
         validate_pdp_context(&expected)?;
         if expected.link_ifindex != device.ifindex {
@@ -949,10 +997,10 @@ impl LinuxGtpuDataplaneBackend {
                 "device ifindex must match the expected context link",
             ));
         }
-        self.remove_pdp_context_exact_under_authority_sync(
-            "pdp_live_writer_exact_removal",
+        self.remove_pdp_context_exact_under_bound_authority_sync(
+            &root,
             &device,
-            request.incarnation(),
+            incarnation,
             &expected,
         )
     }
@@ -976,7 +1024,22 @@ impl LinuxGtpuDataplaneBackend {
     ) -> Result<PdpContextRemovalOutcome, GtpuError> {
         let _operation = self.pdp_operation_guard()?;
         let root = self.pdp_recovery_root_or_feature(root_feature)?;
-        let _topology_lease = match acquire_pdp_topology_lease(&root) {
+        self.remove_pdp_context_exact_under_bound_authority_sync(
+            &root,
+            device,
+            incarnation,
+            expected,
+        )
+    }
+
+    fn remove_pdp_context_exact_under_bound_authority_sync(
+        &self,
+        root: &Path,
+        device: &GtpDevice,
+        incarnation: PdpDeviceIncarnation,
+        expected: &GtpPdpContext,
+    ) -> Result<PdpContextRemovalOutcome, GtpuError> {
+        let _topology_lease = match acquire_pdp_topology_lease(root) {
             Ok(lease) => lease,
             Err(GtpuError::AlreadyExists) => {
                 return Ok(PdpContextRemovalOutcome::Indeterminate(
@@ -985,7 +1048,7 @@ impl LinuxGtpuDataplaneBackend {
             }
             Err(error) => return Err(error),
         };
-        let _device_lease = match acquire_pdp_recovery_lease(&root, device.ifindex) {
+        let _device_lease = match acquire_pdp_recovery_lease(root, device.ifindex) {
             Ok(lease) => lease,
             Err(GtpuError::AlreadyExists) => {
                 return Ok(PdpContextRemovalOutcome::Indeterminate(
@@ -1297,6 +1360,38 @@ impl LinuxGtpuDataplaneBackend {
     }
 }
 
+/// Read the exact network-namespace identity of the current worker thread.
+///
+/// Namespace metadata is authority evidence, not a diagnostic value. Any
+/// failure is mapped to a stable, value-free unsupported error so callers
+/// cannot accidentally disclose procfs paths or host-specific metadata.
+fn current_pdp_live_writer_namespace_identity() -> Result<PdpLiveWriterNamespaceIdentity, GtpuError>
+{
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata("/proc/thread-self/ns/net").map_err(|_| {
+            GtpuError::UnsupportedFeature {
+                feature: "pdp_live_writer_namespace_identity",
+            }
+        })?;
+        Ok(PdpLiveWriterNamespaceIdentity::from_dev_ino(
+            metadata.dev(),
+            metadata.ino(),
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // There is no Linux network namespace or kernel-GTP mutation on these
+        // hosts. A stable sentinel keeps the portable fake transport capable
+        // of exercising proof consumption and mismatch classification; the
+        // production transport still fails closed as UnsupportedPlatform.
+        Ok(PdpLiveWriterNamespaceIdentity::from_dev_ino(0, 0))
+    }
+}
+
 /// Cross-process lease guarding one GTP device's PDP restart recovery.
 ///
 /// On Linux the lease is an exclusive `flock` on a per-device file beneath the
@@ -1471,6 +1566,10 @@ impl GtpuDataplaneBackend for LinuxGtpuDataplaneBackend {
         request: PdpRestartRecoveryRequest,
     ) -> Result<PdpContextRemovalOutcome, GtpuError> {
         LinuxGtpuDataplaneBackend::recover_pdp_context_exact(self, request).await
+    }
+
+    async fn acquire_pdp_live_writer_proof(&self) -> Result<PdpLiveWriterProof, GtpuError> {
+        LinuxGtpuDataplaneBackend::acquire_pdp_live_writer_proof(self).await
     }
 
     async fn remove_pdp_context_exact_live_writer(
@@ -3026,12 +3125,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::model::{Teid, DEFAULT_PDP_HASHSIZE};
+    use crate::model::{PdpLiveWriterNamespaceIdentity, Teid, DEFAULT_PDP_HASHSIZE};
     use crate::{
         PdpContextMismatchField, PdpContextSelectorOccupancy, PdpLiveWriterProof,
-        PdpRestartRecoveryProof, RetainedDeviceConflictReason, RetainedDeviceIdentityAcquisition,
-        RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest,
-        RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
+        PdpLiveWriterRemovalRequest, PdpRestartRecoveryProof, RetainedDeviceConflictReason,
+        RetainedDeviceIdentityAcquisition, RetainedDeviceIdentityOutcome,
+        RetainedDeviceIdentityRequest, RetainedDeviceIndeterminateReason,
+        RetainedDeviceRepairReason,
     };
 
     type TransportResponse = Result<Option<Vec<u8>>, GtpuError>;
@@ -4909,10 +5009,7 @@ mod tests {
             }
         ));
         assert!(matches!(
-            backend
-                .remove_pdp_context_exact_live_writer(live_writer_request(pdp_context()))
-                .await
-                .unwrap_err(),
+            backend.acquire_pdp_live_writer_proof().await.unwrap_err(),
             GtpuError::UnsupportedFeature {
                 feature: "pdp_live_writer_exact_removal"
             }
@@ -5696,7 +5793,14 @@ mod tests {
         assert!(!rendered.contains("10.23.0.2"));
     }
 
-    fn live_writer_request(context: GtpPdpContext) -> PdpLiveWriterRemovalRequest {
+    async fn live_writer_request(
+        backend: &LinuxGtpuDataplaneBackend,
+        context: GtpPdpContext,
+    ) -> PdpLiveWriterRemovalRequest {
+        let writer_proof = backend
+            .acquire_pdp_live_writer_proof()
+            .await
+            .expect("bound backend must attest live writer");
         PdpLiveWriterRemovalRequest::new(
             GtpDevice {
                 name: "gtp0".to_string(),
@@ -5704,7 +5808,7 @@ mod tests {
             },
             test_device_incarnation(),
             context,
-            PdpLiveWriterProof::current_writer_owns_live_namespace(),
+            writer_proof,
         )
     }
 
@@ -5721,7 +5825,9 @@ mod tests {
             .unwrap();
 
         let outcome = backend
-            .remove_pdp_context_exact_live_writer(live_writer_request(context.clone()))
+            .remove_pdp_context_exact_live_writer(
+                live_writer_request(&backend, context.clone()).await,
+            )
             .await
             .unwrap();
 
@@ -5754,12 +5860,89 @@ mod tests {
             .unwrap();
 
         let outcome = backend
-            .remove_pdp_context_exact_live_writer(live_writer_request(pdp_context()))
+            .remove_pdp_context_exact_live_writer(
+                live_writer_request(&backend, pdp_context()).await,
+            )
             .await
             .unwrap();
 
         assert_eq!(outcome, PdpContextRemovalOutcome::AlreadyAbsent);
         assert_no_exact_delete(&transport.requests());
+    }
+
+    #[tokio::test]
+    async fn linux_live_writer_rejects_proof_from_another_recovery_root() {
+        // Detector: using a proof issued by root A against root B must fail
+        // before the device identity read or any PDP netlink operation.
+        let transport = CapturingTransport::new();
+        let root_a = unique_recovery_root("live-proof-root-a");
+        let root_b = unique_recovery_root("live-proof-root-b");
+        let backend_a = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root_a)
+            .unwrap();
+        let proof_a = backend_a.acquire_pdp_live_writer_proof().await.unwrap();
+        let backend_b = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root_b.clone())
+            .unwrap();
+        let request = PdpLiveWriterRemovalRequest::new(
+            GtpDevice {
+                name: "gtp0".to_string(),
+                ifindex: pdp_context().link_ifindex,
+            },
+            test_device_incarnation(),
+            pdp_context(),
+            proof_a,
+        );
+
+        let outcome = backend_b
+            .remove_pdp_context_exact_live_writer(request)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            PdpContextRemovalOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable
+            )
+        );
+        assert!(transport.requests().is_empty());
+        let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    #[tokio::test]
+    async fn linux_live_writer_rejects_mismatched_namespace_identity() {
+        // Detector: the proof's exact namespace identity is checked on the
+        // blocking worker before leases, link reads, or DELPDP.
+        let transport = CapturingTransport::new();
+        let root = unique_recovery_root("live-proof-namespace-mismatch");
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+        let proof = PdpLiveWriterProof::for_test(
+            root.clone(),
+            PdpLiveWriterNamespaceIdentity::from_dev_ino(u64::MAX, u64::MAX),
+        );
+        let request = PdpLiveWriterRemovalRequest::new(
+            GtpDevice {
+                name: "gtp0".to_string(),
+                ifindex: pdp_context().link_ifindex,
+            },
+            test_device_incarnation(),
+            pdp_context(),
+            proof,
+        );
+
+        let outcome = backend
+            .remove_pdp_context_exact_live_writer(request)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            PdpContextRemovalOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable
+            )
+        );
+        assert!(transport.requests().is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -5778,7 +5961,7 @@ mod tests {
             .unwrap();
 
         let outcome = backend
-            .remove_pdp_context_exact_live_writer(live_writer_request(desired))
+            .remove_pdp_context_exact_live_writer(live_writer_request(&backend, desired).await)
             .await
             .unwrap();
 
@@ -5813,7 +5996,7 @@ mod tests {
             .unwrap();
 
         let outcome = backend
-            .remove_pdp_context_exact_live_writer(live_writer_request(desired))
+            .remove_pdp_context_exact_live_writer(live_writer_request(&backend, desired).await)
             .await
             .unwrap();
 
@@ -5848,7 +6031,7 @@ mod tests {
             .unwrap();
 
         let outcome = backend
-            .remove_pdp_context_exact_live_writer(live_writer_request(desired))
+            .remove_pdp_context_exact_live_writer(live_writer_request(&backend, desired).await)
             .await
             .unwrap();
 
@@ -5868,10 +6051,7 @@ mod tests {
         let transport = CapturingTransport::new();
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
 
-        let error = backend
-            .remove_pdp_context_exact_live_writer(live_writer_request(pdp_context()))
-            .await
-            .unwrap_err();
+        let error = backend.acquire_pdp_live_writer_proof().await.unwrap_err();
 
         assert!(matches!(
             error,
@@ -5904,7 +6084,9 @@ mod tests {
             .unwrap();
 
         let outcome = backend
-            .remove_pdp_context_exact_live_writer(live_writer_request(pdp_context()))
+            .remove_pdp_context_exact_live_writer(
+                live_writer_request(&backend, pdp_context()).await,
+            )
             .await
             .unwrap();
 
@@ -5932,7 +6114,9 @@ mod tests {
             .unwrap();
 
         let outcome = backend
-            .remove_pdp_context_exact_live_writer(live_writer_request(pdp_context()))
+            .remove_pdp_context_exact_live_writer(
+                live_writer_request(&backend, pdp_context()).await,
+            )
             .await
             .unwrap();
 
@@ -5947,6 +6131,9 @@ mod tests {
     async fn linux_live_writer_removal_rejects_mismatched_device_and_context_link() {
         let transport = CapturingTransport::new();
         let context = pdp_context();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(unique_recovery_root("live-mismatch"))
+            .unwrap();
         let request = PdpLiveWriterRemovalRequest::new(
             GtpDevice {
                 name: "gtp0".to_string(),
@@ -5954,11 +6141,8 @@ mod tests {
             },
             test_device_incarnation(),
             context,
-            PdpLiveWriterProof::current_writer_owns_live_namespace(),
+            backend.acquire_pdp_live_writer_proof().await.unwrap(),
         );
-        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
-            .with_pdp_recovery_root(unique_recovery_root("live-mismatch"))
-            .unwrap();
 
         let error = backend
             .remove_pdp_context_exact_live_writer(request)
@@ -5971,7 +6155,11 @@ mod tests {
 
     #[tokio::test]
     async fn linux_live_writer_request_and_outcomes_are_redaction_safe() {
-        let request = live_writer_request(pdp_context());
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport)
+            .with_pdp_recovery_root(unique_recovery_root("live-redaction"))
+            .unwrap();
+        let request = live_writer_request(&backend, pdp_context()).await;
         let rendered = format!("{request:?}");
         for secret in ["11223344", "55667788", "10.23.0.2", "192.0.2.10", "gtp0"] {
             assert!(
@@ -5979,10 +6167,7 @@ mod tests {
                 "live-writer request debug leaked {secret}: {rendered}"
             );
         }
-        let proof_rendered = format!(
-            "{:?}",
-            PdpLiveWriterProof::current_writer_owns_live_namespace()
-        );
+        let proof_rendered = format!("{:?}", request.writer_proof());
         for secret in ["11223344", "10.23.0.2", "gtp0"] {
             assert!(!proof_rendered.contains(secret));
         }
@@ -6007,7 +6192,9 @@ mod tests {
             .unwrap();
 
         let outcome = backend
-            .remove_pdp_context_exact_live_writer(live_writer_request(pdp_context()))
+            .remove_pdp_context_exact_live_writer(
+                live_writer_request(&backend, pdp_context()).await,
+            )
             .await
             .unwrap();
 
@@ -6047,7 +6234,9 @@ mod tests {
         let worker_context = context.clone();
         let handle = tokio::spawn(async move {
             backend
-                .remove_pdp_context_exact_live_writer(live_writer_request(worker_context))
+                .remove_pdp_context_exact_live_writer(
+                    live_writer_request(&backend, worker_context).await,
+                )
                 .await
         });
 
@@ -6083,7 +6272,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             retry_backend
-                .remove_pdp_context_exact_live_writer(live_writer_request(context.clone()))
+                .remove_pdp_context_exact_live_writer(
+                    live_writer_request(&retry_backend, context.clone()).await,
+                )
                 .await
                 .unwrap(),
             PdpContextRemovalOutcome::Indeterminate(
@@ -6154,7 +6345,9 @@ mod tests {
         push_absent_readback(&transport);
         assert_eq!(
             retry_backend
-                .remove_pdp_context_exact_live_writer(live_writer_request(context))
+                .remove_pdp_context_exact_live_writer(
+                    live_writer_request(&retry_backend, context).await
+                )
                 .await
                 .unwrap(),
             PdpContextRemovalOutcome::AlreadyAbsent
@@ -6204,7 +6397,9 @@ mod tests {
         let worker_context = context.clone();
         let handle = tokio::spawn(async move {
             backend
-                .remove_pdp_context_exact_live_writer(live_writer_request(worker_context))
+                .remove_pdp_context_exact_live_writer(
+                    live_writer_request(&backend, worker_context).await,
+                )
                 .await
         });
 
@@ -6234,7 +6429,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             retry_backend
-                .remove_pdp_context_exact_live_writer(live_writer_request(context.clone()))
+                .remove_pdp_context_exact_live_writer(
+                    live_writer_request(&retry_backend, context.clone()).await,
+                )
                 .await
                 .unwrap(),
             PdpContextRemovalOutcome::Indeterminate(
@@ -6282,7 +6479,9 @@ mod tests {
         push_absent_readback(&transport);
         assert_eq!(
             retry_backend
-                .remove_pdp_context_exact_live_writer(live_writer_request(context))
+                .remove_pdp_context_exact_live_writer(
+                    live_writer_request(&retry_backend, context).await
+                )
                 .await
                 .unwrap(),
             PdpContextRemovalOutcome::AlreadyAbsent
@@ -6382,7 +6581,9 @@ mod tests {
         );
         assert_eq!(
             backend
-                .remove_pdp_context_exact_live_writer(live_writer_request(context.clone()))
+                .remove_pdp_context_exact_live_writer(
+                    live_writer_request(&backend, context.clone()).await,
+                )
                 .await
                 .unwrap(),
             PdpContextRemovalOutcome::Indeterminate(
@@ -6413,7 +6614,7 @@ mod tests {
         );
         assert_eq!(
             backend
-                .remove_pdp_context_exact_live_writer(live_writer_request(context))
+                .remove_pdp_context_exact_live_writer(live_writer_request(&backend, context).await)
                 .await
                 .unwrap(),
             PdpContextRemovalOutcome::Indeterminate(
@@ -7350,7 +7551,9 @@ mod tests {
             );
             // The live-writer authority fences against the same foreign lease.
             let outcome = backend
-                .remove_pdp_context_exact_live_writer(live_writer_request(pdp_context()))
+                .remove_pdp_context_exact_live_writer(
+                    live_writer_request(&backend, pdp_context()).await,
+                )
                 .await
                 .unwrap();
             assert_eq!(

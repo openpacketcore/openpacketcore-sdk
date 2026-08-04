@@ -11,7 +11,7 @@ use crate::model::{
     GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, PdpContextInstallOutcome,
     PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
-    PdpContextSelector, PdpLiveWriterRemovalRequest, PdpRestartRecoveryRequest,
+    PdpContextSelector, PdpLiveWriterProof, PdpLiveWriterRemovalRequest, PdpRestartRecoveryRequest,
     RemovePdpContextRequest,
 };
 use crate::GtpuError;
@@ -155,6 +155,24 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     ) -> Result<PdpContextRemovalOutcome, GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "pdp_restart_recovery_authority",
+        })
+    }
+
+    /// Acquire an affine attestation for the current cooperating live writer.
+    ///
+    /// Calling this method explicitly attests that the caller is the current
+    /// cooperating writer and owns the live mutation namespace; it never
+    /// asserts that a previous writer stopped. Implementations bind that
+    /// assertion to authority they can revalidate before mutation.
+    ///
+    /// The returned proof is bound to this backend's exact recovery root and
+    /// the network namespace in which the attestation executes. Callers must
+    /// move it into one [`PdpLiveWriterRemovalRequest`]; proofs cannot be
+    /// cloned or constructed through the public API. Backends that cannot
+    /// establish this authority return an explicit unsupported error.
+    async fn acquire_pdp_live_writer_proof(&self) -> Result<PdpLiveWriterProof, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "pdp_live_writer_exact_removal",
         })
     }
 
@@ -419,19 +437,8 @@ mod tests {
             egress_dscp: None,
             uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
         };
-        let live_writer_request = crate::PdpLiveWriterRemovalRequest::new(
-            GtpDevice {
-                name: String::from("gtp0"),
-                ifindex: 7,
-            },
-            crate::PdpDeviceIncarnation::from_bytes([3; 16]).unwrap(),
-            context.clone(),
-            crate::PdpLiveWriterProof::current_writer_owns_live_namespace(),
-        );
         assert!(matches!(
-            backend
-                .remove_pdp_context_exact_live_writer(live_writer_request)
-                .await,
+            backend.acquire_pdp_live_writer_proof().await,
             Err(GtpuError::UnsupportedFeature {
                 feature: "pdp_live_writer_exact_removal"
             })

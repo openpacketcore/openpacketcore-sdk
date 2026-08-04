@@ -20,7 +20,13 @@
 //! missing compare-delete primitive. A distinct live-writer authority removes
 //! one exact PDP context while the cooperating writer remains live for
 //! same-process session replacement, without weakening the strict
-//! prior-writer-stopped restart contract. A separate identity-bearing,
+//! prior-writer-stopped restart contract. Linux callers acquire an affine,
+//! opaque `PdpLiveWriterProof` through
+//! `GtpuDataplaneBackend::acquire_pdp_live_writer_proof`; the proof binds the
+//! exact configured recovery root and current network-namespace identity and
+//! is consumed by the removal request. It cannot be cloned or statically
+//! constructed, and a wrong-root or wrong-namespace proof is rejected before
+//! any netlink access. A separate identity-bearing,
 //! mutation-free retained-device acquisition classifies a durable Linux
 //! kernel-GTP device record after process loss — exact retained identity,
 //! authoritative absence, conflicting replacement identity, structural

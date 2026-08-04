@@ -368,13 +368,25 @@ something false, and the unconditional lifecycle `remove_pdp_context` cannot
 prove exact dual-selector identity, so neither can safely satisfy a
 convergence or Recovery mutation proof.
 
-Build `PdpLiveWriterRemovalRequest` from the live writer's device name and
-ifindex, the device's non-reusable incarnation, the complete expected PDP
-context, and `PdpLiveWriterProof::current_writer_owns_live_namespace()`. The
-recovery root must already be bound. The removal serializes under the same
-topology and per-device `flock` writer gates as every other cooperating
-mutation, proves the kernel-bound incarnation exactly as restart recovery
-does, and then runs the identical dual-selector exact-removal transaction:
+After binding the recovery root, call
+`GtpuDataplaneBackend::acquire_pdp_live_writer_proof` on the same concrete
+backend that will perform removal (or through its trait object). Acquisition
+is the caller's explicit attestation that it is the current cooperating writer
+and owns the live mutation namespace; it never claims that a prior writer
+stopped. It returns one affine, opaque `PdpLiveWriterProof` bound to the exact
+configured root and the current worker thread's network-namespace identity.
+Move that proof into `PdpLiveWriterRemovalRequest`; it cannot be cloned or statically
+constructed. Build the request from the live writer's device name and ifindex,
+the device's non-reusable incarnation, the complete expected PDP context, and
+the acquired proof. The removal checks the proof's root and namespace again,
+under the operation guard, before any link/netlink read or mutation. A stale,
+wrong-root, or wrong-namespace proof returns retryable
+`Indeterminate(AuthorityUnavailable)` with no netlink activity.
+
+The removal serializes under the same topology and per-device `flock` writer
+gates as every other cooperating mutation, proves the kernel-bound incarnation
+exactly as restart recovery does, and then runs the identical dual-selector
+exact-removal transaction:
 authoritative `GETPDP` readbacks on both axes before admitting the
 unconditional `DELPDP`, and classification from the post-mutation readback
 rather than from the delete's own acknowledgement. The classified outcomes are

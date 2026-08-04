@@ -8,9 +8,9 @@ use opc_gtpu_dataplane::{
     GtpuDataplaneBackend, LinuxGtpuDataplaneBackend, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector,
     PdpContextSelectorOccupancy, PdpContextUplinkSelector, PdpDeviceIncarnation,
-    PdpLiveWriterProof, PdpLiveWriterRemovalRequest, PdpRestartRecoveryProof,
-    PdpRestartRecoveryRequest, RemovePdpContextRequest, RetainedDeviceConflictReason,
-    RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest, Teid,
+    PdpLiveWriterRemovalRequest, PdpRestartRecoveryProof, PdpRestartRecoveryRequest,
+    RemovePdpContextRequest, RetainedDeviceConflictReason, RetainedDeviceIdentityOutcome,
+    RetainedDeviceIdentityRequest, Teid,
 };
 
 #[tokio::test]
@@ -594,11 +594,16 @@ fn privileged_live_writer_root() -> PathBuf {
     ))
 }
 
-fn privileged_live_writer_request(
+async fn privileged_live_writer_request(
+    backend: &LinuxGtpuDataplaneBackend,
     device: &GtpDevice,
     incarnation: PdpDeviceIncarnation,
     context: GtpPdpContext,
 ) -> PdpLiveWriterRemovalRequest {
+    let writer_proof = backend
+        .acquire_pdp_live_writer_proof()
+        .await
+        .expect("bound backend must attest live writer");
     PdpLiveWriterRemovalRequest::new(
         GtpDevice {
             name: device.name.clone(),
@@ -606,7 +611,7 @@ fn privileged_live_writer_request(
         },
         incarnation,
         context,
-        PdpLiveWriterProof::current_writer_owns_live_namespace(),
+        writer_proof,
     )
 }
 
@@ -669,11 +674,10 @@ async fn live_writer_removal_removes_exact_pdp_under_live_authority_in_current_n
         // Removing a context that is not present is proven without mutation.
         require_equal(
             backend
-                .remove_pdp_context_exact_live_writer(privileged_live_writer_request(
-                    &device,
-                    incarnation,
-                    context.clone(),
-                ))
+                .remove_pdp_context_exact_live_writer(
+                    privileged_live_writer_request(&backend, &device, incarnation, context.clone())
+                        .await,
+                )
                 .await?,
             PdpContextRemovalOutcome::AlreadyAbsent,
             "absent live-writer removal was not AlreadyAbsent",
@@ -685,11 +689,10 @@ async fn live_writer_removal_removes_exact_pdp_under_live_authority_in_current_n
         // while the creating writer remains live.
         require_equal(
             backend
-                .remove_pdp_context_exact_live_writer(privileged_live_writer_request(
-                    &device,
-                    incarnation,
-                    context.clone(),
-                ))
+                .remove_pdp_context_exact_live_writer(
+                    privileged_live_writer_request(&backend, &device, incarnation, context.clone())
+                        .await,
+                )
                 .await?,
             PdpContextRemovalOutcome::Removed,
             "exact resident context was not removed under live-writer authority",
@@ -698,11 +701,10 @@ async fn live_writer_removal_removes_exact_pdp_under_live_authority_in_current_n
         // A confirmed removal is idempotent: re-running proves exact absence.
         require_equal(
             backend
-                .remove_pdp_context_exact_live_writer(privileged_live_writer_request(
-                    &device,
-                    incarnation,
-                    context.clone(),
-                ))
+                .remove_pdp_context_exact_live_writer(
+                    privileged_live_writer_request(&backend, &device, incarnation, context.clone())
+                        .await,
+                )
                 .await?,
             PdpContextRemovalOutcome::AlreadyAbsent,
             "confirmed live-writer removal was not idempotent",
@@ -723,11 +725,10 @@ async fn live_writer_removal_removes_exact_pdp_under_live_authority_in_current_n
         }
         require_equal(
             backend
-                .remove_pdp_context_exact_live_writer(privileged_live_writer_request(
-                    &device,
-                    incarnation,
-                    context.clone(),
-                ))
+                .remove_pdp_context_exact_live_writer(
+                    privileged_live_writer_request(&backend, &device, incarnation, context.clone())
+                        .await,
+                )
                 .await?,
             PdpContextRemovalOutcome::Removed,
             "live-writer removal after generationless refusal failed",
@@ -738,11 +739,9 @@ async fn live_writer_removal_removes_exact_pdp_under_live_authority_in_current_n
         let mut foreign = context.clone();
         foreign.peer_teid = Teid::new(0x2400_0999).ok_or("foreign TEID must be nonzero")?;
         match backend
-            .remove_pdp_context_exact_live_writer(privileged_live_writer_request(
-                &device,
-                incarnation,
-                foreign,
-            ))
+            .remove_pdp_context_exact_live_writer(
+                privileged_live_writer_request(&backend, &device, incarnation, foreign).await,
+            )
             .await?
         {
             PdpContextRemovalOutcome::Conflict(_) => {}
@@ -765,11 +764,10 @@ async fn live_writer_removal_removes_exact_pdp_under_live_authority_in_current_n
             .ok_or("replacement incarnation must be nonzero")?;
         require_equal(
             backend
-                .remove_pdp_context_exact_live_writer(privileged_live_writer_request(
-                    &device,
-                    replacement,
-                    context.clone(),
-                ))
+                .remove_pdp_context_exact_live_writer(
+                    privileged_live_writer_request(&backend, &device, replacement, context.clone())
+                        .await,
+                )
                 .await?,
             PdpContextRemovalOutcome::RepairRequired(
                 opc_gtpu_dataplane::PdpContextRepairReason::DeviceIdentityChanged,
