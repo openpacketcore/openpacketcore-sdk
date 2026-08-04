@@ -8,9 +8,9 @@ use opc_gtpu_dataplane::{
     GtpuDataplaneBackend, LinuxGtpuDataplaneBackend, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector,
     PdpContextSelectorOccupancy, PdpContextUplinkSelector, PdpDeviceIncarnation,
-    PdpRestartRecoveryProof, PdpRestartRecoveryRequest, RemovePdpContextRequest,
-    RetainedDeviceConflictReason, RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest,
-    Teid,
+    PdpLiveWriterRemovalRequest, PdpRestartRecoveryProof, PdpRestartRecoveryRequest,
+    RemovePdpContextRequest, RetainedDeviceConflictReason, RetainedDeviceIdentityOutcome,
+    RetainedDeviceIdentityRequest, Teid,
 };
 
 #[tokio::test]
@@ -584,5 +584,217 @@ async fn retained_device_identity_acquisition_classifies_without_mutation_in_cur
     }
     let _ = std::fs::remove_dir_all(&recovery_root);
     result?;
+    Ok(())
+}
+
+fn privileged_live_writer_root() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "opc-gtpu-638-priv-livewriter-{}",
+        std::process::id()
+    ))
+}
+
+async fn privileged_live_writer_request(
+    backend: &LinuxGtpuDataplaneBackend,
+    device: &GtpDevice,
+    incarnation: PdpDeviceIncarnation,
+    context: GtpPdpContext,
+) -> PdpLiveWriterRemovalRequest {
+    let writer_proof = backend
+        .acquire_pdp_live_writer_proof()
+        .await
+        .expect("bound backend must attest live writer");
+    PdpLiveWriterRemovalRequest::new(
+        GtpDevice {
+            name: device.name.clone(),
+            ifindex: device.ifindex,
+        },
+        incarnation,
+        context,
+        writer_proof,
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
+async fn live_writer_removal_removes_exact_pdp_under_live_authority_in_current_netns(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh CAP_NET_ADMIN netns");
+        return Ok(());
+    }
+
+    // A separate authority root keeps this fixture's writer group independent
+    // of the other recovery fixtures running in the same test binary.
+    let recovery_root = privileged_live_writer_root();
+    let backend = LinuxGtpuDataplaneBackend::new().with_pdp_recovery_root(recovery_root.clone())?;
+    let incarnation = PdpDeviceIncarnation::from_bytes([0x63; 16])
+        .ok_or("privileged fixture incarnation must be nonzero")?;
+    let name = format!("gw{}", std::process::id() % 10_000);
+    let create = CreateGtpDeviceRequest::new(name.clone());
+    let prepared_request = RetainedDeviceIdentityRequest::new(
+        name,
+        None,
+        incarnation,
+        PdpRestartRecoveryProof::previous_writer_stopped(),
+    );
+    let device = match backend.create_recoverable_device(create, incarnation).await {
+        Ok(device) => device,
+        Err(error) => {
+            if let Ok(acquisition) = backend
+                .acquire_retained_device_identity(prepared_request)
+                .await
+            {
+                if let Some(orphan) = acquisition.into_retained_device() {
+                    let _ = backend.remove_device(&orphan).await;
+                }
+            }
+            let _ = std::fs::remove_dir_all(&recovery_root);
+            return Err(error.into());
+        }
+    };
+    let context = privileged_recovery_context(&device)?;
+
+    let result = async {
+        // The live-writer authority is reported once the root is bound; the
+        // generationless trait removal stays unavailable.
+        require_equal(
+            backend.pdp_live_writer_removal_capability(),
+            GtpuCapability::Available,
+            "live-writer capability was not available with a bound root",
+        )?;
+        require_equal(
+            backend
+                .pdp_context_reconciliation_capabilities()
+                .exact_removal,
+            GtpuCapability::Missing,
+            "generationless exact removal must remain missing",
+        )?;
+
+        // Removing a context that is not present is proven without mutation.
+        require_equal(
+            backend
+                .remove_pdp_context_exact_live_writer(
+                    privileged_live_writer_request(&backend, &device, incarnation, context.clone())
+                        .await,
+                )
+                .await?,
+            PdpContextRemovalOutcome::AlreadyAbsent,
+            "absent live-writer removal was not AlreadyAbsent",
+        )?;
+
+        backend.install_pdp_context(context.clone()).await?;
+
+        // The exact resident context is removed under live-writer authority
+        // while the creating writer remains live.
+        require_equal(
+            backend
+                .remove_pdp_context_exact_live_writer(
+                    privileged_live_writer_request(&backend, &device, incarnation, context.clone())
+                        .await,
+                )
+                .await?,
+            PdpContextRemovalOutcome::Removed,
+            "exact resident context was not removed under live-writer authority",
+        )?;
+
+        // A confirmed removal is idempotent: re-running proves exact absence.
+        require_equal(
+            backend
+                .remove_pdp_context_exact_live_writer(
+                    privileged_live_writer_request(&backend, &device, incarnation, context.clone())
+                        .await,
+                )
+                .await?,
+            PdpContextRemovalOutcome::AlreadyAbsent,
+            "confirmed live-writer removal was not idempotent",
+        )?;
+
+        // The generationless trait request cannot authorize Linux deletion
+        // even with a bound root and a live writer.
+        backend.install_pdp_context(context.clone()).await?;
+        match backend.remove_pdp_context_exact(context.clone()).await {
+            Err(opc_gtpu_dataplane::GtpuError::UnsupportedFeature { feature }) => {
+                require_equal(
+                    feature,
+                    "pdp_context_exact_removal",
+                    "unexpected unsupported feature label",
+                )?;
+            }
+            other => return Err(format!("expected UnsupportedFeature, got {other:?}").into()),
+        }
+        require_equal(
+            backend
+                .remove_pdp_context_exact_live_writer(
+                    privileged_live_writer_request(&backend, &device, incarnation, context.clone())
+                        .await,
+                )
+                .await?,
+            PdpContextRemovalOutcome::Removed,
+            "live-writer removal after generationless refusal failed",
+        )?;
+
+        // A same-selector but different-identity resident is never touched.
+        backend.install_pdp_context(context.clone()).await?;
+        let mut foreign = context.clone();
+        foreign.peer_teid = Teid::new(0x2400_0999).ok_or("foreign TEID must be nonzero")?;
+        match backend
+            .remove_pdp_context_exact_live_writer(
+                privileged_live_writer_request(&backend, &device, incarnation, foreign).await,
+            )
+            .await?
+        {
+            PdpContextRemovalOutcome::Conflict(_) => {}
+            other => return Err(format!("expected Conflict, got {other:?}").into()),
+        }
+        require_equal(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&context)
+                        .ok_or("local selector requires nonzero ifindex")?,
+                ))
+                .await?,
+            PdpContextReadback::Present(context.clone()),
+            "conflicting live-writer removal touched the resident context",
+        )?;
+
+        // A mismatched device incarnation fails closed and leaves the
+        // resident context untouched.
+        let replacement = PdpDeviceIncarnation::from_bytes([0x36; 16])
+            .ok_or("replacement incarnation must be nonzero")?;
+        require_equal(
+            backend
+                .remove_pdp_context_exact_live_writer(
+                    privileged_live_writer_request(&backend, &device, replacement, context.clone())
+                        .await,
+                )
+                .await?,
+            PdpContextRemovalOutcome::RepairRequired(
+                opc_gtpu_dataplane::PdpContextRepairReason::DeviceIdentityChanged,
+            ),
+            "foreign incarnation was not repair-required",
+        )?;
+        require_equal(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&context)
+                        .ok_or("local selector requires nonzero ifindex")?,
+                ))
+                .await?,
+            PdpContextReadback::Present(context.clone()),
+            "foreign-incarnation removal touched the resident context",
+        )?;
+
+        backend
+            .remove_pdp_context(RemovePdpContextRequest::from_context(&context))
+            .await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let cleanup = backend.remove_device(&device).await;
+    let _ = std::fs::remove_dir_all(&recovery_root);
+    result?;
+    cleanup?;
     Ok(())
 }

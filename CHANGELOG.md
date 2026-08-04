@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Live-writer exact Linux PDP removal authority — `opc-gtpu-dataplane`:**
+  `LinuxGtpuDataplaneBackend::remove_pdp_context_exact_live_writer` (also
+  exposed as an additive trait method of the same name) removes one exact
+  kernel-GTP PDP context under the authority of the current cooperating live
+  writer, for same-process subscriber-session replacement where the restart
+  contract's prior-writer stop attestation would be false. The request binds
+  the expected device name and ifindex, the device's non-reusable
+  `PdpDeviceIncarnation`, the complete expected PDP context, and an affine
+  `PdpLiveWriterProof` acquired from
+  `GtpuDataplaneBackend::acquire_pdp_live_writer_proof`. Acquisition binds the
+  proof to the exact configured recovery root and current network-namespace
+  identity; it cannot be cloned or statically constructed and never asserts a
+  writer stopped. The durable recovery root must already be bound; the removal
+  revalidates the proof before any netlink operation and serializes under the
+  same topology-then-device `flock` writer gates as every other cooperating
+  mutation, proves the kernel-bound
+  incarnation, and runs the identical dual-axis `GETPDP` admission and
+  post-mutation readback classification as restart recovery. Typed outcomes
+  distinguish `Removed`, idempotent `AlreadyAbsent`, untouched `Conflict`,
+  retryable `Indeterminate`, and structural `RepairRequired`; replaced,
+  renamed, unstamped, or removed device identities fail closed before any
+  netlink work. The detached blocking worker retains both authorities to a
+  terminal classified result even if the caller future is dropped, so a
+  concurrent cooperating mutation can never overlap the transaction. The
+  restart-recovery contract remains strict and distinct: the two authorities
+  carry different proof types, report independent capabilities
+  (`pdp_live_writer_removal_capability` versus
+  `pdp_restart_recovery_capability`), and the generationless trait removal
+  stays `UnsupportedFeature` with `exact_removal: Missing`. Request, proof,
+  and outcome diagnostics redact TEID, address, device-identity, and
+  incarnation values.
 - **Retained Linux GTP device identity acquisition — `opc-gtpu-dataplane`:**
   `LinuxGtpuDataplaneBackend::acquire_retained_device_identity` takes the
   durable name, optional exact expected ifindex, non-reusable

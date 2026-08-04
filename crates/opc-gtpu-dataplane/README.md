@@ -354,6 +354,57 @@ mutation failures are re-read and returned as exact, conflict, or indeterminate
 state. Product policy decides which stale context it owns, coordinates drain,
 and sequences route/XFRM/session changes.
 
+### Linux live-writer exact PDP removal authority
+
+`LinuxGtpuDataplaneBackend::remove_pdp_context_exact_live_writer` is the
+same-process replacement companion of restart recovery. A subscriber-session
+replacement must remove the prior session's kernel-GTP PDP context with exact
+authority before the replacement dataplane can be proven converged, and during
+that ordered teardown the cooperating writer is still live: the product
+process, its network namespace, the durable device incarnation, and its
+Recovery claim all remain live. Supplying
+`PdpRestartRecoveryProof::previous_writer_stopped()` there would assert
+something false, and the unconditional lifecycle `remove_pdp_context` cannot
+prove exact dual-selector identity, so neither can safely satisfy a
+convergence or Recovery mutation proof.
+
+After binding the recovery root, call
+`GtpuDataplaneBackend::acquire_pdp_live_writer_proof` on the same concrete
+backend that will perform removal (or through its trait object). Acquisition
+is the caller's explicit attestation that it is the current cooperating writer
+and owns the live mutation namespace; it never claims that a prior writer
+stopped. It returns one affine, opaque `PdpLiveWriterProof` bound to the exact
+configured root and the current worker thread's network-namespace identity.
+Move that proof into `PdpLiveWriterRemovalRequest`; it cannot be cloned or statically
+constructed. Build the request from the live writer's device name and ifindex,
+the device's non-reusable incarnation, the complete expected PDP context, and
+the acquired proof. The removal checks the proof's root and namespace again,
+under the operation guard, before any link/netlink read or mutation. A stale,
+wrong-root, or wrong-namespace proof returns retryable
+`Indeterminate(AuthorityUnavailable)` with no netlink activity.
+
+The removal serializes under the same topology and per-device `flock` writer
+gates as every other cooperating mutation, proves the kernel-bound incarnation
+exactly as restart recovery does, and then runs the identical dual-selector
+exact-removal transaction:
+authoritative `GETPDP` readbacks on both axes before admitting the
+unconditional `DELPDP`, and classification from the post-mutation readback
+rather than from the delete's own acknowledgement. The classified outcomes are
+the same `Removed` / `AlreadyAbsent` / `Conflict(_)` / `Indeterminate(_)` /
+`RepairRequired(_)` family, with identical meanings.
+
+The live-writer authority is distinct from restart recovery and does not
+weaken it: the two request families carry different proof types that cannot
+substitute for each other, they report independent capabilities
+(`pdp_live_writer_removal_capability` versus
+`pdp_restart_recovery_capability`), and the generationless
+`remove_pdp_context_exact` trait method remains `UnsupportedFeature` with a
+`Missing` capability even after a root is bound. Dropping the returned future
+does not cancel the detached blocking worker: it retains both writer
+authorities until the transaction reaches its terminal classified result, so
+a concurrent cooperating mutation cannot overlap it and a later retry
+re-reads the converged state.
+
 ### Linux retained device identity acquisition
 
 `LinuxGtpuDataplaneBackend::acquire_retained_device_identity` is the
