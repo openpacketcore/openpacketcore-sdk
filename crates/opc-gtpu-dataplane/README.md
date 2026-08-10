@@ -518,14 +518,18 @@ pending checksum is rejected even if its current bytes happen to satisfy the
 final checksum equation. The program never repairs or trusts an unfinished
 checksum.
 
-After UDP/2152 identifies a candidate, every malformed declaration or
-unverified checksum increments the existing bounded `downlink_malformed`
-counter and drops before TEID/PDR lookup, decapsulation, or inner-destination
-validation. Addresses, TEIDs, lengths, checksum values, and payload bytes are
-not emitted. Non-UDP traffic, other UDP ports, and structurally valid
-non-G-PDU GTP-U control traffic retain their pass-through behavior. Outer
-IPv4 fragments also pass to the stack unchanged; the complete contract for
-them is defined in [Downlink outer-fragment handling](#downlink-outer-fragment-handling).
+After UDP/2152 and an accessible mandatory GTP-U header identify a candidate,
+classification separates pass-only control traffic from G-PDU decapsulation.
+Non-G-PDU traffic passes unchanged to the kernel and local typed control
+consumer, which own checksum completion and message validation; it cannot
+reach TEID/PDR lookup, decapsulation, or datapath mutation. Every malformed
+G-PDU declaration or unverified checksum increments the existing bounded
+`downlink_malformed` counter and drops before TEID/PDR lookup, decapsulation,
+or inner-destination validation. Addresses, TEIDs, lengths, checksum values,
+and payload bytes are not emitted. Non-UDP traffic and other UDP ports also
+retain their pass-through behavior. Outer IPv4 fragments pass to the stack
+unchanged; the complete contract for them is defined in
+[Downlink outer-fragment handling](#downlink-outer-fragment-handling).
 
 The privileged proof covers a legal zero `CHECKSUM_NONE` omission, non-zero
 software-verified bytes, authenticated zero and non-zero
@@ -536,7 +540,9 @@ publishes checksum metadata and forwards the current UDP packet into the real
 tc hook. Every partial form fails before PDR/decap counters, while both legal
 zero cases decapsulate only after the exact checksum bytes are restored. A
 boundary mismatch with trusted metadata proves metadata never bypasses
-structural validation.
+structural validation. A separate Echo Response fixture proves that an
+offload-owned control datagram reaches the local socket unchanged without
+moving malformed, unknown-TEID, or decapsulation counters.
 
 ### Downlink endpoint provenance
 

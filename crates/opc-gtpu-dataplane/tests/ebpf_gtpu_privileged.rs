@@ -4663,6 +4663,40 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     assert_eq!(from, SocketAddr::from((PGW_IP, GTPU_PORT)));
     net.allow_all_input_marks();
 
+    // A same-host veth can present this valid control datagram at tc ingress
+    // with kernel-owned CHECKSUM_PARTIAL metadata. It remains control-plane
+    // traffic: no PDR lookup, decapsulation, or datapath mutation is allowed.
+    let echo_response: [u8; 14] = [
+        0x32, 0x02, 0x00, 0x06, 0, 0, 0, 0, 0x00, 0x2a, 0, 0, 0x0e, 0,
+    ];
+    let control_before = backend.datapath_snapshot(&device).await?.counters;
+    net.set_pgw_tx_checksum_offload(true);
+    let echo_response_delivery = send_until_received(
+        || {
+            let _ = pgw_socket.send_to(&echo_response, (EPDG_S2BU_IP, GTPU_PORT));
+        },
+        &epdg_cp_socket,
+        &mut buffer,
+    );
+    net.set_pgw_tx_checksum_offload(false);
+    let (len, from) = echo_response_delivery
+        .expect("offload-owned GTP-U echo response must reach the control plane");
+    assert_eq!(&buffer[..len], &echo_response);
+    assert_eq!(from, SocketAddr::from((PGW_IP, GTPU_PORT)));
+    let control_after = backend.datapath_snapshot(&device).await?.counters;
+    assert_eq!(
+        control_after.downlink_malformed, control_before.downlink_malformed,
+        "a pass-only offload-owned control datagram must not be malformed",
+    );
+    assert_eq!(
+        control_after.downlink_unknown_teid, control_before.downlink_unknown_teid,
+        "a pass-only offload-owned control datagram must not reach the TEID lookup",
+    );
+    assert_eq!(
+        control_after.downlink_decapsulated, control_before.downlink_decapsulated,
+        "a pass-only offload-owned control datagram must not decapsulate",
+    );
+
     // --- Downlink: G-PDU on our I-TEID must decap and forward to the UE. ---
     // Give every outer G-PDU a distinct infrastructure mark. The nft forward
     // gate accepts exactly the expected post-decap mark, proving that the

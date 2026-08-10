@@ -1449,15 +1449,37 @@ fn parse_downlink_ipv6(ctx: &mut TcContext, parsed: &mut ParsedIpv6Downlink) -> 
         return IPV6_PARSE_PASS;
     }
 
-    // UDP/2152 is now proven. Every malformed boundary, checksum, or G-PDU
-    // declaration fails closed before the grouped selector lookup.
-    if packet_gso_size(ctx) != 0 {
-        return IPV6_PARSE_DROP;
-    }
+    // The IPv6 and UDP headers locate the mandatory GTP-U header. Non-G-PDU
+    // traffic is pass-only and stays with the local typed control consumer,
+    // whose kernel-owned checksum completion may still be pending at tc.
+    // G-PDU is the only decapsulation candidate and therefore remains subject
+    // to every strict envelope and checksum validation below.
     let Some(udp_header_end) = udp_offset.checked_add(8) else {
         return IPV6_PARSE_DROP;
     };
-    if udp_header_end > ip_end {
+    let Some(gtp_header_end) = udp_header_end.checked_add(GTPU_MANDATORY_HDR_LEN) else {
+        return IPV6_PARSE_DROP;
+    };
+    if gtp_header_end > ip_end {
+        return IPV6_PARSE_DROP;
+    }
+    let Ok(gtp_header) = ctx.load::<[u8; GTPU_MANDATORY_HDR_LEN]>(udp_header_end) else {
+        return IPV6_PARSE_DROP;
+    };
+    let (teid, gtp_length, has_opt, has_ext) = match classify_gtpu(&gtp_header) {
+        GtpuClass::NotGtpV1 | GtpuClass::NotGpdu => return IPV6_PARSE_PASS,
+        GtpuClass::Gpdu {
+            teid,
+            length,
+            has_opt,
+            has_ext,
+        } => (teid, length, has_opt, has_ext),
+    };
+
+    // UDP/2152 G-PDUs are decapsulation candidates. Every malformed boundary,
+    // checksum, or G-PDU declaration fails closed before the grouped selector
+    // lookup.
+    if packet_gso_size(ctx) != 0 {
         return IPV6_PARSE_DROP;
     }
     let Ok(udp_length) = ctx.load::<u16>(udp_offset + 4) else {
@@ -1474,9 +1496,6 @@ fn parse_downlink_ipv6(ctx: &mut TcContext, parsed: &mut ParsedIpv6Downlink) -> 
         return IPV6_PARSE_DROP;
     }
     let gtp_offset = udp_header_end;
-    let Ok(gtp_header) = ctx.load::<[u8; GTPU_MANDATORY_HDR_LEN]>(gtp_offset) else {
-        return IPV6_PARSE_DROP;
-    };
     let declared_gtp_length = u16::from_be_bytes([gtp_header[2], gtp_header[3]]);
     let Some(gtp_end) = gtp_offset
         .checked_add(GTPU_MANDATORY_HDR_LEN)
@@ -1487,15 +1506,6 @@ fn parse_downlink_ipv6(ctx: &mut TcContext, parsed: &mut ParsedIpv6Downlink) -> 
     if gtp_end != udp_end {
         return IPV6_PARSE_DROP;
     }
-    let (teid, gtp_length, has_opt, has_ext) = match classify_gtpu(&gtp_header) {
-        GtpuClass::NotGtpV1 | GtpuClass::NotGpdu => return IPV6_PARSE_PASS,
-        GtpuClass::Gpdu {
-            teid,
-            length,
-            has_opt,
-            has_ext,
-        } => (teid, length, has_opt, has_ext),
-    };
     if gtp_length != declared_gtp_length {
         return IPV6_PARSE_DROP;
     }
@@ -2412,8 +2422,34 @@ fn parse_downlink(ctx: &mut TcContext) -> u64 {
         return u64::from(TC_ACT_OK as u32);
     }
 
-    // From this point onward UDP/2152 identifies a GTP-U candidate. Every
-    // malformed declaration or checksum fails closed before any PDR lookup.
+    // The fixed headers locate the mandatory GTP-U header. Non-G-PDU traffic
+    // is pass-only and remains for the local typed control consumer, whose
+    // kernel-owned checksum completion may still be pending at tc. G-PDU is
+    // the only decapsulation candidate and remains fail-closed below.
+    let Some(gtp_offset) = l4_offset.checked_add(UDP_HDR_LEN) else {
+        return u64::from(malformed_downlink() as u32);
+    };
+    let Some(gtp_header_end) = gtp_offset.checked_add(GTPU_MANDATORY_HDR_LEN) else {
+        return u64::from(malformed_downlink() as u32);
+    };
+    if gtp_header_end > ctx.len() as usize {
+        return u64::from(malformed_downlink() as u32);
+    }
+    let Ok(gtp_header) = ctx.load::<[u8; GTPU_MANDATORY_HDR_LEN]>(gtp_offset) else {
+        return u64::from(malformed_downlink() as u32);
+    };
+    let (teid, gtp_length, has_opt, has_ext) = match classify_gtpu(&gtp_header) {
+        GtpuClass::NotGtpV1 | GtpuClass::NotGpdu => return u64::from(TC_ACT_OK as u32),
+        GtpuClass::Gpdu {
+            teid,
+            length,
+            has_opt,
+            has_ext,
+        } => (teid, length, has_opt, has_ext),
+    };
+
+    // UDP/2152 G-PDUs are decapsulation candidates. Every malformed
+    // declaration or checksum fails closed before any PDR lookup.
     let Ok(total_length) = ctx.load::<u16>(ETH_HDR_LEN + 2) else {
         return u64::from(malformed_downlink() as u32);
     };
@@ -2435,24 +2471,10 @@ fn parse_downlink(ctx: &mut TcContext) -> u64 {
         return u64::from(malformed_downlink() as u32);
     }
 
-    let gtp_offset = udp_bounds.gtp_offset();
-    let Ok(gtp_header) = ctx.load::<[u8; GTPU_MANDATORY_HDR_LEN]>(gtp_offset) else {
-        return u64::from(malformed_downlink() as u32);
-    };
     let declared_gtp_length = u16::from_be_bytes([gtp_header[2], gtp_header[3]]);
     let Ok(gtp_bounds) = GtpuEnvelopeBounds::parse(udp_bounds, declared_gtp_length) else {
         return u64::from(malformed_downlink() as u32);
     };
-    let (teid, gtp_length, has_opt, has_ext) = match classify_gtpu(&gtp_header) {
-        GtpuClass::NotGtpV1 | GtpuClass::NotGpdu => return u64::from(TC_ACT_OK as u32),
-        GtpuClass::Gpdu {
-            teid,
-            length,
-            has_opt,
-            has_ext,
-        } => (teid, length, has_opt, has_ext),
-    };
-
     if gtp_length != declared_gtp_length {
         return u64::from(malformed_downlink() as u32);
     }
