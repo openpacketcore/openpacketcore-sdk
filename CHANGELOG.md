@@ -801,6 +801,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fixture, so no message that already round-tripped moves on the wire.
 
 ### Fixed
+- **Cause-only Create Bearer rejection — `opc-proto-gtpv2c` (#653):**
+  S2b Create Bearer Responses whose message-level Cause rejects the request may
+  now omit Bearer Context IEs, as permitted by TS 29.274 clause 6.1.1. Typed
+  projection, canonical building, and request/response correlation preserve
+  exact sequence checking while accepted, partially accepted, and non-empty
+  rejected responses continue to require their complete context set.
 - **Prevent shutdown log amplification — `opc-runtime` (#633):**
   `ShutdownToken::request_shutdown` and `ShutdownToken::cancel` no longer emit
   a tracing event on every invocation. They now return a closed, value-free

@@ -20,8 +20,9 @@ use opc_proto_gtpv2c::{
     S2bUpdateBearerResult, TypedIe, TypedIeValue, CREATE_BEARER_REQUEST, CREATE_BEARER_RESPONSE,
     DELETE_BEARER_REQUEST, DELETE_BEARER_RESPONSE, IE_TYPE_LOAD_CONTROL_INFORMATION,
     IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PGW_CHANGE_INFO, INTERFACE_TYPE_S2B_U_EPDG_GTP_U,
-    INTERFACE_TYPE_S2B_U_PGW_GTP_U, MAX_PGW_APN_LOAD_CONTROL_INFORMATION_IES,
-    MAX_PGW_OVERLOAD_CONTROL_INFORMATION_IES, UPDATE_BEARER_REQUEST, UPDATE_BEARER_RESPONSE,
+    INTERFACE_TYPE_S2B_U_PGW_GTP_U, MAX_DEDICATED_BEARER_CONTEXTS,
+    MAX_PGW_APN_LOAD_CONTROL_INFORMATION_IES, MAX_PGW_OVERLOAD_CONTROL_INFORMATION_IES,
+    UPDATE_BEARER_REQUEST, UPDATE_BEARER_RESPONSE,
 };
 use opc_proto_tft::{
     PacketFilter, PacketFilterComponent, PacketFilterDirection, PacketFilterIdentifier,
@@ -345,6 +346,75 @@ fn create_bearer_response_supports_success_rejection_and_partial_acceptance() {
     correlate_create_bearer_response(&request, &actual).expect("response must correlate");
     assert!(actual.bearer_contexts[0].is_accepted());
     assert!(!actual.bearer_contexts[1].is_accepted());
+}
+
+#[test]
+fn create_bearer_response_supports_cause_only_whole_rejection() {
+    let request = create_request(MAX_DEDICATED_BEARER_CONTEXTS as u8, SEQUENCE);
+    let response = S2bCreateBearerResponse {
+        sequence_number: SEQUENCE,
+        teid: RESPONSE_TEID,
+        message_priority: None,
+        cause: CauseValue::RequestRejected,
+        bearer_contexts: Vec::new(),
+        additional_ies: Vec::new(),
+    };
+
+    let bytes = encode(
+        &s2b_create_bearer_response(response.clone()).expect("cause-only rejected Create response"),
+    );
+    let (tail, decoded) =
+        S2bMessage::decode(&bytes, procedure_context()).expect("Create response must decode");
+    assert!(tail.is_empty());
+    let actual = decoded
+        .as_view()
+        .expect("typed view")
+        .create_bearer_response()
+        .expect("cause-only Create Bearer Response projection");
+    assert_eq!(actual, response);
+    correlate_create_bearer_response(&request, &actual)
+        .expect("cause-only whole rejection must correlate without invented EBIs");
+}
+
+#[test]
+fn create_bearer_response_rejects_cause_only_non_rejections() {
+    for cause in [
+        CauseValue::RequestAccepted,
+        CauseValue::RequestAcceptedPartially,
+    ] {
+        let response = S2bCreateBearerResponse {
+            sequence_number: SEQUENCE,
+            teid: RESPONSE_TEID,
+            message_priority: None,
+            cause,
+            bearer_contexts: Vec::new(),
+            additional_ies: Vec::new(),
+        };
+        assert!(
+            s2b_create_bearer_response(response).is_err(),
+            "non-rejection Cause {cause:?} requires bearer contexts"
+        );
+    }
+}
+
+#[test]
+fn create_bearer_response_rejects_nonempty_rejection_subset() {
+    let request = create_request(2, SEQUENCE);
+    let response = S2bCreateBearerResponse {
+        sequence_number: SEQUENCE,
+        teid: RESPONSE_TEID,
+        message_priority: None,
+        cause: CauseValue::RequestRejected,
+        bearer_contexts: vec![rejected_result(1, CauseValue::NoResourcesAvailable)],
+        additional_ies: Vec::new(),
+    };
+
+    let error = correlate_create_bearer_response(&request, &response)
+        .expect_err("a nonempty rejection must answer every request context");
+    assert_eq!(
+        error.kind(),
+        DedicatedBearerErrorKind::CorrelationCountMismatch
+    );
 }
 
 #[test]
