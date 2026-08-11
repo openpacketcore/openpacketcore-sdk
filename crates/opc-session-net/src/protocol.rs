@@ -73,7 +73,11 @@ pub const SESSION_NET_ALPN: &[u8] = b"opc-session-net/5";
 /// Dedicated ALPN for the least-authority consensus-only transport.
 pub const SESSION_CONSENSUS_ALPN: &[u8] = b"opc-session-consensus/2";
 /// Fixed revision of the consensus-only bootstrap and operation DTOs.
-pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 3;
+///
+/// Revision 4 makes every forwarded consumer operation carry an explicit
+/// internal-or-consumer scope marker. It therefore rejects revision-3 peers
+/// before they can omit that authorization boundary.
+pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 4;
 
 /// Exact resource and semantic profile for consensus-only connections.
 ///
@@ -111,7 +115,7 @@ impl SessionConsensusContractProfile {
 pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractProfile =
     SessionConsensusContractProfile {
         wire_schema_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
-        error_set_revision: 5,
+        error_set_revision: 6,
         max_rpc_payload_bytes: SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES as u32,
         min_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE as u32,
         max_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
@@ -3376,6 +3380,25 @@ fn write_timeout_error() -> ProtocolError {
     ))
 }
 
+/// Effect boundary for one framed write.
+///
+/// `BeforeWrite` proves that no length-prefix byte was offered to the
+/// transport. `MayHaveWritten` means the prefix write was entered, so callers
+/// must conservatively recover an outcome rather than issue a new mutation.
+#[derive(Debug)]
+pub(crate) enum FrameWriteError {
+    BeforeWrite(ProtocolError),
+    MayHaveWritten(ProtocolError),
+}
+
+impl FrameWriteError {
+    fn into_protocol_error(self) -> ProtocolError {
+        match self {
+            Self::BeforeWrite(error) | Self::MayHaveWritten(error) => error,
+        }
+    }
+}
+
 /// Encode and write one complete frame under a negotiated size budget and one
 /// absolute deadline.
 ///
@@ -3396,8 +3419,32 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     T: Serialize,
 {
-    write_frame_bounded_until_cancellable(writer, frame, max_frame_size, deadline, &NEVER_CANCELLED)
+    write_frame_bounded_until_classified(writer, frame, max_frame_size, deadline)
         .await
+        .map_err(FrameWriteError::into_protocol_error)
+}
+
+/// Write one frame while preserving whether the transport effect boundary was
+/// crossed. Mutation clients use this to distinguish a request proven not
+/// sent from an outcome that requires exact-ID recovery.
+pub(crate) async fn write_frame_bounded_until_classified<W, T>(
+    writer: &mut W,
+    frame: &T,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+) -> Result<(), FrameWriteError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: Serialize,
+{
+    write_frame_bounded_until_cancellable_classified(
+        writer,
+        frame,
+        max_frame_size,
+        deadline,
+        &NEVER_CANCELLED,
+    )
+    .await
 }
 
 /// Cancellable counterpart to [`write_frame_bounded_until`].
@@ -3417,14 +3464,41 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     T: Serialize,
 {
+    write_frame_bounded_until_cancellable_classified(
+        writer,
+        frame,
+        max_frame_size,
+        deadline,
+        cancellation,
+    )
+    .await
+    .map_err(FrameWriteError::into_protocol_error)
+}
+
+async fn write_frame_bounded_until_cancellable_classified<W, T>(
+    writer: &mut W,
+    frame: &T,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+    cancellation: &AtomicBool,
+) -> Result<(), FrameWriteError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: Serialize,
+{
     let control = EncodingControl {
         deadline: Some(deadline),
         cancellation,
     };
-    let json = encode_frame_bounded(frame, max_frame_size, control)?;
-    control.check().map_err(encoding_halt_protocol_error)?;
+    let json = encode_frame_bounded(frame, max_frame_size, control)
+        .map_err(FrameWriteError::BeforeWrite)?;
+    control
+        .check()
+        .map_err(encoding_halt_protocol_error)
+        .map_err(FrameWriteError::BeforeWrite)?;
     let len = u32::try_from(json.encoded_len)
-        .map_err(|_| ProtocolError::FrameTooLarge(json.encoded_len))?;
+        .map_err(|_| ProtocolError::FrameTooLarge(json.encoded_len))
+        .map_err(FrameWriteError::BeforeWrite)?;
     let write = async {
         writer
             .write_all(&len.to_be_bytes())
@@ -3439,8 +3513,8 @@ where
         writer.flush().await.map_err(ProtocolError::Io)
     };
     match tokio::time::timeout_at(deadline, write).await {
-        Ok(result) => result,
-        Err(_elapsed) => Err(write_timeout_error()),
+        Ok(result) => result.map_err(FrameWriteError::MayHaveWritten),
+        Err(_elapsed) => Err(FrameWriteError::MayHaveWritten(write_timeout_error())),
     }
 }
 
@@ -3622,7 +3696,7 @@ pub(crate) fn ensure_restore_scan_success_frame_fits_until(
     )
 }
 
-async fn read_frame_payload<R>(
+pub(crate) async fn read_frame_payload<R>(
     reader: &mut R,
     max_frame_size: usize,
 ) -> Result<Vec<u8>, ProtocolError>
@@ -4052,10 +4126,10 @@ mod tests {
         assert!(CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.is_current());
         assert_eq!(
             CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.error_set_revision,
-            5
+            6
         );
         assert_eq!(SESSION_CONSENSUS_ALPN, b"opc-session-consensus/2");
-        assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 3);
+        assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 4);
         let mut previous_error_set = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
         previous_error_set.error_set_revision = 1;
         assert!(!previous_error_set.is_current());
@@ -5384,6 +5458,21 @@ mod tests {
     #[tokio::test]
     async fn expired_bounded_write_deadline_emits_nothing() {
         let mut writer = Vec::new();
+        let classified = write_frame_bounded_until_classified(
+            &mut writer,
+            &Response::WatchStream,
+            MIN_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now(),
+        )
+        .await
+        .expect_err("expired deadline must remain before the write boundary");
+        assert!(matches!(
+            classified,
+            FrameWriteError::BeforeWrite(ProtocolError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(writer.is_empty());
+
         let error = write_frame_bounded_until(
             &mut writer,
             &Response::WatchStream,

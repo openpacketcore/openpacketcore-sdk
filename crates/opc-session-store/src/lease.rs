@@ -7,7 +7,7 @@
 //! rejecting writes whose fence token is lower than the key's recorded token,
 //! so an owner that pauses past its TTL can never overwrite its successor.
 
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use async_trait::async_trait;
 use opc_types::Timestamp;
@@ -21,7 +21,7 @@ use crate::{
 ///
 /// Callers can inspect the lease metadata, but only the lease manager can mint
 /// a valid guard, which makes the guard suitable as proof for fenced mutations.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeaseGuard {
     key: SessionKey,
     owner: OwnerId,
@@ -29,6 +29,12 @@ pub struct LeaseGuard {
     acquired_at: Timestamp,
     expires_at: Timestamp,
     credential_id: u64,
+}
+
+impl fmt::Debug for LeaseGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LeaseGuard(<redacted>)")
+    }
 }
 
 impl LeaseGuard {

@@ -40,6 +40,7 @@
 #[cfg(feature = "legacy-session-net-compat")]
 pub mod client;
 pub mod consensus;
+pub mod consumer;
 pub mod error;
 pub mod identity;
 mod lifecycle;
@@ -58,6 +59,13 @@ pub use client::RemoteSessionBackend;
 pub use consensus::{
     RemoteAddrResolver, RemoteSessionConsensusPeer, SessionConsensusServer,
     SessionConsensusServerHandle,
+};
+pub use consumer::{
+    SessionConsumerAuthorizationError, SessionConsumerAuthorizer, SessionConsumerClientError,
+    SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionQuorumConsumerServer,
+    SessionQuorumConsumerServerHandle, StatelessSessionConsumerClient,
+    MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION, SESSION_QUORUM_CONSUMER_ALPN,
+    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 pub use error::ProtocolError;
 pub use identity::{

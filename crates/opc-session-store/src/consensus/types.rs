@@ -10,6 +10,7 @@ use crate::backend::{CompareAndSet, CompareAndSetResult};
 use crate::error::StoreError;
 use crate::lease::LeaseGuard;
 use crate::model::{OwnerId, SessionKey};
+use crate::record::StoredSessionRecord;
 
 pub use opc_consensus::{
     ConsensusClusterId as SessionConsensusClusterId,
@@ -124,6 +125,23 @@ pub enum SessionMutationIntent {
     },
     /// Release an existing lease.
     ReleaseLease(LeaseGuard),
+    /// SDK-internal quorum-durable binding of a caller-owned consumer request
+    /// ID to one full request commitment.
+    #[doc(hidden)]
+    BindConsumerRequest {
+        /// SHA-256 commitment to the complete typed consumer request.
+        request_commitment: [u8; 32],
+    },
+    /// SDK-internal durable receipt for a consumer batch point read.
+    ///
+    /// A batch is retryable only if every slot has a stable durable outcome.
+    /// The result is retained only in the consensus idempotency receipt and
+    /// never becomes a replication entry or consumer-controlled replay API.
+    #[doc(hidden)]
+    ReadConsumerRecord {
+        /// Key read at the command's committed logical time.
+        key: SessionKey,
+    },
     /// SDK-internal operator recovery fence committed only through the local
     /// leader's authorized admin boundary.
     #[doc(hidden)]
@@ -246,6 +264,9 @@ impl SessionConsensusCommand {
 pub enum SessionMutationOutcome {
     /// Result of a compare-and-set command.
     CompareAndSet(CompareAndSetResult),
+    /// Durable result of an SDK-internal consumer batch point read.
+    #[doc(hidden)]
+    ConsumerRecord(Option<StoredSessionRecord>),
     /// Lease allocated or renewed by the committed command.
     Lease(LeaseGuard),
     /// Mutation completed without a value result.

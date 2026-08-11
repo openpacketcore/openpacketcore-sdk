@@ -50,6 +50,14 @@ use crate::backend::{
 };
 use crate::capability::{BackendCapabilities, SessionStorePlatformProfile};
 use crate::clock::{Clock, SystemClock};
+use crate::consumer::{
+    consumer_request_commitment, derive_consumer_consensus_request_id,
+    derive_consumer_request_binding_id, SessionConsumerAuthorizationManifest,
+    SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerIdentity,
+    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerStoreError, SessionQuorumConsumer, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+};
 use crate::error::{LeaseError, StoreError};
 use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{OwnerId, SessionKey};
@@ -84,6 +92,7 @@ pub const DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT: Duration =
     DURABLE_CONSENSUS_OPERATION_TIMEOUT;
 
 const SESSION_CONSENSUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const CONSUMER_WATCH_SCOPE_RECHECK_INTERVAL: Duration = Duration::from_millis(50);
 const TOPOLOGY_ENDPOINT_BINDING_DOMAIN: &[u8] =
     b"openpacketcore/session-store/topology-endpoint-binding/v1\0";
 const TOPOLOGY_TLS_BINDING_DOMAIN: &[u8] =
@@ -212,6 +221,36 @@ impl From<SessionRaftAdapterError> for ConsensusSessionStoreOpenError {
 struct ForwardMutationRequest {
     request_id: SessionConsensusRequestId,
     intent: SessionMutationIntent,
+    /// The exact consumer scope whose check must remain valid through leader
+    /// admission. Ordinary in-process store callers carry no consumer scope.
+    required_consumer_scope: ForwardConsumerScope,
+}
+
+/// Explicitly distinguishes an internal forwarding call from one made for a
+/// stateless consumer. This is deliberately not an `Option`: a peer which
+/// does not understand consumer scope must fail decoding instead of treating a
+/// missing field as an internal request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum ForwardConsumerScope {
+    Internal,
+    Consumer(Box<SessionConsensusIdentity>),
+}
+
+impl ForwardConsumerScope {
+    fn from_optional(scope: Option<SessionConsensusIdentity>) -> Self {
+        scope.map_or(Self::Internal, |scope| Self::Consumer(Box::new(scope)))
+    }
+
+    fn consumer_scope(&self) -> Option<&SessionConsensusIdentity> {
+        match self {
+            Self::Internal => None,
+            Self::Consumer(scope) => Some(scope),
+        }
+    }
+
+    fn is_consumer_scoped(&self) -> bool {
+        matches!(self, Self::Consumer(_))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +258,9 @@ enum ForwardRequest {
     Mutation(ForwardMutationRequest),
     RecordExpiryPreflight {
         preflights: BoundedRecordExpiryPreflights,
+        /// The consumer scope that must remain valid through the leader's
+        /// logical-time proposal. Internal callers do not carry this scope.
+        required_consumer_scope: ForwardConsumerScope,
     },
 }
 
@@ -313,6 +355,15 @@ struct LocalProposalAuthority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct ReadBarrierRequest;
 
+/// One consumer scope validated while holding the topology read gate.
+///
+/// The guard remains owned by the admission until the local operation returns,
+/// preventing a topology transition from invalidating its scope mid-work.
+struct ConsumerScopeAdmission {
+    required_scope: SessionConsensusIdentity,
+    _operation_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ReadBarrierReply {
     Ready(Option<LogId<SessionConsensusNodeId>>),
@@ -351,6 +402,24 @@ struct ConsensusSessionStoreInner {
 #[derive(Clone)]
 pub struct ConsensusSessionStore {
     inner: Arc<ConsensusSessionStoreInner>,
+}
+
+/// Quorum-side adapter exposing only typed stateless consumer operations.
+///
+/// This adapter owns a [`ConsensusSessionStore`] rather than an arbitrary
+/// backend port, so every mutation retains the store's leader forwarding,
+/// durable request identity, exact-membership admission, and stale-lease
+/// fencing behavior. It cannot express a vote, topology transition, snapshot,
+/// raw replication append, or rebuild operation.
+#[derive(Clone)]
+pub struct ConsensusSessionConsumerService {
+    store: ConsensusSessionStore,
+}
+
+impl fmt::Debug for ConsensusSessionConsumerService {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConsensusSessionConsumerService(<redacted>)")
+    }
 }
 
 impl fmt::Debug for ConsensusSessionStore {
@@ -539,6 +608,94 @@ impl ConsensusSessionStore {
     pub fn rpc_handler(&self) -> Arc<dyn SessionConsensusRpcHandler> {
         Arc::new(SessionConsensusService {
             store: self.clone(),
+        })
+    }
+
+    /// Build the typed least-authority service for authenticated stateless
+    /// application consumers.
+    ///
+    /// The returned service is not a consensus RPC handler and cannot be used
+    /// to add a local member, access SQLite/snapshot state, or dispatch raw
+    /// replication/rebuild commands. Its caller must authenticate and
+    /// authorize each [`SessionConsumerIdentity`] before calling it.
+    pub fn consumer_service(&self) -> ConsensusSessionConsumerService {
+        ConsensusSessionConsumerService {
+            store: self.clone(),
+        }
+    }
+
+    /// Return the exact currently admitted scope for stateless consumers.
+    ///
+    /// A state-process composition layer uses this value to configure both
+    /// its consumer authorizer and externally constructed clients. A client
+    /// must be recreated with a successor scope after a completed topology
+    /// transition; this accessor never weakens the exact-scope check at the
+    /// consumer service boundary.
+    pub fn consumer_scope(&self) -> Result<SessionConsumerScope, StoreError> {
+        self.require_exact_membership_admission()?;
+        self.current_scope()
+            .map(|(identity, _)| SessionConsumerScope::new(identity))
+    }
+
+    /// Produce the only member-exclusion manifest accepted by the stateless
+    /// consumer listener. The set is derived from the store-owned, currently
+    /// admitted topology bindings while its operation gate is held.
+    pub async fn consumer_authorization_manifest(
+        &self,
+    ) -> Result<SessionConsumerAuthorizationManifest, StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        let scope = self.consumer_scope()?;
+        let admission = self
+            .admit_consumer_scope(scope, deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        let descriptors = self
+            .inner
+            .topology_coordinator
+            .current_member_descriptors(admission.required_scope)
+            .ok_or_else(consensus_unavailable)?;
+        let members = descriptors
+            .into_values()
+            .map(|descriptor| {
+                SessionConsumerIdentity::new(descriptor.tls_identity().as_str().to_owned())
+                    .map_err(|_| consensus_unavailable())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if members.is_empty() {
+            return Err(consensus_unavailable());
+        }
+        Ok(SessionConsumerAuthorizationManifest::new(scope, members))
+    }
+
+    fn consumer_scope_is_current(
+        &self,
+        scope: SessionConsumerScope,
+    ) -> Result<(), SessionConsumerRejection> {
+        let (current_scope, _) = self
+            .current_scope()
+            .map_err(|_| SessionConsumerRejection::Unavailable)?;
+        if current_scope != scope.consensus_identity() {
+            return Err(SessionConsumerRejection::ScopeMismatch);
+        }
+        self.require_exact_membership_admission()
+            .map_err(|_| SessionConsumerRejection::Unavailable)
+    }
+
+    async fn admit_consumer_scope(
+        &self,
+        scope: SessionConsumerScope,
+        deadline: tokio::time::Instant,
+    ) -> Result<ConsumerScopeAdmission, SessionConsumerRejection> {
+        let operation_gate = self.inner.topology_coordinator.operation_gate();
+        let operation_guard = tokio::time::timeout_at(deadline, operation_gate.read_owned())
+            .await
+            .map_err(|_| SessionConsumerRejection::Unavailable)?;
+        self.consumer_scope_is_current(scope)?;
+        Ok(ConsumerScopeAdmission {
+            required_scope: scope.consensus_identity(),
+            _operation_guard: operation_guard,
         })
     }
 
@@ -1183,10 +1340,20 @@ impl ConsensusSessionStore {
         request_id: SessionConsensusRequestId,
         intent: SessionMutationIntent,
     ) -> Result<SessionConsensusResponse, StoreError> {
+        self.submit_request_with_consumer_scope(request_id, intent, None)
+            .await
+    }
+
+    async fn submit_request_with_consumer_scope(
+        &self,
+        request_id: SessionConsensusRequestId,
+        intent: SessionMutationIntent,
+        required_consumer_scope: Option<SessionConsensusIdentity>,
+    ) -> Result<SessionConsensusResponse, StoreError> {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
-        self.submit_request_before(request_id, intent, deadline)
+        self.submit_request_before(request_id, intent, required_consumer_scope, deadline)
             .await
     }
 
@@ -1194,6 +1361,7 @@ impl ConsensusSessionStore {
         &self,
         request_id: SessionConsensusRequestId,
         intent: SessionMutationIntent,
+        required_consumer_scope: Option<SessionConsensusIdentity>,
         deadline: tokio::time::Instant,
     ) -> Result<SessionConsensusResponse, StoreError> {
         self.require_exact_membership_admission()?;
@@ -1211,7 +1379,11 @@ impl ConsensusSessionStore {
             return Err(consensus_unavailable());
         }
         validate_consensus_intent(&intent)?;
-        let request = ForwardMutationRequest { request_id, intent };
+        let request = ForwardMutationRequest {
+            request_id,
+            intent,
+            required_consumer_scope: ForwardConsumerScope::from_optional(required_consumer_scope),
+        };
         let mut preferred = None;
         let mut outcome_may_be_unavailable = false;
 
@@ -1246,6 +1418,9 @@ impl ConsensusSessionStore {
                         // request ID is safe; returning a generic unavailable
                         // error after this point is not.
                         outcome_may_be_unavailable = true;
+                        if request.required_consumer_scope.is_consumer_scoped() {
+                            return Err(consensus_outcome_unavailable(&request.intent));
+                        }
                         if self.wait_for_route_refresh(leader, deadline).await.is_err() {
                             return Err(consensus_outcome_unavailable(&request.intent));
                         }
@@ -1313,12 +1488,14 @@ impl ConsensusSessionStore {
     async fn preflight_record_expiry_before(
         &self,
         preflights: &[RecordExpiryPreflight],
+        required_consumer_scope: Option<SessionConsensusIdentity>,
         deadline: tokio::time::Instant,
     ) -> Result<(), StoreError> {
         validate_record_expiry_preflights_profile(preflights)?;
         self.require_exact_membership_admission()?;
         let request = ForwardRequest::RecordExpiryPreflight {
             preflights: BoundedRecordExpiryPreflights::try_from_slice(preflights)?,
+            required_consumer_scope: ForwardConsumerScope::from_optional(required_consumer_scope),
         };
         let mut preferred = None;
         loop {
@@ -1327,11 +1504,16 @@ impl ConsensusSessionStore {
                 None => self.wait_for_known_leader(deadline).await?,
             };
             let reply = if leader == self.inner.local_node_id {
-                let ForwardRequest::RecordExpiryPreflight { preflights } = request.clone() else {
+                let ForwardRequest::RecordExpiryPreflight {
+                    preflights,
+                    required_consumer_scope,
+                } = request.clone()
+                else {
                     unreachable!("fixed expiry-preflight request")
                 };
                 self.preflight_record_expiry_on_local_leader(
                     preflights.into_inner(),
+                    required_consumer_scope,
                     self.inner.local_node_id,
                     deadline,
                 )
@@ -1410,6 +1592,18 @@ impl ConsensusSessionStore {
             };
         if self.require_exact_membership_admission().is_err() {
             return ForwardMutationReply::Unavailable;
+        }
+        if request
+            .required_consumer_scope
+            .consumer_scope()
+            .is_some_and(|required_scope| {
+                self.current_scope()
+                    .map_or(true, |(current_scope, _)| current_scope != *required_scope)
+            })
+        {
+            return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
+                StoreError::TopologyAuthorityRevoked,
+            )));
         }
         if !allow_operator_recovery {
             let recovery_pending = match tokio::time::timeout_at(
@@ -1592,6 +1786,7 @@ impl ConsensusSessionStore {
     async fn preflight_record_expiry_on_local_leader(
         &self,
         preflights: Vec<RecordExpiryPreflight>,
+        required_consumer_scope: ForwardConsumerScope,
         origin: SessionConsensusNodeId,
         deadline: tokio::time::Instant,
     ) -> ForwardMutationReply {
@@ -1606,6 +1801,17 @@ impl ConsensusSessionStore {
             };
         if self.require_exact_membership_admission().is_err() {
             return ForwardMutationReply::Unavailable;
+        }
+        if required_consumer_scope
+            .consumer_scope()
+            .is_some_and(|required_scope| {
+                self.current_scope()
+                    .map_or(true, |(current_scope, _)| current_scope != *required_scope)
+            })
+        {
+            return ForwardMutationReply::RecordExpiryPreflight(Err(
+                StoreError::TopologyAuthorityRevoked,
+            ));
         }
         let recovery_pending = match tokio::time::timeout_at(
             deadline,
@@ -1688,6 +1894,7 @@ impl ConsensusSessionStore {
                 ForwardMutationRequest {
                     request_id: SessionConsensusRequestId::new(),
                     intent: intent.clone(),
+                    required_consumer_scope,
                 },
                 LocalProposalAuthority {
                     origin,
@@ -1737,6 +1944,7 @@ impl ConsensusSessionStore {
                         fence_high_water,
                         credential_high_water,
                     },
+                    required_consumer_scope: ForwardConsumerScope::Internal,
                 },
                 self.inner.local_node_id,
                 deadline,
@@ -1968,12 +2176,14 @@ impl ConsensusSessionStore {
 
     async fn logical_read_time_before(
         &self,
+        required_consumer_scope: Option<SessionConsensusIdentity>,
         deadline: tokio::time::Instant,
     ) -> Result<Timestamp, StoreError> {
         let response = self
             .submit_request_before(
                 SessionConsensusRequestId::new(),
                 SessionMutationIntent::AdvanceLogicalTime,
+                required_consumer_scope,
                 deadline,
             )
             .await
@@ -2000,7 +2210,130 @@ impl ConsensusSessionStore {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
-        self.logical_read_time_before(deadline).await
+        self.logical_read_time_before(None, deadline).await
+    }
+
+    async fn consumer_preflight_record_expiry(
+        &self,
+        scope: SessionConsumerScope,
+        preflights: &[RecordExpiryPreflight],
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        validate_record_expiry_preflights_profile(preflights)?;
+        if !preflights
+            .iter()
+            .copied()
+            .any(RecordExpiryPreflight::is_finite)
+        {
+            return Ok(());
+        }
+        self.preflight_record_expiry_before(preflights, Some(scope.consensus_identity()), deadline)
+            .await
+    }
+
+    async fn consumer_get(
+        &self,
+        scope: SessionConsumerScope,
+        key: &SessionKey,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<StoredSessionRecord>, StoreError> {
+        let logical_time = self
+            .logical_read_time_before(Some(scope.consensus_identity()), deadline)
+            .await?;
+        // `logical_read_time_before` submits a consensus command and owns its
+        // own leader-side topology gate. Acquire the local read gate only
+        // after that command has settled; retaining it across the submission
+        // can self-block behind a queued topology writer on Tokio's fair lock.
+        let _admission = self
+            .admit_consumer_scope(scope, deadline)
+            .await
+            .map_err(|rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            })?;
+        self.inner.backend.consensus_get_at(key, logical_time).await
+    }
+
+    async fn consumer_scan_restore_records(
+        &self,
+        scope: SessionConsumerScope,
+        request: RestoreScanRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<RestoreScanPage, StoreError> {
+        request.validate()?;
+        let logical_time = tokio::time::timeout_at(
+            deadline,
+            self.logical_read_time_before(Some(scope.consensus_identity()), deadline),
+        )
+        .await
+        .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)??;
+        let _admission = self
+            .admit_consumer_scope(scope, deadline)
+            .await
+            .map_err(|rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            })?;
+        self.inner
+            .backend
+            .consensus_scan_restore_records_at(request, logical_time, deadline)
+            .await
+    }
+
+    async fn consumer_watch(
+        &self,
+        scope: SessionConsumerScope,
+        start_sequence: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+        StoreError,
+    > {
+        self.logical_read_time_before(Some(scope.consensus_identity()), deadline)
+            .await?;
+        let admission = self
+            .admit_consumer_scope(scope, deadline)
+            .await
+            .map_err(|rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            })?;
+        let stream = self
+            .inner
+            .backend
+            .consensus_consumer_watch(start_sequence)
+            .await?;
+        let store = self.clone();
+        let scope = SessionConsumerScope::new(admission.required_scope);
+        drop(admission);
+        Ok(futures_util::stream::unfold(
+            (stream, store, scope),
+            |(mut stream, store, scope)| async move {
+                loop {
+                    let entry = tokio::select! {
+                        entry = stream.next() => entry?,
+                        _ = tokio::time::sleep(CONSUMER_WATCH_SCOPE_RECHECK_INTERVAL) => {
+                            let deadline = tokio::time::Instant::now()
+                                .checked_add(store.inner.operation_timeout)?;
+                            if store.admit_consumer_scope(scope, deadline).await.is_err() {
+                                return None;
+                            }
+                            continue;
+                        }
+                    };
+                    let deadline =
+                        tokio::time::Instant::now().checked_add(store.inner.operation_timeout)?;
+                    if store.admit_consumer_scope(scope, deadline).await.is_err() {
+                        return None;
+                    }
+                    return Some((
+                        entry.map_err(SessionConsumerStoreError::from),
+                        (stream, store, scope),
+                    ));
+                }
+            },
+        )
+        .boxed())
     }
 }
 
@@ -2052,6 +2385,7 @@ fn committed_response_matches_intent(
     match (&response.result, intent) {
         (Err(error), intent) => committed_error_matches_intent(intent, error),
         (Ok(SessionMutationOutcome::Unit), SessionMutationIntent::AdvanceLogicalTime)
+        | (Ok(SessionMutationOutcome::Unit), SessionMutationIntent::BindConsumerRequest { .. })
         | (Ok(SessionMutationOutcome::Unit), SessionMutationIntent::DeleteFenced(_))
         | (Ok(SessionMutationOutcome::Unit), SessionMutationIntent::RefreshTtl { .. })
         | (Ok(SessionMutationOutcome::Unit), SessionMutationIntent::ReleaseLease(_))
@@ -2059,6 +2393,10 @@ fn committed_response_matches_intent(
             Ok(SessionMutationOutcome::Unit),
             SessionMutationIntent::FinalizeOperatorRecovery { .. },
         ) => true,
+        (
+            Ok(SessionMutationOutcome::ConsumerRecord(record)),
+            SessionMutationIntent::ReadConsumerRecord { key },
+        ) => record.as_ref().is_none_or(|record| record.key == *key),
         (
             Ok(SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Success)),
             SessionMutationIntent::CompareAndSet(_),
@@ -2149,10 +2487,15 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
                 | SessionMutationIntent::AcquireLease { .. }
                 | SessionMutationIntent::RenewLease { .. }
                 | SessionMutationIntent::ReleaseLease(_)
+                | SessionMutationIntent::ReadConsumerRecord { .. }
         );
     }
     match intent {
         SessionMutationIntent::AdvanceLogicalTime => false,
+        SessionMutationIntent::BindConsumerRequest { .. } => {
+            matches!(error, StoreError::CasIdempotencyConflict)
+        }
+        SessionMutationIntent::ReadConsumerRecord { .. } => false,
         SessionMutationIntent::CompareAndSet(_) => matches!(
             error,
             StoreError::NotFound
@@ -2345,10 +2688,14 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                             .apply_on_local_leader(request, authenticated_sender, deadline)
                             .await
                     }
-                    ForwardRequest::RecordExpiryPreflight { preflights } => {
+                    ForwardRequest::RecordExpiryPreflight {
+                        preflights,
+                        required_consumer_scope,
+                    } => {
                         self.store
                             .preflight_record_expiry_on_local_leader(
                                 preflights.into_inner(),
+                                required_consumer_scope,
                                 authenticated_sender,
                                 deadline,
                             )
@@ -2409,6 +2756,571 @@ fn protocol_rejection() -> SessionConsensusWireResponse {
     }
 }
 
+impl ConsensusSessionConsumerService {
+    fn operation_deadline(&self) -> Result<tokio::time::Instant, SessionConsumerRejection> {
+        tokio::time::Instant::now()
+            .checked_add(self.store.inner.operation_timeout)
+            .ok_or(SessionConsumerRejection::Unavailable)
+    }
+
+    async fn bind_consumer_request(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: &SessionConsumerRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        let request_id = derive_consumer_request_binding_id(identity, request);
+        let request_commitment = consumer_request_commitment(request)
+            .map_err(|_| StoreError::InvalidKey("consumer request commitment rejected".into()))?;
+        let response = self
+            .store
+            .submit_request_before(
+                request_id,
+                SessionMutationIntent::BindConsumerRequest { request_commitment },
+                Some(request.scope().consensus_identity()),
+                deadline,
+            )
+            .await
+            .map_err(|error| match error {
+                // This marker never performs application work. Its unconfirmed
+                // durable outcome is safely retried only by the caller using
+                // the same explicit consumer request ID.
+                StoreError::BackendOperationOutcomeUnavailable => consensus_unavailable(),
+                error => error,
+            })?;
+        match response.result? {
+            SessionMutationOutcome::Unit => Ok(()),
+            _ => Err(StoreError::CasIdempotencyOutcomeUnavailable),
+        }
+    }
+
+    async fn submit_consumer_intent(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: &SessionConsumerRequest,
+        slot: u16,
+        intent: SessionMutationIntent,
+        deadline: tokio::time::Instant,
+    ) -> Result<SessionConsensusResponse, StoreError> {
+        let request_id = derive_consumer_consensus_request_id(identity, request, slot)
+            .map_err(|_| StoreError::InvalidKey("consumer request commitment rejected".into()))?;
+        self.store
+            .submit_request_before(
+                request_id,
+                intent,
+                Some(request.scope().consensus_identity()),
+                deadline,
+            )
+            .await
+    }
+
+    fn binding_failure_response(
+        operation: &SessionConsumerOperation,
+        error: StoreError,
+    ) -> SessionConsumerResponse {
+        if !matches!(error, StoreError::CasIdempotencyConflict) {
+            return SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable);
+        }
+        let conflict = SessionConsumerStoreError::RequestConflict;
+        match operation {
+            SessionConsumerOperation::CompareAndSet { .. } => {
+                SessionConsumerResponse::CompareAndSet(Err(conflict))
+            }
+            SessionConsumerOperation::DeleteFenced { .. } => {
+                SessionConsumerResponse::DeleteFenced(Err(conflict))
+            }
+            SessionConsumerOperation::RefreshTtl { .. } => {
+                SessionConsumerResponse::RefreshTtl(Err(conflict))
+            }
+            SessionConsumerOperation::Batch { .. } => SessionConsumerResponse::Batch(Err(conflict)),
+            SessionConsumerOperation::AcquireLease { .. } => SessionConsumerResponse::AcquireLease(
+                Err(crate::SessionConsumerLeaseError::RequestConflict),
+            ),
+            SessionConsumerOperation::RenewLease { .. } => SessionConsumerResponse::RenewLease(
+                Err(crate::SessionConsumerLeaseError::RequestConflict),
+            ),
+            SessionConsumerOperation::ReleaseLease { .. } => SessionConsumerResponse::ReleaseLease(
+                Err(crate::SessionConsumerLeaseError::RequestConflict),
+            ),
+            SessionConsumerOperation::Capabilities
+            | SessionConsumerOperation::Get { .. }
+            | SessionConsumerOperation::PreflightRecordExpiry { .. }
+            | SessionConsumerOperation::ScanRestoreRecords { .. }
+            | SessionConsumerOperation::Watch { .. } => {
+                SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+            }
+        }
+    }
+
+    fn operation_mutates(operation: &SessionConsumerOperation) -> bool {
+        matches!(
+            operation,
+            SessionConsumerOperation::CompareAndSet { .. }
+                | SessionConsumerOperation::DeleteFenced { .. }
+                | SessionConsumerOperation::RefreshTtl { .. }
+                | SessionConsumerOperation::Batch { .. }
+                | SessionConsumerOperation::AcquireLease { .. }
+                | SessionConsumerOperation::RenewLease { .. }
+                | SessionConsumerOperation::ReleaseLease { .. }
+        )
+    }
+
+    /// Bound the response before binding or applying a batch request.
+    ///
+    /// A `Get` or failed `CompareAndSet` can return a complete stored record.
+    /// Their upper bound is derived from the backend's admitted payload limit,
+    /// using four JSON bytes per source byte plus a deliberately generous
+    /// envelope allowance. This makes a clean `PayloadTooLarge` response
+    /// impossible after a batch effect has reached consensus.
+    fn batch_response_is_admitted(&self, ops: &[SessionOp]) -> bool {
+        consumer_batch_response_is_admitted(
+            self.store
+                .inner
+                .backend
+                .consensus_capabilities()
+                .max_value_bytes,
+            ops,
+        )
+    }
+}
+
+fn consumer_batch_response_is_admitted(max_payload_bytes: usize, ops: &[SessionOp]) -> bool {
+    const RESPONSE_ENVELOPE_BYTES: usize = 4 * 1024;
+    const SLOT_ENVELOPE_BYTES: usize = 4 * 1024;
+    const RECORD_ENVELOPE_BYTES: usize = 64 * 1024;
+
+    let Some(max_record_bytes) = max_payload_bytes
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(RECORD_ENVELOPE_BYTES))
+    else {
+        return false;
+    };
+    let Some(mut total) =
+        RESPONSE_ENVELOPE_BYTES.checked_add(ops.len().saturating_mul(SLOT_ENVELOPE_BYTES))
+    else {
+        return false;
+    };
+    for op in ops {
+        let possible_record = matches!(op, SessionOp::Get { .. } | SessionOp::CompareAndSet(_));
+        let slot_bytes = if possible_record {
+            max_record_bytes
+        } else {
+            SLOT_ENVELOPE_BYTES
+        };
+        let Some(next) = total.checked_add(slot_bytes) else {
+            return false;
+        };
+        if next > MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES {
+            return false;
+        }
+        total = next;
+    }
+    true
+}
+
+impl ConsensusSessionConsumerService {
+    async fn execute_batch(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: &SessionConsumerRequest,
+        deadline: tokio::time::Instant,
+        ops: Vec<SessionOp>,
+    ) -> SessionConsumerResponse {
+        let preflights = match record_expiry_preflights(&ops) {
+            Ok(preflights) => preflights,
+            Err(_) => {
+                return SessionConsumerResponse::Rejected(
+                    SessionConsumerRejection::MalformedRequest,
+                )
+            }
+        };
+        if let Err(error) = self
+            .store
+            .consumer_preflight_record_expiry(request.scope(), &preflights, deadline)
+            .await
+        {
+            return SessionConsumerResponse::Batch(Err(SessionConsumerStoreError::from(error)));
+        }
+
+        let mut results = Vec::with_capacity(ops.len());
+        for (index, op) in ops.into_iter().enumerate() {
+            let slot = match u16::try_from(index + 1) {
+                Ok(slot) => slot,
+                Err(_) => {
+                    return SessionConsumerResponse::Rejected(
+                        SessionConsumerRejection::MalformedRequest,
+                    )
+                }
+            };
+            let response = match op {
+                SessionOp::Get { key } => {
+                    let result = self
+                        .submit_consumer_intent(
+                            identity,
+                            request,
+                            slot,
+                            SessionMutationIntent::ReadConsumerRecord { key },
+                            deadline,
+                        )
+                        .await
+                        .and_then(|response| match response.result? {
+                            SessionMutationOutcome::ConsumerRecord(record) => Ok(record),
+                            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+                        });
+                    if consumer_mutation_unknown(&result) {
+                        return SessionConsumerResponse::OutcomeUnknown(
+                            SessionConsumerOutcomeUnknown::Mutation,
+                        );
+                    }
+                    SessionConsumerBatchResult::Get(result.map_err(SessionConsumerStoreError::from))
+                }
+                SessionOp::CompareAndSet(op) => {
+                    let result = self
+                        .submit_consumer_intent(
+                            identity,
+                            request,
+                            slot,
+                            SessionMutationIntent::CompareAndSet(Box::new(op)),
+                            deadline,
+                        )
+                        .await
+                        .and_then(|response| match response.result? {
+                            SessionMutationOutcome::CompareAndSet(result) => Ok(result),
+                            _ => Err(StoreError::CasIdempotencyOutcomeUnavailable),
+                        });
+                    if consumer_mutation_unknown(&result) {
+                        return SessionConsumerResponse::OutcomeUnknown(
+                            SessionConsumerOutcomeUnknown::Mutation,
+                        );
+                    }
+                    SessionConsumerBatchResult::CompareAndSet(
+                        result.map_err(SessionConsumerStoreError::from),
+                    )
+                }
+                SessionOp::DeleteFenced { lease } => {
+                    let result = self
+                        .submit_consumer_intent(
+                            identity,
+                            request,
+                            slot,
+                            SessionMutationIntent::DeleteFenced(lease),
+                            deadline,
+                        )
+                        .await
+                        .and_then(|response| match response.result? {
+                            SessionMutationOutcome::Unit => Ok(()),
+                            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+                        });
+                    if consumer_mutation_unknown(&result) {
+                        return SessionConsumerResponse::OutcomeUnknown(
+                            SessionConsumerOutcomeUnknown::Mutation,
+                        );
+                    }
+                    SessionConsumerBatchResult::DeleteFenced(
+                        result.map_err(SessionConsumerStoreError::from),
+                    )
+                }
+                SessionOp::RefreshTtl { lease, ttl } => {
+                    let result = self
+                        .submit_consumer_intent(
+                            identity,
+                            request,
+                            slot,
+                            SessionMutationIntent::RefreshTtl { lease, ttl },
+                            deadline,
+                        )
+                        .await
+                        .and_then(|response| match response.result? {
+                            SessionMutationOutcome::Unit => Ok(()),
+                            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+                        });
+                    if consumer_mutation_unknown(&result) {
+                        return SessionConsumerResponse::OutcomeUnknown(
+                            SessionConsumerOutcomeUnknown::Mutation,
+                        );
+                    }
+                    SessionConsumerBatchResult::RefreshTtl(
+                        result.map_err(SessionConsumerStoreError::from),
+                    )
+                }
+            };
+            results.push(response);
+        }
+        SessionConsumerResponse::Batch(Ok(results))
+    }
+}
+
+fn consumer_mutation_unknown<T>(result: &Result<T, StoreError>) -> bool {
+    matches!(
+        result,
+        Err(StoreError::CasIdempotencyOutcomeUnavailable)
+            | Err(StoreError::BackendOperationOutcomeUnavailable)
+    )
+}
+
+#[async_trait]
+impl SessionQuorumConsumer for ConsensusSessionConsumerService {
+    async fn execute(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: SessionConsumerRequest,
+    ) -> SessionConsumerResponse {
+        let deadline = match self.operation_deadline() {
+            Ok(deadline) => deadline,
+            Err(rejection) => return SessionConsumerResponse::Rejected(rejection),
+        };
+        let admission = match self
+            .store
+            .admit_consumer_scope(request.scope(), deadline)
+            .await
+        {
+            Ok(admission) => admission,
+            Err(rejection) => return SessionConsumerResponse::Rejected(rejection),
+        };
+        if let Err(rejection) = request.validate() {
+            return SessionConsumerResponse::Rejected(rejection);
+        }
+        let operation = request.operation().clone();
+        if Self::operation_mutates(&operation) {
+            // Mutation authority is reacquired and scope-checked inside the
+            // leader topology gate. Do not retain this first detector guard
+            // while entering that path: Tokio's fair RwLock would otherwise
+            // allow a queued writer to self-block this consumer request.
+            drop(admission);
+            if let SessionConsumerOperation::Batch { ops } = &operation {
+                if !self.batch_response_is_admitted(ops) {
+                    return SessionConsumerResponse::Batch(Err(
+                        SessionConsumerStoreError::PayloadTooLarge,
+                    ));
+                }
+            }
+            if let Err(error) = self
+                .bind_consumer_request(identity, &request, deadline)
+                .await
+            {
+                return Self::binding_failure_response(&operation, error);
+            }
+            return match operation {
+                SessionConsumerOperation::CompareAndSet { op } => {
+                    let result = self
+                        .submit_consumer_intent(
+                            identity,
+                            &request,
+                            0,
+                            SessionMutationIntent::CompareAndSet(op),
+                            deadline,
+                        )
+                        .await
+                        .and_then(|response| match response.result? {
+                            SessionMutationOutcome::CompareAndSet(result) => Ok(result),
+                            _ => Err(StoreError::CasIdempotencyOutcomeUnavailable),
+                        });
+                    if consumer_mutation_unknown(&result) {
+                        SessionConsumerResponse::OutcomeUnknown(
+                            SessionConsumerOutcomeUnknown::Mutation,
+                        )
+                    } else {
+                        SessionConsumerResponse::CompareAndSet(
+                            result.map_err(SessionConsumerStoreError::from),
+                        )
+                    }
+                }
+                SessionConsumerOperation::DeleteFenced { lease } => {
+                    let result = self
+                        .submit_consumer_intent(
+                            identity,
+                            &request,
+                            0,
+                            SessionMutationIntent::DeleteFenced(lease),
+                            deadline,
+                        )
+                        .await
+                        .and_then(|response| match response.result? {
+                            SessionMutationOutcome::Unit => Ok(()),
+                            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+                        });
+                    if consumer_mutation_unknown(&result) {
+                        SessionConsumerResponse::OutcomeUnknown(
+                            SessionConsumerOutcomeUnknown::Mutation,
+                        )
+                    } else {
+                        SessionConsumerResponse::DeleteFenced(
+                            result.map_err(SessionConsumerStoreError::from),
+                        )
+                    }
+                }
+                SessionConsumerOperation::RefreshTtl { lease, ttl } => {
+                    let result = self
+                        .submit_consumer_intent(
+                            identity,
+                            &request,
+                            0,
+                            SessionMutationIntent::RefreshTtl { lease, ttl },
+                            deadline,
+                        )
+                        .await
+                        .and_then(|response| match response.result? {
+                            SessionMutationOutcome::Unit => Ok(()),
+                            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+                        });
+                    if consumer_mutation_unknown(&result) {
+                        SessionConsumerResponse::OutcomeUnknown(
+                            SessionConsumerOutcomeUnknown::Mutation,
+                        )
+                    } else {
+                        SessionConsumerResponse::RefreshTtl(
+                            result.map_err(SessionConsumerStoreError::from),
+                        )
+                    }
+                }
+                SessionConsumerOperation::Batch { ops } => {
+                    self.execute_batch(identity, &request, deadline, ops).await
+                }
+                SessionConsumerOperation::AcquireLease { key, owner, ttl } => {
+                    let result = self
+                        .submit_consumer_intent(
+                            identity,
+                            &request,
+                            0,
+                            SessionMutationIntent::AcquireLease { key, owner, ttl },
+                            deadline,
+                        )
+                        .await
+                        .and_then(|response| match response.result? {
+                            SessionMutationOutcome::Lease(lease) => Ok(lease),
+                            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+                        })
+                        .map_err(LeaseError::from);
+                    if matches!(result, Err(LeaseError::OperationOutcomeUnavailable)) {
+                        SessionConsumerResponse::OutcomeUnknown(
+                            SessionConsumerOutcomeUnknown::Lease,
+                        )
+                    } else {
+                        SessionConsumerResponse::AcquireLease(
+                            result.map_err(crate::SessionConsumerLeaseError::from),
+                        )
+                    }
+                }
+                SessionConsumerOperation::RenewLease { lease, ttl } => {
+                    let result = self
+                        .submit_consumer_intent(
+                            identity,
+                            &request,
+                            0,
+                            SessionMutationIntent::RenewLease { lease, ttl },
+                            deadline,
+                        )
+                        .await
+                        .and_then(|response| match response.result? {
+                            SessionMutationOutcome::Lease(lease) => Ok(lease),
+                            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+                        })
+                        .map_err(LeaseError::from);
+                    if matches!(result, Err(LeaseError::OperationOutcomeUnavailable)) {
+                        SessionConsumerResponse::OutcomeUnknown(
+                            SessionConsumerOutcomeUnknown::Lease,
+                        )
+                    } else {
+                        SessionConsumerResponse::RenewLease(
+                            result.map_err(crate::SessionConsumerLeaseError::from),
+                        )
+                    }
+                }
+                SessionConsumerOperation::ReleaseLease { lease } => {
+                    let result = self
+                        .submit_consumer_intent(
+                            identity,
+                            &request,
+                            0,
+                            SessionMutationIntent::ReleaseLease(lease),
+                            deadline,
+                        )
+                        .await
+                        .and_then(|response| match response.result? {
+                            SessionMutationOutcome::Unit => Ok(()),
+                            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+                        })
+                        .map_err(LeaseError::from);
+                    if matches!(result, Err(LeaseError::OperationOutcomeUnavailable)) {
+                        SessionConsumerResponse::OutcomeUnknown(
+                            SessionConsumerOutcomeUnknown::Lease,
+                        )
+                    } else {
+                        SessionConsumerResponse::ReleaseLease(
+                            result.map_err(crate::SessionConsumerLeaseError::from),
+                        )
+                    }
+                }
+                _ => unreachable!("mutation classifier and operation variant disagree"),
+            };
+        }
+
+        match operation {
+            SessionConsumerOperation::Capabilities => {
+                SessionConsumerResponse::Capabilities(self.store.capabilities().await)
+            }
+            SessionConsumerOperation::Get { key } => {
+                drop(admission);
+                SessionConsumerResponse::Get(
+                    self.store
+                        .consumer_get(request.scope(), &key, deadline)
+                        .await
+                        .map_err(SessionConsumerStoreError::from),
+                )
+            }
+            SessionConsumerOperation::PreflightRecordExpiry { preflights } => {
+                drop(admission);
+                SessionConsumerResponse::PreflightRecordExpiry(
+                    self.store
+                        .consumer_preflight_record_expiry(request.scope(), &preflights, deadline)
+                        .await
+                        .map_err(SessionConsumerStoreError::from),
+                )
+            }
+            SessionConsumerOperation::CompareAndSet { .. }
+            | SessionConsumerOperation::DeleteFenced { .. }
+            | SessionConsumerOperation::RefreshTtl { .. }
+            | SessionConsumerOperation::Batch { .. }
+            | SessionConsumerOperation::AcquireLease { .. }
+            | SessionConsumerOperation::RenewLease { .. }
+            | SessionConsumerOperation::ReleaseLease { .. } => {
+                unreachable!("mutation classifier and operation variant disagree")
+            }
+            SessionConsumerOperation::ScanRestoreRecords { request: scan } => {
+                drop(admission);
+                SessionConsumerResponse::ScanRestoreRecords(
+                    self.store
+                        .consumer_scan_restore_records(request.scope(), scan, deadline)
+                        .await
+                        .map_err(SessionConsumerStoreError::from),
+                )
+            }
+            SessionConsumerOperation::Watch { .. } => SessionConsumerResponse::WatchOpened,
+        }
+    }
+
+    async fn watch(
+        &self,
+        _identity: &SessionConsumerIdentity,
+        scope: SessionConsumerScope,
+        start_sequence: u64,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+        SessionConsumerRejection,
+    > {
+        let deadline = self.operation_deadline()?;
+        let admission = self.store.admit_consumer_scope(scope, deadline).await?;
+        drop(admission);
+        self.store
+            .consumer_watch(scope, start_sequence, deadline)
+            .await
+            .map_err(|error| match error {
+                StoreError::TopologyAuthorityRevoked => SessionConsumerRejection::ScopeMismatch,
+                _ => SessionConsumerRejection::Unavailable,
+            })
+    }
+}
+
 #[async_trait]
 impl SessionBackend for ConsensusSessionStore {
     fn restore_scan_cursor_profile(&self) -> Option<crate::RestoreScanCursorProfile> {
@@ -2442,7 +3354,7 @@ impl SessionBackend for ConsensusSessionStore {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
-        self.preflight_record_expiry_before(preflights, deadline)
+        self.preflight_record_expiry_before(preflights, None, deadline)
             .await
     }
 
@@ -2518,7 +3430,7 @@ impl SessionBackend for ConsensusSessionStore {
             .checked_add(self.inner.operation_timeout)
             .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
         let logical_time =
-            tokio::time::timeout_at(deadline, self.logical_read_time_before(deadline))
+            tokio::time::timeout_at(deadline, self.logical_read_time_before(None, deadline))
                 .await
                 .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)??;
         self.inner
@@ -2651,6 +3563,7 @@ mod membership_tests {
     use std::sync::Mutex;
 
     use bytes::Bytes;
+    use futures_util::StreamExt;
     use opc_consensus::engine::{CommittedLeaderId, Membership};
     use opc_consensus::{
         derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
@@ -2827,21 +3740,36 @@ mod membership_tests {
             expires_at: None,
             payload: EncryptedSessionPayload::new(b"must-not-cross-preflight"),
         });
+        let required_scope = SessionConsensusIdentity::new(
+            crate::SessionConsensusClusterId::from_bytes([0x31; 32]),
+            crate::SessionConsensusConfigurationId::from_bytes([0x32; 32]),
+            SessionConsensusConfigurationEpoch::new(7).expect("consumer scope epoch"),
+        );
         let exact = ForwardRequest::RecordExpiryPreflight {
             preflights: BoundedRecordExpiryPreflights::try_from_slice(&vec![
                 descriptor;
                 MAX_RECORD_EXPIRY_PREFLIGHTS
             ])
             .expect("exact bound"),
+            required_consumer_scope: ForwardConsumerScope::Consumer(Box::new(required_scope)),
         };
         let mut encoded = serde_json::to_value(exact).expect("encode exact preflight");
         let decoded: ForwardRequest =
             serde_json::from_value(encoded.clone()).expect("decode exact preflight");
         assert!(matches!(
             decoded,
-            ForwardRequest::RecordExpiryPreflight { preflights }
-                if preflights.0.len() == MAX_RECORD_EXPIRY_PREFLIGHTS
+            ForwardRequest::RecordExpiryPreflight {
+                preflights,
+                required_consumer_scope: ForwardConsumerScope::Consumer(scope),
+            } if preflights.0.len() == MAX_RECORD_EXPIRY_PREFLIGHTS
+                && *scope == required_scope
         ));
+        let mut missing_scope = encoded.clone();
+        missing_scope["RecordExpiryPreflight"]
+            .as_object_mut()
+            .expect("forwarded preflight object")
+            .remove("required_consumer_scope");
+        assert!(serde_json::from_value::<ForwardRequest>(missing_scope).is_err());
         let rendered = encoded.to_string();
         for forbidden in ["stable_id", "payload", "owner", "generation", "fence"] {
             assert!(!rendered.contains(forbidden));
@@ -3143,6 +4071,7 @@ mod membership_tests {
                 ForwardMutationRequest {
                     request_id: SessionConsensusRequestId::new(),
                     intent: SessionMutationIntent::AdvanceLogicalTime,
+                    required_consumer_scope: ForwardConsumerScope::Internal,
                 },
                 store.inner.local_node_id,
                 deadline,
@@ -3171,6 +4100,148 @@ mod membership_tests {
             initialized.recovery_progress().state(),
             DurableRecoveryState::Synchronized
         );
+    }
+
+    #[tokio::test]
+    async fn forwarded_consumer_scope_is_rechecked_inside_the_leader_topology_gate() {
+        let directory = tempfile::tempdir().expect("consumer scope gate directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("consumer scope gate SQLite backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open singleton consumer scope gate store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize singleton consumer scope gate store");
+
+        let current = store
+            .consumer_scope()
+            .expect("current admitted consumer scope")
+            .consensus_identity();
+        let stale_scope = SessionConsensusIdentity::new(
+            current.cluster_id(),
+            current.configuration_id(),
+            SessionConsensusConfigurationEpoch::new(current.configuration_epoch().get() + 1)
+                .expect("successor configuration epoch"),
+        );
+        let response = store
+            .apply_on_local_leader(
+                ForwardMutationRequest {
+                    request_id: SessionConsensusRequestId::new(),
+                    intent: SessionMutationIntent::AdvanceLogicalTime,
+                    required_consumer_scope: ForwardConsumerScope::Consumer(Box::new(stale_scope)),
+                },
+                store.inner.local_node_id,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+        assert!(matches!(
+            response,
+            ForwardMutationReply::Applied(response)
+                if response.result == Err(StoreError::TopologyAuthorityRevoked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn typed_consumer_service_deduplicates_and_fences_competing_leases() {
+        let directory = tempfile::tempdir().expect("consumer service directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("consumer service SQLite backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open singleton consumer service store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize singleton consumer service store");
+
+        let scope = store.consumer_scope().expect("current admitted scope");
+        let key = SessionKey {
+            tenant: TenantId::new("consumer-service").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"lease-race")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let first_identity = SessionConsumerIdentity::new("spiffe://test.example/consumer/first")
+            .expect("first consumer identity");
+        let second_identity = SessionConsumerIdentity::new("spiffe://test.example/consumer/second")
+            .expect("second consumer identity");
+        let first_request = SessionConsumerRequest::new(
+            scope,
+            crate::SessionConsumerRequestId::from_bytes([1; 16]),
+            SessionConsumerOperation::AcquireLease {
+                key: key.clone(),
+                owner: OwnerId::new("consumer-first").expect("first owner"),
+                ttl: Duration::from_secs(30),
+            },
+        );
+        let second_request = SessionConsumerRequest::new(
+            scope,
+            crate::SessionConsumerRequestId::from_bytes([2; 16]),
+            SessionConsumerOperation::AcquireLease {
+                key,
+                owner: OwnerId::new("consumer-second").expect("second owner"),
+                ttl: Duration::from_secs(30),
+            },
+        );
+        let service = store.consumer_service();
+        let (first, second) = tokio::join!(
+            service.execute(&first_identity, first_request.clone()),
+            service.execute(&second_identity, second_request),
+        );
+        assert_eq!(
+            [first.clone(), second.clone()]
+                .into_iter()
+                .filter(|response| {
+                    matches!(response, SessionConsumerResponse::AcquireLease(Ok(_)))
+                })
+                .count(),
+            1,
+            "the consumer boundary must preserve a single fenced winner"
+        );
+        assert_eq!(
+            [first.clone(), second.clone()]
+                .into_iter()
+                .filter(|response| {
+                    matches!(
+                        response,
+                        SessionConsumerResponse::AcquireLease(Err(
+                            crate::SessionConsumerLeaseError::AlreadyHeld
+                        ))
+                    )
+                })
+                .count(),
+            1,
+            "the loser must receive the normal quorum lease conflict"
+        );
+
+        let retry = service.execute(&first_identity, first_request).await;
+        if matches!(first, SessionConsumerResponse::AcquireLease(Ok(_))) {
+            assert_eq!(
+                retry, first,
+                "the durable request ID must deduplicate a retry"
+            );
+        } else {
+            assert!(matches!(
+                retry,
+                SessionConsumerResponse::AcquireLease(Err(
+                    crate::SessionConsumerLeaseError::AlreadyHeld
+                ))
+            ));
+        }
     }
 
     #[tokio::test]
@@ -3244,6 +4315,7 @@ mod membership_tests {
         let payload = encode_bounded(&ForwardRequest::Mutation(ForwardMutationRequest {
             request_id: SessionConsensusRequestId::new(),
             intent: forged_operator_recovery_intent(0xB2),
+            required_consumer_scope: ForwardConsumerScope::Internal,
         }))
         .expect("encode forged forwarded recovery request");
         let request = SessionConsensusWireRequest::try_new(

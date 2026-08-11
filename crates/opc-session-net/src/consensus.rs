@@ -2201,6 +2201,14 @@ pub struct SessionConsensusServerHandle {
 }
 
 impl SessionConsensusServerHandle {
+    /// Return whether the consensus listener accept task has terminated.
+    ///
+    /// This observes only the listener lifecycle. It does not claim quorum
+    /// health or consensus progress; callers must probe those separately.
+    pub fn is_finished(&self) -> bool {
+        self.accept_handle.is_finished()
+    }
+
     /// Schedule immediate cancellation of the listener and all connections.
     ///
     /// A handler that already queued cancellation-unsafe consensus work is not

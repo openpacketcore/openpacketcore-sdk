@@ -407,6 +407,14 @@ impl SessionTopologyCoordinatorState {
         Arc::clone(&self.operation_gate)
     }
 
+    pub(super) fn current_member_descriptors(
+        &self,
+        identity: SessionConsensusIdentity,
+    ) -> Option<BTreeMap<SessionConsensusNodeId, QuorumReplicaDescriptor>> {
+        let bindings = self.bindings.read().ok()?;
+        (bindings.current_identity == identity).then(|| bindings.current_descriptors.clone())
+    }
+
     pub(super) fn load_retained_transitions(
         &self,
         scope: &MembershipValidationScope,

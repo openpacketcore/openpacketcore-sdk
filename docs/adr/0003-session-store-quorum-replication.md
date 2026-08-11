@@ -109,10 +109,12 @@ sender, server profile, and fresh challenge. DNS/FQDN/IP aliases remain routing
 inputs only. The legacy writable backend protocol is not a production HA
 authority and is isolated behind an explicit compatibility surface.
 
-The exact consensus profile is transport/wire-schema revision 3 and error-set
-revision 5. Revision 3 adds the bounded topology-admission barrier family;
-error revision 5 adds `TopologyAuthorityRevoked`. Older profiles fail before
-engine dispatch and require a drained full-membership upgrade.
+The exact consensus profile is transport/wire-schema revision 4 and error-set
+revision 6. Revision 4 makes the forwarded consumer scope explicit, so a
+peer cannot silently downgrade a consumer-scoped operation to an internal
+call; error revision 6 binds that semantic boundary into the exact profile.
+Older profiles fail before engine dispatch and require a drained
+full-membership upgrade.
 
 Each directed peer retains a fixed primary/overflow pool of at most two
 authenticated connections after correlated validated successes or typed

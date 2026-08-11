@@ -32,7 +32,8 @@ use opc_redaction::metrics::{SecurityMetricsReader, METRICS};
 use opc_session_net::{
     ConnectionLifecyclePolicy, LocalReplicaBinding, RemoteAddrResolver, RemoteSessionConsensusPeer,
     SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
-    SessionConsensusServer, SessionConsensusServerHandle, SessionReauthenticationControl,
+    SessionConsensusServer, SessionConsensusServerHandle, SessionConsumerAuthorizer,
+    SessionQuorumConsumerServer, SessionQuorumConsumerServerHandle, SessionReauthenticationControl,
     SessionReplicationManifest,
 };
 use opc_session_store::{
@@ -43,9 +44,12 @@ use opc_session_store::{
     RestoreScanCursorProfile, RestoreScanRequest, RestoreScanScope, SessionBackend,
     SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
     SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
-    SessionLeaseManager, SessionOp, SessionOpResult, SqliteSessionBackend, StateClass, StateType,
-    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerChange,
+    SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerResponse,
+    SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
+    SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer, SqliteSessionBackend,
+    StateClass, StateType, StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
     qualification_key_bytes_sha256, qualification_owner_sha256, qualification_state_type_sha256,
@@ -321,6 +325,9 @@ struct QualificationNode {
     store: Arc<ConsensusSessionStore>,
     protected: ProtectedStore,
     server: Option<SessionConsensusServerHandle>,
+    consumer_server: Option<SessionQuorumConsumerServerHandle>,
+    consumer_transport: Option<QualificationConsumerTransport>,
+    consumer_outcome_unknown: Arc<AtomicBool>,
     transport: QualificationTransportRuntime,
     leases: HashMap<String, QualificationLease>,
     next_lease_retention_sequence: u64,
@@ -348,6 +355,55 @@ struct QualificationTrafficRuntime {
     mutation_task: Option<JoinHandle<Result<(), QualificationTrafficFailure>>>,
     watch_cancel: Option<oneshot::Sender<()>>,
     watch_task: Option<JoinHandle<Result<(), QualificationTrafficFailure>>>,
+}
+
+struct QualificationConsumerOutcomeUnknownService {
+    inner: Arc<dyn SessionQuorumConsumer>,
+    armed: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl SessionQuorumConsumer for QualificationConsumerOutcomeUnknownService {
+    async fn execute(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: SessionConsumerRequest,
+    ) -> SessionConsumerResponse {
+        let lease_mutation = matches!(
+            request.operation(),
+            SessionConsumerOperation::AcquireLease { .. }
+                | SessionConsumerOperation::RenewLease { .. }
+                | SessionConsumerOperation::ReleaseLease { .. }
+        );
+        let response = self.inner.execute(identity, request).await;
+        if lease_mutation
+            && matches!(
+                response,
+                SessionConsumerResponse::AcquireLease(Ok(_))
+                    | SessionConsumerResponse::RenewLease(Ok(_))
+                    | SessionConsumerResponse::ReleaseLease(Ok(()))
+            )
+            && self
+                .armed
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Lease);
+        }
+        response
+    }
+
+    async fn watch(
+        &self,
+        identity: &SessionConsumerIdentity,
+        scope: SessionConsumerScope,
+        start_sequence: u64,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+        SessionConsumerRejection,
+    > {
+        self.inner.watch(identity, scope, start_sequence).await
+    }
 }
 
 struct QualificationTrafficObservation {
@@ -690,6 +746,13 @@ struct QualificationProjectedMtlsServerTransport {
     reauthentication: SessionReauthenticationControl,
 }
 
+#[derive(Clone)]
+struct QualificationConsumerTransport {
+    server_config: AuthenticatedServerConfig,
+    lifecycle: ConnectionLifecyclePolicy,
+    reauthentication: SessionReauthenticationControl,
+}
+
 impl QualificationNode {
     async fn open(
         config: &QualificationNodeConfig,
@@ -785,6 +848,17 @@ impl QualificationNode {
                 inner: counting_handler,
                 gate: rpc_gate.clone(),
             });
+        let consumer_transport = match &server_transport {
+            #[cfg(feature = "foundation-insecure")]
+            QualificationServerTransport::FoundationPlaintext => None,
+            QualificationServerTransport::ProjectedMtls(transport) => {
+                Some(QualificationConsumerTransport {
+                    server_config: transport.server_config.clone(),
+                    lifecycle: transport.lifecycle,
+                    reauthentication: transport.reauthentication.clone(),
+                })
+            }
+        };
         let server = match server_transport {
             #[cfg(feature = "foundation-insecure")]
             QualificationServerTransport::FoundationPlaintext => {
@@ -824,6 +898,9 @@ impl QualificationNode {
             store,
             protected,
             server: Some(server),
+            consumer_server: None,
+            consumer_transport,
+            consumer_outcome_unknown: Arc::new(AtomicBool::new(false)),
             transport,
             leases: HashMap::new(),
             next_lease_retention_sequence: 1,
@@ -872,6 +949,19 @@ impl QualificationNode {
                 self.rpc_gate.set(availability);
                 QualificationNodeReply::ConsensusRpcAvailability {
                     availability: self.rpc_gate.availability(),
+                }
+            }
+            QualificationNodeCommand::StartStatelessConsumer {
+                consumer_identities,
+            } => self.start_stateless_consumer(consumer_identities).await,
+            QualificationNodeCommand::ArmStatelessConsumerOutcomeUnknown => {
+                if self.consumer_server.is_none() {
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                } else {
+                    self.consumer_outcome_unknown.store(true, Ordering::SeqCst);
+                    QualificationNodeReply::StatelessConsumerOutcomeUnknownArmed
                 }
             }
             QualificationNodeCommand::SecurityMetrics => QualificationNodeReply::SecurityMetrics {
@@ -1076,6 +1166,74 @@ impl QualificationNode {
                 QualificationNodeReply::LeaseHandleForgotten
             }
             QualificationNodeCommand::Shutdown => QualificationNodeReply::ShuttingDown,
+        }
+    }
+
+    async fn start_stateless_consumer(
+        &mut self,
+        consumer_identities: Vec<String>,
+    ) -> QualificationNodeReply {
+        if self.consumer_server.is_some() {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::InvalidRequest,
+            };
+        }
+        let Some(transport) = self.consumer_transport.as_ref() else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::InvalidRequest,
+            };
+        };
+        let manifest = match self.store.consumer_authorization_manifest().await {
+            Ok(manifest) => manifest,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::BackendUnavailable,
+                }
+            }
+        };
+        let scope = manifest.scope();
+        let identities = match consumer_identities
+            .into_iter()
+            .map(SpiffeId::new)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(identities) => identities,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::InvalidRequest,
+                }
+            }
+        };
+        let authorizer = match SessionConsumerAuthorizer::try_new(manifest, identities) {
+            Ok(authorizer) => authorizer,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::InvalidRequest,
+                }
+            }
+        };
+        let listener = SessionQuorumConsumerServer::new(
+            Arc::new(QualificationConsumerOutcomeUnknownService {
+                inner: Arc::new(self.store.consumer_service()),
+                armed: Arc::clone(&self.consumer_outcome_unknown),
+            }),
+            transport.server_config.clone(),
+            authorizer,
+        )
+        .with_max_connections(16)
+        .with_connection_lifecycle(transport.lifecycle)
+        .with_reauthentication_control(transport.reauthentication.clone());
+        match listener
+            .listen(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+        {
+            Ok((server, bind_addr)) => {
+                self.consumer_server = Some(server);
+                QualificationNodeReply::StatelessConsumerStarted { bind_addr, scope }
+            }
+            Err(_) => QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::BackendUnavailable,
+            },
         }
     }
 
@@ -2209,6 +2367,9 @@ impl QualificationNode {
             let _ = self.stop_traffic_watch().await;
         }
         if let Some(server) = self.server.take() {
+            server.abort_and_wait().await;
+        }
+        if let Some(server) = self.consumer_server.take() {
             server.abort_and_wait().await;
         }
     }
