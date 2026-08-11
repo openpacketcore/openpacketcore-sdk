@@ -67,16 +67,23 @@ XFRM policy, deployment defaults, or traffic-readiness policy.
   publication; foreign ownership conflicts and partial, mixed, or stale state
   is indeterminate. Native exact removal first publishes a SHA-256-bound
   metadata tombstone that the tc program rejects, removes only canonical rows
-  under the current authority, and removes the tombstone last. Retries prove
-  that exact fingerprint; they do not infer a complete classifier from a
-  surviving subset. This fingerprint is a consistency proof, not
+  under the current authority, and removes the tombstone last. Its durable
+  dense-rank cursor authorizes each active-row deletion before it occurs, so a
+  retry accepts only the exact remaining suffix plus any acknowledged-loss
+  rows in the authorized prefix; an unexplained missing row fails closed.
+  Retries also prove the exact fingerprint. This fingerprint is a consistency proof, not
   authentication against a privileged raw map writer. Native eBPF TFT
   adoption rejects partial pin graphs and promotes an all-zero schema marker
   only after both behavior-bearing maps are proven empty before hook mutation
   and rechecked empty immediately before publication. Native eBPF TFT
-  classifier ABI/schema v3 remains IPv4-only: IPv6 PAA, IPv6 components, and
-  flow-label filters are rejected before any map mutation. This contract does
-  not claim IPv6 native packet execution. Linux `gtp` and unsupported adapters
+  classifier ABI/schema v4 remains IPv4-only: filter-map keys include the
+  current owner and snapshot generations, and each value carries its dense
+  precedence rank. TC therefore finds only rows named by validated metadata;
+  exact userspace readback verifies the redundant value identity and rank.
+  This is a consistency boundary, not protection from a privileged actor that
+  can co-mutate raw maps. IPv6 PAA, IPv6 components, and flow-label filters
+  are rejected before any map mutation. This contract does not claim IPv6
+  native packet execution. Linux `gtp` and unsupported adapters
   fail closed as unsupported rather than simulate packet proof.
 - `GtpuError` is intentionally redaction-safe; TEIDs and addresses are not
   emitted by `Debug`/`Display`. A `BPF_PROG_LOAD` failure is reported as one of

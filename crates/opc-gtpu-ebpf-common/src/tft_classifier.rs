@@ -8,18 +8,25 @@
 //! A classifier has one metadata entry and bounded filter entries in each of
 //! two banks. Userspace writes and verifies every entry in the inactive bank,
 //! then replaces the metadata value in one map operation to publish the new
-//! bank. Every filter redundantly carries the opaque owner identity plus both
-//! generations. The tc program validates those fields on every lookup, so a
-//! stale, incomplete, or cross-owner record can only drop a packet. Exact
-//! removal first converts active metadata into a fingerprint-bound tombstone;
-//! tc rejects that canonical-but-inactive state while userspace removes the
-//! records and, last, the tombstone. This makes cleanup retryable without ever
-//! inferring a complete classifier from a surviving subset of filter rows.
+//! bank. Each filter-map key carries the opaque owner identity plus both
+//! generations, so tc constructs lookup keys from already validated metadata
+//! and stale or cross-snapshot rows are unfindable. A filter value retains the
+//! same fields for exact userspace readback and is bound to its dense key rank.
+//! That rank is the executable order derived from the validated, unique TFT
+//! precedence values before publication; the original precedence remains in
+//! the value for exact control-plane readback but does not drive tc execution.
+//! The publication/readback boundary validates that redundant value identity;
+//! it is a consistency boundary, not authentication against a privileged actor
+//! that can co-mutate raw maps. Exact removal first converts active metadata
+//! into a fingerprint-bound tombstone. A durable dense-rank cursor authorizes
+//! each active-row deletion before it occurs; tc rejects every tombstone while
+//! userspace removes the records and, last, the tombstone. This makes cleanup
+//! retryable without treating an unexplained missing active row as progress.
 
 use core::fmt;
 
 /// Current shared-SA TFT map ABI version.
-pub const TFT_CLASSIFIER_ABI_VERSION: u8 = 3;
+pub const TFT_CLASSIFIER_ABI_VERSION: u8 = 4;
 /// The only inner family executable by the current GTP-U tc forwarding path.
 pub const TFT_CLASSIFIER_FAMILY_IPV4: u8 = 4;
 /// Number of immutable filter banks per classifier.
@@ -65,7 +72,7 @@ pub const MAP_TFT_CLASSIFIER_COUNTERS: &str = "GTPU_TFT_DROP";
 pub const TFT_CLASSIFIER_SCHEMA_VALUE_LEN: usize = 16;
 /// Current schema marker for the additive IPv4-only classifier map graph.
 pub const TFT_CLASSIFIER_SCHEMA_MARKER_VALUE: [u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN] =
-    *b"OPC-TFT-IPv4-v3\0";
+    *b"OPC-TFT-IPv4-v4\0";
 /// Classifier metadata-map key width.
 pub const TFT_CLASSIFIER_KEY_LEN: usize = 8;
 /// Exact classifier fingerprint width.
@@ -73,7 +80,7 @@ pub const TFT_CLASSIFIER_FINGERPRINT_LEN: usize = 32;
 /// Classifier metadata-map value width.
 pub const TFT_CLASSIFIER_META_VALUE_LEN: usize = 72;
 /// Classifier filter-map key width.
-pub const TFT_CLASSIFIER_FILTER_KEY_LEN: usize = 12;
+pub const TFT_CLASSIFIER_FILTER_KEY_LEN: usize = 44;
 /// Classifier filter-map value width.
 pub const TFT_CLASSIFIER_FILTER_VALUE_LEN: usize = 72;
 
@@ -274,7 +281,8 @@ impl fmt::Debug for TftClassifierKey {
 /// exact removal.
 ///
 /// All multi-octet values are stored as explicit big-endian byte arrays. The
-/// last two bytes are explicit zero reservation rather than compiler padding.
+/// last two bytes are a removal-only progress cursor rather than compiler
+/// padding. Active selectors require that cursor to be zero.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct TftClassifierMeta {
@@ -287,7 +295,7 @@ pub struct TftClassifierMeta {
     snapshot_generation: [u8; 8],
     filter_count: [u8; 2],
     classifier_fingerprint: [u8; TFT_CLASSIFIER_FINGERPRINT_LEN],
-    reserved: [u8; 2],
+    removal_progress: [u8; 2],
 }
 
 impl TftClassifierMeta {
@@ -325,7 +333,7 @@ impl TftClassifierMeta {
             snapshot_generation: snapshot_generation.to_be_bytes(),
             filter_count: filter_count.to_be_bytes(),
             classifier_fingerprint,
-            reserved: [0; 2],
+            removal_progress: [0; 2],
         })
     }
 
@@ -340,6 +348,27 @@ impl TftClassifierMeta {
             return None;
         }
         self.flags |= META_FLAG_REMOVING;
+        Some(self)
+    }
+
+    /// Return the number of leading dense ranks durably authorized for
+    /// deletion by this removal fence.
+    ///
+    /// Rows below this cursor may still be present after a failed deletion or
+    /// may already be absent after acknowledgement loss. Rows at and above the
+    /// cursor must remain exact until their deletion is authorized in turn.
+    #[must_use]
+    pub const fn removal_progress(&self) -> u16 {
+        u16::from_be_bytes(self.removal_progress)
+    }
+
+    /// Durably authorize deletion of the next dense active-bank rank.
+    #[must_use]
+    pub const fn advance_removal_progress(mut self) -> Option<Self> {
+        if !self.is_valid_removal_fence() || self.removal_progress() >= self.filter_count() {
+            return None;
+        }
+        self.removal_progress = (self.removal_progress() + 1).to_be_bytes();
         Some(self)
     }
 
@@ -414,7 +443,11 @@ impl TftClassifierMeta {
             && self.filter_count() as usize <= TFT_CLASSIFIER_MAX_FILTERS
             && (self.has_default() || self.filter_count() != 0)
             && !bytes_are_zero(&self.classifier_fingerprint)
-            && bytes_are_zero(&self.reserved)
+            && if self.is_removing() {
+                self.removal_progress() <= self.filter_count()
+            } else {
+                self.removal_progress() == 0
+            }
     }
 
     /// Encode this canonical metadata record for byte-array BPF map I/O.
@@ -491,8 +524,8 @@ impl TftClassifierMeta {
             self.classifier_fingerprint[29],
             self.classifier_fingerprint[30],
             self.classifier_fingerprint[31],
-            self.reserved[0],
-            self.reserved[1],
+            self.removal_progress[0],
+            self.removal_progress[1],
         ]
     }
 
@@ -525,7 +558,7 @@ impl TftClassifierMeta {
                 value[59], value[60], value[61], value[62], value[63], value[64], value[65],
                 value[66], value[67], value[68], value[69],
             ],
-            reserved: [value[70], value[71]],
+            removal_progress: [value[70], value[71]],
         };
         if decoded.is_canonical() {
             Some(decoded)
@@ -547,6 +580,7 @@ impl fmt::Debug for TftClassifierMeta {
             .field("snapshot_generation", &"<redacted>")
             .field("filter_count", &self.filter_count())
             .field("removing", &self.is_removing())
+            .field("removal_progress", &self.removal_progress())
             .field("classifier_fingerprint", &"<redacted>")
             .finish()
     }
@@ -560,15 +594,27 @@ pub struct TftClassifierFilterKey {
     bank: u8,
     reserved: u8,
     filter_index: [u8; 2],
+    owner: [u8; 16],
+    owner_generation: [u8; 8],
+    snapshot_generation: [u8; 8],
 }
 
 impl TftClassifierFilterKey {
     /// Construct an exact filter-map key.
     #[must_use]
-    pub const fn new(classifier: TftClassifierKey, bank: u8, filter_index: u16) -> Option<Self> {
+    pub const fn new(
+        classifier: TftClassifierKey,
+        bank: u8,
+        filter_index: u16,
+        owner: TftClassifierOwnerId,
+        owner_generation: u64,
+        snapshot_generation: u64,
+    ) -> Option<Self> {
         if !classifier.is_valid()
             || bank >= TFT_CLASSIFIER_BANKS
             || filter_index as usize >= TFT_CLASSIFIER_MAX_FILTERS
+            || owner_generation == 0
+            || snapshot_generation == 0
         {
             None
         } else {
@@ -577,8 +623,59 @@ impl TftClassifierFilterKey {
                 bank,
                 reserved: 0,
                 filter_index: filter_index.to_be_bytes(),
+                owner: owner.into_bytes(),
+                owner_generation: owner_generation.to_be_bytes(),
+                snapshot_generation: snapshot_generation.to_be_bytes(),
             })
         }
+    }
+
+    /// Construct the key for a canonical filter record.
+    #[must_use]
+    pub const fn for_filter(
+        classifier: TftClassifierKey,
+        bank: u8,
+        filter_index: u16,
+        filter: &TftClassifierFilter,
+    ) -> Option<Self> {
+        let Some(owner) = filter.owner() else {
+            return None;
+        };
+        Self::new(
+            classifier,
+            bank,
+            filter_index,
+            owner,
+            filter.owner_generation(),
+            filter.snapshot_generation(),
+        )
+    }
+
+    /// Construct one lookup key from metadata that the caller has already
+    /// proven canonical. This avoids re-scanning owner bytes in every
+    /// `bpf_loop` callback; the metadata validation is the required
+    /// precondition.
+    #[must_use]
+    pub const fn from_validated_meta(
+        classifier: TftClassifierKey,
+        meta: &TftClassifierMeta,
+        filter_index: u16,
+    ) -> Option<Self> {
+        if !classifier.is_valid()
+            || meta.active_bank >= TFT_CLASSIFIER_BANKS
+            || filter_index as usize >= TFT_CLASSIFIER_MAX_FILTERS
+        {
+            return None;
+        }
+        Some(Self {
+            classifier,
+            bank: meta.active_bank,
+            reserved: 0,
+            filter_index: filter_index.to_be_bytes(),
+            owner: meta.owner,
+            owner_generation: meta.owner_generation,
+            snapshot_generation: meta.snapshot_generation,
+        })
     }
 
     /// Return the owning classifier key.
@@ -599,6 +696,32 @@ impl TftClassifierFilterKey {
         u16::from_be_bytes(self.filter_index)
     }
 
+    /// Return the opaque owner identity carried in this key.
+    #[must_use]
+    pub const fn owner(self) -> Option<TftClassifierOwnerId> {
+        TftClassifierOwnerId::new(self.owner)
+    }
+
+    /// Return the nonzero owner generation carried in this key.
+    #[must_use]
+    pub const fn owner_generation(self) -> u64 {
+        u64::from_be_bytes(self.owner_generation)
+    }
+
+    /// Return the nonzero snapshot generation carried in this key.
+    #[must_use]
+    pub const fn snapshot_generation(self) -> u64 {
+        u64::from_be_bytes(self.snapshot_generation)
+    }
+
+    /// Return whether this key binds exactly `filter`'s retained identity.
+    #[must_use]
+    pub const fn matches_filter(self, filter: &TftClassifierFilter) -> bool {
+        bytes_equal(&self.owner, &filter.owner)
+            && bytes_equal(&self.owner_generation, &filter.owner_generation)
+            && bytes_equal(&self.snapshot_generation, &filter.snapshot_generation)
+    }
+
     /// Return whether every field is canonical.
     #[must_use]
     pub const fn is_valid(self) -> bool {
@@ -606,6 +729,9 @@ impl TftClassifierFilterKey {
             && self.bank < TFT_CLASSIFIER_BANKS
             && self.reserved == 0
             && (self.filter_index() as usize) < TFT_CLASSIFIER_MAX_FILTERS
+            && !bytes_are_zero(&self.owner)
+            && self.owner_generation() != 0
+            && self.snapshot_generation() != 0
     }
 
     /// Encode this canonical filter key for byte-array BPF map I/O.
@@ -625,6 +751,38 @@ impl TftClassifierFilterKey {
             self.reserved,
             self.filter_index[0],
             self.filter_index[1],
+            self.owner[0],
+            self.owner[1],
+            self.owner[2],
+            self.owner[3],
+            self.owner[4],
+            self.owner[5],
+            self.owner[6],
+            self.owner[7],
+            self.owner[8],
+            self.owner[9],
+            self.owner[10],
+            self.owner[11],
+            self.owner[12],
+            self.owner[13],
+            self.owner[14],
+            self.owner[15],
+            self.owner_generation[0],
+            self.owner_generation[1],
+            self.owner_generation[2],
+            self.owner_generation[3],
+            self.owner_generation[4],
+            self.owner_generation[5],
+            self.owner_generation[6],
+            self.owner_generation[7],
+            self.snapshot_generation[0],
+            self.snapshot_generation[1],
+            self.snapshot_generation[2],
+            self.snapshot_generation[3],
+            self.snapshot_generation[4],
+            self.snapshot_generation[5],
+            self.snapshot_generation[6],
+            self.snapshot_generation[7],
         ]
     }
 
@@ -642,6 +800,19 @@ impl TftClassifierFilterKey {
             bank: value[8],
             reserved: value[9],
             filter_index: [value[10], value[11]],
+            owner: [
+                value[12], value[13], value[14], value[15], value[16], value[17], value[18],
+                value[19], value[20], value[21], value[22], value[23], value[24], value[25],
+                value[26], value[27],
+            ],
+            owner_generation: [
+                value[28], value[29], value[30], value[31], value[32], value[33], value[34],
+                value[35],
+            ],
+            snapshot_generation: [
+                value[36], value[37], value[38], value[39], value[40], value[41], value[42],
+                value[43],
+            ],
         };
         if decoded.is_valid() {
             Some(decoded)
@@ -657,6 +828,9 @@ impl fmt::Debug for TftClassifierFilterKey {
             .field("classifier", &self.classifier)
             .field("bank", &self.bank)
             .field("filter_index", &self.filter_index())
+            .field("owner", &"<redacted>")
+            .field("owner_generation", &"<redacted>")
+            .field("snapshot_generation", &"<redacted>")
             .finish()
     }
 }
@@ -832,7 +1006,7 @@ pub struct TftClassifierFilter {
     evaluation_precedence: u8,
     flags: u8,
     semantics: u8,
-    reserved0: u8,
+    dense_rank: u8,
     bearer_mark: [u8; 4],
     local_address: [u8; 4],
     local_mask: [u8; 4],
@@ -1004,7 +1178,7 @@ impl TftClassifierFilter {
             evaluation_precedence,
             flags,
             semantics,
-            reserved0: 0,
+            dense_rank: 0,
             bearer_mark: bearer_mark.to_be_bytes(),
             local_address,
             local_mask,
@@ -1026,6 +1200,22 @@ impl TftClassifierFilter {
     #[must_use]
     pub const fn evaluation_precedence(&self) -> u8 {
         self.evaluation_precedence
+    }
+
+    /// Return this record's dense active-bank rank.
+    #[must_use]
+    pub const fn dense_rank(&self) -> u8 {
+        self.dense_rank
+    }
+
+    /// Bind a canonical record to its dense active-bank rank.
+    #[must_use]
+    pub const fn with_dense_rank(mut self, dense_rank: u8) -> Option<Self> {
+        if !self.is_valid() {
+            return None;
+        }
+        self.dense_rank = dense_rank;
+        Some(self)
     }
 
     /// Return the original four-bit packet-filter identifier.
@@ -1155,7 +1345,7 @@ impl TftClassifierFilter {
         value[32] = self.evaluation_precedence;
         value[33] = self.flags;
         value[34] = self.semantics;
-        value[35] = self.reserved0;
+        value[35] = self.dense_rank;
         value[36..40].copy_from_slice(&self.bearer_mark);
         value[40..44].copy_from_slice(&self.local_address);
         value[44..48].copy_from_slice(&self.local_mask);
@@ -1209,7 +1399,7 @@ impl TftClassifierFilter {
             evaluation_precedence: value[32],
             flags: value[33],
             semantics: value[34],
-            reserved0: value[35],
+            dense_rank: value[35],
             bearer_mark,
             local_address,
             local_mask,
@@ -1241,7 +1431,6 @@ impl TftClassifierFilter {
             && self.owner_generation() != 0
             && self.snapshot_generation() != 0
             && self.bearer_mark() != 0
-            && self.reserved0 == 0
             && self.reserved1 == 0
             && TftClassifierFilterDirection::from_semantics(self.semantics).is_some()
             && self.port_forms_are_canonical()
@@ -1258,6 +1447,28 @@ impl TftClassifierFilter {
             && bytes_equal(&self.owner, &meta.owner)
             && bytes_equal(&self.owner_generation, &meta.owner_generation)
             && bytes_equal(&self.snapshot_generation, &meta.snapshot_generation)
+    }
+
+    /// Return whether this record is safe to execute at `dense_rank`.
+    ///
+    /// The filter-map key has already bound the lookup to the validated
+    /// metadata identity. The rank is the executable precedence order already
+    /// derived by the publisher. This deliberately omits the redundant
+    /// value-side identity and original-precedence checks, while retaining
+    /// every structural field that can affect packet forwarding. Exact
+    /// userspace readback still validates all redundant fields.
+    #[must_use]
+    pub const fn is_runtime_valid_at(&self, dense_rank: u8) -> bool {
+        self.flags & !FILTER_VALID_FLAGS == 0
+            && self.flags != 0
+            && self.bearer_mark() != 0
+            && self.dense_rank == dense_rank
+            && self.reserved1 == 0
+            && TftClassifierFilterDirection::from_semantics(self.semantics).is_some()
+            && self.port_forms_are_canonical()
+            && self.absent_fields_are_zero()
+            && self.present_ranges_are_canonical()
+            && !(self.has_esp_spi() && (self.has_local_port() || self.has_remote_port()))
     }
 
     const fn owner_generation(&self) -> u64 {
@@ -1603,8 +1814,11 @@ pub fn select_tft_classifier_ipv4(
         return TftClassifierSelection::PaaMismatch;
     }
     let mut previous_precedence = None;
-    for filter in filters {
-        if !filter.belongs_to(&meta) {
+    for (dense_rank, filter) in filters.iter().enumerate() {
+        let Ok(dense_rank) = u8::try_from(dense_rank) else {
+            return TftClassifierSelection::Invalid;
+        };
+        if !filter.belongs_to(&meta) || !filter.is_runtime_valid_at(dense_rank) {
             return TftClassifierSelection::Invalid;
         }
         let precedence = filter.evaluation_precedence();
@@ -1658,7 +1872,7 @@ pub const fn tft_classifier_schema_is_current(
         && value[11] == 0x34
         && value[12] == 0x2d
         && value[13] == 0x76
-        && value[14] == 0x33
+        && value[14] == 0x34
         && value[15] == 0
 }
 
@@ -1749,6 +1963,17 @@ mod tests {
         TftClassifierFilter::new(owner(), 8, 9, precedence, mark, spec).expect("synthetic filter")
     }
 
+    fn ranked_filter(
+        rank: u8,
+        precedence: u8,
+        mark: u32,
+        spec: TftClassifierIpv4FilterSpec,
+    ) -> TftClassifierFilter {
+        filter(precedence, mark, spec)
+            .with_dense_rank(rank)
+            .expect("synthetic filter rank is canonical")
+    }
+
     fn udp_packet(remote_port: u16) -> [u8; 28] {
         let mut packet = [0_u8; 28];
         packet[0] = 0x45;
@@ -1801,10 +2026,10 @@ mod tests {
                 .is_none()
         );
 
-        let final_key = TftClassifierFilterKey::new(key(), 1, full_count - 1)
+        let final_key = TftClassifierFilterKey::new(key(), 1, full_count - 1, owner(), 8, 9)
             .expect("the final complete-snapshot index is representable");
         assert_eq!(final_key.filter_index(), full_count - 1);
-        assert!(TftClassifierFilterKey::new(key(), 1, full_count).is_none());
+        assert!(TftClassifierFilterKey::new(key(), 1, full_count, owner(), 8, 9).is_none());
 
         let identifier_zero = TftClassifierFilter::new_with_semantics(
             owner(),
@@ -1828,7 +2053,6 @@ mod tests {
     #[test]
     fn byte_array_map_encodings_round_trip_and_reject_noncanonical_bytes() {
         let key = key();
-        let filter_key = TftClassifierFilterKey::new(key, 1, 0).expect("synthetic filter key");
         let metadata = meta(true, 1);
         let filter = filter(
             1,
@@ -1839,6 +2063,8 @@ mod tests {
                 ..TftClassifierIpv4FilterSpec::default()
             },
         );
+        let filter_key =
+            TftClassifierFilterKey::for_filter(key, 1, 0, &filter).expect("synthetic filter key");
         assert_eq!(TftClassifierKey::decode(key.encode()), Some(key));
         assert_eq!(
             TftClassifierFilterKey::decode(filter_key.encode()),
@@ -1846,6 +2072,11 @@ mod tests {
         );
         assert_eq!(TftClassifierMeta::decode(metadata.encode()), Some(metadata));
         assert_eq!(TftClassifierFilter::decode(filter.encode()), Some(filter));
+        let ranked = filter
+            .with_dense_rank(1)
+            .expect("canonical filter accepts a dense rank");
+        assert!(ranked.is_runtime_valid_at(1));
+        assert!(!ranked.is_runtime_valid_at(0));
 
         let mut malformed_key = key.encode();
         malformed_key[..4].fill(0);
@@ -1871,9 +2102,20 @@ mod tests {
         let removal_fence = metadata.removing().expect("active metadata can be fenced");
         assert!(removal_fence.is_valid_removal_fence());
         assert!(!removal_fence.is_valid());
+        assert_eq!(removal_fence.removal_progress(), 0);
         assert_eq!(
             TftClassifierMeta::decode(removal_fence.encode()),
             Some(removal_fence)
+        );
+        let progressed = removal_fence
+            .advance_removal_progress()
+            .expect("the sole filter deletion can be authorized");
+        assert_eq!(progressed.removal_progress(), 1);
+        assert!(progressed.is_valid_removal_fence());
+        assert!(progressed.advance_removal_progress().is_none());
+        assert_eq!(
+            TftClassifierMeta::decode(progressed.encode()),
+            Some(progressed)
         );
         let mut malformed_filter = filter.encode();
         malformed_filter[34] = 1;
@@ -1984,9 +2226,11 @@ mod tests {
         hostile[56..58].copy_from_slice(&40_000_u16.to_be_bytes());
         hostile[58..60].copy_from_slice(&40_001_u16.to_be_bytes());
         assert!(TftClassifierFilter::decode(hostile).is_none());
-        let mut hostile = single.encode();
-        hostile[35] = 1;
-        assert!(TftClassifierFilter::decode(hostile).is_none());
+        let mut ranked = single.encode();
+        ranked[35] = 1;
+        let ranked = TftClassifierFilter::decode(ranked).expect("dense rank is value data");
+        assert!(ranked.is_runtime_valid_at(1));
+        assert!(!ranked.is_runtime_valid_at(0));
     }
 
     #[test]
@@ -2016,7 +2260,8 @@ mod tests {
     #[test]
     fn selection_observes_lowest_precedence_default_and_no_match_drop() {
         let packet = TftClassifierIpv4Packet::parse(&udp_packet(443)).expect("valid UDP");
-        let broad = filter(
+        let broad = ranked_filter(
+            1,
             50,
             11,
             TftClassifierIpv4FilterSpec {
@@ -2024,7 +2269,8 @@ mod tests {
                 ..TftClassifierIpv4FilterSpec::default()
             },
         );
-        let narrow = filter(
+        let narrow = ranked_filter(
+            0,
             10,
             12,
             TftClassifierIpv4FilterSpec {
@@ -2174,7 +2420,9 @@ mod tests {
                 ..TftClassifierIpv4FilterSpec::default()
             },
         )
-        .expect("synthetic filter");
+        .expect("synthetic filter")
+        .with_dense_rank(1)
+        .expect("synthetic filter rank is canonical");
         assert_eq!(
             select_tft_classifier_ipv4(key(), meta(true, 2), &[valid, wrong_owner], packet),
             TftClassifierSelection::Invalid
@@ -2192,7 +2440,8 @@ mod tests {
                 ..TftClassifierIpv4FilterSpec::default()
             },
         );
-        let two = filter(
+        let two = ranked_filter(
+            1,
             3,
             12,
             TftClassifierIpv4FilterSpec {
@@ -2217,7 +2466,8 @@ mod tests {
                 ..TftClassifierIpv4FilterSpec::default()
             },
         );
-        let two = filter(
+        let two = ranked_filter(
+            1,
             3,
             12,
             TftClassifierIpv4FilterSpec {
@@ -2242,7 +2492,8 @@ mod tests {
                 ..TftClassifierIpv4FilterSpec::default()
             },
         );
-        let earlier = filter(
+        let earlier = ranked_filter(
+            1,
             10,
             12,
             TftClassifierIpv4FilterSpec {
@@ -2252,6 +2503,32 @@ mod tests {
         );
         assert_eq!(
             select_tft_classifier_ipv4(key(), meta(true, 2), &[later, earlier], packet),
+            TftClassifierSelection::Invalid
+        );
+    }
+
+    #[test]
+    fn duplicate_dense_rank_is_invalid_even_when_precedence_is_canonical() {
+        let packet = TftClassifierIpv4Packet::parse(&udp_packet(443)).expect("valid UDP");
+        let first = filter(
+            10,
+            11,
+            TftClassifierIpv4FilterSpec {
+                protocol: Some(17),
+                ..TftClassifierIpv4FilterSpec::default()
+            },
+        );
+        let second = filter(
+            50,
+            12,
+            TftClassifierIpv4FilterSpec {
+                remote_port: TftClassifierPortRange::new(443, 443),
+                ..TftClassifierIpv4FilterSpec::default()
+            },
+        );
+
+        assert_eq!(
+            select_tft_classifier_ipv4(key(), meta(true, 2), &[first, second], packet),
             TftClassifierSelection::Invalid
         );
     }

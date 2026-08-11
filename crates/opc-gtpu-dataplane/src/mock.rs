@@ -154,6 +154,7 @@ struct MockState {
     pdp_by_local: BTreeMap<MockLocalSelector, GtpPdpContext>,
     pdp_by_uplink: BTreeMap<MockUplinkSelector, GtpPdpContext>,
     pdp_fault: Option<MockPdpContextFault>,
+    tft_uplink_classification_capability: GtpuCapability,
     tft_classifiers: BTreeMap<(u32, std::net::IpAddr), TftUplinkClassifier>,
 }
 
@@ -199,6 +200,7 @@ impl MockGtpuDataplaneBackend {
                 pdp_by_local: BTreeMap::new(),
                 pdp_by_uplink: BTreeMap::new(),
                 pdp_fault: None,
+                tft_uplink_classification_capability: GtpuCapability::Available,
                 tft_classifiers: BTreeMap::new(),
             })),
         }
@@ -229,6 +231,15 @@ impl MockGtpuDataplaneBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.probe_result = probe_result;
+    }
+
+    /// Set the classifier capability reported and enforced by this mock.
+    pub fn set_tft_uplink_classification_capability(&self, capability: GtpuCapability) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.tft_uplink_classification_capability = capability;
     }
 
     /// Return all recorded operations, in order.
@@ -437,6 +448,18 @@ impl MockGtpuDataplaneBackend {
                 TftUplinkClassifierReadback::Present,
             )
     }
+
+    fn validate_tft_uplink_classifier_capability(
+        capability: GtpuCapability,
+    ) -> Result<(), GtpuError> {
+        if capability == GtpuCapability::Available {
+            Ok(())
+        } else {
+            Err(GtpuError::UnsupportedFeature {
+                feature: "tft_uplink_classification",
+            })
+        }
+    }
 }
 
 impl Default for MockGtpuDataplaneBackend {
@@ -448,7 +471,22 @@ impl Default for MockGtpuDataplaneBackend {
 #[async_trait]
 impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
     fn tft_uplink_classification_capability(&self) -> GtpuCapability {
-        GtpuCapability::Available
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.tft_uplink_classification_capability
+    }
+
+    fn validate_tft_uplink_classifier(
+        &self,
+        _desired: &TftUplinkClassifier,
+    ) -> Result<(), GtpuError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::validate_tft_uplink_classifier_capability(state.tft_uplink_classification_capability)
     }
 
     async fn read_tft_uplink_classifier(
@@ -492,6 +530,9 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::check_failure(&state)?;
+        Self::validate_tft_uplink_classifier_capability(
+            state.tft_uplink_classification_capability,
+        )?;
         if state.pdp_fault.is_some() {
             return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate);
         }
@@ -1220,6 +1261,7 @@ mod tests {
             backend.tft_uplink_classification_capability(),
             GtpuCapability::Available
         );
+        assert!(backend.validate_tft_uplink_classifier(&desired).is_ok());
         assert_eq!(
             backend
                 .reconcile_tft_uplink_classifier(desired.clone())
@@ -1295,6 +1337,35 @@ mod tests {
                 .unwrap(),
             TftUplinkClassifierRemovalOutcome::AlreadyAbsent
         );
+    }
+
+    #[tokio::test]
+    async fn mock_tft_classifier_validation_honors_configured_capability() {
+        let backend = MockGtpuDataplaneBackend::new();
+        let desired = TftUplinkClassifier::new(
+            7,
+            IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
+            vec![crate::TftUplinkBearer::default_bearer()],
+        )
+        .unwrap();
+        backend.set_tft_uplink_classification_capability(GtpuCapability::Missing);
+
+        assert_eq!(
+            backend.tft_uplink_classification_capability(),
+            GtpuCapability::Missing
+        );
+        assert!(matches!(
+            backend.validate_tft_uplink_classifier(&desired),
+            Err(GtpuError::UnsupportedFeature {
+                feature: "tft_uplink_classification"
+            })
+        ));
+        assert!(matches!(
+            backend.reconcile_tft_uplink_classifier(desired).await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "tft_uplink_classification"
+            })
+        ));
     }
 
     #[tokio::test]

@@ -234,12 +234,6 @@ const fn ipv4_owned_tft_fragment_is_unfragmented(fragment: u16) -> bool {
     fragment & IPV4_OWNED_TFT_FRAG_REJECT_MASK == 0
 }
 
-/// Require canonical strictly increasing precedence in active-bank index order.
-#[inline(always)]
-const fn tft_classifier_precedence_follows(previous: u8, has_previous: u8, current: u8) -> bool {
-    has_previous == 0 || current > previous
-}
-
 #[derive(Clone, Copy)]
 struct ParsedIpv6Downlink {
     ip_end: u32,
@@ -475,8 +469,6 @@ struct TftClassifierLoopContext {
     key: TftClassifierKey,
     meta: TftClassifierMeta,
     packet: TftClassifierIpv4Packet,
-    previous_precedence: u8,
-    has_previous_precedence: u8,
     matched: u8,
     invalid: u8,
     selected_mark: u32,
@@ -493,7 +485,7 @@ unsafe extern "C" fn classify_tft_filter_step(index: u64, context: *mut c_void) 
     // SAFETY: `classify_owned_tft_uplink` gives `bpf_loop` one live, uniquely
     // borrowed stack context for its synchronous invocation.
     let context = unsafe { &mut *context.cast::<TftClassifierLoopContext>() };
-    if context.invalid != 0 || index >= u64::from(context.meta.filter_count()) {
+    if context.invalid != 0 {
         return 1;
     }
     if index >= TFT_CLASSIFIER_MAX_FILTERS as u64 {
@@ -501,7 +493,7 @@ unsafe extern "C" fn classify_tft_filter_step(index: u64, context: *mut c_void) 
         return 1;
     }
     let Some(filter_key) =
-        TftClassifierFilterKey::new(context.key, context.meta.active_bank(), index as u16)
+        TftClassifierFilterKey::from_validated_meta(context.key, &context.meta, index as u16)
     else {
         context.invalid = 1;
         return 1;
@@ -510,27 +502,16 @@ unsafe extern "C" fn classify_tft_filter_step(index: u64, context: *mut c_void) 
         context.invalid = 1;
         return 1;
     };
-    // SAFETY: the map value remains valid for the callback invocation. A
-    // concurrent stale-bank cleanup can only make the lookup fail above,
-    // which this callback converts to an invalid fail-closed snapshot.
+    // SAFETY: the map value remains valid for the callback invocation. The
+    // lookup key binds the executable row to metadata's owner, generations,
+    // bank, and index. Userspace derives that dense index from strict TFT
+    // precedence before publication and exactly verifies the redundant value
+    // identity and original precedence during readback.
     let filter = unsafe { &*filter_ptr };
-    if !filter.belongs_to(&context.meta) {
+    if !filter.is_runtime_valid_at(index as u8) {
         context.invalid = 1;
         return 1;
     }
-    let precedence = filter.evaluation_precedence();
-    if !tft_classifier_precedence_follows(
-        context.previous_precedence,
-        context.has_previous_precedence,
-        precedence,
-    ) {
-        // A noncanonical index order is invalid irrespective of whether either
-        // filter matches this particular packet.
-        context.invalid = 1;
-        return 1;
-    }
-    context.previous_precedence = precedence;
-    context.has_previous_precedence = 1;
     if !tft_classifier_filter_matches(filter, &context.packet) {
         return 0;
     }
@@ -546,10 +527,10 @@ unsafe extern "C" fn classify_tft_filter_step(index: u64, context: *mut c_void) 
 ///
 /// Metadata is the only publication point. The publisher fills and reads back
 /// the inactive bank first, then atomically replaces this hash-map value. A
-/// reader observes either bank; every record in the observed bank must carry
-/// the same owner and generations as metadata. The old bank remains intact
-/// until a later pre-publication staging pass, so readers never race
-/// post-publication record cleanup.
+/// reader observes either bank and constructs every lookup key from that
+/// metadata's owner, generations, bank, and dense precedence rank. The old
+/// bank remains intact until a later pre-publication staging pass, so readers
+/// never race post-publication record cleanup.
 #[inline(never)]
 fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
     let Ok(local_address) = ctx.load::<[u8; 4]>(ETH_HDR_LEN + 12) else {
@@ -561,13 +542,13 @@ fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
     let Some(meta_ptr) = GTPU_TFT_META.get_ptr(&key) else {
         return TftClassifierUplinkResult::Absent;
     };
-    // SAFETY: hash-map values are retained by the kernel for this invocation;
-    // the all-byte ABI has alignment one and userspace publishes whole values.
-    let meta = unsafe { *meta_ptr };
     let Some(schema_ptr) = GTPU_TFT_SCHEMA.get_ptr(0) else {
         count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
         return TftClassifierUplinkResult::Drop;
     };
+    // SAFETY: hash-map values are retained by the kernel for this invocation;
+    // the all-byte ABI has alignment one and userspace publishes whole values.
+    let meta = unsafe { *meta_ptr };
     // SAFETY: the single-slot marker is read-only for this invocation.
     if !tft_classifier_schema_is_current(unsafe { &*schema_ptr }) || !meta.is_valid() {
         count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
@@ -581,8 +562,6 @@ fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
         key,
         meta,
         packet,
-        previous_precedence: 0,
-        has_previous_precedence: 0,
         matched: 0,
         invalid: 0,
         selected_mark: 0,
@@ -592,7 +571,7 @@ fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
     // call. Its fixed whole-classifier iteration bound matches the map ABI.
     let performed = unsafe {
         bpf_loop(
-            TFT_CLASSIFIER_MAX_FILTERS as u32,
+            u32::from(meta.filter_count()),
             classify_tft_filter_step as *mut c_void,
             (&mut loop_context as *mut TftClassifierLoopContext).cast(),
             0,
@@ -3095,15 +3074,6 @@ mod tests {
         assert!(!ipv4_owned_tft_fragment_is_unfragmented(0x8000));
         assert!(!ipv4_owned_tft_fragment_is_unfragmented(0x2000));
         assert!(!ipv4_owned_tft_fragment_is_unfragmented(0x0001));
-    }
-
-    #[test]
-    fn owned_tft_precedence_is_strictly_increasing_across_the_active_bank() {
-        assert!(tft_classifier_precedence_follows(0, 0, 0));
-        assert!(tft_classifier_precedence_follows(0, 1, 1));
-        assert!(tft_classifier_precedence_follows(127, 1, 255));
-        assert!(!tft_classifier_precedence_follows(127, 1, 127));
-        assert!(!tft_classifier_precedence_follows(128, 1, 127));
     }
 
     #[test]

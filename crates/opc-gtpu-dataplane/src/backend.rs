@@ -38,6 +38,20 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         GtpuCapability::Missing
     }
 
+    /// Validate whether one complete TFT classifier can be represented by this
+    /// backend without changing runtime state.
+    ///
+    /// Backends that do not explicitly implement this additive contract fail
+    /// closed, even when they implement other TFT classifier operations.
+    fn validate_tft_uplink_classifier(
+        &self,
+        _desired: &TftUplinkClassifier,
+    ) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "tft_uplink_classification",
+        })
+    }
+
     /// Read the exact desired/observed TFT classifier for one attachment/PAA.
     ///
     /// `Present` proves one complete classifier under this backend's authority.

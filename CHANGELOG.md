@@ -24,15 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrong-bearer state, while foreign ownership conflicts and partial, mixed, or
   stale state remains indeterminate. Native exact removal first publishes a
   SHA-256-bound, fail-closed metadata tombstone, removes only canonical records
-  under the current authority, and removes the tombstone last. A retry proves
-  the complete expected snapshot from its fingerprint rather than accepting a
-  surviving filter subset. The backend-neutral model retains IPv4/IPv6
+  under the current authority, and removes the tombstone last. A durable
+  dense-rank cursor authorizes each active-row deletion before it occurs, so a
+  retry distinguishes acknowledged cleanup progress from an unexplained
+  missing active row. The backend-neutral model retains IPv4/IPv6
   semantics. Native adoption rejects partial TFT pin graphs and promotes an
   all-zero schema marker only after both behavior-bearing maps are proven empty
   before hook mutation and rechecked empty immediately before publication.
-  Native eBPF TFT classifier ABI/schema v3 remains IPv4-only and rejects IPv6
-  PAA/components and flow-label filters before map writes. This increment does
-  not claim IPv6 native packet execution. Linux `gtp` and unsupported adapters
+  Native eBPF TFT classifier ABI/schema v4 remains IPv4-only. Metadata-bound
+  filter keys carry owner and generation identity, dense key rank is the
+  executable precedence order, and a durable removal cursor distinguishes an
+  authorized partial cleanup from an unexplained missing active row. IPv6
+  PAA/components and flow-label filters are rejected before map writes. This
+  increment does not claim IPv6 native packet execution. Linux `gtp` and unsupported adapters
   report the capability missing; no adapter claims host-model packet processing
   as dataplane evidence.
 - **Live-writer exact Linux PDP removal authority — `opc-gtpu-dataplane`:**
