@@ -1634,7 +1634,26 @@ pub fn select_tft_classifier_ipv4(
 pub const fn tft_classifier_schema_is_current(
     value: &[u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN],
 ) -> bool {
-    bytes_equal(value, &TFT_CLASSIFIER_SCHEMA_MARKER_VALUE)
+    // Keep this as scalar immediates. This predicate is linked into the eBPF
+    // classifier, where taking a reference to the marker array materializes
+    // an implicit read-only data map. The datapath identity deliberately
+    // permits only its complete, named, pinned map graph.
+    value[0] == 0x4f
+        && value[1] == 0x50
+        && value[2] == 0x43
+        && value[3] == 0x2d
+        && value[4] == 0x54
+        && value[5] == 0x46
+        && value[6] == 0x54
+        && value[7] == 0x2d
+        && value[8] == 0x49
+        && value[9] == 0x50
+        && value[10] == 0x76
+        && value[11] == 0x34
+        && value[12] == 0x2d
+        && value[13] == 0x76
+        && value[14] == 0x33
+        && value[15] == 0
 }
 
 const fn bytes_are_zero<const N: usize>(value: &[u8; N]) -> bool {
@@ -2283,8 +2302,13 @@ mod tests {
         assert!(tft_classifier_schema_is_current(
             &TFT_CLASSIFIER_SCHEMA_MARKER_VALUE
         ));
-        let mut wrong = TFT_CLASSIFIER_SCHEMA_MARKER_VALUE;
-        wrong[0] ^= 1;
-        assert!(!tft_classifier_schema_is_current(&wrong));
+        for index in 0..TFT_CLASSIFIER_SCHEMA_VALUE_LEN {
+            let mut wrong = TFT_CLASSIFIER_SCHEMA_MARKER_VALUE;
+            wrong[index] ^= 1;
+            assert!(
+                !tft_classifier_schema_is_current(&wrong),
+                "schema byte {index} must participate in the identity"
+            );
+        }
     }
 }

@@ -2430,6 +2430,25 @@ impl EbpfGtpuDataplaneBackend {
         }
     }
 
+    fn canonical_tft_inventory_for(
+        classifier: TftClassifierKey,
+        mut records: Vec<EbpfTftFilterRecord>,
+        operation: &'static str,
+    ) -> Result<Vec<EbpfTftFilterRecord>, GtpuError> {
+        let inventory_limit = usize::from(TFT_CLASSIFIER_BANKS) * TFT_CLASSIFIER_MAX_FILTERS;
+        if records.len() > inventory_limit
+            || records.iter().any(|(raw_key, raw_value)| {
+                TftClassifierFilterKey::decode(*raw_key)
+                    .is_none_or(|key| key.classifier() != classifier)
+                    || TftClassifierFilter::decode(*raw_value).is_none()
+            })
+        {
+            return Err(GtpuError::StateIndeterminate { operation });
+        }
+        records.sort_unstable_by_key(|(key, _)| *key);
+        Ok(records)
+    }
+
     fn stage_tft_inactive_bank_locked(
         &self,
         desired: &EncodedTftClassifier,
@@ -2444,17 +2463,33 @@ impl EbpfGtpuDataplaneBackend {
         } else {
             0
         };
-        let old_inactive = observed.map_or_else(Vec::new, |value| {
-            value
-                .records
-                .iter()
-                .filter_map(|(key, value)| {
-                    TftClassifierFilterKey::decode(*key)
-                        .filter(|key| key.bank() == inactive_bank)
-                        .map(|_| (*key, *value))
-                })
-                .collect()
-        });
+        let current_records = Self::canonical_tft_inventory_for(
+            desired.key,
+            self.inner
+                .runtime
+                .tft_filter_inventory(ifindex, desired.key.encode())?,
+            "ebpf_tft_stage",
+        )?;
+        let mut expected_current = observed.map_or_else(Vec::new, |value| value.records.clone());
+        expected_current.sort_unstable_by_key(|(key, _)| *key);
+        if current_records != expected_current {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_stage",
+            });
+        }
+        let mut retained_active = Vec::new();
+        let mut old_inactive = Vec::new();
+        for (raw_key, raw_value) in current_records {
+            let filter_key =
+                TftClassifierFilterKey::decode(raw_key).ok_or(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_stage",
+                })?;
+            if filter_key.bank() == inactive_bank {
+                old_inactive.push((raw_key, raw_value));
+            } else {
+                retained_active.push((raw_key, raw_value));
+            }
+        }
         for (_, raw_value) in &old_inactive {
             let Some(filter) = TftClassifierFilter::decode(*raw_value) else {
                 return Err(GtpuError::StateIndeterminate {
@@ -2516,20 +2551,16 @@ impl EbpfGtpuDataplaneBackend {
             self.inner.runtime.tft_filter_put(ifindex, key, value)?;
             expected.push((key, value));
         }
-        let mut staged_records = self
-            .inner
-            .runtime
-            .tft_filter_inventory(ifindex, desired.key.encode())?
-            .into_iter()
-            .filter_map(|(key, value)| {
-                TftClassifierFilterKey::decode(key)
-                    .filter(|key| key.bank() == inactive_bank)
-                    .map(|_| (key, value))
-            })
-            .collect::<Vec<_>>();
-        staged_records.sort_unstable_by_key(|(key, _)| *key);
-        expected.sort_unstable_by_key(|(key, _)| *key);
-        if staged_records != expected {
+        retained_active.append(&mut expected);
+        retained_active.sort_unstable_by_key(|(key, _)| *key);
+        let staged_records = Self::canonical_tft_inventory_for(
+            desired.key,
+            self.inner
+                .runtime
+                .tft_filter_inventory(ifindex, desired.key.encode())?,
+            "ebpf_tft_stage",
+        )?;
+        if staged_records != retained_active {
             return Err(GtpuError::StateIndeterminate {
                 operation: "ebpf_tft_stage",
             });
@@ -9050,6 +9081,36 @@ mod aya_runtime {
             Self::object_program_tags(object)
         }
 
+        fn current_artifact_tags_from(
+            bytes: &[u8],
+        ) -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError> {
+            let object = AyaObject::parse(bytes).map_err(|_| {
+                GtpuError::io(
+                    "ebpf_current_object_parse",
+                    invalid_data("current bpf object parse failed"),
+                )
+            })?;
+            if object.maps.len() != CURRENT_MAP_SPECS.len() {
+                return Err(state_indeterminate("ebpf_current_object_identity"));
+            }
+            for spec in CURRENT_MAP_SPECS {
+                let map = object
+                    .maps
+                    .get(spec.name)
+                    .ok_or_else(|| state_indeterminate("ebpf_current_object_identity"))?;
+                if map.map_type() != spec.map_type
+                    || map.key_size() != spec.key_size
+                    || map.value_size() != spec.value_size
+                    || map.max_entries() != spec.max_entries
+                    || map.map_flags() != 0
+                    || map.pinning() != PinningType::ByName
+                {
+                    return Err(state_indeterminate("ebpf_current_object_identity"));
+                }
+            }
+            Self::object_program_tags(object)
+        }
+
         /// Derive tag candidates for the frozen pre-bearer-mark generation.
         ///
         /// The object is classification evidence only. Its authentic counter
@@ -9210,12 +9271,8 @@ mod aya_runtime {
             static TAGS: OnceLock<Result<DatapathGenerationTags, ObjectTagFailure>> =
                 OnceLock::new();
             TAGS.get_or_init(|| {
-                let current = AyaObject::parse(DATAPATH_OBJECT)
-                    .map_err(|_| ObjectTagFailure::Parse("ebpf_current_object_identity"))
-                    .and_then(|object| {
-                        Self::object_program_tags(object)
-                            .map_err(object_identity_failure("ebpf_current_object_identity"))
-                    })?;
+                let current = Self::current_artifact_tags_from(DATAPATH_OBJECT)
+                    .map_err(object_identity_failure("ebpf_current_object_identity"))?;
                 let legacy_v1 = Self::legacy_v1_artifact_tags_from(LEGACY_V1_DATAPATH_OBJECT)
                     .map_err(object_identity_failure("ebpf_legacy_object_identity"))?;
                 let pre_redirect = pre_redirect_artifact::program_tags()
@@ -18556,6 +18613,18 @@ mod aya_runtime {
             println!("OPC_GTPU_LOAD_CAPABILITY_PROVEN");
         }
 
+        #[test]
+        fn current_object_has_exactly_the_named_pinned_map_graph() {
+            AyaGtpuRuntime::current_artifact_tags_from(DATAPATH_OBJECT)
+                .expect("current object must contain only its exact named pinned map graph");
+            let object = AyaObject::parse(DATAPATH_OBJECT).expect("parse current datapath object");
+            assert_eq!(object.maps.len(), CURRENT_MAP_NAMES.len());
+            for name in CURRENT_MAP_NAMES {
+                let map = object.maps.get(name).expect("current named map");
+                assert_eq!(map.pinning(), PinningType::ByName, "map {name}");
+            }
+        }
+
         fn bpffs_entries(pin_root: &std::path::Path) -> Vec<std::ffi::OsString> {
             let Ok(entries) = fs::read_dir(pin_root) else {
                 return Vec::new();
@@ -24760,6 +24829,75 @@ mod tests {
                 .unwrap(),
             TftUplinkClassifierReconcileOutcome::Replaced
         );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_stage_rejects_concurrent_malformed_key_before_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let initial = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(initial.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        let key = TftClassifierKey::decode(tft_classifier_key_bytes(&initial))
+            .expect("test classifier key is canonical");
+        let observed = match backend
+            .stable_tft_observation_locked(key)
+            .expect("test observation succeeds")
+        {
+            TftClassifierObservation::Present(observed) => observed,
+            _ => panic!("test classifier is present"),
+        };
+        let authority = runtime
+            .tft_authority(initial.link_ifindex())
+            .expect("test authority is available");
+        let snapshot_generation =
+            EbpfGtpuDataplaneBackend::next_tft_snapshot_generation(Some(observed.as_ref()))
+                .expect("test snapshot generation advances");
+        let replacement = tft_classifier(0x42, 8, 17);
+        let desired = EbpfGtpuDataplaneBackend::encode_tft_classifier(
+            &replacement,
+            authority,
+            snapshot_generation,
+        )
+        .expect("replacement test classifier encodes");
+
+        let before = {
+            let mut state = runtime.state();
+            let ((ifindex, canonical_key), value) = state
+                .tft_filters
+                .iter()
+                .next()
+                .map(|(key, value)| (*key, *value))
+                .expect("test active record is retained");
+            let mut malformed_key = canonical_key;
+            malformed_key[9] = 1;
+            assert!(TftClassifierFilterKey::decode(malformed_key).is_none());
+            state.tft_filters.insert((ifindex, malformed_key), value);
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+
+        assert!(matches!(
+            backend.stage_tft_inactive_bank_locked(
+                &desired,
+                authority,
+                Some(observed.as_ref()),
+                snapshot_generation,
+            ),
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_stage"
+            })
+        ));
+        let after = {
+            let state = runtime.state();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        assert_eq!(after, before);
     }
 
     #[tokio::test]
