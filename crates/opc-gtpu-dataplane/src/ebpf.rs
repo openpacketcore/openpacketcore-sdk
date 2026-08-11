@@ -24721,6 +24721,54 @@ mod tests {
         .expect("test classifier is canonical")
     }
 
+    fn tft_classifier_with_global_precedence_overlap(
+        reverse_bearer_input: bool,
+    ) -> TftUplinkClassifier {
+        let lower_mark_higher_precedence = TftUplinkBearer::dedicated(
+            GtpBearerMark::new(0x2000_0002).expect("test bearer mark is nonzero"),
+            TrafficFlowTemplate::create_new(
+                vec![PacketFilter::new(
+                    PacketFilterIdentifier::new(10).expect("test identifier is four-bit"),
+                    PacketFilterDirection::UplinkOnly,
+                    10,
+                    vec![
+                        PacketFilterComponent::ProtocolIdentifierNextHeader(17),
+                        PacketFilterComponent::SingleLocalPort(5010),
+                    ],
+                )
+                .expect("test filter is canonical")],
+                Vec::new(),
+            )
+            .expect("test TFT is canonical"),
+        );
+        let higher_mark_lower_precedence = TftUplinkBearer::dedicated(
+            GtpBearerMark::new(0x2000_0003).expect("test bearer mark is nonzero"),
+            TrafficFlowTemplate::create_new(
+                vec![PacketFilter::new(
+                    PacketFilterIdentifier::new(1).expect("test identifier is four-bit"),
+                    PacketFilterDirection::UplinkOnly,
+                    1,
+                    vec![PacketFilterComponent::SingleLocalPort(5010)],
+                )
+                .expect("test filter is canonical")],
+                Vec::new(),
+            )
+            .expect("test TFT is canonical"),
+        );
+        let mut bearers = vec![TftUplinkBearer::default_bearer()];
+        if reverse_bearer_input {
+            bearers.extend([higher_mark_lower_precedence, lower_mark_higher_precedence]);
+        } else {
+            bearers.extend([lower_mark_higher_precedence, higher_mark_lower_precedence]);
+        }
+        TftUplinkClassifier::new(
+            S2BU_IFINDEX,
+            IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
+            bearers,
+        )
+        .expect("globally unique test precedences are canonical")
+    }
+
     #[test]
     fn tft_classifier_validation_is_pure_and_rejects_unsupported_native_forms() {
         let (backend, runtime) = backend_with_fake();
@@ -25101,6 +25149,74 @@ mod tests {
                 .await
                 .unwrap(),
             TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_encoder_and_readback_use_global_precedence_across_bearer_orders() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let forward = tft_classifier_with_global_precedence_overlap(false);
+        let reversed = tft_classifier_with_global_precedence_overlap(true);
+        assert_eq!(forward, reversed);
+
+        let authority = runtime
+            .tft_authority(forward.link_ifindex())
+            .expect("test authority is available");
+        let encoded = EbpfGtpuDataplaneBackend::encode_tft_classifier(&forward, authority, 1)
+            .expect("globally ordered test classifier encodes");
+        assert_eq!(
+            encoded
+                .filters
+                .iter()
+                .map(TftClassifierFilter::evaluation_precedence)
+                .collect::<Vec<_>>(),
+            vec![1, 10]
+        );
+        assert_eq!(
+            encoded
+                .filters
+                .iter()
+                .map(TftClassifierFilter::dense_rank)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            encoded
+                .filters
+                .iter()
+                .map(TftClassifierFilter::bearer_mark)
+                .collect::<Vec<_>>(),
+            vec![0x2000_0003, 0x2000_0002]
+        );
+
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(forward.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(forward.link_ifindex(), forward.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(forward)
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(reversed.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(reversed.link_ifindex(), reversed.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(reversed)
         );
     }
 

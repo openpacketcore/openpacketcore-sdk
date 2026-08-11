@@ -471,7 +471,44 @@ struct TftClassifierLoopContext {
     packet: TftClassifierIpv4Packet,
     matched: u8,
     invalid: u8,
-    selected_mark: u32,
+    selected_rank: u16,
+    candidate_rank: u16,
+}
+
+/// Persist the current callback rank only after that filter matched.
+///
+/// `bpf_loop` callbacks on older enterprise kernels must not carry a selected
+/// bearer mark across nested BPF-to-BPF calls. The callback records the dense
+/// execution rank in its caller-owned context instead; the caller re-reads the
+/// metadata-bound row after the loop and obtains its mark there.
+#[inline(never)]
+fn remember_tft_classifier_match(context: &mut TftClassifierLoopContext) {
+    if context.matched == 0 {
+        context.selected_rank = context.candidate_rank;
+        context.matched = 1;
+    }
+}
+
+/// Re-read the metadata-bound winning row after the bounded callback loop.
+///
+/// The callback has already established that this dense rank matched. Looking
+/// the record up again makes the selected mark a post-loop value, so it never
+/// crosses the callback's validation and match subprogram calls.
+#[inline(never)]
+fn selected_tft_classifier_mark(
+    key: TftClassifierKey,
+    meta: &TftClassifierMeta,
+    dense_rank: u16,
+) -> Option<u32> {
+    let filter_key = TftClassifierFilterKey::from_validated_meta(key, meta, dense_rank)?;
+    let filter_ptr = GTPU_TFT_FILT.get_ptr(filter_key)?;
+    // SAFETY: the active metadata and metadata-bound key retain this map value
+    // for the current invocation. This revalidates the executable row before
+    // exposing its mark to the caller.
+    let filter = unsafe { &*filter_ptr };
+    filter
+        .is_runtime_valid_at(dense_rank as u8)
+        .then(|| filter.bearer_mark())
 }
 
 /// Match exactly one active-bank filter in a bounded `bpf_loop` callback.
@@ -492,6 +529,10 @@ unsafe extern "C" fn classify_tft_filter_step(index: u64, context: *mut c_void) 
         context.invalid = 1;
         return 1;
     }
+    // Store the scalar before any nested BPF-to-BPF call. The selection helper
+    // below reloads this context field after matching rather than preserving
+    // `index` or a bearer mark through those calls.
+    context.candidate_rank = index as u16;
     let Some(filter_key) =
         TftClassifierFilterKey::from_validated_meta(context.key, &context.meta, index as u16)
     else {
@@ -515,10 +556,7 @@ unsafe extern "C" fn classify_tft_filter_step(index: u64, context: *mut c_void) 
     if !tft_classifier_filter_matches(filter, &context.packet) {
         return 0;
     }
-    if context.matched == 0 {
-        context.selected_mark = filter.bearer_mark();
-        context.matched = 1;
-    }
+    remember_tft_classifier_match(context);
     0
 }
 
@@ -564,7 +602,8 @@ fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
         packet,
         matched: 0,
         invalid: 0,
-        selected_mark: 0,
+        selected_rank: 0,
+        candidate_rank: 0,
     };
     // SAFETY: the callback is a static BPF subprogram with the helper's exact
     // ABI. The context remains live and uniquely borrowed for this synchronous
@@ -582,7 +621,13 @@ fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
         return TftClassifierUplinkResult::Drop;
     }
     match loop_context.matched {
-        1 => TftClassifierUplinkResult::Selected(loop_context.selected_mark),
+        1 => match selected_tft_classifier_mark(key, &meta, loop_context.selected_rank) {
+            Some(mark) => TftClassifierUplinkResult::Selected(mark),
+            None => {
+                count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
+                TftClassifierUplinkResult::Drop
+            }
+        },
         0 if meta.has_default() => TftClassifierUplinkResult::Selected(0),
         0 => {
             count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_NO_MATCH);
@@ -3055,6 +3100,54 @@ mod tests {
         assert!(
             uplink.contains("TftClassifierUplinkResult::Drop => return Ok(TC_ACT_SHOT as i32)")
         );
+    }
+
+    #[test]
+    fn tft_callback_defers_bearer_mark_resolution_until_after_bpf_loop() {
+        // The host test cannot invoke a tc `bpf_loop` callback, so retain the
+        // generated control-flow contract in source: the callback may retain
+        // only a dense rank, and the mark is resolved from a fresh
+        // metadata-bound lookup after the loop returns.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let (_, callback) = source
+            .split_once("unsafe extern \"C\" fn classify_tft_filter_step")
+            .expect("TFT callback is present");
+        let (callback, _) = callback
+            .split_once("/// Classify one previously unmarked IPv4 packet")
+            .expect("TFT callback terminator is present");
+        let candidate_rank = callback
+            .find("context.candidate_rank = index as u16;")
+            .expect("candidate rank is stored in caller-owned context");
+        let filter_key = callback
+            .find("TftClassifierFilterKey::from_validated_meta")
+            .expect("metadata-bound filter-key validation is present");
+        let runtime_validation = callback
+            .find("filter.is_runtime_valid_at(index as u8)")
+            .expect("runtime filter validation is present");
+        let packet_match = callback
+            .find("tft_classifier_filter_matches(filter, &context.packet)")
+            .expect("packet-filter match is present");
+        let remember_match = callback
+            .find("remember_tft_classifier_match(context);")
+            .expect("rank-only selection commit is present");
+        assert!(candidate_rank < filter_key);
+        assert!(candidate_rank < runtime_validation);
+        assert!(candidate_rank < packet_match);
+        assert!(packet_match < remember_match);
+        assert!(!callback.contains("bearer_mark()"));
+        assert!(!callback.contains("evaluation_precedence"));
+
+        let (_, classifier) = source
+            .split_once("fn classify_owned_tft_uplink(ctx: &TcContext)")
+            .expect("owned TFT classifier is present");
+        let loop_call = classifier
+            .find("bpf_loop(")
+            .expect("bounded TFT loop is present");
+        let selected_mark = classifier
+            .find("selected_tft_classifier_mark(key, &meta, loop_context.selected_rank)")
+            .expect("post-loop selected mark lookup is present");
+        assert!(loop_call < selected_mark);
+        assert!(classifier.contains("u32::from(meta.filter_count())"));
     }
 
     #[test]

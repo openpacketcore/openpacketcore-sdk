@@ -720,6 +720,45 @@ mod tests {
     }
 
     #[test]
+    fn global_precedence_beats_canonical_bearer_mark_for_every_input_order() {
+        let paa = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let classifier = |reverse_bearer_input: bool| {
+            let lower_mark_higher_precedence = dedicated(
+                0x2000_0002,
+                10,
+                vec![
+                    PacketFilterComponent::ProtocolIdentifierNextHeader(17),
+                    PacketFilterComponent::SingleLocalPort(5010),
+                ],
+            );
+            let higher_mark_lower_precedence = dedicated(
+                0x2000_0003,
+                1,
+                vec![PacketFilterComponent::SingleLocalPort(5010)],
+            );
+            let mut bearers = vec![TftUplinkBearer::default_bearer()];
+            if reverse_bearer_input {
+                bearers.extend([higher_mark_lower_precedence, lower_mark_higher_precedence]);
+            } else {
+                bearers.extend([lower_mark_higher_precedence, higher_mark_lower_precedence]);
+            }
+            TftUplinkClassifier::new(7, paa, bearers)
+                .expect("globally unique test precedences are canonical")
+        };
+
+        let forward = classifier(false);
+        let reversed = classifier(true);
+        assert_eq!(forward, reversed);
+        let packet = ipv4_udp([10, 0, 0, 1], [192, 0, 2, 1], 5010, 5402);
+        for classifier in [&forward, &reversed] {
+            assert_eq!(
+                classifier.classify(&packet),
+                TftUplinkClassification::Selected(GtpBearerMark::new(0x2000_0003))
+            );
+        }
+    }
+
+    #[test]
     fn rejects_conflicting_ownership_and_unsupported_tft_direction() {
         let one = dedicated(
             11,
