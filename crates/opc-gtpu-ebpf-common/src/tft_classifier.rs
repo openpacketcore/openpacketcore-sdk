@@ -222,7 +222,13 @@ impl TftClassifierKey {
     /// Return whether every field is canonical.
     #[must_use]
     pub const fn is_valid(self) -> bool {
-        self.attachment_ifindex() != 0 && !bytes_are_zero(&self.paa)
+        // This predicate is also inlined while a `bpf_loop` callback builds a
+        // filter-map key. Keep the four-byte PAA check scalar so the callback
+        // does not make a BPF-to-BPF call between preserving its bank/index
+        // state and issuing the map lookup. Older enterprise-kernel JITs do
+        // not reliably preserve that callback state across the nested call.
+        self.attachment_ifindex() != 0
+            && (self.paa[0] != 0 || self.paa[1] != 0 || self.paa[2] != 0 || self.paa[3] != 0)
     }
 
     /// Encode this canonical key for byte-array BPF map I/O.
