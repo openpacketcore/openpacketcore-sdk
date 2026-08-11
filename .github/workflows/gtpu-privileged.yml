@@ -138,6 +138,7 @@ jobs:
           grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
 
           # The two lib tag proofs return Ok early without printing `skipping:`
           # when the environment is not privileged, so the skip check above
@@ -173,6 +174,16 @@ jobs:
           test -n "${test_binary}"
           test -x "${test_binary}"
           cp "${test_binary}" "${RUNNER_TEMP}/opc-gtpu-linux68-test"
+
+          cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged --no-run --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-linux68-datapath-build.jsonl"
+          datapath_binary="$(
+            jq -r 'select(.profile.test == true and .target.name == "ebpf_gtpu_privileged") | .executable // empty' \
+              "${RUNNER_TEMP}/gtpu-linux68-datapath-build.jsonl" | tail -n 1
+          )"
+          test -n "${datapath_binary}"
+          test -x "${datapath_binary}"
+          cp "${datapath_binary}" "${RUNNER_TEMP}/opc-gtpu-linux68-datapath"
 
       - name: Load both classifiers on pinned Linux 6.8
         run: |
@@ -272,6 +283,16 @@ jobs:
             -o UserKnownHostsFile=/dev/null \
             "${RUNNER_TEMP}/opc-gtpu-linux68-test" \
             opc@127.0.0.1:/tmp/opc-gtpu-linux68-test
+          scp \
+            -i "${key}" \
+            -P 2227 \
+            -o BatchMode=yes \
+            -o ConnectTimeout=2 \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${RUNNER_TEMP}/opc-gtpu-linux68-datapath" \
+            opc@127.0.0.1:/tmp/opc-gtpu-linux68-datapath
           ssh "${ssh_options[@]}" opc@127.0.0.1 '
             set -euo pipefail
             test "$(uname -r)" = "6.8.0-134-generic"
@@ -283,6 +304,7 @@ jobs:
             esac
             sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
             chmod 0755 /tmp/opc-gtpu-linux68-test
+            chmod 0755 /tmp/opc-gtpu-linux68-datapath
           '
           load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
@@ -297,6 +319,19 @@ jobs:
           grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_PRE_REDIRECT_TAG_PROOF_PROVEN' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
+
+          live_output="$(
+            ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-linux68-datapath --ignored --nocapture --test-threads=1 ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract"' \
+              2>&1
+          )"
+          printf '%s\n' "${live_output}"
+          if grep -q 'skipping:' <<< "${live_output}"; then
+            echo '::error::Linux 6.8 TFT live proof skipped instead of running'
+            exit 1
+          fi
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' <<< "${live_output}"
 
   el9-514-classifier-load:
     name: RHEL 9 / OpenShift 4.18 datapath
@@ -649,6 +684,7 @@ jobs:
           grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
 
   ebpf-object:
     name: eBPF datapath object rebuild
@@ -792,12 +828,13 @@ jobs:
             wire_address_is_canonical apply_uplink_mtu_policy \
             pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph \
             marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink \
-            marked_owner_wire_authorizes_downlink \
+            marked_owner_wire_authorizes_downlink classify_tft_filter_step \
             GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP \
             GTPU_UL_SPORT GTPU_ULM_SPORT GTPU_PMTU_CFG GTPU_PMTU_DROP \
             GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_DL_BIND GTPU_DL_DROP \
             GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG GTPU_SESSIONS \
-            GTPU_UL_INDEX GTPU_DL_INDEX GTPU_SESS_TXN GTPU_SCHEMA6 GTPU_CONFIG6; do
+            GTPU_UL_INDEX GTPU_DL_INDEX GTPU_SESS_TXN GTPU_SCHEMA6 GTPU_CONFIG6 \
+            GTPU_TFT_SCHEMA GTPU_TFT_META GTPU_TFT_FILT GTPU_TFT_DROP; do
             grep -Eq "( |[[:digit:]])${symbol}$" committed.inventory
           done
 

@@ -2879,6 +2879,7 @@ dependencies = [
  "opc-gtpu-ebpf-common",
  "opc-ipsec-xfrm",
  "opc-linux-gtpu-sys",
+ "opc-proto-tft",
  "opc-types",
  "rand 0.10.2",
  "rustix",

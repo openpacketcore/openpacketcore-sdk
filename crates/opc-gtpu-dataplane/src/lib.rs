@@ -60,6 +60,7 @@ pub mod linux;
 pub mod mock;
 pub mod model;
 pub mod reassembly;
+pub mod tft_classifier;
 pub mod unsupported;
 
 pub use backend::GtpuDataplaneBackend;
@@ -116,6 +117,10 @@ pub use reassembly::{
     reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuReassemblyConsumer,
     GtpuReassemblyCounters, GtpuReassemblyDrop, GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome,
     GtpuReassemblyPdr, GtpuReassemblySelector,
+};
+pub use tft_classifier::{
+    TftUplinkBearer, TftUplinkClassification, TftUplinkClassifier, TftUplinkClassifierReadback,
+    TftUplinkClassifierReconcileOutcome, TftUplinkClassifierRemovalOutcome, TftUplinkDropReason,
 };
 pub use unsupported::UnsupportedGtpuDataplaneBackend;
 

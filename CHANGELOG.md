@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Fail-closed canonical TFT uplink classifier contract — `opc-gtpu-dataplane`:**
+  `TftUplinkClassifier` composes the existing canonical `opc-proto-tft` packet
+  filter model with one shared PAA and explicit default/dedicated bearer
+  ownership. It selects the lowest evaluation-precedence matching uplink TFT,
+  falls back only to the sole unfiltered bearer, and otherwise silently drops.
+  Its bounded parser covers the supported IPv4/IPv6 address, protocol,
+  port/range, traffic-class, ESP SPI, and IPv6 flow-label components; malformed,
+  fragmented, unsupported-extension, and foreign-PAA packets fail closed.
+  Duplicate marks/precedence/default ownership and non-uplink, partial, or
+  unsupported TFT snapshots are rejected before install. The additive backend
+  methods expose capability, exact readback, idempotent reconcile, atomic
+  self-owned replacement, and exact removal; the mock provides deterministic
+  lifecycle proof. A replacement never transiently publishes absent or
+  wrong-bearer state, while foreign ownership conflicts and partial, mixed, or
+  stale state remains indeterminate. Native exact removal first publishes a
+  SHA-256-bound, fail-closed metadata tombstone, removes only canonical records
+  under the current authority, and removes the tombstone last. A retry proves
+  the complete expected snapshot from its fingerprint rather than accepting a
+  surviving filter subset. The backend-neutral model retains IPv4/IPv6
+  semantics. Native adoption rejects partial TFT pin graphs and promotes an
+  all-zero schema marker only after both behavior-bearing maps are proven empty
+  before hook mutation and rechecked empty immediately before publication.
+  Native eBPF TFT classifier ABI/schema v3 remains IPv4-only and rejects IPv6
+  PAA/components and flow-label filters before map writes. This increment does
+  not claim IPv6 native packet execution. Linux `gtp` and unsupported adapters
+  report the capability missing; no adapter claims host-model packet processing
+  as dataplane evidence.
 - **Live-writer exact Linux PDP removal authority — `opc-gtpu-dataplane`:**
   `LinuxGtpuDataplaneBackend::remove_pdp_context_exact_live_writer` (also
   exposed as an additive trait method of the same name) removes one exact

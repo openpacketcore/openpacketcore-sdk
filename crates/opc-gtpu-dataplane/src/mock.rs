@@ -14,6 +14,10 @@ use crate::model::{
     PdpContextInstallOutcome, PdpContextReadback, PdpContextReconciliationCapabilities,
     PdpContextRemovalOutcome, PdpContextSelector, RemovePdpContextRequest,
 };
+use crate::tft_classifier::{
+    TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
+    TftUplinkClassifierRemovalOutcome,
+};
 
 /// Redaction-safe reconciliation fault injected into the deterministic mock.
 #[non_exhaustive]
@@ -150,6 +154,7 @@ struct MockState {
     pdp_by_local: BTreeMap<MockLocalSelector, GtpPdpContext>,
     pdp_by_uplink: BTreeMap<MockUplinkSelector, GtpPdpContext>,
     pdp_fault: Option<MockPdpContextFault>,
+    tft_classifiers: BTreeMap<(u32, std::net::IpAddr), TftUplinkClassifier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -194,6 +199,7 @@ impl MockGtpuDataplaneBackend {
                 pdp_by_local: BTreeMap::new(),
                 pdp_by_uplink: BTreeMap::new(),
                 pdp_fault: None,
+                tft_classifiers: BTreeMap::new(),
             })),
         }
     }
@@ -416,6 +422,21 @@ impl MockGtpuDataplaneBackend {
         state.pdp_by_local.remove(&Self::local_key(context));
         state.pdp_by_uplink.remove(&Self::uplink_key(context));
     }
+
+    fn tft_classifier_readback_locked(
+        state: &MockState,
+        link_ifindex: u32,
+        paa: std::net::IpAddr,
+    ) -> TftUplinkClassifierReadback {
+        state
+            .tft_classifiers
+            .get(&(link_ifindex, paa))
+            .cloned()
+            .map_or(
+                TftUplinkClassifierReadback::Absent,
+                TftUplinkClassifierReadback::Present,
+            )
+    }
 }
 
 impl Default for MockGtpuDataplaneBackend {
@@ -426,6 +447,95 @@ impl Default for MockGtpuDataplaneBackend {
 
 #[async_trait]
 impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
+    fn tft_uplink_classification_capability(&self) -> GtpuCapability {
+        GtpuCapability::Available
+    }
+
+    async fn read_tft_uplink_classifier(
+        &self,
+        link_ifindex: u32,
+        paa: std::net::IpAddr,
+    ) -> Result<TftUplinkClassifierReadback, GtpuError> {
+        if link_ifindex == 0 {
+            return Err(GtpuError::invalid_config(
+                "tft_uplink_classifier.link_ifindex",
+                "ifindex must be nonzero",
+            ));
+        }
+        if paa.is_unspecified() {
+            return Err(GtpuError::invalid_config(
+                "tft_uplink_classifier.paa",
+                "PAA must not be unspecified",
+            ));
+        }
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        if state.pdp_fault.is_some() {
+            return Ok(TftUplinkClassifierReadback::Indeterminate);
+        }
+        Ok(Self::tft_classifier_readback_locked(
+            &state,
+            link_ifindex,
+            paa,
+        ))
+    }
+
+    async fn reconcile_tft_uplink_classifier(
+        &self,
+        desired: TftUplinkClassifier,
+    ) -> Result<TftUplinkClassifierReconcileOutcome, GtpuError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        if state.pdp_fault.is_some() {
+            return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate);
+        }
+        let key = (desired.link_ifindex(), desired.paa());
+        match state.tft_classifiers.get(&key) {
+            None => {
+                state.tft_classifiers.insert(key, desired);
+                Ok(TftUplinkClassifierReconcileOutcome::Installed)
+            }
+            Some(existing) if existing == &desired => {
+                Ok(TftUplinkClassifierReconcileOutcome::AlreadyPresent)
+            }
+            Some(_) => {
+                // Every classifier in this map was installed by this backend, so
+                // replacing its complete snapshot is within this authority.
+                state.tft_classifiers.insert(key, desired);
+                Ok(TftUplinkClassifierReconcileOutcome::Replaced)
+            }
+        }
+    }
+
+    async fn remove_tft_uplink_classifier_exact(
+        &self,
+        expected: TftUplinkClassifier,
+    ) -> Result<TftUplinkClassifierRemovalOutcome, GtpuError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        if state.pdp_fault.is_some() {
+            return Ok(TftUplinkClassifierRemovalOutcome::Indeterminate);
+        }
+        let key = (expected.link_ifindex(), expected.paa());
+        match state.tft_classifiers.get(&key) {
+            None => Ok(TftUplinkClassifierRemovalOutcome::AlreadyAbsent),
+            Some(existing) if existing == &expected => {
+                state.tft_classifiers.remove(&key);
+                Ok(TftUplinkClassifierRemovalOutcome::Removed)
+            }
+            Some(_) => Ok(TftUplinkClassifierRemovalOutcome::Conflict),
+        }
+    }
+
     async fn create_device(&self, request: CreateGtpDeviceRequest) -> Result<GtpDevice, GtpuError> {
         let mut state = self
             .state
@@ -1095,5 +1205,108 @@ mod tests {
             ));
         }
         backend.set_pdp_context_fault(None);
+    }
+
+    #[tokio::test]
+    async fn mock_tft_classifier_reconciliation_is_exact_and_idempotent() {
+        let backend = MockGtpuDataplaneBackend::new();
+        let desired = TftUplinkClassifier::new(
+            7,
+            IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
+            vec![crate::TftUplinkBearer::default_bearer()],
+        )
+        .unwrap();
+        assert_eq!(
+            backend.tft_uplink_classification_capability(),
+            GtpuCapability::Available
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(desired.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(desired.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::AlreadyPresent
+        );
+        let replacement = TftUplinkClassifier::new(
+            7,
+            IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
+            vec![
+                crate::TftUplinkBearer::default_bearer(),
+                crate::TftUplinkBearer::dedicated(
+                    crate::GtpBearerMark::new(9).unwrap(),
+                    opc_proto_tft::TrafficFlowTemplate::create_new(
+                        vec![opc_proto_tft::PacketFilter::new(
+                            opc_proto_tft::PacketFilterIdentifier::new(1).unwrap(),
+                            opc_proto_tft::PacketFilterDirection::UplinkOnly,
+                            1,
+                            vec![
+                                opc_proto_tft::PacketFilterComponent::ProtocolIdentifierNextHeader(
+                                    17,
+                                ),
+                            ],
+                        )
+                        .unwrap()],
+                        vec![],
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(replacement.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(desired.link_ifindex(), desired.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(replacement.clone())
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(desired.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Conflict
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(replacement.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(replacement)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_tft_classifier_readback_rejects_invalid_identity() {
+        let backend = MockGtpuDataplaneBackend::new();
+        assert!(backend
+            .read_tft_uplink_classifier(0, IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)))
+            .await
+            .is_err());
+        assert!(backend
+            .read_tft_uplink_classifier(7, IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            .await
+            .is_err());
     }
 }
