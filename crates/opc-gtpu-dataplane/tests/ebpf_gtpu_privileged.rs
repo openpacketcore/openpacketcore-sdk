@@ -2367,7 +2367,8 @@ fn receive_tft_uplink_teid(socket: &UdpSocket, expected_teid: u32, payload_senti
     assert_eq!(
         u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]),
         expected_teid,
-        "unmarked packet must be steered to the selected bearer"
+        "unmarked packet for sentinel {payload_sentinel:?} must be steered to the selected bearer; packet tail={:?}",
+        &buffer[length.saturating_sub(64)..length],
     );
     assert!(
         buffer[..length].ends_with(payload_sentinel),
