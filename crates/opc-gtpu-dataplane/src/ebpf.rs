@@ -574,6 +574,7 @@ pub(crate) struct EbpfTftFilterMapCapacity {
 }
 
 impl EbpfTftFilterMapCapacity {
+    #[cfg(any(target_os = "linux", test))]
     const fn new(occupied: u32, maximum: u32) -> Option<Self> {
         if maximum != 0 && occupied <= maximum {
             Some(Self { occupied, maximum })
