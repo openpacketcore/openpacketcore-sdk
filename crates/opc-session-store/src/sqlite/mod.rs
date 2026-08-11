@@ -32,7 +32,8 @@ use crate::{
     model::{OwnerId, SessionKey},
     record::StoredSessionRecord,
     replication_watch::{
-        prepare_watch_registration, watch_backlog_query_limit, ReplicationWatcher,
+        prepare_consumer_watch_registration, prepare_watch_registration, watch_backlog_query_limit,
+        ConsumerReplicationWatcher, ReplicationWatcher,
     },
     restore::{RestoreScanPage, RestoreScanRequest},
     ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
@@ -115,6 +116,7 @@ pub struct SqliteSessionBackend {
     #[cfg(test)]
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
     watchers: Arc<tokio::sync::Mutex<Vec<ReplicationWatcher>>>,
+    consumer_watchers: Arc<tokio::sync::Mutex<Vec<ConsumerReplicationWatcher>>>,
     #[cfg(test)]
     pub(crate) watch_registration_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -394,6 +396,7 @@ impl SqliteSessionBackend {
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            consumer_watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             watch_registration_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
@@ -900,6 +903,41 @@ impl SqliteSessionBackend {
         watchers.retain(|watcher| !watcher.is_closed());
         if let Some(watcher) = watcher {
             watchers.push(watcher);
+        }
+        use futures_util::StreamExt;
+        Ok(stream.boxed())
+    }
+
+    /// Subscribe an authenticated consumer to redacted committed changes.
+    ///
+    /// The raw replication backlog is projected while the ordinary watch
+    /// registration lock is held, which closes the capture/register race.
+    /// Live consumers then receive only compact projection envelopes through
+    /// their own byte-bounded registry; no raw replay entry is cloned per
+    /// consumer connection.
+    pub(crate) async fn consensus_consumer_watch(
+        &self,
+        start_sequence: u64,
+    ) -> Result<
+        futures_util::stream::BoxStream<'static, Result<crate::SessionConsumerChange, StoreError>>,
+        StoreError,
+    > {
+        let cursor = ReplicationWatchCursor::new(start_sequence);
+        // The ordinary watcher mutex serializes raw append notification with
+        // backlog capture. Keep it while adding the projected subscriber so a
+        // committed entry can land in neither source.
+        let _raw_watchers = self.watchers.lock().await;
+        let existing = self
+            .consensus_get_replication_log(
+                cursor.first_sequence(),
+                watch_backlog_query_limit(cursor),
+            )
+            .await?;
+        let (stream, watcher) = prepare_consumer_watch_registration(cursor, existing)?;
+        let mut consumer_watchers = self.consumer_watchers.lock().await;
+        consumer_watchers.retain(|watcher| !watcher.is_closed());
+        if let Some(watcher) = watcher {
+            consumer_watchers.push(watcher);
         }
         use futures_util::StreamExt;
         Ok(stream.boxed())

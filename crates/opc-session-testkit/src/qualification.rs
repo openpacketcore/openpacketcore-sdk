@@ -29,8 +29,8 @@ use opc_session_net::{
 };
 use opc_session_store::{
     validate_session_ttl, OwnerId, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, StateType, MAX_REPLICATION_LOG_PAGE_ENTRIES,
-    MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, STABLE_ID_MAX_BYTES,
+    ReplicaId, ReplicaTlsIdentity, SessionConsumerScope, StateType,
+    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, STABLE_ID_MAX_BYTES,
 };
 use opc_tls::{TlsMaterialAvailability, TlsMaterialReloadReason, TlsMaterialStatus};
 use opc_types::{SpiffeId, Timestamp};
@@ -1329,6 +1329,39 @@ pub struct QualificationProtocol {
     pub max_frame_bytes: usize,
     pub max_rpc_payload_bytes: usize,
     pub legacy_direct_backend_enabled: bool,
+    #[serde(default)]
+    pub stateless_consumer: Option<QualificationStatelessConsumerProtocol>,
+}
+
+/// Fixed/default bounded contract inventory for the dedicated stateless
+/// session-quorum consumer transport.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationStatelessConsumerProtocol {
+    pub alpn: String,
+    pub transport_revision: u16,
+    pub fallback_or_dual_mode_enabled: bool,
+    pub max_requests_per_connection: usize,
+    pub default_max_connections: usize,
+    pub min_response_frame_bytes: usize,
+    pub max_frame_bytes: usize,
+    pub default_idle_timeout_millis: u64,
+    pub default_operation_timeout_millis: u64,
+    pub request_id_bytes: usize,
+    pub max_consumer_identity_bytes: usize,
+    pub max_batch_operations: usize,
+    pub max_batch_response_bytes: usize,
+    pub max_store_watch_buffer_bytes: usize,
+    pub watch_channel_capacity: usize,
+    pub watch_channel_max_bytes: usize,
+    pub watch_cancellation_recheck_millis: u64,
+    pub watch_delivery_tasks_per_watch: usize,
+    pub default_listener_connection_task_limit: usize,
+    pub default_max_authentication_age_millis: u64,
+    pub default_rotation_drain_window_millis: u64,
+    pub default_reconnect_backoff_min_millis: u64,
+    pub default_reconnect_backoff_max_millis: u64,
+    pub default_rotation_jitter_millis: u64,
 }
 
 /// Fixed non-operator-tunable consensus timing inventory.
@@ -3013,6 +3046,11 @@ pub enum QualificationNodeCommandKind {
     LifecycleMetrics,
     /// Change the qualification-only consensus RPC fault gate.
     SetConsensusRpcAvailability,
+    /// Start the test-only stateless consumer endpoint.
+    StartStatelessConsumer,
+    /// Cause the next successful stateless-consumer mutation to report an
+    /// explicitly ambiguous outcome after durable dispatch.
+    ArmStatelessConsumerOutcomeUnknown,
     /// Read bounded security metrics.
     SecurityMetrics,
     /// Start the deterministic traffic watch.
@@ -3067,6 +3105,8 @@ impl QualificationNodeCommandKind {
         Self::DirectedHandshake,
         Self::LifecycleMetrics,
         Self::SetConsensusRpcAvailability,
+        Self::StartStatelessConsumer,
+        Self::ArmStatelessConsumerOutcomeUnknown,
         Self::SecurityMetrics,
         Self::StartTrafficWatch,
         Self::ReconcileTrafficWatch,
@@ -3119,6 +3159,15 @@ pub enum QualificationNodeCommand {
     SetConsensusRpcAvailability {
         availability: QualificationConsensusRpcAvailability,
     },
+    /// Start one dedicated stateless-consumer listener for the supplied
+    /// application mTLS identities. This test-only control seam never admits
+    /// a consensus-member identity.
+    StartStatelessConsumer {
+        consumer_identities: Vec<String>,
+    },
+    /// Arm a one-shot, test-only post-dispatch response-loss simulation for
+    /// the dedicated stateless-consumer endpoint.
+    ArmStatelessConsumerOutcomeUnknown,
     /// Return a redacted fixed-cardinality security telemetry snapshot.
     SecurityMetrics,
     /// Register exactly one protected applied-state watch before any traffic
@@ -3231,6 +3280,16 @@ impl fmt::Debug for QualificationNodeCommand {
                 .debug_struct("QualificationNodeCommand::SetConsensusRpcAvailability")
                 .field("availability", availability)
                 .finish(),
+            Self::StartStatelessConsumer {
+                consumer_identities,
+            } => formatter
+                .debug_struct("QualificationNodeCommand::StartStatelessConsumer")
+                .field("consumer_count", &consumer_identities.len())
+                .field("identities", &"<redacted>")
+                .finish(),
+            Self::ArmStatelessConsumerOutcomeUnknown => {
+                formatter.write_str("QualificationNodeCommand::ArmStatelessConsumerOutcomeUnknown")
+            }
             Self::SecurityMetrics => {
                 formatter.write_str("QualificationNodeCommand::SecurityMetrics")
             }
@@ -3321,6 +3380,12 @@ impl QualificationNodeCommand {
             Self::SetConsensusRpcAvailability { .. } => {
                 QualificationNodeCommandKind::SetConsensusRpcAvailability
             }
+            Self::StartStatelessConsumer { .. } => {
+                QualificationNodeCommandKind::StartStatelessConsumer
+            }
+            Self::ArmStatelessConsumerOutcomeUnknown => {
+                QualificationNodeCommandKind::ArmStatelessConsumerOutcomeUnknown
+            }
             Self::SecurityMetrics => QualificationNodeCommandKind::SecurityMetrics,
             Self::StartTrafficWatch => QualificationNodeCommandKind::StartTrafficWatch,
             Self::ReconcileTrafficWatch => QualificationNodeCommandKind::ReconcileTrafficWatch,
@@ -3359,6 +3424,7 @@ impl QualificationNodeCommand {
             | Self::RequestReauthentication
             | Self::LifecycleMetrics
             | Self::SetConsensusRpcAvailability { .. }
+            | Self::ArmStatelessConsumerOutcomeUnknown
             | Self::SecurityMetrics
             | Self::StartTrafficWatch
             | Self::ReconcileTrafficWatch
@@ -3368,6 +3434,25 @@ impl QualificationNodeCommand {
             | Self::TrafficStatus
             | Self::TrafficStatusSnapshot
             | Self::Shutdown => Ok(()),
+            Self::StartStatelessConsumer {
+                consumer_identities,
+            } => {
+                if !(12..=16).contains(&consumer_identities.len()) {
+                    return Err(QualificationCommandError::ConsumerIdentity);
+                }
+                let identities = consumer_identities
+                    .iter()
+                    .map(|identity| {
+                        SpiffeId::new(identity.clone())
+                            .map(|_| identity.as_str())
+                            .map_err(|_| QualificationCommandError::ConsumerIdentity)
+                    })
+                    .collect::<Result<HashSet<_>, _>>()?;
+                if identities.len() != consumer_identities.len() {
+                    return Err(QualificationCommandError::ConsumerIdentity);
+                }
+                Ok(())
+            }
             Self::DirectedHandshake { remote_node_index } => {
                 if *remote_node_index < 5 {
                     Ok(())
@@ -3491,6 +3576,9 @@ pub enum QualificationCommandError {
     /// A v5 state type is not the exact history-derived form.
     #[error("qualification concurrent state type is invalid")]
     StateType,
+    /// A stateless-consumer identity set is not bounded and canonical.
+    #[error("qualification stateless consumer identity is invalid")]
+    ConsumerIdentity,
 }
 
 /// Fixed v5 readiness view with Openraft and application-journal index
@@ -3728,6 +3816,14 @@ pub enum QualificationNodeReply {
     SecurityMetrics {
         metrics: QualificationSecurityMetricsSnapshot,
     },
+    /// Bound listener address and opaque exact scope for the test-only
+    /// stateless consumer endpoint.
+    StatelessConsumerStarted {
+        bind_addr: SocketAddr,
+        scope: SessionConsumerScope,
+    },
+    /// A one-shot post-dispatch ambiguous-outcome simulation was armed.
+    StatelessConsumerOutcomeUnknownArmed,
     TrafficStatus {
         status: QualificationTrafficStatus,
     },
@@ -4509,6 +4605,16 @@ mod tests {
             QualificationNodeCommand::SetConsensusRpcAvailability {
                 availability: QualificationConsensusRpcAvailability::Available,
             },
+            QualificationNodeCommand::StartStatelessConsumer {
+                consumer_identities: (0..12)
+                    .map(|index| {
+                        format!(
+                            "spiffe://qualification.invalid/tenant/test/ns/test/sa/session-consumer/nf/test/instance/{index}"
+                        )
+                    })
+                    .collect(),
+            },
+            QualificationNodeCommand::ArmStatelessConsumerOutcomeUnknown,
             QualificationNodeCommand::SecurityMetrics,
             QualificationNodeCommand::StartTrafficWatch,
             QualificationNodeCommand::ReconcileTrafficWatch,

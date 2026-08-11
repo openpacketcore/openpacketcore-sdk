@@ -103,10 +103,11 @@ cap of 128 rather than that planning estimate.
 
 The election range is `[5,000 ms, 8,000 ms)`, the session/config operation
 default is 10,000 ms, and listener idle/handler ceilings are 30,000 ms.
-The exact consensus contract is transport/wire-schema revision 3 and error-set
-revision 5. Revision 3 adds the bounded topology-admission barrier family;
-error revision 5 adds the typed `TopologyAuthorityRevoked` rejection. Revision
-2/error revision 4 or older peers fail before dispatch;
+The exact consensus contract is transport/wire-schema revision 4 and error-set
+revision 6. Revision 4 makes the forwarded consumer scope explicit, so a peer
+cannot silently downgrade a consumer-scoped operation to an internal call;
+error revision 6 binds that semantic boundary into the exact profile. Revision
+3/error revision 5 or older peers fail before dispatch;
 upgrade every consensus member together while traffic and writers are drained.
 This is not a rolling mixed-profile transition.
 

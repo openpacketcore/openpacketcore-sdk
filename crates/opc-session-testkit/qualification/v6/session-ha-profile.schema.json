@@ -175,7 +175,8 @@
         "min_frame_bytes",
         "max_frame_bytes",
         "max_rpc_payload_bytes",
-        "legacy_direct_backend_enabled"
+        "legacy_direct_backend_enabled",
+        "stateless_consumer"
       ],
       "properties": {
         "consensus_alpn": { "type": "string", "minLength": 1, "maxLength": 128 },
@@ -186,7 +187,63 @@
         "min_frame_bytes": { "type": "integer", "minimum": 1 },
         "max_frame_bytes": { "type": "integer", "minimum": 1 },
         "max_rpc_payload_bytes": { "type": "integer", "minimum": 1 },
-        "legacy_direct_backend_enabled": { "const": false }
+        "legacy_direct_backend_enabled": { "const": false },
+        "stateless_consumer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "alpn",
+            "transport_revision",
+            "fallback_or_dual_mode_enabled",
+            "max_requests_per_connection",
+            "default_max_connections",
+            "min_response_frame_bytes",
+            "max_frame_bytes",
+            "default_idle_timeout_millis",
+            "default_operation_timeout_millis",
+            "request_id_bytes",
+            "max_consumer_identity_bytes",
+            "max_batch_operations",
+            "max_batch_response_bytes",
+            "max_store_watch_buffer_bytes",
+            "watch_channel_capacity",
+            "watch_channel_max_bytes",
+            "watch_cancellation_recheck_millis",
+            "watch_delivery_tasks_per_watch",
+            "default_listener_connection_task_limit",
+            "default_max_authentication_age_millis",
+            "default_rotation_drain_window_millis",
+            "default_reconnect_backoff_min_millis",
+            "default_reconnect_backoff_max_millis",
+            "default_rotation_jitter_millis"
+          ],
+          "properties": {
+            "alpn": { "const": "opc-session-consumer/1" },
+            "transport_revision": { "const": 1 },
+            "fallback_or_dual_mode_enabled": { "const": false },
+            "max_requests_per_connection": { "const": 1 },
+            "default_max_connections": { "const": 256 },
+            "min_response_frame_bytes": { "const": 8392704 },
+            "max_frame_bytes": { "const": 16777216 },
+            "default_idle_timeout_millis": { "const": 5000 },
+            "default_operation_timeout_millis": { "const": 10000 },
+            "request_id_bytes": { "const": 16 },
+            "max_consumer_identity_bytes": { "const": 253 },
+            "max_batch_operations": { "const": 256 },
+            "max_batch_response_bytes": { "const": 8388608 },
+            "max_store_watch_buffer_bytes": { "const": 262144 },
+            "watch_channel_capacity": { "const": 64 },
+            "watch_channel_max_bytes": { "const": 524288 },
+            "watch_cancellation_recheck_millis": { "const": 50 },
+            "watch_delivery_tasks_per_watch": { "const": 1 },
+            "default_listener_connection_task_limit": { "const": 256 },
+            "default_max_authentication_age_millis": { "const": 900000 },
+            "default_rotation_drain_window_millis": { "const": 30000 },
+            "default_reconnect_backoff_min_millis": { "const": 50 },
+            "default_reconnect_backoff_max_millis": { "const": 1000 },
+            "default_rotation_jitter_millis": { "const": 30000 }
+          }
+        }
       }
     },
     "consensus_timing": {

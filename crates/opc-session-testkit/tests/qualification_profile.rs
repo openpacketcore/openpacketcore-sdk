@@ -5,17 +5,23 @@ use std::process::{Command, Output};
 
 use opc_consensus::{DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_PROFILE};
 use opc_session_net::{
-    CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE, MAX_NEGOTIATED_FRAME_SIZE,
-    MIN_SESSION_CONSENSUS_FRAME_SIZE, SESSION_CONSENSUS_ALPN, SESSION_CONSENSUS_TRANSPORT_REVISION,
+    CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE, DEFAULT_MAX_AUTHENTICATION_AGE,
+    DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW,
+    DEFAULT_ROTATION_JITTER, MAX_NEGOTIATED_FRAME_SIZE,
+    MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION, MIN_SESSION_CONSENSUS_FRAME_SIZE,
+    SESSION_CONSENSUS_ALPN, SESSION_CONSENSUS_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_ALPN,
+    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, MAX_REPLICATION_LOG_PAGE_ENTRIES,
     MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
-    MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, MAX_SESSION_TTL, QUORUM_TOPOLOGY_MAX_MEMBERS,
-    REPLICATION_TX_ID_MAX_BYTES, RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE,
-    RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES, RESTORE_SCAN_MAX_PAGE_SIZE,
-    RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
-    SESSION_CONSENSUS_SCHEMA_VERSION, STABLE_ID_MAX_BYTES,
+    MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, MAX_SESSION_CONSUMER_BATCH_OPERATIONS,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES,
+    MAX_SESSION_TTL, QUORUM_TOPOLOGY_MAX_MEMBERS, REPLICATION_TX_ID_MAX_BYTES,
+    RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+    RESTORE_SCAN_MAX_PAGE_SIZE, RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
+    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
+    SESSION_CONSUMER_IDENTITY_MAX_BYTES, SESSION_CONSUMER_REQUEST_ID_BYTES, STABLE_ID_MAX_BYTES,
 };
 use opc_session_testkit::qualification::{
     session_mtls_candidate_evidence_v2_schema_sha256, session_mtls_candidate_schedule_sha256,
@@ -566,6 +572,72 @@ fn current_v6_profile_matches_its_declared_consensus_and_store_contract() {
         SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES
     );
     assert!(!profile.protocol.legacy_direct_backend_enabled);
+
+    let consumer = profile
+        .protocol
+        .stateless_consumer
+        .as_ref()
+        .expect("current v6 profile has the stateless consumer contract");
+    assert_eq!(consumer.alpn.as_bytes(), SESSION_QUORUM_CONSUMER_ALPN);
+    assert_eq!(
+        consumer.transport_revision,
+        SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION
+    );
+    assert!(!consumer.fallback_or_dual_mode_enabled);
+    assert_eq!(
+        consumer.max_requests_per_connection,
+        MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION
+    );
+    assert_eq!(consumer.default_max_connections, 256);
+    assert_eq!(
+        consumer.min_response_frame_bytes,
+        MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES + 4 * 1024
+    );
+    assert_eq!(consumer.max_frame_bytes, MAX_NEGOTIATED_FRAME_SIZE);
+    assert_eq!(consumer.default_idle_timeout_millis, 5_000);
+    assert_eq!(consumer.default_operation_timeout_millis, 10_000);
+    assert_eq!(consumer.request_id_bytes, SESSION_CONSUMER_REQUEST_ID_BYTES);
+    assert_eq!(
+        consumer.max_consumer_identity_bytes,
+        SESSION_CONSUMER_IDENTITY_MAX_BYTES
+    );
+    assert_eq!(
+        consumer.max_batch_operations,
+        MAX_SESSION_CONSUMER_BATCH_OPERATIONS
+    );
+    assert_eq!(
+        consumer.max_batch_response_bytes,
+        MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES
+    );
+    assert_eq!(
+        consumer.max_store_watch_buffer_bytes,
+        MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES
+    );
+    assert_eq!(consumer.watch_channel_capacity, 64);
+    assert_eq!(consumer.watch_channel_max_bytes, 512 * 1024);
+    assert_eq!(consumer.watch_cancellation_recheck_millis, 50);
+    assert_eq!(consumer.watch_delivery_tasks_per_watch, 1);
+    assert_eq!(consumer.default_listener_connection_task_limit, 256);
+    assert_eq!(
+        consumer.default_max_authentication_age_millis,
+        DEFAULT_MAX_AUTHENTICATION_AGE.as_millis() as u64
+    );
+    assert_eq!(
+        consumer.default_rotation_drain_window_millis,
+        DEFAULT_ROTATION_DRAIN_WINDOW.as_millis() as u64
+    );
+    assert_eq!(
+        consumer.default_reconnect_backoff_min_millis,
+        DEFAULT_RECONNECT_BACKOFF_MIN.as_millis() as u64
+    );
+    assert_eq!(
+        consumer.default_reconnect_backoff_max_millis,
+        DEFAULT_RECONNECT_BACKOFF_MAX.as_millis() as u64
+    );
+    assert_eq!(
+        consumer.default_rotation_jitter_millis,
+        DEFAULT_ROTATION_JITTER.as_millis() as u64
+    );
 
     let timing = DURABLE_CONSENSUS_TIMING_PROFILE;
     assert_eq!(

@@ -1112,6 +1112,8 @@ pub(crate) struct SqliteConsensusCore {
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
     pub(crate) applied_progress: tokio::sync::watch::Sender<Option<LogId<SessionConsensusNodeId>>>,
     pub(crate) watchers: Arc<tokio::sync::Mutex<Vec<crate::replication_watch::ReplicationWatcher>>>,
+    pub(crate) consumer_watchers:
+        Arc<tokio::sync::Mutex<Vec<crate::replication_watch::ConsumerReplicationWatcher>>>,
     #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
 }
@@ -1201,6 +1203,7 @@ impl SqliteConsensusCore {
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
             applied_progress,
             watchers: Arc::clone(&backend.watchers),
+            consumer_watchers: Arc::clone(&backend.consumer_watchers),
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
         })
@@ -4706,22 +4709,19 @@ impl MembershipLogProjection {
             EntryPayload::Normal(command) => {
                 let digest = payload_digest(command)?;
                 let request_id = *command.request_id.as_bytes();
-                if let Some(projected) = self.projected_requests.get(&request_id) {
-                    return if projected == &digest {
-                        Ok(())
-                    } else {
-                        Err(invalid_data(
-                            "projected session consensus request ID was reused",
-                        ))
-                    };
+                if self.projected_requests.contains_key(&request_id) {
+                    // A request-ID collision is a valid, deterministically
+                    // rejected command. The state-machine apply path returns
+                    // `CasIdempotencyConflict`; treating the log as corrupt
+                    // here would instead turn untrusted caller reuse into a
+                    // replica-fatal storage error.
+                    return Ok(());
                 }
                 if let Some((persisted, _)) =
                     read_outcome_sync(conn, storage_identity, command.request_id)?
                 {
                     if persisted != digest {
-                        return Err(invalid_data(
-                            "persisted session consensus request ID was reused",
-                        ));
+                        return Ok(());
                     }
                     self.projected_requests.insert(request_id, digest);
                     return Ok(());
@@ -5034,6 +5034,8 @@ impl MembershipLogProjection {
                 Ok(())
             }
             SessionMutationIntent::AdvanceLogicalTime
+            | SessionMutationIntent::BindConsumerRequest { .. }
+            | SessionMutationIntent::ReadConsumerRecord { .. }
             | SessionMutationIntent::CompareAndSet(_)
             | SessionMutationIntent::DeleteFenced(_)
             | SessionMutationIntent::RefreshTtl { .. }
@@ -6074,7 +6076,14 @@ fn execute_application_intent_sync(
     logical_time: Timestamp,
 ) -> Result<(SessionMutationOutcome, Option<ReplicationOp>), StoreError> {
     match intent {
-        SessionMutationIntent::AdvanceLogicalTime => Ok((SessionMutationOutcome::Unit, None)),
+        SessionMutationIntent::AdvanceLogicalTime
+        | SessionMutationIntent::BindConsumerRequest { .. } => {
+            Ok((SessionMutationOutcome::Unit, None))
+        }
+        SessionMutationIntent::ReadConsumerRecord { key } => Ok((
+            SessionMutationOutcome::ConsumerRecord(ops::get_sync(conn, key, logical_time)?),
+            None,
+        )),
         SessionMutationIntent::CompareAndSet(op) => {
             if op.new_record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
                 return Err(StoreError::Serialization(
@@ -6483,11 +6492,25 @@ pub(crate) fn apply_entries_sync(
                     read_outcome_sync(&tx, identity, command.request_id)?
                 {
                     if persisted_digest != digest {
-                        return Err(invalid_data(
-                            "session consensus request ID was reused with another payload",
-                        ));
+                        // A caller can reuse an opaque durable request ID with
+                        // another payload. That must be a closed domain
+                        // conflict, never a storage fault that prevents the
+                        // replicated log from applying.
+                        SessionConsensusResponse {
+                            result: Err(StoreError::CasIdempotencyConflict),
+                            // This log entry is committed but intentionally
+                            // has no application effect. Return the last
+                            // committed state metadata so callers can prove
+                            // it is a durable conflict rather than a local
+                            // preproposal rejection.
+                            sequence: machine.0,
+                            digest: Some(machine.1),
+                            logical_time: machine.2,
+                            raft_log_index: entry.log_id.index,
+                        }
+                    } else {
+                        persisted_response
                     }
-                    persisted_response
                 } else {
                     let sequence = machine.0.checked_add(1).ok_or_else(|| {
                         invalid_data("session consensus application sequence exhausted")
@@ -10087,7 +10110,7 @@ mod tests {
             })
         ));
 
-        let error = apply_entries_sync(
+        let conflict = apply_entries_sync(
             &conn,
             storage_identity,
             &backend.caps,
@@ -10098,15 +10121,25 @@ mod tests {
                 identity_at(2, 0x5c),
             )],
         )
-        .expect_err("a new authority epoch must not recover the old outcome");
-        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        .expect("a request-ID collision is a durable domain conflict");
+        assert!(matches!(
+            conflict.responses.last(),
+            Some(SessionConsensusResponse {
+                result: Err(StoreError::CasIdempotencyConflict),
+                ..
+            })
+        ));
         assert_eq!(
-            "session consensus request ID was reused with another payload",
-            error.to_string()
+            Some(log_id(2)),
+            read_applied_sync(&conn, storage_identity)
+                .expect("the closed conflict is durably applied")
         );
         assert_eq!(
-            Some(log_id(1)),
-            read_applied_sync(&conn, storage_identity).expect("applied index remains fenced")
+            1_i64,
+            conn.query_row("SELECT COUNT(*) FROM leases", [], |row| row
+                .get::<_, i64>(0))
+                .expect("count unchanged leases"),
+            "the new authority epoch must not recover or repeat the old effect"
         );
     }
 }

@@ -32,6 +32,7 @@ pub mod backend;
 pub mod capability;
 pub mod clock;
 pub mod consensus;
+pub mod consumer;
 pub mod error;
 pub mod fake;
 pub mod handover;
@@ -77,18 +78,30 @@ pub use capability::{
 };
 pub use clock::{Clock, MonotonicClock, SystemClock, TokioVirtualClock};
 pub use consensus::{
-    ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusClusterId,
-    SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-    SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusIdentityError,
-    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpc,
-    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusStatus,
-    SessionConsensusStorageAnchor, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionMutationIntent, SessionMutationOutcome, SessionTopologyCandidateBootstrap,
-    SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
-    SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
-    SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    ConsensusSessionConsumerService, ConsensusSessionStore, ConsensusSessionStoreOpenError,
+    SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
+    SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusIdentity,
+    SessionConsensusIdentityError, SessionConsensusNodeId, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusRequestId, SessionConsensusResponse,
+    SessionConsensusRpc, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
+    SessionConsensusStatus, SessionConsensusStorageAnchor, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionMutationIntent, SessionMutationOutcome,
+    SessionTopologyCandidateBootstrap, SessionTopologyTransitionPeers,
+    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
+    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
+    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
+};
+pub use consumer::{
+    derive_consumer_consensus_request_id, session_consumer_batch_result,
+    session_consumer_batch_result_into_store, SessionConsumerAuthorizationManifest,
+    SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerChangeItem,
+    SessionConsumerChangeKind, SessionConsumerIdentity, SessionConsumerIdentityError,
+    SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+    SessionQuorumConsumer, StatelessSessionConsumer, MAX_SESSION_CONSUMER_BATCH_OPERATIONS,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES,
+    SESSION_CONSUMER_IDENTITY_MAX_BYTES, SESSION_CONSUMER_REQUEST_ID_BYTES,
 };
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;

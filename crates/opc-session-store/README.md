@@ -497,10 +497,11 @@ cluster, configuration digest, epoch, peer role, and fresh challenge must all
 agree before an Openraft RPC is dispatched. Resolver or DNS aliases change
 only the dial address; a bare self ID such as `epdg-app-0` can correctly name
 the member whose route is an FQDN because the SDK never compares those strings.
-The exact consensus contract uses transport/wire-schema revision 3 and
-error-set revision 5. Revision 3 adds the bounded topology-admission barrier,
-and error revision 5 adds `TopologyAuthorityRevoked`.
-Revision 2/error revision 4 or older fails before dispatch. Drain traffic and
+The exact consensus contract uses transport/wire-schema revision 4 and
+error-set revision 6. Revision 4 makes the forwarded consumer scope explicit,
+so a peer cannot silently downgrade a consumer-scoped operation to an internal
+call; error revision 6 binds that semantic boundary into the exact profile.
+Revision 3/error revision 5 or older fails before dispatch. Drain traffic and
 writers, then stop and upgrade every consensus member together; mixed-profile
 rolling operation is unsupported.
 

@@ -900,6 +900,25 @@ async fn notify_watchers(core: &SqliteConsensusCore, notifications: &[Replicatio
     for notification in notifications {
         watchers.retain_mut(|watcher| watcher.notify(notification));
     }
+    drop(watchers);
+
+    let mut consumer_watchers = core.consumer_watchers.lock().await;
+    for notification in notifications {
+        let projected = crate::consumer::session_consumer_change(notification);
+        let Ok(projected) = projected else {
+            // Invalid replay shape cannot be safely projected. Closing the
+            // affected consumers forces coherent catch-up instead of exposing
+            // raw state or retaining it in an unbounded queue.
+            consumer_watchers.clear();
+            return;
+        };
+        let Ok(encoded_bytes) = crate::consumer::session_consumer_change_encoded_bytes(&projected)
+        else {
+            consumer_watchers.clear();
+            return;
+        };
+        consumer_watchers.retain_mut(|watcher| watcher.notify(&projected, encoded_bytes));
+    }
 }
 
 async fn seal_snapshot_database(

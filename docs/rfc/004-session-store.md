@@ -1364,10 +1364,12 @@ replication append, or rebuild request. The consensus ALPN and legacy
 `opc-session-net/5` ALPN MUST NOT be multiplexed as equivalent authority on one
 production listener.
 
-The exact consensus contract profile MUST use transport/wire-schema revision 3
-and error-set revision 5. Revision 3 adds the bounded topology-admission
-barrier family; error revision 5 adds `TopologyAuthorityRevoked`. Revision
-2/error revision 4 or older MUST fail before engine dispatch.
+The exact consensus contract profile MUST use transport/wire-schema revision 4
+and error-set revision 6. Revision 4 makes the forwarded consumer scope
+explicit, so a peer cannot silently downgrade a consumer-scoped operation to
+an internal call; error revision 6 binds that semantic boundary into the
+exact profile. Revision 3/error revision 5 or older MUST fail before engine
+dispatch.
 Operators MUST drain traffic and writers, stop every consensus member, upgrade
 the full membership together, verify exact-profile handshakes, and only then
 restore traffic. Mixed-profile rolling operation is unsupported.
@@ -1535,6 +1537,69 @@ resources, soak, remote HKMS, deployed CNFs, and signed release evidence under
 #164/#143. The lack of immediate generic CRL, OCSP, or
 certificate/identity-denylist revocation MUST remain explicit. #158 remains the
 umbrella until that fleet evidence passes.
+
+### 12.5 Stateless Session-Quorum Consumer Transport
+
+`StatelessSessionConsumerClient` and `SessionQuorumConsumerServer` provide the
+only production application-consumer boundary. They MUST use mutual TLS and
+the dedicated `opc-session-consumer/1` ALPN with transport revision 1. This is
+a separate exact protocol from both `opc-session-consensus/2` and the
+quarantined `opc-session-net/5` compatibility protocol. A listener MUST NOT
+offer a fallback, negotiate a common revision, or multiplex either other
+protocol as equivalent consumer authority. Because this SDK is unreleased,
+deployments MUST make a coordinated cutover to this final boundary; dual-mode
+or compatibility consumer operation is unsupported.
+
+The consumer listener authenticates the peer from the live mTLS connection and
+authorizes it only through the store-issued current-member manifest and the
+configured consumer allow-list. Consensus-member identities are excluded from
+the consumer role. Every bootstrap and request carries the exact
+cluster/configuration/epoch scope, which the listener and quorum-side service
+MUST verify before backend work. Consumer identity and scope values are
+security-sensitive: diagnostics, profile inventories, and observability MUST
+record only redaction-safe status/count information, never their concrete
+values.
+
+The API exposes typed session reads, bounded mutation/lease operations,
+bounded restore scans, capability discovery, and a coarse committed-change
+watch. It does not expose membership, voting, peer discovery, replication-log
+read/append, raw replication operation trees, snapshots, rebuild/recovery, or
+any topology/consensus authority. The server constructor accepts only the
+`SessionQuorumConsumer` port, and all accepted mutations route through the
+durable quorum leader path.
+
+Each normal connection processes exactly one application request. The default
+listener limit is 256 live connections and its retained connection-task set is
+bounded by that limit; each watch owns one delivery task. Consumer frames are
+at most 16 MiB and a configured listener frame limit cannot be lower than the
+8 MiB batch-response limit plus 4 KiB framing allowance. The default bootstrap
+and active-frame idle bound is 5 seconds and one complete request/response
+operation has a 10-second deadline. A watch has a 64-item, 512 KiB transport
+queue, rechecks cancellation at least every 50 ms, and is also bounded by the
+256 KiB store-side projection buffer. The fixed request identity is 16 bytes;
+consumer identity input is capped at 253 UTF-8 bytes; one batch has at most
+256 operations and retains at most 8 MiB of serialized response data.
+
+Every client and listener applies the finite `ConnectionLifecyclePolicy`: by
+default authentication age is at most 15 minutes, retirement drain is at most
+30 seconds, reconnect backoff is 50 ms through 1 second, and material-rotation
+jitter is at most 30 seconds. Reauthentication, material changes, certificate
+expiry, idle retirement, cancellation, malformed frames, EOF, or an uncertain
+stream position terminate the connection/watch and release its transport task
+slot; they do not create another request on that connection.
+
+The caller owns the request ID for every mutation or lease operation. If a
+request can have crossed the durable effect point without a complete response,
+the outcome is ambiguous. The SDK MUST NOT automatically replay it or mint a
+new request ID. Recovery may retry only the identical request body under the
+retained ID, which resolves through the durable request binding; reuse of that
+ID for a different request is a closed conflict. Applications otherwise must
+perform authoritative readback and apply the existing fencing/idempotency
+contract.
+
+The v6 qualification profile records this dedicated ALPN/revision and the
+connection, frame, request/response, watch, task, and lifecycle limits beside
+the consensus profile. It records no consumer identity or scope material.
 
 ## 13. Local Cache
 

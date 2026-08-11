@@ -454,7 +454,7 @@ impl std::fmt::Debug for EncryptedSessionPayload {
 }
 
 /// Persistent representation of a session record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSessionRecord {
     /// Tenant- and type-scoped identity of the session this record belongs
     /// to; must match the key the record is stored under.
@@ -488,6 +488,16 @@ pub struct StoredSessionRecord {
     /// Payload bytes, either caller-facing plaintext or a sealed envelope
     /// depending on `EncryptedSessionPayload::encoding`.
     pub payload: EncryptedSessionPayload,
+}
+
+// Records cross application and consumer boundaries. Keep their persisted
+// identity, ownership, fencing, expiry, and protected payload out of generic
+// diagnostics so enclosing consumer responses cannot reintroduce data that
+// their own `Debug` implementations deliberately redact.
+impl std::fmt::Debug for StoredSessionRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StoredSessionRecord(<redacted>)")
+    }
 }
 
 impl StoredSessionRecord {
