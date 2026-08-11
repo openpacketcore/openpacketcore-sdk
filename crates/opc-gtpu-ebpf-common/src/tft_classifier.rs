@@ -1656,6 +1656,9 @@ pub const fn tft_classifier_schema_is_current(
         && value[15] == 0
 }
 
+// Keep fixed-size scans in a register-only eBPF subprogram. Inlining this loop
+// makes LLVM spill map bytes into the `bpf_loop` callback's verifier frame.
+#[inline(never)]
 const fn bytes_are_zero<const N: usize>(value: &[u8; N]) -> bool {
     let mut index = 0;
     while index < N {
@@ -1667,6 +1670,8 @@ const fn bytes_are_zero<const N: usize>(value: &[u8; N]) -> bool {
     true
 }
 
+// See `bytes_are_zero`: callers share the same 512-byte verifier stack limit.
+#[inline(never)]
 const fn bytes_equal<const N: usize>(left: &[u8; N], right: &[u8; N]) -> bool {
     let mut index = 0;
     while index < N {

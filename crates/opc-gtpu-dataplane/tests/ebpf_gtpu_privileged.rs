@@ -2371,7 +2371,8 @@ fn receive_tft_uplink_teid(socket: &UdpSocket, expected_teid: u32, payload_senti
     );
     assert!(
         buffer[..length].ends_with(payload_sentinel),
-        "selected G-PDU must contain the submitted flow sentinel"
+        "selected G-PDU must contain the submitted flow sentinel: expected={payload_sentinel:?}, tail={:?}",
+        &buffer[length.saturating_sub(64)..length],
     );
 }
 
@@ -6364,7 +6365,7 @@ async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
         send_udp(source_port, destination_port, tos, sentinel);
         receive_tft_uplink_teid(&pgw_socket, expected_teid, sentinel);
     }
-    let esp_sentinel = 0x1020_3040_u32.to_be_bytes();
+    let esp_sentinel = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
     let mut esp_packet = vec![0_u8; IPV4_MIN_HDR_LEN + 8];
     esp_packet[0] = 0x45;
     let esp_packet_len = u16::try_from(esp_packet.len()).expect("bounded ESP packet length");
@@ -6373,7 +6374,7 @@ async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
     esp_packet[9] = IPPROTO_ESP;
     esp_packet[12..16].copy_from_slice(&UE_PAA.octets());
     esp_packet[16..20].copy_from_slice(&REMOTE_HOST.octets());
-    esp_packet[20..24].copy_from_slice(&esp_sentinel);
+    esp_packet[20..28].copy_from_slice(&esp_sentinel);
     let mut esp_header = [0_u8; IPV4_MIN_HDR_LEN];
     esp_header.copy_from_slice(&esp_packet[..IPV4_MIN_HDR_LEN]);
     esp_packet[10..12].copy_from_slice(&ipv4_header_checksum(&esp_header).to_be_bytes());
