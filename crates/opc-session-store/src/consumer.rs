@@ -923,10 +923,10 @@ pub fn derive_consumer_consensus_request_id(
 }
 
 /// Marker imported by stateless clients to make accidental use of
-/// [`SessionBackend`] explicit at composition time.
+/// [`crate::SessionBackend`] explicit at composition time.
 ///
 /// A consumer client deliberately composes the application subset instead of
-/// implementing `SessionBackend` or `SessionLeaseManager`: the former carries
+/// implementing `SessionBackend` or [`crate::SessionLeaseManager`]: the former carries
 /// legacy replication reconstruction authority and the latter would hide
 /// freshly generated retry IDs. Lease calls on this boundary therefore always
 /// require a caller-owned [`SessionConsumerRequestId`].
