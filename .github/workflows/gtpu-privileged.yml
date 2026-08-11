@@ -811,13 +811,17 @@ jobs:
             # Private verifier-bounded subprograms retain local linkage. Rust
             # therefore gives them v0-mangled symbols whose crate-disambiguator
             # prefixes can differ across source roots. Normalize only that
-            # non-ABI prefix while preserving the complete module/function
-            # suffix, then require every packet-path helper explicitly below.
+            # non-ABI prefix and LLVM's content-addressed anonymous-object
+            # suffix while preserving the complete module/function suffix,
+            # then require every packet-path helper explicitly below. Exact
+            # functional section bytes and relocation locations remain gated
+            # separately below.
             readelf -sW "$1" | awk '
               $4 == "FUNC" || $4 == "OBJECT" {
                 name = $8
                 gsub(/C[^_]+_17opc_gtpu_datapath/, "C<crate>_17opc_gtpu_datapath", name)
                 gsub(/C[^_]+_20opc_gtpu_ebpf_common/, "C<crate>_20opc_gtpu_ebpf_common", name)
+                gsub(/anon\.[[:xdigit:]]+\.0/, "anon.<hash>.0", name)
                 print $4, name
               }
             ' | sort
@@ -904,6 +908,7 @@ jobs:
                 }
                 gsub(/_RNvC[^_]+_17opc_gtpu_datapath/, "_RNvC<crate>_17opc_gtpu_datapath", line)
                 gsub(/_RNvC[^_]+_20opc_gtpu_ebpf_common/, "_RNvC<crate>_20opc_gtpu_ebpf_common", line)
+                gsub(/anon\.[[:xdigit:]]+\.0/, "anon.<hash>.0", line)
                 print line
               }
             '

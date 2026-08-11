@@ -1354,17 +1354,27 @@ impl fmt::Debug for TftClassifierFilter {
 /// Parsed inner IPv4 fields used by the supported TFT component set.
 ///
 /// It intentionally has no `Debug` implementation so raw packet values are
-/// not accidentally emitted by diagnostics.
+/// not accidentally emitted by diagnostics. Every field is an explicit byte
+/// array or byte flag: this value crosses the `bpf_loop` callback boundary, so
+/// Rust enum niches or padding would otherwise leave bytes unreadable to the
+/// kernel verifier even when their logical `Option` is `None`.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct TftClassifierIpv4Packet {
     local_address: [u8; 4],
     remote_address: [u8; 4],
+    local_port: [u8; 2],
+    remote_port: [u8; 2],
+    esp_spi: [u8; 4],
     protocol: u8,
     tos: u8,
-    local_port: Option<u16>,
-    remote_port: Option<u16>,
-    esp_spi: Option<u32>,
+    present: u8,
+    reserved: u8,
 }
+
+const PACKET_HAS_LOCAL_PORT: u8 = 1 << 0;
+const PACKET_HAS_REMOTE_PORT: u8 = 1 << 1;
+const PACKET_HAS_ESP_SPI: u8 = 1 << 2;
 
 impl TftClassifierIpv4Packet {
     /// Construct a packet view after a boundary has completed strict parsing.
@@ -1378,15 +1388,51 @@ impl TftClassifierIpv4Packet {
         remote_port: Option<u16>,
         esp_spi: Option<u32>,
     ) -> Self {
+        let mut present = 0;
+        let local_port = match local_port {
+            Some(port) => {
+                present |= PACKET_HAS_LOCAL_PORT;
+                port.to_be_bytes()
+            }
+            None => [0; 2],
+        };
+        let remote_port = match remote_port {
+            Some(port) => {
+                present |= PACKET_HAS_REMOTE_PORT;
+                port.to_be_bytes()
+            }
+            None => [0; 2],
+        };
+        let esp_spi = match esp_spi {
+            Some(spi) => {
+                present |= PACKET_HAS_ESP_SPI;
+                spi.to_be_bytes()
+            }
+            None => [0; 4],
+        };
         Self {
             local_address,
             remote_address,
-            protocol,
-            tos,
             local_port,
             remote_port,
             esp_spi,
+            protocol,
+            tos,
+            present,
+            reserved: 0,
         }
+    }
+
+    const fn has_local_port(&self) -> bool {
+        self.present & PACKET_HAS_LOCAL_PORT != 0
+    }
+
+    const fn has_remote_port(&self) -> bool {
+        self.present & PACKET_HAS_REMOTE_PORT != 0
+    }
+
+    const fn has_esp_spi(&self) -> bool {
+        self.present & PACKET_HAS_ESP_SPI != 0
     }
 
     /// Strictly parse one exact inner IPv4 packet.
@@ -1483,27 +1529,21 @@ pub const fn tft_classifier_filter_matches(
                 filter.remote_mask,
             ))
         && (!filter.has_local_port()
-            || match packet.local_port {
-                Some(port) => {
-                    port >= u16::from_be_bytes(filter.local_port_first)
-                        && port <= u16::from_be_bytes(filter.local_port_last)
-                }
-                None => false,
-            })
+            || (packet.has_local_port()
+                && u16::from_be_bytes(packet.local_port)
+                    >= u16::from_be_bytes(filter.local_port_first)
+                && u16::from_be_bytes(packet.local_port)
+                    <= u16::from_be_bytes(filter.local_port_last)))
         && (!filter.has_remote_port()
-            || match packet.remote_port {
-                Some(port) => {
-                    port >= u16::from_be_bytes(filter.remote_port_first)
-                        && port <= u16::from_be_bytes(filter.remote_port_last)
-                }
-                None => false,
-            })
+            || (packet.has_remote_port()
+                && u16::from_be_bytes(packet.remote_port)
+                    >= u16::from_be_bytes(filter.remote_port_first)
+                && u16::from_be_bytes(packet.remote_port)
+                    <= u16::from_be_bytes(filter.remote_port_last)))
         && (!filter.has_tos() || packet.tos & filter.tos_mask == filter.tos_value & filter.tos_mask)
         && (!filter.has_esp_spi()
-            || match packet.esp_spi {
-                Some(spi) => spi == u32::from_be_bytes(filter.esp_spi),
-                None => false,
-            })
+            || (packet.has_esp_spi()
+                && u32::from_be_bytes(packet.esp_spi) == u32::from_be_bytes(filter.esp_spi)))
 }
 
 /// Value-independent result of selecting a complete active snapshot.
@@ -1634,6 +1674,8 @@ const _: [(); TFT_CLASSIFIER_FILTER_KEY_LEN] = [(); core::mem::size_of::<TftClas
 const _: [(); 1] = [(); core::mem::align_of::<TftClassifierFilterKey>()];
 const _: [(); TFT_CLASSIFIER_FILTER_VALUE_LEN] = [(); core::mem::size_of::<TftClassifierFilter>()];
 const _: [(); 1] = [(); core::mem::align_of::<TftClassifierFilter>()];
+const _: [(); 20] = [(); core::mem::size_of::<TftClassifierIpv4Packet>()];
+const _: [(); 1] = [(); core::mem::align_of::<TftClassifierIpv4Packet>()];
 
 #[cfg(test)]
 mod tests {
@@ -1649,6 +1691,19 @@ mod tests {
 
     fn fingerprint() -> [u8; TFT_CLASSIFIER_FINGERPRINT_LEN] {
         [9; TFT_CLASSIFIER_FINGERPRINT_LEN]
+    }
+
+    #[test]
+    fn callback_packet_has_no_padding_and_zeroes_absent_payloads() {
+        let packet =
+            TftClassifierIpv4Packet::new([10, 45, 0, 2], [192, 0, 2, 1], 1, 0, None, None, None);
+        assert_eq!(core::mem::size_of::<TftClassifierIpv4Packet>(), 20);
+        assert_eq!(core::mem::align_of::<TftClassifierIpv4Packet>(), 1);
+        assert_eq!(packet.local_port, [0; 2]);
+        assert_eq!(packet.remote_port, [0; 2]);
+        assert_eq!(packet.esp_spi, [0; 4]);
+        assert_eq!(packet.present, 0);
+        assert_eq!(packet.reserved, 0);
     }
 
     fn key() -> TftClassifierKey {
