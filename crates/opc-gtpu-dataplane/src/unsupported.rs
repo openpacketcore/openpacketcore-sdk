@@ -76,4 +76,22 @@ mod tests {
         assert!(!probe.net_admin_capable);
         assert!(!probe.mutation_ready);
     }
+
+    #[test]
+    fn unsupported_backend_rejects_classifier_validation() {
+        let backend = UnsupportedGtpuDataplaneBackend::new();
+        let classifier = crate::TftUplinkClassifier::new(
+            7,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 23, 0, 2)),
+            vec![crate::TftUplinkBearer::default_bearer()],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            backend.validate_tft_uplink_classifier(&classifier),
+            Err(GtpuError::UnsupportedFeature {
+                feature: "tft_uplink_classification"
+            })
+        ));
+    }
 }

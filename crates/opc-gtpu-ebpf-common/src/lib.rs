@@ -17,6 +17,7 @@ mod envelope;
 mod fragment;
 mod pmtu;
 mod session;
+mod tft_classifier;
 
 pub use envelope::{
     classify_ipv6_extension_step, classify_ipv6_gtpu_ingress, classify_udp_checksum,
@@ -54,6 +55,7 @@ pub use session::{
     GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_IPV4_SLOT, GTPU_SESSION_IPV6_SLOT,
     GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
 };
+pub use tft_classifier::*;
 
 /// GTP-U UDP port (TS 29.281 §4.4.2).
 pub const GTPU_UDP_PORT: u16 = 2152;
@@ -2376,6 +2378,10 @@ mod tests {
             MAP_SESSION_TRANSACTIONS,
             MAP_CONFIG_IPV6,
             MAP_SESSION_SCHEMA,
+            MAP_TFT_CLASSIFIER_SCHEMA,
+            MAP_TFT_CLASSIFIER_META,
+            MAP_TFT_CLASSIFIER_FILTERS,
+            MAP_TFT_CLASSIFIER_COUNTERS,
         ];
         for name in new_names {
             assert!(name.len() <= BPF_OBJ_NAME_VISIBLE_LEN);
@@ -2402,6 +2408,10 @@ mod tests {
             MAP_SESSION_TRANSACTIONS,
             MAP_CONFIG_IPV6,
             MAP_SESSION_SCHEMA,
+            MAP_TFT_CLASSIFIER_SCHEMA,
+            MAP_TFT_CLASSIFIER_META,
+            MAP_TFT_CLASSIFIER_FILTERS,
+            MAP_TFT_CLASSIFIER_COUNTERS,
         ];
         for (index, name) in all_names.iter().enumerate() {
             let name = &name.as_bytes()[..name.len().min(BPF_OBJ_NAME_VISIBLE_LEN)];

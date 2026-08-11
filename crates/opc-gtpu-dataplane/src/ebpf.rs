@@ -43,19 +43,31 @@ use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use opc_gtpu_ebpf_common::{
-    DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress, GtpuOuterFragmentPolicy,
-    GtpuSessionDeviceConfig, GtpuSessionDownlinkKey, GtpuSessionEntry as EbpfSessionEntry,
-    GtpuSessionGeneration, GtpuSessionGroupPhase, GtpuSessionGroupRecord, GtpuSessionGroupRef,
-    GtpuSessionIndexCandidate, GtpuSessionIpFamily, GtpuSessionTransactionId,
-    GtpuSessionTransactionPhase, GtpuSessionTransactionRecord, GtpuSessionUplinkKey,
-    GtpuUplinkMtuPolicy, MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr,
-    PdpContextCommit, UplinkFar, UplinkFarKey, UplinkMtuMapState,
+    tft_classifier_schema_is_current, DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress,
+    GtpuOuterFragmentPolicy, GtpuSessionDeviceConfig, GtpuSessionDownlinkKey,
+    GtpuSessionEntry as EbpfSessionEntry, GtpuSessionGeneration, GtpuSessionGroupPhase,
+    GtpuSessionGroupRecord, GtpuSessionGroupRef, GtpuSessionIndexCandidate, GtpuSessionIpFamily,
+    GtpuSessionTransactionId, GtpuSessionTransactionPhase, GtpuSessionTransactionRecord,
+    GtpuSessionUplinkKey, GtpuUplinkMtuPolicy, MarkedBearerOwner, MarkedBearerOwnerPhase,
+    MarkedDownlinkPdr, PdpContextCommit, TftClassifierFilter, TftClassifierFilterDirection,
+    TftClassifierFilterKey, TftClassifierIpv4Address, TftClassifierIpv4FilterSpec,
+    TftClassifierKey, TftClassifierMeta, TftClassifierOwnerId, TftClassifierPortForm,
+    TftClassifierPortRange, TftClassifierTos, UplinkFar, UplinkFarKey, UplinkMtuMapState,
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, GTPU_SESSION_CONFIG_VALUE_LEN,
     GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
     GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
-    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, UPLINK_DSCP_VALUE_LEN,
-    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
+    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, TFT_CLASSIFIER_ABI_VERSION,
+    TFT_CLASSIFIER_BANKS, TFT_CLASSIFIER_FAMILY_IPV4, TFT_CLASSIFIER_FILTER_KEY_LEN,
+    TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES, TFT_CLASSIFIER_FILTER_VALUE_LEN,
+    TFT_CLASSIFIER_FINGERPRINT_LEN, TFT_CLASSIFIER_KEY_LEN, TFT_CLASSIFIER_MAX_FILTERS,
+    TFT_CLASSIFIER_META_VALUE_LEN, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
+    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
+use opc_proto_tft::{
+    PacketFilter, PacketFilterComponent, PacketFilterDirection, PacketFilterIdentifier, PortRange,
+    TrafficFlowTemplate,
+};
+use sha2::{Digest, Sha256};
 
 use crate::backend::error_proves_no_requested_mutation;
 use crate::model::{classify_dual_selector_state, DualSelectorState};
@@ -72,7 +84,9 @@ use crate::{
     GtpuUplinkChecksumOffloadContract, PdpContextIndeterminateReason, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextReadback, PdpContextReconciliationCapabilities,
     PdpContextRemovalOutcome, PdpContextSelector, PdpContextUplinkSelector,
-    RemovePdpContextRequest, Teid,
+    RemovePdpContextRequest, Teid, TftUplinkBearer, TftUplinkClassifier,
+    TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
+    TftUplinkClassifierRemovalOutcome,
 };
 #[cfg(any(target_os = "linux", test))]
 use crate::{
@@ -548,6 +562,61 @@ pub(crate) enum EbpfMapUpdateMode {
     Exist,
 }
 
+/// Fixed, redaction-safe capacity evidence for the shared-SA TFT filter map.
+///
+/// The raw map never stores more than the ABI-declared bound, but callers
+/// still need an exact preflight count before staging an inactive bank. This
+/// type intentionally exposes no keys, values, owners, or device identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EbpfTftFilterMapCapacity {
+    occupied: u32,
+    maximum: u32,
+}
+
+impl EbpfTftFilterMapCapacity {
+    #[cfg(any(target_os = "linux", test))]
+    const fn new(occupied: u32, maximum: u32) -> Option<Self> {
+        if maximum != 0 && occupied <= maximum {
+            Some(Self { occupied, maximum })
+        } else {
+            None
+        }
+    }
+
+    const fn occupied(self) -> u32 {
+        self.occupied
+    }
+
+    const fn maximum(self) -> u32 {
+        self.maximum
+    }
+}
+
+impl fmt::Debug for EbpfTftFilterMapCapacity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EbpfTftFilterMapCapacity")
+            .field("occupied", &self.occupied)
+            .field("maximum", &self.maximum)
+            .finish()
+    }
+}
+
+/// Opaque authority derived from the exact retained current map/program graph.
+///
+/// This is deliberately private and has no formatting implementation: it is
+/// map state, never subscriber state, and must not escape diagnostics.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EbpfTftAuthority {
+    owner: [u8; 16],
+    owner_generation: u64,
+}
+
+type EbpfTftFilterRecord = (
+    [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+    [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+);
+
 #[derive(Clone, PartialEq, Eq, Default)]
 pub(crate) struct EbpfSessionIndexInventory {
     uplink: Vec<(
@@ -1006,6 +1075,70 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         value: [u8; UPLINK_PMTU_VALUE_LEN],
     ) -> Result<(), GtpuError>;
 
+    /// Read the single current-schema marker slot for the TFT classifier.
+    fn tft_schema_get(
+        &self,
+        ifindex: u32,
+    ) -> Result<[u8; opc_gtpu_ebpf_common::TFT_CLASSIFIER_SCHEMA_VALUE_LEN], GtpuError>;
+
+    /// Read one TFT classifier metadata value by its exact byte key.
+    fn tft_meta_get(
+        &self,
+        ifindex: u32,
+        key: [u8; TFT_CLASSIFIER_KEY_LEN],
+    ) -> Result<Option<[u8; TFT_CLASSIFIER_META_VALUE_LEN]>, GtpuError>;
+
+    /// Atomically create or replace one complete TFT classifier metadata value.
+    fn tft_meta_put(
+        &self,
+        ifindex: u32,
+        key: [u8; TFT_CLASSIFIER_KEY_LEN],
+        value: [u8; TFT_CLASSIFIER_META_VALUE_LEN],
+    ) -> Result<(), GtpuError>;
+
+    /// Delete one TFT classifier metadata value; returns whether it existed.
+    fn tft_meta_remove(
+        &self,
+        ifindex: u32,
+        key: [u8; TFT_CLASSIFIER_KEY_LEN],
+    ) -> Result<bool, GtpuError>;
+
+    /// Enumerate the bounded raw filter records whose first classifier-key
+    /// octets equal `classifier_key`. Malformed key/value bytes are preserved
+    /// so the backend can classify them as indeterminate rather than overlook
+    /// hostile retained map contents.
+    fn tft_filter_inventory(
+        &self,
+        ifindex: u32,
+        classifier_key: [u8; TFT_CLASSIFIER_KEY_LEN],
+    ) -> Result<Vec<EbpfTftFilterRecord>, GtpuError>;
+
+    /// Insert or replace one complete fixed-width TFT filter record.
+    fn tft_filter_put(
+        &self,
+        ifindex: u32,
+        key: [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+        value: [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+    ) -> Result<(), GtpuError>;
+
+    /// Delete one exact TFT filter record; returns whether it existed.
+    fn tft_filter_remove(
+        &self,
+        ifindex: u32,
+        key: [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+    ) -> Result<bool, GtpuError>;
+
+    /// Report exact bounded occupancy/capacity before inactive-bank staging.
+    fn tft_filter_capacity(&self, ifindex: u32) -> Result<EbpfTftFilterMapCapacity, GtpuError>;
+
+    /// Derive opaque durable classifier ownership from the exact retained
+    /// current graph and managed attachment identity.
+    fn tft_authority(&self, ifindex: u32) -> Result<EbpfTftAuthority, GtpuError>;
+
+    /// Return whether current program, held/pinned maps, TFT marker, and
+    /// managed attachment identity are all simultaneously authoritative.
+    fn tft_datapath_usable(&self, ifindex: u32) -> bool;
+
     /// Probe the environment for eBPF datapath readiness.
     fn probe_environment(&self) -> EbpfEnvironment;
 
@@ -1385,6 +1518,34 @@ struct MarkedPdpState {
     binding_value: [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN],
     dscp_value: Option<[u8; UPLINK_DSCP_VALUE_LEN]>,
     commit: PdpContextCommit,
+}
+
+/// Fully encoded desired snapshot, before an inactive bank is selected.
+///
+/// The typed records deliberately retain no subscriber identity in diagnostics;
+/// their custom ABI debug renderers redact all routing-sensitive fields.
+#[derive(Clone)]
+struct EncodedTftClassifier {
+    key: TftClassifierKey,
+    has_default: bool,
+    filters: Vec<TftClassifierFilter>,
+}
+
+#[derive(Clone)]
+struct ObservedTftClassifier {
+    classifier: TftUplinkClassifier,
+    meta: TftClassifierMeta,
+    raw_meta: [u8; TFT_CLASSIFIER_META_VALUE_LEN],
+    records: Vec<(
+        [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+        [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+    )>,
+}
+
+enum TftClassifierObservation {
+    Absent,
+    Present(Box<ObservedTftClassifier>),
+    Indeterminate,
 }
 
 /// Shared completion state for one cleanup-only acquisition.
@@ -1770,6 +1931,1266 @@ impl EbpfGtpuDataplaneBackend {
             .operation_lock
             .lock()
             .map_err(|_| GtpuError::io("ebpf_reconciliation", poisoned_lock()))
+    }
+
+    fn require_tft_attachment(&self, ifindex: u32) -> Result<(), GtpuError> {
+        let managed = self
+            .devices()?
+            .get(&ifindex)
+            .map(|device| device.cleanup_only);
+        match managed {
+            None => Err(GtpuError::NotFound),
+            Some(true) => Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_attachment",
+            }),
+            Some(false) if self.inner.runtime.tft_datapath_usable(ifindex) => Ok(()),
+            Some(false) => Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_attachment",
+            }),
+        }
+    }
+
+    fn tft_classifier_key(link_ifindex: u32, paa: IpAddr) -> Result<TftClassifierKey, GtpuError> {
+        let IpAddr::V4(paa) = paa else {
+            return Err(GtpuError::invalid_config(
+                "tft_uplink_classifier.paa",
+                "native eBPF TFT classifier supports IPv4 PAA only",
+            ));
+        };
+        TftClassifierKey::new(link_ifindex, paa.octets()).ok_or_else(|| {
+            GtpuError::invalid_config(
+                "tft_uplink_classifier",
+                "classifier identity must be canonical",
+            )
+        })
+    }
+
+    fn encode_tft_packet_filter(
+        filter: &PacketFilter,
+        bearer_mark: GtpBearerMark,
+        authority: EbpfTftAuthority,
+        snapshot_generation: u64,
+    ) -> Result<TftClassifierFilter, GtpuError> {
+        let mut spec = TftClassifierIpv4FilterSpec::default();
+        let mut local_port_form = None;
+        let mut remote_port_form = None;
+        for component in filter.components() {
+            let duplicate = || {
+                GtpuError::invalid_config(
+                    "tft_uplink_classifier.component",
+                    "duplicate native IPv4 component category",
+                )
+            };
+            match component {
+                PacketFilterComponent::Ipv4LocalAddress { address, mask } => {
+                    if spec.local_address.is_some() {
+                        return Err(duplicate());
+                    }
+                    spec.local_address = Some(TftClassifierIpv4Address::new(
+                        address.octets(),
+                        mask.octets(),
+                    ));
+                }
+                PacketFilterComponent::Ipv4RemoteAddress { address, mask } => {
+                    if spec.remote_address.is_some() {
+                        return Err(duplicate());
+                    }
+                    spec.remote_address = Some(TftClassifierIpv4Address::new(
+                        address.octets(),
+                        mask.octets(),
+                    ));
+                }
+                PacketFilterComponent::ProtocolIdentifierNextHeader(protocol) => {
+                    if spec.protocol.replace(*protocol).is_some() {
+                        return Err(duplicate());
+                    }
+                }
+                PacketFilterComponent::SingleLocalPort(port) => {
+                    if spec.local_port.is_some() {
+                        return Err(duplicate());
+                    }
+                    spec.local_port = TftClassifierPortRange::new(*port, *port);
+                    local_port_form = Some(TftClassifierPortForm::SinglePort);
+                }
+                PacketFilterComponent::LocalPortRange(range) => {
+                    if spec.local_port.is_some() {
+                        return Err(duplicate());
+                    }
+                    spec.local_port = TftClassifierPortRange::new(range.low(), range.high());
+                    local_port_form = Some(TftClassifierPortForm::PortRange);
+                }
+                PacketFilterComponent::SingleRemotePort(port) => {
+                    if spec.remote_port.is_some() {
+                        return Err(duplicate());
+                    }
+                    spec.remote_port = TftClassifierPortRange::new(*port, *port);
+                    remote_port_form = Some(TftClassifierPortForm::SinglePort);
+                }
+                PacketFilterComponent::RemotePortRange(range) => {
+                    if spec.remote_port.is_some() {
+                        return Err(duplicate());
+                    }
+                    spec.remote_port = TftClassifierPortRange::new(range.low(), range.high());
+                    remote_port_form = Some(TftClassifierPortForm::PortRange);
+                }
+                PacketFilterComponent::SecurityParameterIndex(spi) => {
+                    if spec.esp_spi.replace(*spi).is_some() {
+                        return Err(duplicate());
+                    }
+                }
+                PacketFilterComponent::TypeOfServiceTrafficClass { value, mask } => {
+                    if spec.tos.is_some() {
+                        return Err(duplicate());
+                    }
+                    spec.tos = Some(TftClassifierTos::new(*value, *mask));
+                }
+                _ => {
+                    return Err(GtpuError::invalid_config(
+                        "tft_uplink_classifier.component",
+                        "native eBPF TFT classifier supports only IPv4 packet-filter components",
+                    ));
+                }
+            }
+        }
+        let direction = match filter.direction() {
+            PacketFilterDirection::UplinkOnly => TftClassifierFilterDirection::UplinkOnly,
+            PacketFilterDirection::Bidirectional => TftClassifierFilterDirection::Bidirectional,
+            PacketFilterDirection::PreRelease7 | PacketFilterDirection::DownlinkOnly => {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier.direction",
+                    "native eBPF TFT classifier requires uplink or bidirectional filters",
+                ));
+            }
+        };
+        let owner =
+            TftClassifierOwnerId::new(authority.owner).ok_or(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_authority",
+            })?;
+        TftClassifierFilter::new_with_semantics(
+            owner,
+            authority.owner_generation,
+            snapshot_generation,
+            filter.evaluation_precedence(),
+            bearer_mark.get(),
+            filter.identifier().value(),
+            direction,
+            local_port_form,
+            remote_port_form,
+            spec,
+        )
+        .ok_or_else(|| {
+            GtpuError::invalid_config(
+                "tft_uplink_classifier",
+                "native IPv4 filter representation is not canonical",
+            )
+        })
+    }
+
+    fn encode_tft_classifier(
+        desired: &TftUplinkClassifier,
+        authority: EbpfTftAuthority,
+        snapshot_generation: u64,
+    ) -> Result<EncodedTftClassifier, GtpuError> {
+        let key = Self::tft_classifier_key(desired.link_ifindex(), desired.paa())?;
+        if snapshot_generation == 0 {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_snapshot_generation",
+            });
+        }
+        let mut has_default = false;
+        let mut filters = Vec::new();
+        for bearer in desired.bearers() {
+            match (bearer.mark(), bearer.tft()) {
+                (None, None) => has_default = true,
+                (Some(mark), Some(tft)) => {
+                    let packet_filters = tft.packet_filters().filters().ok_or_else(|| {
+                        GtpuError::invalid_config(
+                            "tft_uplink_classifier.tft",
+                            "full packet filters are required",
+                        )
+                    })?;
+                    for filter in packet_filters {
+                        if filters.len() >= TFT_CLASSIFIER_MAX_FILTERS {
+                            return Err(GtpuError::invalid_config(
+                                "tft_uplink_classifier",
+                                "classifier exceeds native packet-filter capacity",
+                            ));
+                        }
+                        filters.push(Self::encode_tft_packet_filter(
+                            filter,
+                            mark,
+                            authority,
+                            snapshot_generation,
+                        )?);
+                    }
+                }
+                _ => {
+                    return Err(GtpuError::invalid_config(
+                        "tft_uplink_classifier.bearers",
+                        "default and filtered bearer ownership must be explicit",
+                    ));
+                }
+            }
+        }
+        filters.sort_unstable_by_key(TftClassifierFilter::evaluation_precedence);
+        if filters
+            .windows(2)
+            .any(|pair| pair[0].evaluation_precedence() >= pair[1].evaluation_precedence())
+        {
+            return Err(GtpuError::invalid_config(
+                "tft_uplink_classifier",
+                "packet-filter precedence must be unique",
+            ));
+        }
+        let filters = filters
+            .into_iter()
+            .enumerate()
+            .map(|(rank, filter)| {
+                filter
+                    .with_dense_rank(u8::try_from(rank).map_err(|_| {
+                        GtpuError::StateIndeterminate {
+                            operation: "ebpf_tft_dense_rank",
+                        }
+                    })?)
+                    .ok_or(GtpuError::StateIndeterminate {
+                        operation: "ebpf_tft_dense_rank",
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(EncodedTftClassifier {
+            key,
+            has_default,
+            filters,
+        })
+    }
+
+    fn validate_tft_uplink_classifier_native(
+        desired: &TftUplinkClassifier,
+    ) -> Result<(), GtpuError> {
+        // Encoding validates the complete native representation. These fixed
+        // nonzero values are only structural inputs to that pure conversion;
+        // they neither inspect nor modify live runtime state.
+        Self::encode_tft_classifier(
+            desired,
+            EbpfTftAuthority {
+                owner: [1; 16],
+                owner_generation: 1,
+            },
+            1,
+        )
+        .map(|_| ())
+    }
+
+    fn tft_classifier_fingerprint(
+        encoded: &EncodedTftClassifier,
+        active_bank: u8,
+        authority: EbpfTftAuthority,
+        snapshot_generation: u64,
+    ) -> Result<[u8; TFT_CLASSIFIER_FINGERPRINT_LEN], GtpuError> {
+        const DOMAIN: &[u8] = b"OpenPacketCore TFT classifier fingerprint\0";
+
+        let filter_count =
+            u16::try_from(encoded.filters.len()).map_err(|_| GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_fingerprint",
+            })?;
+        let mut digest = Sha256::new();
+        digest.update(DOMAIN);
+        digest.update([TFT_CLASSIFIER_ABI_VERSION, TFT_CLASSIFIER_FAMILY_IPV4]);
+        digest.update(encoded.key.encode());
+        digest.update([active_bank, u8::from(encoded.has_default)]);
+        digest.update(filter_count.to_be_bytes());
+        digest.update(authority.owner);
+        digest.update(authority.owner_generation.to_be_bytes());
+        digest.update(snapshot_generation.to_be_bytes());
+        for (index, filter) in encoded.filters.iter().enumerate() {
+            let index = u16::try_from(index).map_err(|_| GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_fingerprint",
+            })?;
+            let filter_key =
+                TftClassifierFilterKey::for_filter(encoded.key, active_bank, index, filter).ok_or(
+                    GtpuError::StateIndeterminate {
+                        operation: "ebpf_tft_fingerprint",
+                    },
+                )?;
+            digest.update(filter_key.encode());
+            digest.update(filter.encode());
+        }
+        Ok(digest.finalize().into())
+    }
+
+    fn tft_record_to_packet_filter(record: TftClassifierFilter) -> Result<PacketFilter, GtpuError> {
+        let spec = record.spec();
+        let mut components = Vec::with_capacity(spec.component_count());
+        if let Some(address) = spec.remote_address {
+            components.push(PacketFilterComponent::Ipv4RemoteAddress {
+                address: Ipv4Addr::from(address.address()),
+                mask: Ipv4Addr::from(address.mask()),
+            });
+        }
+        if let Some(address) = spec.local_address {
+            components.push(PacketFilterComponent::Ipv4LocalAddress {
+                address: Ipv4Addr::from(address.address()),
+                mask: Ipv4Addr::from(address.mask()),
+            });
+        }
+        if let Some(protocol) = spec.protocol {
+            components.push(PacketFilterComponent::ProtocolIdentifierNextHeader(
+                protocol,
+            ));
+        }
+        if let Some(port) = spec.local_port {
+            match record.local_port_form() {
+                Some(TftClassifierPortForm::SinglePort) => {
+                    components.push(PacketFilterComponent::SingleLocalPort(port.first()));
+                }
+                Some(TftClassifierPortForm::PortRange) => {
+                    let range = PortRange::new(port.first(), port.last()).map_err(|_| {
+                        GtpuError::StateIndeterminate {
+                            operation: "ebpf_tft_readback",
+                        }
+                    })?;
+                    components.push(PacketFilterComponent::LocalPortRange(range));
+                }
+                None => {
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_tft_readback",
+                    });
+                }
+            }
+        }
+        if let Some(port) = spec.remote_port {
+            match record.remote_port_form() {
+                Some(TftClassifierPortForm::SinglePort) => {
+                    components.push(PacketFilterComponent::SingleRemotePort(port.first()));
+                }
+                Some(TftClassifierPortForm::PortRange) => {
+                    let range = PortRange::new(port.first(), port.last()).map_err(|_| {
+                        GtpuError::StateIndeterminate {
+                            operation: "ebpf_tft_readback",
+                        }
+                    })?;
+                    components.push(PacketFilterComponent::RemotePortRange(range));
+                }
+                None => {
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_tft_readback",
+                    });
+                }
+            }
+        }
+        if let Some(tos) = spec.tos {
+            components.push(PacketFilterComponent::TypeOfServiceTrafficClass {
+                value: tos.value(),
+                mask: tos.mask(),
+            });
+        }
+        if let Some(spi) = spec.esp_spi {
+            components.push(PacketFilterComponent::SecurityParameterIndex(spi));
+        }
+        let identifier =
+            PacketFilterIdentifier::new(record.packet_filter_identifier()).map_err(|_| {
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_readback",
+                }
+            })?;
+        let direction = match record.direction() {
+            TftClassifierFilterDirection::UplinkOnly => PacketFilterDirection::UplinkOnly,
+            TftClassifierFilterDirection::Bidirectional => PacketFilterDirection::Bidirectional,
+        };
+        PacketFilter::new(
+            identifier,
+            direction,
+            record.evaluation_precedence(),
+            components,
+        )
+        .map_err(|_| GtpuError::StateIndeterminate {
+            operation: "ebpf_tft_readback",
+        })
+    }
+
+    fn inspect_tft_classifier_locked(
+        &self,
+        key: TftClassifierKey,
+    ) -> Result<TftClassifierObservation, GtpuError> {
+        let ifindex = key.attachment_ifindex();
+        let marker = self.inner.runtime.tft_schema_get(ifindex)?;
+        if !tft_classifier_schema_is_current(&marker) {
+            return Ok(TftClassifierObservation::Indeterminate);
+        }
+        let raw_meta = self.inner.runtime.tft_meta_get(ifindex, key.encode())?;
+        let records = self
+            .inner
+            .runtime
+            .tft_filter_inventory(ifindex, key.encode())?;
+        let inventory_limit = usize::from(TFT_CLASSIFIER_BANKS) * TFT_CLASSIFIER_MAX_FILTERS;
+        if records.len() > inventory_limit {
+            return Ok(TftClassifierObservation::Indeterminate);
+        }
+        let Some(raw_meta) = raw_meta else {
+            return Ok(if records.is_empty() {
+                TftClassifierObservation::Absent
+            } else {
+                TftClassifierObservation::Indeterminate
+            });
+        };
+        let Some(meta) = TftClassifierMeta::decode(raw_meta) else {
+            return Ok(TftClassifierObservation::Indeterminate);
+        };
+        if !meta.is_valid() {
+            return Ok(TftClassifierObservation::Indeterminate);
+        }
+        let Some(meta_owner) = meta.owner() else {
+            return Ok(TftClassifierObservation::Indeterminate);
+        };
+        let mut active = BTreeMap::new();
+        for (raw_key, raw_value) in &records {
+            let Some(filter_key) = TftClassifierFilterKey::decode(*raw_key) else {
+                return Ok(TftClassifierObservation::Indeterminate);
+            };
+            if filter_key.classifier() != key {
+                return Ok(TftClassifierObservation::Indeterminate);
+            }
+            let Some(filter) = TftClassifierFilter::decode(*raw_value) else {
+                return Ok(TftClassifierObservation::Indeterminate);
+            };
+            // Retained inactive-bank history may describe an older or partial
+            // snapshot, but it must remain under the exact owner authority
+            // published by metadata. Foreign or mixed retained records are
+            // never safe to overwrite during a later staging operation.
+            if !filter_key.matches_filter(&filter)
+                || filter.dense_rank() != filter_key.filter_index() as u8
+                || filter
+                    .owner()
+                    .is_none_or(|owner| owner.into_bytes() != meta_owner.into_bytes())
+                || filter.owner_generation_value() != meta.owner_generation()
+            {
+                return Ok(TftClassifierObservation::Indeterminate);
+            }
+            if filter_key.bank() == meta.active_bank()
+                && (!filter.belongs_to(&meta)
+                    || filter.dense_rank() != filter_key.filter_index() as u8
+                    || active.insert(filter_key.filter_index(), filter).is_some())
+            {
+                return Ok(TftClassifierObservation::Indeterminate);
+            }
+        }
+        if active.len() != usize::from(meta.filter_count())
+            || active
+                .keys()
+                .copied()
+                .enumerate()
+                .any(|(index, found)| u16::try_from(index) != Ok(found))
+        {
+            return Ok(TftClassifierObservation::Indeterminate);
+        }
+        let active = active.into_values().collect::<Vec<_>>();
+        let encoded = EncodedTftClassifier {
+            key,
+            has_default: meta.has_default(),
+            filters: active.clone(),
+        };
+        if Self::tft_classifier_fingerprint(
+            &encoded,
+            meta.active_bank(),
+            EbpfTftAuthority {
+                owner: meta_owner.into_bytes(),
+                owner_generation: meta.owner_generation(),
+            },
+            meta.snapshot_generation(),
+        )? != meta.classifier_fingerprint()
+        {
+            return Ok(TftClassifierObservation::Indeterminate);
+        }
+        let mut previous_precedence = None;
+        let mut filters_by_mark = BTreeMap::<u32, Vec<PacketFilter>>::new();
+        for filter in active {
+            let precedence = filter.evaluation_precedence();
+            if previous_precedence.is_some_and(|previous| precedence <= previous) {
+                return Ok(TftClassifierObservation::Indeterminate);
+            }
+            previous_precedence = Some(precedence);
+            filters_by_mark
+                .entry(filter.bearer_mark())
+                .or_default()
+                .push(Self::tft_record_to_packet_filter(filter)?);
+        }
+        let mut bearers =
+            Vec::with_capacity(filters_by_mark.len() + usize::from(meta.has_default()));
+        if meta.has_default() {
+            bearers.push(TftUplinkBearer::default_bearer());
+        }
+        for (mark, mut filters) in filters_by_mark {
+            filters.sort_unstable_by_key(PacketFilter::evaluation_precedence);
+            let tft = TrafficFlowTemplate::create_new(filters, Vec::new()).map_err(|_| {
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_readback",
+                }
+            })?;
+            let mark = GtpBearerMark::new(mark).ok_or(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_readback",
+            })?;
+            bearers.push(TftUplinkBearer::dedicated(mark, tft));
+        }
+        let classifier = TftUplinkClassifier::new(
+            key.attachment_ifindex(),
+            IpAddr::V4(Ipv4Addr::from(key.paa())),
+            bearers,
+        )
+        .map_err(|_| GtpuError::StateIndeterminate {
+            operation: "ebpf_tft_readback",
+        })?;
+        Ok(TftClassifierObservation::Present(Box::new(
+            ObservedTftClassifier {
+                classifier,
+                meta,
+                raw_meta,
+                records,
+            },
+        )))
+    }
+
+    fn tft_observation_owned_by(
+        observed: &ObservedTftClassifier,
+        authority: EbpfTftAuthority,
+    ) -> bool {
+        observed.meta.owner().is_some_and(|owner| {
+            owner.into_bytes() == authority.owner
+                && observed.meta.owner_generation() == authority.owner_generation
+        })
+    }
+
+    fn next_tft_snapshot_generation(
+        observed: Option<&ObservedTftClassifier>,
+    ) -> Result<u64, GtpuError> {
+        match observed {
+            None => Ok(1),
+            Some(observed) => observed
+                .meta
+                .snapshot_generation()
+                .checked_add(1)
+                .filter(|generation| *generation != 0)
+                .ok_or(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_snapshot_generation",
+                }),
+        }
+    }
+
+    fn canonical_tft_inventory_for(
+        classifier: TftClassifierKey,
+        mut records: Vec<EbpfTftFilterRecord>,
+        operation: &'static str,
+    ) -> Result<Vec<EbpfTftFilterRecord>, GtpuError> {
+        let inventory_limit = usize::from(TFT_CLASSIFIER_BANKS) * TFT_CLASSIFIER_MAX_FILTERS;
+        if records.len() > inventory_limit
+            || records.iter().any(|(raw_key, raw_value)| {
+                match (
+                    TftClassifierFilterKey::decode(*raw_key),
+                    TftClassifierFilter::decode(*raw_value),
+                ) {
+                    (Some(key), Some(filter)) => {
+                        key.classifier() != classifier
+                            || !key.matches_filter(&filter)
+                            || filter.dense_rank() != key.filter_index() as u8
+                    }
+                    _ => true,
+                }
+            })
+        {
+            return Err(GtpuError::StateIndeterminate { operation });
+        }
+        records.sort_unstable_by_key(|(key, _)| *key);
+        Ok(records)
+    }
+
+    fn stage_tft_inactive_bank_locked(
+        &self,
+        desired: &EncodedTftClassifier,
+        authority: EbpfTftAuthority,
+        observed: Option<&ObservedTftClassifier>,
+        snapshot_generation: u64,
+    ) -> Result<TftClassifierMeta, GtpuError> {
+        let ifindex = desired.key.attachment_ifindex();
+        let active_bank = observed.map_or(0, |value| value.meta.active_bank());
+        let inactive_bank = if observed.is_some() {
+            1 - active_bank
+        } else {
+            0
+        };
+        let current_records = Self::canonical_tft_inventory_for(
+            desired.key,
+            self.inner
+                .runtime
+                .tft_filter_inventory(ifindex, desired.key.encode())?,
+            "ebpf_tft_stage",
+        )?;
+        let mut expected_current = observed.map_or_else(Vec::new, |value| value.records.clone());
+        expected_current.sort_unstable_by_key(|(key, _)| *key);
+        if current_records != expected_current {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_stage",
+            });
+        }
+        let mut retained_active = Vec::new();
+        let mut old_inactive = Vec::new();
+        for (raw_key, raw_value) in current_records {
+            let filter_key =
+                TftClassifierFilterKey::decode(raw_key).ok_or(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_stage",
+                })?;
+            if filter_key.bank() == inactive_bank {
+                old_inactive.push((raw_key, raw_value));
+            } else {
+                retained_active.push((raw_key, raw_value));
+            }
+        }
+        for (_, raw_value) in &old_inactive {
+            let Some(filter) = TftClassifierFilter::decode(*raw_value) else {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_stage",
+                });
+            };
+            if filter
+                .owner()
+                .is_none_or(|owner| owner.into_bytes() != authority.owner)
+                || filter.owner_generation_value() != authority.owner_generation
+            {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_stage",
+                });
+            }
+        }
+        let capacity = self.inner.runtime.tft_filter_capacity(ifindex)?;
+        let remaining = capacity
+            .occupied()
+            .checked_sub(u32::try_from(old_inactive.len()).map_err(|_| {
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_stage",
+                }
+            })?)
+            .ok_or(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_stage",
+            })?;
+        let staged = remaining
+            .checked_add(u32::try_from(desired.filters.len()).map_err(|_| {
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_stage",
+                }
+            })?)
+            .ok_or(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_stage",
+            })?;
+        if capacity.maximum() != TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES
+            || staged > capacity.maximum()
+        {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_stage",
+            });
+        }
+        for (key, _) in &old_inactive {
+            self.inner.runtime.tft_filter_remove(ifindex, *key)?;
+        }
+        let mut expected = Vec::with_capacity(desired.filters.len());
+        for (index, filter) in desired.filters.iter().copied().enumerate() {
+            let index = u16::try_from(index).map_err(|_| GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_stage",
+            })?;
+            let key =
+                TftClassifierFilterKey::for_filter(desired.key, inactive_bank, index, &filter)
+                    .ok_or(GtpuError::StateIndeterminate {
+                        operation: "ebpf_tft_stage",
+                    })?;
+            let key = key.encode();
+            let value = filter.encode();
+            self.inner.runtime.tft_filter_put(ifindex, key, value)?;
+            expected.push((key, value));
+        }
+        retained_active.append(&mut expected);
+        retained_active.sort_unstable_by_key(|(key, _)| *key);
+        let staged_records = Self::canonical_tft_inventory_for(
+            desired.key,
+            self.inner
+                .runtime
+                .tft_filter_inventory(ifindex, desired.key.encode())?,
+            "ebpf_tft_stage",
+        )?;
+        if staged_records != retained_active {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_stage",
+            });
+        }
+        let owner =
+            TftClassifierOwnerId::new(authority.owner).ok_or(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_authority",
+            })?;
+        TftClassifierMeta::new(
+            inactive_bank,
+            desired.has_default,
+            owner,
+            authority.owner_generation,
+            snapshot_generation,
+            u16::try_from(desired.filters.len()).map_err(|_| GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_stage",
+            })?,
+            Self::tft_classifier_fingerprint(
+                desired,
+                inactive_bank,
+                authority,
+                snapshot_generation,
+            )?,
+        )
+        .ok_or(GtpuError::StateIndeterminate {
+            operation: "ebpf_tft_stage",
+        })
+    }
+
+    fn stable_tft_observation_locked(
+        &self,
+        key: TftClassifierKey,
+    ) -> Result<TftClassifierObservation, GtpuError> {
+        let first = self.inspect_tft_classifier_locked(key)?;
+        let second = self.inspect_tft_classifier_locked(key)?;
+        let same = match (&first, &second) {
+            (TftClassifierObservation::Absent, TftClassifierObservation::Absent)
+            | (TftClassifierObservation::Indeterminate, TftClassifierObservation::Indeterminate) => {
+                true
+            }
+            (TftClassifierObservation::Present(left), TftClassifierObservation::Present(right)) => {
+                left.classifier == right.classifier
+                    && left.raw_meta == right.raw_meta
+                    && left.records == right.records
+            }
+            _ => false,
+        };
+        Ok(if same {
+            first
+        } else {
+            TftClassifierObservation::Indeterminate
+        })
+    }
+
+    fn tft_readback_sync(
+        &self,
+        link_ifindex: u32,
+        paa: IpAddr,
+    ) -> Result<TftUplinkClassifierReadback, GtpuError> {
+        let key = Self::tft_classifier_key(link_ifindex, paa)?;
+        let _operation = self.operation_guard()?;
+        match self.require_tft_attachment(link_ifindex) {
+            Ok(()) => {}
+            Err(GtpuError::NotFound) => return Err(GtpuError::NotFound),
+            Err(_) => return Ok(TftUplinkClassifierReadback::Indeterminate),
+        }
+        let authority = match self.inner.runtime.tft_authority(link_ifindex) {
+            Ok(authority) => authority,
+            Err(_) => return Ok(TftUplinkClassifierReadback::Indeterminate),
+        };
+        match self.stable_tft_observation_locked(key) {
+            Ok(TftClassifierObservation::Absent) => Ok(TftUplinkClassifierReadback::Absent),
+            Ok(TftClassifierObservation::Present(observed))
+                if Self::tft_observation_owned_by(&observed, authority) =>
+            {
+                Ok(TftUplinkClassifierReadback::Present(observed.classifier))
+            }
+            Ok(TftClassifierObservation::Present(_))
+            | Ok(TftClassifierObservation::Indeterminate)
+            | Err(_) => Ok(TftUplinkClassifierReadback::Indeterminate),
+        }
+    }
+
+    fn tft_current_authority_orphan_records_locked(
+        &self,
+        key: TftClassifierKey,
+        authority: EbpfTftAuthority,
+    ) -> Result<Option<Vec<EbpfTftFilterRecord>>, GtpuError> {
+        let ifindex = key.attachment_ifindex();
+        let first_metadata = self.inner.runtime.tft_meta_get(ifindex, key.encode())?;
+        if first_metadata.is_some() {
+            return Ok(None);
+        }
+        let first_records = self
+            .inner
+            .runtime
+            .tft_filter_inventory(ifindex, key.encode())?;
+        let inventory_limit = usize::from(TFT_CLASSIFIER_BANKS) * TFT_CLASSIFIER_MAX_FILTERS;
+        if first_records.is_empty() || first_records.len() > inventory_limit {
+            return Ok(None);
+        }
+        let records_match_authority = |records: &[EbpfTftFilterRecord]| {
+            let mut bank = None;
+            let mut snapshot_generation = None;
+            records.iter().all(|(raw_key, raw_value)| {
+                let Some(filter_key) = TftClassifierFilterKey::decode(*raw_key) else {
+                    return false;
+                };
+                let Some(filter) = TftClassifierFilter::decode(*raw_value) else {
+                    return false;
+                };
+                if filter_key.classifier() != key
+                    || !filter_key.matches_filter(&filter)
+                    || filter.dense_rank() != filter_key.filter_index() as u8
+                    || filter
+                        .owner()
+                        .is_none_or(|owner| owner.into_bytes() != authority.owner)
+                    || filter.owner_generation_value() != authority.owner_generation
+                {
+                    return false;
+                }
+                match bank {
+                    Some(expected) if expected != filter_key.bank() => return false,
+                    None => bank = Some(filter_key.bank()),
+                    Some(_) => {}
+                }
+                match snapshot_generation {
+                    Some(expected) if expected != filter.snapshot_generation_value() => false,
+                    None => {
+                        snapshot_generation = Some(filter.snapshot_generation_value());
+                        true
+                    }
+                    Some(_) => true,
+                }
+            })
+        };
+        if !records_match_authority(&first_records) {
+            return Ok(None);
+        }
+        let second_metadata = self.inner.runtime.tft_meta_get(ifindex, key.encode())?;
+        if second_metadata.is_some() {
+            return Ok(None);
+        }
+        let second_records = self
+            .inner
+            .runtime
+            .tft_filter_inventory(ifindex, key.encode())?;
+        if second_records != first_records || !records_match_authority(&second_records) {
+            return Ok(None);
+        }
+        Ok(Some(first_records))
+    }
+
+    fn reconcile_tft_classifier_sync(
+        &self,
+        desired: TftUplinkClassifier,
+    ) -> Result<TftUplinkClassifierReconcileOutcome, GtpuError> {
+        Self::validate_tft_uplink_classifier_native(&desired)?;
+        let key = Self::tft_classifier_key(desired.link_ifindex(), desired.paa())?;
+        let _operation = self.operation_guard()?;
+        match self.require_tft_attachment(desired.link_ifindex()) {
+            Ok(()) => {}
+            Err(GtpuError::NotFound) => return Err(GtpuError::NotFound),
+            Err(_) => return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate),
+        }
+        let authority = match self.inner.runtime.tft_authority(desired.link_ifindex()) {
+            Ok(authority) => authority,
+            Err(_) => return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate),
+        };
+        // Validate and encode the complete desired snapshot before orphan
+        // recovery or any other map mutation. The real generation is selected
+        // only after the current state is observed below.
+        Self::encode_tft_classifier(&desired, authority, 1)?;
+        let observed = match self.stable_tft_observation_locked(key) {
+            Ok(observed) => observed,
+            Err(_) => return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate),
+        };
+        let (previous, replacement) = match &observed {
+            TftClassifierObservation::Absent => (None, false),
+            TftClassifierObservation::Present(value) => {
+                if !Self::tft_observation_owned_by(value, authority) {
+                    return Ok(TftUplinkClassifierReconcileOutcome::Conflict);
+                }
+                if value.classifier == desired {
+                    return Ok(TftUplinkClassifierReconcileOutcome::AlreadyPresent);
+                }
+                (Some(value.as_ref()), true)
+            }
+            TftClassifierObservation::Indeterminate => {
+                let orphan = match self.tft_current_authority_orphan_records_locked(key, authority)
+                {
+                    Ok(Some(records)) => records,
+                    Ok(None) | Err(_) => {
+                        return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate);
+                    }
+                };
+                for (record_key, _) in orphan {
+                    if self
+                        .inner
+                        .runtime
+                        .tft_filter_remove(desired.link_ifindex(), record_key)
+                        .is_err()
+                    {
+                        return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate);
+                    }
+                }
+                match self.stable_tft_observation_locked(key) {
+                    Ok(TftClassifierObservation::Absent) => (None, false),
+                    _ => return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate),
+                }
+            }
+        };
+        let snapshot_generation = match Self::next_tft_snapshot_generation(previous) {
+            Ok(value) => value,
+            Err(_) => return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate),
+        };
+        let encoded = Self::encode_tft_classifier(&desired, authority, snapshot_generation)?;
+        let meta = match self.stage_tft_inactive_bank_locked(
+            &encoded,
+            authority,
+            previous,
+            snapshot_generation,
+        ) {
+            Ok(meta) => meta,
+            Err(_) => return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate),
+        };
+        let expected_previous_meta = previous.map(|value| value.raw_meta);
+        let precommit = self
+            .inner
+            .runtime
+            .tft_meta_get(desired.link_ifindex(), key.encode());
+        let precommit_matches = match (expected_previous_meta, precommit) {
+            (None, Ok(None)) => true,
+            (Some(expected), Ok(Some(actual))) => expected == actual,
+            _ => false,
+        };
+        if !precommit_matches {
+            return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate);
+        }
+        let committed =
+            self.inner
+                .runtime
+                .tft_meta_put(desired.link_ifindex(), key.encode(), meta.encode());
+        if committed.is_err() {
+            return match self.stable_tft_observation_locked(key) {
+                Ok(TftClassifierObservation::Present(value))
+                    if value.classifier == desired
+                        && Self::tft_observation_owned_by(&value, authority) =>
+                {
+                    Ok(if replacement {
+                        TftUplinkClassifierReconcileOutcome::Replaced
+                    } else {
+                        TftUplinkClassifierReconcileOutcome::Installed
+                    })
+                }
+                _ => Ok(TftUplinkClassifierReconcileOutcome::Indeterminate),
+            };
+        }
+        match self.stable_tft_observation_locked(key) {
+            Ok(TftClassifierObservation::Present(value))
+                if value.classifier == desired
+                    && value.raw_meta == meta.encode()
+                    && Self::tft_observation_owned_by(&value, authority) =>
+            {
+                Ok(if replacement {
+                    TftUplinkClassifierReconcileOutcome::Replaced
+                } else {
+                    TftUplinkClassifierReconcileOutcome::Installed
+                })
+            }
+            _ => Ok(TftUplinkClassifierReconcileOutcome::Indeterminate),
+        }
+    }
+
+    fn tft_removal_fence_matches_expected(
+        expected: &TftUplinkClassifier,
+        authority: EbpfTftAuthority,
+        key: TftClassifierKey,
+        meta: TftClassifierMeta,
+    ) -> Option<EncodedTftClassifier> {
+        if !meta.is_valid_removal_fence()
+            || meta
+                .owner()
+                .is_none_or(|owner| owner.into_bytes() != authority.owner)
+            || meta.owner_generation() != authority.owner_generation
+        {
+            return None;
+        }
+        let encoded =
+            Self::encode_tft_classifier(expected, authority, meta.snapshot_generation()).ok()?;
+        let filter_count = u16::try_from(encoded.filters.len()).ok()?;
+        if encoded.key != key
+            || encoded.has_default != meta.has_default()
+            || filter_count != meta.filter_count()
+            || Self::tft_classifier_fingerprint(
+                &encoded,
+                meta.active_bank(),
+                authority,
+                meta.snapshot_generation(),
+            )
+            .ok()?
+                != meta.classifier_fingerprint()
+        {
+            return None;
+        }
+        Some(encoded)
+    }
+
+    fn tft_removal_records_match_fence(
+        encoded: &EncodedTftClassifier,
+        authority: EbpfTftAuthority,
+        meta: TftClassifierMeta,
+        records: &[EbpfTftFilterRecord],
+    ) -> bool {
+        let inventory_limit = usize::from(TFT_CLASSIFIER_BANKS) * TFT_CLASSIFIER_MAX_FILTERS;
+        if records.len() > inventory_limit {
+            return false;
+        }
+        let mut expected_active = Vec::with_capacity(encoded.filters.len());
+        for (index, filter) in encoded.filters.iter().copied().enumerate() {
+            let Ok(index) = u16::try_from(index) else {
+                return false;
+            };
+            let Some(filter_key) =
+                TftClassifierFilterKey::for_filter(encoded.key, meta.active_bank(), index, &filter)
+            else {
+                return false;
+            };
+            expected_active.push((filter_key.encode(), filter.encode()));
+        }
+        let mut observed_active = Vec::with_capacity(expected_active.len());
+        observed_active.resize(expected_active.len(), false);
+        let mut bank_generations = [None; TFT_CLASSIFIER_BANKS as usize];
+        for (raw_key, raw_value) in records {
+            let Some(filter_key) = TftClassifierFilterKey::decode(*raw_key) else {
+                return false;
+            };
+            let Some(filter) = TftClassifierFilter::decode(*raw_value) else {
+                return false;
+            };
+            if filter_key.classifier() != encoded.key
+                || !filter_key.matches_filter(&filter)
+                || filter.dense_rank() != filter_key.filter_index() as u8
+                || filter
+                    .owner()
+                    .is_none_or(|owner| owner.into_bytes() != authority.owner)
+                || filter.owner_generation_value() != authority.owner_generation
+            {
+                return false;
+            }
+            let generation = filter.snapshot_generation_value();
+            let bank_generation = &mut bank_generations[usize::from(filter_key.bank())];
+            match *bank_generation {
+                Some(previous) if previous != generation => return false,
+                None => *bank_generation = Some(generation),
+                Some(_) => {}
+            }
+            if filter_key.bank() == meta.active_bank() {
+                if generation != meta.snapshot_generation() {
+                    return false;
+                }
+                let Ok(position) = expected_active.binary_search(&(*raw_key, *raw_value)) else {
+                    return false;
+                };
+                if observed_active[position] {
+                    return false;
+                }
+                observed_active[position] = true;
+            }
+        }
+        let removal_progress = usize::from(meta.removal_progress());
+        observed_active
+            .iter()
+            .enumerate()
+            .all(|(rank, present)| rank < removal_progress || *present)
+    }
+
+    fn observe_tft_removal_fence_locked(
+        &self,
+        expected: &TftUplinkClassifier,
+        authority: EbpfTftAuthority,
+        key: TftClassifierKey,
+    ) -> Option<(
+        [u8; TFT_CLASSIFIER_META_VALUE_LEN],
+        Vec<EbpfTftFilterRecord>,
+    )> {
+        let raw_meta = self
+            .inner
+            .runtime
+            .tft_meta_get(expected.link_ifindex(), key.encode())
+            .ok()??;
+        let meta = TftClassifierMeta::decode(raw_meta)?;
+        let encoded = Self::tft_removal_fence_matches_expected(expected, authority, key, meta)?;
+        let records = self
+            .inner
+            .runtime
+            .tft_filter_inventory(expected.link_ifindex(), key.encode())
+            .ok()?;
+        Self::tft_removal_records_match_fence(&encoded, authority, meta, &records)
+            .then_some((raw_meta, records))
+    }
+
+    fn stable_tft_removal_fence_locked(
+        &self,
+        expected: &TftUplinkClassifier,
+        authority: EbpfTftAuthority,
+        key: TftClassifierKey,
+    ) -> Option<(
+        [u8; TFT_CLASSIFIER_META_VALUE_LEN],
+        Vec<EbpfTftFilterRecord>,
+    )> {
+        let first = self.observe_tft_removal_fence_locked(expected, authority, key)?;
+        let second = self.observe_tft_removal_fence_locked(expected, authority, key)?;
+        (first == second).then_some(first)
+    }
+
+    fn finish_tft_removal_fence_locked(
+        &self,
+        expected: &TftUplinkClassifier,
+        authority: EbpfTftAuthority,
+        key: TftClassifierKey,
+    ) -> TftUplinkClassifierRemovalOutcome {
+        loop {
+            let Some((raw_fence, records)) =
+                self.stable_tft_removal_fence_locked(expected, authority, key)
+            else {
+                return TftUplinkClassifierRemovalOutcome::Indeterminate;
+            };
+            let Some(fence) = TftClassifierMeta::decode(raw_fence) else {
+                return TftUplinkClassifierRemovalOutcome::Indeterminate;
+            };
+            let removal_progress = fence.removal_progress();
+            let active_bank = fence.active_bank();
+            let authorized_active_keys = records
+                .iter()
+                .filter_map(|(raw_key, _)| {
+                    let filter_key = TftClassifierFilterKey::decode(*raw_key)?;
+                    (filter_key.bank() == active_bank
+                        && filter_key.filter_index() < removal_progress)
+                        .then_some(*raw_key)
+                })
+                .collect::<Vec<_>>();
+
+            if !authorized_active_keys.is_empty() {
+                for record_key in authorized_active_keys {
+                    if !matches!(
+                        self.inner
+                            .runtime
+                            .tft_filter_remove(expected.link_ifindex(), record_key),
+                        Ok(true)
+                    ) {
+                        return TftUplinkClassifierRemovalOutcome::Indeterminate;
+                    }
+                }
+                let Some((confirmed_fence, confirmed_records)) =
+                    self.stable_tft_removal_fence_locked(expected, authority, key)
+                else {
+                    return TftUplinkClassifierRemovalOutcome::Indeterminate;
+                };
+                if confirmed_fence != raw_fence
+                    || confirmed_records.iter().any(|(raw_key, _)| {
+                        TftClassifierFilterKey::decode(*raw_key).is_some_and(|filter_key| {
+                            filter_key.bank() == active_bank
+                                && filter_key.filter_index() < removal_progress
+                        })
+                    })
+                {
+                    return TftUplinkClassifierRemovalOutcome::Indeterminate;
+                }
+                continue;
+            }
+
+            if removal_progress < fence.filter_count() {
+                let Some(advanced) = fence.advance_removal_progress() else {
+                    return TftUplinkClassifierRemovalOutcome::Indeterminate;
+                };
+                let advanced_raw = advanced.encode();
+                let _ = self.inner.runtime.tft_meta_put(
+                    expected.link_ifindex(),
+                    key.encode(),
+                    advanced_raw,
+                );
+                if !matches!(
+                    self.stable_tft_removal_fence_locked(expected, authority, key),
+                    Some((confirmed, _)) if confirmed == advanced_raw
+                ) {
+                    return TftUplinkClassifierRemovalOutcome::Indeterminate;
+                }
+                continue;
+            }
+
+            // Every active rank has been durably authorized and proved absent.
+            // Any remaining records belong to the inactive bank and may be
+            // cleaned idempotently under the same exact owner authority.
+            for (record_key, _) in records {
+                if !matches!(
+                    self.inner
+                        .runtime
+                        .tft_filter_remove(expected.link_ifindex(), record_key),
+                    Ok(true)
+                ) {
+                    return TftUplinkClassifierRemovalOutcome::Indeterminate;
+                }
+            }
+            if !matches!(
+                self.inner
+                    .runtime
+                    .tft_filter_inventory(expected.link_ifindex(), key.encode()),
+                Ok(records) if records.is_empty()
+            ) || !matches!(
+                self.inner
+                    .runtime
+                    .tft_meta_get(expected.link_ifindex(), key.encode()),
+                Ok(Some(current)) if current == raw_fence
+            ) {
+                return TftUplinkClassifierRemovalOutcome::Indeterminate;
+            }
+            let _ = self
+                .inner
+                .runtime
+                .tft_meta_remove(expected.link_ifindex(), key.encode());
+            return match self.stable_tft_observation_locked(key) {
+                Ok(TftClassifierObservation::Absent) => TftUplinkClassifierRemovalOutcome::Removed,
+                _ => TftUplinkClassifierRemovalOutcome::Indeterminate,
+            };
+        }
+    }
+
+    fn remove_tft_classifier_sync(
+        &self,
+        expected: TftUplinkClassifier,
+    ) -> Result<TftUplinkClassifierRemovalOutcome, GtpuError> {
+        let key = Self::tft_classifier_key(expected.link_ifindex(), expected.paa())?;
+        let _operation = self.operation_guard()?;
+        match self.require_tft_attachment(expected.link_ifindex()) {
+            Ok(()) => {}
+            Err(GtpuError::NotFound) => return Err(GtpuError::NotFound),
+            Err(_) => return Ok(TftUplinkClassifierRemovalOutcome::Indeterminate),
+        }
+        let authority = match self.inner.runtime.tft_authority(expected.link_ifindex()) {
+            Ok(authority) => authority,
+            Err(_) => return Ok(TftUplinkClassifierRemovalOutcome::Indeterminate),
+        };
+        Self::encode_tft_classifier(&expected, authority, 1)?;
+        let observed = match self.stable_tft_observation_locked(key) {
+            Ok(observed) => observed,
+            Err(_) => return Ok(TftUplinkClassifierRemovalOutcome::Indeterminate),
+        };
+        let present = match observed {
+            TftClassifierObservation::Absent => {
+                return Ok(TftUplinkClassifierRemovalOutcome::AlreadyAbsent);
+            }
+            TftClassifierObservation::Indeterminate => {
+                return Ok(self.finish_tft_removal_fence_locked(&expected, authority, key));
+            }
+            TftClassifierObservation::Present(value) => value,
+        };
+        if !Self::tft_observation_owned_by(&present, authority) || present.classifier != expected {
+            return Ok(TftUplinkClassifierRemovalOutcome::Conflict);
+        }
+        match self
+            .inner
+            .runtime
+            .tft_meta_get(expected.link_ifindex(), key.encode())
+        {
+            Ok(Some(raw)) if raw == present.raw_meta => {}
+            _ => return Ok(TftUplinkClassifierRemovalOutcome::Indeterminate),
+        }
+        let Some(removal_fence) = present.meta.removing() else {
+            return Ok(TftUplinkClassifierRemovalOutcome::Indeterminate);
+        };
+        let _ = self.inner.runtime.tft_meta_put(
+            expected.link_ifindex(),
+            key.encode(),
+            removal_fence.encode(),
+        );
+        Ok(self.finish_tft_removal_fence_locked(&expected, authority, key))
     }
 
     fn grouped_attachment_context(
@@ -5342,6 +6763,69 @@ fn downlink_outer_fragment_contract(
 
 #[async_trait]
 impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
+    fn tft_uplink_classification_capability(&self) -> GtpuCapability {
+        let environment = self.inner.runtime.probe_environment();
+        if !environment.platform_supported || !environment.bpffs_present || !environment.btf_present
+        {
+            return GtpuCapability::Missing;
+        }
+        if !environment.net_admin_capable || !environment.bpf_capable {
+            return GtpuCapability::PermissionDenied;
+        }
+        let devices = match self.devices() {
+            Ok(devices) if !devices.is_empty() => devices
+                .iter()
+                .map(|(ifindex, device)| (*ifindex, device.cleanup_only))
+                .collect::<Vec<_>>(),
+            Ok(_) | Err(_) => return GtpuCapability::Unknown,
+        };
+        if devices.iter().all(|(ifindex, cleanup_only)| {
+            !cleanup_only && self.inner.runtime.tft_datapath_usable(*ifindex)
+        }) {
+            GtpuCapability::Available
+        } else {
+            GtpuCapability::Missing
+        }
+    }
+
+    fn validate_tft_uplink_classifier(
+        &self,
+        desired: &TftUplinkClassifier,
+    ) -> Result<(), GtpuError> {
+        Self::validate_tft_uplink_classifier_native(desired)
+    }
+
+    async fn read_tft_uplink_classifier(
+        &self,
+        link_ifindex: u32,
+        paa: IpAddr,
+    ) -> Result<TftUplinkClassifierReadback, GtpuError> {
+        self.run_blocking("ebpf_tft_readback", move |backend| {
+            backend.tft_readback_sync(link_ifindex, paa)
+        })
+        .await
+    }
+
+    async fn reconcile_tft_uplink_classifier(
+        &self,
+        desired: TftUplinkClassifier,
+    ) -> Result<TftUplinkClassifierReconcileOutcome, GtpuError> {
+        self.run_blocking("ebpf_tft_reconcile", move |backend| {
+            backend.reconcile_tft_classifier_sync(desired)
+        })
+        .await
+    }
+
+    async fn remove_tft_uplink_classifier_exact(
+        &self,
+        expected: TftUplinkClassifier,
+    ) -> Result<TftUplinkClassifierRemovalOutcome, GtpuError> {
+        self.run_blocking("ebpf_tft_remove", move |backend| {
+            backend.remove_tft_classifier_sync(expected)
+        })
+        .await
+    }
+
     async fn create_device(&self, request: CreateGtpDeviceRequest) -> Result<GtpDevice, GtpuError> {
         self.run_blocking("ebpf_create_device", move |backend| {
             backend.create_device_sync(request)
@@ -5779,8 +7263,8 @@ mod aya_runtime {
     use sha2::{Digest as Sha2Digest, Sha256};
 
     use opc_gtpu_ebpf_common::{
-        default_bearer_graph_is_valid, DownlinkEndpointBinding, DownlinkPdr,
-        GtpuSessionDeviceConfig, GtpuSessionIpFamily, GtpuSessionTransactionId,
+        default_bearer_graph_is_valid, tft_classifier_schema_is_current, DownlinkEndpointBinding,
+        DownlinkPdr, GtpuSessionDeviceConfig, GtpuSessionIpFamily, GtpuSessionTransactionId,
         GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy, MarkedBearerOwner, MarkedBearerOwnerPhase,
         MarkedDownlinkPdr, PdpContextCommit, UplinkFar, UplinkFarKey, UplinkMtuMapState,
         COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
@@ -5796,12 +7280,18 @@ mod aya_runtime {
         GTPU_SESSION_UPLINK_KEY_LEN, MAP_CONFIG, MAP_CONFIG_IPV6, MAP_COUNTERS,
         MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR,
         MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX, MAP_SESSION_GROUPS,
-        MAP_SESSION_SCHEMA, MAP_SESSION_TRANSACTIONS, MAP_SESSION_UPLINK_INDEX, MAP_UPLINK_DSCP,
-        MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT,
-        MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT,
-        MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
-        UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
-        UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
+        MAP_SESSION_SCHEMA, MAP_SESSION_TRANSACTIONS, MAP_SESSION_UPLINK_INDEX,
+        MAP_TFT_CLASSIFIER_COUNTERS, MAP_TFT_CLASSIFIER_FILTERS, MAP_TFT_CLASSIFIER_META,
+        MAP_TFT_CLASSIFIER_SCHEMA, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP,
+        MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU,
+        MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN,
+        MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK, TFT_CLASSIFIER_BANKS,
+        TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_KEY_LEN,
+        TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES, TFT_CLASSIFIER_FILTER_VALUE_LEN,
+        TFT_CLASSIFIER_KEY_LEN, TFT_CLASSIFIER_MAX_FILTERS, TFT_CLASSIFIER_META_MAP_MAX_ENTRIES,
+        TFT_CLASSIFIER_META_VALUE_LEN, TFT_CLASSIFIER_SCHEMA_MARKER_VALUE,
+        TFT_CLASSIFIER_SCHEMA_VALUE_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+        UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
         UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
         UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
         UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE, UPLINK_SOURCE_PORT_VALUE_LEN,
@@ -5811,6 +7301,8 @@ mod aya_runtime {
         ebpf_pmtu_map_state_is_executable, CurrentRecoveryManagedState, EbpfAttachmentDisposition,
         EbpfCleanupOnlyAdoption, EbpfEnvironment, EbpfGtpuDatapathCounters,
         EbpfGtpuDatapathSnapshot, EbpfGtpuRuntime, EbpfMapUpdateMode, EbpfSessionIndexInventory,
+        EbpfTftAuthority, EbpfTftFilterMapCapacity, TftClassifierFilter, TftClassifierFilterKey,
+        TftClassifierKey, TftClassifierMeta,
     };
     use crate::{
         CurrentEbpfGraphRecoveryOutcome, CurrentEbpfGraphRecoveryProgress,
@@ -5885,7 +7377,7 @@ mod aya_runtime {
             Err(_) => {
                 return Capability::UnableToAttempt {
                     blocker: Blocker::Environment,
-                }
+                };
             }
         };
 
@@ -5900,7 +7392,7 @@ mod aya_runtime {
                 Err(_) => {
                     return Capability::UnableToAttempt {
                         blocker: Blocker::Environment,
-                    }
+                    };
                 }
             };
             match program.load() {
@@ -5941,7 +7433,7 @@ mod aya_runtime {
                 Err(_) => {
                     return Capability::UnableToAttempt {
                         blocker: Blocker::Environment,
-                    }
+                    };
                 }
             }
         }
@@ -6229,7 +7721,7 @@ mod aya_runtime {
         },
     ];
 
-    const CURRENT_MAP_NAMES: [&str; 21] = [
+    const CURRENT_MAP_NAMES: [&str; 25] = [
         MAP_UPLINK_FAR,
         MAP_UPLINK_MARK_FAR,
         MAP_UPLINK_DSCP,
@@ -6251,9 +7743,13 @@ mod aya_runtime {
         MAP_SESSION_TRANSACTIONS,
         MAP_CONFIG_IPV6,
         MAP_SESSION_SCHEMA,
+        MAP_TFT_CLASSIFIER_SCHEMA,
+        MAP_TFT_CLASSIFIER_META,
+        MAP_TFT_CLASSIFIER_FILTERS,
+        MAP_TFT_CLASSIFIER_COUNTERS,
     ];
 
-    const CURRENT_UPLINK_PROGRAM_MAP_NAMES: [&str; 17] = [
+    const CURRENT_UPLINK_PROGRAM_MAP_NAMES: [&str; 21] = [
         MAP_UPLINK_FAR,
         MAP_UPLINK_MARK_FAR,
         MAP_UPLINK_DSCP,
@@ -6271,6 +7767,10 @@ mod aya_runtime {
         MAP_SESSION_GROUPS,
         MAP_SESSION_UPLINK_INDEX,
         MAP_CONFIG_IPV6,
+        MAP_TFT_CLASSIFIER_SCHEMA,
+        MAP_TFT_CLASSIFIER_META,
+        MAP_TFT_CLASSIFIER_FILTERS,
+        MAP_TFT_CLASSIFIER_COUNTERS,
     ];
 
     const CURRENT_DOWNLINK_PROGRAM_MAP_NAMES: [&str; 15] = [
@@ -6448,9 +7948,36 @@ mod aya_runtime {
             value_size: GTPU_SESSION_SCHEMA_MARKER_LEN as u32,
             max_entries: 1,
         },
+        CurrentMapSpec {
+            name: MAP_TFT_CLASSIFIER_SCHEMA,
+            map_type: bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            key_size: 4,
+            value_size: TFT_CLASSIFIER_SCHEMA_VALUE_LEN as u32,
+            max_entries: 1,
+        },
+        CurrentMapSpec {
+            name: MAP_TFT_CLASSIFIER_META,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: TFT_CLASSIFIER_KEY_LEN as u32,
+            value_size: TFT_CLASSIFIER_META_VALUE_LEN as u32,
+            max_entries: TFT_CLASSIFIER_META_MAP_MAX_ENTRIES,
+        },
+        CurrentMapSpec {
+            name: MAP_TFT_CLASSIFIER_FILTERS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_HASH as u32,
+            key_size: TFT_CLASSIFIER_FILTER_KEY_LEN as u32,
+            value_size: TFT_CLASSIFIER_FILTER_VALUE_LEN as u32,
+            max_entries: TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES,
+        },
+        CurrentMapSpec {
+            name: MAP_TFT_CLASSIFIER_COUNTERS,
+            map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
+            key_size: 4,
+            value_size: 8,
+            max_entries: TFT_CLASSIFIER_COUNTER_SLOTS,
+        },
     ];
 
-    const CURRENT_RECOVERY_PROOF_LEN: usize = 160;
     const CURRENT_RECOVERY_MAGIC: [u8; 8] = *b"OPCCURR1";
     const CURRENT_RECOVERY_MAP_IDS_OFFSET: usize = 48;
     const CURRENT_RECOVERY_PROOF_MAP_ID_OFFSET: usize =
@@ -6458,6 +7985,7 @@ mod aya_runtime {
     const CURRENT_RECOVERY_GRAPH_DEVICE_OFFSET: usize = CURRENT_RECOVERY_PROOF_MAP_ID_OFFSET + 4;
     const CURRENT_RECOVERY_GRAPH_INODE_OFFSET: usize = CURRENT_RECOVERY_GRAPH_DEVICE_OFFSET + 8;
     const CURRENT_RECOVERY_CHECKSUM_OFFSET: usize = CURRENT_RECOVERY_GRAPH_INODE_OFFSET + 8;
+    const CURRENT_RECOVERY_PROOF_LEN: usize = CURRENT_RECOVERY_CHECKSUM_OFFSET + 8;
 
     const TC_HANDLE: TcHandle = TcHandle::new(0, 1);
     const RECONCILER_CONTROL_DIRECTORY: &str = "GTPU_RECONCILER_LOCKS";
@@ -6571,6 +8099,10 @@ mod aya_runtime {
         session_transactions: u32,
         config_ipv6: u32,
         session_schema: u32,
+        tft_schema: u32,
+        tft_meta: u32,
+        tft_filters: u32,
+        tft_counters: u32,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7631,29 +9163,7 @@ mod aya_runtime {
 
         /// Remove the map pins and their directory; absence is tolerated.
         fn unpin(pin_dir: &Path) -> Result<(), GtpuError> {
-            for map_name in [
-                MAP_UPLINK_FAR,
-                MAP_UPLINK_MARK_FAR,
-                MAP_UPLINK_DSCP,
-                MAP_UPLINK_MARK_DSCP,
-                MAP_UPLINK_SOURCE_PORT,
-                MAP_UPLINK_MARK_SOURCE_PORT,
-                MAP_UPLINK_PMTU,
-                MAP_UPLINK_PMTU_COUNTERS,
-                MAP_DOWNLINK_PDR,
-                MAP_DOWNLINK_MARK_PDR,
-                MAP_DOWNLINK_ENDPOINT_BINDING,
-                MAP_MARKED_BEARER_OWNER,
-                MAP_COUNTERS,
-                MAP_DOWNLINK_BINDING_COUNTERS,
-                MAP_CONFIG,
-                MAP_SESSION_GROUPS,
-                MAP_SESSION_UPLINK_INDEX,
-                MAP_SESSION_DOWNLINK_INDEX,
-                MAP_SESSION_TRANSACTIONS,
-                MAP_CONFIG_IPV6,
-                MAP_SESSION_SCHEMA,
-            ] {
+            for map_name in CURRENT_MAP_NAMES {
                 match fs::remove_file(pin_dir.join(map_name)) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -7714,6 +9224,36 @@ mod aya_runtime {
             Self::object_program_tags(object)
         }
 
+        fn current_artifact_tags_from(
+            bytes: &[u8],
+        ) -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError> {
+            let object = AyaObject::parse(bytes).map_err(|_| {
+                GtpuError::io(
+                    "ebpf_current_object_parse",
+                    invalid_data("current bpf object parse failed"),
+                )
+            })?;
+            if object.maps.len() != CURRENT_MAP_SPECS.len() {
+                return Err(state_indeterminate("ebpf_current_object_identity"));
+            }
+            for spec in CURRENT_MAP_SPECS {
+                let map = object
+                    .maps
+                    .get(spec.name)
+                    .ok_or_else(|| state_indeterminate("ebpf_current_object_identity"))?;
+                if map.map_type() != spec.map_type
+                    || map.key_size() != spec.key_size
+                    || map.value_size() != spec.value_size
+                    || map.max_entries() != spec.max_entries
+                    || map.map_flags() != 0
+                    || map.pinning() != PinningType::ByName
+                {
+                    return Err(state_indeterminate("ebpf_current_object_identity"));
+                }
+            }
+            Self::object_program_tags(object)
+        }
+
         /// Derive tag candidates for the frozen pre-bearer-mark generation.
         ///
         /// The object is classification evidence only. Its authentic counter
@@ -7755,11 +9295,10 @@ mod aya_runtime {
         /// Derive the tag candidates of the frozen generation that preceded the
         /// uplink redirect-outcome counter.
         ///
-        /// The map inventory is the current one: this generation differs from
-        /// the current build by its instruction stream and by the counter map
-        /// width, not by which maps exist. Checking the whole inventory anyway
-        /// keeps the artifact pinned to a single meaning, so a future object
-        /// swapped in under this name cannot quietly become the authority.
+        /// This artifact predates the additive TFT graph. It remains frozen
+        /// classification evidence: its complete pre-TFT map inventory and
+        /// counter width are both checked so it can never become current
+        /// replacement authority.
         fn pre_redirect_artifact_tags_from(
             bytes: &[u8],
         ) -> Result<(LegacyV2ProgramTags, LegacyV2ProgramTags), GtpuError> {
@@ -7772,10 +9311,13 @@ mod aya_runtime {
                     invalid_data("pre-redirect bpf object parse failed"),
                 )
             })?;
-            if object.maps.len() != CURRENT_MAP_SPECS.len() {
+            // This frozen object predates the additive TFT map generation.
+            // It is identity-only migration evidence and must never be
+            // mistaken for the current graph.
+            if object.maps.len() != CURRENT_MAP_SPECS.len() - 4 {
                 return Err(state_indeterminate("ebpf_pre_redirect_object_identity"));
             }
-            for spec in CURRENT_MAP_SPECS {
+            for spec in CURRENT_MAP_SPECS.iter().take(CURRENT_MAP_SPECS.len() - 4) {
                 let map = object
                     .maps
                     .get(spec.name)
@@ -7872,12 +9414,8 @@ mod aya_runtime {
             static TAGS: OnceLock<Result<DatapathGenerationTags, ObjectTagFailure>> =
                 OnceLock::new();
             TAGS.get_or_init(|| {
-                let current = AyaObject::parse(DATAPATH_OBJECT)
-                    .map_err(|_| ObjectTagFailure::Parse("ebpf_current_object_identity"))
-                    .and_then(|object| {
-                        Self::object_program_tags(object)
-                            .map_err(object_identity_failure("ebpf_current_object_identity"))
-                    })?;
+                let current = Self::current_artifact_tags_from(DATAPATH_OBJECT)
+                    .map_err(object_identity_failure("ebpf_current_object_identity"))?;
                 let legacy_v1 = Self::legacy_v1_artifact_tags_from(LEGACY_V1_DATAPATH_OBJECT)
                     .map_err(object_identity_failure("ebpf_legacy_object_identity"))?;
                 let pre_redirect = pre_redirect_artifact::program_tags()
@@ -8765,6 +10303,10 @@ mod aya_runtime {
                     MAP_SESSION_TRANSACTIONS,
                     MAP_CONFIG_IPV6,
                     MAP_SESSION_SCHEMA,
+                    MAP_TFT_CLASSIFIER_SCHEMA,
+                    MAP_TFT_CLASSIFIER_META,
+                    MAP_TFT_CLASSIFIER_FILTERS,
+                    MAP_TFT_CLASSIFIER_COUNTERS,
                 ] {
                     if pin_dir
                         .join(other_pin)
@@ -9013,6 +10555,88 @@ mod aya_runtime {
                 [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN]
             );
             Ok(GroupedSchemaState::Initializing { config: decoded })
+        }
+
+        /// Classify the independent additive TFT graph before Aya can reuse or
+        /// materialize any pinned-by-name map.
+        ///
+        /// An absent graph is a safe initialization state. A partial graph is
+        /// never repaired implicitly, and an all-zero marker may be promoted
+        /// only when both behavioral hash maps are empty. Otherwise retained
+        /// rows could become executable merely because this process publishes
+        /// the current marker after attaching its tc program.
+        fn tft_schema_preflight(pin_dir: &Path) -> Result<(), GtpuError> {
+            let tft_pins = [
+                MAP_TFT_CLASSIFIER_SCHEMA,
+                MAP_TFT_CLASSIFIER_META,
+                MAP_TFT_CLASSIFIER_FILTERS,
+                MAP_TFT_CLASSIFIER_COUNTERS,
+            ];
+            let present = tft_pins
+                .iter()
+                .map(|name| {
+                    pin_dir
+                        .join(name)
+                        .try_exists()
+                        .map_err(|error| GtpuError::io("ebpf_tft_schema", error))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if present.iter().all(|present| !present) {
+                return Ok(());
+            }
+            if present.iter().any(|present| !present) {
+                return Err(GtpuError::io(
+                    "ebpf_tft_schema",
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "adopted TFT classifier map pin is missing",
+                    ),
+                ));
+            }
+
+            let schema = Array::<MapData, [u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]>::try_from(
+                Self::current_map(pin_dir, MAP_TFT_CLASSIFIER_SCHEMA)
+                    .map_err(|_| state_indeterminate("ebpf_tft_schema"))?,
+            )
+            .map_err(|error| map_error("ebpf_tft_schema", error))?
+            .get(&0, 0)
+            .map_err(|error| map_error("ebpf_tft_schema", error))?;
+            if tft_classifier_schema_is_current(&schema) {
+                return Ok(());
+            }
+            if schema != [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN] {
+                return Err(state_indeterminate("ebpf_tft_schema"));
+            }
+
+            macro_rules! require_empty {
+                ($name:expr, $key:ty, $value:ty) => {{
+                    let map = BpfHashMap::<MapData, $key, $value>::try_from(
+                        Self::current_map(pin_dir, $name)
+                            .map_err(|_| state_indeterminate("ebpf_tft_schema"))?,
+                    )
+                    .map_err(|error| map_error("ebpf_tft_schema", error))?;
+                    if map
+                        .iter()
+                        .next()
+                        .transpose()
+                        .map_err(|error| map_error("ebpf_tft_schema", error))?
+                        .is_some()
+                    {
+                        return Err(state_indeterminate("ebpf_tft_schema"));
+                    }
+                }};
+            }
+            require_empty!(
+                MAP_TFT_CLASSIFIER_META,
+                [u8; TFT_CLASSIFIER_KEY_LEN],
+                [u8; TFT_CLASSIFIER_META_VALUE_LEN]
+            );
+            require_empty!(
+                MAP_TFT_CLASSIFIER_FILTERS,
+                [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+                [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN]
+            );
+            Ok(())
         }
 
         fn grouped_config_same_namespace(
@@ -10980,6 +12604,10 @@ mod aya_runtime {
                 session_transactions: id(MAP_SESSION_TRANSACTIONS)?,
                 config_ipv6: id(MAP_CONFIG_IPV6)?,
                 session_schema: id(MAP_SESSION_SCHEMA)?,
+                tft_schema: id(MAP_TFT_CLASSIFIER_SCHEMA)?,
+                tft_meta: id(MAP_TFT_CLASSIFIER_META)?,
+                tft_filters: id(MAP_TFT_CLASSIFIER_FILTERS)?,
+                tft_counters: id(MAP_TFT_CLASSIFIER_COUNTERS)?,
             })
         }
 
@@ -11006,6 +12634,10 @@ mod aya_runtime {
                 identity.session_transactions,
                 identity.config_ipv6,
                 identity.session_schema,
+                identity.tft_schema,
+                identity.tft_meta,
+                identity.tft_filters,
+                identity.tft_counters,
             ]
         }
 
@@ -11127,6 +12759,30 @@ mod aya_runtime {
                 ebpf.map(MAP_SESSION_SCHEMA).ok_or_else(missing)?,
             )
             .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let tft_schema = Array::<_, [u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]>::try_from(
+                ebpf.map(MAP_TFT_CLASSIFIER_SCHEMA).ok_or_else(missing)?,
+            )
+            .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let tft_meta = BpfHashMap::<
+                _,
+                [u8; TFT_CLASSIFIER_KEY_LEN],
+                [u8; TFT_CLASSIFIER_META_VALUE_LEN],
+            >::try_from(
+                ebpf.map(MAP_TFT_CLASSIFIER_META).ok_or_else(missing)?
+            )
+            .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let tft_filters = BpfHashMap::<
+                _,
+                [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+                [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+            >::try_from(
+                ebpf.map(MAP_TFT_CLASSIFIER_FILTERS).ok_or_else(missing)?
+            )
+            .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let tft_counters = PerCpuArray::<_, u64>::try_from(
+                ebpf.map(MAP_TFT_CLASSIFIER_COUNTERS).ok_or_else(missing)?,
+            )
+            .map_err(|error| map_error("ebpf_map_identity", error))?;
             Ok(PinnedMapIdentity {
                 uplink_far: info_id(uplink_far.map())?,
                 uplink_mark_far: info_id(uplink_mark_far.map())?,
@@ -11149,6 +12805,10 @@ mod aya_runtime {
                 session_transactions: info_id(session_transactions.map())?,
                 config_ipv6: info_id(config_ipv6.map())?,
                 session_schema: info_id(session_schema.map())?,
+                tft_schema: info_id(tft_schema.map())?,
+                tft_meta: info_id(tft_meta.map())?,
+                tft_filters: info_id(tft_filters.map())?,
+                tft_counters: info_id(tft_counters.map())?,
             })
         }
 
@@ -11484,6 +13144,120 @@ mod aya_runtime {
                 return Err(state_indeterminate("ebpf_pmtu_policy_adopt"));
             }
             Ok(())
+        }
+
+        /// Read the exact single TFT schema marker slot from the held map.
+        fn tft_schema_slot(
+            ebpf: &Ebpf,
+        ) -> Result<[u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN], GtpuError> {
+            let map = ebpf
+                .map(MAP_TFT_CLASSIFIER_SCHEMA)
+                .ok_or_else(|| GtpuError::io("ebpf_tft_schema_map", invalid_data("map missing")))?;
+            let array = Array::<_, [u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]>::try_from(map)
+                .map_err(|error| map_error("ebpf_tft_schema_map", error))?;
+            array
+                .get(&0, 0)
+                .map_err(|error| map_error("ebpf_tft_schema_get", error))
+        }
+
+        /// Re-check the behavior-bearing maps held by this exact loader before
+        /// committing a zero schema marker. The pinned preflight catches
+        /// retained state before mutation; this second check also closes the
+        /// interval in which the loader materializes an absent additive graph.
+        fn require_loaded_tft_initialization_empty(ebpf: &Ebpf) -> Result<(), GtpuError> {
+            macro_rules! require_empty {
+                ($name:expr, $key:ty, $value:ty) => {{
+                    let map = ebpf.map($name).ok_or_else(|| {
+                        GtpuError::io("ebpf_tft_schema_map", invalid_data("map missing"))
+                    })?;
+                    let hash = BpfHashMap::<_, $key, $value>::try_from(map)
+                        .map_err(|error| map_error("ebpf_tft_schema_map", error))?;
+                    if hash
+                        .iter()
+                        .next()
+                        .transpose()
+                        .map_err(|error| map_error("ebpf_tft_schema", error))?
+                        .is_some()
+                    {
+                        return Err(state_indeterminate("ebpf_tft_schema"));
+                    }
+                }};
+            }
+            require_empty!(
+                MAP_TFT_CLASSIFIER_META,
+                [u8; TFT_CLASSIFIER_KEY_LEN],
+                [u8; TFT_CLASSIFIER_META_VALUE_LEN]
+            );
+            require_empty!(
+                MAP_TFT_CLASSIFIER_FILTERS,
+                [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+                [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN]
+            );
+            Ok(())
+        }
+
+        /// Initialize an otherwise-empty additive TFT marker, or prove the
+        /// retained graph already has this exact classifier ABI. A nonzero
+        /// foreign marker is never overwritten.
+        fn ensure_tft_schema_marker(ebpf: &mut Ebpf) -> Result<(), GtpuError> {
+            let current = Self::tft_schema_slot(ebpf)?;
+            if tft_classifier_schema_is_current(&current) {
+                return Ok(());
+            }
+            if current != [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN] {
+                return Err(state_indeterminate("ebpf_tft_schema"));
+            }
+            Self::require_loaded_tft_initialization_empty(ebpf)?;
+            {
+                let map = ebpf.map_mut(MAP_TFT_CLASSIFIER_SCHEMA).ok_or_else(|| {
+                    GtpuError::io("ebpf_tft_schema_map", invalid_data("map missing"))
+                })?;
+                let mut array = Array::<_, [u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]>::try_from(map)
+                    .map_err(|error| map_error("ebpf_tft_schema_map", error))?;
+                array
+                    .set(0, TFT_CLASSIFIER_SCHEMA_MARKER_VALUE, 0)
+                    .map_err(|error| map_error("ebpf_tft_schema_put", error))?;
+            }
+            if Self::tft_schema_slot(ebpf)? != TFT_CLASSIFIER_SCHEMA_MARKER_VALUE {
+                return Err(state_indeterminate("ebpf_tft_schema"));
+            }
+            Ok(())
+        }
+
+        /// Derive durable opaque TFT ownership from the held pin identity and
+        /// the canonical namespace lease. Program IDs are intentionally not
+        /// included: an exact restart/re-attach can allocate fresh programs
+        /// while preserving the same retained map graph.
+        fn tft_authority_for_loaded(
+            ifindex: u32,
+            device: &LoadedDevice,
+        ) -> Result<EbpfTftAuthority, GtpuError> {
+            if !Self::loaded_datapath_is_current(ifindex, device) {
+                return Err(state_indeterminate("ebpf_tft_authority"));
+            }
+            let mut digest = Sha256::new();
+            digest.update(b"opc-gtpu/tft-owner/v1");
+            digest.update(device._reconciler_ownership.namespace_hash);
+            digest.update(ifindex.to_be_bytes());
+            for map_id in Self::pinned_map_ids(&device.datapath_identity.pins) {
+                digest.update(map_id.to_be_bytes());
+            }
+            let digest: [u8; 32] = digest.finalize().into();
+            let mut owner = [0_u8; 16];
+            owner.copy_from_slice(&digest[..16]);
+            if owner == [0; 16] {
+                owner[15] = 1;
+            }
+            let mut generation = [0_u8; 8];
+            generation.copy_from_slice(&digest[16..24]);
+            let mut generation = u64::from_be_bytes(generation);
+            if generation == 0 {
+                generation = 1;
+            }
+            Ok(EbpfTftAuthority {
+                owner,
+                owner_generation: generation,
+            })
         }
     }
 
@@ -13046,6 +14820,7 @@ mod aya_runtime {
             Self::classify_pinned_map_layout(&canonical_pin_dir)?;
             Self::require_current_pin_capacity(&canonical_pin_dir)?;
             let schema_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
+            Self::tft_schema_preflight(&canonical_pin_dir)?;
             // Prove ownership from the pins before the loader publishes any
             // map. The equivalent check below runs against the loaded graph and
             // is kept, but by then a conflicting owner has already had pins
@@ -13134,6 +14909,23 @@ mod aya_runtime {
                             "ebpf_tc_attach_rollback",
                         ));
                     }
+                }
+                if let Err(error) = Self::ensure_tft_schema_marker(&mut ebpf) {
+                    if attached.replaced_existing {
+                        return Err(state_indeterminate("ebpf_tft_schema_commit"));
+                    }
+                    let rollback = detach_datapath_if_current(
+                        attached.links,
+                        &attached.identity,
+                        ifindex,
+                        tc_priority,
+                    );
+                    return Err(error_after_rollback(
+                        error,
+                        rollback,
+                        false,
+                        "ebpf_tc_attach_rollback",
+                    ));
                 }
                 Ok((attached, indexes))
             })();
@@ -13255,6 +15047,7 @@ mod aya_runtime {
             // reports an initializing state, which says nothing about whether a
             // legacy IPv4 graph is still live behind the same pin namespace.
             Self::require_empty_legacy_authority(&canonical_pin_dir, bearer_state)?;
+            Self::tft_schema_preflight(&canonical_pin_dir)?;
             // ---- mutation boundary ----
             let mut ebpf = match self.load_pinned(&canonical_pin_dir) {
                 Ok(ebpf) => ebpf,
@@ -13364,6 +15157,23 @@ mod aya_runtime {
                         ));
                     }
                 }
+                if let Err(error) = Self::ensure_tft_schema_marker(&mut ebpf) {
+                    if attached.replaced_existing {
+                        return Err(state_indeterminate("ebpf_tft_schema_commit"));
+                    }
+                    let rollback = detach_datapath_if_current(
+                        attached.links,
+                        &attached.identity,
+                        ifindex,
+                        tc_priority,
+                    );
+                    return Err(error_after_rollback(
+                        error,
+                        rollback,
+                        false,
+                        "ebpf_tc_attach_rollback",
+                    ));
+                }
                 Ok(attached)
             })();
             let attached = match provisioned {
@@ -13460,6 +15270,7 @@ mod aya_runtime {
             Self::classify_pinned_map_layout(&canonical_pin_dir)?;
             Self::require_current_pin_capacity(&canonical_pin_dir)?;
             let schema_state = Self::bearer_schema_preflight(&canonical_pin_dir)?;
+            Self::tft_schema_preflight(&canonical_pin_dir)?;
             // ---- mutation boundary ----
             let mut ebpf = self.load_pinned(&canonical_pin_dir)?;
             let expected_pins = Self::held_map_identity(&ebpf)
@@ -13525,6 +15336,23 @@ mod aya_runtime {
                         "ebpf_tc_attach_rollback",
                     ));
                 }
+            }
+            if let Err(error) = Self::ensure_tft_schema_marker(&mut ebpf) {
+                if attached.replaced_existing {
+                    return Err(state_indeterminate("ebpf_tft_schema_commit"));
+                }
+                let rollback = detach_datapath_if_current(
+                    attached.links,
+                    &attached.identity,
+                    ifindex,
+                    tc_priority,
+                );
+                return Err(error_after_rollback(
+                    error,
+                    rollback,
+                    false,
+                    "ebpf_tc_attach_rollback",
+                ));
             }
             let mut devices = match self.devices.lock() {
                 Ok(devices) => devices,
@@ -13678,6 +15506,14 @@ mod aya_runtime {
             if named_pins != expected_pins {
                 return Err(state_indeterminate("ebpf_map_identity"));
             }
+            if !matches!(
+                Self::tft_schema_slot(&ebpf),
+                Ok(value) if tft_classifier_schema_is_current(&value)
+            ) {
+                return Ok(EbpfCleanupOnlyAdoption::Refused(
+                    RetainedGraphCleanupRefusal::NotCurrentSchema,
+                ));
+            }
             // Fence any retained live hook before stale PDP cleanup so
             // forwarding is disabled. This never reattaches.
             let hooks_fenced =
@@ -13750,6 +15586,9 @@ mod aya_runtime {
             }
             let schema_state = Self::bearer_schema_preflight(&device.pin_dir)?;
             if schema_state != BearerSchemaState::PmtuV5 {
+                return Err(state_indeterminate("ebpf_cleanup_schema"));
+            }
+            if !tft_classifier_schema_is_current(&Self::tft_schema_slot(&device.ebpf)?) {
                 return Err(state_indeterminate("ebpf_cleanup_schema"));
             }
             let attached = self.attach_programs_by_ifindex(
@@ -14466,6 +16305,12 @@ mod aya_runtime {
             if Self::pinned_map_ids(&held) != map_ids {
                 return refused(CurrentEbpfGraphRecoveryRefusal::IdentityMismatch);
             }
+            if !matches!(
+                Self::tft_schema_slot(&ebpf),
+                Ok(value) if tft_classifier_schema_is_current(&value)
+            ) {
+                return refused(CurrentEbpfGraphRecoveryRefusal::NotCurrentSchema);
+            }
             if load_program(&mut ebpf, PROG_UPLINK).is_err()
                 || load_program(&mut ebpf, PROG_DOWNLINK).is_err()
             {
@@ -15105,6 +16950,312 @@ mod aya_runtime {
                 array
                     .set(0, value, 0)
                     .map_err(|error| map_error("ebpf_pmtu_policy_write", error))
+            })
+        }
+
+        fn tft_schema_get(
+            &self,
+            ifindex: u32,
+        ) -> Result<[u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN], GtpuError> {
+            self.with_device(ifindex, "ebpf_tft_schema_get", |device| {
+                if !Self::loaded_datapath_is_current(ifindex, device) {
+                    return Err(state_indeterminate("ebpf_tft_schema_get"));
+                }
+                Self::tft_schema_slot(&device.ebpf)
+            })
+        }
+
+        fn tft_meta_get(
+            &self,
+            ifindex: u32,
+            key: [u8; TFT_CLASSIFIER_KEY_LEN],
+        ) -> Result<Option<[u8; TFT_CLASSIFIER_META_VALUE_LEN]>, GtpuError> {
+            self.with_device(ifindex, "ebpf_tft_meta_get", |device| {
+                if !Self::loaded_datapath_is_current(ifindex, device)
+                    || !tft_classifier_schema_is_current(&Self::tft_schema_slot(&device.ebpf)?)
+                {
+                    return Err(state_indeterminate("ebpf_tft_meta_get"));
+                }
+                let map = device.ebpf.map(MAP_TFT_CLASSIFIER_META).ok_or_else(|| {
+                    GtpuError::io("ebpf_tft_meta_map", invalid_data("map missing"))
+                })?;
+                let hash = BpfHashMap::<
+                    _,
+                    [u8; TFT_CLASSIFIER_KEY_LEN],
+                    [u8; TFT_CLASSIFIER_META_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_tft_meta_map", error))?;
+                match hash.get(&key, 0) {
+                    Ok(value) => Ok(Some(value)),
+                    Err(MapError::KeyNotFound) => Ok(None),
+                    Err(error) => Err(map_error("ebpf_tft_meta_get", error)),
+                }
+            })
+        }
+
+        fn tft_meta_put(
+            &self,
+            ifindex: u32,
+            key: [u8; TFT_CLASSIFIER_KEY_LEN],
+            value: [u8; TFT_CLASSIFIER_META_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            let classifier = TftClassifierKey::decode(key).ok_or_else(|| {
+                GtpuError::invalid_config("tft_uplink_classifier", "non-canonical metadata key")
+            })?;
+            if classifier.attachment_ifindex() != ifindex
+                || TftClassifierMeta::decode(value).is_none()
+            {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier",
+                    "non-canonical metadata value",
+                ));
+            }
+            self.with_device(ifindex, "ebpf_tft_meta_put", |device| {
+                if !Self::loaded_datapath_is_current(ifindex, device)
+                    || !tft_classifier_schema_is_current(&Self::tft_schema_slot(&device.ebpf)?)
+                {
+                    return Err(state_indeterminate("ebpf_tft_meta_put"));
+                }
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_TFT_CLASSIFIER_META)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_tft_meta_map", invalid_data("map missing"))
+                    })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; TFT_CLASSIFIER_KEY_LEN],
+                    [u8; TFT_CLASSIFIER_META_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_tft_meta_map", error))?;
+                hash.insert(key, value, 0)
+                    .map_err(|error| map_error("ebpf_tft_meta_put", error))
+            })
+        }
+
+        fn tft_meta_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; TFT_CLASSIFIER_KEY_LEN],
+        ) -> Result<bool, GtpuError> {
+            if TftClassifierKey::decode(key)
+                .is_none_or(|classifier| classifier.attachment_ifindex() != ifindex)
+            {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier",
+                    "non-canonical metadata key",
+                ));
+            }
+            self.with_device(ifindex, "ebpf_tft_meta_remove", |device| {
+                if !Self::loaded_datapath_is_current(ifindex, device)
+                    || !tft_classifier_schema_is_current(&Self::tft_schema_slot(&device.ebpf)?)
+                {
+                    return Err(state_indeterminate("ebpf_tft_meta_remove"));
+                }
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_TFT_CLASSIFIER_META)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_tft_meta_map", invalid_data("map missing"))
+                    })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; TFT_CLASSIFIER_KEY_LEN],
+                    [u8; TFT_CLASSIFIER_META_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_tft_meta_map", error))?;
+                map_delete_result("ebpf_tft_meta_remove", hash.remove(&key))
+            })
+        }
+
+        fn tft_filter_inventory(
+            &self,
+            ifindex: u32,
+            classifier_key: [u8; TFT_CLASSIFIER_KEY_LEN],
+        ) -> Result<
+            Vec<(
+                [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+                [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+            )>,
+            GtpuError,
+        > {
+            if TftClassifierKey::decode(classifier_key)
+                .is_none_or(|classifier| classifier.attachment_ifindex() != ifindex)
+            {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier",
+                    "non-canonical filter classifier key",
+                ));
+            }
+            self.with_device(ifindex, "ebpf_tft_filter_inventory", |device| {
+                if !Self::loaded_datapath_is_current(ifindex, device)
+                    || !tft_classifier_schema_is_current(&Self::tft_schema_slot(&device.ebpf)?)
+                {
+                    return Err(state_indeterminate("ebpf_tft_filter_inventory"));
+                }
+                let map = device.ebpf.map(MAP_TFT_CLASSIFIER_FILTERS).ok_or_else(|| {
+                    GtpuError::io("ebpf_tft_filters_map", invalid_data("map missing"))
+                })?;
+                let hash = BpfHashMap::<
+                    _,
+                    [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+                    [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_tft_filters_map", error))?;
+                let limit = usize::from(TFT_CLASSIFIER_BANKS) * TFT_CLASSIFIER_MAX_FILTERS + 1;
+                let mut records = Vec::with_capacity(limit);
+                for entry in hash.iter() {
+                    let (key, value) =
+                        entry.map_err(|error| map_error("ebpf_tft_filter_inventory", error))?;
+                    if key[..TFT_CLASSIFIER_KEY_LEN] == classifier_key {
+                        records.push((key, value));
+                        if records.len() == limit {
+                            break;
+                        }
+                    }
+                }
+                records.sort_unstable_by_key(|(key, _)| *key);
+                Ok(records)
+            })
+        }
+
+        fn tft_filter_put(
+            &self,
+            ifindex: u32,
+            key: [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+            value: [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            let (Some(filter_key), Some(filter)) = (
+                TftClassifierFilterKey::decode(key),
+                TftClassifierFilter::decode(value),
+            ) else {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier",
+                    "non-canonical filter record",
+                ));
+            };
+            if filter_key.classifier().attachment_ifindex() != ifindex
+                || !filter_key.matches_filter(&filter)
+                || filter.dense_rank() != filter_key.filter_index() as u8
+            {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier",
+                    "non-canonical filter record",
+                ));
+            }
+            self.with_device(ifindex, "ebpf_tft_filter_put", |device| {
+                if !Self::loaded_datapath_is_current(ifindex, device)
+                    || !tft_classifier_schema_is_current(&Self::tft_schema_slot(&device.ebpf)?)
+                {
+                    return Err(state_indeterminate("ebpf_tft_filter_put"));
+                }
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_TFT_CLASSIFIER_FILTERS)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_tft_filters_map", invalid_data("map missing"))
+                    })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+                    [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_tft_filters_map", error))?;
+                hash.insert(key, value, 0)
+                    .map_err(|error| map_error("ebpf_tft_filter_put", error))
+            })
+        }
+
+        fn tft_filter_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+        ) -> Result<bool, GtpuError> {
+            if TftClassifierFilterKey::decode(key)
+                .is_none_or(|filter_key| filter_key.classifier().attachment_ifindex() != ifindex)
+            {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier",
+                    "non-canonical filter key",
+                ));
+            }
+            self.with_device(ifindex, "ebpf_tft_filter_remove", |device| {
+                if !Self::loaded_datapath_is_current(ifindex, device)
+                    || !tft_classifier_schema_is_current(&Self::tft_schema_slot(&device.ebpf)?)
+                {
+                    return Err(state_indeterminate("ebpf_tft_filter_remove"));
+                }
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_TFT_CLASSIFIER_FILTERS)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_tft_filters_map", invalid_data("map missing"))
+                    })?;
+                let mut hash = BpfHashMap::<
+                    _,
+                    [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+                    [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_tft_filters_map", error))?;
+                map_delete_result("ebpf_tft_filter_remove", hash.remove(&key))
+            })
+        }
+
+        fn tft_filter_capacity(&self, ifindex: u32) -> Result<EbpfTftFilterMapCapacity, GtpuError> {
+            self.with_device(ifindex, "ebpf_tft_filter_capacity", |device| {
+                if !Self::loaded_datapath_is_current(ifindex, device)
+                    || !tft_classifier_schema_is_current(&Self::tft_schema_slot(&device.ebpf)?)
+                {
+                    return Err(state_indeterminate("ebpf_tft_filter_capacity"));
+                }
+                let map = device.ebpf.map(MAP_TFT_CLASSIFIER_FILTERS).ok_or_else(|| {
+                    GtpuError::io("ebpf_tft_filters_map", invalid_data("map missing"))
+                })?;
+                let hash = BpfHashMap::<
+                    _,
+                    [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+                    [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+                >::try_from(map)
+                .map_err(|error| map_error("ebpf_tft_filters_map", error))?;
+                if hash
+                    .map()
+                    .info()
+                    .map_err(|error| map_error("ebpf_tft_filters_map", error))?
+                    .max_entries()
+                    != TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES
+                {
+                    return Err(state_indeterminate("ebpf_tft_filter_capacity"));
+                }
+                let mut occupied = 0_u32;
+                for entry in hash.iter() {
+                    entry.map_err(|error| map_error("ebpf_tft_filter_capacity", error))?;
+                    occupied = occupied
+                        .checked_add(1)
+                        .ok_or_else(|| state_indeterminate("ebpf_tft_filter_capacity"))?;
+                }
+                EbpfTftFilterMapCapacity::new(occupied, TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES)
+                    .ok_or_else(|| state_indeterminate("ebpf_tft_filter_capacity"))
+            })
+        }
+
+        fn tft_authority(&self, ifindex: u32) -> Result<EbpfTftAuthority, GtpuError> {
+            self.with_device(ifindex, "ebpf_tft_authority", |device| {
+                if !tft_classifier_schema_is_current(&Self::tft_schema_slot(&device.ebpf)?) {
+                    return Err(state_indeterminate("ebpf_tft_authority"));
+                }
+                Self::tft_authority_for_loaded(ifindex, device)
+            })
+        }
+
+        fn tft_datapath_usable(&self, ifindex: u32) -> bool {
+            let devices = self
+                .devices
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            devices.get(&ifindex).is_some_and(|device| {
+                Self::loaded_datapath_is_current(ifindex, device)
+                    && Self::tft_schema_slot(&device.ebpf)
+                        .is_ok_and(|marker| tft_classifier_schema_is_current(&marker))
             })
         }
 
@@ -16205,6 +18356,25 @@ mod aya_runtime {
             );
         }
 
+        #[test]
+        fn unpin_removes_every_current_map_pin_including_the_tft_graph() {
+            let pin_dir =
+                std::env::temp_dir().join(format!("opc-gtpu-current-unpin-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&pin_dir);
+            fs::create_dir_all(&pin_dir).expect("create current pin directory");
+            for map_name in CURRENT_MAP_NAMES {
+                fs::write(pin_dir.join(map_name), b"synthetic map pin")
+                    .expect("create synthetic current map pin");
+            }
+            assert!(pin_dir.join(MAP_TFT_CLASSIFIER_SCHEMA).exists());
+            assert!(pin_dir.join(MAP_TFT_CLASSIFIER_META).exists());
+            assert!(pin_dir.join(MAP_TFT_CLASSIFIER_FILTERS).exists());
+            assert!(pin_dir.join(MAP_TFT_CLASSIFIER_COUNTERS).exists());
+
+            AyaGtpuRuntime::unpin(&pin_dir).expect("remove every current map pin");
+            assert!(!pin_dir.exists());
+        }
+
         fn instruction(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> bpf_insn {
             bpf_insn {
                 code,
@@ -16593,6 +18763,18 @@ mod aya_runtime {
             // still prints "1 passed", so the gate could go green having
             // loaded nothing.
             println!("OPC_GTPU_LOAD_CAPABILITY_PROVEN");
+        }
+
+        #[test]
+        fn current_object_has_exactly_the_named_pinned_map_graph() {
+            AyaGtpuRuntime::current_artifact_tags_from(DATAPATH_OBJECT)
+                .expect("current object must contain only its exact named pinned map graph");
+            let object = AyaObject::parse(DATAPATH_OBJECT).expect("parse current datapath object");
+            assert_eq!(object.maps.len(), CURRENT_MAP_NAMES.len());
+            for name in CURRENT_MAP_NAMES {
+                let map = object.maps.get(name).expect("current named map");
+                assert_eq!(map.pinning(), PinningType::ByName, "map {name}");
+            }
         }
 
         fn bpffs_entries(pin_root: &std::path::Path) -> Vec<std::ffi::OsString> {
@@ -17335,6 +19517,10 @@ mod aya_runtime {
                 session_transactions: 19,
                 config_ipv6: 20,
                 session_schema: 21,
+                tft_schema: 22,
+                tft_meta: 23,
+                tft_filters: 24,
+                tft_counters: 25,
             };
             let swapped = PinnedMapIdentity {
                 uplink_far: expected.uplink_dscp,
@@ -18303,10 +20489,7 @@ mod load_capability_tests {
         ));
         let capability = probe_committed_classifier_load(&pin_root);
         assert!(
-            matches!(
-                capability,
-                ClassifierLoadCapability::UnableToAttempt { .. }
-            ),
+            matches!(capability, ClassifierLoadCapability::UnableToAttempt { .. }),
             "an unattemptable probe must not be reported as a verifier rejection, got {capability:?}"
         );
         assert!(!capability.is_loadable());
@@ -18342,7 +20525,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex};
 
-    use opc_gtpu_ebpf_common::default_bearer_graph_is_valid;
+    use opc_gtpu_ebpf_common::{
+        default_bearer_graph_is_valid, TFT_CLASSIFIER_SCHEMA_MARKER_VALUE,
+        TFT_CLASSIFIER_SCHEMA_VALUE_LEN,
+    };
 
     use crate::model::{GtpBearerMark, Teid};
     use crate::{
@@ -18355,7 +20541,7 @@ mod tests {
     const S2BU_IFINDEX: u32 = 7;
     const REPLACEMENT_IFINDEX: u32 = 19;
     const LEGACY_V2_PIN_COUNT: usize = 9;
-    const CURRENT_PIN_COUNT: usize = 21;
+    const CURRENT_PIN_COUNT: usize = 25;
 
     struct FakeRuntime {
         ifindexes: HashMap<String, u32>,
@@ -18403,6 +20589,17 @@ mod tests {
         sport: HashMap<(u32, [u8; 4]), [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>,
         marked_sport: HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>,
         pmtu_policy: HashMap<u32, [u8; UPLINK_PMTU_VALUE_LEN]>,
+        // Additive shared-SA TFT graph. The fake deliberately stores the raw
+        // fixed-width records so hostile/malformed retained bytes exercise
+        // the same userspace classification path as Aya map I/O.
+        tft_schema: HashMap<u32, [u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]>,
+        tft_meta: HashMap<(u32, [u8; TFT_CLASSIFIER_KEY_LEN]), [u8; TFT_CLASSIFIER_META_VALUE_LEN]>,
+        tft_filters: HashMap<
+            (u32, [u8; TFT_CLASSIFIER_FILTER_KEY_LEN]),
+            [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+        >,
+        tft_map_identity: HashMap<u32, [u32; 4]>,
+        tft_next_map_identity: u32,
         pdr: HashMap<(u32, [u8; 4]), [u8; DOWNLINK_PDR_VALUE_LEN]>,
         marked_pdr: HashMap<(u32, [u8; 4]), [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]>,
         downlink_binding: HashMap<(u32, [u8; 4]), [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>,
@@ -18418,6 +20615,10 @@ mod tests {
         marked_sport_map_ready: HashSet<u32>,
         pmtu_map_ready: HashSet<u32>,
         pmtu_counters_map_ready: HashSet<u32>,
+        tft_schema_map_ready: HashSet<u32>,
+        tft_meta_map_ready: HashSet<u32>,
+        tft_filters_map_ready: HashSet<u32>,
+        tft_counters_map_ready: HashSet<u32>,
         marked_pdr_map_ready: HashSet<u32>,
         marked_owner_map_ready: HashSet<u32>,
         downlink_binding_map_ready: HashSet<u32>,
@@ -18552,6 +20753,14 @@ mod tests {
         marked_owner_by_teid: HashMap<(u32, [u8; 4]), [u8; UPLINK_MARK_KEY_LEN]>,
         default_teid_by_ue: HashMap<(u32, [u8; 4]), [u8; 4]>,
         pmtu_policy: HashMap<u32, [u8; UPLINK_PMTU_VALUE_LEN]>,
+        tft_schema: HashMap<u32, [u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]>,
+        tft_meta: HashMap<(u32, [u8; TFT_CLASSIFIER_KEY_LEN]), [u8; TFT_CLASSIFIER_META_VALUE_LEN]>,
+        tft_filters: HashMap<
+            (u32, [u8; TFT_CLASSIFIER_FILTER_KEY_LEN]),
+            [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+        >,
+        tft_map_identity: HashMap<u32, [u32; 4]>,
+        tft_next_map_identity: u32,
         schema: HashMap<PathBuf, FakeSchema>,
     }
 
@@ -18585,6 +20794,11 @@ mod tests {
                 marked_owner_by_teid: state.marked_owner_by_teid.clone(),
                 default_teid_by_ue: state.default_teid_by_ue.clone(),
                 pmtu_policy: state.pmtu_policy.clone(),
+                tft_schema: state.tft_schema.clone(),
+                tft_meta: state.tft_meta.clone(),
+                tft_filters: state.tft_filters.clone(),
+                tft_map_identity: state.tft_map_identity.clone(),
+                tft_next_map_identity: state.tft_next_map_identity,
                 schema: state.schema.clone(),
             }
         }
@@ -18701,6 +20915,169 @@ mod tests {
                 ));
             }
             Ok(())
+        }
+
+        /// Mirror the production pre-load TFT schema guard. The fake stores
+        /// map readiness separately from rows, so it also rejects impossible
+        /// partial graphs rather than silently materializing their missing
+        /// pieces during a test attach.
+        fn validate_tft_schema_preflight(state: &FakeState, ifindex: u32) -> Result<(), GtpuError> {
+            let map_presence = [
+                state.tft_schema_map_ready.contains(&ifindex),
+                state.tft_meta_map_ready.contains(&ifindex),
+                state.tft_filters_map_ready.contains(&ifindex),
+                state.tft_counters_map_ready.contains(&ifindex),
+            ];
+            let meta_present = state.tft_meta.keys().any(|(index, _)| *index == ifindex);
+            let filters_present = state.tft_filters.keys().any(|(index, _)| *index == ifindex);
+            let any_state = map_presence.iter().any(|present| *present)
+                || state.tft_schema.contains_key(&ifindex)
+                || state.tft_map_identity.contains_key(&ifindex)
+                || meta_present
+                || filters_present;
+            if !any_state {
+                return Ok(());
+            }
+            if map_presence.iter().any(|present| !present)
+                || !Self::tft_identity_is_exact(state, ifindex)
+            {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_schema",
+                });
+            }
+            let marker = state
+                .tft_schema
+                .get(&ifindex)
+                .copied()
+                .unwrap_or([0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]);
+            if tft_classifier_schema_is_current(&marker) {
+                return Ok(());
+            }
+            if marker != [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN] || meta_present || filters_present {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_schema",
+                });
+            }
+            Ok(())
+        }
+
+        /// Materialize the additive shared-SA TFT maps exactly once for a
+        /// newly attached current graph. A nonzero foreign marker is never
+        /// overwritten, even by the fake: tests use that distinction to
+        /// exercise the production fail-closed adoption path.
+        fn provision_tft_graph(state: &mut FakeState, ifindex: u32) -> Result<(), GtpuError> {
+            Self::validate_tft_schema_preflight(state, ifindex)?;
+            match state.tft_schema.get(&ifindex).copied() {
+                Some(marker) if tft_classifier_schema_is_current(&marker) => {}
+                Some(marker) if marker == [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN] => {
+                    state
+                        .tft_schema
+                        .insert(ifindex, TFT_CLASSIFIER_SCHEMA_MARKER_VALUE);
+                }
+                Some(_) => {
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_tft_schema",
+                    });
+                }
+                None => {
+                    state
+                        .tft_schema
+                        .insert(ifindex, TFT_CLASSIFIER_SCHEMA_MARKER_VALUE);
+                }
+            }
+            if !state.tft_map_identity.contains_key(&ifindex) {
+                let first = state.tft_next_map_identity.max(1);
+                let last = first.checked_add(3).ok_or(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_map_identity",
+                })?;
+                state
+                    .tft_map_identity
+                    .insert(ifindex, [first, first + 1, first + 2, last]);
+                state.tft_next_map_identity =
+                    last.checked_add(1).ok_or(GtpuError::StateIndeterminate {
+                        operation: "ebpf_tft_map_identity",
+                    })?;
+            }
+            state.tft_schema_map_ready.insert(ifindex);
+            state.tft_meta_map_ready.insert(ifindex);
+            state.tft_filters_map_ready.insert(ifindex);
+            state.tft_counters_map_ready.insert(ifindex);
+            Ok(())
+        }
+
+        fn tft_identity_is_exact(state: &FakeState, ifindex: u32) -> bool {
+            let Some(identity) = state.tft_map_identity.get(&ifindex) else {
+                return false;
+            };
+            identity.iter().all(|id| *id != 0)
+                && identity.iter().enumerate().all(|(position, id)| {
+                    identity[..position].iter().all(|previous| previous != id)
+                })
+                && !state.pin_identity_invalid.contains(&ifindex)
+        }
+
+        fn tft_maps_are_ready(state: &FakeState, ifindex: u32) -> bool {
+            state.tft_schema_map_ready.contains(&ifindex)
+                && state.tft_meta_map_ready.contains(&ifindex)
+                && state.tft_filters_map_ready.contains(&ifindex)
+                && state.tft_counters_map_ready.contains(&ifindex)
+                && state
+                    .tft_schema
+                    .get(&ifindex)
+                    .is_some_and(tft_classifier_schema_is_current)
+                && Self::tft_identity_is_exact(state, ifindex)
+        }
+
+        fn tft_datapath_is_exact(state: &FakeState, ifindex: u32) -> bool {
+            state.attached.contains_key(&ifindex)
+                && Self::tft_maps_are_ready(state, ifindex)
+                && state.uplink_filter_ready.contains(&ifindex)
+                && state.downlink_filter_ready.contains(&ifindex)
+                && !state.cleanup_only.contains(&ifindex)
+                && !state.uplink_filter_foreign.contains(&ifindex)
+                && !state.downlink_filter_foreign.contains(&ifindex)
+                && !state.off_slot_sdk_hooks.contains(&ifindex)
+        }
+
+        fn tft_authority_from_state(
+            state: &FakeState,
+            ifindex: u32,
+        ) -> Result<EbpfTftAuthority, GtpuError> {
+            if !Self::tft_datapath_is_exact(state, ifindex) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_authority",
+                });
+            }
+            let identity =
+                state
+                    .tft_map_identity
+                    .get(&ifindex)
+                    .ok_or(GtpuError::StateIndeterminate {
+                        operation: "ebpf_tft_authority",
+                    })?;
+            let mut owner = [0_u8; 16];
+            for (position, id) in identity.iter().enumerate() {
+                owner[position * 4..position * 4 + 4].copy_from_slice(&id.to_be_bytes());
+            }
+            let attachment = ifindex.to_be_bytes();
+            for (position, byte) in attachment.iter().enumerate() {
+                owner[position] ^= *byte;
+            }
+            if owner == [0; 16] {
+                owner[15] = 1;
+            }
+            let mut generation_bytes = [0_u8; 8];
+            generation_bytes[..4].copy_from_slice(&identity[0].to_be_bytes());
+            generation_bytes[4..].copy_from_slice(&identity[3].to_be_bytes());
+            let mut owner_generation =
+                u64::from_be_bytes(generation_bytes) ^ u64::from(ifindex).rotate_left(17);
+            if owner_generation == 0 {
+                owner_generation = 1;
+            }
+            Ok(EbpfTftAuthority {
+                owner,
+                owner_generation,
+            })
         }
 
         fn current_proof_disappeared(
@@ -19541,6 +21918,7 @@ mod tests {
                 EbpfAttachmentDisposition::Fresh
             };
             Self::validate_schema(&state, pin_dir, ifindex)?;
+            Self::validate_tft_schema_preflight(&state, ifindex)?;
             let source_port_committed = matches!(
                 state.schema.get(pin_dir),
                 Some(&FakeSchema::SourcePortV4 | &FakeSchema::PmtuV5)
@@ -19561,6 +21939,7 @@ mod tests {
                     operation: "ebpf_pmtu_policy_adopt",
                 });
             }
+            Self::provision_tft_graph(&mut state, ifindex)?;
             state.pinned_config.insert(pin_dir.to_path_buf(), local_ip);
             state.attached.insert(
                 ifindex,
@@ -19662,6 +22041,10 @@ mod tests {
                 });
             }
             Self::validate_grouped_attach_preflight(&state, pin_dir, ifindex, recorded)?;
+            Self::validate_tft_schema_preflight(
+                &state,
+                recorded.map_or(ifindex, GtpuSessionDeviceConfig::ingress_ifindex),
+            )?;
             if let Some(current) = recorded {
                 let same_namespace = current.device_id() == desired.device_id()
                     && current.local_endpoint(GtpuSessionIpFamily::Ipv4)
@@ -19679,6 +22062,19 @@ mod tests {
                         || state.downlink_filter_foreign.contains(&old_ifindex)
                     {
                         return Err(GtpuError::AlreadyExists);
+                    }
+                    if state
+                        .tft_meta
+                        .keys()
+                        .any(|(index, _)| *index == old_ifindex)
+                        || state
+                            .tft_filters
+                            .keys()
+                            .any(|(index, _)| *index == old_ifindex)
+                    {
+                        return Err(GtpuError::StateIndeterminate {
+                            operation: "ebpf_tft_grouped_replacement",
+                        });
                     }
                     let groups = state
                         .session_groups
@@ -19741,6 +22137,12 @@ mod tests {
                             .map(|(key, value)| ((ifindex, key), value)),
                     );
                     state.grouped_map_ready.remove(&old_ifindex);
+                    state.tft_schema.remove(&old_ifindex);
+                    state.tft_map_identity.remove(&old_ifindex);
+                    state.tft_schema_map_ready.remove(&old_ifindex);
+                    state.tft_meta_map_ready.remove(&old_ifindex);
+                    state.tft_filters_map_ready.remove(&old_ifindex);
+                    state.tft_counters_map_ready.remove(&old_ifindex);
                     state.uplink_filter_pin_dir.remove(&old_ifindex);
                     state.downlink_filter_pin_dir.remove(&old_ifindex);
                 }
@@ -19762,6 +22164,7 @@ mod tests {
                 .pmtu_policy
                 .entry(ifindex)
                 .or_insert([0; UPLINK_PMTU_VALUE_LEN]);
+            Self::provision_tft_graph(&mut state, ifindex)?;
             state
                 .schema
                 .insert(pin_dir.to_path_buf(), FakeSchema::PmtuV5);
@@ -19815,6 +22218,7 @@ mod tests {
                 return Err(GtpuError::AlreadyExists);
             }
             Self::validate_schema(&state, pin_dir, ifindex)?;
+            Self::validate_tft_schema_preflight(&state, ifindex)?;
             let local_ip = *state
                 .pinned_config
                 .get(pin_dir)
@@ -19839,6 +22243,12 @@ mod tests {
                     operation: "ebpf_pmtu_policy_adopt",
                 });
             }
+            Self::provision_tft_graph(&mut state, ifindex)?;
+            if !Self::tft_identity_is_exact(&state, ifindex) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_schema_adopt",
+                });
+            }
             state.attached.insert(
                 ifindex,
                 FakeAttachment {
@@ -19860,6 +22270,10 @@ mod tests {
             state.downlink_binding_counters_map_ready.insert(ifindex);
             state.pmtu_map_ready.insert(ifindex);
             state.pmtu_counters_map_ready.insert(ifindex);
+            state.tft_schema_map_ready.insert(ifindex);
+            state.tft_meta_map_ready.insert(ifindex);
+            state.tft_filters_map_ready.insert(ifindex);
+            state.tft_counters_map_ready.insert(ifindex);
             state.uplink_filter_ready.insert(ifindex);
             state.downlink_filter_ready.insert(ifindex);
             state
@@ -19956,6 +22370,7 @@ mod tests {
                 && state.marked_owner_map_ready.contains(&ifindex)
                 && state.downlink_binding_map_ready.contains(&ifindex)
                 && state.downlink_binding_counters_map_ready.contains(&ifindex)
+                && Self::tft_maps_are_ready(&state, ifindex)
                 && state.pmtu_policy.get(&ifindex).is_some_and(|value| {
                     ebpf_pmtu_map_state_is_executable(GtpuUplinkMtuPolicy::decode_map_value(value))
                 });
@@ -20066,6 +22481,11 @@ mod tests {
             }
             if !state.cleanup_only.contains(&ifindex) {
                 return Err(GtpuError::AlreadyExists);
+            }
+            if !Self::tft_maps_are_ready(&state, ifindex) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_cleanup_schema",
+                });
             }
             // Model the attach failure before clearing cleanup-only so a
             // failed activation leaves the device fenced and retryable,
@@ -20304,6 +22724,10 @@ mod tests {
             state.downlink_binding_counters_map_ready.remove(&ifindex);
             state.pmtu_map_ready.remove(&ifindex);
             state.pmtu_counters_map_ready.remove(&ifindex);
+            state.tft_schema_map_ready.remove(&ifindex);
+            state.tft_meta_map_ready.remove(&ifindex);
+            state.tft_filters_map_ready.remove(&ifindex);
+            state.tft_counters_map_ready.remove(&ifindex);
             state.uplink_filter_ready.remove(&ifindex);
             state.downlink_filter_ready.remove(&ifindex);
             state.uplink_filter_pin_dir.remove(&ifindex);
@@ -20328,6 +22752,10 @@ mod tests {
             state.sport.retain(|(index, _), _| *index != ifindex);
             state.marked_sport.retain(|(index, _), _| *index != ifindex);
             state.pmtu_policy.remove(&ifindex);
+            state.tft_schema.remove(&ifindex);
+            state.tft_map_identity.remove(&ifindex);
+            state.tft_meta.retain(|(index, _), _| *index != ifindex);
+            state.tft_filters.retain(|(index, _), _| *index != ifindex);
             state.pdr.retain(|(index, _), _| *index != ifindex);
             state.marked_pdr.retain(|(index, _), _| *index != ifindex);
             state
@@ -21723,6 +24151,244 @@ mod tests {
             Ok(())
         }
 
+        fn tft_schema_get(
+            &self,
+            ifindex: u32,
+        ) -> Result<[u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN], GtpuError> {
+            let mut state = self.state();
+            state.operations.push("tft_schema_get");
+            Self::fail_if_requested(&mut state, "tft_schema_get")?;
+            if !Self::tft_maps_are_ready(&state, ifindex) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_schema_get",
+                });
+            }
+            state
+                .tft_schema
+                .get(&ifindex)
+                .copied()
+                .ok_or(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_schema_get",
+                })
+        }
+
+        fn tft_meta_get(
+            &self,
+            ifindex: u32,
+            key: [u8; TFT_CLASSIFIER_KEY_LEN],
+        ) -> Result<Option<[u8; TFT_CLASSIFIER_META_VALUE_LEN]>, GtpuError> {
+            let mut state = self.state();
+            state.operations.push("tft_meta_get");
+            Self::fail_if_requested(&mut state, "tft_meta_get")?;
+            if !Self::tft_datapath_is_exact(&state, ifindex) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_meta_get",
+                });
+            }
+            Ok(state.tft_meta.get(&(ifindex, key)).copied())
+        }
+
+        fn tft_meta_put(
+            &self,
+            ifindex: u32,
+            key: [u8; TFT_CLASSIFIER_KEY_LEN],
+            value: [u8; TFT_CLASSIFIER_META_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            let classifier = TftClassifierKey::decode(key).ok_or_else(|| {
+                GtpuError::invalid_config("tft_uplink_classifier", "non-canonical metadata key")
+            })?;
+            if classifier.attachment_ifindex() != ifindex
+                || TftClassifierMeta::decode(value).is_none()
+            {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier",
+                    "non-canonical metadata value",
+                ));
+            }
+            let mut state = self.state();
+            state.operations.push("tft_meta_put");
+            Self::fail_if_requested(&mut state, "tft_meta_put")?;
+            if !Self::tft_datapath_is_exact(&state, ifindex) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_meta_put",
+                });
+            }
+            state.tft_meta.insert((ifindex, key), value);
+            Self::fail_after_if_requested(&mut state, "tft_meta_put")?;
+            Self::crash_if_requested(&mut state, "tft_meta_put");
+            Ok(())
+        }
+
+        fn tft_meta_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; TFT_CLASSIFIER_KEY_LEN],
+        ) -> Result<bool, GtpuError> {
+            if TftClassifierKey::decode(key)
+                .is_none_or(|classifier| classifier.attachment_ifindex() != ifindex)
+            {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier",
+                    "non-canonical metadata key",
+                ));
+            }
+            let mut state = self.state();
+            state.operations.push("tft_meta_remove");
+            Self::fail_if_requested(&mut state, "tft_meta_remove")?;
+            if !Self::tft_datapath_is_exact(&state, ifindex) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_meta_remove",
+                });
+            }
+            let removed = state.tft_meta.remove(&(ifindex, key)).is_some();
+            Self::fail_after_if_requested(&mut state, "tft_meta_remove")?;
+            Self::crash_if_requested(&mut state, "tft_meta_remove");
+            Ok(removed)
+        }
+
+        fn tft_filter_inventory(
+            &self,
+            ifindex: u32,
+            classifier_key: [u8; TFT_CLASSIFIER_KEY_LEN],
+        ) -> Result<
+            Vec<(
+                [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+                [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+            )>,
+            GtpuError,
+        > {
+            if TftClassifierKey::decode(classifier_key)
+                .is_none_or(|classifier| classifier.attachment_ifindex() != ifindex)
+            {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier",
+                    "non-canonical filter classifier key",
+                ));
+            }
+            let mut state = self.state();
+            state.operations.push("tft_filter_inventory");
+            Self::fail_if_requested(&mut state, "tft_filter_inventory")?;
+            if !Self::tft_datapath_is_exact(&state, ifindex) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_filter_inventory",
+                });
+            }
+            let limit = usize::from(TFT_CLASSIFIER_BANKS) * TFT_CLASSIFIER_MAX_FILTERS + 1;
+            let mut records = state
+                .tft_filters
+                .iter()
+                .filter_map(|((index, key), value)| {
+                    (*index == ifindex && key[..TFT_CLASSIFIER_KEY_LEN] == classifier_key)
+                        .then_some((*key, *value))
+                })
+                .take(limit)
+                .collect::<Vec<_>>();
+            records.sort_unstable_by_key(|(key, _)| *key);
+            Ok(records)
+        }
+
+        fn tft_filter_put(
+            &self,
+            ifindex: u32,
+            key: [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+            value: [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            let (Some(filter_key), Some(filter)) = (
+                TftClassifierFilterKey::decode(key),
+                TftClassifierFilter::decode(value),
+            ) else {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier",
+                    "non-canonical filter record",
+                ));
+            };
+            if filter_key.classifier().attachment_ifindex() != ifindex
+                || !filter_key.matches_filter(&filter)
+                || filter.dense_rank() != filter_key.filter_index() as u8
+            {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier",
+                    "non-canonical filter record",
+                ));
+            }
+            let mut state = self.state();
+            state.operations.push("tft_filter_put");
+            Self::fail_if_requested(&mut state, "tft_filter_put")?;
+            if !Self::tft_datapath_is_exact(&state, ifindex) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_filter_put",
+                });
+            }
+            state.tft_filters.insert((ifindex, key), value);
+            Self::fail_after_if_requested(&mut state, "tft_filter_put")?;
+            Self::crash_if_requested(&mut state, "tft_filter_put");
+            Ok(())
+        }
+
+        fn tft_filter_remove(
+            &self,
+            ifindex: u32,
+            key: [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+        ) -> Result<bool, GtpuError> {
+            if TftClassifierFilterKey::decode(key)
+                .is_none_or(|filter_key| filter_key.classifier().attachment_ifindex() != ifindex)
+            {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier",
+                    "non-canonical filter key",
+                ));
+            }
+            let mut state = self.state();
+            state.operations.push("tft_filter_remove");
+            Self::fail_if_requested(&mut state, "tft_filter_remove")?;
+            if !Self::tft_datapath_is_exact(&state, ifindex) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_filter_remove",
+                });
+            }
+            let removed = state.tft_filters.remove(&(ifindex, key)).is_some();
+            Self::fail_after_if_requested(&mut state, "tft_filter_remove")?;
+            Self::crash_if_requested(&mut state, "tft_filter_remove");
+            Ok(removed)
+        }
+
+        fn tft_filter_capacity(&self, ifindex: u32) -> Result<EbpfTftFilterMapCapacity, GtpuError> {
+            let mut state = self.state();
+            state.operations.push("tft_filter_capacity");
+            Self::fail_if_requested(&mut state, "tft_filter_capacity")?;
+            if !Self::tft_datapath_is_exact(&state, ifindex) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_filter_capacity",
+                });
+            }
+            let occupied = u32::try_from(
+                state
+                    .tft_filters
+                    .keys()
+                    .filter(|(index, _)| *index == ifindex)
+                    .count(),
+            )
+            .map_err(|_| GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_filter_capacity",
+            })?;
+            EbpfTftFilterMapCapacity::new(occupied, TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES).ok_or(
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_tft_filter_capacity",
+                },
+            )
+        }
+
+        fn tft_authority(&self, ifindex: u32) -> Result<EbpfTftAuthority, GtpuError> {
+            let mut state = self.state();
+            state.operations.push("tft_authority");
+            Self::fail_if_requested(&mut state, "tft_authority")?;
+            Self::tft_authority_from_state(&state, ifindex)
+        }
+
+        fn tft_datapath_usable(&self, ifindex: u32) -> bool {
+            Self::tft_datapath_is_exact(&self.state(), ifindex)
+        }
+
         fn probe_environment(&self) -> EbpfEnvironment {
             self.environment
         }
@@ -21903,6 +24569,2471 @@ mod tests {
         let runtime = Arc::new(FakeRuntime::new());
         let backend = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
         (backend, runtime)
+    }
+
+    fn suspend_fake_attachment(state: &mut FakeState, ifindex: u32) {
+        state.attached.remove(&ifindex);
+        state.uplink_filter_ready.remove(&ifindex);
+        state.downlink_filter_ready.remove(&ifindex);
+        state.uplink_filter_pin_dir.remove(&ifindex);
+        state.downlink_filter_pin_dir.remove(&ifindex);
+    }
+
+    struct FakeTftRows {
+        meta: HashMap<(u32, [u8; TFT_CLASSIFIER_KEY_LEN]), [u8; TFT_CLASSIFIER_META_VALUE_LEN]>,
+        filters: HashMap<
+            (u32, [u8; TFT_CLASSIFIER_FILTER_KEY_LEN]),
+            [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+        >,
+    }
+
+    fn zero_fake_tft_marker_for_restart(runtime: &FakeRuntime) -> FakeTftRows {
+        let mut state = runtime.state();
+        suspend_fake_attachment(&mut state, S2BU_IFINDEX);
+        state
+            .tft_schema
+            .insert(S2BU_IFINDEX, [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]);
+        assert!(!state.tft_meta.is_empty());
+        assert!(!state.tft_filters.is_empty());
+        FakeTftRows {
+            meta: state.tft_meta.clone(),
+            filters: state.tft_filters.clone(),
+        }
+    }
+
+    fn tft_classifier(mark: u32, precedence: u8, protocol: u8) -> TftUplinkClassifier {
+        let filter = PacketFilter::new(
+            PacketFilterIdentifier::new(precedence % 16).expect("test identifier is four-bit"),
+            PacketFilterDirection::UplinkOnly,
+            precedence,
+            vec![PacketFilterComponent::ProtocolIdentifierNextHeader(
+                protocol,
+            )],
+        )
+        .expect("test filter is canonical");
+        let tft = TrafficFlowTemplate::create_new(vec![filter], Vec::new())
+            .expect("test TFT is canonical");
+        TftUplinkClassifier::new(
+            S2BU_IFINDEX,
+            IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
+            vec![
+                TftUplinkBearer::default_bearer(),
+                TftUplinkBearer::dedicated(
+                    GtpBearerMark::new(mark).expect("test bearer mark is nonzero"),
+                    tft,
+                ),
+            ],
+        )
+        .expect("test classifier is canonical")
+    }
+
+    fn tft_classifier_without_default(
+        mark: u32,
+        precedence: u8,
+        protocol: u8,
+    ) -> TftUplinkClassifier {
+        let classifier = tft_classifier(mark, precedence, protocol);
+        let dedicated = classifier
+            .bearers()
+            .iter()
+            .find(|bearer| bearer.mark().is_some())
+            .expect("test classifier has a dedicated bearer")
+            .clone();
+        TftUplinkClassifier::new(classifier.link_ifindex(), classifier.paa(), vec![dedicated])
+            .expect("test classifier without a default is canonical")
+    }
+
+    fn tft_default_only_classifier() -> TftUplinkClassifier {
+        TftUplinkClassifier::new(
+            S2BU_IFINDEX,
+            IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
+            vec![TftUplinkBearer::default_bearer()],
+        )
+        .expect("default-only test classifier is canonical")
+    }
+
+    fn tft_classifier_key_bytes(classifier: &TftUplinkClassifier) -> [u8; TFT_CLASSIFIER_KEY_LEN] {
+        let IpAddr::V4(paa) = classifier.paa() else {
+            panic!("test classifier must use IPv4");
+        };
+        TftClassifierKey::new(classifier.link_ifindex(), paa.octets())
+            .expect("test classifier key is canonical")
+            .encode()
+    }
+
+    fn tft_filter_with_authority(
+        filter: TftClassifierFilter,
+        owner: TftClassifierOwnerId,
+        owner_generation: u64,
+        snapshot_generation: u64,
+    ) -> TftClassifierFilter {
+        TftClassifierFilter::new_with_semantics(
+            owner,
+            owner_generation,
+            snapshot_generation,
+            filter.evaluation_precedence(),
+            filter.bearer_mark(),
+            filter.packet_filter_identifier(),
+            filter.direction(),
+            filter.local_port_form(),
+            filter.remote_port_form(),
+            filter.spec(),
+        )
+        .expect("test replacement filter is canonical")
+    }
+
+    fn distinct_test_generation(generation: u64) -> u64 {
+        if generation == u64::MAX {
+            generation - 1
+        } else {
+            generation + 1
+        }
+    }
+
+    fn tft_classifier_with_two_filters() -> TftUplinkClassifier {
+        let first = PacketFilter::new(
+            PacketFilterIdentifier::new(7).expect("test identifier is four-bit"),
+            PacketFilterDirection::UplinkOnly,
+            7,
+            vec![PacketFilterComponent::ProtocolIdentifierNextHeader(6)],
+        )
+        .expect("test filter is canonical");
+        let second = PacketFilter::new(
+            PacketFilterIdentifier::new(8).expect("test identifier is four-bit"),
+            PacketFilterDirection::UplinkOnly,
+            8,
+            vec![PacketFilterComponent::ProtocolIdentifierNextHeader(17)],
+        )
+        .expect("test filter is canonical");
+        let tft = TrafficFlowTemplate::create_new(vec![first, second], Vec::new())
+            .expect("test TFT is canonical");
+        TftUplinkClassifier::new(
+            S2BU_IFINDEX,
+            IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
+            vec![
+                TftUplinkBearer::default_bearer(),
+                TftUplinkBearer::dedicated(
+                    GtpBearerMark::new(0x41).expect("test bearer mark is nonzero"),
+                    tft,
+                ),
+            ],
+        )
+        .expect("test classifier is canonical")
+    }
+
+    fn tft_classifier_with_global_precedence_overlap(
+        reverse_bearer_input: bool,
+    ) -> TftUplinkClassifier {
+        let lower_mark_higher_precedence = TftUplinkBearer::dedicated(
+            GtpBearerMark::new(0x2000_0002).expect("test bearer mark is nonzero"),
+            TrafficFlowTemplate::create_new(
+                vec![PacketFilter::new(
+                    PacketFilterIdentifier::new(10).expect("test identifier is four-bit"),
+                    PacketFilterDirection::UplinkOnly,
+                    10,
+                    vec![
+                        PacketFilterComponent::ProtocolIdentifierNextHeader(17),
+                        PacketFilterComponent::SingleLocalPort(5010),
+                    ],
+                )
+                .expect("test filter is canonical")],
+                Vec::new(),
+            )
+            .expect("test TFT is canonical"),
+        );
+        let higher_mark_lower_precedence = TftUplinkBearer::dedicated(
+            GtpBearerMark::new(0x2000_0003).expect("test bearer mark is nonzero"),
+            TrafficFlowTemplate::create_new(
+                vec![PacketFilter::new(
+                    PacketFilterIdentifier::new(1).expect("test identifier is four-bit"),
+                    PacketFilterDirection::UplinkOnly,
+                    1,
+                    vec![PacketFilterComponent::SingleLocalPort(5010)],
+                )
+                .expect("test filter is canonical")],
+                Vec::new(),
+            )
+            .expect("test TFT is canonical"),
+        );
+        let mut bearers = vec![TftUplinkBearer::default_bearer()];
+        if reverse_bearer_input {
+            bearers.extend([higher_mark_lower_precedence, lower_mark_higher_precedence]);
+        } else {
+            bearers.extend([lower_mark_higher_precedence, higher_mark_lower_precedence]);
+        }
+        TftUplinkClassifier::new(
+            S2BU_IFINDEX,
+            IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
+            bearers,
+        )
+        .expect("globally unique test precedences are canonical")
+    }
+
+    #[test]
+    fn tft_classifier_validation_is_pure_and_rejects_unsupported_native_forms() {
+        let (backend, runtime) = backend_with_fake();
+        let before = {
+            let state = runtime.state();
+            (
+                state.attached.clone(),
+                state.tft_meta.clone(),
+                state.tft_filters.clone(),
+            )
+        };
+        let ipv6_paa = TftUplinkClassifier::new(
+            S2BU_IFINDEX,
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            vec![TftUplinkBearer::default_bearer()],
+        )
+        .expect("backend-neutral classifier permits IPv6 PAA");
+        assert!(matches!(
+            backend.validate_tft_uplink_classifier(&ipv6_paa),
+            Err(GtpuError::InvalidConfig {
+                field: "tft_uplink_classifier.paa",
+                ..
+            })
+        ));
+
+        let filter = PacketFilter::new(
+            PacketFilterIdentifier::new(7).expect("test identifier is four-bit"),
+            PacketFilterDirection::UplinkOnly,
+            7,
+            vec![PacketFilterComponent::FlowLabel(
+                opc_proto_tft::Ipv6FlowLabel::new(0x12345).expect("test flow label is canonical"),
+            )],
+        )
+        .expect("backend-neutral filter is canonical");
+        let tft = TrafficFlowTemplate::create_new(vec![filter], Vec::new())
+            .expect("backend-neutral TFT is canonical");
+        let classifier = TftUplinkClassifier::new(
+            S2BU_IFINDEX,
+            IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
+            vec![TftUplinkBearer::dedicated(
+                GtpBearerMark::new(0x41).expect("test bearer mark is nonzero"),
+                tft,
+            )],
+        )
+        .expect("backend-neutral classifier accepts the form");
+        assert!(matches!(
+            backend.validate_tft_uplink_classifier(&classifier),
+            Err(GtpuError::InvalidConfig { .. })
+        ));
+
+        let downlink_filter = PacketFilter::new(
+            PacketFilterIdentifier::new(8).expect("test identifier is four-bit"),
+            PacketFilterDirection::DownlinkOnly,
+            8,
+            vec![PacketFilterComponent::ProtocolIdentifierNextHeader(17)],
+        )
+        .expect("packet filter is structurally canonical");
+        assert!(matches!(
+            EbpfGtpuDataplaneBackend::encode_tft_packet_filter(
+                &downlink_filter,
+                GtpBearerMark::new(0x41).expect("test bearer mark is nonzero"),
+                EbpfTftAuthority {
+                    owner: [1; 16],
+                    owner_generation: 1,
+                },
+                1,
+            ),
+            Err(GtpuError::InvalidConfig {
+                field: "tft_uplink_classifier.direction",
+                ..
+            })
+        ));
+
+        let after = {
+            let state = runtime.state();
+            (
+                state.attached.clone(),
+                state.tft_meta.clone(),
+                state.tft_filters.clone(),
+            )
+        };
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn tft_classifier_validation_accepts_native_ipv4_component_forms() {
+        let (backend, _runtime) = backend_with_fake();
+        let address = Ipv4Addr::new(10, 45, 0, 2);
+        let first = PacketFilter::new(
+            PacketFilterIdentifier::new(1).expect("test identifier is four-bit"),
+            PacketFilterDirection::UplinkOnly,
+            1,
+            vec![
+                PacketFilterComponent::Ipv4LocalAddress {
+                    address,
+                    mask: Ipv4Addr::new(255, 255, 255, 0),
+                },
+                PacketFilterComponent::Ipv4RemoteAddress {
+                    address: Ipv4Addr::new(198, 51, 100, 1),
+                    mask: Ipv4Addr::new(255, 255, 255, 255),
+                },
+                PacketFilterComponent::ProtocolIdentifierNextHeader(6),
+                PacketFilterComponent::SingleLocalPort(443),
+                PacketFilterComponent::RemotePortRange(
+                    opc_proto_tft::PortRange::new(1024, 2048)
+                        .expect("test port range is canonical"),
+                ),
+                PacketFilterComponent::TypeOfServiceTrafficClass {
+                    value: 0x2e,
+                    mask: 0xfc,
+                },
+            ],
+        )
+        .expect("test filter is canonical");
+        let second = PacketFilter::new(
+            PacketFilterIdentifier::new(2).expect("test identifier is four-bit"),
+            PacketFilterDirection::Bidirectional,
+            2,
+            vec![
+                PacketFilterComponent::LocalPortRange(
+                    opc_proto_tft::PortRange::new(1024, 2048)
+                        .expect("test port range is canonical"),
+                ),
+                PacketFilterComponent::SingleRemotePort(443),
+            ],
+        )
+        .expect("test filter is canonical");
+        let third = PacketFilter::new(
+            PacketFilterIdentifier::new(3).expect("test identifier is four-bit"),
+            PacketFilterDirection::Bidirectional,
+            3,
+            vec![PacketFilterComponent::SecurityParameterIndex(42)],
+        )
+        .expect("test filter is canonical");
+        let tft = TrafficFlowTemplate::create_new(vec![first, second, third], Vec::new())
+            .expect("test TFT is canonical");
+        let classifier = TftUplinkClassifier::new(
+            S2BU_IFINDEX,
+            IpAddr::V4(address),
+            vec![TftUplinkBearer::dedicated(
+                GtpBearerMark::new(0x41).expect("test bearer mark is nonzero"),
+                tft,
+            )],
+        )
+        .expect("test classifier is canonical");
+
+        assert!(backend.validate_tft_uplink_classifier(&classifier).is_ok());
+    }
+
+    #[tokio::test]
+    async fn zero_tft_schema_with_retained_rows_is_never_promoted_by_attach_or_adopt() {
+        for operation in ["attach", "adopt"] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            backend
+                .reconcile_tft_uplink_classifier(tft_classifier(0x41, 7, 6))
+                .await
+                .unwrap();
+            let rows_before = zero_fake_tft_marker_for_restart(&runtime);
+            let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+
+            let error = if operation == "attach" {
+                runtime
+                    .attach(
+                        "s2bu",
+                        S2BU_IFINDEX,
+                        &pin_dir,
+                        DEFAULT_TC_PRIORITY,
+                        [192, 0, 2, 1],
+                    )
+                    .unwrap_err()
+            } else {
+                runtime
+                    .adopt("s2bu", S2BU_IFINDEX, &pin_dir, DEFAULT_TC_PRIORITY)
+                    .unwrap_err()
+            };
+            assert!(
+                matches!(
+                    error,
+                    GtpuError::StateIndeterminate {
+                        operation: "ebpf_tft_schema"
+                    }
+                ),
+                "{operation}: {error:?}"
+            );
+
+            let state = runtime.state();
+            assert_eq!(
+                state.tft_schema.get(&S2BU_IFINDEX),
+                Some(&[0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]),
+                "{operation}"
+            );
+            assert_eq!(&state.tft_meta, &rows_before.meta, "{operation}");
+            assert_eq!(&state.tft_filters, &rows_before.filters, "{operation}");
+            assert!(!state.attached.contains_key(&S2BU_IFINDEX), "{operation}");
+            assert!(
+                !state.uplink_filter_ready.contains(&S2BU_IFINDEX),
+                "{operation}"
+            );
+            assert!(
+                !state.downlink_filter_ready.contains(&S2BU_IFINDEX),
+                "{operation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_tft_schema_with_retained_rows_is_never_promoted_by_grouped_attach() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let device_id = grouped_device_id(0x31);
+        let endpoints =
+            GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).expect("test endpoints");
+        let config = grouped_device_config(device_id, S2BU_IFINDEX, endpoints)
+            .expect("test grouped config")
+            .encode();
+        let backend = attach_grouped_fake(runtime.clone(), device_id, endpoints).await;
+        backend
+            .reconcile_tft_uplink_classifier(tft_classifier(0x41, 7, 6))
+            .await
+            .unwrap();
+        let rows_before = zero_fake_tft_marker_for_restart(&runtime);
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+
+        let error = runtime
+            .attach_grouped("s2bu", S2BU_IFINDEX, &pin_dir, DEFAULT_TC_PRIORITY, config)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_schema"
+            }
+        ));
+
+        let state = runtime.state();
+        assert_eq!(
+            state.tft_schema.get(&S2BU_IFINDEX),
+            Some(&[0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN])
+        );
+        assert_eq!(state.tft_meta, rows_before.meta);
+        assert_eq!(state.tft_filters, rows_before.filters);
+        assert!(!state.attached.contains_key(&S2BU_IFINDEX));
+        assert!(!state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+        assert!(!state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn empty_zero_tft_schema_is_promoted_during_safe_adoption() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+        {
+            let mut state = runtime.state();
+            suspend_fake_attachment(&mut state, S2BU_IFINDEX);
+            assert!(state.tft_meta.is_empty());
+            assert!(state.tft_filters.is_empty());
+            state
+                .tft_schema
+                .insert(S2BU_IFINDEX, [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]);
+        }
+
+        assert_eq!(
+            runtime
+                .adopt("s2bu", S2BU_IFINDEX, &pin_dir, DEFAULT_TC_PRIORITY)
+                .unwrap(),
+            [192, 0, 2, 1]
+        );
+        let state = runtime.state();
+        assert_eq!(
+            state.tft_schema.get(&S2BU_IFINDEX),
+            Some(&TFT_CLASSIFIER_SCHEMA_MARKER_VALUE)
+        );
+        assert!(state.attached.contains_key(&S2BU_IFINDEX));
+        assert!(state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+        assert!(state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+    }
+
+    #[test]
+    fn partial_tft_pin_graph_is_refused_without_materialization() {
+        let runtime = FakeRuntime::new();
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+        {
+            let mut state = runtime.state();
+            state.tft_schema_map_ready.insert(S2BU_IFINDEX);
+            state
+                .tft_schema
+                .insert(S2BU_IFINDEX, [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]);
+        }
+
+        assert!(matches!(
+            runtime
+                .attach(
+                    "s2bu",
+                    S2BU_IFINDEX,
+                    &pin_dir,
+                    DEFAULT_TC_PRIORITY,
+                    [192, 0, 2, 1],
+                )
+                .unwrap_err(),
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_schema"
+            }
+        ));
+        let state = runtime.state();
+        assert!(state.tft_schema_map_ready.contains(&S2BU_IFINDEX));
+        assert!(!state.tft_meta_map_ready.contains(&S2BU_IFINDEX));
+        assert!(!state.tft_filters_map_ready.contains(&S2BU_IFINDEX));
+        assert!(!state.tft_counters_map_ready.contains(&S2BU_IFINDEX));
+        assert_eq!(
+            state.tft_schema.get(&S2BU_IFINDEX),
+            Some(&[0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN])
+        );
+        assert!(!state.attached.contains_key(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_is_exact_idempotent_and_atomically_replaced() {
+        let (backend, _runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let first = tft_classifier(0x41, 7, 6);
+        let replacement = tft_classifier(0x42, 8, 17);
+
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(first.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        assert_eq!(
+            backend.tft_uplink_classification_capability(),
+            GtpuCapability::Available
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(first.link_ifindex(), first.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(first.clone())
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(first.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(replacement.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(replacement.link_ifindex(), replacement.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(replacement.clone())
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(first)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Conflict
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(replacement.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(replacement.link_ifindex(), replacement.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_encoder_and_readback_use_global_precedence_across_bearer_orders() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let forward = tft_classifier_with_global_precedence_overlap(false);
+        let reversed = tft_classifier_with_global_precedence_overlap(true);
+        assert_eq!(forward, reversed);
+
+        let authority = runtime
+            .tft_authority(forward.link_ifindex())
+            .expect("test authority is available");
+        let encoded = EbpfGtpuDataplaneBackend::encode_tft_classifier(&forward, authority, 1)
+            .expect("globally ordered test classifier encodes");
+        assert_eq!(
+            encoded
+                .filters
+                .iter()
+                .map(TftClassifierFilter::evaluation_precedence)
+                .collect::<Vec<_>>(),
+            vec![1, 10]
+        );
+        assert_eq!(
+            encoded
+                .filters
+                .iter()
+                .map(TftClassifierFilter::dense_rank)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            encoded
+                .filters
+                .iter()
+                .map(TftClassifierFilter::bearer_mark)
+                .collect::<Vec<_>>(),
+            vec![0x2000_0003, 0x2000_0002]
+        );
+
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(forward.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(forward.link_ifindex(), forward.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(forward)
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(reversed.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(reversed.link_ifindex(), reversed.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(reversed)
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_precommit_failure_keeps_old_bank_effective() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let first = tft_classifier(0x41, 7, 6);
+        let replacement = tft_classifier(0x42, 8, 17);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(first.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.fail_in_order(["tft_filter_put"]);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(replacement.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Indeterminate
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(first.link_ifindex(), first.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(first)
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(replacement)
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_stage_rejects_concurrent_malformed_key_before_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let initial = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(initial.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        let key = TftClassifierKey::decode(tft_classifier_key_bytes(&initial))
+            .expect("test classifier key is canonical");
+        let observed = match backend
+            .stable_tft_observation_locked(key)
+            .expect("test observation succeeds")
+        {
+            TftClassifierObservation::Present(observed) => observed,
+            _ => panic!("test classifier is present"),
+        };
+        let authority = runtime
+            .tft_authority(initial.link_ifindex())
+            .expect("test authority is available");
+        let snapshot_generation =
+            EbpfGtpuDataplaneBackend::next_tft_snapshot_generation(Some(observed.as_ref()))
+                .expect("test snapshot generation advances");
+        let replacement = tft_classifier(0x42, 8, 17);
+        let desired = EbpfGtpuDataplaneBackend::encode_tft_classifier(
+            &replacement,
+            authority,
+            snapshot_generation,
+        )
+        .expect("replacement test classifier encodes");
+
+        let before = {
+            let mut state = runtime.state();
+            let ((ifindex, canonical_key), value) = state
+                .tft_filters
+                .iter()
+                .next()
+                .map(|(key, value)| (*key, *value))
+                .expect("test active record is retained");
+            let mut malformed_key = canonical_key;
+            malformed_key[9] = 1;
+            assert!(TftClassifierFilterKey::decode(malformed_key).is_none());
+            state.tft_filters.insert((ifindex, malformed_key), value);
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+
+        assert!(matches!(
+            backend.stage_tft_inactive_bank_locked(
+                &desired,
+                authority,
+                Some(observed.as_ref()),
+                snapshot_generation,
+            ),
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_tft_stage"
+            })
+        ));
+        let after = {
+            let state = runtime.state();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_preserves_raw_tos_value_mask_on_readback() {
+        let (backend, _runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let filter = PacketFilter::new(
+            PacketFilterIdentifier::new(3).unwrap(),
+            PacketFilterDirection::Bidirectional,
+            12,
+            vec![PacketFilterComponent::TypeOfServiceTrafficClass {
+                value: 0x2e,
+                mask: 0xfc,
+            }],
+        )
+        .unwrap();
+        let tft = TrafficFlowTemplate::create_new(vec![filter], Vec::new()).unwrap();
+        let classifier = TftUplinkClassifier::new(
+            S2BU_IFINDEX,
+            IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
+            vec![TftUplinkBearer::dedicated(
+                GtpBearerMark::new(0x41).unwrap(),
+                tft,
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(classifier)
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_retries_current_authority_orphan_after_metadata_publication_failure() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        let classifier_key = tft_classifier_key_bytes(&classifier);
+
+        runtime.fail_in_order(["tft_meta_put"]);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Indeterminate
+        );
+        {
+            let state = runtime.state();
+            assert!(state
+                .tft_filters
+                .keys()
+                .any(|(ifindex, _)| *ifindex == classifier.link_ifindex()));
+            assert!(!state
+                .tft_meta
+                .contains_key(&(classifier.link_ifindex(), classifier_key)));
+        }
+
+        runtime.state().operations.clear();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        assert!(runtime.state().operations.contains(&"tft_filter_remove"));
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(classifier)
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_retries_partial_current_authority_orphan_before_metadata_publication() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        let classifier_key = tft_classifier_key_bytes(&classifier);
+
+        runtime.fail_after_in_order(["tft_filter_put"]);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Indeterminate
+        );
+        {
+            let state = runtime.state();
+            assert_eq!(
+                state
+                    .tft_filters
+                    .keys()
+                    .filter(|(ifindex, _)| *ifindex == classifier.link_ifindex())
+                    .count(),
+                1
+            );
+            assert!(!state
+                .tft_meta
+                .contains_key(&(classifier.link_ifindex(), classifier_key)));
+        }
+
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(classifier)
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_reconcile_rejects_malformed_metadata_less_orphan_untouched() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        let classifier_key = TftClassifierKey::decode(tft_classifier_key_bytes(&classifier))
+            .expect("test classifier key is canonical");
+        let record_key = TftClassifierFilterKey::new(
+            classifier_key,
+            0,
+            0,
+            TftClassifierOwnerId::new([1; 16]).expect("test owner is nonzero"),
+            1,
+            1,
+        )
+        .expect("test filter key is canonical")
+        .encode();
+        let before = {
+            let mut state = runtime.state();
+            state.tft_filters.insert(
+                (classifier.link_ifindex(), record_key),
+                [0; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+            );
+            state.tft_filters.clone()
+        };
+
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Indeterminate
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Indeterminate
+        );
+        assert_eq!(runtime.state().tft_filters, before);
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_reconcile_rejects_foreign_or_mixed_metadata_less_orphans_untouched() {
+        for mixed_generation in [false, true] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let classifier = tft_classifier(0x41, 7, 6);
+            let classifier_key = TftClassifierKey::decode(tft_classifier_key_bytes(&classifier))
+                .expect("test classifier key is canonical");
+            let authority = runtime
+                .tft_authority(classifier.link_ifindex())
+                .expect("test authority is available");
+            let canonical =
+                EbpfGtpuDataplaneBackend::encode_tft_classifier(&classifier, authority, 1)
+                    .expect("test classifier encodes");
+            let foreign_owner =
+                TftClassifierOwnerId::new([0x7e; 16]).expect("test foreign owner is nonzero");
+            let replacement = tft_filter_with_authority(
+                canonical.filters[0],
+                if mixed_generation {
+                    TftClassifierOwnerId::new(authority.owner)
+                        .expect("test authority owner is nonzero")
+                } else {
+                    foreign_owner
+                },
+                if mixed_generation {
+                    distinct_test_generation(authority.owner_generation)
+                } else {
+                    authority.owner_generation
+                },
+                1,
+            );
+            let before = {
+                let mut state = runtime.state();
+                if mixed_generation {
+                    let current_key = TftClassifierFilterKey::for_filter(
+                        classifier_key,
+                        0,
+                        0,
+                        &canonical.filters[0],
+                    )
+                    .expect("test filter key is canonical")
+                    .encode();
+                    state.tft_filters.insert(
+                        (classifier.link_ifindex(), current_key),
+                        canonical.filters[0].encode(),
+                    );
+                }
+                let replacement_key = TftClassifierFilterKey::for_filter(
+                    classifier_key,
+                    0,
+                    if mixed_generation { 1 } else { 0 },
+                    &replacement,
+                )
+                .expect("test filter key is canonical")
+                .encode();
+                state.tft_filters.insert(
+                    (classifier.link_ifindex(), replacement_key),
+                    replacement.encode(),
+                );
+                state.tft_filters.clone()
+            };
+
+            assert_eq!(
+                backend
+                    .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierReadback::Indeterminate
+            );
+            assert_eq!(
+                backend
+                    .reconcile_tft_uplink_classifier(classifier.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierReconcileOutcome::Indeterminate
+            );
+            let state = runtime.state();
+            assert_eq!(state.tft_filters, before);
+            assert!(!state
+                .tft_meta
+                .contains_key(&(classifier.link_ifindex(), classifier_key.encode())));
+        }
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_reconcile_rejects_mixed_snapshot_or_bank_orphans_untouched() {
+        for (mixed_snapshot, mixed_bank) in [(true, false), (false, true)] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let classifier = tft_classifier_with_two_filters();
+            let classifier_key = TftClassifierKey::decode(tft_classifier_key_bytes(&classifier))
+                .expect("test classifier key is canonical");
+            let authority = runtime
+                .tft_authority(classifier.link_ifindex())
+                .expect("test authority is available");
+            let canonical =
+                EbpfGtpuDataplaneBackend::encode_tft_classifier(&classifier, authority, 1)
+                    .expect("test classifier encodes");
+            let owner = TftClassifierOwnerId::new(authority.owner)
+                .expect("test authority owner is nonzero");
+            let second = if mixed_snapshot {
+                tft_filter_with_authority(
+                    canonical.filters[1],
+                    owner,
+                    authority.owner_generation,
+                    2,
+                )
+            } else {
+                canonical.filters[1]
+            };
+            let before = {
+                let mut state = runtime.state();
+                for (index, bank, filter) in [
+                    (0, 0, canonical.filters[0]),
+                    (1, u8::from(mixed_bank), second),
+                ] {
+                    let record_key =
+                        TftClassifierFilterKey::for_filter(classifier_key, bank, index, &filter)
+                            .expect("test filter key is canonical")
+                            .encode();
+                    state
+                        .tft_filters
+                        .insert((classifier.link_ifindex(), record_key), filter.encode());
+                }
+                state.tft_filters.clone()
+            };
+
+            assert_eq!(
+                backend
+                    .reconcile_tft_uplink_classifier(classifier.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierReconcileOutcome::Indeterminate
+            );
+            let state = runtime.state();
+            assert_eq!(state.tft_filters, before);
+            assert!(!state
+                .tft_meta
+                .contains_key(&(classifier.link_ifindex(), classifier_key.encode())));
+        }
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_invalid_native_components_never_mutate_orphan_state() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let seed = tft_classifier_with_two_filters();
+        runtime.fail_after_in_order(["tft_filter_put"]);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(seed.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Indeterminate
+        );
+        let classifier_key = tft_classifier_key_bytes(&seed);
+        let before = runtime.state().tft_filters.clone();
+        let prefix = opc_proto_tft::Ipv6AddressPrefix::new(Ipv6Addr::LOCALHOST, 128)
+            .expect("test IPv6 prefix is canonical");
+        for component in [
+            PacketFilterComponent::Ipv6RemoteAddress {
+                address: Ipv6Addr::LOCALHOST,
+                mask: Ipv6Addr::from([0xff; 16]),
+            },
+            PacketFilterComponent::Ipv6RemoteAddressPrefix(prefix),
+            PacketFilterComponent::Ipv6LocalAddressPrefix(prefix),
+            PacketFilterComponent::FlowLabel(
+                opc_proto_tft::Ipv6FlowLabel::new(0x12345).expect("test flow label is canonical"),
+            ),
+        ] {
+            let filter = PacketFilter::new(
+                PacketFilterIdentifier::new(7).expect("test identifier is four-bit"),
+                PacketFilterDirection::UplinkOnly,
+                7,
+                vec![component],
+            )
+            .expect("backend-neutral test filter is canonical");
+            let tft = TrafficFlowTemplate::create_new(vec![filter], Vec::new())
+                .expect("backend-neutral test TFT is canonical");
+            let invalid = TftUplinkClassifier::new(
+                seed.link_ifindex(),
+                seed.paa(),
+                vec![
+                    TftUplinkBearer::default_bearer(),
+                    TftUplinkBearer::dedicated(
+                        GtpBearerMark::new(0x41).expect("test bearer mark is nonzero"),
+                        tft,
+                    ),
+                ],
+            )
+            .expect("backend-neutral classifier accepts the component");
+            assert!(matches!(
+                backend.reconcile_tft_uplink_classifier(invalid).await,
+                Err(GtpuError::InvalidConfig {
+                    field: "tft_uplink_classifier.component",
+                    ..
+                })
+            ));
+            let state = runtime.state();
+            assert_eq!(state.tft_filters, before);
+            assert!(!state
+                .tft_meta
+                .contains_key(&(seed.link_ifindex(), classifier_key)));
+        }
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_rejects_out_of_order_active_records_without_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        let classifier_key = TftClassifierKey::decode(tft_classifier_key_bytes(&classifier))
+            .expect("test classifier key is canonical");
+        let before = {
+            let mut state = runtime.state();
+            let raw_meta = *state
+                .tft_meta
+                .get(&(classifier.link_ifindex(), classifier_key.encode()))
+                .expect("test metadata is installed");
+            let meta = TftClassifierMeta::decode(raw_meta).expect("test metadata is canonical");
+            let first_key = TftClassifierFilterKey::from_validated_meta(classifier_key, &meta, 0)
+                .expect("test first filter key is canonical")
+                .encode();
+            let second_key = TftClassifierFilterKey::from_validated_meta(classifier_key, &meta, 1)
+                .expect("test second filter key is canonical")
+                .encode();
+            let first = *state
+                .tft_filters
+                .get(&(classifier.link_ifindex(), first_key))
+                .expect("test first filter is installed");
+            let second = *state
+                .tft_filters
+                .get(&(classifier.link_ifindex(), second_key))
+                .expect("test second filter is installed");
+            state
+                .tft_filters
+                .insert((classifier.link_ifindex(), first_key), second);
+            state
+                .tft_filters
+                .insert((classifier.link_ifindex(), second_key), first);
+            state.tft_filters.clone()
+        };
+
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Indeterminate
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Indeterminate
+        );
+        assert_eq!(runtime.state().tft_filters, before);
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_rejects_foreign_inactive_bank_record_without_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        let classifier_key = TftClassifierKey::decode(tft_classifier_key_bytes(&classifier))
+            .expect("test classifier key is canonical");
+        let (meta, active_filter) = {
+            let state = runtime.state();
+            let raw_meta = *state
+                .tft_meta
+                .get(&(classifier.link_ifindex(), classifier_key.encode()))
+                .expect("test metadata is installed");
+            let meta = TftClassifierMeta::decode(raw_meta).expect("test metadata is canonical");
+            let active_filter = state
+                .tft_filters
+                .iter()
+                .find_map(|((ifindex, raw_key), raw_value)| {
+                    (*ifindex == classifier.link_ifindex()
+                        && TftClassifierFilterKey::decode(*raw_key)
+                            .is_some_and(|key| key.bank() == meta.active_bank()))
+                    .then_some(*raw_value)
+                })
+                .and_then(TftClassifierFilter::decode)
+                .expect("test active filter is canonical");
+            (meta, active_filter)
+        };
+        let foreign_owner =
+            TftClassifierOwnerId::new([0x7e; 16]).expect("test foreign owner is nonzero");
+        let foreign = tft_filter_with_authority(
+            active_filter,
+            foreign_owner,
+            meta.owner_generation(),
+            active_filter.snapshot_generation_value(),
+        );
+        let before = {
+            let mut state = runtime.state();
+            let inactive_key = TftClassifierFilterKey::for_filter(
+                classifier_key,
+                1 - meta.active_bank(),
+                0,
+                &foreign,
+            )
+            .expect("test inactive key is canonical")
+            .encode();
+            state
+                .tft_filters
+                .insert((classifier.link_ifindex(), inactive_key), foreign.encode());
+            state.tft_filters.clone()
+        };
+
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Indeterminate
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Indeterminate
+        );
+        assert_eq!(runtime.state().tft_filters, before);
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_rejects_mixed_generation_inactive_bank_record_without_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        let classifier_key = TftClassifierKey::decode(tft_classifier_key_bytes(&classifier))
+            .expect("test classifier key is canonical");
+        let (meta, active_filter) = {
+            let state = runtime.state();
+            let raw_meta = *state
+                .tft_meta
+                .get(&(classifier.link_ifindex(), classifier_key.encode()))
+                .expect("test metadata is installed");
+            let meta = TftClassifierMeta::decode(raw_meta).expect("test metadata is canonical");
+            let active_filter = state
+                .tft_filters
+                .iter()
+                .find_map(|((ifindex, raw_key), raw_value)| {
+                    (*ifindex == classifier.link_ifindex()
+                        && TftClassifierFilterKey::decode(*raw_key)
+                            .is_some_and(|key| key.bank() == meta.active_bank()))
+                    .then_some(*raw_value)
+                })
+                .and_then(TftClassifierFilter::decode)
+                .expect("test active filter is canonical");
+            (meta, active_filter)
+        };
+        let mixed = tft_filter_with_authority(
+            active_filter,
+            meta.owner().expect("test metadata owner is present"),
+            distinct_test_generation(meta.owner_generation()),
+            active_filter.snapshot_generation_value(),
+        );
+        let before = {
+            let mut state = runtime.state();
+            let inactive_key = TftClassifierFilterKey::for_filter(
+                classifier_key,
+                1 - meta.active_bank(),
+                0,
+                &mixed,
+            )
+            .expect("test inactive key is canonical")
+            .encode();
+            state
+                .tft_filters
+                .insert((classifier.link_ifindex(), inactive_key), mixed.encode());
+            state.tft_filters.clone()
+        };
+
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Indeterminate
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Indeterminate
+        );
+        assert_eq!(runtime.state().tft_filters, before);
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_tolerates_partial_same_authority_inactive_history() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        let classifier_key = TftClassifierKey::decode(tft_classifier_key_bytes(&classifier))
+            .expect("test classifier key is canonical");
+        let (meta, active_filter) = {
+            let state = runtime.state();
+            let raw_meta = *state
+                .tft_meta
+                .get(&(classifier.link_ifindex(), classifier_key.encode()))
+                .expect("test metadata is installed");
+            let meta = TftClassifierMeta::decode(raw_meta).expect("test metadata is canonical");
+            let active_filter = state
+                .tft_filters
+                .iter()
+                .find_map(|((ifindex, raw_key), raw_value)| {
+                    (*ifindex == classifier.link_ifindex()
+                        && TftClassifierFilterKey::decode(*raw_key)
+                            .is_some_and(|key| key.bank() == meta.active_bank()))
+                    .then_some(*raw_value)
+                })
+                .and_then(TftClassifierFilter::decode)
+                .expect("test active filter is canonical");
+            (meta, active_filter)
+        };
+        let partial = tft_filter_with_authority(
+            active_filter,
+            meta.owner().expect("test metadata owner is present"),
+            meta.owner_generation(),
+            distinct_test_generation(meta.snapshot_generation()),
+        );
+        {
+            let mut state = runtime.state();
+            let inactive_key = TftClassifierFilterKey::for_filter(
+                classifier_key,
+                1 - meta.active_bank(),
+                0,
+                &partial,
+            )
+            .expect("test inactive key is canonical")
+            .encode();
+            state
+                .tft_filters
+                .insert((classifier.link_ifindex(), inactive_key), partial.encode());
+        }
+
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(classifier.clone())
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::AlreadyPresent
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_foreign_complete_snapshot_fails_closed() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        let classifier_key = TftClassifierKey::new(
+            classifier.link_ifindex(),
+            match classifier.paa() {
+                IpAddr::V4(paa) => paa.octets(),
+                IpAddr::V6(_) => panic!("test classifier must use IPv4"),
+            },
+        )
+        .expect("test classifier key is canonical")
+        .encode();
+        let foreign_owner =
+            TftClassifierOwnerId::new([0x7e; 16]).expect("test foreign owner must be nonzero");
+        {
+            let mut state = runtime.state();
+            let raw_meta = *state
+                .tft_meta
+                .get(&(classifier.link_ifindex(), classifier_key))
+                .expect("installed test metadata");
+            let meta = TftClassifierMeta::decode(raw_meta).expect("canonical test metadata");
+            let foreign_authority = EbpfTftAuthority {
+                owner: foreign_owner.into_bytes(),
+                owner_generation: meta.owner_generation(),
+            };
+            let foreign_encoded = EbpfGtpuDataplaneBackend::encode_tft_classifier(
+                &classifier,
+                foreign_authority,
+                meta.snapshot_generation(),
+            )
+            .expect("foreign test classifier encodes");
+            let foreign_fingerprint = EbpfGtpuDataplaneBackend::tft_classifier_fingerprint(
+                &foreign_encoded,
+                meta.active_bank(),
+                foreign_authority,
+                meta.snapshot_generation(),
+            )
+            .expect("foreign test fingerprint is canonical");
+            let records = state
+                .tft_filters
+                .iter()
+                .filter_map(|((ifindex, record_key), raw_value)| {
+                    (*ifindex == classifier.link_ifindex()).then_some((*record_key, *raw_value))
+                })
+                .collect::<Vec<_>>();
+            for (record_key, raw_value) in records {
+                let record_key =
+                    TftClassifierFilterKey::decode(record_key).expect("canonical test filter key");
+                let filter = TftClassifierFilter::decode(raw_value).expect("canonical test filter");
+                let replacement = TftClassifierFilter::new_with_semantics(
+                    foreign_owner,
+                    filter.owner_generation_value(),
+                    filter.snapshot_generation_value(),
+                    filter.evaluation_precedence(),
+                    filter.bearer_mark(),
+                    filter.packet_filter_identifier(),
+                    filter.direction(),
+                    filter.local_port_form(),
+                    filter.remote_port_form(),
+                    filter.spec(),
+                )
+                .expect("foreign test filter is canonical")
+                .with_dense_rank(record_key.filter_index() as u8)
+                .expect("foreign test filter rank is canonical");
+                let replacement_key = TftClassifierFilterKey::for_filter(
+                    record_key.classifier(),
+                    record_key.bank(),
+                    record_key.filter_index(),
+                    &replacement,
+                )
+                .expect("foreign test filter key is canonical")
+                .encode();
+                state
+                    .tft_filters
+                    .remove(&(classifier.link_ifindex(), record_key.encode()));
+                state.tft_filters.insert(
+                    (classifier.link_ifindex(), replacement_key),
+                    replacement.encode(),
+                );
+            }
+            let replacement = TftClassifierMeta::new(
+                meta.active_bank(),
+                meta.has_default(),
+                foreign_owner,
+                meta.owner_generation(),
+                meta.snapshot_generation(),
+                meta.filter_count(),
+                foreign_fingerprint,
+            )
+            .expect("foreign test metadata is canonical");
+            state.tft_meta.insert(
+                (classifier.link_ifindex(), classifier_key),
+                replacement.encode(),
+            );
+        }
+
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Indeterminate
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Conflict
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_removal_fence_rejects_unaccounted_missing_active_record_untouched() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        let before = {
+            let mut state = runtime.state();
+            let classifier_key = tft_classifier_key_bytes(&classifier);
+            let raw_meta = *state
+                .tft_meta
+                .get(&(classifier.link_ifindex(), classifier_key))
+                .expect("test metadata is installed");
+            let active = TftClassifierMeta::decode(raw_meta).expect("test metadata is canonical");
+            let fence = active.removing().expect("active metadata can be fenced");
+            assert_eq!(fence.removal_progress(), 0);
+            state
+                .tft_meta
+                .insert((classifier.link_ifindex(), classifier_key), fence.encode());
+            let missing_key = state
+                .tft_filters
+                .keys()
+                .find_map(|(ifindex, raw_key)| {
+                    let filter_key = TftClassifierFilterKey::decode(*raw_key)?;
+                    (*ifindex == classifier.link_ifindex()
+                        && filter_key.bank() == active.active_bank())
+                    .then_some((*ifindex, *raw_key))
+                })
+                .expect("test active filter is installed");
+            state
+                .tft_filters
+                .remove(&missing_key)
+                .expect("test active filter can be removed");
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        let after = {
+            let state = runtime.state();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_removal_fence_rejects_wrong_superset_and_subset_untouched() {
+        for (actual, wrong) in [
+            (
+                tft_classifier(0x41, 7, 6),
+                tft_classifier_with_two_filters(),
+            ),
+            (
+                tft_classifier_with_two_filters(),
+                tft_classifier(0x41, 7, 6),
+            ),
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            assert_eq!(
+                backend
+                    .reconcile_tft_uplink_classifier(actual.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierReconcileOutcome::Installed
+            );
+
+            runtime.fail_in_order(["tft_filter_remove"]);
+            assert_eq!(
+                backend
+                    .remove_tft_uplink_classifier_exact(actual.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierRemovalOutcome::Indeterminate
+            );
+            let before = {
+                let state = runtime.state();
+                (state.tft_meta.clone(), state.tft_filters.clone())
+            };
+
+            assert_eq!(
+                backend
+                    .remove_tft_uplink_classifier_exact(wrong)
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierRemovalOutcome::Indeterminate
+            );
+            let after = {
+                let state = runtime.state();
+                (state.tft_meta.clone(), state.tft_filters.clone())
+            };
+            assert_eq!(after, before);
+            assert_eq!(
+                backend
+                    .remove_tft_uplink_classifier_exact(actual)
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierRemovalOutcome::Removed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_removal_fence_rejects_default_mismatch_untouched() {
+        for (actual, wrong) in [
+            (
+                tft_classifier(0x41, 7, 6),
+                tft_classifier_without_default(0x41, 7, 6),
+            ),
+            (
+                tft_classifier_without_default(0x41, 7, 6),
+                tft_classifier(0x41, 7, 6),
+            ),
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            assert_eq!(
+                backend
+                    .reconcile_tft_uplink_classifier(actual.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierReconcileOutcome::Installed
+            );
+
+            runtime.fail_in_order(["tft_filter_remove"]);
+            assert_eq!(
+                backend
+                    .remove_tft_uplink_classifier_exact(actual.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierRemovalOutcome::Indeterminate
+            );
+            let before = {
+                let state = runtime.state();
+                (state.tft_meta.clone(), state.tft_filters.clone())
+            };
+
+            assert_eq!(
+                backend
+                    .remove_tft_uplink_classifier_exact(wrong)
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierRemovalOutcome::Indeterminate
+            );
+            let after = {
+                let state = runtime.state();
+                (state.tft_meta.clone(), state.tft_filters.clone())
+            };
+            assert_eq!(after, before);
+            assert_eq!(
+                backend
+                    .remove_tft_uplink_classifier_exact(actual)
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierRemovalOutcome::Removed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_zero_record_fence_retains_exact_removal_identity() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        runtime.fail_in_order(["tft_meta_remove"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        let before = {
+            let state = runtime.state();
+            assert!(state.tft_filters.is_empty());
+            assert!(state.tft_meta.values().all(|raw| {
+                TftClassifierMeta::decode(*raw).is_some_and(|meta| meta.is_valid_removal_fence())
+            }));
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+
+        for wrong in [
+            tft_classifier(0x41, 7, 17),
+            tft_classifier_without_default(0x41, 7, 6),
+            tft_classifier_with_two_filters(),
+        ] {
+            assert_eq!(
+                backend
+                    .remove_tft_uplink_classifier_exact(wrong)
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierRemovalOutcome::Indeterminate
+            );
+            let after = {
+                let state = runtime.state();
+                (state.tft_meta.clone(), state.tft_filters.clone())
+            };
+            assert_eq!(after, before);
+        }
+
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_default_only_snapshot_installs_and_removes_exactly() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_default_only_classifier();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        assert!(runtime.state().tft_filters.is_empty());
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(classifier.clone())
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_removal_fence_publish_failure_keeps_active_snapshot() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        runtime.fail_in_order(["tft_meta_put"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(classifier.clone())
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_removal_fence_publish_ack_loss_converges() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        runtime.fail_after_in_order(["tft_meta_put"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_removal_fence_publish_crash_converges_after_restart() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        runtime.crash_after_in_order(["tft_meta_put"]);
+        assert!(backend
+            .remove_tft_uplink_classifier_exact(classifier.clone())
+            .await
+            .is_err());
+        {
+            let mut state = runtime.state();
+            assert!(state.tft_meta.values().all(|raw| {
+                TftClassifierMeta::decode(*raw).is_some_and(|meta| meta.is_valid_removal_fence())
+            }));
+            state.attached.clear();
+        }
+
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime);
+        restarted.resolve_device("s2bu").await.unwrap();
+        assert_eq!(
+            restarted
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_confirms_absence_after_metadata_remove_ack_loss() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        runtime.fail_after_in_order(["tft_meta_remove"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::AlreadyAbsent
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_retries_filter_cleanup_after_removal_fence() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        runtime.fail_in_order(["tft_filter_remove"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Indeterminate
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Indeterminate
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_retries_after_filter_remove_ack_loss() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        runtime.fail_after_in_order(["tft_filter_remove"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        {
+            let state = runtime.state();
+            assert_eq!(state.tft_meta.len(), 1);
+            assert!(state.tft_meta.values().all(|raw| {
+                TftClassifierMeta::decode(*raw).is_some_and(|meta| meta.is_valid_removal_fence())
+            }));
+            assert_eq!(
+                state
+                    .tft_filters
+                    .keys()
+                    .filter(|(ifindex, _)| *ifindex == classifier.link_ifindex())
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_filter_cleanup_converges_after_process_crash() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        runtime.crash_after_in_order(["tft_filter_remove"]);
+        assert!(backend
+            .remove_tft_uplink_classifier_exact(classifier.clone())
+            .await
+            .is_err());
+        {
+            let mut state = runtime.state();
+            assert_eq!(state.tft_meta.len(), 1);
+            assert!(state.tft_meta.values().all(|raw| {
+                TftClassifierMeta::decode(*raw).is_some_and(|meta| meta.is_valid_removal_fence())
+            }));
+            assert_eq!(
+                state
+                    .tft_filters
+                    .keys()
+                    .filter(|(ifindex, _)| *ifindex == classifier.link_ifindex())
+                    .count(),
+                1
+            );
+            state.attached.clear();
+        }
+
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        restarted.resolve_device("s2bu").await.unwrap();
+        assert_eq!(
+            restarted
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        assert_eq!(
+            restarted
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_final_fence_removal_crash_converges_after_restart() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        runtime.crash_after_in_order(["tft_meta_remove"]);
+        assert!(backend
+            .remove_tft_uplink_classifier_exact(classifier.clone())
+            .await
+            .is_err());
+        {
+            let mut state = runtime.state();
+            assert!(state.tft_meta.is_empty());
+            assert!(state.tft_filters.is_empty());
+            state.attached.clear();
+        }
+
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime);
+        restarted.resolve_device("s2bu").await.unwrap();
+        assert_eq!(
+            restarted
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+        assert_eq!(
+            restarted
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_removal_fence_rejects_foreign_active_record_untouched() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.fail_in_order(["tft_filter_remove"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+
+        let before = {
+            let mut state = runtime.state();
+            let ((map_key, raw_filter), owner_generation, snapshot_generation) = {
+                let (map_key, raw_filter) = state
+                    .tft_filters
+                    .iter()
+                    .next()
+                    .map(|(key, value)| (*key, *value))
+                    .expect("test active record is retained");
+                let raw_meta = *state
+                    .tft_meta
+                    .values()
+                    .next()
+                    .expect("test removal fence is retained");
+                let meta =
+                    TftClassifierMeta::decode(raw_meta).expect("test removal fence is canonical");
+                (
+                    (map_key, raw_filter),
+                    meta.owner_generation(),
+                    meta.snapshot_generation(),
+                )
+            };
+            let filter =
+                TftClassifierFilter::decode(raw_filter).expect("test active record is canonical");
+            let foreign = tft_filter_with_authority(
+                filter,
+                TftClassifierOwnerId::new([0x7e; 16]).expect("foreign owner is canonical"),
+                owner_generation,
+                snapshot_generation,
+            );
+            state.tft_filters.insert(map_key, foreign.encode());
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        let after = {
+            let state = runtime.state();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_removal_fence_rejects_malformed_inactive_record_untouched() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.fail_in_order(["tft_filter_remove"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+
+        let before = {
+            let mut state = runtime.state();
+            let raw_meta = *state
+                .tft_meta
+                .values()
+                .next()
+                .expect("test removal fence is retained");
+            let meta =
+                TftClassifierMeta::decode(raw_meta).expect("test removal fence is canonical");
+            let classifier_key = TftClassifierKey::decode(tft_classifier_key_bytes(&classifier))
+                .expect("test classifier key is canonical");
+            let inactive_key = TftClassifierFilterKey::new(
+                classifier_key,
+                1 - meta.active_bank(),
+                0,
+                meta.owner().expect("test metadata owner is present"),
+                meta.owner_generation(),
+                meta.snapshot_generation(),
+            )
+            .expect("test inactive key is canonical")
+            .encode();
+            let mut malformed = *state
+                .tft_filters
+                .values()
+                .next()
+                .expect("test active record is retained");
+            malformed[35] = 1;
+            state
+                .tft_filters
+                .insert((classifier.link_ifindex(), inactive_key), malformed);
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        let after = {
+            let state = runtime.state();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_fingerprint_tamper_is_indeterminate_and_untouched() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+
+        let before = {
+            let mut state = runtime.state();
+            let raw_meta = state
+                .tft_meta
+                .values_mut()
+                .next()
+                .expect("test metadata is installed");
+            raw_meta[38] ^= 0x01;
+            assert!(TftClassifierMeta::decode(*raw_meta).is_some());
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Indeterminate
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Indeterminate
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        let after = {
+            let state = runtime.state();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_removal_rejects_metadata_absent_same_authority_subset() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        let classifier_key = TftClassifierKey::decode(tft_classifier_key_bytes(&classifier))
+            .expect("test classifier key is canonical");
+        let authority = runtime
+            .tft_authority(classifier.link_ifindex())
+            .expect("test authority is available");
+        let unexpected = EbpfGtpuDataplaneBackend::encode_tft_classifier(
+            &tft_classifier(0x42, 7, 17),
+            authority,
+            1,
+        )
+        .expect("unexpected test classifier encodes");
+        let before = {
+            let mut state = runtime.state();
+            state
+                .tft_meta
+                .remove(&(classifier.link_ifindex(), classifier_key.encode()));
+            state
+                .tft_filters
+                .retain(|(ifindex, _), _| *ifindex != classifier.link_ifindex());
+            let record_key =
+                TftClassifierFilterKey::for_filter(classifier_key, 0, 0, &unexpected.filters[0])
+                    .expect("test filter key is canonical")
+                    .encode();
+            state.tft_filters.insert(
+                (classifier.link_ifindex(), record_key),
+                unexpected.filters[0].encode(),
+            );
+            state.tft_filters.clone()
+        };
+
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        assert_eq!(runtime.state().tft_filters, before);
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_removal_cleans_retained_inactive_history_after_ack_loss() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let initial = tft_classifier_with_two_filters();
+        let replacement = tft_classifier(0x42, 9, 132);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(initial)
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(replacement.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+
+        runtime.fail_after_in_order(["tft_filter_remove"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(replacement.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(replacement.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(replacement.link_ifindex(), replacement.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_survives_restart_with_retained_map_authority() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier(0x41, 7, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.state().attached.remove(&S2BU_IFINDEX);
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime);
+        restarted.resolve_device("s2bu").await.unwrap();
+        assert_eq!(
+            restarted
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(classifier)
+        );
     }
 
     fn seed_managed_identity(

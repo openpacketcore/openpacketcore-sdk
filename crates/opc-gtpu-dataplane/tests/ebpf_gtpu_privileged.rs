@@ -80,7 +80,9 @@ use opc_gtpu_dataplane::{
     PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
     PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
     PdpContextUplinkSelector, RemovePdpContextRequest, RetainedGraphCleanupClassification,
-    RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest, Teid,
+    RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest, Teid, TftUplinkBearer,
+    TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
+    TftUplinkClassifierRemovalOutcome,
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, udp_ipv6_checksum,
@@ -93,8 +95,8 @@ use opc_gtpu_ebpf_common::{
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
-    COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
-    COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
+    COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
+    COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN,
     GTPU_MANDATORY_HDR_LEN, GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN,
     GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
@@ -104,19 +106,27 @@ use opc_gtpu_ebpf_common::{
     MAP_CONFIG_IPV6, MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING,
     MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX,
     MAP_SESSION_GROUPS, MAP_SESSION_SCHEMA, MAP_SESSION_TRANSACTIONS, MAP_SESSION_UPLINK_INDEX,
-    MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR,
-    MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT,
-    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
-    UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
-    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
-    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS,
-    UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
+    MAP_TFT_CLASSIFIER_COUNTERS, MAP_TFT_CLASSIFIER_FILTERS, MAP_TFT_CLASSIFIER_META,
+    MAP_TFT_CLASSIFIER_SCHEMA, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP,
+    MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS,
+    MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
+    PROG_DOWNLINK, PROG_UPLINK, TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_KEY_LEN,
+    TFT_CLASSIFIER_FILTER_VALUE_LEN, TFT_CLASSIFIER_KEY_LEN, TFT_CLASSIFIER_META_VALUE_LEN,
+    TFT_CLASSIFIER_SCHEMA_VALUE_LEN, UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
+    UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
+    UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
+    UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
     LifetimeConfig, LinuxXfrmBackend, PolicyParameters, SaParameters, UdpEncap, XfrmAction,
     XfrmBackend, XfrmDirection, XfrmId, XfrmLookupMark, XfrmMark, XfrmMode, XfrmRequestId,
     XfrmSelector, XfrmTemplate,
+};
+use opc_proto_tft::{
+    PacketFilter, PacketFilterComponent, PacketFilterDirection, PacketFilterIdentifier, PortRange,
+    TrafficFlowTemplate,
 };
 
 sockopt_impl!(
@@ -184,7 +194,7 @@ const IPPROTO_ESP: u8 = 50;
 const CURRENT_DATAPATH_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath.bpf.o");
 const FROZEN_V1_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v1.bpf.o");
 const FROZEN_V2_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v2.bpf.o");
-const CURRENT_PIN_NAMES: [&str; 21] = [
+const CURRENT_PIN_NAMES: [&str; 25] = [
     MAP_UPLINK_FAR,
     MAP_UPLINK_MARK_FAR,
     MAP_UPLINK_DSCP,
@@ -206,6 +216,10 @@ const CURRENT_PIN_NAMES: [&str; 21] = [
     MAP_SESSION_TRANSACTIONS,
     MAP_CONFIG_IPV6,
     MAP_SESSION_SCHEMA,
+    MAP_TFT_CLASSIFIER_SCHEMA,
+    MAP_TFT_CLASSIFIER_META,
+    MAP_TFT_CLASSIFIER_FILTERS,
+    MAP_TFT_CLASSIFIER_COUNTERS,
 ];
 /// The generation immediately before the uplink redirect-outcome counter.
 ///
@@ -2332,6 +2346,37 @@ fn receive_grouped_uplink(
     assert_exact_gpdu(&buffer[..length], expected_teid, expected_inner);
 }
 
+/// Assert that the real tc egress path selected one bearer for an injected
+/// unmarked inner packet. The payload sentinel ties each receipt to the flow
+/// just submitted, while the outer GTP-U TEID proves packet steering.
+fn receive_tft_uplink_teid(socket: &UdpSocket, expected_teid: u32, payload_sentinel: &[u8]) {
+    let mut buffer = vec![0_u8; 65_536];
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set TFT uplink receive timeout");
+    let (length, source) = socket.recv_from(&mut buffer).unwrap_or_else(|error| {
+        panic!("TFT-selected uplink TEID {expected_teid:#010x} must encapsulate: {error}")
+    });
+    assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert!(
+        length >= GTPU_MANDATORY_HDR_LEN,
+        "GTP-U packet must have header"
+    );
+    assert_eq!(buffer[0], 0x30, "TFT packet must be a plain G-PDU");
+    assert_eq!(buffer[1], 0xff, "TFT packet must be a G-PDU");
+    assert_eq!(
+        u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]),
+        expected_teid,
+        "unmarked packet for sentinel {payload_sentinel:?} must be steered to the selected bearer; packet tail={:?}",
+        &buffer[length.saturating_sub(64)..length],
+    );
+    assert!(
+        buffer[..length].ends_with(payload_sentinel),
+        "selected G-PDU must contain the submitted flow sentinel: expected={payload_sentinel:?}, tail={:?}",
+        &buffer[length.saturating_sub(64)..length],
+    );
+}
+
 async fn exercise_outer_envelope_validation(
     net: &TestNet,
     backend: &EbpfGtpuDataplaneBackend,
@@ -3367,7 +3412,7 @@ fn pinned_per_cpu_u64_values(pin_dir: &std::path::Path, name: &str, slots: u32) 
         .collect()
 }
 
-/// Exact byte-for-byte state of every map in the current 21-pin graph.
+/// Exact byte-for-byte state of every map in the current 25-pin graph.
 ///
 /// This intentionally has no `Debug` implementation: assertion failures must
 /// not print subscriber addresses, TEIDs, or grouped routing authority.
@@ -3412,6 +3457,16 @@ struct CurrentMapContents {
     )>,
     config_ipv6: Vec<[u8; GTPU_SESSION_CONFIG_VALUE_LEN]>,
     session_schema: Vec<[u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>,
+    tft_schema: Vec<[u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]>,
+    tft_meta: Vec<(
+        [u8; TFT_CLASSIFIER_KEY_LEN],
+        [u8; TFT_CLASSIFIER_META_VALUE_LEN],
+    )>,
+    tft_filters: Vec<(
+        [u8; TFT_CLASSIFIER_FILTER_KEY_LEN],
+        [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
+    )>,
+    tft_drop_counters: Vec<Vec<u64>>,
 }
 
 fn current_map_contents(pin_dir: &std::path::Path) -> CurrentMapContents {
@@ -3445,6 +3500,14 @@ fn current_map_contents(pin_dir: &std::path::Path) -> CurrentMapContents {
         session_transactions: pinned_hash_entries(pin_dir, MAP_SESSION_TRANSACTIONS),
         config_ipv6: pinned_array_values(pin_dir, MAP_CONFIG_IPV6, 1),
         session_schema: pinned_array_values(pin_dir, MAP_SESSION_SCHEMA, 1),
+        tft_schema: pinned_array_values(pin_dir, MAP_TFT_CLASSIFIER_SCHEMA, 1),
+        tft_meta: pinned_hash_entries(pin_dir, MAP_TFT_CLASSIFIER_META),
+        tft_filters: pinned_hash_entries(pin_dir, MAP_TFT_CLASSIFIER_FILTERS),
+        tft_drop_counters: pinned_per_cpu_u64_values(
+            pin_dir,
+            MAP_TFT_CLASSIFIER_COUNTERS,
+            TFT_CLASSIFIER_COUNTER_SLOTS,
+        ),
     }
 }
 
@@ -3463,7 +3526,7 @@ fn current_pin_graph_snapshot(pin_dir: &std::path::Path) -> CurrentPinGraphSnaps
     expected.sort_unstable();
     assert_eq!(
         pins, expected,
-        "fixture must retain the exact current 21-pin graph"
+        "fixture must retain the exact current 25-pin graph"
     );
     let map_ids = pins
         .iter()
@@ -4236,6 +4299,10 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_SESSION_GROUPS,
                 MAP_SESSION_UPLINK_INDEX,
                 MAP_CONFIG_IPV6,
+                MAP_TFT_CLASSIFIER_SCHEMA,
+                MAP_TFT_CLASSIFIER_META,
+                MAP_TFT_CLASSIFIER_FILTERS,
+                MAP_TFT_CLASSIFIER_COUNTERS,
             ],
         ),
         "the live uplink program must reference the exact pinned maps read by diagnostics",
@@ -6099,6 +6166,500 @@ fn capture_gtpu_outer_flags(capture: &OwnedFd) -> u8 {
         }
         return ip[6];
     }
+}
+
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request).await?;
+    let pin_dir = net.pin_root.join("s2bu");
+    net.install_outer_mark_injector();
+    let foreign_ingress_filter = tc_filters("ingress");
+    assert!(
+        foreign_ingress_filter.contains("flower"),
+        "the pre-existing foreign tc filter must be visible before TFT lifecycle"
+    );
+
+    let default_bearer = session_context(device.ifindex);
+    let bearer_a = dedicated_session_context(device.ifindex, MARK_A, LOCAL_TEID_A, PEER_TEID_A);
+    let bearer_b = dedicated_session_context(device.ifindex, MARK_B, LOCAL_TEID_B, PEER_TEID_B);
+    backend.install_pdp_context(default_bearer.clone()).await?;
+    backend.install_pdp_context(bearer_a.clone()).await?;
+    backend.install_pdp_context(bearer_b.clone()).await?;
+
+    let filter = |identifier: u8, precedence: u8, components: Vec<PacketFilterComponent>| {
+        PacketFilter::new(
+            PacketFilterIdentifier::new(identifier).expect("TFT identifier is four-bit"),
+            PacketFilterDirection::UplinkOnly,
+            precedence,
+            components,
+        )
+        .expect("TFT packet filter is canonical")
+    };
+    let tft = |filters| {
+        TrafficFlowTemplate::create_new(filters, Vec::new()).expect("TFT snapshot is canonical")
+    };
+    let local_address = PacketFilterComponent::Ipv4LocalAddress {
+        address: UE_PAA,
+        mask: Ipv4Addr::new(255, 255, 255, 255),
+    };
+    let remote_address = PacketFilterComponent::Ipv4RemoteAddress {
+        address: REMOTE_HOST,
+        mask: Ipv4Addr::new(255, 255, 255, 255),
+    };
+    let bearer_a_tft = tft(vec![
+        filter(
+            0,
+            10,
+            vec![
+                local_address.clone(),
+                PacketFilterComponent::ProtocolIdentifierNextHeader(IPPROTO_UDP),
+                PacketFilterComponent::SingleLocalPort(5010),
+            ],
+        ),
+        filter(1, 11, vec![PacketFilterComponent::SingleLocalPort(5011)]),
+        filter(
+            2,
+            12,
+            vec![PacketFilterComponent::LocalPortRange(
+                PortRange::new(5012, 5013).expect("ordered local port range"),
+            )],
+        ),
+        filter(
+            3,
+            13,
+            vec![
+                remote_address.clone(),
+                PacketFilterComponent::ProtocolIdentifierNextHeader(IPPROTO_UDP),
+                PacketFilterComponent::SingleLocalPort(5014),
+            ],
+        ),
+        filter(
+            4,
+            14,
+            vec![
+                PacketFilterComponent::SingleRemotePort(5400),
+                PacketFilterComponent::SingleLocalPort(5015),
+            ],
+        ),
+    ]);
+    let bearer_b_tft = tft(vec![
+        filter(
+            0,
+            15,
+            vec![
+                PacketFilterComponent::RemotePortRange(
+                    PortRange::new(5400, 5401).expect("ordered remote port range"),
+                ),
+                PacketFilterComponent::SingleLocalPort(5016),
+            ],
+        ),
+        filter(
+            1,
+            16,
+            vec![
+                PacketFilterComponent::ProtocolIdentifierNextHeader(IPPROTO_UDP),
+                PacketFilterComponent::SingleLocalPort(5020),
+            ],
+        ),
+        filter(
+            2,
+            17,
+            vec![
+                PacketFilterComponent::TypeOfServiceTrafficClass {
+                    value: 0x21,
+                    mask: 0xf0,
+                },
+                PacketFilterComponent::ProtocolIdentifierNextHeader(IPPROTO_UDP),
+                PacketFilterComponent::SingleLocalPort(5021),
+            ],
+        ),
+        filter(
+            3,
+            18,
+            vec![
+                PacketFilterComponent::ProtocolIdentifierNextHeader(IPPROTO_ESP),
+                PacketFilterComponent::SecurityParameterIndex(0x1020_3040),
+            ],
+        ),
+    ]);
+    let main_classifier = TftUplinkClassifier::new(
+        device.ifindex,
+        IpAddr::V4(UE_PAA),
+        vec![
+            TftUplinkBearer::default_bearer(),
+            TftUplinkBearer::dedicated(
+                GtpBearerMark::new(MARK_A).expect("nonzero dedicated mark"),
+                bearer_a_tft.clone(),
+            ),
+            TftUplinkBearer::dedicated(
+                GtpBearerMark::new(MARK_B).expect("nonzero dedicated mark"),
+                bearer_b_tft.clone(),
+            ),
+        ],
+    )
+    .expect("canonical shared-PAA TFT classifier");
+    assert_eq!(
+        backend
+            .reconcile_tft_uplink_classifier(main_classifier.clone())
+            .await?,
+        TftUplinkClassifierReconcileOutcome::Installed
+    );
+    assert_eq!(
+        backend
+            .read_tft_uplink_classifier(device.ifindex, IpAddr::V4(UE_PAA))
+            .await?,
+        TftUplinkClassifierReadback::Present(main_classifier.clone()),
+        "public TFT readback must preserve the requested canonical snapshot"
+    );
+
+    let pgw_socket = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW TFT GTP-U socket")
+    });
+    let send_udp = |source_port: u16, destination_port: u16, tos: u8, sentinel: &[u8]| {
+        let mut packet =
+            build_inner_udp(UE_PAA, REMOTE_HOST, source_port, destination_port, sentinel);
+        packet[1] = tos;
+        packet[10..12].fill(0);
+        let mut header = [0_u8; IPV4_MIN_HDR_LEN];
+        header.copy_from_slice(&packet[..IPV4_MIN_HDR_LEN]);
+        let checksum = ipv4_header_checksum(&header);
+        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+        send_wireguard_ipv4_packet(&net.ue_ns, &packet);
+    };
+    for (source_port, destination_port, tos, expected_teid, sentinel) in [
+        (5010, 5402, 0, PEER_TEID_A, b"tft-local-address".as_slice()),
+        (5011, 5402, 0, PEER_TEID_A, b"tft-local-port".as_slice()),
+        (5012, 5402, 0, PEER_TEID_A, b"tft-local-range".as_slice()),
+        (
+            5013,
+            5402,
+            0,
+            PEER_TEID_A,
+            b"tft-local-range-high".as_slice(),
+        ),
+        (5014, 5402, 0, PEER_TEID_A, b"tft-remote-address".as_slice()),
+        (5015, 5400, 0, PEER_TEID_A, b"tft-remote-port".as_slice()),
+        (5016, 5401, 0, PEER_TEID_B, b"tft-remote-range".as_slice()),
+        (5020, 5402, 0, PEER_TEID_B, b"tft-protocol".as_slice()),
+        (5021, 5402, 0x20, PEER_TEID_B, b"tft-tos-mask".as_slice()),
+    ] {
+        send_udp(source_port, destination_port, tos, sentinel);
+        receive_tft_uplink_teid(&pgw_socket, expected_teid, sentinel);
+    }
+    let esp_sentinel = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
+    let mut esp_packet = vec![0_u8; IPV4_MIN_HDR_LEN + 8];
+    esp_packet[0] = 0x45;
+    let esp_packet_len = u16::try_from(esp_packet.len()).expect("bounded ESP packet length");
+    esp_packet[2..4].copy_from_slice(&esp_packet_len.to_be_bytes());
+    esp_packet[8] = 64;
+    esp_packet[9] = IPPROTO_ESP;
+    esp_packet[12..16].copy_from_slice(&UE_PAA.octets());
+    esp_packet[16..20].copy_from_slice(&REMOTE_HOST.octets());
+    esp_packet[20..28].copy_from_slice(&esp_sentinel);
+    let mut esp_header = [0_u8; IPV4_MIN_HDR_LEN];
+    esp_header.copy_from_slice(&esp_packet[..IPV4_MIN_HDR_LEN]);
+    esp_packet[10..12].copy_from_slice(&ipv4_header_checksum(&esp_header).to_be_bytes());
+    send_wireguard_ipv4_packet(&net.ue_ns, &esp_packet);
+    receive_tft_uplink_teid(&pgw_socket, PEER_TEID_B, &esp_sentinel);
+
+    let overlap_b_tft = tft(vec![
+        filter(0, 1, vec![PacketFilterComponent::SingleLocalPort(5010)]),
+        filter(
+            1,
+            15,
+            vec![
+                PacketFilterComponent::RemotePortRange(
+                    PortRange::new(5400, 5401).expect("ordered remote port range"),
+                ),
+                PacketFilterComponent::SingleLocalPort(5016),
+            ],
+        ),
+        filter(
+            2,
+            16,
+            vec![
+                PacketFilterComponent::ProtocolIdentifierNextHeader(IPPROTO_UDP),
+                PacketFilterComponent::SingleLocalPort(5020),
+            ],
+        ),
+        filter(
+            3,
+            17,
+            vec![
+                PacketFilterComponent::TypeOfServiceTrafficClass {
+                    value: 0x21,
+                    mask: 0xf0,
+                },
+                PacketFilterComponent::ProtocolIdentifierNextHeader(IPPROTO_UDP),
+                PacketFilterComponent::SingleLocalPort(5021),
+            ],
+        ),
+        filter(
+            4,
+            18,
+            vec![
+                PacketFilterComponent::ProtocolIdentifierNextHeader(IPPROTO_ESP),
+                PacketFilterComponent::SecurityParameterIndex(0x1020_3040),
+            ],
+        ),
+    ]);
+    let overlap_classifier = TftUplinkClassifier::new(
+        device.ifindex,
+        IpAddr::V4(UE_PAA),
+        vec![
+            TftUplinkBearer::default_bearer(),
+            TftUplinkBearer::dedicated(
+                GtpBearerMark::new(MARK_A).expect("nonzero dedicated mark"),
+                bearer_a_tft.clone(),
+            ),
+            TftUplinkBearer::dedicated(
+                GtpBearerMark::new(MARK_B).expect("nonzero dedicated mark"),
+                overlap_b_tft,
+            ),
+        ],
+    )
+    .expect("overlapping TFT classifier");
+    assert_eq!(
+        backend
+            .reconcile_tft_uplink_classifier(overlap_classifier)
+            .await?,
+        TftUplinkClassifierReconcileOutcome::Replaced
+    );
+    send_udp(5010, 5402, 0, b"tft-overlap-precedence");
+    receive_tft_uplink_teid(&pgw_socket, PEER_TEID_B, b"tft-overlap-precedence");
+
+    let no_default_classifier = TftUplinkClassifier::new(
+        device.ifindex,
+        IpAddr::V4(UE_PAA),
+        vec![
+            TftUplinkBearer::dedicated(
+                GtpBearerMark::new(MARK_A).expect("nonzero dedicated mark"),
+                bearer_a_tft.clone(),
+            ),
+            TftUplinkBearer::dedicated(
+                GtpBearerMark::new(MARK_B).expect("nonzero dedicated mark"),
+                bearer_b_tft.clone(),
+            ),
+        ],
+    )
+    .expect("no-default TFT classifier");
+    assert_eq!(
+        backend
+            .reconcile_tft_uplink_classifier(no_default_classifier)
+            .await?,
+        TftUplinkClassifierReconcileOutcome::Replaced
+    );
+    let no_match_before = pinned_per_cpu_u64_values(
+        &pin_dir,
+        MAP_TFT_CLASSIFIER_COUNTERS,
+        TFT_CLASSIFIER_COUNTER_SLOTS,
+    )[usize::try_from(COUNTER_TFT_CLASSIFIER_NO_MATCH).expect("counter index fits usize")]
+    .iter()
+    .copied()
+    .sum::<u64>();
+    send_udp(5099, 5499, 0, b"tft-no-default");
+    expect_no_datagram(&pgw_socket);
+    let no_match_after = pinned_per_cpu_u64_values(
+        &pin_dir,
+        MAP_TFT_CLASSIFIER_COUNTERS,
+        TFT_CLASSIFIER_COUNTER_SLOTS,
+    )[usize::try_from(COUNTER_TFT_CLASSIFIER_NO_MATCH).expect("counter index fits usize")]
+    .iter()
+    .copied()
+    .sum::<u64>();
+    assert_eq!(
+        no_match_after,
+        no_match_before + 1,
+        "no-default unmatched traffic must increment the exact TFT no-match counter"
+    );
+    assert_eq!(
+        backend
+            .reconcile_tft_uplink_classifier(main_classifier.clone())
+            .await?,
+        TftUplinkClassifierReconcileOutcome::Replaced
+    );
+
+    send_udp(5011, 5402, 0, b"tft-before-atomic-replace");
+    receive_tft_uplink_teid(&pgw_socket, PEER_TEID_A, b"tft-before-atomic-replace");
+    let moved_b_tft = tft(vec![
+        filter(0, 11, vec![PacketFilterComponent::SingleLocalPort(5011)]),
+        filter(
+            1,
+            15,
+            vec![
+                PacketFilterComponent::RemotePortRange(
+                    PortRange::new(5400, 5401).expect("ordered remote port range"),
+                ),
+                PacketFilterComponent::SingleLocalPort(5016),
+            ],
+        ),
+        filter(
+            2,
+            16,
+            vec![
+                PacketFilterComponent::ProtocolIdentifierNextHeader(IPPROTO_UDP),
+                PacketFilterComponent::SingleLocalPort(5020),
+            ],
+        ),
+        filter(
+            3,
+            17,
+            vec![
+                PacketFilterComponent::TypeOfServiceTrafficClass {
+                    value: 0x21,
+                    mask: 0xf0,
+                },
+                PacketFilterComponent::ProtocolIdentifierNextHeader(IPPROTO_UDP),
+                PacketFilterComponent::SingleLocalPort(5021),
+            ],
+        ),
+        filter(
+            4,
+            18,
+            vec![
+                PacketFilterComponent::ProtocolIdentifierNextHeader(IPPROTO_ESP),
+                PacketFilterComponent::SecurityParameterIndex(0x1020_3040),
+            ],
+        ),
+    ]);
+    let moved_a_tft = tft(vec![
+        filter(
+            0,
+            10,
+            vec![
+                local_address,
+                PacketFilterComponent::ProtocolIdentifierNextHeader(IPPROTO_UDP),
+                PacketFilterComponent::SingleLocalPort(5010),
+            ],
+        ),
+        filter(
+            1,
+            12,
+            vec![PacketFilterComponent::LocalPortRange(
+                PortRange::new(5012, 5013).expect("ordered local port range"),
+            )],
+        ),
+        filter(
+            2,
+            13,
+            vec![
+                remote_address,
+                PacketFilterComponent::ProtocolIdentifierNextHeader(IPPROTO_UDP),
+                PacketFilterComponent::SingleLocalPort(5014),
+            ],
+        ),
+        filter(
+            3,
+            14,
+            vec![
+                PacketFilterComponent::SingleRemotePort(5400),
+                PacketFilterComponent::SingleLocalPort(5015),
+            ],
+        ),
+    ]);
+    let moved_classifier = TftUplinkClassifier::new(
+        device.ifindex,
+        IpAddr::V4(UE_PAA),
+        vec![
+            TftUplinkBearer::default_bearer(),
+            TftUplinkBearer::dedicated(
+                GtpBearerMark::new(MARK_A).expect("nonzero dedicated mark"),
+                moved_a_tft,
+            ),
+            TftUplinkBearer::dedicated(
+                GtpBearerMark::new(MARK_B).expect("nonzero dedicated mark"),
+                moved_b_tft,
+            ),
+        ],
+    )
+    .expect("atomically moved TFT classifier");
+    assert_eq!(
+        backend
+            .reconcile_tft_uplink_classifier(moved_classifier.clone())
+            .await?,
+        TftUplinkClassifierReconcileOutcome::Replaced
+    );
+    assert_eq!(
+        backend
+            .read_tft_uplink_classifier(device.ifindex, IpAddr::V4(UE_PAA))
+            .await?,
+        TftUplinkClassifierReadback::Present(moved_classifier.clone())
+    );
+    send_udp(5011, 5402, 0, b"tft-after-atomic-replace");
+    receive_tft_uplink_teid(&pgw_socket, PEER_TEID_B, b"tft-after-atomic-replace");
+
+    assert_eq!(
+        backend
+            .remove_tft_uplink_classifier_exact(moved_classifier)
+            .await?,
+        TftUplinkClassifierRemovalOutcome::Removed
+    );
+    assert_eq!(
+        backend
+            .read_tft_uplink_classifier(device.ifindex, IpAddr::V4(UE_PAA))
+            .await?,
+        TftUplinkClassifierReadback::Absent
+    );
+    send_udp(5099, 5499, 0, b"tft-removed-default");
+    receive_tft_uplink_teid(&pgw_socket, PEER_TEID, b"tft-removed-default");
+    send_udp(5001, 5402, 0, b"tft-removed-explicit-mark");
+    receive_tft_uplink_teid(&pgw_socket, PEER_TEID_A, b"tft-removed-explicit-mark");
+    assert_eq!(
+        tc_filters("ingress"),
+        foreign_ingress_filter,
+        "TFT removal must preserve the foreign tc filter"
+    );
+    let maps_after_removal = current_map_contents(&pin_dir);
+    assert!(maps_after_removal.tft_meta.is_empty());
+    assert!(maps_after_removal.tft_filters.is_empty());
+    for name in [
+        MAP_TFT_CLASSIFIER_SCHEMA,
+        MAP_TFT_CLASSIFIER_META,
+        MAP_TFT_CLASSIFIER_FILTERS,
+        MAP_TFT_CLASSIFIER_COUNTERS,
+    ] {
+        assert!(
+            pin_dir.join(name).exists(),
+            "{name} pin must survive classifier removal"
+        );
+    }
+    run(
+        "tc",
+        &[
+            "filter", "del", "dev", "s2bu", "ingress", "pref", "10", "protocol", "ip", "flower",
+        ],
+    );
+
+    drop(pgw_socket);
+    backend.remove_device(&device).await?;
+    assert!(
+        !pin_dir.exists(),
+        "device removal must unlink the complete 25-map pin graph"
+    );
+    drop(backend);
+    drop(net);
+    eprintln!("OPC_GTPU_TFT_IPV4_LIVE_PROVEN");
+    Ok(())
 }
 
 #[tokio::test]
@@ -8632,6 +9193,10 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
         MAP_SESSION_TRANSACTIONS,
         MAP_CONFIG_IPV6,
         MAP_SESSION_SCHEMA,
+        MAP_TFT_CLASSIFIER_SCHEMA,
+        MAP_TFT_CLASSIFIER_META,
+        MAP_TFT_CLASSIFIER_FILTERS,
+        MAP_TFT_CLASSIFIER_COUNTERS,
     ];
     let pins_before = pin_directory_listing(&pin_dir_b);
     assert_eq!(
@@ -8681,6 +9246,10 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
             MAP_SESSION_GROUPS,
             MAP_SESSION_UPLINK_INDEX,
             MAP_CONFIG_IPV6,
+            MAP_TFT_CLASSIFIER_SCHEMA,
+            MAP_TFT_CLASSIFIER_META,
+            MAP_TFT_CLASSIFIER_FILTERS,
+            MAP_TFT_CLASSIFIER_COUNTERS,
         ],
     );
     let alternate_downlink_maps = exact_pinned_map_ids(

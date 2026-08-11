@@ -14,6 +14,10 @@ use crate::model::{
     PdpContextSelector, PdpLiveWriterProof, PdpLiveWriterRemovalRequest, PdpRestartRecoveryRequest,
     RemovePdpContextRequest,
 };
+use crate::tft_classifier::{
+    TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
+    TftUplinkClassifierRemovalOutcome,
+};
 use crate::GtpuError;
 
 /// Backend that can mutate Linux GTP-U dataplane state.
@@ -23,6 +27,78 @@ use crate::GtpuError;
 /// and deterministic.
 #[async_trait]
 pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
+    /// Report whether this backend can classify an unmarked shared-SA uplink
+    /// packet by a canonical TFT before its existing bearer-mark lookup.
+    ///
+    /// This is deliberately separate from [`GtpuProbe::per_bearer_marking`]:
+    /// the latter consumes an already assigned mark. Backends must report
+    /// `Missing` until their live program and readback ABI can prove an exact
+    /// classifier snapshot as one unit.
+    fn tft_uplink_classification_capability(&self) -> GtpuCapability {
+        GtpuCapability::Missing
+    }
+
+    /// Validate whether one complete TFT classifier can be represented by this
+    /// backend without changing runtime state.
+    ///
+    /// Backends that do not explicitly implement this additive contract fail
+    /// closed, even when they implement other TFT classifier operations.
+    fn validate_tft_uplink_classifier(
+        &self,
+        _desired: &TftUplinkClassifier,
+    ) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "tft_uplink_classification",
+        })
+    }
+
+    /// Read the exact desired/observed TFT classifier for one attachment/PAA.
+    ///
+    /// `Present` proves one complete classifier under this backend's authority.
+    /// Partial, mixed, stale, or otherwise unprovable state is `Indeterminate`,
+    /// never `Absent`.
+    async fn read_tft_uplink_classifier(
+        &self,
+        _link_ifindex: u32,
+        _paa: std::net::IpAddr,
+    ) -> Result<TftUplinkClassifierReadback, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "tft_uplink_classification",
+        })
+    }
+
+    /// Reconcile one complete TFT classifier snapshot under this backend's
+    /// authority.
+    ///
+    /// An absent classifier is installed and an exact classifier is idempotently
+    /// already present. A different complete classifier already owned by this
+    /// backend/authority is atomically replaced. A complete classifier owned by
+    /// another authority is `Conflict`; partial, mixed, stale, or otherwise
+    /// unprovable state is `Indeterminate`. Implementations must never publish a
+    /// transient absent classifier, partial ownership, or wrong-bearer
+    /// classifier during replacement.
+    async fn reconcile_tft_uplink_classifier(
+        &self,
+        _desired: TftUplinkClassifier,
+    ) -> Result<TftUplinkClassifierReconcileOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "tft_uplink_classification",
+        })
+    }
+
+    /// Remove a TFT classifier only when the complete observed object equals
+    /// `expected` under this backend's authority.
+    ///
+    /// Absence is idempotent, foreign complete ownership is `Conflict`, and
+    /// partial, mixed, stale, or otherwise unprovable state is `Indeterminate`.
+    async fn remove_tft_uplink_classifier_exact(
+        &self,
+        _expected: TftUplinkClassifier,
+    ) -> Result<TftUplinkClassifierRemovalOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "tft_uplink_classification",
+        })
+    }
     /// Create a Linux `gtp` netdevice.
     async fn create_device(&self, request: CreateGtpDeviceRequest) -> Result<GtpDevice, GtpuError>;
 
