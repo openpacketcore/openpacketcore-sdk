@@ -16,7 +16,9 @@ use std::sync::Arc;
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
 use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
 use opc_types::Timestamp;
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use sha2::{Digest, Sha256};
 
 use crate::backend::{
@@ -7651,30 +7653,32 @@ pub(crate) fn validate_sealed_replication_op(root: &ReplicationOp) -> io::Result
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_snapshot_database_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     path: &std::path::Path,
 ) -> io::Result<ConsensusAppliedMembership> {
-    build_snapshot_database_in_tx(conn, identity, path)
+    let destination = create_pinned_snapshot_database(path)?;
+    build_snapshot_database_from_pinned_sync(conn, identity, destination)
+        .map(|(snapshot, _)| snapshot)
 }
 
-pub(crate) fn build_snapshot_database_with_authority_sync(
+pub(crate) fn build_snapshot_database_from_pinned_with_authority_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     authority_profile: ConsensusAuthorityProfile,
     expected_members: &BTreeSet<SessionConsensusNodeId>,
     expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
-    path: &std::path::Path,
-) -> io::Result<ConsensusAppliedMembership> {
+    destination: crate::consensus::snapshot::PinnedSqliteFile,
+) -> io::Result<(
+    ConsensusAppliedMembership,
+    crate::consensus::snapshot::PinnedSqliteFile,
+)> {
     if authority_profile == ConsensusAuthorityProfile::Dynamic {
-        return build_snapshot_database_sync(conn, identity, path);
+        return build_snapshot_database_from_pinned_sync(conn, identity, destination);
     }
-    // A read transaction pins the source image from the authority validation
-    // through Backup's initial read without blocking the backup machinery.
-    // The subsequent metadata write still takes an IMMEDIATE transaction and
-    // repeats the authority check before it can become durable.
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
     validate_durable_authority_for_raw_write(
         &tx,
@@ -7684,50 +7688,221 @@ pub(crate) fn build_snapshot_database_with_authority_sync(
         expected_bindings,
         fixed_placement_policy,
     )?;
-    let snapshot = capture_snapshot_database_sync(&tx, identity, path)?;
+    let (snapshot, destination) =
+        capture_and_finalize_snapshot_database_sync(&tx, identity, destination)?;
     tx.commit().map_err(db_error)?;
-    finalize_snapshot_database_sync(path, identity)?;
-    Ok(snapshot)
+    Ok((snapshot, destination))
 }
 
-fn build_snapshot_database_in_tx(
+#[allow(dead_code)]
+pub(crate) fn build_snapshot_database_with_authority_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
     path: &std::path::Path,
 ) -> io::Result<ConsensusAppliedMembership> {
-    let snapshot = capture_snapshot_database_sync(conn, identity, path)?;
-    finalize_snapshot_database_sync(path, identity)?;
-    Ok(snapshot)
+    let destination = create_pinned_snapshot_database(path)?;
+    build_snapshot_database_from_pinned_with_authority_sync(
+        conn,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+        destination,
+    )
+    .map(|(snapshot, _)| snapshot)
+}
+
+fn build_snapshot_database_from_pinned_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    destination: crate::consensus::snapshot::PinnedSqliteFile,
+) -> io::Result<(
+    ConsensusAppliedMembership,
+    crate::consensus::snapshot::PinnedSqliteFile,
+)> {
+    capture_and_finalize_snapshot_database_sync(conn, identity, destination)
+}
+
+#[allow(dead_code)]
+fn create_pinned_snapshot_database(
+    path: &std::path::Path,
+) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let mut options = OpenOptions::new();
+        options
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        crate::consensus::snapshot::PinnedSqliteFile::from_file(
+            options.open(path)?,
+            path.to_path_buf(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "pinned SQLite snapshot binding requires Linux",
+        ))
+    }
+}
+
+fn refresh_pinned_snapshot_database(
+    pinned: crate::consensus::snapshot::PinnedSqliteFile,
+) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
+    let path = pinned.path().to_path_buf();
+    crate::consensus::snapshot::PinnedSqliteFile::from_file(pinned.into_file(), path)
+}
+
+#[cfg(target_os = "linux")]
+fn matching_pinned_snapshot_descriptors(
+    pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+) -> io::Result<BTreeSet<std::os::fd::RawFd>> {
+    let mut descriptors = BTreeSet::new();
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let entry = entry?;
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<std::os::fd::RawFd>().ok())
+        else {
+            continue;
+        };
+        match pinned.path_matches_identity(&entry.path()) {
+            Ok(true) => {
+                descriptors.insert(fd);
+            }
+            Ok(false) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(descriptors)
+}
+
+#[cfg(target_os = "linux")]
+fn pinned_snapshot_uri(
+    pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+    read_only: bool,
+) -> String {
+    let mode = if read_only { "ro" } else { "rw" };
+    format!(
+        "file:/proc/self/fd/{}?mode={mode}&cache=private{}",
+        pinned.raw_fd(),
+        if read_only { "&immutable=1" } else { "" }
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pinned_snapshot_uri(
+    _pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+    _read_only: bool,
+) -> String {
+    String::new()
+}
+
+#[cfg(target_os = "linux")]
+fn open_pinned_snapshot_database(
+    pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+) -> io::Result<(Connection, BTreeSet<std::os::fd::RawFd>)> {
+    pinned.verify_identity()?;
+    let before = matching_pinned_snapshot_descriptors(pinned)?;
+    let uri = pinned_snapshot_uri(pinned, false);
+    let destination = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(db_error)?;
+    destination
+        .query_row("PRAGMA schema_version", [], |_| Ok(()))
+        .map_err(db_error)?;
+    let after = matching_pinned_snapshot_descriptors(pinned)?;
+    let opened = after.difference(&before).copied().collect::<BTreeSet<_>>();
+    if opened.len() != 1 {
+        return Err(invalid_data(
+            "SQLite did not retain exactly one pinned snapshot descriptor",
+        ));
+    }
+    Ok((destination, opened))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_pinned_snapshot_database(
+    _pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+) -> io::Result<(Connection, BTreeSet<i32>)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "pinned SQLite snapshot binding requires Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_pinned_snapshot_descriptor(
+    pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+    retained: &BTreeSet<std::os::fd::RawFd>,
+) -> io::Result<()> {
+    pinned.verify_identity()?;
+    let observed = matching_pinned_snapshot_descriptors(pinned)?;
+    if retained.is_empty() || !retained.is_subset(&observed) {
+        return Err(invalid_data(
+            "SQLite released the pinned snapshot descriptor",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_pinned_snapshot_descriptor(
+    _pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+    _retained: &BTreeSet<i32>,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "pinned SQLite snapshot binding requires Linux",
+    ))
 }
 
 /// Capture the source image while the caller holds the SQLite transaction that
 /// admitted it. The fixed-authority validation and backup therefore observe
 /// the same pinned source snapshot.
-fn capture_snapshot_database_sync(
+fn capture_and_finalize_snapshot_database_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
-    path: &std::path::Path,
-) -> io::Result<ConsensusAppliedMembership> {
+    mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
+) -> io::Result<(
+    ConsensusAppliedMembership,
+    crate::consensus::snapshot::PinnedSqliteFile,
+)> {
     validate_sealed_state_sync(conn)?;
     let applied = read_applied_sync(conn, identity)?;
     let membership = read_membership_sync(conn, identity)?;
     validate_membership_ids(&membership)?;
 
-    let mut destination = Connection::open(path).map_err(db_error)?;
+    let (mut destination, descriptor_fds) = open_pinned_snapshot_database(&pinned)?;
+    destination
+        .execute_batch("PRAGMA journal_mode = OFF;")
+        .map_err(db_error)?;
     {
         let backup = rusqlite::backup::Backup::new(conn, &mut destination).map_err(db_error)?;
         backup
             .run_to_completion(128, std::time::Duration::ZERO, None)
             .map_err(db_error)?;
     }
-    Ok((applied, membership))
-}
-
-fn finalize_snapshot_database_sync(
-    path: &std::path::Path,
-    identity: SessionConsensusIdentity,
-) -> io::Result<()> {
-    let destination = Connection::open(path).map_err(db_error)?;
+    pinned = refresh_pinned_snapshot_database(pinned)?;
+    verify_pinned_snapshot_descriptor(&pinned, &descriptor_fds)?;
     destination
         .execute_batch(
             r#"
@@ -7736,7 +7911,7 @@ fn finalize_snapshot_database_sync(
             DELETE FROM consensus_purged;
             DELETE FROM consensus_log;
             DELETE FROM consensus_snapshot;
-            PRAGMA journal_mode = DELETE;
+            PRAGMA journal_mode = OFF;
             VACUUM;
             "#,
         )
@@ -7746,7 +7921,10 @@ fn finalize_snapshot_database_sync(
     validate_existing_schema(&destination, identity)
         .map_err(|_| invalid_data("built session consensus snapshot failed validation"))?;
     validate_sealed_state_sync(&destination)?;
-    Ok(())
+    pinned = refresh_pinned_snapshot_database(pinned)?;
+    verify_pinned_snapshot_descriptor(&pinned, &descriptor_fds)?;
+    drop(destination);
+    Ok(((applied, membership), pinned))
 }
 
 fn transition_start_is_compatible(local: u64, incoming: u64) -> bool {
@@ -8376,6 +8554,44 @@ pub(crate) fn install_snapshot_database_with_authority_sync(
     checksum: [u8; 32],
     byte_length: u64,
 ) -> io::Result<()> {
+    let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+        File::open(snapshot_db_path)?,
+        snapshot_db_path.to_path_buf(),
+    )?;
+    install_snapshot_database_from_pinned_with_authority_sync(
+        conn,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+        pinned,
+        None,
+        meta,
+        final_file_name,
+        checksum,
+        byte_length,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: Option<&BTreeSet<SessionConsensusNodeId>>,
+    expected_bindings: Option<&BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    published_snapshot: Option<(&crate::consensus::snapshot::PinnedSqliteFile, &Path)>,
+    meta: &opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    final_file_name: &str,
+    checksum: [u8; 32],
+    byte_length: u64,
+) -> io::Result<()> {
     let incoming_last_log_id = meta.last_log_id.as_ref();
     validate_snapshot_floor(conn, identity, incoming_last_log_id)?;
     let expected_scope = read_membership_scope_sync(conn, identity)?;
@@ -8389,11 +8605,24 @@ pub(crate) fn install_snapshot_database_with_authority_sync(
         return Err(invalid_data("invalid session consensus snapshot file name"));
     }
     let byte_length = checked_positive_i64(byte_length)?;
-    let snapshot_path = snapshot_db_path
-        .to_str()
-        .ok_or_else(|| invalid_data("session consensus snapshot path is not UTF-8"))?;
-    conn.execute("ATTACH DATABASE ?1 AS consensus_incoming", [snapshot_path])
+    let before = matching_pinned_snapshot_descriptors(&pinned)?;
+    let snapshot_uri = pinned_snapshot_uri(&pinned, true);
+    conn.execute("ATTACH DATABASE ?1 AS consensus_incoming", [snapshot_uri])
         .map_err(db_error)?;
+    conn.query_row(
+        "SELECT 1 FROM consensus_incoming.sqlite_schema LIMIT 1",
+        [],
+        |_| Ok(()),
+    )
+    .map_err(db_error)?;
+    let after = matching_pinned_snapshot_descriptors(&pinned)?;
+    let retained_descriptors = after.difference(&before).copied().collect::<BTreeSet<_>>();
+    if retained_descriptors.len() != 1 {
+        let _ = conn.execute("DETACH DATABASE consensus_incoming", []);
+        return Err(invalid_data(
+            "SQLite did not retain exactly one pinned incoming snapshot descriptor",
+        ));
+    }
 
     let result = (|| {
         let tx =
@@ -8522,6 +8751,14 @@ pub(crate) fn install_snapshot_database_with_authority_sync(
             ],
         )
         .map_err(db_error)?;
+        verify_pinned_snapshot_descriptor(&pinned, &retained_descriptors)?;
+        if let Some((published_snapshot, published_path)) = published_snapshot {
+            if !published_snapshot.path_matches_identity(published_path)? {
+                return Err(invalid_data(
+                    "session consensus published snapshot was replaced",
+                ));
+            }
+        }
         tx.commit().map_err(db_error)
     })();
 
@@ -8729,6 +8966,8 @@ mod tests {
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::consensus::snapshot::PinnedSqliteFile;
     use crate::model::{OwnerId, SessionKey, SessionKeyType};
     use crate::restore::{RestoreScanCursor, RestoreScanRequest, RestoreScanScope};
 
@@ -12656,5 +12895,50 @@ mod tests {
         )
         .expect_err("fixed snapshot binding drift must fail closed");
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn procfd_snapshot_open_rejects_or_stays_on_pinned_inode_during_name_substitution() {
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let path = directory.path().join("incoming.sqlite");
+        let original = Connection::open(&path).expect("create original SQLite image");
+        original
+            .execute_batch(
+                "CREATE TABLE original_only(value INTEGER); INSERT INTO original_only VALUES (7);",
+            )
+            .expect("populate original image");
+        drop(original);
+        let pinned = PinnedSqliteFile::from_file(
+            File::open(&path).expect("open original descriptor"),
+            path.clone(),
+        )
+        .expect("pin original descriptor");
+
+        let displaced = directory.path().join("displaced.sqlite");
+        let replacement = directory.path().join("replacement.sqlite");
+        std::fs::rename(&path, &displaced).expect("displace A");
+        let replacement_connection = Connection::open(&replacement).expect("create replacement B");
+        replacement_connection
+            .execute_batch("CREATE TABLE replacement_only(value INTEGER); INSERT INTO replacement_only VALUES (9);")
+            .expect("populate replacement image");
+        drop(replacement_connection);
+        std::fs::rename(&replacement, &path).expect("publish B");
+        std::fs::rename(&displaced, &replacement).expect("retain A for ABA restore");
+
+        let opened = open_pinned_snapshot_database(&pinned);
+        std::fs::rename(&replacement, &path).expect("restore A after SQLite proof");
+        if let Ok((connection, retained)) = opened {
+            let value: i64 = connection
+                .query_row("SELECT value FROM original_only", [], |row| row.get(0))
+                .expect("SQLite must consume A rather than B");
+            assert_eq!(7, value);
+            assert!(connection
+                .query_row("SELECT value FROM replacement_only", [], |row| row
+                    .get::<_, i64>(0))
+                .is_err());
+            verify_pinned_snapshot_descriptor(&pinned, &retained)
+                .expect("retained descriptor must still be A before mutation");
+        }
     }
 }
