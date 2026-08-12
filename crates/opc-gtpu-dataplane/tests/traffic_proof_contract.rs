@@ -1,8 +1,8 @@
 use opc_gtpu_dataplane::{
     GtpPdpContext, GtpVersion, GtpuCapability, GtpuDataplaneBackend, GtpuSessionDeviceId,
     GtpuSessionEntry, GtpuSessionGroup, GtpuSessionGroupId, GtpuSourcePortPolicy,
-    GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityStore, GtpuUplinkSourcePortPolicy,
-    MockGtpuDataplaneBackend, Teid, TrafficContinuityPolicy, UnsupportedGtpuDataplaneBackend,
+    GtpuTrafficProofAuthority, GtpuUplinkSourcePortPolicy, MockGtpuDataplaneBackend, Teid,
+    TrafficContinuityPolicy, UnsupportedGtpuDataplaneBackend,
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
@@ -58,14 +58,12 @@ async fn mock_and_unsupported_backends_cannot_mint_a_proof() {
     let mock = MockGtpuDataplaneBackend::new();
     let unsupported = UnsupportedGtpuDataplaneBackend::new();
 
-    let mock_store = GtpuTrafficProofAuthorityStore::new(authority());
     assert!(mock
-        .begin_gtpu_traffic_proof(mock_store.lease().await)
+        .register_gtpu_traffic_proof_authority(authority())
         .await
         .is_err());
-    let unsupported_store = GtpuTrafficProofAuthorityStore::new(authority());
     assert!(unsupported
-        .begin_gtpu_traffic_proof(unsupported_store.lease().await)
+        .register_gtpu_traffic_proof_authority(authority())
         .await
         .is_err());
 }

@@ -19,8 +19,9 @@ use crate::tft_classifier::{
     TftUplinkClassifierRemovalOutcome,
 };
 use crate::traffic_observation::{
-    GtpuTrafficProof, GtpuTrafficProofAuthorityLease, GtpuTrafficProofPoll,
-    GtpuTrafficProofSession, GtpuTrafficProofValidation,
+    GtpuTrafficProof, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityLease,
+    GtpuTrafficProofAuthorityStore, GtpuTrafficProofPoll, GtpuTrafficProofSession,
+    GtpuTrafficProofValidation,
 };
 use crate::GtpuError;
 
@@ -40,6 +41,24 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// authority may override this fail-closed default.
     fn gtpu_traffic_proof_capability(&self) -> GtpuCapability {
         GtpuCapability::Missing
+    }
+
+    /// Register the sole canonical product-authority store for one session group.
+    ///
+    /// A trusted adapter mints and retains an opaque store identity bound to
+    /// its backend incarnation. This is deliberately not a public store
+    /// constructor: independently recreating a store from a stale authority
+    /// snapshot must not create a usable lease. Exact session-group removal
+    /// retires the backend's store and revokes every outstanding attempt;
+    /// orphaned store clones cannot register themselves again. Existing
+    /// backends fail closed.
+    async fn register_gtpu_traffic_proof_authority(
+        &self,
+        _authority: GtpuTrafficProofAuthority,
+    ) -> Result<GtpuTrafficProofAuthorityStore, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_traffic_proof",
+        })
     }
 
     /// Start one trusted traffic-proof attempt for an exact current authority.
@@ -74,7 +93,10 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     ///
     /// A `Proven` result is possible only from a trusted adapter override;
     /// successful reconcile, install, readback, or mock operations alone are
-    /// insufficient evidence. Existing backends fail closed.
+    /// insufficient evidence. The trusted backend acquires and retains a lease
+    /// from its canonical registered store across all uncancellable work, so a
+    /// canceled caller cannot lose an affine proof or race authority
+    /// replacement. Existing backends fail closed.
     async fn poll_gtpu_traffic_proof(
         &self,
         _session: &mut GtpuTrafficProofSession,

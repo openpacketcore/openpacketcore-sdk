@@ -127,8 +127,9 @@ pub use tft_classifier::{
 pub use traffic_observation::{
     GtpuTrafficProof, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityError,
     GtpuTrafficProofAuthorityLease, GtpuTrafficProofAuthorityStore,
-    GtpuTrafficProofAuthorityStoreUpdateError, GtpuTrafficProofInvalidation, GtpuTrafficProofPoll,
-    GtpuTrafficProofSession, GtpuTrafficProofSummary, GtpuTrafficProofValidation,
+    GtpuTrafficProofAuthorityStoreUpdateError, GtpuTrafficProofChallenge,
+    GtpuTrafficProofInvalidation, GtpuTrafficProofPoll, GtpuTrafficProofSession,
+    GtpuTrafficProofSummary, GtpuTrafficProofValidation,
 };
 pub use unsupported::UnsupportedGtpuDataplaneBackend;
 

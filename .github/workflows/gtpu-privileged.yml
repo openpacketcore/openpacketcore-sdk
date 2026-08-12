@@ -307,11 +307,14 @@ jobs:
             chmod 0755 /tmp/opc-gtpu-linux68-test
             chmod 0755 /tmp/opc-gtpu-linux68-datapath
           '
-          load_output="$(
+          if ! load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
               2>&1
-          )"
+          )"; then
+            printf '%s\n' "${load_output}"
+            exit 1
+          fi
           printf '%s\n' "${load_output}"
           grep -Fq 'test result: ok. 3 passed; 0 failed;' <<< "${load_output}"
           # Every one of these tests returns early when
@@ -531,11 +534,14 @@ jobs:
             sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
             chmod 0755 /tmp/opc-gtpu-el9-test
           '
-          load_output="$(
+          if ! load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-el9-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
               2>&1
-          )"
+          )"; then
+            printf '%s\n' "${load_output}"
+            exit 1
+          fi
           printf '%s\n' "${load_output}"
           grep -Fq 'test result: ok. 3 passed; 0 failed;' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
@@ -777,16 +783,19 @@ jobs:
           diff -u <(printf '%s\n' opc_gtpu_downlink opc_gtpu_uplink) pre-redirect.programs
           # This generation predates the TFT classifier maps. Prove that its
           # map inventory remains an exact subset of the current object and
-          # that the four versioned TFT maps are the only additions. The
-          # historical generation still differs by its instruction stream and
-          # by GTPU_COUNTERS width, so a current-object fixture cannot stand in
-          # for its byte authority.
+          # that only the versioned TFT and issue-655 observation maps were
+          # added. The historical generation still differs by its instruction
+          # stream and by GTPU_COUNTERS width, so a current-object fixture
+          # cannot stand in for its byte authority.
           readelf -sW "${current_path}" | awk '$4 == "OBJECT" && $8 ~ /^GTPU_/ {print $8}' | sort > current.maps
           comm -23 pre-redirect.maps current.maps > removed-pre-redirect.maps
           test ! -s removed-pre-redirect.maps
           comm -13 pre-redirect.maps current.maps > added-after-pre-redirect.maps
           diff -u \
-            <(printf '%s\n' GTPU_TFT_DROP GTPU_TFT_FILT GTPU_TFT_META GTPU_TFT_SCHEMA) \
+            <(printf '%s\n' \
+              GTPU_OBS_EVT GTPU_OBS_FLOW GTPU_OBS_GATE GTPU_OBS_LCK \
+              GTPU_OBS_LOSS GTPU_OBS_REDIR GTPU_OBS_REG GTPU_OBS_SEQ \
+              GTPU_TFT_DROP GTPU_TFT_FILT GTPU_TFT_META GTPU_TFT_SCHEMA) \
             added-after-pre-redirect.maps
           # The whole guard rests on these being different programs. Byte
           # equality with the current object would make the historical-upgrade

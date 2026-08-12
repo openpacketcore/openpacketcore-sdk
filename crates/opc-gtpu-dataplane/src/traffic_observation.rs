@@ -18,6 +18,9 @@ use opc_dataplane_observation::{
     SourceEpoch, TrafficBinding, TrafficContinuityAssessment, TrafficContinuityAssessmentSummary,
     TrafficContinuityPolicy,
 };
+use opc_gtpu_ebpf_common::{
+    GtpuTrafficObservationRegistration, GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN,
+};
 
 use crate::GtpuSessionGroup;
 
@@ -57,8 +60,10 @@ impl std::error::Error for GtpuTrafficProofAuthorityError {}
 ///
 /// The product must durably prevent ABA reuse: owner generations and reconcile
 /// revisions advance, and the reconcile fence rotates, across restore and
-/// restart. Store the authority in [`GtpuTrafficProofAuthorityStore`] before
-/// validation; retaining an older clone does not grant a validation lease.
+/// restart. Register the authority through
+/// [`crate::GtpuDataplaneBackend::register_gtpu_traffic_proof_authority`]; only
+/// the backend-returned [`GtpuTrafficProofAuthorityStore`] can issue usable
+/// leases, and retaining an older authority clone grants no validation power.
 /// Each proof begin or retry receives a fresh trusted adapter source epoch, so
 /// this product authority is not a per-attempt anti-replay token and may
 /// remain unchanged across a retry.
@@ -162,7 +167,6 @@ impl GtpuTrafficProofAuthority {
         self.invalidation_for(&proof.binding, proof.policy)
     }
 
-    #[cfg(test)]
     pub(crate) fn invalidation_for_session(
         &self,
         session: &GtpuTrafficProofSession,
@@ -205,6 +209,8 @@ impl fmt::Debug for GtpuTrafficProofAuthority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GtpuTrafficProofAuthorityStoreUpdateError {
+    /// The candidate names a different session group or device attachment.
+    SessionBindingChanged,
     /// The candidate did not advance the reconciliation revision.
     ReconcileRevisionNotIncreasing,
     /// The candidate reused the current reconciliation fence.
@@ -218,6 +224,7 @@ pub enum GtpuTrafficProofAuthorityStoreUpdateError {
 impl fmt::Display for GtpuTrafficProofAuthorityStoreUpdateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::SessionBindingChanged => "session_binding_changed",
             Self::ReconcileRevisionNotIncreasing => "reconcile_revision_not_increasing",
             Self::ReconcileFenceUnchanged => "reconcile_fence_unchanged",
             Self::ProductOwnerGenerationRegressed => "product_owner_generation_regressed",
@@ -228,6 +235,29 @@ impl fmt::Display for GtpuTrafficProofAuthorityStoreUpdateError {
 
 impl std::error::Error for GtpuTrafficProofAuthorityStoreUpdateError {}
 
+/// Opaque identity minted by one trusted backend for its canonical authority store.
+///
+/// The value is never exposed through public diagnostics. Binding it in every
+/// lease prevents a separately recreated store holding a stale authority
+/// snapshot from racing or replacing the product's registered store.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GtpuTrafficProofAuthorityStoreIdentity {
+    backend_incarnation: u64,
+    registration: u128,
+}
+
+impl GtpuTrafficProofAuthorityStoreIdentity {
+    pub(crate) const fn new(backend_incarnation: u64, registration: u128) -> Option<Self> {
+        if backend_incarnation == 0 || registration == 0 {
+            return None;
+        }
+        Some(Self {
+            backend_incarnation,
+            registration,
+        })
+    }
+}
+
 /// Product-owned, generation-fenced storage for the current traffic authority.
 ///
 /// Call [`Self::lease`] before beginning a proof and retain the returned lease
@@ -237,15 +267,35 @@ impl std::error::Error for GtpuTrafficProofAuthorityStoreUpdateError {}
 #[derive(Clone)]
 pub struct GtpuTrafficProofAuthorityStore {
     current: Arc<RwLock<GtpuTrafficProofAuthority>>,
+    identity: GtpuTrafficProofAuthorityStoreIdentity,
 }
 
 impl GtpuTrafficProofAuthorityStore {
-    /// Create a store owning the product's exact current authority.
-    #[must_use]
-    pub fn new(authority: GtpuTrafficProofAuthority) -> Self {
+    /// Create a store after a trusted backend atomically registered its identity.
+    pub(crate) fn registered(
+        authority: GtpuTrafficProofAuthority,
+        identity: GtpuTrafficProofAuthorityStoreIdentity,
+    ) -> Self {
         Self {
             current: Arc::new(RwLock::new(authority)),
+            identity,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(authority: GtpuTrafficProofAuthority) -> Self {
+        Self::registered(
+            authority,
+            GtpuTrafficProofAuthorityStoreIdentity::new(1, 1).expect("nonzero test store identity"),
+        )
+    }
+
+    pub(crate) const fn identity(&self) -> GtpuTrafficProofAuthorityStoreIdentity {
+        self.identity
+    }
+
+    pub(crate) fn blocking_exactly_matches(&self, authority: &GtpuTrafficProofAuthority) -> bool {
+        self.current.blocking_read().exactly_matches(authority)
     }
 
     /// Acquire the current authority's non-cloneable validation lease.
@@ -256,6 +306,7 @@ impl GtpuTrafficProofAuthorityStore {
     pub async fn lease(&self) -> GtpuTrafficProofAuthorityLease {
         GtpuTrafficProofAuthorityLease {
             guard: self.current.clone().read_owned().await,
+            identity: self.identity,
         }
     }
 
@@ -270,6 +321,9 @@ impl GtpuTrafficProofAuthorityStore {
         replacement: GtpuTrafficProofAuthority,
     ) -> Result<(), GtpuTrafficProofAuthorityStoreUpdateError> {
         let mut current = self.current.write().await;
+        if replacement.binding.desired != current.binding.desired {
+            return Err(GtpuTrafficProofAuthorityStoreUpdateError::SessionBindingChanged);
+        }
         if replacement.exactly_matches(&current) {
             return Err(GtpuTrafficProofAuthorityStoreUpdateError::AuthorityUnchanged);
         }
@@ -322,6 +376,7 @@ impl fmt::Debug for GtpuTrafficProofAuthorityStore {
 /// ```
 pub struct GtpuTrafficProofAuthorityLease {
     guard: OwnedRwLockReadGuard<GtpuTrafficProofAuthority>,
+    identity: GtpuTrafficProofAuthorityStoreIdentity,
 }
 
 impl GtpuTrafficProofAuthorityLease {
@@ -333,6 +388,10 @@ impl GtpuTrafficProofAuthorityLease {
 
     pub(crate) fn authority(&self) -> &GtpuTrafficProofAuthority {
         &self.guard
+    }
+
+    pub(crate) const fn store_identity(&self) -> GtpuTrafficProofAuthorityStoreIdentity {
+        self.identity
     }
 }
 
@@ -350,6 +409,7 @@ impl GtpuTrafficProofAuthority {
         source_epoch: SourceEpoch,
         clock_origin: ClockOriginIdentity,
         authority: GtpuTrafficProofAuthorityToken,
+        registration: GtpuTrafficObservationRegistration,
     ) -> GtpuTrafficProofSession {
         let traffic_binding = self.binding.traffic_binding(
             dataplane_generation,
@@ -362,6 +422,7 @@ impl GtpuTrafficProofAuthority {
             policy: self.policy,
             traffic_binding,
             authority,
+            registration,
             proof_issued: false,
             revoker: None,
         }
@@ -450,11 +511,27 @@ pub struct GtpuTrafficProofSession {
     policy: TrafficContinuityPolicy,
     traffic_binding: TrafficBinding,
     authority: GtpuTrafficProofAuthorityToken,
+    registration: GtpuTrafficObservationRegistration,
     proof_issued: bool,
     revoker: Option<Arc<dyn GtpuTrafficProofRevoker>>,
 }
 
 impl GtpuTrafficProofSession {
+    /// Build the fixed, authenticated payload for one nonzero challenge sample.
+    ///
+    /// The returned value contains no subscriber identity or secret. A product
+    /// sends it in an ICMP Echo Request from core to access using the returned
+    /// exact identifier and sequence. The trusted downlink adapter replaces
+    /// the public request authenticator with a private return authenticator
+    /// before the packet reaches the access side. Only the corresponding
+    /// access-to-core Echo Reply can complete this sample.
+    #[must_use]
+    pub fn challenge(&self, sample_id: u32) -> Option<GtpuTrafficProofChallenge> {
+        self.registration
+            .icmp_echo_challenge_payload(sample_id)
+            .map(|payload| GtpuTrafficProofChallenge { sample_id, payload })
+    }
+
     pub(crate) fn desired(&self) -> &GtpuSessionGroup {
         &self.binding.desired
     }
@@ -497,18 +574,10 @@ impl GtpuTrafficProofSession {
             policy: self.policy,
             traffic_binding: self.traffic_binding,
             authority: self.authority,
+            registration: self.registration,
             proof_issued: self.proof_issued,
             revoker: None,
         }
-    }
-
-    pub(crate) fn synchronize_adapter_state(&mut self, adapter: &Self) {
-        debug_assert!(self.authority.matches(
-            adapter.authority.backend_incarnation,
-            adapter.authority.source_epoch
-        ));
-        debug_assert_eq!(self.authority.attempt, adapter.authority.attempt);
-        self.proof_issued |= adapter.proof_issued;
     }
 
     pub(crate) fn mark_proof_issued(&mut self) {
@@ -539,6 +608,50 @@ impl GtpuTrafficProofSession {
             authority: self.authority,
             assessment,
         })
+    }
+}
+
+/// A bounded, non-identifying authenticated traffic-proof challenge.
+pub struct GtpuTrafficProofChallenge {
+    sample_id: u32,
+    payload: [u8; GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN],
+}
+
+impl GtpuTrafficProofChallenge {
+    /// Return the caller-selected nonzero sample identifier.
+    #[must_use]
+    pub const fn sample_id(&self) -> u32 {
+        self.sample_id
+    }
+
+    /// Return the exact ICMP Echo identifier bound into this challenge.
+    ///
+    /// This request must travel from core to access. A different identifier
+    /// cannot contribute production evidence.
+    #[must_use]
+    pub const fn identifier(&self) -> u16 {
+        (self.sample_id >> 16) as u16
+    }
+
+    /// Return the exact ICMP Echo sequence bound into this challenge.
+    ///
+    /// This request must travel from core to access. A different sequence
+    /// cannot contribute production evidence.
+    #[must_use]
+    pub const fn sequence(&self) -> u16 {
+        self.sample_id as u16
+    }
+
+    /// Return the exact fixed-size ICMP Echo payload to transmit.
+    #[must_use]
+    pub const fn payload(&self) -> &[u8; GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN] {
+        &self.payload
+    }
+}
+
+impl fmt::Debug for GtpuTrafficProofChallenge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GtpuTrafficProofChallenge(<redacted>)")
     }
 }
 
@@ -746,6 +859,7 @@ mod tests {
         FlowCorrelation, MonotonicTime, SourceOutcome, TrafficContinuityEvaluator,
         TrafficContinuityEvent, TrafficContinuityRecord, TrafficContinuitySource, TrafficDirection,
     };
+    use opc_gtpu_ebpf_common::{GtpuSessionGeneration, GtpuTrafficObservationBinding};
 
     use super::*;
     use crate::{
@@ -792,12 +906,26 @@ mod tests {
     }
 
     fn session(authority: &GtpuTrafficProofAuthority) -> GtpuTrafficProofSession {
+        let registration = GtpuTrafficObservationRegistration::new(
+            GtpuTrafficObservationBinding::new(
+                authority.desired().id(),
+                authority.desired().device_id(),
+                GtpuSessionGeneration::new(1).unwrap(),
+            ),
+            1,
+            1,
+            [1; 16],
+            1,
+            [2; 16],
+        )
+        .unwrap();
         authority.bind_readback(
             DataplaneSessionGeneration::new(1).unwrap(),
             BackendIncarnation::new(1).unwrap(),
             SourceEpoch::new(1).unwrap(),
             ClockOriginIdentity::new(1).unwrap(),
             GtpuTrafficProofAuthorityToken::new(1, 1, 1),
+            registration,
         )
     }
 
@@ -821,6 +949,23 @@ mod tests {
     fn debug_redacts_session_and_owner_authority() {
         let debug = format!("{authority:?}", authority = authority());
         assert_eq!(debug, "GtpuTrafficProofAuthority(<redacted>)");
+    }
+
+    #[test]
+    fn challenge_binds_exact_identifier_sequence_and_redacts_payload() {
+        let session = session(&authority());
+        assert!(session.challenge(0).is_none());
+        let challenge = session
+            .challenge(0x1234_5678)
+            .expect("nonzero challenge sample");
+        assert_eq!(challenge.sample_id(), 0x1234_5678);
+        assert_eq!(challenge.identifier(), 0x1234);
+        assert_eq!(challenge.sequence(), 0x5678);
+        assert_eq!(challenge.payload().len(), 32);
+        assert_eq!(
+            format!("{challenge:?}"),
+            "GtpuTrafficProofChallenge(<redacted>)"
+        );
     }
 
     #[test]
@@ -1008,7 +1153,7 @@ mod tests {
         let backend = DefaultBackend;
         let authority = authority();
         let proof = proven_proof(&authority);
-        let store = GtpuTrafficProofAuthorityStore::new(authority);
+        let store = GtpuTrafficProofAuthorityStore::new_for_test(authority);
         assert_eq!(
             backend.gtpu_traffic_proof_capability(),
             GtpuCapability::Missing
@@ -1038,7 +1183,7 @@ mod tests {
     async fn mock_and_unsupported_backends_cannot_validate_a_proof() {
         let authority = authority();
         let proof = proven_proof(&authority);
-        let store = GtpuTrafficProofAuthorityStore::new(authority);
+        let store = GtpuTrafficProofAuthorityStore::new_for_test(authority);
         let lease = store.lease().await;
         let mock = MockGtpuDataplaneBackend::new();
         let unsupported = UnsupportedGtpuDataplaneBackend::new();
@@ -1055,7 +1200,7 @@ mod tests {
 
     #[tokio::test]
     async fn authority_store_lease_blocks_replacement_until_dropped() {
-        let store = GtpuTrafficProofAuthorityStore::new(authority());
+        let store = GtpuTrafficProofAuthorityStore::new_for_test(authority());
         let lease = store.lease().await;
         assert_eq!(lease.policy(), authority().policy());
         let replacement = GtpuTrafficProofAuthority::new(group(), 1, 2, 2, policy()).unwrap();
@@ -1081,7 +1226,7 @@ mod tests {
     async fn fresh_lease_observes_exact_authority_invalidation_after_replacement() {
         let original = authority();
         let proof = proven_proof(&original);
-        let store = GtpuTrafficProofAuthorityStore::new(original.clone());
+        let store = GtpuTrafficProofAuthorityStore::new_for_test(original.clone());
         let stale_clone = original;
         store
             .replace(GtpuTrafficProofAuthority::new(group(), 2, 2, 2, policy()).unwrap())
@@ -1098,7 +1243,7 @@ mod tests {
 
     #[tokio::test]
     async fn authority_store_rejects_rollback_and_aba_replacements() {
-        let store = GtpuTrafficProofAuthorityStore::new(
+        let store = GtpuTrafficProofAuthorityStore::new_for_test(
             GtpuTrafficProofAuthority::new(group(), 2, 2, 2, policy()).unwrap(),
         );
         assert_eq!(
@@ -1135,7 +1280,7 @@ mod tests {
 
     #[tokio::test]
     async fn authority_store_and_lease_are_redacted_and_send_sync() {
-        let store = GtpuTrafficProofAuthorityStore::new(authority());
+        let store = GtpuTrafficProofAuthorityStore::new_for_test(authority());
         let lease = store.lease().await;
         assert_eq!(
             format!("{store:?}"),

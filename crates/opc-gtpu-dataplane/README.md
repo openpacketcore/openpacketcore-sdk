@@ -203,7 +203,28 @@ observation-source epoch, and monotonic-clock origin. Validation repeats the
 live readback under the adapter's writer authority; equality of a previously
 read object is not sufficient.
 
-Direction is relative to the access gateway:
+The product drives an authenticated ICMP Echo challenge through the live
+session by calling `GtpuTrafficProofSession::challenge` with a distinct nonzero
+sample ID. The sample's high and low 16-bit halves are the exact ICMP Echo
+identifier and sequence. Every request starts `CoreToAccess`; accepting an
+`AccessToCore`-initiated request would expose its private return capability on
+the untrusted core side and is therefore deliberately unsupported. The public
+fixed-size request payload commits to the attempt's private registration,
+publication identity, sample, identifier, sequence, and request role.
+
+After exact packet, checksum, binding, generation, publication, and request-tag
+validation, the trusted downlink tc program replaces the public request tag
+with a distinct private return tag and repairs the ICMP checksum before the
+packet enters the access-side stack. The ordinary ICMP Echo Reply copies that
+private tag. The trusted uplink program accepts only that private-tagged reply,
+with the exact identifier and sequence. It never exposes the private payload in
+the public API, event ABI, readback, log, metric, or diagnostic. Consequently,
+copying the public request into a syntactically valid reply cannot fabricate a
+return leg. Ordinary subscriber TCP, UDP, ICMP, counters, structural readback,
+and mock packets never mint proof evidence.
+
+Direction is relative to the access gateway and describes the two halves of a
+validated challenge round trip:
 
 - `AccessToCore` is emitted only after a grouped inner packet has been
   successfully submitted to the local GTP-U uplink redirect.
@@ -211,22 +232,26 @@ Direction is relative to the access gateway:
   downlink checks, been decapsulated, and been accepted past the local tc
   ingress hook into the access-side network stack.
 
-These are authenticated observations at the local forwarding boundaries, not
-claims that a remote peer or a later local XFRM/routing stage delivered a
-packet. An end-to-end claim must compose them with the protocol-specific
-delivery proof, such as a disposable real XFRM-to-GTP-U round trip. The
+These are authenticated challenge observations at the local forwarding
+boundaries, not peer authentication or a claim that a remote endpoint received
+the packet. The private return tag is a one-attempt bearer capability. The
+proof is sound when the trusted downlink rewrite feeds immediately into the
+product's protected access path; a principal that can inspect plaintext after
+that rewrite, or a compromised peer, is outside this proof's trust boundary.
+An end-to-end claim must compose this boundary proof with protocol-specific
+delivery authority and a disposable real protected-path round trip. The
 observation ABI carries no addresses, TEIDs,
 SPIs, packet lengths, packet bytes, subscriber fields, or reusable raw flow
-identifier. Its direction-normalized flow correlation is opaque, freshly
-keyed per attempt, and never logged.
-Correlation is deliberately limited to exact, unfragmented TCP/UDP tuples and
-ICMPv4/ICMPv6 echo request/reply identifiers (including bounded canonical IPv6
-extension chains). Other protocols and fragments continue forwarding but do
-not contribute proof evidence.
+identifier. Its challenge-stream correlation is opaque, freshly keyed per
+attempt, and never logged. Parsing accepts only exact, unfragmented IPv4 or
+IPv6 ICMP Echo messages with the fixed challenge payload, exact Echo header
+fields, and valid network/transport checksums; other protocols, fragments,
+malformed messages, and trailing bytes continue through normal forwarding
+policy but do not contribute proof evidence.
 
 Continuity is deliberately policy-bound instead of inferred from one packet or
-from aggregate traffic. One opaque flow must independently have at least
-`minimum_samples_per_direction` observations in both directions, and each
+from aggregate traffic. One authenticated challenge stream must independently
+have at least `minimum_samples_per_direction` observations in both directions, and each
 direction's first-to-last span must be at least the nonzero
 `minimum_window_per_direction`. The last sample in each direction must be no
 older than `maximum_freshness`, every retained sample must fit within
@@ -251,7 +276,10 @@ identity retained in the pinned attachment state. It remains a capacity and
 same-graph replacement fence: the downlink path captures it before
 decapsulation and verifies it again at the final observation boundary. Source
 reset never rewinds that allocator, invalid or uncertain readback burns the
-candidate identity, and exhaustion fails closed.
+candidate identity, and exhaustion fails closed. Publication readback alone is
+not packet-causal: the per-attempt challenge tag additionally prevents a
+packet queued under an earlier registration from being relabeled when it is
+processed after a replacement.
 
 Uplink neighbour redirect uses a separate `GTPU_OBS_REDIR` authority: the
 registration's private CSPRNG-filled correlation secret is reused as the exact
@@ -278,8 +306,9 @@ source reset, backend restart, group restore, any generation/phase/model/index
 change, reconcile-fence drift, attachment or pinned-map/hook replacement, or
 an indeterminate readback permanently invalidates the attempt or proof. A
 fresh attempt uses a new source epoch, correlation key, and publication
-identity, so packets queued under an earlier generation or process cannot be
-replayed as current evidence.
+identity plus a newly authenticated challenge payload, so packets queued under
+an earlier generation, registration, or process cannot be replayed as current
+evidence.
 
 The port reports packet-continuity evidence only. Products must not derive
 PodReady, process health, structural convergence, or service admission from

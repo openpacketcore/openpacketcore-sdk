@@ -75,11 +75,11 @@ use opc_gtpu_dataplane::{
     GtpuSessionGroup, GtpuSessionGroupId, GtpuSessionGroupReadback,
     GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionSelectorProvenance,
-    GtpuSourcePortPolicy, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityStore,
-    GtpuTrafficProofPoll, GtpuTrafficProofValidation, GtpuUplinkChecksumOffloadContract,
-    GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy, GtpuV2DrainProof,
-    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
-    PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
+    GtpuSourcePortPolicy, GtpuTrafficProofAuthority, GtpuTrafficProofPoll,
+    GtpuTrafficProofValidation, GtpuUplinkChecksumOffloadContract, GtpuUplinkMtuPolicy,
+    GtpuUplinkSourcePortPolicy, GtpuV2DrainProof, PdpContextIndeterminateReason,
+    PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
+    PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
     PdpContextUplinkSelector, RemovePdpContextRequest, RetainedGraphCleanupClassification,
     RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest, Teid, TftUplinkBearer,
     TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
@@ -195,7 +195,11 @@ const XFRM_DOWNLINK_SOURCE_PORT: u16 = 53;
 // observation writer can correlate it with the ESP-decrypted uplink.
 const XFRM_DOWNLINK_DESTINATION_PORT: u16 = XFRM_INNER_SOURCE_PORT;
 const IPPROTO_UDP: u8 = 17;
+const IPPROTO_ICMP: u8 = 1;
 const IPPROTO_ESP: u8 = 50;
+const ICMP_ECHO_REQUEST: u8 = 8;
+const ICMP_ECHO_REPLY: u8 = 0;
+const ICMP_ECHO_IDENTIFIER: u16 = 0x6550;
 const CURRENT_DATAPATH_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath.bpf.o");
 const FROZEN_V1_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v1.bpf.o");
 const FROZEN_V2_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v2.bpf.o");
@@ -1073,17 +1077,16 @@ fn xfrm_session_request_id() -> XfrmRequestId {
 }
 
 fn marked_inner_selector() -> XfrmSelector {
-    let mut selector = XfrmSelector::new(xfrm_ip(UE_PAA), xfrm_ip(REMOTE_HOST), IPPROTO_UDP);
-    selector.source_port = XFRM_INNER_SOURCE_PORT;
-    selector.destination_port = XFRM_INNER_DESTINATION_PORT;
-    selector
+    // The disposable Child SA carries both the independent application UDP
+    // assertion and the authenticated ICMP Echo challenges. Wildcarding the
+    // inner protocol and ports lets the kernel protect both exact packet
+    // classes while the proof parser remains responsible for ICMP shape and
+    // challenge authentication.
+    XfrmSelector::new(xfrm_ip(UE_PAA), xfrm_ip(REMOTE_HOST), 0)
 }
 
 fn downlink_selector() -> XfrmSelector {
-    let mut selector = XfrmSelector::new(xfrm_ip(REMOTE_HOST), xfrm_ip(UE_PAA), IPPROTO_UDP);
-    selector.source_port = XFRM_DOWNLINK_SOURCE_PORT;
-    selector.destination_port = XFRM_DOWNLINK_DESTINATION_PORT;
-    selector
+    XfrmSelector::new(xfrm_ip(REMOTE_HOST), xfrm_ip(UE_PAA), 0)
 }
 
 fn inbound_sa_parameters(spi: u32, output_mark: XfrmMark) -> SaParameters {
@@ -1279,6 +1282,45 @@ async fn install_real_marked_outbound_xfrm() -> Result<(), opc_ipsec_xfrm::XfrmE
             })
             .await?;
     }
+    Ok(())
+}
+
+async fn install_real_marked_outbound_xfrm_for_ue_application(
+    ue_namespace: &str,
+) -> Result<(), opc_ipsec_xfrm::XfrmError> {
+    install_real_marked_outbound_xfrm().await?;
+
+    // The peer receives only the dedicated Child SA. This makes the
+    // application-layer receive assertion below prove that the marked GTP-U
+    // downlink was not merely emitted as outer ESP, but was also accepted and
+    // decrypted in the disposable UE namespace.
+    let ue_namespace = ue_namespace.to_owned();
+    let dedicated_mark = XfrmLookupMark::full(MARK_A);
+    in_netns(&ue_namespace, move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build UE downlink XFRM runtime");
+        runtime.block_on(async {
+            let peer_backend = LinuxXfrmBackend::new();
+            peer_backend
+                .install_sa(InstallSaRequest {
+                    parameters: downlink_sa_parameters(OUTBOUND_SPI_A, None),
+                })
+                .await
+                .expect("install UE inbound dedicated downlink SA");
+            peer_backend
+                .install_policy(InstallPolicyRequest {
+                    parameters: PolicyParameters {
+                        direction: XfrmDirection::In,
+                        mark: None,
+                        ..downlink_policy_parameters(OUTBOUND_SPI_A, dedicated_mark)
+                    },
+                })
+                .await
+                .expect("install UE inbound dedicated downlink policy");
+        });
+    });
     Ok(())
 }
 
@@ -1516,6 +1558,101 @@ fn build_inner_udp(
     packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
     packet[28..].copy_from_slice(payload);
     packet
+}
+
+/// Build an exact IPv4 ICMP Echo packet for one authenticated traffic-proof
+/// challenge. The challenge API fixes the payload at 32 bytes; the identifier
+/// and sequence fields remain explicit so the reply assertion can reject any
+/// kernel-generated or unrelated Echo traffic.
+fn build_inner_icmp_echo(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    icmp_type: u8,
+    identifier: u16,
+    sequence: u16,
+    payload: &[u8; 32],
+) -> Vec<u8> {
+    const IPV4_HEADER_LEN: usize = 20;
+    const ICMP_HEADER_LEN: usize = 8;
+    let total_len = IPV4_HEADER_LEN + ICMP_HEADER_LEN + payload.len();
+    let mut packet = vec![0_u8; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(
+        &u16::try_from(total_len)
+            .expect("bounded ICMP challenge packet")
+            .to_be_bytes(),
+    );
+    packet[8] = 64;
+    packet[9] = IPPROTO_ICMP;
+    packet[12..16].copy_from_slice(&src.octets());
+    packet[16..20].copy_from_slice(&dst.octets());
+    let mut ipv4_header = [0_u8; IPV4_HEADER_LEN];
+    ipv4_header.copy_from_slice(&packet[..IPV4_HEADER_LEN]);
+    packet[10..12].copy_from_slice(&ipv4_header_checksum(&ipv4_header).to_be_bytes());
+
+    let icmp = IPV4_HEADER_LEN;
+    packet[icmp] = icmp_type;
+    packet[icmp + 2..icmp + 4].fill(0);
+    packet[icmp + 4..icmp + 6].copy_from_slice(&identifier.to_be_bytes());
+    packet[icmp + 6..icmp + 8].copy_from_slice(&sequence.to_be_bytes());
+    packet[icmp + ICMP_HEADER_LEN..].copy_from_slice(payload);
+    let icmp_checksum = internet_checksum(&packet[icmp..]);
+    packet[icmp + 2..icmp + 4].copy_from_slice(&icmp_checksum.to_be_bytes());
+    packet
+}
+
+/// Receive and strictly validate one GTP-U-carried ICMP Echo Reply from the
+/// disposable UE/XFRM path.
+fn receive_gtpu_icmp_echo_reply(
+    socket: &UdpSocket,
+    expected_teid: u32,
+    expected_identifier: u16,
+    expected_sequence: u16,
+) -> [u8; 32] {
+    const IPV4_HEADER_LEN: usize = 20;
+    const ICMP_HEADER_LEN: usize = 8;
+    const PAYLOAD_LEN: usize = 32;
+    let expected_inner_len = IPV4_HEADER_LEN + ICMP_HEADER_LEN + PAYLOAD_LEN;
+    let mut buffer = [0_u8; 2048];
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set ICMP reply receive timeout");
+    let (length, source) = socket
+        .recv_from(&mut buffer)
+        .expect("authenticated ICMP Echo Reply must traverse GTP-U uplink");
+    assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(length, GTPU_MANDATORY_HDR_LEN + expected_inner_len);
+    assert_eq!(&buffer[..2], &[0x30, 0xff], "reply must be a plain G-PDU");
+    assert_eq!(
+        u16::from_be_bytes([buffer[2], buffer[3]]) as usize,
+        expected_inner_len,
+        "GTP-U length must cover exactly the ICMP Echo Reply"
+    );
+    assert_eq!(
+        u32::from_be_bytes(buffer[4..8].try_into().expect("GTP-U TEID extent")),
+        expected_teid
+    );
+
+    let inner = &buffer[GTPU_MANDATORY_HDR_LEN..length];
+    assert_eq!(inner[0], 0x45, "reply must be IPv4 without options");
+    assert_eq!(
+        u16::from_be_bytes([inner[2], inner[3]]) as usize,
+        expected_inner_len
+    );
+    assert_eq!(inner[9], IPPROTO_ICMP);
+    assert_eq!(&inner[12..16], &UE_PAA.octets());
+    assert_eq!(&inner[16..20], &REMOTE_HOST.octets());
+    assert_eq!(internet_checksum(&inner[..IPV4_HEADER_LEN]), 0);
+
+    let icmp = &inner[IPV4_HEADER_LEN..];
+    assert_eq!(icmp[0], ICMP_ECHO_REPLY);
+    assert_eq!(icmp[1], 0, "ICMP Echo Reply code must be zero");
+    assert_eq!(u16::from_be_bytes([icmp[4], icmp[5]]), expected_identifier);
+    assert_eq!(u16::from_be_bytes([icmp[6], icmp[7]]), expected_sequence);
+    assert_eq!(internet_checksum(icmp), 0);
+    icmp[ICMP_HEADER_LEN..]
+        .try_into()
+        .expect("fixed authenticated challenge payload extent")
 }
 
 /// Build an inner IPv6/UDP packet with the mandatory UDP checksum
@@ -2331,6 +2468,41 @@ fn receive_grouped_downlink(
         .recv_from(&mut buffer)
         .expect("authorized grouped G-PDU must decapsulate");
     assert_eq!(source, expected_source);
+    assert_eq!(&buffer[..length], expected_payload);
+}
+
+/// Assert that a marked GTP-U downlink was decrypted by the UE Child SA and
+/// delivered to the application endpoint that owns its inverse flow tuple.
+///
+/// The bounded buffer deliberately makes this an application-layer assertion,
+/// rather than allowing the raw ESP capture to be the only evidence that the
+/// ePDG forwarded a protected downlink all the way to the UE.
+fn receive_xfrm_downlink_application(socket: &UdpSocket, expected_payload: &[u8]) {
+    const MAX_CONTINUITY_PAYLOAD_LEN: usize = 256;
+
+    assert!(
+        expected_payload.len() <= MAX_CONTINUITY_PAYLOAD_LEN,
+        "continuity payload must remain bounded"
+    );
+    assert_eq!(
+        socket
+            .local_addr()
+            .expect("read proof UE application endpoint"),
+        SocketAddr::from((UE_PAA, XFRM_DOWNLINK_DESTINATION_PORT)),
+        "the proof socket must be bound to the decrypted downlink destination"
+    );
+    let mut buffer = [0_u8; MAX_CONTINUITY_PAYLOAD_LEN];
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set XFRM downlink application receive timeout");
+    let (length, source) = socket
+        .recv_from(&mut buffer)
+        .expect("marked GTP-U downlink must decrypt and reach the UE application");
+    assert_eq!(
+        source,
+        SocketAddr::from((REMOTE_HOST, XFRM_DOWNLINK_SOURCE_PORT)),
+        "the decrypted downlink source must preserve the inverse flow tuple"
+    );
     assert_eq!(&buffer[..length], expected_payload);
 }
 
@@ -7077,7 +7249,7 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
     let _epdg_nat_t_socket = nat_t_socket(EPDG_SWU_IP);
     let _ue_nat_t_socket = in_netns(&net.ue_ns, || nat_t_socket(UE_SWU_IP));
     install_real_marked_inbound_xfrm(&net.ue_ns).await?;
-    install_real_marked_outbound_xfrm().await?;
+    install_real_marked_outbound_xfrm_for_ue_application(&net.ue_ns).await?;
     let outbound_capture = packet_capture_socket(&net.ue_ns);
     let policy = TrafficContinuityPolicy::new(
         2,
@@ -7088,7 +7260,9 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
         8,
     )?;
     let authority = GtpuTrafficProofAuthority::new(desired, 1, 1, 1, policy)?;
-    let authority_store = GtpuTrafficProofAuthorityStore::new(authority);
+    let authority_store = backend
+        .register_gtpu_traffic_proof_authority(authority)
+        .await?;
 
     let downlink = build_inner_udp(
         REMOTE_HOST,
@@ -7121,6 +7295,7 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
     );
     assert!(uplink[..uplink_len].ends_with(b"continuity-pre-window"));
     pgw.send_to(&valid_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+    receive_xfrm_downlink_application(&ue, b"continuity");
     assert_eq!(
         capture_nat_t_esp_spi(&outbound_capture),
         OUTBOUND_SPI_A,
@@ -7173,68 +7348,116 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
         GtpuTrafficProofPoll::Pending
     ));
 
-    let (uplink_len, uplink_source) = send_until_received(
-        || {
-            let _ = ue.send_to(b"continuity", (REMOTE_HOST, XFRM_INNER_DESTINATION_PORT));
-        },
-        &pgw,
-        &mut uplink,
-    )
-    .expect("first registered ESP uplink must traverse the production GTP-U writer");
-    assert_eq!(uplink_source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
-    assert_eq!(
-        u32::from_be_bytes(uplink[4..8].try_into()?),
-        GROUP_PEER_TEID_V4_INITIAL
-    );
-    assert!(uplink_len > GTPU_MANDATORY_HDR_LEN);
-    // One observed direction and an unelapsed directional window cannot issue
-    // a proof, even after the event source was polled.
-    assert!(matches!(
-        backend.poll_gtpu_traffic_proof(&mut session).await?,
-        GtpuTrafficProofPoll::Pending
-    ));
-
-    std::thread::sleep(Duration::from_millis(30));
-    let (uplink_len, uplink_source) = send_until_received(
-        || {
-            let _ = ue.send_to(b"continuity", (REMOTE_HOST, XFRM_INNER_DESTINATION_PORT));
-        },
-        &pgw,
-        &mut uplink,
-    )
-    .expect("second registered ESP uplink must traverse the production GTP-U writer");
-    assert_eq!(uplink_source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
-    assert_eq!(
-        u32::from_be_bytes(uplink[4..8].try_into()?),
-        GROUP_PEER_TEID_V4_INITIAL
-    );
-    assert!(uplink_len > GTPU_MANDATORY_HDR_LEN);
-    // The access-to-core window is now complete, but one direction alone is
-    // still insufficient for a production proof.
-    assert!(matches!(
-        backend.poll_gtpu_traffic_proof(&mut session).await?,
-        GtpuTrafficProofPoll::Pending
-    ));
-
+    // Keep the independent application assertion: this UDP packet proves the
+    // decrypted UE endpoint is reachable, but it is not an authenticated
+    // traffic-proof input and therefore cannot mint evidence by itself.
     pgw.send_to(&valid_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+    receive_xfrm_downlink_application(&ue, b"continuity");
     assert_eq!(
         capture_nat_t_esp_spi(&outbound_capture),
         OUTBOUND_SPI_A,
-        "first registered grouped downlink must traverse marked outbound XFRM"
+        "registered grouped UDP downlink must traverse marked outbound XFRM"
     );
-    // The reverse direction has arrived, but has not yet met its independent
-    // policy observation window.
     assert!(matches!(
         backend.poll_gtpu_traffic_proof(&mut session).await?,
         GtpuTrafficProofPoll::Pending
     ));
 
-    std::thread::sleep(Duration::from_millis(30));
-    pgw.send_to(&valid_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+    // Production challenges always start CoreToAccess. The public request tag
+    // is replaced by a private return tag only at the trusted downlink eBPF
+    // boundary before XFRM. The disposable UE kernel copies that private tag
+    // into its Echo Reply, which returns through XFRM and the trusted uplink
+    // boundary. A reflected public request therefore cannot fabricate the
+    // return leg even with exact ICMP fields and materialized checksums.
+    let first_sample = (u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 1;
+    let second_sample = (u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 2;
+    let first_challenge = session
+        .challenge(first_sample)
+        .expect("nonzero first challenge sample");
+    let second_challenge = session
+        .challenge(second_sample)
+        .expect("nonzero second challenge sample");
+    assert_ne!(first_challenge.sample_id(), 0);
+    assert_ne!(second_challenge.sample_id(), 0);
+    assert_ne!(first_challenge.sample_id(), second_challenge.sample_id());
+    assert_ne!(first_challenge.payload(), second_challenge.payload());
+    assert_eq!(first_challenge.identifier(), ICMP_ECHO_IDENTIFIER);
+    assert_eq!(second_challenge.identifier(), ICMP_ECHO_IDENTIFIER);
+
+    let forged_reflection = build_inner_icmp_echo(
+        UE_PAA,
+        REMOTE_HOST,
+        ICMP_ECHO_REPLY,
+        first_challenge.identifier(),
+        first_challenge.sequence(),
+        first_challenge.payload(),
+    );
+    send_wireguard_ipv4_packet(&net.ue_ns, &forged_reflection);
+    let reflected_payload = receive_gtpu_icmp_echo_reply(
+        &pgw,
+        GROUP_PEER_TEID_V4_INITIAL,
+        first_challenge.identifier(),
+        first_challenge.sequence(),
+    );
     assert_eq!(
-        capture_nat_t_esp_spi(&outbound_capture),
-        OUTBOUND_SPI_A,
-        "second registered grouped downlink must traverse marked outbound XFRM"
+        reflected_payload,
+        *first_challenge.payload(),
+        "the adversarial packet must carry the copied public request tag"
+    );
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+
+    let first_inner = build_inner_icmp_echo(
+        REMOTE_HOST,
+        UE_PAA,
+        ICMP_ECHO_REQUEST,
+        first_challenge.identifier(),
+        first_challenge.sequence(),
+        first_challenge.payload(),
+    );
+    pgw.send_to(
+        &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &first_inner),
+        (EPDG_S2BU_IP, GTPU_PORT),
+    )?;
+    let first_response_payload = receive_gtpu_icmp_echo_reply(
+        &pgw,
+        GROUP_PEER_TEID_V4_INITIAL,
+        first_challenge.identifier(),
+        first_challenge.sequence(),
+    );
+    assert_ne!(
+        first_response_payload,
+        *first_challenge.payload(),
+        "the trusted downlink must install a private return tag before XFRM"
+    );
+
+    // Separate complete round trips by at least the policy's observation
+    // window so both directional sample histories can mature before polling.
+    std::thread::sleep(policy.minimum_window_per_direction());
+    let second_inner = build_inner_icmp_echo(
+        REMOTE_HOST,
+        UE_PAA,
+        ICMP_ECHO_REQUEST,
+        second_challenge.identifier(),
+        second_challenge.sequence(),
+        second_challenge.payload(),
+    );
+    pgw.send_to(
+        &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &second_inner),
+        (EPDG_S2BU_IP, GTPU_PORT),
+    )?;
+    let second_response_payload = receive_gtpu_icmp_echo_reply(
+        &pgw,
+        GROUP_PEER_TEID_V4_INITIAL,
+        second_challenge.identifier(),
+        second_challenge.sequence(),
+    );
+    assert_ne!(
+        second_response_payload,
+        *second_challenge.payload(),
+        "each request must be translated to its private return domain"
     );
     let proof = match backend.poll_gtpu_traffic_proof(&mut session).await? {
         GtpuTrafficProofPoll::Proven(proof) => proof,
@@ -7276,18 +7499,37 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
         .begin_gtpu_traffic_proof(authority_store.lease().await)
         .await?;
     pgw.set_read_timeout(Some(Duration::from_millis(250)))?;
-    ue.send_to(
-        b"continuity-after-inbound-xfrm-removal",
-        (REMOTE_HOST, XFRM_INNER_DESTINATION_PORT),
-    )?;
-    assert!(
-        pgw.recv_from(&mut uplink).is_err(),
-        "without the owned inbound SA/policy, ESP cannot reach the production GTP-U writer"
-    );
-    assert!(matches!(
-        backend.poll_gtpu_traffic_proof(&mut broken_session).await?,
-        GtpuTrafficProofPoll::Pending
-    ));
+    for (sample, separator) in [
+        ((u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 3, false),
+        ((u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 4, true),
+    ] {
+        if separator {
+            std::thread::sleep(policy.minimum_window_per_direction());
+        }
+        let challenge = broken_session
+            .challenge(sample)
+            .expect("fresh nonzero broken-path challenge");
+        let request = build_inner_icmp_echo(
+            REMOTE_HOST,
+            UE_PAA,
+            ICMP_ECHO_REQUEST,
+            challenge.identifier(),
+            challenge.sequence(),
+            challenge.payload(),
+        );
+        pgw.send_to(
+            &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &request),
+            (EPDG_S2BU_IP, GTPU_PORT),
+        )?;
+        assert!(
+            pgw.recv_from(&mut uplink).is_err(),
+            "without the owned inbound SA/policy, an authenticated Echo Reply cannot reach the production GTP-U writer"
+        );
+        assert!(matches!(
+            backend.poll_gtpu_traffic_proof(&mut broken_session).await?,
+            GtpuTrafficProofPoll::Pending
+        ));
+    }
     backend.close_gtpu_traffic_proof(broken_session).await?;
 
     // A source-loss indication must revoke an otherwise valid proof rather
