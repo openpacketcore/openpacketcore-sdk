@@ -26,6 +26,7 @@ use super::{
     SessionTopologyMemberBinding,
 };
 use crate::backend::ReplicationEntry;
+use crate::readiness::PlacementResiliencePolicy;
 use crate::sqlite::consensus::{self, SqliteConsensusCore};
 use crate::sqlite::SqliteSessionBackend;
 
@@ -151,6 +152,7 @@ pub(crate) async fn open_with_member_bindings(
         expected_bindings,
         membership_admission,
         ConsensusAuthorityProfile::Dynamic,
+        None,
     )
     .await
 }
@@ -166,6 +168,7 @@ pub(crate) async fn open_fixed_with_member_bindings(
     expected_members: BTreeSet<SessionConsensusNodeId>,
     expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     membership_admission: SessionRaftPeerDirectory,
+    placement_policy: PlacementResiliencePolicy,
 ) -> Result<
     (
         SqliteConsensusLogStore,
@@ -182,10 +185,12 @@ pub(crate) async fn open_fixed_with_member_bindings(
         expected_bindings,
         membership_admission,
         ConsensusAuthorityProfile::FixedImmutable,
+        Some(placement_policy),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_with_member_bindings_for_profile(
     backend: &SqliteSessionBackend,
     snapshot_dir: impl Into<PathBuf>,
@@ -194,6 +199,7 @@ async fn open_with_member_bindings_for_profile(
     expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     membership_admission: SessionRaftPeerDirectory,
     authority_profile: ConsensusAuthorityProfile,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
 ) -> Result<
     (
         SqliteConsensusLogStore,
@@ -209,6 +215,7 @@ async fn open_with_member_bindings_for_profile(
         expected_members,
         expected_bindings,
         authority_profile,
+        fixed_placement_policy,
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
@@ -255,6 +262,7 @@ async fn open(
         expected_members,
         bindings,
         ConsensusAuthorityProfile::Dynamic,
+        None,
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
@@ -312,6 +320,7 @@ pub(crate) async fn open_with_pending_membership(
             desired_bindings,
         },
         ConsensusAuthorityProfile::Dynamic,
+        None,
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
@@ -749,22 +758,21 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             )
         })?;
         let incoming_path = snapshot.path().to_path_buf();
-        drop(snapshot);
-
-        let (payload_length, checksum, total_length) = verify_snapshot_envelope(&incoming_path)
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
-                )
-            })?;
+        let (payload_length, checksum, total_length) =
+            verify_snapshot_envelope_reader(&mut snapshot)
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
         let raw_path = self
             .core
             .snapshot_dir
             .join(format!("install-{}.sqlite", uuid::Uuid::new_v4()));
-        extract_snapshot_database(&incoming_path, &raw_path, payload_length)
+        extract_snapshot_database_from_reader(&mut snapshot, &raw_path, payload_length)
             .await
             .map_err(|error| {
                 storage_error(
@@ -780,12 +788,35 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             .core
             .snapshot_dir
             .join(format!("promote-{}.part", uuid::Uuid::new_v4()));
-        if let Err(error) = copy_and_promote(&incoming_path, &promoted_path, &final_path).await {
+        if let Err(error) =
+            copy_and_promote_from_reader(&mut snapshot, &promoted_path, &final_path, total_length)
+                .await
+        {
             let _ = tokio::fs::remove_file(&raw_path).await;
             return Err(storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
                 ErrorVerb::Write,
                 error,
+            ));
+        }
+        drop(snapshot);
+
+        let (_, promoted_checksum, promoted_length) = verify_snapshot_envelope(&final_path)
+            .await
+            .map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                error,
+            )
+        })?;
+        if promoted_checksum != checksum || promoted_length != total_length {
+            let _ = tokio::fs::remove_file(&final_path).await;
+            let _ = tokio::fs::remove_file(&raw_path).await;
+            return Err(storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                consensus::invalid_data("session consensus promoted snapshot is inconsistent"),
             ));
         }
 
@@ -814,6 +845,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 self.core.authority_profile,
                 Some(&self.core.expected_members),
                 Some(&self.core.expected_bindings),
+                self.core.fixed_placement_policy,
                 &raw_path,
                 meta,
                 &file_name,
@@ -1100,7 +1132,15 @@ async fn seal_snapshot_database(
 }
 
 async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64)> {
-    let total_length = tokio::fs::metadata(path).await?.len();
+    let mut file = tokio::fs::File::open(path).await?;
+    verify_snapshot_envelope_reader(&mut file).await
+}
+
+async fn verify_snapshot_envelope_reader<R>(file: &mut R) -> io::Result<(u64, [u8; 32], u64)>
+where
+    R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
+{
+    let total_length = file.seek(io::SeekFrom::End(0)).await?;
     if total_length <= SNAPSHOT_FOOTER_BYTES
         || total_length > SNAPSHOT_MAX_BYTES.saturating_add(SNAPSHOT_FOOTER_BYTES)
     {
@@ -1108,7 +1148,6 @@ async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64
             "session consensus snapshot size is invalid",
         ));
     }
-    let mut file = tokio::fs::File::open(path).await?;
     file.seek(io::SeekFrom::End(
         -i64::try_from(SNAPSHOT_FOOTER_BYTES).map_err(|_| {
             consensus::invalid_data("session consensus snapshot footer size is invalid")
@@ -1161,12 +1200,16 @@ async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64
     Ok((payload_length, actual_checksum, total_length))
 }
 
-async fn extract_snapshot_database(
-    source: &Path,
+async fn extract_snapshot_database_from_reader<R>(
+    source: &mut R,
     destination: &Path,
     length: u64,
-) -> io::Result<()> {
-    let mut source = tokio::fs::File::open(source).await?.take(length);
+) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
+{
+    source.seek(io::SeekFrom::Start(0)).await?;
+    let mut source = source.take(length);
     let mut destination = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -1182,14 +1225,27 @@ async fn extract_snapshot_database(
     destination.sync_all().await
 }
 
-async fn copy_and_promote(source: &Path, temporary: &Path, final_path: &Path) -> io::Result<()> {
-    let mut source = tokio::fs::File::open(source).await?;
+async fn copy_and_promote_from_reader<R>(
+    source: &mut R,
+    temporary: &Path,
+    final_path: &Path,
+    expected_length: u64,
+) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
+{
+    source.seek(io::SeekFrom::Start(0)).await?;
     let mut output = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(temporary)
         .await?;
-    tokio::io::copy(&mut source, &mut output).await?;
+    let copied = tokio::io::copy(source, &mut output).await?;
+    if copied != expected_length {
+        return Err(consensus::invalid_data(
+            "session consensus promoted snapshot length changed",
+        ));
+    }
     output.flush().await?;
     output.sync_all().await?;
     drop(output);

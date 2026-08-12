@@ -700,6 +700,37 @@ async fn initialized_fixed_three_voter_cluster_reopens_with_durable_authority_an
 }
 
 #[tokio::test]
+async fn fixed_durable_quorum_reopen_rejects_placement_policy_mismatch() {
+    for (initial, reopened) in [
+        (
+            PlacementResiliencePolicy::RequireIndependentFailureDomains,
+            PlacementResiliencePolicy::AllowReducedResilience,
+        ),
+        (
+            PlacementResiliencePolicy::AllowReducedResilience,
+            PlacementResiliencePolicy::RequireIndependentFailureDomains,
+        ),
+    ] {
+        let (directory, database_paths, stores) = open_fixed_cluster(3, initial).await;
+        drop(stores);
+        let members = fixed_members(3);
+        let topology = fixed_topology_for_local(0, members, reopened).expect("reopen topology");
+        let error = ConsensusSessionStore::open_fixed_durable_quorum(
+            topology.clone(),
+            SqliteSessionBackend::open(&database_paths[0]).expect("reopen backend"),
+            directory.path().join("snapshots-0"),
+            scoped_peers(&topology),
+        )
+        .await
+        .expect_err("fixed placement policy must be durably bound");
+        assert_eq!(
+            ConsensusSessionStoreOpenError::DurableIdentityMismatch,
+            error
+        );
+    }
+}
+
+#[tokio::test]
 async fn fixed_five_voter_store_without_a_majority_reports_no_quorum() {
     let topology = fixed_topology(fixed_members(5)).expect("fixed five-voter topology");
     let peers = scoped_peers(&topology);

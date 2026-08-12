@@ -2191,6 +2191,7 @@ mod tests {
                 members.clone(),
                 bindings.clone(),
                 directory.clone(),
+                crate::readiness::PlacementResiliencePolicy::RequireIndependentFailureDomains,
             )
             .await
             .expect("fixed follower storage");

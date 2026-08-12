@@ -519,6 +519,10 @@ impl ConsensusSessionStore {
             SessionRaftNetworkFactory::try_new(identity, local_node_id, members.clone(), peers)?;
         let peer_directory = network.peer_directory();
         let bindings = topology_node_bindings(&topology);
+        let placement_policy = topology
+            .summary()
+            .fixed_durable_placement_policy()
+            .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
         let (log_store, state_machine, storage_identity) =
             storage::open_fixed_with_member_bindings(
                 &backend,
@@ -527,6 +531,7 @@ impl ConsensusSessionStore {
                 members.clone(),
                 bindings.clone(),
                 peer_directory.clone(),
+                placement_policy,
             )
             .await?;
         let (membership_scope, _) = backend
@@ -1159,6 +1164,24 @@ impl ConsensusSessionStore {
             Ok(Ok(true)) => Ok(()),
             Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(consensus_unavailable()),
         }
+    }
+
+    /// Fixed watches must re-establish quorum-backed read authority after a
+    /// notification is dequeued and before it is exposed. Dynamic watches
+    /// retain their original passive stream semantics.
+    async fn fixed_watch_authority_before(
+        &self,
+        scope: Option<SessionConsensusIdentity>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum {
+            return Ok(());
+        }
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
+        self.logical_read_time_before(scope, deadline).await?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await
     }
 
     async fn durable_fixed_quorum_engine_admission_before(
@@ -2821,20 +2844,30 @@ impl ConsensusSessionStore {
             (stream, store, scope),
             |(mut stream, store, scope)| async move {
                 loop {
-                    let entry = tokio::select! {
-                        entry = stream.next() => entry?,
-                        _ = tokio::time::sleep(CONSUMER_WATCH_SCOPE_RECHECK_INTERVAL) => {
-                            let deadline = tokio::time::Instant::now()
-                                .checked_add(store.inner.operation_timeout)?;
-                            if store.admit_consumer_scope(scope, deadline).await.is_err() {
-                                return None;
+                    let entry =
+                        if store.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum {
+                            tokio::select! {
+                                entry = stream.next() => entry?,
+                                _ = tokio::time::sleep(CONSUMER_WATCH_SCOPE_RECHECK_INTERVAL) => {
+                                    let deadline = tokio::time::Instant::now()
+                                        .checked_add(store.inner.operation_timeout)?;
+                                    if store.admit_consumer_scope(scope, deadline).await.is_err() {
+                                        return None;
+                                    }
+                                    continue;
+                                }
                             }
-                            continue;
-                        }
-                    };
+                        } else {
+                            stream.next().await?
+                        };
                     let deadline =
                         tokio::time::Instant::now().checked_add(store.inner.operation_timeout)?;
-                    if store.admit_consumer_scope(scope, deadline).await.is_err() {
+                    if store
+                        .fixed_watch_authority_before(Some(scope.consensus_identity()), deadline)
+                        .await
+                        .is_err()
+                        || store.admit_consumer_scope(scope, deadline).await.is_err()
+                    {
                         return None;
                     }
                     return Some((
@@ -4059,22 +4092,26 @@ impl SessionBackend for ConsensusSessionStore {
                     return None;
                 }
                 loop {
-                    let entry = tokio::select! {
-                        entry = stream.next() => entry?,
-                        () = tokio::time::sleep(GENERIC_WATCH_AUTHORITY_RECHECK_INTERVAL) => {
-                            let deadline = tokio::time::Instant::now()
-                                .checked_add(store.inner.operation_timeout)?;
-                            if store.require_durable_fixed_quorum_admission_before(deadline).await.is_err() {
-                                return Some((Err(consensus_unavailable()), (stream, store, true)));
+                    let entry = if store.inner.topology.mode()
+                        == QuorumTopologyMode::FixedDurableQuorum
+                    {
+                        tokio::select! {
+                            entry = stream.next() => entry?,
+                            () = tokio::time::sleep(GENERIC_WATCH_AUTHORITY_RECHECK_INTERVAL) => {
+                                let deadline = tokio::time::Instant::now()
+                                    .checked_add(store.inner.operation_timeout)?;
+                                if store.require_durable_fixed_quorum_admission_before(deadline).await.is_err() {
+                                    return Some((Err(consensus_unavailable()), (stream, store, true)));
+                                }
+                                continue;
                             }
-                            continue;
                         }
+                    } else {
+                        stream.next().await?
                     };
                     let deadline = tokio::time::Instant::now()
                         .checked_add(store.inner.operation_timeout)?;
-                    let admission = store
-                        .require_durable_fixed_quorum_admission_before(deadline)
-                        .await;
+                    let admission = store.fixed_watch_authority_before(None, deadline).await;
                     let terminated = admission.is_err();
                     return Some((admission.and(entry), (stream, store, terminated)));
                 }

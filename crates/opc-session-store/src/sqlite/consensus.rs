@@ -33,6 +33,7 @@ use crate::consensus::types::{
 };
 use crate::consensus::SessionRaftTypeConfig;
 use crate::error::{LeaseError, StoreError};
+use crate::readiness::PlacementResiliencePolicy;
 use crate::record::SessionPayloadEncoding;
 
 use super::{lease, ops, SqliteSessionBackend};
@@ -649,7 +650,8 @@ CREATE TABLE consensus_identity (
     cluster_id BLOB NOT NULL CHECK (length(cluster_id) = 32),
     configuration_id BLOB NOT NULL CHECK (length(configuration_id) = 32),
     configuration_epoch INTEGER NOT NULL UNIQUE CHECK (configuration_epoch > 0),
-    authority_profile INTEGER NOT NULL DEFAULT 1 CHECK (authority_profile IN (1, 2))
+    authority_profile INTEGER NOT NULL DEFAULT 1 CHECK (authority_profile IN (1, 2)),
+    fixed_placement_policy INTEGER CHECK (fixed_placement_policy IN (1, 2))
 );
 
 CREATE TABLE consensus_membership_scope (
@@ -1109,6 +1111,7 @@ pub(crate) struct SqliteConsensusCore {
     /// The active topology identity lives in `consensus_membership_scope`.
     pub(crate) storage_identity: SessionConsensusIdentity,
     pub(crate) authority_profile: ConsensusAuthorityProfile,
+    pub(crate) fixed_placement_policy: Option<PlacementResiliencePolicy>,
     pub(crate) expected_members: BTreeSet<SessionConsensusNodeId>,
     pub(crate) expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     pub(crate) snapshot_dir: Arc<PathBuf>,
@@ -1130,6 +1133,7 @@ impl SqliteConsensusCore {
         expected_members: BTreeSet<SessionConsensusNodeId>,
         expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
         authority_profile: ConsensusAuthorityProfile,
+        fixed_placement_policy: Option<PlacementResiliencePolicy>,
     ) -> Result<Self, SessionConsensusStorageError> {
         Self::initialize_inner(
             backend,
@@ -1140,6 +1144,7 @@ impl SqliteConsensusCore {
             None,
             None,
             authority_profile,
+            fixed_placement_policy,
         )
         .await
     }
@@ -1154,6 +1159,7 @@ impl SqliteConsensusCore {
         current_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
         pending: PendingMembershipBootstrap<'_>,
         authority_profile: ConsensusAuthorityProfile,
+        fixed_placement_policy: Option<PlacementResiliencePolicy>,
     ) -> Result<Self, SessionConsensusStorageError> {
         Self::initialize_inner(
             backend,
@@ -1164,6 +1170,7 @@ impl SqliteConsensusCore {
             Some(storage_identity),
             Some(pending),
             authority_profile,
+            fixed_placement_policy,
         )
         .await
     }
@@ -1178,6 +1185,7 @@ impl SqliteConsensusCore {
         required_storage_identity: Option<SessionConsensusIdentity>,
         pending: Option<PendingMembershipBootstrap<'_>>,
         authority_profile: ConsensusAuthorityProfile,
+        fixed_placement_policy: Option<PlacementResiliencePolicy>,
     ) -> Result<Self, SessionConsensusStorageError> {
         validate_member_set(&expected_members, false)
             .map_err(|_| SessionConsensusStorageError::InvalidIdentity)?;
@@ -1200,6 +1208,7 @@ impl SqliteConsensusCore {
                 &expected_bindings,
                 pending,
                 authority_profile,
+                fixed_placement_policy,
             )?;
             let applied = read_applied_sync(&conn, storage_identity)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?;
@@ -1211,6 +1220,7 @@ impl SqliteConsensusCore {
             conn: Arc::clone(&backend.conn),
             storage_identity,
             authority_profile,
+            fixed_placement_policy,
             expected_members,
             expected_bindings,
             snapshot_dir: Arc::new(canonical_snapshot_dir),
@@ -1360,6 +1370,7 @@ fn initialize_schema_with_pending_and_bindings(
         expected_bindings,
         pending,
         ConsensusAuthorityProfile::Dynamic,
+        None,
     )
 }
 
@@ -1378,9 +1389,12 @@ fn initialize_schema_with_profile(
         &test_member_bindings(expected_members),
         None,
         authority_profile,
+        (authority_profile == ConsensusAuthorityProfile::FixedImmutable)
+            .then_some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     conn: &Connection,
     required_storage_identity: Option<SessionConsensusIdentity>,
@@ -1389,7 +1403,13 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     pending: Option<PendingMembershipBootstrap<'_>>,
     authority_profile: ConsensusAuthorityProfile,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
 ) -> Result<SessionConsensusIdentity, SessionConsensusStorageError> {
+    if matches!(authority_profile, ConsensusAuthorityProfile::FixedImmutable)
+        != fixed_placement_policy.is_some()
+    {
+        return Err(SessionConsensusStorageError::InvalidIdentity);
+    }
     if let Some(storage_identity) = required_storage_identity {
         let same_incarnation = storage_identity.cluster_id() == requested_identity.cluster_id()
             && storage_identity.configuration_epoch() <= requested_identity.configuration_epoch()
@@ -1420,13 +1440,14 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
         let epoch = checked_positive_i64(storage_identity.configuration_epoch().get())
             .map_err(|_| SessionConsensusStorageError::InvalidIdentity)?;
         tx.execute(
-            "INSERT INTO consensus_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch, authority_profile) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO consensus_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch, authority_profile, fixed_placement_policy) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
                 storage_identity.cluster_id().as_bytes().as_slice(),
                 storage_identity.configuration_id().as_bytes().as_slice(),
                 epoch,
                 authority_profile_i64(authority_profile),
+                fixed_placement_policy.map(placement_policy_i64),
             ],
         )
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
@@ -1444,6 +1465,7 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
 
     let storage_identity = read_storage_identity_sync(&tx)?;
     ensure_consensus_authority_profile_sync(&tx, authority_profile, identity_table_exists)?;
+    ensure_fixed_placement_policy_sync(&tx, authority_profile, fixed_placement_policy)?;
     if required_storage_identity.is_some_and(|required| required != storage_identity) {
         return Err(SessionConsensusStorageError::IdentityMismatch);
     }
@@ -1613,6 +1635,86 @@ fn authority_profile_from_i64(
     }
 }
 
+fn placement_policy_i64(policy: PlacementResiliencePolicy) -> i64 {
+    match policy {
+        PlacementResiliencePolicy::RequireIndependentFailureDomains => 1,
+        PlacementResiliencePolicy::AllowReducedResilience => 2,
+    }
+}
+
+fn placement_policy_from_i64(
+    value: i64,
+) -> Result<PlacementResiliencePolicy, SessionConsensusStorageError> {
+    match value {
+        1 => Ok(PlacementResiliencePolicy::RequireIndependentFailureDomains),
+        2 => Ok(PlacementResiliencePolicy::AllowReducedResilience),
+        _ => Err(SessionConsensusStorageError::CorruptState),
+    }
+}
+
+fn fixed_placement_policy_column_exists(
+    conn: &Connection,
+) -> Result<bool, SessionConsensusStorageError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_identity') WHERE name = 'fixed_placement_policy')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)
+}
+
+fn ensure_fixed_placement_policy_sync(
+    conn: &Connection,
+    profile: ConsensusAuthorityProfile,
+    expected: Option<PlacementResiliencePolicy>,
+) -> Result<(), SessionConsensusStorageError> {
+    if !fixed_placement_policy_column_exists(conn)? {
+        if profile == ConsensusAuthorityProfile::FixedImmutable {
+            return Err(SessionConsensusStorageError::IdentityMismatch);
+        }
+        conn.execute_batch(
+            "ALTER TABLE consensus_identity ADD COLUMN fixed_placement_policy INTEGER CHECK (fixed_placement_policy IN (1, 2));",
+        )
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    }
+    let stored: Option<i64> = conn
+        .query_row(
+            "SELECT fixed_placement_policy FROM consensus_identity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+        .ok_or(SessionConsensusStorageError::CorruptState)?;
+    match (profile, expected, stored) {
+        (ConsensusAuthorityProfile::Dynamic, None, None) => Ok(()),
+        (ConsensusAuthorityProfile::FixedImmutable, Some(expected), Some(stored))
+            if placement_policy_from_i64(stored)? == expected =>
+        {
+            Ok(())
+        }
+        _ => Err(SessionConsensusStorageError::IdentityMismatch),
+    }
+}
+
+fn read_fixed_placement_policy_sync(
+    conn: &Connection,
+) -> Result<Option<PlacementResiliencePolicy>, SessionConsensusStorageError> {
+    if !fixed_placement_policy_column_exists(conn)? {
+        return Err(SessionConsensusStorageError::CorruptState);
+    }
+    let stored: Option<i64> = conn
+        .query_row(
+            "SELECT fixed_placement_policy FROM consensus_identity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+        .ok_or(SessionConsensusStorageError::CorruptState)?;
+    stored.map(placement_policy_from_i64).transpose()
+}
+
 fn consensus_authority_profile_column_exists(
     conn: &Connection,
 ) -> Result<bool, SessionConsensusStorageError> {
@@ -1759,6 +1861,7 @@ fn initialize_schema_with_storage_anchor_and_pending(
         &test_member_bindings(expected_members),
         pending,
         ConsensusAuthorityProfile::Dynamic,
+        None,
     )
 }
 
@@ -5676,6 +5779,14 @@ pub(crate) fn append_logs_with_authority_sync(
         expected_members,
         expected_bindings,
     )?;
+    if entries
+        .iter()
+        .any(|entry| fixed_profile_entry_changes_topology(entry, expected_members))
+    {
+        return Err(invalid_data(
+            "fixed session consensus authority rejects topology transitions",
+        ));
+    }
     append_logs_in_tx(&tx, identity, entries)?;
     tx.commit().map_err(db_error)
 }
@@ -7793,12 +7904,12 @@ fn validate_fixed_immutable_membership_scope(
 /// already-attached incoming snapshot. The names are constants controlled by
 /// this adapter; no snapshot-supplied identifier is interpolated into SQL.
 const ATTACHED_SNAPSHOT_VALIDATION_TABLES: &[&str] = &[
+    "consensus_identity",
     "session_records",
     "leases",
     "key_fences",
     "lease_globals",
     "session_replication_log",
-    "consensus_identity",
     "consensus_membership_scope",
     "consensus_membership_history",
     "consensus_membership_terminal_history",
@@ -7847,6 +7958,7 @@ fn validate_attached_snapshot_database_sync(
     fixed_expected_bindings: Option<
         &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     >,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
     local_candidate_marker: Option<CandidateBootstrapMarker>,
     meta: &opc_consensus::engine::SnapshotMeta<
         SessionConsensusNodeId,
@@ -7886,6 +7998,15 @@ fn validate_attached_snapshot_database_sync(
         ));
     }
     if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+        if fixed_placement_policy.is_none()
+            || read_fixed_placement_policy_sync(conn).map_err(|_| {
+                invalid_data("session consensus snapshot placement policy is invalid")
+            })? != fixed_placement_policy
+        {
+            return Err(invalid_data(
+                "session consensus snapshot placement policy is invalid",
+            ));
+        }
         validate_fixed_immutable_membership_scope(identity, expected_scope, &incoming_scope)?;
         if let (Some(expected_members), Some(expected_bindings)) =
             (fixed_expected_members, fixed_expected_bindings)
@@ -7989,6 +8110,8 @@ pub(crate) fn install_snapshot_database_with_profile_sync(
         authority_profile,
         None,
         None,
+        (authority_profile == ConsensusAuthorityProfile::FixedImmutable)
+            .then_some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
         snapshot_db_path,
         meta,
         final_file_name,
@@ -8004,6 +8127,7 @@ pub(crate) fn install_snapshot_database_with_authority_sync(
     authority_profile: ConsensusAuthorityProfile,
     expected_members: Option<&BTreeSet<SessionConsensusNodeId>>,
     expected_bindings: Option<&BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
     snapshot_db_path: &std::path::Path,
     meta: &opc_consensus::engine::SnapshotMeta<
         SessionConsensusNodeId,
@@ -8069,6 +8193,7 @@ pub(crate) fn install_snapshot_database_with_authority_sync(
             &expected_scope,
             expected_members,
             expected_bindings,
+            fixed_placement_policy,
             local_candidate_marker,
             meta,
         );
@@ -11164,6 +11289,60 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn fixed_raw_log_append_rejects_nested_topology_transition_before_persistence() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        let identity = identity();
+        let fixed_members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&fixed_members);
+        initialize_schema_with_profile(
+            &conn,
+            identity,
+            &fixed_members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed authority");
+
+        let desired_members = members(&[8, 9, 10]);
+        let rejected = append_logs_with_authority_sync(
+            &conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &fixed_members,
+            &bindings,
+            &[
+                membership_entry_at(0, vec![fixed_members.clone()], fixed_members.clone()),
+                topology_entry_at(
+                    1,
+                    0x87,
+                    SessionMutationIntent::Authorized {
+                        origin: member(7),
+                        authority_identity: identity,
+                        mutation: Box::new(SessionMutationIntent::PrepareTopologyTransition {
+                            transition_id: [0x87; MEMBERSHIP_TRANSITION_ID_BYTES],
+                            request_digest: [0x88; 32],
+                            desired_identity: identity_at(2, 0x89),
+                            desired_members: desired_members.clone(),
+                            desired_bindings: test_member_bindings(&desired_members),
+                        }),
+                    },
+                ),
+            ],
+        );
+        assert_eq!(
+            Err(io::ErrorKind::InvalidData),
+            rejected.map_err(|error| error.kind())
+        );
+        assert_eq!(
+            0_i64,
+            conn.query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("read rejected log count")
+        );
+    }
+
     #[tokio::test]
     async fn fixed_raw_writes_reject_profile_preserving_storage_identity_drift() {
         for drift in ["cluster_id", "configuration_id", "configuration_epoch"] {
@@ -11519,6 +11698,7 @@ mod tests {
             ConsensusAuthorityProfile::FixedImmutable,
             Some(&members),
             Some(&bindings),
+            Some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
             &snapshot_path,
             &meta,
             "fixed-local-drift.opc",
@@ -11611,6 +11791,7 @@ mod tests {
             ConsensusAuthorityProfile::FixedImmutable,
             Some(&members),
             Some(&bindings),
+            Some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
             &replaced_path,
             &meta,
             "replaced-source.opc",
@@ -11631,6 +11812,7 @@ mod tests {
             ConsensusAuthorityProfile::FixedImmutable,
             Some(&members),
             Some(&bindings),
+            Some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
             &valid_path,
             &meta,
             "valid-source.opc",
@@ -11764,6 +11946,39 @@ mod tests {
             read_consensus_authority_profile_sync(&dynamic_conn)
                 .expect("failed snapshot cannot overwrite local authority")
         );
+        drop(dynamic_conn);
+
+        let tampered_snapshot = Connection::open(&snapshot_path).expect("open fixed snapshot");
+        tampered_snapshot
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = ?1 WHERE singleton = 1",
+                [placement_policy_i64(
+                    PlacementResiliencePolicy::AllowReducedResilience,
+                )],
+            )
+            .expect("tamper fixed snapshot placement policy");
+        drop(tampered_snapshot);
+
+        let policy_target = SqliteSessionBackend::in_memory().expect("policy target");
+        let policy_conn = policy_target.conn.lock().await;
+        initialize_schema_with_profile(
+            &policy_conn,
+            identity,
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed policy target");
+        assert!(install_snapshot_database_with_profile_sync(
+            &policy_conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &snapshot_path,
+            &meta,
+            "fixed-policy-mismatch.opc",
+            [0x93; 32],
+            byte_length,
+        )
+        .is_err());
     }
 
     #[tokio::test]
