@@ -1612,6 +1612,22 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     }
     validate_persisted_membership_sync(&tx, storage_identity)
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    if authority_profile == ConsensusAuthorityProfile::FixedImmutable
+        && !fixed_quorum_authority_is_exact_sync(
+            &tx,
+            storage_identity,
+            expected_members,
+            expected_bindings,
+            true,
+        )
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?
+    {
+        return Err(SessionConsensusStorageError::CorruptState);
+    }
+    if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+        validate_fixed_durable_state_sync(&tx, storage_identity, expected_members)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    }
 
     tx.commit()
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
@@ -5436,6 +5452,7 @@ pub(crate) fn save_vote_with_authority_sync(
         expected_members,
         expected_bindings,
     )?;
+    validate_fixed_vote_member(vote, expected_members)?;
     save_vote_in_tx(&tx, identity, vote)?;
     tx.commit().map_err(db_error)
 }
@@ -5552,6 +5569,7 @@ pub(crate) fn save_committed_with_authority_sync(
         expected_members,
         expected_bindings,
     )?;
+    committed.as_ref().map(validate_fixed_log_id).transpose()?;
     save_committed_in_tx(&tx, identity, committed)?;
     tx.commit().map_err(db_error)
 }
@@ -5779,6 +5797,9 @@ pub(crate) fn append_logs_with_authority_sync(
         expected_members,
         expected_bindings,
     )?;
+    for entry in entries {
+        validate_fixed_log_id(&entry.log_id)?;
+    }
     if entries
         .iter()
         .any(|entry| fixed_profile_entry_changes_topology(entry, expected_members))
@@ -5874,6 +5895,7 @@ pub(crate) fn truncate_logs_with_authority_sync(
         expected_members,
         expected_bindings,
     )?;
+    validate_fixed_log_id(since)?;
     truncate_logs_in_tx(&tx, identity, since, index)?;
     tx.commit().map_err(db_error)
 }
@@ -5941,6 +5963,7 @@ pub(crate) fn purge_logs_with_authority_sync(
         expected_members,
         expected_bindings,
     )?;
+    validate_fixed_log_id(through)?;
     purge_logs_in_tx(&tx, identity, through, index)?;
     tx.commit().map_err(db_error)
 }
@@ -6918,6 +6941,11 @@ pub(crate) fn apply_entries_with_authority_sync(
             "session consensus fixed authority is no longer exact",
         ));
     }
+    if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+        for entry in &entries {
+            validate_fixed_log_id(&entry.log_id)?;
+        }
+    }
     let mut machine = read_machine_sync(&tx, identity)?;
     let mut responses = Vec::with_capacity(entries.len());
     let mut notifications = Vec::new();
@@ -7150,8 +7178,178 @@ pub(crate) fn fixed_quorum_authority_is_exact_sync(
         && scope.history.is_empty()
         && scope.terminal_history.is_empty()
         && scope.terminal.is_none()
+        && validate_fixed_live_durable_state_sync(conn, identity, expected_members).is_ok()
         && (applied_membership_is_exact
             || (allow_pristine_membership && membership.log_id().is_none())))
+}
+
+fn validate_fixed_vote_member(
+    vote: &Vote<SessionConsensusNodeId>,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    if vote
+        .leader_id
+        .voted_for()
+        .is_some_and(|node_id| !expected_members.contains(&node_id))
+    {
+        return Err(invalid_data(
+            "session consensus fixed vote names a nonmember",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_fixed_log_id(log_id: &LogId<SessionConsensusNodeId>) -> io::Result<()> {
+    // The pinned Openraft `single-term-leader` profile serializes committed
+    // leader IDs as a term only. Its `LogId` therefore carries no recoverable
+    // node identity to compare here; membership-bearing state and votes retain
+    // their node IDs and are checked by the fixed-authority validators.
+    validate_log_id(log_id).map(|_| ())
+}
+
+fn ensure_log_id_not_after(
+    earlier: &LogId<SessionConsensusNodeId>,
+    later: &LogId<SessionConsensusNodeId>,
+    message: &'static str,
+) -> io::Result<()> {
+    if earlier.index > later.index {
+        return Err(invalid_data(message));
+    }
+    if earlier.index == later.index && earlier != later {
+        return Err(invalid_data(message));
+    }
+    Ok(())
+}
+
+fn validate_fixed_snapshot_metadata(
+    meta: &opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    if let Some(last_log_id) = meta.last_log_id.as_ref() {
+        validate_fixed_log_id(last_log_id)?;
+    }
+    if is_pristine_membership(&meta.last_membership) {
+        if meta.last_log_id.is_some() {
+            return Err(invalid_data(
+                "session consensus fixed snapshot has pristine membership after a log",
+            ));
+        }
+        return Ok(());
+    }
+    validate_uniform_membership(&meta.last_membership, expected_members)?;
+    let membership_log_id = meta.last_membership.log_id().ok_or_else(|| {
+        invalid_data("session consensus fixed snapshot membership log identity is missing")
+    })?;
+    validate_fixed_log_id(&membership_log_id)?;
+    let last_log_id = meta.last_log_id.as_ref().ok_or_else(|| {
+        invalid_data("session consensus fixed snapshot membership is beyond its last log")
+    })?;
+    ensure_log_id_not_after(
+        &membership_log_id,
+        last_log_id,
+        "session consensus fixed snapshot membership is beyond its last log",
+    )
+}
+
+fn validate_fixed_live_durable_state_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    if let Some(vote) = read_vote_sync(conn, identity)? {
+        validate_fixed_vote_member(&vote, expected_members)?;
+    }
+
+    let committed = read_committed_sync(conn, identity)?;
+    let purged = read_purged_sync(conn, identity)?;
+    let applied = read_applied_sync(conn, identity)?;
+    for log_id in [&committed, &purged, &applied].into_iter().flatten() {
+        validate_fixed_log_id(log_id)?;
+    }
+    if let (Some(purged), Some(applied)) = (&purged, &applied) {
+        ensure_log_id_not_after(
+            purged,
+            applied,
+            "session consensus fixed purged pointer is beyond applied state",
+        )?;
+    }
+
+    let membership = read_membership_sync(conn, identity)?;
+    if !is_pristine_membership(&membership) {
+        validate_uniform_membership(&membership, expected_members)?;
+        let membership_log_id = membership.log_id().ok_or_else(|| {
+            invalid_data("session consensus fixed membership log identity is missing")
+        })?;
+        validate_fixed_log_id(&membership_log_id)?;
+        let applied = applied.as_ref().ok_or_else(|| {
+            invalid_data("session consensus fixed membership is beyond applied state")
+        })?;
+        ensure_log_id_not_after(
+            &membership_log_id,
+            applied,
+            "session consensus fixed membership is beyond applied state",
+        )?;
+    } else if applied.is_some() {
+        return Err(invalid_data(
+            "session consensus fixed applied state has pristine membership",
+        ));
+    }
+
+    if let Some((meta, _, _, _)) = read_current_snapshot_sync(conn, identity)? {
+        validate_fixed_snapshot_metadata(&meta, expected_members)?;
+        match (meta.last_log_id.as_ref(), applied.as_ref()) {
+            (Some(snapshot), Some(applied)) => ensure_log_id_not_after(
+                snapshot,
+                applied,
+                "session consensus fixed snapshot is beyond applied state",
+            )?,
+            (Some(_), None) => {
+                return Err(invalid_data(
+                    "session consensus fixed snapshot is beyond applied state",
+                ));
+            }
+            (None, _) => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Deeply validate retained fixed-quorum state at startup/reopen. Live engine
+/// admission uses [`validate_fixed_live_durable_state_sync`] so authenticated
+/// heartbeats and ordinary writes remain bounded independently of retained log
+/// length. Incoming entries are validated before their individual raw writes.
+fn validate_fixed_durable_state_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    validate_fixed_live_durable_state_sync(conn, identity, expected_members)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log ORDER BY log_index ASC",
+        )
+        .map_err(db_error)?;
+    let mut rows = statement.query([]).map_err(db_error)?;
+    while let Some(row) = rows.next().map_err(db_error)? {
+        let epoch: i64 = row.get(0).map_err(db_error)?;
+        let term: i64 = row.get(1).map_err(db_error)?;
+        let index: i64 = row.get(2).map_err(db_error)?;
+        let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
+        validate_epoch(epoch, identity)?;
+        let entry: Entry<SessionRaftTypeConfig> = decode_json(&encoded)?;
+        validate_fixed_log_id(&entry.log_id)?;
+        if checked_u64(term)? != entry.log_id.leader_id.term
+            || checked_u64(index)? != entry.log_id.index
+            || fixed_profile_entry_changes_topology(&entry, expected_members)
+        {
+            return Err(invalid_data("session consensus fixed log entry is invalid"));
+        }
+    }
+    Ok(())
 }
 
 fn fixed_profile_entry_changes_topology(
@@ -8357,6 +8555,17 @@ pub(crate) fn save_current_snapshot_with_authority_sync(
         expected_members,
         expected_bindings,
     )?;
+    validate_fixed_snapshot_metadata(meta, expected_members)?;
+    if let Some(snapshot_log_id) = meta.last_log_id.as_ref() {
+        let applied = read_applied_sync(&tx, identity)?.ok_or_else(|| {
+            invalid_data("session consensus fixed snapshot is beyond applied state")
+        })?;
+        ensure_log_id_not_after(
+            snapshot_log_id,
+            &applied,
+            "session consensus fixed snapshot is beyond applied state",
+        )?;
+    }
     save_current_snapshot_in_tx(&tx, identity, meta, file_name, checksum, byte_length)?;
     tx.commit().map_err(db_error)
 }
@@ -11138,6 +11347,101 @@ mod tests {
         assert!(read_vote_sync(&conn, identity)
             .expect("read rejected vote")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn fixed_raw_vote_rejects_nonmember_leader_id_without_mutation() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        let identity = identity();
+        let fixed_members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&fixed_members);
+        initialize_schema_with_profile(
+            &conn,
+            identity,
+            &fixed_members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed authority");
+
+        let error = save_vote_with_authority_sync(
+            &conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &fixed_members,
+            &bindings,
+            &Vote::new_committed(1, member(10)),
+        )
+        .expect_err("fixed authority must reject a nonmember vote leader");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(read_vote_sync(&conn, identity)
+            .expect("read rolled-back vote")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn fixed_reopen_rejects_stopped_database_nonmember_vote_tamper() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let database = directory.path().join("fixed-vote-tamper.sqlite");
+        let identity = identity();
+        let fixed_members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&fixed_members);
+
+        let backend = SqliteSessionBackend::open(&database).expect("backend");
+        let conn = backend.conn.lock().await;
+        initialize_schema_with_profile(
+            &conn,
+            identity,
+            &fixed_members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed authority");
+        apply_entries_with_authority_sync(
+            &conn,
+            identity,
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &fixed_members,
+            &bindings,
+            vec![membership_entry_at(
+                0,
+                vec![fixed_members.clone()],
+                fixed_members.clone(),
+            )],
+        )
+        .expect("form fixed quorum");
+        save_vote_with_authority_sync(
+            &conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &fixed_members,
+            &bindings,
+            &Vote::new_committed(1, member(7)),
+        )
+        .expect("persist member vote");
+        drop(conn);
+        drop(backend);
+
+        let tampered = Connection::open(&database).expect("open stopped database");
+        let nonmember_vote = Vote::new_committed(2, member(10));
+        tampered
+            .execute(
+                "UPDATE consensus_vote SET term = ?1, node_id = ?2, vote_json = ?3 WHERE singleton = 1",
+                params![2_i64, 10_i64, encode_json(&nonmember_vote).expect("encode tampered vote")],
+            )
+            .expect("tamper stopped database vote");
+        drop(tampered);
+
+        let reopened = SqliteSessionBackend::open(&database).expect("reopen backend");
+        let conn = reopened.conn.lock().await;
+        let error = initialize_schema_with_profile(
+            &conn,
+            identity,
+            &fixed_members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect_err("fixed reopen must reject the tampered nonmember vote");
+        assert_eq!(SessionConsensusStorageError::CorruptState, error);
     }
 
     #[tokio::test]
