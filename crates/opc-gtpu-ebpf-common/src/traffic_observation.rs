@@ -7,7 +7,9 @@
 //! bidirectional round-trip/continuity evaluator; one record is not proof
 //! that a peer received a packet on the wire.
 
-use crate::{GtpuSessionDeviceId, GtpuSessionGeneration, GtpuSessionGroupId};
+use crate::{
+    GtpuSessionAuthorityWireView, GtpuSessionDeviceId, GtpuSessionGeneration, GtpuSessionGroupId,
+};
 
 /// Width of an opaque reconcile-fence token.
 pub const GTPU_TRAFFIC_OBSERVATION_FENCE_LEN: usize = 16;
@@ -425,6 +427,24 @@ impl GtpuTrafficObservationRegistration {
                 == publication_id.to_be_bytes()
     }
 
+    /// Validate one encoded registration against a borrowed canonical
+    /// authority without materializing its opaque identities on the BPF stack.
+    #[must_use]
+    #[inline(always)]
+    pub fn encoded_matches_current_authority(
+        encoded: &[u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+        authority: GtpuSessionAuthorityWireView<'_>,
+        publication_id: u32,
+    ) -> bool {
+        let authority = authority.as_wire();
+        encoded_is_valid(encoded)
+            && encoded[GROUP_ID_OFFSET..DEVICE_ID_OFFSET] == authority[32..48]
+            && encoded[DEVICE_ID_OFFSET..GENERATION_OFFSET] == authority[16..32]
+            && encoded[GENERATION_OFFSET..BACKEND_INCARNATION_OFFSET] == authority[4..12]
+            && encoded[PUBLICATION_ID_OFFSET..REGISTRATION_RESERVED_OFFSET]
+                == publication_id.to_be_bytes()
+    }
+
     /// Return the exact redirect nonce and finite publication identity when
     /// the encoded registration matches the live forwarding authority.
     #[must_use]
@@ -438,6 +458,28 @@ impl GtpuTrafficObservationRegistration {
         let publication_id =
             Self::encoded_publication_id_if_current(encoded, group_id, device_id, generation)?;
         Some((slice_16(encoded, CORRELATION_SECRET_OFFSET), publication_id))
+    }
+
+    /// Return the redirect nonce and publication identity bound to one
+    /// canonical authority, without an owned authority header.
+    #[must_use]
+    #[inline(always)]
+    pub fn encoded_redirect_identity_if_current_authority(
+        encoded: &[u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+        authority: GtpuSessionAuthorityWireView<'_>,
+    ) -> Option<([u8; GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN], u32)> {
+        let authority = authority.as_wire();
+        if !encoded_is_valid(encoded)
+            || encoded[GROUP_ID_OFFSET..DEVICE_ID_OFFSET] != authority[32..48]
+            || encoded[DEVICE_ID_OFFSET..GENERATION_OFFSET] != authority[16..32]
+            || encoded[GENERATION_OFFSET..BACKEND_INCARNATION_OFFSET] != authority[4..12]
+        {
+            return None;
+        }
+        Some((
+            slice_16(encoded, CORRELATION_SECRET_OFFSET),
+            u32::from_be_bytes(slice_4(encoded, PUBLICATION_ID_OFFSET)),
+        ))
     }
 
     /// Return the exact finite publication identity when an encoded
@@ -1315,6 +1357,10 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use crate::{
+        GtpuEndpointAddress, GtpuSessionEntry, GtpuSessionGroupRecord, GtpuSessionPaa,
+        GtpuSourcePortPolicy, GtpuUplinkSourcePortPolicy,
+    };
 
     fn group_id() -> GtpuSessionGroupId {
         GtpuSessionGroupId::new([0x11; 16]).unwrap()
@@ -1345,6 +1391,24 @@ mod tests {
             secret,
         )
         .unwrap()
+    }
+
+    fn authority() -> [u8; crate::GTPU_SESSION_GROUP_VALUE_LEN] {
+        let entry = GtpuSessionEntry::new(
+            GtpuSessionPaa::new(GtpuEndpointAddress::Ipv4([10, 23, 0, 2])).unwrap(),
+            GtpuEndpointAddress::Ipv4([192, 0, 2, 2]),
+            GtpuEndpointAddress::Ipv4([192, 0, 2, 1]),
+            0x1000_0001_u32.to_be_bytes(),
+            0x2000_0001_u32.to_be_bytes(),
+            [0; 4],
+            None,
+            GtpuSourcePortPolicy::Any,
+            GtpuUplinkSourcePortPolicy::LegacyServicePort,
+        )
+        .unwrap();
+        GtpuSessionGroupRecord::active(group_id(), device_id(), generation(), Some(entry), None)
+            .unwrap()
+            .encode()
     }
 
     fn valid_request_sample(
@@ -1663,6 +1727,66 @@ mod tests {
                 group_id(),
                 device_id(),
                 generation(),
+                registration.publication_id() + 1,
+            )
+        );
+    }
+
+    #[test]
+    fn borrowed_authority_helpers_match_owned_binding_and_reject_mutation() {
+        let registration = registration();
+        let encoded = registration.encode();
+        let authority = authority();
+        let view = GtpuSessionAuthorityWireView::decode(&authority).unwrap();
+
+        assert_eq!(
+            GtpuTrafficObservationRegistration::encoded_matches_current_authority(
+                &encoded,
+                view,
+                registration.publication_id(),
+            ),
+            GtpuTrafficObservationRegistration::encoded_matches_current(
+                &encoded,
+                group_id(),
+                device_id(),
+                generation(),
+                registration.publication_id(),
+            ),
+        );
+        assert_eq!(
+            GtpuTrafficObservationRegistration::encoded_redirect_identity_if_current_authority(
+                &encoded, view,
+            ),
+            GtpuTrafficObservationRegistration::encoded_redirect_identity_if_current(
+                &encoded,
+                group_id(),
+                device_id(),
+                generation(),
+            ),
+        );
+
+        for offset in [4_usize, 16, 32] {
+            let mut stale = authority;
+            stale[offset] ^= 1;
+            let stale = GtpuSessionAuthorityWireView::decode(&stale).unwrap();
+            assert!(
+                !GtpuTrafficObservationRegistration::encoded_matches_current_authority(
+                    &encoded,
+                    stale,
+                    registration.publication_id(),
+                )
+            );
+            assert_eq!(
+                GtpuTrafficObservationRegistration::encoded_redirect_identity_if_current_authority(
+                    &encoded, stale,
+                ),
+                None,
+            );
+        }
+        assert!(
+            !GtpuTrafficObservationRegistration::encoded_matches_current_authority(
+                &encoded,
+                view,
                 registration.publication_id() + 1,
             )
         );

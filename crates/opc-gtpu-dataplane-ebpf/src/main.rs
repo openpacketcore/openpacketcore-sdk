@@ -60,16 +60,15 @@ use opc_gtpu_ebpf_common::{
     tft_classifier_filter_matches, tft_classifier_schema_is_current,
     uplink_non_encapsulation_drops, validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch,
     DownlinkPdr, GtpuClass, GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuPmtuProtocol,
-    GtpuSessionAuthorityHeader, GtpuSessionEntryWireView, GtpuSessionGroupPhase,
-    GtpuSessionIpFamily, GtpuTrafficObservationDirection, GtpuUplinkMtuPolicy,
-    Ipv4EnvelopeBounds, Ipv6ExtensionStep, MarkedDownlinkPdr,
-    TftClassifierFilter, TftClassifierFilterKey, TftClassifierIpv4Packet, TftClassifierKey,
-    TftClassifierMeta, UdpChecksumDisposition, UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar,
-    UplinkFarKey, UplinkMtuMapState, UplinkPmtuDecision, COUNTER_DL_BINDING_FAMILY_MISMATCH,
-    COUNTER_DL_BINDING_INGRESS_MISMATCH, COUNTER_DL_BINDING_INVALID,
-    COUNTER_DL_BINDING_LOCAL_MISMATCH, COUNTER_DL_BINDING_PEER_MISMATCH,
-    COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH,
-    COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
+    GtpuSessionAuthorityWireView, GtpuSessionEntryWireView, GtpuSessionGroupPhase,
+    GtpuSessionIpFamily, GtpuTrafficObservationDirection, GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds,
+    Ipv6ExtensionStep, MarkedDownlinkPdr, TftClassifierFilter, TftClassifierFilterKey,
+    TftClassifierIpv4Packet, TftClassifierKey, TftClassifierMeta, UdpChecksumDisposition,
+    UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar, UplinkFarKey, UplinkMtuMapState,
+    UplinkPmtuDecision, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+    COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
+    COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
+    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
     COUNTER_TFT_CLASSIFIER_INVALID_STATE, COUNTER_TFT_CLASSIFIER_MALFORMED,
     COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
     COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
@@ -577,16 +576,14 @@ fn current_observation_redirect_identity(
     authority: Option<&[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
 ) -> Option<([u8; GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN], u32)> {
     let authority = authority?;
-    let header = GtpuSessionAuthorityHeader::decode(authority)?;
-    let raw_registration = GTPU_OBS_REG.get_ptr(header.group_id().to_bytes())?;
+    let authority = GtpuSessionAuthorityWireView::decode(authority)?;
+    let raw_registration = GTPU_OBS_REG.get_ptr(authority.group_key())?;
     // SAFETY: Aya returned a live read-only map-value pointer for this program
     // invocation. No reference or identifying bytes escape the kernel.
     let raw_registration = unsafe { &*raw_registration };
-    GtpuTrafficObservationRegistration::encoded_redirect_identity_if_current(
+    GtpuTrafficObservationRegistration::encoded_redirect_identity_if_current_authority(
         raw_registration,
-        header.group_id(),
-        header.device_id(),
-        header.generation(),
+        authority,
     )
 }
 
@@ -598,13 +595,7 @@ fn stamp_grouped_uplink_observation(
     ctx: &TcContext,
     authority: Option<&[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
 ) {
-    let Some(authority) = authority else {
-        return;
-    };
-    let Some(_header) = GtpuSessionAuthorityHeader::decode(authority) else {
-        return;
-    };
-    let Some((nonce, _)) = current_observation_redirect_identity(Some(authority)) else {
+    let Some((nonce, _)) = current_observation_redirect_identity(authority) else {
         return;
     };
     store_grouped_uplink_observation_cb_stamp(ctx, grouped_observation_cb_stamp(nonce));
@@ -926,21 +917,19 @@ fn try_emit_grouped_observation(
     let Some(authority) = authority else {
         return;
     };
-    let Some(header) = GtpuSessionAuthorityHeader::decode(authority) else {
+    let Some(authority_view) = GtpuSessionAuthorityWireView::decode(authority) else {
         return;
     };
-    let group_key = header.group_id().to_bytes();
+    let group_key = authority_view.group_key();
     let Some(raw_registration) = GTPU_OBS_REG.get_ptr(group_key) else {
         return;
     };
     // SAFETY: Aya returned this pointer from the retained registration map;
     // this function only reads its fixed map-value extent before returning.
     let raw_registration = unsafe { &*raw_registration };
-    if !GtpuTrafficObservationRegistration::encoded_matches_current(
+    if !GtpuTrafficObservationRegistration::encoded_matches_current_authority(
         raw_registration,
-        header.group_id(),
-        header.device_id(),
-        header.generation(),
+        authority_view,
         publication_id,
     ) {
         return;
@@ -1022,10 +1011,11 @@ fn emit_grouped_uplink_observation_on_reentry(ctx: &TcContext, eth_proto: u16) {
     // SAFETY: this is one retained normal hash-map value borrowed for this tc
     // invocation only; no view escapes this function.
     let authority = unsafe { &*authority_ptr };
-    let Some(header) = GtpuSessionAuthorityHeader::decode(authority) else {
+    let Some(authority_view) = GtpuSessionAuthorityWireView::decode(authority) else {
         return;
     };
-    if header.group_id().to_bytes() != group_key || header.phase() != GtpuSessionGroupPhase::Active
+    if !authority_view.matches_group_key(&group_key)
+        || authority_view.phase() != Some(GtpuSessionGroupPhase::Active)
     {
         return;
     }
@@ -1035,11 +1025,9 @@ fn emit_grouped_uplink_observation_on_reentry(ctx: &TcContext, eth_proto: u16) {
     // SAFETY: this retained fixed-size registration is borrowed for this invocation.
     let raw_registration = unsafe { &*raw_registration };
     let Some((registration_nonce, publication_id)) =
-        GtpuTrafficObservationRegistration::encoded_redirect_identity_if_current(
+        GtpuTrafficObservationRegistration::encoded_redirect_identity_if_current_authority(
             raw_registration,
-            header.group_id(),
-            header.device_id(),
-            header.generation(),
+            authority_view,
         )
     else {
         return;
@@ -5163,8 +5151,7 @@ mod tests {
 
         assert_eq!(cb_accesses.len(), 16);
         assert!(cb_accesses.iter().all(|line| {
-            line.contains("core::ptr::write_volatile")
-                || line.contains("core::ptr::read_volatile")
+            line.contains("core::ptr::write_volatile") || line.contains("core::ptr::read_volatile")
         }));
         assert_eq!(
             context_accesses
@@ -5233,8 +5220,9 @@ mod tests {
         );
         assert!(reentry.contains("GTPU_OBS_REDIR.get_ptr(nonce)"));
         assert!(reentry.contains("GTPU_SESSIONS.get_ptr(group_key)"));
-        assert!(reentry.contains("header.group_id().to_bytes() != group_key"));
-        assert!(reentry.contains("header.phase() != GtpuSessionGroupPhase::Active"));
+        assert!(reentry.contains("GtpuSessionAuthorityWireView::decode(authority)"));
+        assert!(reentry.contains("!authority_view.matches_group_key(&group_key)"));
+        assert!(reentry.contains("authority_view.phase() != Some(GtpuSessionGroupPhase::Active)"));
         assert!(reentry.contains("registration_nonce, publication_id"));
         assert!(reentry.contains("registration_nonce != nonce"));
         assert!(reentry.contains("emit_grouped_observation("));
@@ -5252,8 +5240,11 @@ mod tests {
         let (capture, _) = capture
             .split_once("/// Store opaque grouped authority")
             .expect("publication capture helper terminator is present");
-        assert!(capture
-            .contains("GtpuTrafficObservationRegistration::encoded_redirect_identity_if_current("));
+        assert!(capture.contains(
+            "GtpuTrafficObservationRegistration::encoded_redirect_identity_if_current_authority("
+        ));
+        assert!(capture.contains("raw_registration,"));
+        assert!(capture.contains("\n        authority,\n"));
 
         let (_, writer) = source
             .split_once("fn try_emit_grouped_observation(")
@@ -5261,7 +5252,10 @@ mod tests {
         let (writer, _) = writer
             .split_once("/// Emit an uplink observation")
             .expect("observation writer terminator is present");
-        assert!(writer.contains("GtpuTrafficObservationRegistration::encoded_matches_current("));
+        assert!(writer
+            .contains("GtpuTrafficObservationRegistration::encoded_matches_current_authority("));
+        assert!(writer.contains("raw_registration,"));
+        assert!(writer.contains("\n        authority_view,\n"));
         assert!(writer.contains("publication_id,"));
 
         let (_, downlink) = source

@@ -850,7 +850,8 @@ jobs:
             grouped_uplink_authority grouped_downlink_authority decap_grouped_downlink \
             encapsulate_grouped_ipv4 encapsulate_grouped_ipv6 \
             checksum_bytes_are_materialized select_gtpu_session_entry_wire \
-            wire_address_is_canonical apply_uplink_mtu_policy \
+            authority_slots_are_canonical entry_wire_is_canonical bytes_80_are_zero \
+            apply_uplink_mtu_policy \
             observation_challenge_sample observation_icmp_checksum_for_payload \
             observation_icmpv6_checksum_is_valid rewrite_observation_icmp_echo_request \
             emit_grouped_observation \

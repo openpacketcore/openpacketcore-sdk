@@ -811,55 +811,101 @@ impl GtpuSessionEntry {
     }
 }
 
-fn wire_address_is_canonical(family: u8, value: &[u8]) -> bool {
-    if value.len() != 16 {
-        return false;
-    }
+#[inline(always)]
+fn native_word_4(value: &[u8; 16], offset: usize) -> u32 {
+    u32::from_ne_bytes([
+        value[offset],
+        value[offset + 1],
+        value[offset + 2],
+        value[offset + 3],
+    ])
+}
+
+#[inline(always)]
+fn native_word_8(value: &[u8; 16], offset: usize) -> u64 {
+    u64::from_ne_bytes([
+        value[offset],
+        value[offset + 1],
+        value[offset + 2],
+        value[offset + 3],
+        value[offset + 4],
+        value[offset + 5],
+        value[offset + 6],
+        value[offset + 7],
+    ])
+}
+
+#[inline(always)]
+fn bytes_16_are_zero(value: &[u8; 16]) -> bool {
+    native_word_8(value, 0) | native_word_8(value, 8) == 0
+}
+
+#[inline(always)]
+fn wire_address_is_canonical(family: u8, value: &[u8; 16]) -> bool {
     match GtpuSessionIpFamily::from_wire(family) {
         Some(GtpuSessionIpFamily::Ipv4) => {
-            value[..4].iter().any(|byte| *byte != 0) && value[4..].iter().all(|byte| *byte == 0)
+            native_word_4(value, 0) != 0
+                && native_word_4(value, 4) == 0
+                && native_word_8(value, 8) == 0
         }
-        Some(GtpuSessionIpFamily::Ipv6) => value.iter().any(|byte| *byte != 0),
+        Some(GtpuSessionIpFamily::Ipv6) => !bytes_16_are_zero(value),
         None => false,
     }
 }
 
-fn wire_paa_is_canonical(family: u8, value: &[u8]) -> bool {
-    if value.len() != 16 {
-        return false;
-    }
+#[inline(always)]
+fn wire_paa_is_canonical(family: u8, value: &[u8; 16]) -> bool {
     match GtpuSessionIpFamily::from_wire(family) {
         Some(GtpuSessionIpFamily::Ipv4) => {
-            value[..4].iter().any(|byte| *byte != 0) && value[4..].iter().all(|byte| *byte == 0)
+            native_word_4(value, 0) != 0
+                && native_word_4(value, 4) == 0
+                && native_word_8(value, 8) == 0
         }
         Some(GtpuSessionIpFamily::Ipv6) => {
-            value[..8].iter().any(|byte| *byte != 0) && value[8..].iter().all(|byte| *byte == 0)
+            native_word_8(value, 0) != 0 && native_word_8(value, 8) == 0
         }
         None => false,
     }
 }
 
-fn entry_wire_is_canonical(value: &[u8], expected_family: GtpuSessionIpFamily) -> bool {
-    if value.len() != GTPU_SESSION_ENTRY_LEN
-        || value[0] != ENTRY_FORMAT_VERSION
+#[inline(never)]
+fn entry_wire_is_canonical(
+    value: &[u8; GTPU_SESSION_ENTRY_LEN],
+    expected_family: GtpuSessionIpFamily,
+) -> bool {
+    let inner_paa: &[u8; 16] = match (&value[4..20]).try_into() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let peer_outer: &[u8; 16] = match (&value[20..36]).try_into() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let local_outer: &[u8; 16] = match (&value[36..52]).try_into() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if value[0] != ENTRY_FORMAT_VERSION
         || value[1] != expected_family as u8
         || value[3] != 0
-        || !wire_paa_is_canonical(value[1], &value[4..20])
-        || !wire_address_is_canonical(value[2], &value[20..36])
-        || !wire_address_is_canonical(value[2], &value[36..52])
-        || value[52..56].iter().all(|byte| *byte == 0)
-        || value[56..60].iter().all(|byte| *byte == 0)
+        || !wire_paa_is_canonical(value[1], inner_paa)
+        || !wire_address_is_canonical(value[2], peer_outer)
+        || !wire_address_is_canonical(value[2], local_outer)
+        || u32::from_ne_bytes([value[52], value[53], value[54], value[55]]) == 0
+        || u32::from_ne_bytes([value[56], value[57], value[58], value[59]]) == 0
         || !matches!(value[64], 0..=63 | 0xff)
-        || value[72..].iter().any(|byte| *byte != 0)
+        || u64::from_ne_bytes([
+            value[72], value[73], value[74], value[75], value[76], value[77], value[78], value[79],
+        ]) != 0
     {
         return false;
     }
     let aliases_inner = match (expected_family, GtpuSessionIpFamily::from_wire(value[2])) {
         (GtpuSessionIpFamily::Ipv4, Some(GtpuSessionIpFamily::Ipv4)) => {
-            value[4..8] == value[36..40]
+            native_word_4(inner_paa, 0) == native_word_4(local_outer, 0)
         }
         (GtpuSessionIpFamily::Ipv6, Some(GtpuSessionIpFamily::Ipv6)) => {
-            value[4..12] == value[36..44]
+            native_word_8(inner_paa, 0) == native_word_8(local_outer, 0)
         }
         _ => false,
     };
@@ -876,6 +922,56 @@ fn entry_wire_is_canonical(value: &[u8], expected_family: GtpuSessionIpFamily) -
     };
     downlink_policy_is_canonical
         && GtpuUplinkSourcePortPolicy::from_map_value([value[70], value[71]]).is_some()
+}
+
+#[inline(always)]
+fn entry_slot(value: &[u8; GTPU_SESSION_GROUP_VALUE_LEN], slot: u8) -> Option<&[u8; 80]> {
+    let start =
+        GROUP_HEADER_LEN.checked_add(usize::from(slot).checked_mul(GTPU_SESSION_ENTRY_LEN)?)?;
+    let end = start.checked_add(GTPU_SESSION_ENTRY_LEN)?;
+    value.get(start..end)?.try_into().ok()
+}
+
+#[inline(never)]
+fn authority_slots_are_canonical(
+    value: &[u8; GTPU_SESSION_GROUP_VALUE_LEN],
+    family_mask: u8,
+) -> bool {
+    let Some(ipv4) = entry_slot(value, GTPU_SESSION_IPV4_SLOT) else {
+        return false;
+    };
+    let Some(ipv6) = entry_slot(value, GTPU_SESSION_IPV6_SLOT) else {
+        return false;
+    };
+    match family_mask {
+        1 => entry_wire_is_canonical(ipv4, GtpuSessionIpFamily::Ipv4) && bytes_80_are_zero(ipv6),
+        2 => bytes_80_are_zero(ipv4) && entry_wire_is_canonical(ipv6, GtpuSessionIpFamily::Ipv6),
+        3 => {
+            entry_wire_is_canonical(ipv4, GtpuSessionIpFamily::Ipv4)
+                && entry_wire_is_canonical(ipv6, GtpuSessionIpFamily::Ipv6)
+        }
+        _ => false,
+    }
+}
+
+#[inline(never)]
+fn bytes_80_are_zero(value: &[u8; GTPU_SESSION_ENTRY_LEN]) -> bool {
+    let mut offset = 0;
+    let mut aggregate = 0_u64;
+    while offset < GTPU_SESSION_ENTRY_LEN {
+        aggregate |= u64::from_ne_bytes([
+            value[offset],
+            value[offset + 1],
+            value[offset + 2],
+            value[offset + 3],
+            value[offset + 4],
+            value[offset + 5],
+            value[offset + 6],
+            value[offset + 7],
+        ]);
+        offset += 8;
+    }
+    aggregate == 0
 }
 
 /// Zero-copy, verifier-friendly view of one canonical grouped-session entry.
@@ -1397,48 +1493,124 @@ pub struct GtpuSessionAuthorityHeader {
     family_mask: u8,
 }
 
+/// Borrowed, verifier-oriented view of one fully canonical authority value.
+///
+/// Unlike [`GtpuSessionAuthorityHeader`], this view retains the map-owned wire
+/// value instead of materializing both opaque 16-byte identities in an owned
+/// return value. That distinction keeps nested tc packet paths below the
+/// kernel's cumulative BPF stack bound while preserving the exact same header,
+/// slot, generation, and phase validation.
+#[derive(Clone, Copy)]
+pub struct GtpuSessionAuthorityWireView<'a> {
+    wire: &'a [u8; GTPU_SESSION_GROUP_VALUE_LEN],
+}
+
+impl core::fmt::Debug for GtpuSessionAuthorityWireView<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GtpuSessionAuthorityWireView")
+            .field("routing_identity", &"<redacted>")
+            .field("family_mask", &self.family_mask())
+            .finish()
+    }
+}
+
+impl<'a> GtpuSessionAuthorityWireView<'a> {
+    /// Validate the fixed header and both family slots in place.
+    #[must_use]
+    pub fn decode(value: &'a [u8; GTPU_SESSION_GROUP_VALUE_LEN]) -> Option<Self> {
+        if value[0] != GROUP_FORMAT_VERSION
+            || value[3] != 0
+            || u32::from_ne_bytes([value[12], value[13], value[14], value[15]]) != 0
+            || !matches!(value[2], 1..=3)
+        {
+            return None;
+        }
+        let generation = GtpuSessionGeneration::new(u64::from_be_bytes([
+            value[4], value[5], value[6], value[7], value[8], value[9], value[10], value[11],
+        ]))?;
+        let phase = GtpuSessionGroupPhase::from_wire(value[1])?;
+        let device_id: &[u8; 16] = value[16..32].try_into().ok()?;
+        let group_id: &[u8; 16] = value[32..48].try_into().ok()?;
+        if phase == GtpuSessionGroupPhase::Pending && generation != GtpuSessionGeneration::INITIAL
+            || phase == GtpuSessionGroupPhase::Removing && generation.get() < 2
+            || bytes_16_are_zero(device_id)
+            || bytes_16_are_zero(group_id)
+            || !authority_slots_are_canonical(value, value[2])
+        {
+            return None;
+        }
+        Some(Self { wire: value })
+    }
+
+    /// Return the fully validated map-owned authority bytes.
+    #[must_use]
+    pub const fn as_wire(self) -> &'a [u8; GTPU_SESSION_GROUP_VALUE_LEN] {
+        self.wire
+    }
+
+    /// Return the opaque group map key. Do not log this value.
+    #[must_use]
+    pub fn group_key(self) -> [u8; GTPU_SESSION_GROUP_ID_LEN] {
+        let mut key = [0_u8; GTPU_SESSION_GROUP_ID_LEN];
+        key.copy_from_slice(&self.wire[32..48]);
+        key
+    }
+
+    /// Return whether the duplicated group identity matches one retained key.
+    #[must_use]
+    pub fn matches_group_key(self, key: &[u8; GTPU_SESSION_GROUP_ID_LEN]) -> bool {
+        self.wire[32..48] == key[..]
+    }
+
+    /// Return the stable device identity bytes. Do not log this value.
+    #[must_use]
+    pub fn device_key(self) -> [u8; GTPU_SESSION_GROUP_ID_LEN] {
+        let mut key = [0_u8; GTPU_SESSION_GROUP_ID_LEN];
+        key.copy_from_slice(&self.wire[16..32]);
+        key
+    }
+
+    /// Return the nonzero authority generation.
+    #[must_use]
+    pub fn generation(self) -> Option<GtpuSessionGeneration> {
+        GtpuSessionGeneration::new(u64::from_be_bytes([
+            self.wire[4],
+            self.wire[5],
+            self.wire[6],
+            self.wire[7],
+            self.wire[8],
+            self.wire[9],
+            self.wire[10],
+            self.wire[11],
+        ]))
+    }
+
+    /// Return the validated authority phase.
+    #[must_use]
+    pub fn phase(self) -> Option<GtpuSessionGroupPhase> {
+        GtpuSessionGroupPhase::from_wire(self.wire[1])
+    }
+
+    /// Return the canonical family-presence mask.
+    #[must_use]
+    pub const fn family_mask(self) -> u8 {
+        self.wire[2]
+    }
+}
+
 impl GtpuSessionAuthorityHeader {
     /// Validate a raw authority header and both fixed slots without
     /// materializing a complete group record.
     #[must_use]
     pub fn decode(value: &[u8; GTPU_SESSION_GROUP_VALUE_LEN]) -> Option<Self> {
-        if value[0] != GROUP_FORMAT_VERSION
-            || value[3] != 0
-            || value[12..16].iter().any(|byte| *byte != 0)
-            || !matches!(value[2], 1..=3)
-        {
-            return None;
-        }
-        let generation = GtpuSessionGeneration::new(u64::from_be_bytes(copy_8(value, 4)?))?;
-        let phase = GtpuSessionGroupPhase::from_wire(value[1])?;
-        if phase == GtpuSessionGroupPhase::Pending && generation != GtpuSessionGeneration::INITIAL
-            || phase == GtpuSessionGroupPhase::Removing && generation.get() < 2
-        {
-            return None;
-        }
-        let header = Self {
-            device_id: GtpuSessionDeviceId::new(copy_16(value, 16)?)?,
-            group_id: GtpuSessionGroupId::new(copy_16(value, 32)?)?,
-            generation,
-            phase,
-            family_mask: value[2],
-        };
-        for (slot, family, mask) in [
-            (0_usize, GtpuSessionIpFamily::Ipv4, 1_u8),
-            (1, GtpuSessionIpFamily::Ipv6, 2),
-        ] {
-            let start = GROUP_HEADER_LEN + slot * GTPU_SESSION_ENTRY_LEN;
-            let end = start + GTPU_SESSION_ENTRY_LEN;
-            let encoded = value.get(start..end)?;
-            if header.family_mask & mask != 0 {
-                if !entry_wire_is_canonical(encoded, family) {
-                    return None;
-                }
-            } else if encoded.iter().any(|byte| *byte != 0) {
-                return None;
-            }
-        }
-        Some(header)
+        let view = GtpuSessionAuthorityWireView::decode(value)?;
+        Some(Self {
+            device_id: GtpuSessionDeviceId::new(view.device_key())?,
+            group_id: GtpuSessionGroupId::new(view.group_key())?,
+            generation: view.generation()?,
+            phase: view.phase()?,
+            family_mask: view.family_mask(),
+        })
     }
 
     /// Group map key duplicated in the authority.
@@ -2101,28 +2273,14 @@ pub fn select_gtpu_session_entry_wire<'a>(
     {
         return None;
     }
-    for (slot, family, mask) in [
-        (0_usize, GtpuSessionIpFamily::Ipv4, 1_u8),
-        (1, GtpuSessionIpFamily::Ipv6, 2),
-    ] {
-        let start = GROUP_HEADER_LEN + slot * GTPU_SESSION_ENTRY_LEN;
-        let end = start + GTPU_SESSION_ENTRY_LEN;
-        let encoded = authority.get(start..end)?;
-        if family_mask & mask != 0 {
-            if !entry_wire_is_canonical(encoded, family) {
-                return None;
-            }
-        } else if encoded.iter().any(|byte| *byte != 0) {
-            return None;
-        }
+    if !authority_slots_are_canonical(authority, family_mask) {
+        return None;
     }
     let mask = 1_u8.checked_shl(u32::from(expected_slot))?;
     if family_mask & mask == 0 {
         return None;
     }
-    let start = GROUP_HEADER_LEN + usize::from(expected_slot) * GTPU_SESSION_ENTRY_LEN;
-    let end = start + GTPU_SESSION_ENTRY_LEN;
-    let entry: &[u8; GTPU_SESSION_ENTRY_LEN] = authority.get(start..end)?.try_into().ok()?;
+    let entry = entry_slot(authority, expected_slot)?;
     if !config_authorizes_entry_local(config, entry) {
         return None;
     }
@@ -2649,6 +2807,70 @@ mod tests {
             42,
         )
         .is_none());
+    }
+
+    #[test]
+    fn borrowed_authority_view_preserves_exact_header_and_slot_validation() {
+        for record in [
+            active(7, Some(v4_entry()), None),
+            active(8, None, Some(v6_entry())),
+            active(9, Some(v4_entry()), Some(v6_entry())),
+        ] {
+            let encoded = record.encode();
+            let view = GtpuSessionAuthorityWireView::decode(&encoded).unwrap();
+            let header = GtpuSessionAuthorityHeader::decode(&encoded).unwrap();
+
+            assert_eq!(view.as_wire(), &encoded);
+            assert_eq!(view.group_key(), header.group_id().to_bytes());
+            assert!(view.matches_group_key(&header.group_id().to_bytes()));
+            assert_eq!(view.device_key(), header.device_id().to_bytes());
+            assert_eq!(view.generation(), Some(header.generation()));
+            assert_eq!(view.phase(), Some(header.phase()));
+            assert_eq!(view.family_mask(), header.family_mask());
+        }
+
+        let canonical = active(9, Some(v4_entry()), Some(v6_entry())).encode();
+        let mut wrong_version = canonical;
+        wrong_version[0] = 0;
+        let mut wrong_phase = canonical;
+        wrong_phase[1] = 0;
+        let mut wrong_mask = canonical;
+        wrong_mask[2] = 0;
+        let mut header_reserved = canonical;
+        header_reserved[3] = 1;
+        let mut zero_generation = canonical;
+        zero_generation[4..12].fill(0);
+        let mut header_tail_reserved = canonical;
+        header_tail_reserved[12] = 1;
+        let mut zero_device = canonical;
+        zero_device[16..32].fill(0);
+        let mut zero_group = canonical;
+        zero_group[32..48].fill(0);
+        let mut entry_reserved = canonical;
+        entry_reserved[GROUP_HEADER_LEN + 3] = 1;
+        let mut zero_local_teid = canonical;
+        zero_local_teid[GROUP_HEADER_LEN + 52..GROUP_HEADER_LEN + 56].fill(0);
+        let mut ipv6_tail_reserved = canonical;
+        ipv6_tail_reserved[GROUP_HEADER_LEN + GTPU_SESSION_ENTRY_LEN + 72] = 1;
+        for malformed in [
+            wrong_version,
+            wrong_phase,
+            wrong_mask,
+            header_reserved,
+            zero_generation,
+            header_tail_reserved,
+            zero_device,
+            zero_group,
+            entry_reserved,
+            zero_local_teid,
+            ipv6_tail_reserved,
+        ] {
+            assert!(GtpuSessionAuthorityWireView::decode(&malformed).is_none());
+        }
+
+        let mut inactive_slot_is_not_zero = active(9, Some(v4_entry()), None).encode();
+        inactive_slot_is_not_zero[GROUP_HEADER_LEN + GTPU_SESSION_ENTRY_LEN + 79] = 1;
+        assert!(GtpuSessionAuthorityWireView::decode(&inactive_slot_is_not_zero).is_none());
     }
 
     #[test]
