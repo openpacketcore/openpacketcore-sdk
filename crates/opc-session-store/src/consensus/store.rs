@@ -372,6 +372,13 @@ enum ReadBarrierReply {
     NotLeader {
         leader: Option<SessionConsensusNodeId>,
     },
+    RecoveryRequired,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinearizableBarrierFailure {
+    RecoveryRequired,
     Unavailable,
 }
 
@@ -801,7 +808,7 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<SessionConsumerScope, StoreError> {
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.require_application_traffic_authority_before(deadline)
             .await?;
         self.current_scope()
             .map(|(identity, _)| SessionConsumerScope::new(identity))
@@ -1181,6 +1188,38 @@ impl ConsensusSessionStore {
         }
     }
 
+    async fn operator_recovery_pending_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, StoreError> {
+        match tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .backend
+                .consensus_operator_recovery_pending(self.inner.storage_identity),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(consensus_unavailable()),
+        }
+    }
+
+    /// Revalidate every durable application-traffic authority immediately
+    /// before an ordinary result or proposal crosses its acceptance boundary.
+    /// Operator Recovery uses a separate explicitly authorized path.
+    async fn require_application_traffic_authority_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
+        match self.operator_recovery_pending_before(deadline).await {
+            Ok(false) => Ok(()),
+            Ok(true) | Err(_) => Err(consensus_unavailable()),
+        }
+    }
+
     /// Fixed watches must re-establish quorum-backed read authority after a
     /// notification is dequeued and before it is exposed. Dynamic watches
     /// retain their original passive stream semantics.
@@ -1191,23 +1230,12 @@ impl ConsensusSessionStore {
         if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum {
             return Ok(());
         }
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.require_application_traffic_authority_before(deadline)
             .await?;
-        let recovery_pending = tokio::time::timeout_at(
-            deadline,
-            self.inner
-                .backend
-                .consensus_operator_recovery_pending(self.inner.storage_identity),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or(true);
-        if recovery_pending {
-            return Err(consensus_unavailable());
-        }
-        self.linearizable_barrier_before(deadline).await?;
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.linearizable_barrier_before(deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        self.require_application_traffic_authority_before(deadline)
             .await
     }
 
@@ -1589,7 +1617,19 @@ impl ConsensusSessionStore {
                 )
                 .with_recovery_progress(recovery_progress)
             }
-            Err(_) => {
+            Err(LinearizableBarrierFailure::RecoveryRequired) => {
+                let metrics = self.inner.raft.metrics();
+                let metrics = metrics.borrow();
+                let recovery_progress = DurableRecoveryProgress::new(
+                    DurableRecoveryState::RecoveryRequired,
+                    metrics.last_log_index,
+                    metrics.last_applied.as_ref().map(|log_id| log_id.index),
+                    metrics.snapshot.as_ref().map(|log_id| log_id.index),
+                    metrics.purged.as_ref().map(|log_id| log_id.index),
+                );
+                report_without_barrier(DurableReadinessState::RecoveryRequired, recovery_progress)
+            }
+            Err(LinearizableBarrierFailure::Unavailable) => {
                 let progress = progress();
                 let state = if progress.state() == DurableRecoveryState::RecoveryRequired {
                     DurableReadinessState::RecoveryRequired
@@ -1877,21 +1917,8 @@ impl ConsensusSessionStore {
         required_consumer_scope: Option<SessionConsensusIdentity>,
         deadline: tokio::time::Instant,
     ) -> Result<SessionConsensusResponse, StoreError> {
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.require_application_traffic_authority_before(deadline)
             .await?;
-        let recovery_pending = tokio::time::timeout_at(
-            deadline,
-            self.inner
-                .backend
-                .consensus_operator_recovery_pending(self.inner.storage_identity),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or(true);
-        if recovery_pending {
-            return Err(consensus_unavailable());
-        }
         validate_consensus_intent(&intent)?;
         let request = ForwardMutationRequest {
             request_id,
@@ -1955,6 +1982,13 @@ impl ConsensusSessionStore {
             match reply {
                 ForwardMutationReply::Applied(response) => {
                     if committed_response_matches_intent(&request.intent, &response) {
+                        if self
+                            .require_application_traffic_authority_before(deadline)
+                            .await
+                            .is_err()
+                        {
+                            return Err(consensus_outcome_unavailable(&request.intent));
+                        }
                         return Ok(*response);
                     }
                     if !outcome_may_be_unavailable
@@ -2006,7 +2040,7 @@ impl ConsensusSessionStore {
         deadline: tokio::time::Instant,
     ) -> Result<(), StoreError> {
         validate_record_expiry_preflights_profile(preflights)?;
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.require_application_traffic_authority_before(deadline)
             .await?;
         let request = ForwardRequest::RecordExpiryPreflight {
             preflights: BoundedRecordExpiryPreflights::try_from_slice(preflights)?,
@@ -2057,7 +2091,12 @@ impl ConsensusSessionStore {
                 }
             };
             match reply {
-                ForwardMutationReply::RecordExpiryPreflight(result) => return result,
+                ForwardMutationReply::RecordExpiryPreflight(result) => {
+                    result?;
+                    self.require_application_traffic_authority_before(deadline)
+                        .await?;
+                    return Ok(());
+                }
                 ForwardMutationReply::NotLeader {
                     leader: next_leader,
                 } => {
@@ -2105,11 +2144,14 @@ impl ConsensusSessionStore {
                 Ok(guard) => guard,
                 Err(_) => return ForwardMutationReply::Unavailable,
             };
-        if self
-            .require_durable_fixed_quorum_admission_before(deadline)
-            .await
-            .is_err()
-        {
+        let initial_authority = if allow_operator_recovery {
+            self.require_durable_fixed_quorum_admission_before(deadline)
+                .await
+        } else {
+            self.require_application_traffic_authority_before(deadline)
+                .await
+        };
+        if initial_authority.is_err() {
             return ForwardMutationReply::Unavailable;
         }
         if request
@@ -2123,22 +2165,6 @@ impl ConsensusSessionStore {
             return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
                 StoreError::TopologyAuthorityRevoked,
             )));
-        }
-        if !allow_operator_recovery {
-            let recovery_pending = match tokio::time::timeout_at(
-                deadline,
-                self.inner
-                    .backend
-                    .consensus_operator_recovery_pending(self.inner.storage_identity),
-            )
-            .await
-            {
-                Ok(Ok(pending)) => pending,
-                Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
-            };
-            if recovery_pending {
-                return ForwardMutationReply::Unavailable;
-            }
         }
         if let Err(error) =
             validate_consensus_intent_with_recovery(&request.intent, allow_operator_recovery)
@@ -2164,11 +2190,14 @@ impl ConsensusSessionStore {
             .await
         {
             EnsureLinearizableOutcome::Ready { .. } => {
-                if self
-                    .require_durable_fixed_quorum_admission_before(deadline)
-                    .await
-                    .is_err()
-                {
+                let authority = if allow_operator_recovery {
+                    self.require_durable_fixed_quorum_admission_before(deadline)
+                        .await
+                } else {
+                    self.require_application_traffic_authority_before(deadline)
+                        .await
+                };
+                if authority.is_err() {
                     return ForwardMutationReply::Unavailable;
                 }
             }
@@ -2197,6 +2226,14 @@ impl ConsensusSessionStore {
             ),
             Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
         };
+        if !allow_operator_recovery
+            && self
+                .require_application_traffic_authority_before(deadline)
+                .await
+                .is_err()
+        {
+            return ForwardMutationReply::Unavailable;
+        }
         self.propose_on_local_leader(
             request,
             LocalProposalAuthority {
@@ -2256,6 +2293,15 @@ impl ConsensusSessionStore {
                     max,
                 },
             )));
+        }
+
+        if !authority.allows_operator_recovery
+            && self
+                .require_application_traffic_authority_before(deadline)
+                .await
+                .is_err()
+        {
+            return ForwardMutationReply::Unavailable;
         }
 
         // Split Openraft's enqueue and result phases explicitly. Once
@@ -2323,7 +2369,7 @@ impl ConsensusSessionStore {
                 Err(_) => return ForwardMutationReply::Unavailable,
             };
         if self
-            .require_durable_fixed_quorum_admission_before(deadline)
+            .require_application_traffic_authority_before(deadline)
             .await
             .is_err()
         {
@@ -2339,20 +2385,6 @@ impl ConsensusSessionStore {
             return ForwardMutationReply::RecordExpiryPreflight(Err(
                 StoreError::TopologyAuthorityRevoked,
             ));
-        }
-        let recovery_pending = match tokio::time::timeout_at(
-            deadline,
-            self.inner
-                .backend
-                .consensus_operator_recovery_pending(self.inner.storage_identity),
-        )
-        .await
-        {
-            Ok(Ok(pending)) => pending,
-            Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
-        };
-        if recovery_pending {
-            return ForwardMutationReply::Unavailable;
         }
         let proposal_permit = match tokio::time::timeout_at(
             deadline,
@@ -2371,7 +2403,7 @@ impl ConsensusSessionStore {
         {
             EnsureLinearizableOutcome::Ready { .. } => {
                 if self
-                    .require_durable_fixed_quorum_admission_before(deadline)
+                    .require_application_traffic_authority_before(deadline)
                     .await
                     .is_err()
                 {
@@ -2402,6 +2434,13 @@ impl ConsensusSessionStore {
         if persisted.is_some_and(|persisted| {
             validate_record_expiry_preflights_at(&preflights, persisted).is_ok()
         }) {
+            if self
+                .require_application_traffic_authority_before(deadline)
+                .await
+                .is_err()
+            {
+                return ForwardMutationReply::Unavailable;
+            }
             return ForwardMutationReply::RecordExpiryPreflight(Ok(()));
         }
         let authority_time = persisted.map_or_else(
@@ -2416,7 +2455,22 @@ impl ConsensusSessionStore {
             .copied()
             .any(RecordExpiryPreflight::is_finite)
         {
+            if self
+                .require_application_traffic_authority_before(deadline)
+                .await
+                .is_err()
+            {
+                return ForwardMutationReply::Unavailable;
+            }
             return ForwardMutationReply::RecordExpiryPreflight(Ok(()));
+        }
+
+        if self
+            .require_application_traffic_authority_before(deadline)
+            .await
+            .is_err()
+        {
+            return ForwardMutationReply::Unavailable;
         }
 
         let intent = SessionMutationIntent::AdvanceLogicalTime;
@@ -2634,29 +2688,24 @@ impl ConsensusSessionStore {
         {
             return ReadBarrierReply::Unavailable;
         }
-        let recovery_pending = tokio::time::timeout_at(
-            deadline,
-            self.inner
-                .backend
-                .consensus_operator_recovery_pending(self.inner.storage_identity),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or(true);
-        if recovery_pending {
-            return ReadBarrierReply::Unavailable;
+        match self.operator_recovery_pending_before(deadline).await {
+            Ok(true) => return ReadBarrierReply::RecoveryRequired,
+            Ok(false) => {}
+            Err(_) => return ReadBarrierReply::Unavailable,
         }
         match self.inner.read_barrier.admit(deadline).await {
             Ok(admit) => {
                 if self
                     .require_durable_fixed_quorum_admission_before(deadline)
                     .await
-                    .is_ok()
+                    .is_err()
                 {
-                    ReadBarrierReply::Ready(admit.read_log_id())
-                } else {
-                    ReadBarrierReply::Unavailable
+                    return ReadBarrierReply::Unavailable;
+                }
+                match self.operator_recovery_pending_before(deadline).await {
+                    Ok(false) => ReadBarrierReply::Ready(admit.read_log_id()),
+                    Ok(true) => ReadBarrierReply::RecoveryRequired,
+                    Err(_) => ReadBarrierReply::Unavailable,
                 }
             }
             Err(LinearizableReadBarrierError::Unavailable) => ReadBarrierReply::Unavailable,
@@ -2670,14 +2719,23 @@ impl ConsensusSessionStore {
     async fn linearizable_barrier_before(
         &self,
         deadline: tokio::time::Instant,
-    ) -> Result<Option<LogId<SessionConsensusNodeId>>, StoreError> {
+    ) -> Result<Option<LogId<SessionConsensusNodeId>>, LinearizableBarrierFailure> {
         self.require_durable_fixed_quorum_admission_before(deadline)
-            .await?;
+            .await
+            .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
+        match self.operator_recovery_pending_before(deadline).await {
+            Ok(false) => {}
+            Ok(true) => return Err(LinearizableBarrierFailure::RecoveryRequired),
+            Err(_) => return Err(LinearizableBarrierFailure::Unavailable),
+        }
         let mut preferred = None;
         loop {
             let leader = match preferred.take() {
                 Some(leader) => leader,
-                None => self.wait_for_known_leader(deadline).await?,
+                None => self
+                    .wait_for_known_leader(deadline)
+                    .await
+                    .map_err(|_| LinearizableBarrierFailure::Unavailable)?,
             };
             let reply = if leader == self.inner.local_node_id {
                 self.local_read_barrier(deadline).await
@@ -2693,7 +2751,9 @@ impl ConsensusSessionStore {
                 {
                     Ok(reply) => reply,
                     Err(_) => {
-                        self.wait_for_route_refresh(leader, deadline).await?;
+                        self.wait_for_route_refresh(leader, deadline)
+                            .await
+                            .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
                         continue;
                     }
                 }
@@ -2705,11 +2765,20 @@ impl ConsensusSessionStore {
                             .read_barrier
                             .wait_for_applied_index(log_id.index, deadline)
                             .await
-                            .map_err(|_| consensus_unavailable())?;
+                            .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
                     }
                     self.require_durable_fixed_quorum_admission_before(deadline)
-                        .await?;
+                        .await
+                        .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
+                    match self.operator_recovery_pending_before(deadline).await {
+                        Ok(false) => {}
+                        Ok(true) => return Err(LinearizableBarrierFailure::RecoveryRequired),
+                        Err(_) => return Err(LinearizableBarrierFailure::Unavailable),
+                    }
                     return Ok(log_id);
+                }
+                ReadBarrierReply::RecoveryRequired => {
+                    return Err(LinearizableBarrierFailure::RecoveryRequired);
                 }
                 ReadBarrierReply::NotLeader {
                     leader: next_leader,
@@ -2718,11 +2787,15 @@ impl ConsensusSessionStore {
                         *candidate != leader && self.is_current_member(*candidate)
                     });
                     if preferred.is_none() {
-                        self.wait_for_route_refresh(leader, deadline).await?;
+                        self.wait_for_route_refresh(leader, deadline)
+                            .await
+                            .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
                     }
                 }
                 ReadBarrierReply::Unavailable => {
-                    self.wait_for_route_refresh(leader, deadline).await?;
+                    self.wait_for_route_refresh(leader, deadline)
+                        .await
+                        .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
                 }
             }
         }
@@ -2757,6 +2830,8 @@ impl ConsensusSessionStore {
             .wait_for_applied_index(response.raft_log_index, deadline)
             .await
             .map_err(|_| consensus_unavailable())?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
         response.logical_time.ok_or_else(consensus_unavailable)
     }
 
@@ -2810,7 +2885,7 @@ impl ConsensusSessionStore {
             .backend
             .consensus_get_at(key, logical_time)
             .await?;
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.require_application_traffic_authority_before(deadline)
             .await?;
         Ok(record)
     }
@@ -2840,7 +2915,7 @@ impl ConsensusSessionStore {
             .backend
             .consensus_scan_restore_records_at(request, logical_time, deadline)
             .await?;
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.require_application_traffic_authority_before(deadline)
             .await?;
         Ok(page)
     }
@@ -3955,7 +4030,7 @@ impl SessionBackend for ConsensusSessionStore {
             .backend
             .consensus_get_at(key, logical_time)
             .await?;
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.require_application_traffic_authority_before(deadline)
             .await?;
         Ok(record)
     }
@@ -3999,7 +4074,7 @@ impl SessionBackend for ConsensusSessionStore {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.require_application_traffic_authority_before(deadline)
             .await?;
         let preflights = record_expiry_preflights(&ops)?;
         validate_consensus_batch(&ops)?;
@@ -4039,7 +4114,7 @@ impl SessionBackend for ConsensusSessionStore {
             .backend
             .consensus_scan_restore_records_at(request, logical_time, deadline)
             .await?;
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.require_application_traffic_authority_before(deadline)
             .await?;
         Ok(page)
     }
@@ -4054,7 +4129,7 @@ impl SessionBackend for ConsensusSessionStore {
             .backend
             .consensus_max_replication_sequence()
             .await?;
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.require_application_traffic_authority_before(deadline)
             .await?;
         Ok(sequence)
     }
@@ -4068,7 +4143,7 @@ impl SessionBackend for ConsensusSessionStore {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.require_application_traffic_authority_before(deadline)
             .await?;
         if range.is_empty() {
             return Ok(Vec::new());
@@ -4082,7 +4157,7 @@ impl SessionBackend for ConsensusSessionStore {
                 .consensus_get_replication_log(start, limit)
                 .await?,
         )?;
-        self.require_durable_fixed_quorum_admission_before(deadline)
+        self.require_application_traffic_authority_before(deadline)
             .await?;
         Ok(entries)
     }

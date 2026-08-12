@@ -1286,6 +1286,197 @@ async fn fixed_recovery_latch_terminates_an_idle_generic_watch_without_an_event(
 }
 
 #[tokio::test]
+async fn fixed_recovery_latch_during_readiness_barrier_never_grants_traffic() {
+    let (_directory, database_paths, stores, paths) =
+        open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    let admitted_at = TopologyAttestationTime::from_unix_seconds(1);
+    assert!(
+        stores[0]
+            .probe_fixed_durable_quorum_readiness_at(admitted_at)
+            .await
+            .traffic_authority()
+            .is_granted(),
+        "the detector requires an initially healthy fixed quorum"
+    );
+
+    for target in 1..3 {
+        paths
+            .get(&(0, target))
+            .expect("fixed outbound path")
+            .set_enabled(false);
+    }
+    let probe_store = stores[0].clone();
+    let readiness_probe = tokio::spawn(async move {
+        probe_store
+            .probe_fixed_durable_quorum_readiness_at(admitted_at)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !readiness_probe.is_finished(),
+        "the detector must hold readiness inside its quorum barrier"
+    );
+
+    let connection =
+        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
+    connection
+        .execute(
+            "UPDATE consensus_operator_recovery \
+             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
+             WHERE singleton = 1",
+            [],
+        )
+        .expect("activate durable fixed recovery latch during readiness barrier");
+    drop(connection);
+    for target in 1..3 {
+        paths
+            .get(&(0, target))
+            .expect("fixed outbound path")
+            .set_enabled(true);
+    }
+
+    let readiness = tokio::time::timeout(Duration::from_secs(12), readiness_probe)
+        .await
+        .expect("readiness must remain bounded after Recovery activation")
+        .expect("readiness task must not panic");
+    assert_eq!(
+        readiness.traffic_authority(),
+        FixedQuorumTrafficAuthority::RecoveryRequired,
+        "Recovery activated during a quorum barrier must revoke traffic before readiness returns"
+    );
+}
+
+#[tokio::test]
+async fn fixed_recovery_latch_during_ordinary_read_barrier_never_returns_data() {
+    let (_directory, database_paths, stores, paths) =
+        open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    let key = SessionKey {
+        tenant: TenantId::new("fixed-recovery-read-race").expect("test tenant"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: SessionKeyType::PduSession,
+        stable_id: b"fixed-recovery-read-race"
+            .as_slice()
+            .try_into()
+            .expect("bounded stable ID"),
+    };
+
+    for target in 1..3 {
+        paths
+            .get(&(0, target))
+            .expect("fixed outbound path")
+            .set_enabled(false);
+    }
+    let read_store = stores[0].clone();
+    let read_key = key.clone();
+    let read = tokio::spawn(async move { SessionBackend::get(&read_store, &read_key).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !read.is_finished(),
+        "the detector must hold the ordinary read inside its quorum barrier"
+    );
+
+    let connection =
+        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
+    connection
+        .execute(
+            "UPDATE consensus_operator_recovery \
+             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
+             WHERE singleton = 1",
+            [],
+        )
+        .expect("activate durable fixed recovery latch during ordinary read barrier");
+    drop(connection);
+    for target in 1..3 {
+        paths
+            .get(&(0, target))
+            .expect("fixed outbound path")
+            .set_enabled(true);
+    }
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(12), read)
+            .await
+            .expect("ordinary read must remain bounded after Recovery activation")
+            .expect("ordinary read task must not panic")
+            .is_err(),
+        "Recovery activated during a quorum barrier must revoke an ordinary read before return"
+    );
+}
+
+#[tokio::test]
+async fn fixed_recovery_latch_during_mutation_barrier_never_admits_new_lease() {
+    let (_directory, database_paths, stores, paths) =
+        open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    let key = SessionKey {
+        tenant: TenantId::new("fixed-recovery-mutation-race").expect("test tenant"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: SessionKeyType::PduSession,
+        stable_id: b"fixed-recovery-mutation-race"
+            .as_slice()
+            .try_into()
+            .expect("bounded stable ID"),
+    };
+
+    for target in 1..3 {
+        paths
+            .get(&(0, target))
+            .expect("fixed outbound path")
+            .set_enabled(false);
+    }
+    let mutation_store = stores[0].clone();
+    let mutation = tokio::spawn(async move {
+        mutation_store
+            .acquire(
+                &key,
+                OwnerId::new("fixed-recovery-mutation-owner").expect("test owner"),
+                Duration::from_secs(30),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !mutation.is_finished(),
+        "the detector must hold the mutation inside its quorum barrier"
+    );
+
+    let connection =
+        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
+    connection
+        .execute(
+            "UPDATE consensus_operator_recovery \
+             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
+             WHERE singleton = 1",
+            [],
+        )
+        .expect("activate durable fixed recovery latch during mutation barrier");
+    drop(connection);
+    for target in 1..3 {
+        paths
+            .get(&(0, target))
+            .expect("fixed outbound path")
+            .set_enabled(true);
+    }
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(12), mutation)
+            .await
+            .expect("mutation must remain bounded after Recovery activation")
+            .expect("mutation task must not panic")
+            .is_err(),
+        "Recovery activated during a quorum barrier must revoke mutation before proposal"
+    );
+    let connection =
+        rusqlite::Connection::open(&database_paths[0]).expect("reopen fixed voter database");
+    let record_count: u64 = connection
+        .query_row("SELECT COUNT(*) FROM session_records", [], |row| row.get(0))
+        .expect("count durable session records after rejected mutation");
+    assert_eq!(
+        record_count, 0,
+        "rejected mutation must have no durable effect"
+    );
+}
+
+#[tokio::test]
 async fn fixed_quorum_rejects_every_dynamic_transition_entry_point() {
     let topology = fixed_topology(fixed_members(3)).expect("fixed topology admission");
     let identity = topology.consensus_identity().expect("consensus identity");
