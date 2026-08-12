@@ -16,9 +16,9 @@ use std::sync::Arc;
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
 use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
 use opc_types::Timestamp;
-use rusqlite::{
-    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
-};
+#[cfg(target_os = "linux")]
+use rusqlite::OpenFlags;
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::backend::{
@@ -7711,10 +7711,6 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
 )> {
-    if authority_profile == ConsensusAuthorityProfile::Dynamic {
-        let destination = create_pinned_snapshot_database(path)?;
-        return build_snapshot_database_from_pinned_sync(conn, identity, destination);
-    }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
     validate_durable_authority_for_raw_access(
         &tx,
@@ -7743,6 +7739,9 @@ pub(crate) fn build_snapshot_database_with_authority_sync(
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     path: &std::path::Path,
 ) -> io::Result<ConsensusAppliedMembership> {
+    if authority_profile == ConsensusAuthorityProfile::Dynamic {
+        return build_snapshot_database_sync(conn, identity, path);
+    }
     build_snapshot_database_pinned_with_authority_sync(
         conn,
         identity,
@@ -7827,6 +7826,16 @@ fn matching_pinned_snapshot_descriptors(
         }
     }
     Ok(descriptors)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn matching_pinned_snapshot_descriptors(
+    _pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+) -> io::Result<BTreeSet<i32>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "pinned SQLite snapshot binding requires Linux",
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -8398,6 +8407,48 @@ fn drop_attached_snapshot_validation_views(conn: &Connection) -> io::Result<()> 
     Ok(())
 }
 
+/// Returns the authority profile stored by the exact attached snapshot.
+///
+/// Snapshots emitted before authority profiles were added have no column.
+/// They are unambiguously legacy Dynamic snapshots; Fixed authority did not
+/// exist in that durable format and must never infer its identity from it.
+fn read_attached_snapshot_authority_profile_sync(
+    conn: &Connection,
+) -> io::Result<Option<ConsensusAuthorityProfile>> {
+    let has_column: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM consensus_incoming.pragma_table_info('consensus_identity') WHERE name = 'authority_profile')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if !has_column {
+        return Ok(None);
+    }
+    let stored: Option<i64> = conn
+        .query_row(
+            "SELECT authority_profile FROM consensus_incoming.consensus_identity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error)?
+        .ok_or_else(|| invalid_data("session consensus snapshot authority profile is invalid"))?;
+    stored
+        .map(|value| {
+            authority_profile_from_i64(value).map_err(|_| {
+                invalid_data("session consensus snapshot authority profile is invalid")
+            })
+        })
+        .transpose()
+        .and_then(|value| {
+            value.ok_or_else(|| {
+                invalid_data("session consensus snapshot authority profile is invalid")
+            })
+        })
+        .map(Some)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_attached_snapshot_database_sync(
     conn: &Connection,
@@ -8427,13 +8478,14 @@ fn validate_attached_snapshot_database_sync(
     }
     validate_existing_schema(conn, identity)
         .map_err(|_| invalid_data("session consensus snapshot identity is invalid"))?;
-    if read_consensus_authority_profile_sync(conn)
-        .map_err(|_| invalid_data("session consensus snapshot authority profile is invalid"))?
-        != authority_profile
-    {
-        return Err(invalid_data(
-            "session consensus snapshot authority profile is invalid",
-        ));
+    match read_attached_snapshot_authority_profile_sync(conn)? {
+        Some(incoming_profile) if incoming_profile == authority_profile => {}
+        None if authority_profile == ConsensusAuthorityProfile::Dynamic => {}
+        Some(_) | None => {
+            return Err(invalid_data(
+                "session consensus snapshot authority profile is invalid",
+            ));
+        }
     }
     let incoming_scope = read_membership_scope_sync(conn, identity)?;
     if local_candidate_marker.is_some_and(|marker| {
@@ -8517,6 +8569,161 @@ fn validate_attached_snapshot_database_sync(
         }
     }
     Ok(())
+}
+
+fn replace_state_from_attached_snapshot_sync(
+    tx: &Transaction<'_>,
+    identity: SessionConsensusIdentity,
+    meta: &opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    final_file_name: &str,
+    checksum: [u8; 32],
+    byte_length: i64,
+) -> io::Result<()> {
+    for (table, columns) in [
+        (
+            "session_records",
+            "tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding",
+        ),
+        (
+            "leases",
+            "tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at",
+        ),
+        (
+            "key_fences",
+            "tenant, nf_kind, key_type, stable_id, fence",
+        ),
+        ("lease_globals", "key, val"),
+        (
+            "session_replication_log",
+            "sequence, tx_id, entry_json, timestamp",
+        ),
+        (
+            "consensus_request_outcomes",
+            "request_id, configuration_epoch, payload_digest, response_json",
+        ),
+        (
+            "consensus_machine",
+            "singleton, configuration_epoch, application_sequence, last_digest, logical_time, watch_sequence",
+        ),
+        (
+            "consensus_membership",
+            "singleton, configuration_epoch, membership_json",
+        ),
+        (
+            "consensus_membership_scope",
+            "singleton, storage_configuration_epoch, current_configuration_id, current_configuration_epoch, current_members_json, current_bindings_json, application_authority_epoch, application_authority_members_json, predecessor_configuration_id, predecessor_transition_id, predecessor_transition_digest, predecessor_configuration_epoch, predecessor_members_json, predecessor_transition_start_index, predecessor_cutover_index, pending_transition_id, pending_transition_digest, desired_configuration_id, desired_configuration_epoch, desired_members_json, desired_bindings_json, pending_transition_start_index, pending_learners_ready_index, pending_joint_membership_index, pending_uniform_membership_index, terminal_transition_id, terminal_transition_digest, terminal_transition_outcome, terminal_transition_start_index, terminal_learners_ready_index, terminal_joint_membership_index, terminal_uniform_membership_index, terminal_cutover_index, terminal_finalization_index, terminal_desired_configuration_id, terminal_desired_configuration_epoch, terminal_desired_members_json, terminal_desired_bindings_json, terminal_abort_learners_json, terminal_abort_decision_index, terminal_abort_cleanup_membership_index",
+        ),
+        (
+            "consensus_membership_history",
+            "configuration_epoch, storage_configuration_epoch, configuration_id, members_json, transition_id, transition_digest, transition_start_index, cutover_index",
+        ),
+        (
+            "consensus_membership_terminal_history",
+            "transition_id, storage_configuration_epoch, transition_digest, outcome, expected_member_count, transition_start_index, learners_ready_index, joint_membership_index, uniform_membership_index, cutover_index, finalization_index, abort_decision_index, abort_cleanup_membership_index",
+        ),
+        (
+            "consensus_applied",
+            "singleton, configuration_epoch, term, log_index, log_id_json",
+        ),
+        (
+            "consensus_operator_recovery",
+            "singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor",
+        ),
+        ("restore_scan_state", "singleton, epoch, revision, cursor_key"),
+    ] {
+        tx.execute(&format!("DELETE FROM {table}"), [])
+            .map_err(db_error)?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {table} ({columns}) SELECT {columns} FROM consensus_incoming.{table}"
+            ),
+            [],
+        )
+        .map_err(db_error)?;
+    }
+    ops::rotate_restore_scan_incarnation_sync(tx)
+        .map_err(|_| invalid_data("installed session snapshot restore metadata failed"))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO consensus_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        params![
+            epoch_i64(identity)?,
+            encode_json(meta)?,
+            final_file_name,
+            checksum.as_slice(),
+            byte_length,
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_dynamic_snapshot_database_from_path_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    snapshot_db_path: &Path,
+    meta: &opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    final_file_name: &str,
+    checksum: [u8; 32],
+    byte_length: u64,
+) -> io::Result<()> {
+    let incoming_last_log_id = meta.last_log_id.as_ref();
+    validate_snapshot_floor(conn, identity, incoming_last_log_id)?;
+    let expected_scope = read_membership_scope_sync(conn, identity)?;
+    let local_candidate_marker = read_candidate_bootstrap_marker_sync(conn, identity)?;
+    if final_file_name.is_empty()
+        || final_file_name.contains('/')
+        || final_file_name.contains('\\')
+        || final_file_name == "."
+        || final_file_name == ".."
+    {
+        return Err(invalid_data("invalid session consensus snapshot file name"));
+    }
+    let byte_length = checked_positive_i64(byte_length)?;
+    let snapshot_path = snapshot_db_path
+        .to_str()
+        .ok_or_else(|| invalid_data("session consensus snapshot path is not UTF-8"))?;
+    conn.execute("ATTACH DATABASE ?1 AS consensus_incoming", [snapshot_path])
+        .map_err(db_error)?;
+    let result = (|| {
+        let tx =
+            Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+        validate_snapshot_floor(&tx, identity, incoming_last_log_id)?;
+        create_attached_snapshot_validation_views(&tx)?;
+        let validation = validate_attached_snapshot_database_sync(
+            &tx,
+            identity,
+            ConsensusAuthorityProfile::Dynamic,
+            &expected_scope,
+            None,
+            None,
+            None,
+            local_candidate_marker,
+            meta,
+        );
+        let drop_views = drop_attached_snapshot_validation_views(&tx);
+        validation?;
+        drop_views?;
+        replace_state_from_attached_snapshot_sync(
+            &tx,
+            identity,
+            meta,
+            final_file_name,
+            checksum,
+            byte_length,
+        )?;
+        tx.commit().map_err(db_error)
+    })();
+    let detach = conn
+        .execute("DETACH DATABASE consensus_incoming", [])
+        .map_err(db_error);
+    result.and(detach.map(|_| ()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8630,6 +8837,17 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
     checksum: [u8; 32],
     byte_length: u64,
 ) -> io::Result<()> {
+    if authority_profile == ConsensusAuthorityProfile::Dynamic {
+        return install_dynamic_snapshot_database_from_path_sync(
+            conn,
+            identity,
+            pinned.path(),
+            meta,
+            final_file_name,
+            checksum,
+            byte_length,
+        );
+    }
     let incoming_last_log_id = meta.last_log_id.as_ref();
     validate_snapshot_floor(conn, identity, incoming_last_log_id)?;
     let expected_scope = read_membership_scope_sync(conn, identity)?;
@@ -12882,6 +13100,94 @@ mod tests {
             byte_length,
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_dynamic_snapshot_without_authority_columns_installs() {
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.lock().await;
+        let identity = identity();
+        let dynamic_members = expected_members();
+        initialize_schema(&source_conn, identity, &dynamic_members)
+            .expect("initialize dynamic source");
+        apply_entries_sync(
+            &source_conn,
+            identity,
+            &source.caps,
+            vec![membership_entry_at(
+                0,
+                vec![dynamic_members.clone()],
+                dynamic_members.clone(),
+            )],
+        )
+        .expect("apply source membership");
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("legacy-dynamic.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity, &snapshot_path)
+                .expect("build dynamic snapshot");
+        drop(source_conn);
+
+        let legacy_snapshot = Connection::open(&snapshot_path).expect("open snapshot fixture");
+        legacy_snapshot
+            .execute_batch(
+                "ALTER TABLE consensus_identity DROP COLUMN authority_profile;\
+                 ALTER TABLE consensus_identity DROP COLUMN fixed_placement_policy;",
+            )
+            .expect("remove post-release authority columns");
+        drop(legacy_snapshot);
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.lock().await;
+        initialize_schema(&target_conn, identity, &dynamic_members)
+            .expect("initialize dynamic target");
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "legacy-dynamic-snapshot".into(),
+        };
+        install_snapshot_database_with_profile_sync(
+            &target_conn,
+            identity,
+            ConsensusAuthorityProfile::Dynamic,
+            &snapshot_path,
+            &meta,
+            "legacy-dynamic.opc",
+            [0x94; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("legacy snapshot metadata")
+                .len(),
+        )
+        .expect("released dynamic snapshot installs after upgrade");
+        assert_eq!(
+            Some(log_id(0)),
+            read_applied_sync(&target_conn, identity).expect("read installed dynamic snapshot")
+        );
+
+        let fixed_target = SqliteSessionBackend::in_memory().expect("fixed target backend");
+        let fixed_conn = fixed_target.conn.lock().await;
+        let fixed_members = members(&[7, 8, 9]);
+        initialize_schema_with_profile(
+            &fixed_conn,
+            identity,
+            &fixed_members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed target");
+        let error = install_snapshot_database_with_profile_sync(
+            &fixed_conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &snapshot_path,
+            &meta,
+            "legacy-dynamic-fixed.opc",
+            [0x95; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("legacy snapshot metadata")
+                .len(),
+        )
+        .expect_err("fixed authority must reject a legacy dynamic snapshot");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
     }
 
     #[tokio::test]

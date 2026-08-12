@@ -20,8 +20,8 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteE
 ///
 /// On Linux this is deliberately based on the descriptor rather than its
 /// pathname, which makes it stable when a snapshot name is atomically
-/// replaced. Other platforms keep the type available so callers can compile,
-/// but cannot yet bind a descriptor to SQLite.
+/// replaced. Other platforms retain the handle wrapper for portable Dynamic
+/// snapshot transport; only Linux can use it as a SQLite descriptor binding.
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,10 +242,7 @@ fn file_identity(metadata: &std::fs::Metadata) -> io::Result<FileIdentity> {
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
 fn file_identity(_metadata: &std::fs::Metadata) -> io::Result<FileIdentity> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "pinned SQLite file identity is only supported on Linux",
-    ))
+    Ok(FileIdentity)
 }
 
 fn snapshot_open_options(create_new: bool, read: bool, write: bool) -> tokio::fs::OpenOptions {

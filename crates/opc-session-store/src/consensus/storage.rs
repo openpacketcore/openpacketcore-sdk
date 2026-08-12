@@ -897,15 +897,22 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 consensus::invalid_data("session consensus promoted snapshot is inconsistent"),
             ));
         }
-        let promoted_pin = snapshot_handle_pin(&promoted_snapshot, &final_path)
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
+        let promoted_pin =
+            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                Some(
+                    snapshot_handle_pin(&promoted_snapshot, &final_path)
+                        .await
+                        .map_err(|error| {
+                            storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                error,
+                            )
+                        })?,
                 )
-            })?;
+            } else {
+                None
+            };
 
         let installs_uniform_cutover =
             self.membership_admission.as_ref().is_some_and(|admission| {
@@ -926,21 +933,25 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                         error,
                     )
                 })?;
-            if !promoted_pin
-                .path_matches_identity(&final_path)
-                .map_err(|error| {
-                    storage_error(
+            if let Some(promoted_pin) = &promoted_pin {
+                if !promoted_pin
+                    .path_matches_identity(&final_path)
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?
+                {
+                    return Err(storage_error(
                         ErrorSubject::Snapshot(Some(meta.signature())),
                         ErrorVerb::Read,
-                        error,
-                    )
-                })?
-            {
-                return Err(storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    consensus::invalid_data("session consensus published snapshot was replaced"),
-                ));
+                        consensus::invalid_data(
+                            "session consensus published snapshot was replaced",
+                        ),
+                    ));
+                }
             }
             match consensus::install_snapshot_database_from_pinned_with_authority_sync(
                 &conn,
@@ -950,7 +961,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 Some(&self.core.expected_bindings),
                 self.core.fixed_placement_policy,
                 raw_snapshot,
-                Some((&promoted_pin, &final_path)),
+                promoted_pin.as_ref().map(|pin| (pin, final_path.as_path())),
                 meta,
                 &file_name,
                 checksum,
@@ -1102,31 +1113,59 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             .core
             .snapshot_dir
             .join(format!("build-{}.sqlite", uuid::Uuid::new_v4()));
-        let ((last_log_id, last_membership), raw_snapshot) = {
-            let conn = self.core.conn.lock().await;
-            consensus::build_snapshot_database_pinned_with_authority_sync(
-                &conn,
-                self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                &raw_path,
-            )
-            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))?
-        };
         let file_name = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
         let final_path = self.core.snapshot_dir.join(&file_name);
         let temporary_path = self
             .core
             .snapshot_dir
             .join(format!("seal-{}.part", uuid::Uuid::new_v4()));
-        let (mut snapshot, checksum, byte_length) =
-            seal_snapshot_database(raw_snapshot, &temporary_path, &final_path)
-                .await
+        let ((last_log_id, last_membership), (mut snapshot, checksum, byte_length)) =
+            if self.core.authority_profile == ConsensusAuthorityProfile::Dynamic {
+                let membership = {
+                    let conn = self.core.conn.lock().await;
+                    consensus::build_snapshot_database_with_authority_sync(
+                        &conn,
+                        self.core.storage_identity,
+                        self.core.authority_profile,
+                        &self.core.expected_members,
+                        &self.core.expected_bindings,
+                        self.core.fixed_placement_policy,
+                        &raw_path,
+                    )
+                }
                 .map_err(|error| {
                     storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
                 })?;
+                let sealed =
+                    seal_snapshot_database_from_path(&raw_path, &temporary_path, &final_path)
+                        .await
+                        .map_err(|error| {
+                            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                        })?;
+                (membership, sealed)
+            } else {
+                let (membership, raw_snapshot) = {
+                    let conn = self.core.conn.lock().await;
+                    consensus::build_snapshot_database_pinned_with_authority_sync(
+                        &conn,
+                        self.core.storage_identity,
+                        self.core.authority_profile,
+                        &self.core.expected_members,
+                        &self.core.expected_bindings,
+                        self.core.fixed_placement_policy,
+                        &raw_path,
+                    )
+                }
+                .map_err(|error| {
+                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                })?;
+                let sealed = seal_snapshot_database(raw_snapshot, &temporary_path, &final_path)
+                    .await
+                    .map_err(|error| {
+                        storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                    })?;
+                (membership, sealed)
+            };
         tokio::fs::rename(&temporary_path, &final_path)
             .await
             .map_err(|error| {
@@ -1141,15 +1180,22 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             last_membership,
             snapshot_id,
         };
-        let published_pin = snapshot_handle_pin(&snapshot, &final_path)
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
+        let published_pin =
+            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                Some(
+                    snapshot_handle_pin(&snapshot, &final_path)
+                        .await
+                        .map_err(|error| {
+                            storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                error,
+                            )
+                        })?,
                 )
-            })?;
+            } else {
+                None
+            };
         let previous = {
             let conn = self.core.conn.lock().await;
             let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
@@ -1160,21 +1206,25 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                         error,
                     )
                 })?;
-            if !published_pin
-                .path_matches_identity(&final_path)
-                .map_err(|error| {
-                    storage_error(
+            if let Some(published_pin) = &published_pin {
+                if !published_pin
+                    .path_matches_identity(&final_path)
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?
+                {
+                    return Err(storage_error(
                         ErrorSubject::Snapshot(Some(meta.signature())),
                         ErrorVerb::Read,
-                        error,
-                    )
-                })?
-            {
-                return Err(storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    consensus::invalid_data("session consensus published snapshot was replaced"),
-                ));
+                        consensus::invalid_data(
+                            "session consensus published snapshot was replaced",
+                        ),
+                    ));
+                }
             }
             consensus::save_current_snapshot_with_authority_sync(
                 &conn,
@@ -1330,6 +1380,65 @@ async fn seal_snapshot_database(
     // `output` is the same descriptor that will survive the caller's atomic
     // promotion from `output_path` to `final_path`; the diagnostic path is
     // therefore deliberately the eventual published name, never reopened.
+    let snapshot = SessionSnapshotFile::from_file(output, final_path.to_path_buf()).await?;
+    let total = payload_length
+        .checked_add(SNAPSHOT_FOOTER_BYTES)
+        .ok_or_else(|| consensus::invalid_data("session consensus snapshot length overflow"))?;
+    Ok((snapshot, checksum, total))
+}
+
+/// Seal a Dynamic snapshot using the portable path-based SQLite image flow.
+///
+/// Dynamic consensus intentionally retains the released cross-platform
+/// behavior. Fixed authority uses `seal_snapshot_database` above, whose
+/// descriptor pinning remains an additional Linux-only identity fence.
+async fn seal_snapshot_database_from_path(
+    raw_path: &Path,
+    output_path: &Path,
+    final_path: &Path,
+) -> io::Result<(SessionSnapshotFile, [u8; 32], u64)> {
+    let payload_length = tokio::fs::metadata(raw_path).await?.len();
+    if payload_length == 0 || payload_length > SNAPSHOT_MAX_BYTES {
+        return Err(consensus::invalid_data(
+            "session consensus snapshot size is invalid",
+        ));
+    }
+    let mut source = tokio::fs::File::open(raw_path).await?;
+    let mut output = secure_snapshot_create_options(true)
+        .open(output_path)
+        .await?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(u64::try_from(read).map_err(|_| {
+                consensus::invalid_data("session consensus snapshot length overflow")
+            })?)
+            .ok_or_else(|| consensus::invalid_data("session consensus snapshot length overflow"))?;
+        if copied > SNAPSHOT_MAX_BYTES {
+            return Err(consensus::invalid_data(
+                "session consensus snapshot exceeds size limit",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        output.write_all(&buffer[..read]).await?;
+    }
+    if copied != payload_length {
+        return Err(consensus::invalid_data(
+            "session consensus snapshot changed while sealing",
+        ));
+    }
+    let checksum: [u8; 32] = hasher.finalize().into();
+    output.write_all(SNAPSHOT_FOOTER_MAGIC).await?;
+    output.write_all(&payload_length.to_be_bytes()).await?;
+    output.write_all(&checksum).await?;
+    output.flush().await?;
+    output.sync_all().await?;
     let snapshot = SessionSnapshotFile::from_file(output, final_path.to_path_buf()).await?;
     let total = payload_length
         .checked_add(SNAPSHOT_FOOTER_BYTES)
