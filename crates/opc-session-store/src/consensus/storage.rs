@@ -60,6 +60,19 @@ pub enum SessionConsensusStorageError {
     BackendUnavailable,
 }
 
+/// Immutable authority model bound to one durable consensus database.
+///
+/// Dynamic authority permits the existing staged membership-transition model.
+/// Fixed authority is set only when a pristine database is first admitted and
+/// requires the original storage identity on every later open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsensusAuthorityProfile {
+    /// The durable store uses the normal dynamic-membership authority model.
+    Dynamic,
+    /// The durable store is permanently bound to one exact fixed quorum.
+    FixedImmutable,
+}
+
 /// Serialized Openraft vote/log persistence.
 #[derive(Clone)]
 pub(crate) struct SqliteConsensusLogStore {
@@ -130,12 +143,72 @@ pub(crate) async fn open_with_member_bindings(
     ),
     SessionConsensusStorageError,
 > {
+    open_with_member_bindings_for_profile(
+        backend,
+        snapshot_dir,
+        identity,
+        expected_members,
+        expected_bindings,
+        membership_admission,
+        ConsensusAuthorityProfile::Dynamic,
+    )
+    .await
+}
+
+/// Open one durable fixed-quorum authority store.
+///
+/// Unlike the dynamic entry point, this binds the original durable storage
+/// identity to `identity` permanently and rejects membership transitions.
+pub(crate) async fn open_fixed_with_member_bindings(
+    backend: &SqliteSessionBackend,
+    snapshot_dir: impl Into<PathBuf>,
+    identity: SessionConsensusIdentity,
+    expected_members: BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    membership_admission: SessionRaftPeerDirectory,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
+    open_with_member_bindings_for_profile(
+        backend,
+        snapshot_dir,
+        identity,
+        expected_members,
+        expected_bindings,
+        membership_admission,
+        ConsensusAuthorityProfile::FixedImmutable,
+    )
+    .await
+}
+
+async fn open_with_member_bindings_for_profile(
+    backend: &SqliteSessionBackend,
+    snapshot_dir: impl Into<PathBuf>,
+    identity: SessionConsensusIdentity,
+    expected_members: BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    membership_admission: SessionRaftPeerDirectory,
+    authority_profile: ConsensusAuthorityProfile,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
     let core = SqliteConsensusCore::initialize(
         backend,
         snapshot_dir.into(),
         identity,
         expected_members,
         expected_bindings,
+        authority_profile,
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
@@ -181,6 +254,7 @@ async fn open(
         identity,
         expected_members,
         bindings,
+        ConsensusAuthorityProfile::Dynamic,
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
@@ -237,6 +311,7 @@ pub(crate) async fn open_with_pending_membership(
             desired_members,
             desired_bindings,
         },
+        ConsensusAuthorityProfile::Dynamic,
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
@@ -695,9 +770,10 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                         error,
                     )
                 })?;
-            match consensus::install_snapshot_database_sync(
+            match consensus::install_snapshot_database_with_profile_sync(
                 &conn,
                 self.core.storage_identity,
+                self.core.authority_profile,
                 &raw_path,
                 meta,
                 &file_name,

@@ -564,6 +564,15 @@ impl SqliteSessionBackend {
         self.caps
     }
 
+    /// Whether consensus state is backed by a filesystem database.
+    ///
+    /// Fixed durable quorums reject ephemeral in-memory stores. This is a
+    /// durability-shape check, not a claim about physical failure domains or
+    /// concrete volume identity.
+    pub(crate) const fn is_file_backed(&self) -> bool {
+        self.database_path.is_some()
+    }
+
     /// Read the last committed state-machine logical time after a caller-owned
     /// Openraft linearizable barrier. This path is read-only and allocates no
     /// sequencing authority.

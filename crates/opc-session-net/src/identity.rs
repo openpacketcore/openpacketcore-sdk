@@ -17,8 +17,8 @@ use opc_session_store::ReplicaBackingIdentity;
 #[cfg(any(feature = "legacy-session-net-compat", test))]
 use opc_session_store::{BackendPeerBinding, BackendPeerScopeIdentity};
 use opc_session_store::{
-    QuorumReplicaDescriptor, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
-    QUORUM_TOPOLOGY_MAX_MEMBERS,
+    PlacementResiliencePolicy, QuorumReplicaDescriptor, ReplicaEndpoint, ReplicaFailureDomain,
+    ReplicaId, ReplicaTlsIdentity, QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
 use opc_types::SpiffeId;
 use sha2::{Digest, Sha256};
@@ -59,6 +59,26 @@ pub enum SessionManifestError {
     MissingLocalReplica,
     #[error("remote replica is not present in the session replication manifest")]
     MissingRemoteReplica,
+}
+
+/// Admission policy shared with fixed durable-quorum placement reporting.
+///
+/// The default requires distinct declared failure-domain descriptors.
+/// Reduced resilience is an explicit deployment decision; it never relaxes
+/// replica, endpoint, TLS identity, or backing-identity uniqueness.
+pub type SessionPlacementPolicy = PlacementResiliencePolicy;
+
+/// Redaction-safe disposition of caller-declared placement descriptors.
+///
+/// This disposition never claims independently verified physical placement.
+/// That claim requires a separate authenticated platform-evidence boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionPlacementDisposition {
+    /// Every admitted replica declared a distinct failure-domain descriptor.
+    DistinctDeclaredFailureDomains,
+    /// The explicit policy admitted one or more duplicate failure domains.
+    ExplicitlyAllowedCorrelatedFailureDomains,
 }
 
 fn validate_opaque(value: String, max_bytes: usize) -> Result<String, ()> {
@@ -160,6 +180,8 @@ pub struct SessionReplicationManifest {
     cluster_id: SessionClusterId,
     configuration_id: SessionConfigurationId,
     configuration_epoch: SessionConfigurationEpoch,
+    placement_policy: SessionPlacementPolicy,
+    placement_disposition: SessionPlacementDisposition,
     consensus_identity: SessionConsensusIdentity,
     members: BTreeMap<ReplicaId, ManifestMember>,
     node_ids: BTreeMap<ReplicaId, SessionConsensusNodeId>,
@@ -195,6 +217,27 @@ impl SessionReplicationManifest {
         configuration_epoch: SessionConfigurationEpoch,
         descriptors: Vec<QuorumReplicaDescriptor>,
     ) -> Result<Self, SessionManifestError> {
+        Self::try_new_with_epoch_and_placement_policy(
+            cluster_id,
+            generation,
+            configuration_epoch,
+            descriptors,
+            SessionPlacementPolicy::RequireIndependentFailureDomains,
+        )
+    }
+
+    /// Validate a complete descriptor set using an explicit placement policy.
+    ///
+    /// This is the only manifest constructor that may admit correlated
+    /// failure domains. All authenticated peer identity uniqueness checks
+    /// remain mandatory under either policy.
+    pub fn try_new_with_epoch_and_placement_policy(
+        cluster_id: SessionClusterId,
+        generation: SessionConfigurationGeneration,
+        configuration_epoch: SessionConfigurationEpoch,
+        descriptors: Vec<QuorumReplicaDescriptor>,
+        placement_policy: SessionPlacementPolicy,
+    ) -> Result<Self, SessionManifestError> {
         if descriptors.is_empty() {
             return Err(SessionManifestError::EmptyMembership);
         }
@@ -208,6 +251,7 @@ impl SessionReplicationManifest {
         let mut failure_domains = HashSet::<ReplicaFailureDomain>::with_capacity(descriptors.len());
         let mut backing_identities = HashSet::with_capacity(descriptors.len());
         let mut members = BTreeMap::new();
+        let mut has_correlated_failure_domains = false;
 
         for descriptor in descriptors {
             if !replica_ids.insert(descriptor.replica_id().clone()) {
@@ -220,7 +264,15 @@ impl SessionReplicationManifest {
                 return Err(SessionManifestError::DuplicateEndpoint);
             }
             if !failure_domains.insert(descriptor.failure_domain().clone()) {
-                return Err(SessionManifestError::DuplicateFailureDomain);
+                match placement_policy {
+                    SessionPlacementPolicy::RequireIndependentFailureDomains => {
+                        return Err(SessionManifestError::DuplicateFailureDomain);
+                    }
+                    SessionPlacementPolicy::AllowReducedResilience => {
+                        has_correlated_failure_domains = true;
+                    }
+                    _ => return Err(SessionManifestError::DuplicateFailureDomain),
+                }
             }
             if !backing_identities.insert(descriptor.backing_identity().clone()) {
                 return Err(SessionManifestError::DuplicateBackingIdentity);
@@ -276,10 +328,18 @@ impl SessionReplicationManifest {
             node_ids.insert(replica_id.clone(), node_id);
         }
 
+        let placement_disposition = if has_correlated_failure_domains {
+            SessionPlacementDisposition::ExplicitlyAllowedCorrelatedFailureDomains
+        } else {
+            SessionPlacementDisposition::DistinctDeclaredFailureDomains
+        };
+
         Ok(Self {
             cluster_id,
             configuration_id,
             configuration_epoch,
+            placement_policy,
+            placement_disposition,
             consensus_identity,
             members,
             node_ids,
@@ -297,6 +357,16 @@ impl SessionReplicationManifest {
     /// Monotonic operator-controlled consensus configuration epoch.
     pub const fn configuration_epoch(&self) -> SessionConfigurationEpoch {
         self.configuration_epoch
+    }
+
+    /// Explicit placement policy used when this manifest was admitted.
+    pub const fn placement_policy(&self) -> SessionPlacementPolicy {
+        self.placement_policy
+    }
+
+    /// Placement resilience fact derived at manifest admission.
+    pub const fn placement_disposition(&self) -> SessionPlacementDisposition {
+        self.placement_disposition
     }
 
     /// Exact cluster/configuration/epoch identity carried on consensus RPCs.
@@ -364,6 +434,8 @@ impl fmt::Debug for SessionReplicationManifest {
             .field("cluster_id", &self.cluster_id)
             .field("configuration_id", &self.configuration_id)
             .field("configuration_epoch", &self.configuration_epoch)
+            .field("placement_policy", &self.placement_policy)
+            .field("placement_disposition", &self.placement_disposition)
             .field("configured_members", &self.members.len())
             .finish()
     }

@@ -63,7 +63,8 @@ use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{OwnerId, SessionKey};
 use crate::readiness::{
     DurableReadinessReport, DurableReadinessState, DurableRecoveryProgress, DurableRecoveryState,
-    ReplicaReadinessObservation, ReplicaReadinessOutcome,
+    FixedQuorumReadinessReport, FixedQuorumTrafficAuthority, PlacementResiliencePolicy,
+    PlacementResilienceReport, ReplicaReadinessObservation, ReplicaReadinessOutcome,
 };
 use crate::record::SessionPayloadEncoding;
 use crate::record::StoredSessionRecord;
@@ -382,6 +383,7 @@ struct ConsensusSessionStoreInner {
     peer_directory: SessionRaftPeerDirectory,
     topology_coordinator: Arc<SessionTopologyCoordinatorState>,
     bootstrap_members: BTreeSet<SessionConsensusNodeId>,
+    bootstrap_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     topology: QuorumTopologySummary,
     clock: Arc<dyn Clock>,
     operation_timeout: Duration,
@@ -455,6 +457,129 @@ impl ConsensusSessionStore {
             DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
         )
         .await
+    }
+
+    /// Start one immutable fixed three- or five-voter durable quorum node.
+    ///
+    /// This path requires a fixed-quorum topology, exact scope-bound
+    /// authenticated remote peers. Dynamic membership construction remains
+    /// separate and is intentionally unavailable for this immutable quorum
+    /// profile.
+    pub async fn open_fixed_durable_quorum(
+        topology: ValidatedQuorumTopology,
+        backend: SqliteSessionBackend,
+        snapshot_dir: impl Into<PathBuf>,
+        peers: BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
+    ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        let operation_timeout = DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
+        if topology.summary().mode() != QuorumTopologyMode::FixedDurableQuorum {
+            return Err(ConsensusSessionStoreOpenError::InvalidTopology);
+        }
+        if !backend.is_file_backed() {
+            return Err(ConsensusSessionStoreOpenError::StorageUnavailable);
+        }
+        let identity = topology
+            .consensus_identity()
+            .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
+        let local_node_id = topology
+            .local_consensus_node_id()
+            .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
+        let members = topology
+            .members()
+            .iter()
+            .map(|descriptor| {
+                topology
+                    .consensus_node_id(descriptor.replica_id())
+                    .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if !matches!(members.len(), 3 | 5)
+            || members.len() != topology.summary().configured_members()
+            || !members.contains(&local_node_id)
+        {
+            return Err(ConsensusSessionStoreOpenError::InvalidTopology);
+        }
+        let expected_peers = members
+            .iter()
+            .copied()
+            .filter(|node_id| *node_id != local_node_id)
+            .collect::<BTreeSet<_>>();
+        if peers.keys().copied().collect::<BTreeSet<_>>() != expected_peers
+            || peers.iter().any(|(node_id, peer)| {
+                peer.node_id() != *node_id || peer.scope_identity() != Some(identity)
+            })
+        {
+            return Err(ConsensusSessionStoreOpenError::PeerSetMismatch);
+        }
+        let topology_coordinator = Arc::new(SessionTopologyCoordinatorState::try_from_topology(
+            &topology,
+        )?);
+        let network =
+            SessionRaftNetworkFactory::try_new(identity, local_node_id, members.clone(), peers)?;
+        let peer_directory = network.peer_directory();
+        let bindings = topology_node_bindings(&topology);
+        let (log_store, state_machine, storage_identity) =
+            storage::open_fixed_with_member_bindings(
+                &backend,
+                snapshot_dir,
+                identity,
+                members.clone(),
+                bindings.clone(),
+                peer_directory.clone(),
+            )
+            .await?;
+        let (membership_scope, _) = backend
+            .consensus_membership_scope_snapshot(storage_identity)
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
+        topology_coordinator
+            .load_retained_transitions(&membership_scope)
+            .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
+        let config = Arc::new(session_raft_config()?);
+        let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
+        let raft_handler =
+            SessionRaftRpcHandler::new(raft.clone(), peer_directory.clone(), local_node_id);
+        let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
+        let read_barrier = LinearizableReadBarrier::new(
+            local_node_id,
+            linearizability.clone(),
+            raft.metrics(),
+            LinearizableReadLease::Disabled,
+        );
+        let topology_summary = topology.summary().clone();
+        let topology_attestation_time_high_water = topology_summary
+            .attestation_admission()
+            .production_verified_at()
+            .map(TopologyAttestationTime::unix_seconds)
+            .unwrap_or(0);
+
+        Ok(Self {
+            inner: Arc::new(ConsensusSessionStoreInner {
+                raft,
+                raft_handler,
+                backend,
+                storage_identity,
+                local_node_id,
+                peer_directory,
+                topology_coordinator,
+                bootstrap_members: members,
+                bootstrap_bindings: bindings,
+                topology: topology_summary,
+                clock: Arc::new(SystemClock),
+                operation_timeout,
+                admitted: AtomicBool::new(false),
+                topology_attestation_time_high_water: AtomicU64::new(
+                    topology_attestation_time_high_water,
+                ),
+                linearizability,
+                read_barrier,
+                proposal_admission: Arc::new(tokio::sync::Semaphore::new(
+                    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+                )),
+            }),
+        })
     }
 
     /// Start one durable Openraft node with a bounded complete operation
@@ -546,7 +671,7 @@ impl ConsensusSessionStore {
             snapshot_dir,
             identity,
             members.clone(),
-            bindings,
+            bindings.clone(),
             peer_directory.clone(),
         )
         .await?;
@@ -587,6 +712,7 @@ impl ConsensusSessionStore {
                 peer_directory,
                 topology_coordinator,
                 bootstrap_members: members,
+                bootstrap_bindings: bindings,
                 topology: topology_summary,
                 clock,
                 operation_timeout,
@@ -693,6 +819,9 @@ impl ConsensusSessionStore {
             .await
             .map_err(|_| SessionConsumerRejection::Unavailable)?;
         self.consumer_scope_is_current(scope)?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await
+            .map_err(|_| SessionConsumerRejection::Unavailable)?;
         Ok(ConsumerScopeAdmission {
             required_scope: scope.consensus_identity(),
             _operation_guard: operation_guard,
@@ -735,6 +864,11 @@ impl ConsensusSessionStore {
             }
         }
         self.wait_for_exact_membership(deadline).await?;
+        if self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
+            && !self.durable_fixed_quorum_scope_is_exact().await?
+        {
+            return Err(ConsensusSessionStoreOpenError::ClusterFormationRejected);
+        }
         self.inner.admitted.store(true, Ordering::Release);
         if !self.exact_membership_is_admitted() {
             return Err(ConsensusSessionStoreOpenError::ClusterFormationRejected);
@@ -836,9 +970,9 @@ impl ConsensusSessionStore {
             {
                 SessionStorePlatformProfile::Quorum
             }
-            QuorumTopologyMode::ValidatedHa | QuorumTopologyMode::AttestedHa => {
-                SessionStorePlatformProfile::Unknown
-            }
+            QuorumTopologyMode::ValidatedHa
+            | QuorumTopologyMode::AttestedHa
+            | QuorumTopologyMode::FixedDurableQuorum => SessionStorePlatformProfile::Unknown,
         }
     }
 
@@ -932,7 +1066,10 @@ impl ConsensusSessionStore {
     }
 
     fn exact_membership_is_admitted(&self) -> bool {
-        self.inner.admitted.load(Ordering::Acquire) && self.engine_is_running_in_local_scope()
+        self.inner.admitted.load(Ordering::Acquire)
+            && self.engine_is_running_in_local_scope()
+            && (self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum
+                || self.fixed_durable_quorum_scope_is_exact())
     }
 
     fn current_application_scope_matches(
@@ -974,6 +1111,20 @@ impl ConsensusSessionStore {
         }
     }
 
+    async fn require_durable_fixed_quorum_admission_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        self.require_exact_membership_admission()?;
+        if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum {
+            return Ok(());
+        }
+        match tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_is_exact()).await {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(consensus_unavailable()),
+        }
+    }
+
     /// Fresh readiness proof using the same Openraft quorum/read-index path as
     /// authoritative operations.
     ///
@@ -988,6 +1139,238 @@ impl ConsensusSessionStore {
         let start = tokio::time::Instant::now();
         let deadline = self.operation_deadline_from(start);
         self.probe_durable_readiness_before(deadline).await
+    }
+
+    /// Probe the fixed durable-quorum authority and physical-placement result
+    /// as separate typed observations.
+    ///
+    /// The traffic result requires exact persisted fixed 3/5 membership,
+    /// recovery clearance, and a fresh Openraft linearizable-majority barrier.
+    /// Physical-placement expiry can only
+    /// downgrade [`PlacementResilienceReport`]; it never changes the traffic
+    /// authority branch or Openraft mutation sequencing.
+    pub async fn probe_fixed_durable_quorum_readiness(&self) -> FixedQuorumReadinessReport {
+        let start = tokio::time::Instant::now();
+        let deadline = self.operation_deadline_from(start);
+        let placement_policy = self
+            .inner
+            .topology
+            .fixed_durable_placement_policy()
+            .unwrap_or_default();
+        let durable_readiness = self.probe_fixed_durable_readiness_before(deadline).await;
+        let placement_resilience = TopologyAttestationTime::now()
+            .ok()
+            .and_then(|now| self.fixed_quorum_placement_resilience_at(placement_policy, now));
+        self.fixed_durable_quorum_readiness_report(
+            placement_resilience.unwrap_or_else(|| placement_policy.evaluate_unverified()),
+            durable_readiness,
+        )
+    }
+
+    /// Deterministic-time form of [`Self::probe_fixed_durable_quorum_readiness`].
+    ///
+    /// `now` evaluates only the separate physical-placement claim. It is never
+    /// used to extend, revoke, or otherwise influence fixed quorum authority.
+    pub async fn probe_fixed_durable_quorum_readiness_at(
+        &self,
+        now: TopologyAttestationTime,
+    ) -> FixedQuorumReadinessReport {
+        let start = tokio::time::Instant::now();
+        let deadline = self.operation_deadline_from(start);
+        let placement_policy = self
+            .inner
+            .topology
+            .fixed_durable_placement_policy()
+            .unwrap_or_default();
+        let durable_readiness = self.probe_fixed_durable_readiness_before(deadline).await;
+        let placement_resilience = self
+            .fixed_quorum_placement_resilience_at(placement_policy, now)
+            .unwrap_or_else(|| placement_policy.evaluate_unverified());
+        self.fixed_durable_quorum_readiness_report(placement_resilience, durable_readiness)
+    }
+
+    /// Probe fixed durable quorum authority using replacement authenticated
+    /// physical-placement evidence and the current platform clock.
+    ///
+    /// The replacement evidence is bound to this exact immutable
+    /// configuration. Its expiry can change only the placement disposition;
+    /// the traffic authority remains a fresh durable Openraft observation.
+    pub async fn probe_fixed_durable_quorum_readiness_with_placement_attestation(
+        &self,
+        attestation: &VerifiedQuorumTopologyAttestation,
+    ) -> FixedQuorumReadinessReport {
+        let start = tokio::time::Instant::now();
+        let deadline = self.operation_deadline_from(start);
+        let placement_policy = self
+            .inner
+            .topology
+            .fixed_durable_placement_policy()
+            .unwrap_or_default();
+        let durable_readiness = self.probe_fixed_durable_readiness_before(deadline).await;
+        let placement_resilience = TopologyAttestationTime::now()
+            .ok()
+            .and_then(|now| {
+                self.refreshed_fixed_quorum_placement_attestation_valid_for_at(attestation, now)
+            })
+            .map(|_| PlacementResilienceReport::qualified(placement_policy))
+            .unwrap_or_else(|| placement_policy.evaluate_unverified());
+        self.fixed_durable_quorum_readiness_report(placement_resilience, durable_readiness)
+    }
+
+    /// Deterministic-time form of
+    /// [`Self::probe_fixed_durable_quorum_readiness_with_placement_attestation`].
+    ///
+    /// `now` evaluates only the refreshed physical-placement claim. It never
+    /// extends, revokes, or otherwise influences fixed quorum authority.
+    pub async fn probe_fixed_durable_quorum_readiness_with_placement_attestation_at(
+        &self,
+        attestation: &VerifiedQuorumTopologyAttestation,
+        now: TopologyAttestationTime,
+    ) -> FixedQuorumReadinessReport {
+        let start = tokio::time::Instant::now();
+        let deadline = self.operation_deadline_from(start);
+        let placement_policy = self
+            .inner
+            .topology
+            .fixed_durable_placement_policy()
+            .unwrap_or_default();
+        let durable_readiness = self.probe_fixed_durable_readiness_before(deadline).await;
+        let placement_resilience = self
+            .refreshed_fixed_quorum_placement_attestation_valid_for_at(attestation, now)
+            .map(|_| PlacementResilienceReport::qualified(placement_policy))
+            .unwrap_or_else(|| placement_policy.evaluate_unverified());
+        self.fixed_durable_quorum_readiness_report(placement_resilience, durable_readiness)
+    }
+
+    fn fixed_durable_quorum_readiness_report(
+        &self,
+        placement_resilience: PlacementResilienceReport,
+        durable_readiness: DurableReadinessReport,
+    ) -> FixedQuorumReadinessReport {
+        let traffic_authority = if !self.fixed_durable_quorum_scope_is_exact() {
+            FixedQuorumTrafficAuthority::StructuralRecoveryRequired
+        } else {
+            match durable_readiness.state() {
+                DurableReadinessState::Ready => FixedQuorumTrafficAuthority::Granted,
+                DurableReadinessState::RecoveryRequired => {
+                    FixedQuorumTrafficAuthority::RecoveryRequired
+                }
+                DurableReadinessState::NoQuorum => FixedQuorumTrafficAuthority::NoQuorum,
+                DurableReadinessState::TopologyInvalid => {
+                    FixedQuorumTrafficAuthority::StructuralRecoveryRequired
+                }
+            }
+        };
+        FixedQuorumReadinessReport::new(traffic_authority, placement_resilience, durable_readiness)
+    }
+
+    async fn probe_fixed_durable_readiness_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> DurableReadinessReport {
+        if !matches!(
+            tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_record_is_exact(),)
+                .await,
+            Ok(Ok(true))
+        ) {
+            return self.topology_invalid_readiness_report();
+        }
+        let report = self.probe_durable_readiness_before(deadline).await;
+        if report.state() != DurableReadinessState::Ready {
+            return report;
+        }
+        if matches!(
+            tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_is_exact()).await,
+            Ok(Ok(true))
+        ) {
+            report
+        } else {
+            self.topology_invalid_readiness_report()
+        }
+    }
+
+    async fn durable_fixed_quorum_scope_is_exact(
+        &self,
+    ) -> Result<bool, ConsensusSessionStoreOpenError> {
+        if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum {
+            return Ok(false);
+        }
+        let (scope, applied_membership) = self
+            .inner
+            .backend
+            .consensus_membership_scope_snapshot(self.inner.storage_identity)
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
+        Ok(scope.current_identity == self.inner.storage_identity
+            && scope.current_members == self.inner.bootstrap_members
+            && scope.current_bindings == self.inner.bootstrap_bindings
+            && scope.application_authority_epoch
+                == self.inner.storage_identity.configuration_epoch()
+            && scope.application_authority_members == self.inner.bootstrap_members
+            && scope.pending.is_none()
+            && scope.predecessor.is_none()
+            && scope.history.is_empty()
+            && scope.terminal_history.is_empty()
+            && scope.terminal.is_none()
+            && exact_uniform_voter_membership(&applied_membership, &self.inner.bootstrap_members))
+    }
+
+    async fn durable_fixed_quorum_scope_record_is_exact(
+        &self,
+    ) -> Result<bool, ConsensusSessionStoreOpenError> {
+        if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum {
+            return Ok(false);
+        }
+        let (scope, _) = self
+            .inner
+            .backend
+            .consensus_membership_scope_snapshot(self.inner.storage_identity)
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
+        Ok(scope.current_identity == self.inner.storage_identity
+            && scope.current_members == self.inner.bootstrap_members
+            && scope.current_bindings == self.inner.bootstrap_bindings
+            && scope.application_authority_epoch
+                == self.inner.storage_identity.configuration_epoch()
+            && scope.application_authority_members == self.inner.bootstrap_members
+            && scope.pending.is_none()
+            && scope.predecessor.is_none()
+            && scope.history.is_empty()
+            && scope.terminal_history.is_empty()
+            && scope.terminal.is_none())
+    }
+
+    fn fixed_durable_quorum_scope_is_exact(&self) -> bool {
+        matches!(
+            self.inner.topology.mode(),
+            QuorumTopologyMode::FixedDurableQuorum
+        ) && matches!(self.inner.bootstrap_members.len(), 3 | 5)
+            && self
+                .inner
+                .topology
+                .fixed_durable_placement_policy()
+                .is_some()
+            && self.current_scope().is_ok_and(|(identity, members)| {
+                identity == self.inner.storage_identity && members == self.inner.bootstrap_members
+            })
+    }
+
+    fn fixed_quorum_placement_resilience_at(
+        &self,
+        placement_policy: PlacementResiliencePolicy,
+        now: TopologyAttestationTime,
+    ) -> Option<PlacementResilienceReport> {
+        if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum {
+            return None;
+        }
+        if self
+            .fixed_quorum_placement_attestation_valid_for_at(now)
+            .is_some()
+        {
+            Some(PlacementResilienceReport::qualified(placement_policy))
+        } else {
+            Some(placement_policy.evaluate_unverified())
+        }
     }
 
     fn operation_deadline_from(&self, start: tokio::time::Instant) -> tokio::time::Instant {
@@ -1218,7 +1601,7 @@ impl ConsensusSessionStore {
         // consumed by wall/monotonic verification must reduce, never extend,
         // the asynchronous barrier budget.
         let start = tokio::time::Instant::now();
-        let Some(valid_for) = self.production_attestation_valid_for_at(admission, now) else {
+        let Some(valid_for) = self.attestation_valid_for_at(admission, now) else {
             return self.topology_invalid_readiness_report();
         };
         let Some(attestation_deadline) =
@@ -1234,9 +1617,7 @@ impl ConsensusSessionStore {
             .await
             .with_production_topology_attestation();
         if tokio::time::Instant::now() >= attestation_deadline
-            || self
-                .production_attestation_valid_for_at(admission, now)
-                .is_none()
+            || self.attestation_valid_for_at(admission, now).is_none()
         {
             self.topology_invalid_readiness_report()
         } else {
@@ -1252,7 +1633,30 @@ impl ConsensusSessionStore {
         self.current_scope()
             .ok()
             .filter(|(identity, _)| *identity == self.inner.storage_identity)?;
-        self.production_attestation_valid_for_at(self.inner.topology.attestation_admission(), now)
+        self.attestation_valid_for_at(self.inner.topology.attestation_admission(), now)
+    }
+
+    fn fixed_quorum_placement_attestation_valid_for_at(
+        &self,
+        now: TopologyAttestationTime,
+    ) -> Option<Duration> {
+        (self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum).then_some(())?;
+        self.current_scope()
+            .ok()
+            .filter(|(identity, _)| *identity == self.inner.storage_identity)?;
+        self.attestation_valid_for_at(self.inner.topology.attestation_admission(), now)
+    }
+
+    fn refreshed_fixed_quorum_placement_attestation_valid_for_at(
+        &self,
+        attestation: &VerifiedQuorumTopologyAttestation,
+        now: TopologyAttestationTime,
+    ) -> Option<Duration> {
+        (self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum).then_some(())?;
+        self.current_scope()
+            .ok()
+            .filter(|(identity, _)| *identity == attestation.consensus_identity())?;
+        self.attestation_valid_for_at(attestation.admission(), now)
     }
 
     fn refreshed_production_attestation_valid_for_at(
@@ -1264,15 +1668,14 @@ impl ConsensusSessionStore {
         self.current_scope()
             .ok()
             .filter(|(identity, _)| *identity == attestation.consensus_identity())?;
-        self.production_attestation_valid_for_at(attestation.admission(), now)
+        self.attestation_valid_for_at(attestation.admission(), now)
     }
 
-    fn production_attestation_valid_for_at(
+    fn attestation_valid_for_at(
         &self,
         admission: &crate::topology_attestation::TopologyAttestationAdmission,
         now: TopologyAttestationTime,
     ) -> Option<Duration> {
-        (self.inner.topology.mode() == QuorumTopologyMode::AttestedHa).then_some(())?;
         let verified_at = admission.production_verified_at()?;
         if self.current_member_count()? < 3
             || now < verified_at
@@ -1364,7 +1767,8 @@ impl ConsensusSessionStore {
         required_consumer_scope: Option<SessionConsensusIdentity>,
         deadline: tokio::time::Instant,
     ) -> Result<SessionConsensusResponse, StoreError> {
-        self.require_exact_membership_admission()?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
         let recovery_pending = tokio::time::timeout_at(
             deadline,
             self.inner
@@ -1492,7 +1896,8 @@ impl ConsensusSessionStore {
         deadline: tokio::time::Instant,
     ) -> Result<(), StoreError> {
         validate_record_expiry_preflights_profile(preflights)?;
-        self.require_exact_membership_admission()?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
         let request = ForwardRequest::RecordExpiryPreflight {
             preflights: BoundedRecordExpiryPreflights::try_from_slice(preflights)?,
             required_consumer_scope: ForwardConsumerScope::from_optional(required_consumer_scope),
@@ -1590,7 +1995,11 @@ impl ConsensusSessionStore {
                 Ok(guard) => guard,
                 Err(_) => return ForwardMutationReply::Unavailable,
             };
-        if self.require_exact_membership_admission().is_err() {
+        if self
+            .require_durable_fixed_quorum_admission_before(deadline)
+            .await
+            .is_err()
+        {
             return ForwardMutationReply::Unavailable;
         }
         if request
@@ -1645,7 +2054,11 @@ impl ConsensusSessionStore {
             .await
         {
             EnsureLinearizableOutcome::Ready { .. } => {
-                if self.require_exact_membership_admission().is_err() {
+                if self
+                    .require_durable_fixed_quorum_admission_before(deadline)
+                    .await
+                    .is_err()
+                {
                     return ForwardMutationReply::Unavailable;
                 }
             }
@@ -1799,7 +2212,11 @@ impl ConsensusSessionStore {
                 Ok(guard) => guard,
                 Err(_) => return ForwardMutationReply::Unavailable,
             };
-        if self.require_exact_membership_admission().is_err() {
+        if self
+            .require_durable_fixed_quorum_admission_before(deadline)
+            .await
+            .is_err()
+        {
             return ForwardMutationReply::Unavailable;
         }
         if required_consumer_scope
@@ -1843,7 +2260,11 @@ impl ConsensusSessionStore {
             .await
         {
             EnsureLinearizableOutcome::Ready { .. } => {
-                if self.require_exact_membership_admission().is_err() {
+                if self
+                    .require_durable_fixed_quorum_admission_before(deadline)
+                    .await
+                    .is_err()
+                {
                     return ForwardMutationReply::Unavailable;
                 }
             }
