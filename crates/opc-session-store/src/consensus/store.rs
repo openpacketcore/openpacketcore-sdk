@@ -1393,6 +1393,9 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> DurableReadinessReport {
+        if let Some(report) = self.fatal_engine_readiness_report() {
+            return report;
+        }
         match tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_record_is_exact())
             .await
         {
@@ -1518,6 +1521,9 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> DurableReadinessReport {
+        if let Some(report) = self.fatal_engine_readiness_report() {
+            return report;
+        }
         let configured = self.current_member_count().unwrap_or(0);
         let quorum = (configured / 2) + 1;
         let report_without_barrier = |state, recovery_progress| {
@@ -1879,9 +1885,12 @@ impl ConsensusSessionStore {
     }
 
     /// A durable observation did not complete. This remains a transient
-    /// quorum failure: only a completed typed observation may classify the
-    /// store as structurally invalid or recovery-required.
+    /// quorum failure unless the local Openraft engine has already supplied
+    /// authoritative fatal evidence.
     fn unavailable_durable_readiness_report(&self) -> DurableReadinessReport {
+        if let Some(report) = self.fatal_engine_readiness_report() {
+            return report;
+        }
         let configured = self.current_member_count().unwrap_or(0);
         let quorum = (configured / 2) + 1;
         let metrics = self.inner.raft.metrics();
@@ -1902,6 +1911,38 @@ impl ConsensusSessionStore {
             metrics.snapshot.as_ref().map(|log_id| log_id.index),
             metrics.purged.as_ref().map(|log_id| log_id.index),
         ))
+    }
+
+    /// A fatal Openraft engine state is local authoritative evidence. It has
+    /// priority over failures while reading auxiliary durable authority, so a
+    /// known recovery-required state cannot be downgraded to transient
+    /// no-quorum.
+    fn fatal_engine_readiness_report(&self) -> Option<DurableReadinessReport> {
+        let metrics = self.inner.raft.metrics();
+        let metrics = metrics.borrow();
+        if metrics.running_state.is_ok() {
+            return None;
+        }
+        let configured = self.current_member_count().unwrap_or(0);
+        let quorum = (configured / 2) + 1;
+        Some(
+            DurableReadinessReport::new(
+                DurableReadinessState::RecoveryRequired,
+                configured,
+                0,
+                0,
+                quorum,
+                None,
+                Vec::new(),
+            )
+            .with_recovery_progress(DurableRecoveryProgress::new(
+                DurableRecoveryState::RecoveryRequired,
+                metrics.last_log_index,
+                metrics.last_applied.as_ref().map(|log_id| log_id.index),
+                metrics.snapshot.as_ref().map(|log_id| log_id.index),
+                metrics.purged.as_ref().map(|log_id| log_id.index),
+            )),
+        )
     }
 
     async fn submit_intent(
@@ -4887,6 +4928,24 @@ mod membership_tests {
         assert_eq!(
             general.recovery_progress().state(),
             DurableRecoveryState::AwaitingQuorum
+        );
+
+        store
+            .inner
+            .raft
+            .shutdown()
+            .await
+            .expect("shut down Raft for fatal-state priority detector");
+        store
+            .inner
+            .backend
+            .inject_consensus_operator_recovery_failure(true);
+        let fatal = store.probe_durable_readiness().await;
+        assert_eq!(fatal.state(), DurableReadinessState::RecoveryRequired);
+        assert_eq!(
+            fatal.recovery_progress().state(),
+            DurableRecoveryState::RecoveryRequired,
+            "a failed auxiliary Recovery read must not downgrade known fatal engine state"
         );
     }
 

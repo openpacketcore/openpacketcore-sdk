@@ -1499,9 +1499,8 @@ pub(super) fn backup_and_reset_replica(
         });
     validate_workflow_shape(input.plan, &workflow)?;
     // A completed execute retry is read-only: it neither creates nor alters a
-    // recovery latch, so it does not need to contend with a restarted live
-    // backend. Every path that can activate the latch acquires the fleet's
-    // exclusive locks below before doing so.
+    // recovery latch. Every mutating path in this explicitly drained offline
+    // workflow acquires its per-file execution locks below before proceeding.
     if workflow.state == RecoveryExecutionState::Rejoined {
         return Ok(RecoveryExecutionState::Rejoined);
     }
@@ -1585,7 +1584,7 @@ pub(super) fn backup_and_reset_replica(
         workflow.checkpoint_progress = FileProgress::Verified;
         write_workflow(input.key, &workflow_dir, &workflow)?;
         // A target may have changed while the sequential quarantine copies
-        // were being made. Re-prove every live file once more after every
+        // were being made. Re-prove every supplied file once more after every
         // backup/checkpoint and before the first destructive installation.
         inspect_planned_fleet(&input)?;
         workflow.checkpoint_database_digest = Some(checkpoint.database_digest);
