@@ -1323,7 +1323,7 @@ impl ConsensusSessionStore {
                 topology: topology_summary,
                 clock: Arc::new(SystemClock),
                 operation_timeout: DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
-                admitted: AtomicBool::new(false),
+                admitted: Arc::new(AtomicBool::new(false)),
                 topology_attestation_time_high_water: AtomicU64::new(
                     topology_attestation_time_high_water,
                 ),

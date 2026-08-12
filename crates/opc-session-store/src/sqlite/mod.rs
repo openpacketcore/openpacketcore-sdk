@@ -573,6 +573,54 @@ impl SqliteSessionBackend {
         self.database_path.is_some()
     }
 
+    /// Synchronously test a fixed-quorum authority record without waiting for
+    /// a concurrent SQLite operation. Callers must treat lock contention or a
+    /// malformed durable record as revoked authority.
+    pub(crate) fn fixed_quorum_authority_is_exact_now(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        expected_members: &std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+        expected_bindings: &std::collections::BTreeMap<
+            crate::consensus::SessionConsensusNodeId,
+            crate::consensus::SessionTopologyMemberBinding,
+        >,
+    ) -> bool {
+        self.conn.try_lock().is_ok_and(|conn| {
+            consensus::fixed_quorum_authority_is_exact_sync(
+                &conn,
+                identity,
+                expected_members,
+                expected_bindings,
+                false,
+            )
+            .unwrap_or(false)
+        })
+    }
+
+    /// Read the immutable fixed-quorum authority record under the backend
+    /// lock. Storage failure is intentionally indistinguishable from a
+    /// revoked authority to inbound engine traffic.
+    pub(crate) async fn fixed_quorum_authority_record_is_exact(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        expected_members: &std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+        expected_bindings: &std::collections::BTreeMap<
+            crate::consensus::SessionConsensusNodeId,
+            crate::consensus::SessionTopologyMemberBinding,
+        >,
+        allow_pristine_membership: bool,
+    ) -> bool {
+        let conn = self.conn.lock().await;
+        consensus::fixed_quorum_authority_is_exact_sync(
+            &conn,
+            identity,
+            expected_members,
+            expected_bindings,
+            allow_pristine_membership,
+        )
+        .unwrap_or(false)
+    }
+
     /// Read the last committed state-machine logical time after a caller-owned
     /// Openraft linearizable barrier. This path is read-only and allocates no
     /// sequencing authority.

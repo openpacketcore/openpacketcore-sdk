@@ -654,10 +654,13 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 None
             };
             let conn = self.core.conn.lock().await;
-            let applied = consensus::apply_entries_sync(
+            let applied = consensus::apply_entries_with_authority_sync(
                 &conn,
                 self.core.storage_identity,
                 &self.core.caps,
+                self.core.authority_profile,
+                &self.core.expected_members,
+                &self.core.expected_bindings,
                 entries,
             )
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;

@@ -29,8 +29,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::raft_adapter::{
-    SessionRaftAdapterError, SessionRaftNetworkFactory, SessionRaftPeerDirectory,
-    SessionRaftRpcHandler,
+    FixedQuorumEngineAdmission, SessionRaftAdapterError, SessionRaftNetworkFactory,
+    SessionRaftPeerDirectory, SessionRaftRpcHandler,
 };
 use super::storage::{self, SessionConsensusStorageError};
 use super::{
@@ -94,6 +94,7 @@ pub const DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT: Duration =
 
 const SESSION_CONSENSUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CONSUMER_WATCH_SCOPE_RECHECK_INTERVAL: Duration = Duration::from_millis(50);
+const GENERIC_WATCH_AUTHORITY_RECHECK_INTERVAL: Duration = Duration::from_millis(50);
 const TOPOLOGY_ENDPOINT_BINDING_DOMAIN: &[u8] =
     b"openpacketcore/session-store/topology-endpoint-binding/v1\0";
 const TOPOLOGY_TLS_BINDING_DOMAIN: &[u8] =
@@ -387,7 +388,7 @@ struct ConsensusSessionStoreInner {
     topology: QuorumTopologySummary,
     clock: Arc<dyn Clock>,
     operation_timeout: Duration,
-    admitted: AtomicBool,
+    admitted: Arc<AtomicBool>,
     topology_attestation_time_high_water: AtomicU64,
     linearizability: EnsureLinearizableSupervisor<SessionRaftTypeConfig>,
     read_barrier: LinearizableReadBarrier<SessionRaftTypeConfig>,
@@ -539,8 +540,19 @@ impl ConsensusSessionStore {
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
-        let raft_handler =
-            SessionRaftRpcHandler::new(raft.clone(), peer_directory.clone(), local_node_id);
+        let admitted = Arc::new(AtomicBool::new(false));
+        let raft_handler = SessionRaftRpcHandler::new_fixed_durable_quorum(
+            raft.clone(),
+            peer_directory.clone(),
+            local_node_id,
+            FixedQuorumEngineAdmission::new(
+                backend.clone(),
+                storage_identity,
+                members.clone(),
+                bindings.clone(),
+                Arc::clone(&admitted),
+            ),
+        );
         let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
         let read_barrier = LinearizableReadBarrier::new(
             local_node_id,
@@ -569,7 +581,7 @@ impl ConsensusSessionStore {
                 topology: topology_summary,
                 clock: Arc::new(SystemClock),
                 operation_timeout,
-                admitted: AtomicBool::new(false),
+                admitted,
                 topology_attestation_time_high_water: AtomicU64::new(
                     topology_attestation_time_high_water,
                 ),
@@ -716,7 +728,7 @@ impl ConsensusSessionStore {
                 topology: topology_summary,
                 clock,
                 operation_timeout,
-                admitted: AtomicBool::new(false),
+                admitted: Arc::new(AtomicBool::new(false)),
                 topology_attestation_time_high_water: AtomicU64::new(
                     topology_attestation_time_high_water,
                 ),
@@ -757,11 +769,19 @@ impl ConsensusSessionStore {
     /// must be recreated with a successor scope after a completed topology
     /// transition; this accessor never weakens the exact-scope check at the
     /// consumer service boundary.
-    pub async fn consumer_scope(&self) -> Result<SessionConsumerScope, StoreError> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.inner.operation_timeout)
-            .ok_or_else(consensus_unavailable)?;
-        self.consumer_scope_before(deadline).await
+    pub fn consumer_scope(&self) -> Result<SessionConsumerScope, StoreError> {
+        self.require_exact_membership_admission()?;
+        if self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
+            && !self.inner.backend.fixed_quorum_authority_is_exact_now(
+                self.inner.storage_identity,
+                &self.inner.bootstrap_members,
+                &self.inner.bootstrap_bindings,
+            )
+        {
+            return Err(consensus_unavailable());
+        }
+        self.current_scope()
+            .map(|(identity, _)| SessionConsumerScope::new(identity))
     }
 
     async fn consumer_scope_before(
@@ -916,7 +936,13 @@ impl ConsensusSessionStore {
         // removal remain live vetoes.
         let admitted = self.inner.admitted.load(Ordering::Acquire)
             && engine_running
-            && current_members.contains(&self.inner.local_node_id);
+            && current_members.contains(&self.inner.local_node_id)
+            && (self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum
+                || self.inner.backend.fixed_quorum_authority_is_exact_now(
+                    self.inner.storage_identity,
+                    &self.inner.bootstrap_members,
+                    &self.inner.bootstrap_bindings,
+                ));
         SessionConsensusStatus {
             node_id: self.inner.local_node_id,
             term,
@@ -3944,18 +3970,29 @@ impl SessionBackend for ConsensusSessionStore {
             tokio::time::timeout_at(deadline, self.logical_read_time_before(None, deadline))
                 .await
                 .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)??;
-        self.inner
+        let page = self
+            .inner
             .backend
             .consensus_scan_restore_records_at(request, logical_time, deadline)
-            .await
+            .await?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
+        Ok(page)
     }
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
-        self.logical_read_time().await?;
-        self.inner
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.logical_read_time_before(None, deadline).await?;
+        let sequence = self
+            .inner
             .backend
             .consensus_max_replication_sequence()
-            .await
+            .await?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
+        Ok(sequence)
     }
 
     async fn get_replication_log(
@@ -3964,18 +4001,26 @@ impl SessionBackend for ConsensusSessionStore {
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
         let range = ReplicationLogRange::try_new(start, limit)?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
         if range.is_empty() {
             return Ok(Vec::new());
         }
-        self.logical_read_time().await?;
-        validate_replication_log_page_owned(
+        self.logical_read_time_before(None, deadline).await?;
+        let entries = validate_replication_log_page_owned(
             start,
             limit,
             self.inner
                 .backend
                 .consensus_get_replication_log(start, limit)
                 .await?,
-        )
+        )?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
+        Ok(entries)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
@@ -4013,14 +4058,26 @@ impl SessionBackend for ConsensusSessionStore {
                 if terminated {
                     return None;
                 }
-                let entry = stream.next().await?;
-                let deadline =
-                    tokio::time::Instant::now().checked_add(store.inner.operation_timeout)?;
-                let admission = store
-                    .require_durable_fixed_quorum_admission_before(deadline)
-                    .await;
-                let terminated = admission.is_err();
-                Some((admission.and(entry), (stream, store, terminated)))
+                loop {
+                    let entry = tokio::select! {
+                        entry = stream.next() => entry?,
+                        () = tokio::time::sleep(GENERIC_WATCH_AUTHORITY_RECHECK_INTERVAL) => {
+                            let deadline = tokio::time::Instant::now()
+                                .checked_add(store.inner.operation_timeout)?;
+                            if store.require_durable_fixed_quorum_admission_before(deadline).await.is_err() {
+                                return Some((Err(consensus_unavailable()), (stream, store, true)));
+                            }
+                            continue;
+                        }
+                    };
+                    let deadline = tokio::time::Instant::now()
+                        .checked_add(store.inner.operation_timeout)?;
+                    let admission = store
+                        .require_durable_fixed_quorum_admission_before(deadline)
+                        .await;
+                    let terminated = admission.is_err();
+                    return Some((admission.and(entry), (stream, store, terminated)));
+                }
             },
         )
         .boxed())
@@ -4649,7 +4706,6 @@ mod membership_tests {
 
         let current = store
             .consumer_scope()
-            .await
             .expect("current admitted consumer scope")
             .consensus_identity();
         let stale_scope = SessionConsensusIdentity::new(
@@ -4694,10 +4750,7 @@ mod membership_tests {
             .await
             .expect("initialize singleton consumer service store");
 
-        let scope = store
-            .consumer_scope()
-            .await
-            .expect("current admitted scope");
+        let scope = store.consumer_scope().expect("current admitted scope");
         let key = SessionKey {
             tenant: TenantId::new("consumer-service").expect("tenant"),
             nf_kind: NetworkFunctionKind::smf(),

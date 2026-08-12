@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use opc_consensus::engine::{Entry, EntryPayload, LogId, StoredMembership, Vote};
+use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
 use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
 use opc_types::Timestamp;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -1109,6 +1109,8 @@ pub(crate) struct SqliteConsensusCore {
     /// The active topology identity lives in `consensus_membership_scope`.
     pub(crate) storage_identity: SessionConsensusIdentity,
     pub(crate) authority_profile: ConsensusAuthorityProfile,
+    pub(crate) expected_members: BTreeSet<SessionConsensusNodeId>,
+    pub(crate) expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     pub(crate) snapshot_dir: Arc<PathBuf>,
     pub(crate) caps: BackendCapabilities,
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
@@ -1209,6 +1211,8 @@ impl SqliteConsensusCore {
             conn: Arc::clone(&backend.conn),
             storage_identity,
             authority_profile,
+            expected_members,
+            expected_bindings,
             snapshot_dir: Arc::new(canonical_snapshot_dir),
             caps: backend.caps,
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -6580,10 +6584,31 @@ fn store_replication_notification_sync(
     Ok(entry)
 }
 
+#[cfg(test)]
 pub(crate) fn apply_entries_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     caps: &BackendCapabilities,
+    entries: Vec<Entry<SessionRaftTypeConfig>>,
+) -> io::Result<AppliedBatch> {
+    apply_entries_with_authority_sync(
+        conn,
+        identity,
+        caps,
+        ConsensusAuthorityProfile::Dynamic,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        entries,
+    )
+}
+
+pub(crate) fn apply_entries_with_authority_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    caps: &BackendCapabilities,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     entries: Vec<Entry<SessionRaftTypeConfig>>,
 ) -> io::Result<AppliedBatch> {
     if entries.is_empty() {
@@ -6595,6 +6620,27 @@ pub(crate) fn apply_entries_sync(
     let mut tx =
         Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
     let mut last_applied = read_applied_sync(&tx, identity)?;
+    let allows_initial_formation = last_applied.is_none()
+        && entries.first().is_some_and(|entry| {
+            matches!(
+                &entry.payload,
+                EntryPayload::Membership(membership)
+                    if fixed_uniform_membership_matches(membership, expected_members)
+            )
+        });
+    if authority_profile == ConsensusAuthorityProfile::FixedImmutable
+        && !fixed_quorum_authority_is_exact_sync(
+            &tx,
+            identity,
+            expected_members,
+            expected_bindings,
+            allows_initial_formation,
+        )?
+    {
+        return Err(invalid_data(
+            "session consensus fixed authority is no longer exact",
+        ));
+    }
     let mut machine = read_machine_sync(&tx, identity)?;
     let mut responses = Vec::with_capacity(entries.len());
     let mut notifications = Vec::new();
@@ -6765,6 +6811,52 @@ pub(crate) fn apply_entries_sync(
         responses,
         notifications,
     })
+}
+
+pub(crate) fn fixed_quorum_authority_is_exact_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    allow_pristine_membership: bool,
+) -> io::Result<bool> {
+    if read_consensus_authority_profile_sync(conn)
+        .map_err(|_| invalid_data("session consensus fixed authority profile is invalid"))?
+        != ConsensusAuthorityProfile::FixedImmutable
+    {
+        return Ok(false);
+    }
+    let scope = read_scope_for_mutation(conn, identity)
+        .map_err(|_| invalid_data("session consensus fixed scope is invalid"))?;
+    let membership = read_membership_sync(conn, identity)?;
+    let applied_membership_is_exact = membership.log_id().is_some()
+        && fixed_uniform_membership_matches(membership.membership(), expected_members);
+    Ok(scope.current_identity == identity
+        && scope.current_members == *expected_members
+        && scope.current_bindings == *expected_bindings
+        && scope.application_authority_epoch == identity.configuration_epoch()
+        && scope.application_authority_members == *expected_members
+        && scope.pending.is_none()
+        && scope.predecessor.is_none()
+        && scope.history.is_empty()
+        && scope.terminal_history.is_empty()
+        && scope.terminal.is_none()
+        && (applied_membership_is_exact
+            || (allow_pristine_membership && membership.log_id().is_none())))
+}
+
+fn fixed_uniform_membership_matches(
+    membership: &Membership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+) -> bool {
+    let nodes = membership
+        .nodes()
+        .map(|(node_id, _)| *node_id)
+        .collect::<BTreeSet<_>>();
+    membership.get_joint_config().len() == 1
+        && membership.get_joint_config().first() == Some(expected_members)
+        && membership.learner_ids().next().is_none()
+        && nodes == *expected_members
 }
 
 pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {

@@ -255,6 +255,17 @@ async fn open_fixed_cluster(
     member_count: usize,
     placement_policy: PlacementResiliencePolicy,
 ) -> (tempfile::TempDir, Vec<PathBuf>, Vec<ConsensusSessionStore>) {
+    let directory = tempfile::tempdir().expect("fixed cluster directory");
+    let (database_paths, stores) =
+        open_fixed_cluster_in(directory.path(), member_count, placement_policy).await;
+    (directory, database_paths, stores)
+}
+
+async fn open_fixed_cluster_in(
+    directory: &std::path::Path,
+    member_count: usize,
+    placement_policy: PlacementResiliencePolicy,
+) -> (Vec<PathBuf>, Vec<ConsensusSessionStore>) {
     let members = fixed_members(member_count);
     let identity = consensus_identity(&members);
     let topologies = (0..member_count)
@@ -264,9 +275,8 @@ async fn open_fixed_cluster(
         })
         .collect::<Result<Vec<_>, _>>()
         .expect("fixed cluster topologies");
-    let directory = tempfile::tempdir().expect("fixed cluster directory");
     let database_paths = (0..member_count)
-        .map(|index| directory.path().join(format!("fixed-voter-{index}.sqlite")))
+        .map(|index| directory.join(format!("fixed-voter-{index}.sqlite")))
         .collect::<Vec<_>>();
     let node_ids = topologies
         .iter()
@@ -302,7 +312,7 @@ async fn open_fixed_cluster(
         let store = ConsensusSessionStore::open_fixed_durable_quorum(
             topology,
             SqliteSessionBackend::open(&database_paths[source]).expect("file-backed voter store"),
-            directory.path().join(format!("snapshots-{source}")),
+            directory.join(format!("snapshots-{source}")),
             peers,
         )
         .await
@@ -318,7 +328,7 @@ async fn open_fixed_cluster(
     {
         result.expect("initialize fixed cluster membership");
     }
-    (directory, database_paths, stores)
+    (database_paths, stores)
 }
 
 fn successor_request(identity: ConsensusIdentity) -> SessionTopologyTransitionRequest {
@@ -663,6 +673,33 @@ async fn file_backed_fixed_five_voter_quorum_reaches_granted_authority() {
 }
 
 #[tokio::test]
+async fn initialized_fixed_three_voter_cluster_reopens_with_durable_authority_and_rpc_readiness() {
+    let (directory, _database_paths, stores) =
+        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    drop(stores);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (_database_paths, reopened) = open_fixed_cluster_in(
+        directory.path(),
+        3,
+        PlacementResiliencePolicy::AllowReducedResilience,
+    )
+    .await;
+    assert!(
+        reopened.iter().all(|store| store.status().admitted),
+        "reopened fixed voters must retain exact durable admission"
+    );
+    assert!(
+        reopened[0]
+            .probe_fixed_durable_quorum_readiness_at(TopologyAttestationTime::from_unix_seconds(1))
+            .await
+            .traffic_authority()
+            .is_granted(),
+        "reopened fixed quorum RPC path must recover durable traffic authority"
+    );
+}
+
+#[tokio::test]
 async fn fixed_five_voter_store_without_a_majority_reports_no_quorum() {
     let topology = fixed_topology(fixed_members(5)).expect("fixed five-voter topology");
     let peers = scoped_peers(&topology);
@@ -789,12 +826,40 @@ async fn running_fixed_profile_drift_revokes_traffic_authority() {
         SessionBackend::batch(&stores[0], Vec::new()).await.is_err(),
         "mutation authority must fail closed after fixed-profile drift"
     );
+    assert!(
+        !stores[0].status().admitted,
+        "status must not retain admission after fixed-profile drift"
+    );
     let readiness = stores[0]
         .probe_fixed_durable_quorum_readiness_at(TopologyAttestationTime::from_unix_seconds(1))
         .await;
     assert_eq!(
         readiness.traffic_authority(),
         FixedQuorumTrafficAuthority::StructuralRecoveryRequired,
+    );
+}
+
+#[tokio::test]
+async fn running_fixed_applied_membership_drift_revokes_status_and_mutation_authority() {
+    let (_directory, database_paths, stores) =
+        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    let connection =
+        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
+    connection
+        .execute(
+            "UPDATE consensus_membership SET membership_json = x'00' WHERE singleton = 1",
+            [],
+        )
+        .expect("persist malformed applied membership drift");
+    drop(connection);
+
+    assert!(
+        !stores[0].status().admitted,
+        "status must fail closed when the persisted applied membership is not exact"
+    );
+    assert!(
+        SessionBackend::batch(&stores[0], Vec::new()).await.is_err(),
+        "mutation authority must fail closed when the persisted applied membership is not exact"
     );
 }
 
@@ -839,6 +904,42 @@ async fn running_fixed_scope_drift_terminates_an_already_open_generic_watch() {
             .expect("watch must observe its queued entry")
             .is_err(),
         "an already-open fixed watch must not expose entries after durable scope drift"
+    );
+    assert!(
+        watch.next().await.is_none(),
+        "watch must terminate after revocation"
+    );
+}
+
+#[tokio::test]
+async fn running_fixed_scope_drift_terminates_an_idle_generic_watch_promptly() {
+    let (_directory, database_paths, stores) =
+        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    let start_sequence = stores[0]
+        .status()
+        .last_log_index
+        .map_or(0, |index| index.saturating_add(1));
+    let mut watch = SessionBackend::watch(&stores[0], start_sequence)
+        .await
+        .expect("open idle generic watch before drift");
+
+    let connection =
+        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
+    connection
+        .execute(
+            "UPDATE consensus_membership_scope SET application_authority_epoch = application_authority_epoch + 1 WHERE singleton = 1",
+            [],
+        )
+        .expect("persist fixed structural scope drift");
+    drop(connection);
+
+    let item = tokio::time::timeout(Duration::from_secs(1), watch.next())
+        .await
+        .expect("idle watch must revalidate durable authority promptly")
+        .expect("idle watch must emit a terminal authority failure");
+    assert!(
+        item.is_err(),
+        "idle watch must fail closed after durable drift"
     );
     assert!(
         watch.next().await.is_none(),
