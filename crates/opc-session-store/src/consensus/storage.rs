@@ -1015,19 +1015,16 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             .core
             .snapshot_dir
             .join(format!("build-{}.sqlite", uuid::Uuid::new_v4()));
-        let raw_snapshot = create_pinned_sqlite_file(raw_path.clone()).map_err(|error| {
-            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-        })?;
         let ((last_log_id, last_membership), raw_snapshot) = {
             let conn = self.core.conn.lock().await;
-            consensus::build_snapshot_database_from_pinned_with_authority_sync(
+            consensus::build_snapshot_database_pinned_with_authority_sync(
                 &conn,
                 self.core.storage_identity,
                 self.core.authority_profile,
                 &self.core.expected_members,
                 &self.core.expected_bindings,
                 self.core.fixed_placement_policy,
-                raw_snapshot,
+                &raw_path,
             )
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))?
         };
@@ -1173,19 +1170,6 @@ async fn notify_watchers(core: &SqliteConsensusCore, notifications: &[Replicatio
         };
         consumer_watchers.retain_mut(|watcher| watcher.notify(&projected, encoded_bytes));
     }
-}
-
-fn create_pinned_sqlite_file(path: PathBuf) -> io::Result<PinnedSqliteFile> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    PinnedSqliteFile::from_file(options.open(&path)?, path)
 }
 
 fn secure_snapshot_create_options(read: bool) -> tokio::fs::OpenOptions {

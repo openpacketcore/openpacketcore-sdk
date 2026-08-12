@@ -7664,19 +7664,20 @@ pub(crate) fn build_snapshot_database_sync(
         .map(|(snapshot, _)| snapshot)
 }
 
-pub(crate) fn build_snapshot_database_from_pinned_with_authority_sync(
+pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     authority_profile: ConsensusAuthorityProfile,
     expected_members: &BTreeSet<SessionConsensusNodeId>,
     expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
-    destination: crate::consensus::snapshot::PinnedSqliteFile,
+    path: &std::path::Path,
 ) -> io::Result<(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
 )> {
     if authority_profile == ConsensusAuthorityProfile::Dynamic {
+        let destination = create_pinned_snapshot_database(path)?;
         return build_snapshot_database_from_pinned_sync(conn, identity, destination);
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
@@ -7688,6 +7689,9 @@ pub(crate) fn build_snapshot_database_from_pinned_with_authority_sync(
         expected_bindings,
         fixed_placement_policy,
     )?;
+    // Do not create even an empty snapshot artifact until the durable fixed
+    // authority check has succeeded under the source read transaction.
+    let destination = create_pinned_snapshot_database(path)?;
     let (snapshot, destination) =
         capture_and_finalize_snapshot_database_sync(&tx, identity, destination)?;
     tx.commit().map_err(db_error)?;
@@ -7704,15 +7708,14 @@ pub(crate) fn build_snapshot_database_with_authority_sync(
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     path: &std::path::Path,
 ) -> io::Result<ConsensusAppliedMembership> {
-    let destination = create_pinned_snapshot_database(path)?;
-    build_snapshot_database_from_pinned_with_authority_sync(
+    build_snapshot_database_pinned_with_authority_sync(
         conn,
         identity,
         authority_profile,
         expected_members,
         expected_bindings,
         fixed_placement_policy,
-        destination,
+        path,
     )
     .map(|(snapshot, _)| snapshot)
 }
