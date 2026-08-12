@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, MapInfo, PerCpuArray};
+use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, MapInfo, PerCpuArray, PerCpuValues};
 use aya::programs::tc::{NlOptions, TcAttachOptions, TcHandle};
 use aya::programs::{loaded_programs, SchedClassifier, TcAttachType};
 use aya::{Ebpf, EbpfLoader};
@@ -75,14 +75,15 @@ use opc_gtpu_dataplane::{
     GtpuSessionGroup, GtpuSessionGroupId, GtpuSessionGroupReadback,
     GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionSelectorProvenance,
-    GtpuSourcePortPolicy, GtpuUplinkChecksumOffloadContract, GtpuUplinkMtuPolicy,
-    GtpuUplinkSourcePortPolicy, GtpuV2DrainProof, PdpContextIndeterminateReason,
-    PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
-    PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
+    GtpuSourcePortPolicy, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityStore,
+    GtpuTrafficProofPoll, GtpuTrafficProofValidation, GtpuUplinkChecksumOffloadContract,
+    GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy, GtpuV2DrainProof,
+    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
+    PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
     PdpContextUplinkSelector, RemovePdpContextRequest, RetainedGraphCleanupClassification,
     RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest, Teid, TftUplinkBearer,
     TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
-    TftUplinkClassifierRemovalOutcome,
+    TftUplinkClassifierRemovalOutcome, TrafficContinuityPolicy,
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, udp_ipv6_checksum,
@@ -102,8 +103,10 @@ use opc_gtpu_ebpf_common::{
     GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
     GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_IPV4_SLOT, GTPU_SESSION_IPV6_SLOT,
     GTPU_SESSION_SCHEMA_MARKER_LEN, GTPU_SESSION_SCHEMA_MARKER_VALUE,
-    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG,
-    MAP_CONFIG_IPV6, MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING,
+    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
+    GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_CONFIG_IPV6,
+    MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING,
     MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX,
     MAP_SESSION_GROUPS, MAP_SESSION_SCHEMA, MAP_SESSION_TRANSACTIONS, MAP_SESSION_UPLINK_INDEX,
     MAP_TFT_CLASSIFIER_COUNTERS, MAP_TFT_CLASSIFIER_FILTERS, MAP_TFT_CLASSIFIER_META,
@@ -120,9 +123,9 @@ use opc_gtpu_ebpf_common::{
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
-    LifetimeConfig, LinuxXfrmBackend, PolicyParameters, SaParameters, UdpEncap, XfrmAction,
-    XfrmBackend, XfrmDirection, XfrmId, XfrmLookupMark, XfrmMark, XfrmMode, XfrmRequestId,
-    XfrmSelector, XfrmTemplate,
+    LifetimeConfig, LinuxXfrmBackend, PolicyParameters, RemovePolicyRequest, RemoveSaRequest,
+    SaParameters, UdpEncap, XfrmAction, XfrmBackend, XfrmDirection, XfrmId, XfrmLookupMark,
+    XfrmMark, XfrmMode, XfrmRequestId, XfrmSelector, XfrmTemplate,
 };
 use opc_proto_tft::{
     PacketFilter, PacketFilterComponent, PacketFilterDirection, PacketFilterIdentifier, PortRange,
@@ -188,7 +191,9 @@ const NAT_T_PORT: u16 = 4500;
 const XFRM_INNER_SOURCE_PORT: u16 = 5004;
 const XFRM_INNER_DESTINATION_PORT: u16 = 53;
 const XFRM_DOWNLINK_SOURCE_PORT: u16 = 53;
-const XFRM_DOWNLINK_DESTINATION_PORT: u16 = 5005;
+// The protected reply must retain the inverse five-tuple so the production
+// observation writer can correlate it with the ESP-decrypted uplink.
+const XFRM_DOWNLINK_DESTINATION_PORT: u16 = XFRM_INNER_SOURCE_PORT;
 const IPPROTO_UDP: u8 = 17;
 const IPPROTO_ESP: u8 = 50;
 const CURRENT_DATAPATH_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath.bpf.o");
@@ -4303,6 +4308,9 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_TFT_CLASSIFIER_META,
                 MAP_TFT_CLASSIFIER_FILTERS,
                 MAP_TFT_CLASSIFIER_COUNTERS,
+                GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
             ],
         ),
         "the live uplink program must reference the exact pinned maps read by diagnostics",
@@ -4327,6 +4335,9 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_SESSION_GROUPS,
                 MAP_SESSION_DOWNLINK_INDEX,
                 MAP_CONFIG_IPV6,
+                GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
             ],
         ),
         "the live downlink program must reference the exact pinned maps read by diagnostics",
@@ -6978,6 +6989,327 @@ async fn ebpf_gtpu_downlink_outer_fragments_reenter_sdk_consumer_exactly_once(
     assert_eq!(counters.malformed, 0);
 
     drop(net);
+    Ok(())
+}
+
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let device = backend
+        .create_device_with_endpoints(grouped_device_request(grouped_mtu_policy()))
+        .await?;
+    // The exact grouped v4 entry is marked. This lets the production ingress
+    // writer stamp the access-to-core path from the XFRM output mark and lets
+    // the production downlink writer select the dedicated SWu Child SA.
+    let mut marked_v4 = session_context(device.ifindex);
+    marked_v4.local_teid =
+        Teid::new(GROUP_LOCAL_TEID_V4_INITIAL).expect("nonzero grouped v4 local TEID");
+    marked_v4.peer_teid =
+        Teid::new(GROUP_PEER_TEID_V4_INITIAL).expect("nonzero grouped v4 peer TEID");
+    marked_v4.bearer_mark = Some(GtpBearerMark::new(MARK_A).expect("nonzero XFRM bearer mark"));
+    let mut grouped_v6 = session_context(device.ifindex);
+    grouped_v6.local_teid =
+        Teid::new(GROUP_LOCAL_TEID_V6_INITIAL).expect("nonzero grouped v6 local TEID");
+    grouped_v6.peer_teid =
+        Teid::new(GROUP_PEER_TEID_V6_INITIAL).expect("nonzero grouped v6 peer TEID");
+    grouped_v6.ms_address = IpAddr::V6(UE_PAA_IPV6);
+    grouped_v6.peer_address = IpAddr::V6(PGW_IPV6);
+    let desired = GtpuSessionGroup::new(
+        grouped_group_id(),
+        grouped_device_id(),
+        vec![
+            GtpuSessionEntry::new(marked_v4, IpAddr::V4(EPDG_S2BU_IP))?,
+            GtpuSessionEntry::new(grouped_v6, IpAddr::V6(EPDG_S2BU_IPV6))?,
+        ],
+    )?;
+    assert_eq!(
+        backend
+            .reconcile_pdp_context_group(fresh_grouped_reconcile(desired.clone()))
+            .await?,
+        GtpuSessionGroupReconcileOutcome::Activated
+    );
+    assert_eq!(
+        backend
+            .read_pdp_context_group(GtpuSessionGroupSelector::new(
+                grouped_group_id(),
+                grouped_device_id(),
+            ))
+            .await?,
+        GtpuSessionGroupReadback::Active(desired.clone())
+    );
+    assert_eq!(
+        backend.gtpu_traffic_proof_capability(),
+        GtpuCapability::Available,
+        "an exact active grouped attachment must expose trusted observations"
+    );
+
+    // Resolve the outer neighbour before registration, so no warm-up packet
+    // can become proof evidence. The SWu objects live only in this fresh
+    // netns and its uniquely named UE peer netns; TestNet's RAII teardown
+    // destroys both namespaces and every remaining XFRM object with them.
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    let pgw = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind proof PGW socket")
+    });
+    let untrusted_pgw = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_ALT_IP, GTPU_PORT)).expect("bind untrusted proof PGW socket")
+    });
+    let ue = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, XFRM_INNER_SOURCE_PORT)).expect("bind proof UE socket")
+    });
+    let _epdg_nat_t_socket = nat_t_socket(EPDG_SWU_IP);
+    let _ue_nat_t_socket = in_netns(&net.ue_ns, || nat_t_socket(UE_SWU_IP));
+    install_real_marked_inbound_xfrm(&net.ue_ns).await?;
+    install_real_marked_outbound_xfrm().await?;
+    let outbound_capture = packet_capture_socket(&net.ue_ns);
+    let policy = TrafficContinuityPolicy::new(
+        2,
+        Duration::from_millis(25),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        8,
+    )?;
+    let authority = GtpuTrafficProofAuthority::new(desired, 1, 1, 1, policy)?;
+    let authority_store = GtpuTrafficProofAuthorityStore::new(authority);
+
+    let downlink = build_inner_udp(
+        REMOTE_HOST,
+        UE_PAA,
+        XFRM_DOWNLINK_SOURCE_PORT,
+        XFRM_DOWNLINK_DESTINATION_PORT,
+        b"continuity",
+    );
+    let valid_gpdu = build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &downlink);
+    let mut uplink = [0_u8; 2048];
+
+    // These are complete real ESP -> XFRM -> eBPF GTP-U and grouped GTP-U ->
+    // eBPF -> XFRM -> ESP paths, but they precede every registration and are
+    // therefore structurally incapable of proving a later attempt.
+    let (uplink_len, uplink_source) = send_until_received(
+        || {
+            let _ = ue.send_to(
+                b"continuity-pre-window",
+                (REMOTE_HOST, XFRM_INNER_DESTINATION_PORT),
+            );
+        },
+        &pgw,
+        &mut uplink,
+    )
+    .expect("pre-window ESP uplink must traverse the production GTP-U writer");
+    assert_eq!(uplink_source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(
+        u32::from_be_bytes(uplink[4..8].try_into()?),
+        GROUP_PEER_TEID_V4_INITIAL
+    );
+    assert!(uplink[..uplink_len].ends_with(b"continuity-pre-window"));
+    pgw.send_to(&valid_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+    assert_eq!(
+        capture_nat_t_esp_spi(&outbound_capture),
+        OUTBOUND_SPI_A,
+        "a grouped marked downlink must traverse the dedicated outbound Child SA"
+    );
+
+    // Retire one registered attempt after it observes a genuine path. Its
+    // events carry that registration's epoch and must be stale for the fresh
+    // attempt below, just like the pre-registration packets above.
+    let mut stale_session = backend
+        .begin_gtpu_traffic_proof(authority_store.lease().await)
+        .await?;
+    let _ = send_until_received(
+        || {
+            let _ = ue.send_to(
+                b"continuity-stale",
+                (REMOTE_HOST, XFRM_INNER_DESTINATION_PORT),
+            );
+        },
+        &pgw,
+        &mut uplink,
+    )
+    .expect("stale-attempt ESP uplink must traverse the production GTP-U writer");
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut stale_session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+    backend.close_gtpu_traffic_proof(stale_session).await?;
+    let mut session = backend
+        .begin_gtpu_traffic_proof(authority_store.lease().await)
+        .await?;
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+
+    // A packet from a peer excluded by the active binding, and a malformed
+    // envelope from the admitted peer, must not create trusted evidence.
+    untrusted_pgw.send_to(&valid_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+    pgw.send_to(
+        &valid_gpdu[..GTPU_MANDATORY_HDR_LEN - 1],
+        (EPDG_S2BU_IP, GTPU_PORT),
+    )?;
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+
+    let (uplink_len, uplink_source) = send_until_received(
+        || {
+            let _ = ue.send_to(b"continuity", (REMOTE_HOST, XFRM_INNER_DESTINATION_PORT));
+        },
+        &pgw,
+        &mut uplink,
+    )
+    .expect("first registered ESP uplink must traverse the production GTP-U writer");
+    assert_eq!(uplink_source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(
+        u32::from_be_bytes(uplink[4..8].try_into()?),
+        GROUP_PEER_TEID_V4_INITIAL
+    );
+    assert!(uplink_len > GTPU_MANDATORY_HDR_LEN);
+    // One observed direction and an unelapsed directional window cannot issue
+    // a proof, even after the event source was polled.
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+
+    std::thread::sleep(Duration::from_millis(30));
+    let (uplink_len, uplink_source) = send_until_received(
+        || {
+            let _ = ue.send_to(b"continuity", (REMOTE_HOST, XFRM_INNER_DESTINATION_PORT));
+        },
+        &pgw,
+        &mut uplink,
+    )
+    .expect("second registered ESP uplink must traverse the production GTP-U writer");
+    assert_eq!(uplink_source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(
+        u32::from_be_bytes(uplink[4..8].try_into()?),
+        GROUP_PEER_TEID_V4_INITIAL
+    );
+    assert!(uplink_len > GTPU_MANDATORY_HDR_LEN);
+    // The access-to-core window is now complete, but one direction alone is
+    // still insufficient for a production proof.
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+
+    pgw.send_to(&valid_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+    assert_eq!(
+        capture_nat_t_esp_spi(&outbound_capture),
+        OUTBOUND_SPI_A,
+        "first registered grouped downlink must traverse marked outbound XFRM"
+    );
+    // The reverse direction has arrived, but has not yet met its independent
+    // policy observation window.
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+
+    std::thread::sleep(Duration::from_millis(30));
+    pgw.send_to(&valid_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+    assert_eq!(
+        capture_nat_t_esp_spi(&outbound_capture),
+        OUTBOUND_SPI_A,
+        "second registered grouped downlink must traverse marked outbound XFRM"
+    );
+    let proof = match backend.poll_gtpu_traffic_proof(&mut session).await? {
+        GtpuTrafficProofPoll::Proven(proof) => proof,
+        GtpuTrafficProofPoll::Pending | GtpuTrafficProofPoll::Invalidated(_) | _ => {
+            panic!("bidirectional continuity proof did not complete")
+        }
+    };
+    let summary = proof.summary();
+    assert!(summary.access_to_core_samples() >= policy.minimum_samples_per_direction());
+    assert!(summary.core_to_access_samples() >= policy.minimum_samples_per_direction());
+    let validation_lease = authority_store.lease().await;
+    assert_eq!(
+        backend
+            .validate_gtpu_traffic_proof(&proof, &validation_lease)
+            .await?,
+        GtpuTrafficProofValidation::Current,
+        "the final proof must validate against the exact current authority"
+    );
+    backend.close_gtpu_traffic_proof(session).await?;
+
+    // Remove only the fresh-netns SA and policy created for this test. A new
+    // attempt cannot reuse a pre-removal proof path: the peer can still emit
+    // ESP, but the ePDG no longer owns an inbound SA/policy that can decrypt
+    // and forward it to the production GTP-U writer.
+    let xfrm = LinuxXfrmBackend::new();
+    xfrm.remove_policy(RemovePolicyRequest::new(
+        marked_inner_selector(),
+        XfrmDirection::Forward,
+    ))
+    .await?;
+    xfrm.remove_sa(RemoveSaRequest::new(
+        xfrm_ip(EPDG_SWU_IP),
+        IPPROTO_ESP,
+        INBOUND_SPI_A,
+    ))
+    .await?;
+    drain_datagrams(&pgw);
+    let mut broken_session = backend
+        .begin_gtpu_traffic_proof(authority_store.lease().await)
+        .await?;
+    pgw.set_read_timeout(Some(Duration::from_millis(250)))?;
+    ue.send_to(
+        b"continuity-after-inbound-xfrm-removal",
+        (REMOTE_HOST, XFRM_INNER_DESTINATION_PORT),
+    )?;
+    assert!(
+        pgw.recv_from(&mut uplink).is_err(),
+        "without the owned inbound SA/policy, ESP cannot reach the production GTP-U writer"
+    );
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut broken_session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+    backend.close_gtpu_traffic_proof(broken_session).await?;
+
+    // A source-loss indication must revoke an otherwise valid proof rather
+    // than allowing the already-issued result to stand. This test owns the
+    // disposable pin and changes no host or foreign dataplane state.
+    let loss_pin = grouped_pin_directory(&net.pin_root, grouped_device_id())
+        .join(GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME);
+    let loss_map = Map::from_map_data(MapData::from_pin(loss_pin)?)?;
+    let mut loss = PerCpuArray::<_, u64>::try_from(loss_map)?;
+    let mut loss_values = loss.get(&0, 0)?.iter().copied().collect::<Vec<_>>();
+    let first_loss_counter = loss_values
+        .first_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing loss counter"))?;
+    *first_loss_counter = first_loss_counter.saturating_add(1);
+    loss.set(0, PerCpuValues::try_from(loss_values)?, 0)?;
+    assert!(matches!(
+        backend
+            .validate_gtpu_traffic_proof(&proof, &validation_lease)
+            .await?,
+        GtpuTrafficProofValidation::Invalidated(_)
+    ));
+    println!("OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN");
     Ok(())
 }
 

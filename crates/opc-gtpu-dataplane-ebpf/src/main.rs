@@ -31,61 +31,71 @@
 
 use aya_ebpf::{
     bindings::{
-        __sk_buff, BPF_CSUM_LEVEL_QUERY, BPF_F_ADJ_ROOM_DECAP_L3_IPV4,
-        BPF_F_ADJ_ROOM_DECAP_L3_IPV6, BPF_F_ADJ_ROOM_ENCAP_L3_IPV4, BPF_F_ADJ_ROOM_ENCAP_L3_IPV6,
-        BPF_F_ADJ_ROOM_ENCAP_L4_UDP, TC_ACT_OK, TC_ACT_REDIRECT, TC_ACT_SHOT,
-        bpf_adj_room_mode::BPF_ADJ_ROOM_MAC,
+        __sk_buff, bpf_adj_room_mode::BPF_ADJ_ROOM_MAC, bpf_spin_lock as BpfSpinLock,
+        BPF_CSUM_LEVEL_QUERY, BPF_F_ADJ_ROOM_DECAP_L3_IPV4, BPF_F_ADJ_ROOM_DECAP_L3_IPV6,
+        BPF_F_ADJ_ROOM_ENCAP_L3_IPV4, BPF_F_ADJ_ROOM_ENCAP_L3_IPV6, BPF_F_ADJ_ROOM_ENCAP_L4_UDP,
+        TC_ACT_OK, TC_ACT_REDIRECT, TC_ACT_SHOT,
     },
+    btf_maps::Array as BtfArray,
     cty::c_void,
     helpers::{
-        bpf_csum_diff, bpf_csum_level, bpf_loop, bpf_redirect_neigh, bpf_skb_change_tail,
-        bpf_skb_load_bytes,
+        bpf_csum_diff, bpf_csum_level, bpf_ktime_get_boot_ns, bpf_loop, bpf_redirect_neigh,
+        bpf_skb_change_tail, bpf_skb_load_bytes, bpf_spin_lock, bpf_spin_unlock,
     },
-    macros::{classifier, map},
-    maps::{Array, HashMap, PerCpuArray},
+    macros::{btf_map, classifier, map},
+    maps::{Array, HashMap, PerCpuArray, RingBuf},
     programs::TcContext,
 };
+use opc_gtpu_ebpf_common::classify_ipv6_extension_step;
 use opc_gtpu_ebpf_common::{
-    COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
-    COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
-    COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
-    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
+    apply_uplink_mtu_policy, build_uplink_encap_with_dscp_and_source_port, classify_gtpu,
+    classify_udp_checksum, decide_uplink_pmtu, downlink_frame_end,
+    downlink_parse_ipv4_total_length, downlink_parse_payload_offset, downlink_parse_teid,
+    gtpu_session_config_wire_owns_local_ipv4, gtpu_session_config_wire_owns_local_ipv6,
+    internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
+    marked_owner_wire_authorizes_uplink, pack_downlink_parse_result,
+    pdp_commit_wire_authorized_source_port, pdp_commit_wire_authorizes_downlink,
+    pdp_commit_wire_authorizes_graph, select_gtpu_session_entry_wire,
+    tft_classifier_filter_matches, tft_classifier_schema_is_current,
+    uplink_non_encapsulation_drops, validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch,
+    DownlinkPdr, GtpuClass, GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuPmtuProtocol,
+    GtpuSessionAuthorityHeader, GtpuSessionEntryWireView, GtpuSessionGroupPhase,
+    GtpuSessionIpFamily, GtpuTrafficObservationDirection, GtpuTrafficObservationRegistration,
+    GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds, Ipv6ExtensionStep, MarkedDownlinkPdr,
+    TftClassifierFilter, TftClassifierFilterKey, TftClassifierIpv4Packet, TftClassifierKey,
+    TftClassifierMeta, UdpChecksumDisposition, UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar,
+    UplinkFarKey, UplinkMtuMapState, UplinkPmtuDecision, COUNTER_DL_BINDING_FAMILY_MISMATCH,
+    COUNTER_DL_BINDING_INGRESS_MISMATCH, COUNTER_DL_BINDING_INVALID,
+    COUNTER_DL_BINDING_LOCAL_MISMATCH, COUNTER_DL_BINDING_PEER_MISMATCH,
+    COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH,
+    COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
     COUNTER_TFT_CLASSIFIER_INVALID_STATE, COUNTER_TFT_CLASSIFIER_MALFORMED,
     COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
     COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
-    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, DownlinkBindingMismatch,
-    DownlinkPdr, ETH_HDR_LEN, ETH_P_IPV4, ETH_P_IPV6, GTPU_FLAGS_V1_GPDU, GTPU_IPV6_ENCAP_LEN,
-    GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN,
-    GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN,
-    GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN,
-    GTPU_SESSION_SCHEMA_MARKER_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN,
-    GTPU_SESSION_UPLINK_KEY_LEN, GTPU_UDP_PORT, GtpuClass, GtpuEnvelopeBounds,
-    GtpuOuterFragmentPolicy, GtpuPmtuProtocol, GtpuSessionEntryWireView, GtpuSessionIpFamily,
-    GtpuUplinkMtuPolicy, IPV4_MIN_HDR_LEN, IPV6_HDR_LEN, IPV6_MAX_EXT_HEADERS,
-    IPV6_MAX_OPTIONS_PER_HEADER, IPV6_NH_DESTINATION_OPTIONS, IPV6_NH_FRAGMENT, IPV6_NH_HOP_BY_HOP,
-    IPV6_NH_NONE, IPV6_NH_ROUTING, IPV6_NH_UDP, Ipv4EnvelopeBounds, MARKED_BEARER_OWNER_VALUE_LEN,
-    MARKED_DOWNLINK_PDR_VALUE_LEN, MarkedDownlinkPdr, TFT_CLASSIFIER_COUNTER_SLOTS,
+    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
+    ETH_P_IPV6, GTPU_ENCAP_LEN, GTPU_FLAGS_V1_GPDU, GTPU_IPV6_ENCAP_LEN, GTPU_MANDATORY_HDR_LEN,
+    GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN, GTPU_SESSION_CONFIG_KEY,
+    GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
+    GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
+    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
+    GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, GTPU_TRAFFIC_OBSERVATION_GATE_INDEX,
+    GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+    GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN, GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN,
+    GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAX_ENTRIES, GTPU_TRAFFIC_OBSERVATION_RING_BYTES,
+    GTPU_UDP_PORT, IPV4_MIN_HDR_LEN, IPV6_HDR_LEN,
+    IPV6_MAX_EXT_HEADERS, IPV6_MAX_OPTIONS_PER_HEADER, IPV6_NH_DESTINATION_OPTIONS,
+    IPV6_NH_FRAGMENT, IPV6_NH_HOP_BY_HOP, IPV6_NH_NONE, IPV6_NH_ROUTING, IPV6_NH_UDP,
+    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, TFT_CLASSIFIER_COUNTER_SLOTS,
     TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES, TFT_CLASSIFIER_MAX_FILTERS,
-    TFT_CLASSIFIER_META_MAP_MAX_ENTRIES, TFT_CLASSIFIER_SCHEMA_VALUE_LEN, TftClassifierFilter,
-    TftClassifierFilterKey, TftClassifierIpv4Packet, TftClassifierKey, TftClassifierMeta,
-    UDP_HDR_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
+    TFT_CLASSIFIER_META_MAP_MAX_ENTRIES, TFT_CLASSIFIER_SCHEMA_VALUE_LEN, UDP_HDR_LEN,
+    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
     UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_VALUE_LEN,
-    UPLINK_SOURCE_PORT_VALUE_LEN, UdpChecksumDisposition, UdpChecksumEvidence, UdpEnvelopeBounds,
-    UplinkFar, UplinkFarKey, UplinkMtuMapState, UplinkPmtuDecision, apply_uplink_mtu_policy,
-    build_uplink_encap_with_dscp_and_source_port, classify_gtpu, classify_udp_checksum,
-    decide_uplink_pmtu, downlink_frame_end, downlink_parse_ipv4_total_length,
-    downlink_parse_payload_offset, downlink_parse_teid, gtpu_session_config_wire_owns_local_ipv4,
-    gtpu_session_config_wire_owns_local_ipv6, internet_checksum_sum_is_valid,
-    marked_owner_wire_authorizes_downlink, marked_owner_wire_authorizes_uplink,
-    pack_downlink_parse_result, pdp_commit_wire_authorized_source_port,
-    pdp_commit_wire_authorizes_downlink, pdp_commit_wire_authorizes_graph,
-    select_gtpu_session_entry_wire, tft_classifier_filter_matches,
-    tft_classifier_schema_is_current, uplink_non_encapsulation_drops,
-    validate_ipv4_downlink_binding_wire,
+    UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 #[cfg(test)]
 use opc_gtpu_ebpf_common::{
-    Ipv6ExtensionStep, classify_ipv6_extension_step, internet_checksum, udp_ipv6_checksum,
+    internet_checksum, udp_ipv6_checksum, validate_ipv6_options_header,
+    validate_ipv6_routing_header,
 };
 
 /// Uplink FAR: UE PAA (IPv4, network order) -> encap state.
@@ -164,6 +174,67 @@ static GTPU_PMTU_DROP: PerCpuArray<u64> = PerCpuArray::pinned(UPLINK_PMTU_COUNTE
 static GTPU_SESSIONS: HashMap<[u8; GTPU_SESSION_GROUP_ID_LEN], [u8; GTPU_SESSION_GROUP_VALUE_LEN]> =
     HashMap::pinned(65536, 0);
 
+/// Exact-current observation registrations. Startup clears this pinned map
+/// before minting a new source incarnation and epoch.
+#[map]
+static GTPU_OBS_REG: HashMap<
+    [u8; GTPU_SESSION_GROUP_ID_LEN],
+    [u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+> = HashMap::pinned(GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAX_ENTRIES, 0);
+
+/// Exact per-attempt redirect authority. A nonce resolves only to the group
+/// that published it; re-entry still requires that group's active exact
+/// registration to carry the same nonce, so this map alone can never emit.
+#[map]
+static GTPU_OBS_REDIR: HashMap<
+    [u8; GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN],
+    [u8; GTPU_SESSION_GROUP_ID_LEN],
+> = HashMap::pinned(GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAX_ENTRIES, 0);
+
+/// Bounded local-forwarding observations. This pinned ring buffer is not a
+/// peer-delivery channel; a host evaluator must compose both directions and
+/// bracket drains with `GTPU_OBS_LOSS`.
+#[map]
+static GTPU_OBS_EVT: RingBuf = RingBuf::pinned(GTPU_TRAFFIC_OBSERVATION_RING_BYTES, 0);
+
+/// Per-CPU, saturating evidence that a local observation could not enter the
+/// bounded ring buffer. Startup clears it with the pinned source state.
+#[map]
+static GTPU_OBS_LOSS: PerCpuArray<u64> = PerCpuArray::pinned(1, 0);
+
+/// Global, source-scoped producer sequence. Unlike boot time, this remains
+/// unique when different CPUs observe packets in the same clock tick. Startup
+/// resets it together with registrations, the ring, and loss evidence.
+#[map]
+static GTPU_OBS_SEQ: Array<u64> = Array::pinned(1, 0);
+
+/// Loader-owned source-publication state. Slot zero is the reset/quiescence
+/// gate; slot one is the durable publication-identity high-water mark. Odd gate
+/// values authorize producers and even values fence them. The publication
+/// high-water mark is never reset within a retained map graph, so delayed
+/// packets cannot bind a later proof attempt through an identity ABA. The
+/// separate full-width redirect nonce closes that ABA across graph recreation.
+#[map]
+static GTPU_OBS_GATE: Array<u64> = Array::pinned(GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES, 0);
+
+/// BTF-visible synchronization primitive for `GTPU_OBS_SEQ`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ObservationSequenceLock {
+    lock: BpfSpinLock,
+}
+
+/// Separate lock-only map. Every required map lookup happens before the lock
+/// is acquired, and userspace never mutates this special BTF value.
+#[btf_map]
+static GTPU_OBS_LCK: BtfArray<ObservationSequenceLock, 1> = BtfArray::new();
+
+/// Per-CPU scratch for the canonical flow key. Keeping this 40-byte parser
+/// result out of the packet program's stack preserves the verifier's fixed
+/// 512-byte bound without sharing mutable state across CPUs.
+#[map]
+static GTPU_OBS_FLOW: PerCpuArray<[u8; 40]> = PerCpuArray::pinned(1, 0);
+
 /// Family-tagged grouped uplink selector index.
 #[map]
 static GTPU_UL_INDEX: HashMap<[u8; GTPU_SESSION_UPLINK_KEY_LEN], [u8; GTPU_SESSION_GROUP_REF_LEN]> =
@@ -228,6 +299,10 @@ const IPV6_PARSE_DROP: i32 = -1;
 const GROUPED_LOOKUP_MISS: u8 = 0;
 const GROUPED_LOOKUP_ERROR: u8 = 1;
 const GROUPED_LOOKUP_AUTHORIZED: u8 = 2;
+const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
+const IPPROTO_ICMP: u8 = 1;
+const IPPROTO_ICMPV6: u8 = 58;
 
 #[inline(always)]
 const fn ipv4_owned_tft_fragment_is_unfragmented(fragment: u16) -> bool {
@@ -344,6 +419,545 @@ fn count_tft_classifier_drop(index: u32) {
         // SAFETY: per-CPU slot; no concurrent access on the same CPU.
         unsafe { *counter += 1 };
     }
+}
+
+#[inline(always)]
+fn count_observation_loss() {
+    if let Some(counter) = GTPU_OBS_LOSS.get_ptr_mut(0) {
+        // SAFETY: per-CPU slot; no concurrent access on the same CPU.
+        unsafe { *counter = (*counter).saturating_add(1) };
+    }
+}
+
+#[inline(always)]
+fn clear_observation_flow_scratch() {
+    if let Some(flow) = GTPU_OBS_FLOW.get_ptr_mut(0) {
+        // SAFETY: this is the current CPU's private fixed-size scratch slot.
+        unsafe { (&mut *flow).fill(0) };
+    }
+}
+
+/// Enter the observation publication critical section for one exact loader
+/// gate incarnation. The per-CPU scratch remains nonzero until after the ring
+/// record is submitted, allowing userspace to prove every old producer has
+/// quiesced before it resets retained source state.
+#[inline(always)]
+fn begin_observation_publication() -> bool {
+    let Some(gate_ptr) = GTPU_OBS_GATE.get_ptr(GTPU_TRAFFIC_OBSERVATION_GATE_INDEX) else {
+        return false;
+    };
+    // SAFETY: the gate is a live array value written only by the loader. A
+    // volatile load prevents compiler reuse across the scratch publication.
+    let gate = unsafe { core::ptr::read_volatile(gate_ptr) };
+    if gate == 0 || gate & 1 == 0 {
+        return false;
+    }
+    let Some(flow_ptr) = GTPU_OBS_FLOW.get_ptr_mut(0) else {
+        return false;
+    };
+    // SAFETY: this is the current CPU's private fixed-size scratch slot.
+    let flow = unsafe { &mut *flow_ptr };
+    flow.fill(0);
+    flow[0] = u8::MAX;
+    let Some(confirm_ptr) = GTPU_OBS_GATE.get_ptr(GTPU_TRAFFIC_OBSERVATION_GATE_INDEX) else {
+        flow.fill(0);
+        return false;
+    };
+    // SAFETY: same live read-only map value as above. A changed value means
+    // reset began between entry and publication of the active marker.
+    let confirmed = unsafe { core::ptr::read_volatile(confirm_ptr) };
+    if confirmed != gate {
+        flow.fill(0);
+        return false;
+    }
+    true
+}
+
+#[inline(always)]
+fn next_observation_sequence() -> Option<u64> {
+    let counter = GTPU_OBS_SEQ.get_ptr_mut(0)?;
+    let sequence_lock = GTPU_OBS_LCK.get_ptr_mut(0)?;
+    // SAFETY: both pointers are live array-map values for this invocation.
+    // The BTF spin lock serializes this plain u64 update across CPUs, all map
+    // lookups occurred before locking, and unlock is unconditional even when
+    // the sequence is exhausted.
+    unsafe {
+        bpf_spin_lock(&mut (*sequence_lock).lock);
+        let next = (*counter).checked_add(1);
+        if let Some(next) = next {
+            *counter = next;
+        }
+        bpf_spin_unlock(&mut (*sequence_lock).lock);
+        next
+    }
+}
+
+// `__sk_buff.cb` is five `u32` words in Aya's generated bindings, matching
+// Linux's 20-byte tc scratch area. Word zero is an exact ownership marker; the
+// remaining four native-endian words preserve every byte of the CSPRNG-filled
+// per-attempt redirect nonce. The SDK owns this tc hook's scratch contract.
+// A fresh pinned graph may restart finite publication IDs, but cannot recreate
+// this nonce, closing delayed-skb ABA across graph recreation.
+const GROUPED_UPLINK_OBSERVATION_CB_MARKER: u32 = 0xa000_0000;
+
+#[inline(always)]
+fn grouped_observation_marker(stamp: u32) -> bool {
+    stamp == GROUPED_UPLINK_OBSERVATION_CB_MARKER
+}
+
+#[inline(always)]
+fn grouped_observation_cb_stamp(nonce: [u8; GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN]) -> [u32; 5] {
+    [
+        GROUPED_UPLINK_OBSERVATION_CB_MARKER,
+        u32::from_ne_bytes([nonce[0], nonce[1], nonce[2], nonce[3]]),
+        u32::from_ne_bytes([nonce[4], nonce[5], nonce[6], nonce[7]]),
+        u32::from_ne_bytes([nonce[8], nonce[9], nonce[10], nonce[11]]),
+        u32::from_ne_bytes([nonce[12], nonce[13], nonce[14], nonce[15]]),
+    ]
+}
+
+#[inline(always)]
+fn nonce_from_grouped_observation_cb_stamp(
+    cb: [u32; 5],
+) -> Option<[u8; GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN]> {
+    if !grouped_observation_marker(cb[0]) {
+        return None;
+    }
+    let first = cb[1].to_ne_bytes();
+    let second = cb[2].to_ne_bytes();
+    let third = cb[3].to_ne_bytes();
+    let fourth = cb[4].to_ne_bytes();
+    Some([
+        first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3],
+        third[0], third[1], third[2], third[3], fourth[0], fourth[1], fourth[2], fourth[3],
+    ])
+}
+
+/// Capture the current immutable registration identity at a forwarding
+/// boundary. A map replacement after this lookup leaves the borrowed old value
+/// valid for this invocation, while later publication requires exact identity
+/// equality with the live registration.
+#[inline(always)]
+fn current_observation_redirect_identity(
+    authority: Option<&[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
+) -> Option<([u8; GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN], u32)> {
+    let authority = authority?;
+    let header = GtpuSessionAuthorityHeader::decode(authority)?;
+    let raw_registration = GTPU_OBS_REG.get_ptr(header.group_id().to_bytes())?;
+    // SAFETY: Aya returned a live read-only map-value pointer for this program
+    // invocation. No reference or identifying bytes escape the kernel.
+    let raw_registration = unsafe { &*raw_registration };
+    GtpuTrafficObservationRegistration::encoded_redirect_identity_if_current(
+        raw_registration,
+        header.group_id(),
+        header.device_id(),
+        header.generation(),
+    )
+}
+
+/// Store opaque grouped authority only across this program's pending neighbour
+/// redirect. The tc scratch area is not packet data and cannot be populated by
+/// an unprivileged packet sender.
+#[inline(always)]
+fn stamp_grouped_uplink_observation(
+    ctx: &TcContext,
+    authority: Option<&[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
+) {
+    let Some(authority) = authority else {
+        return;
+    };
+    let Some(_header) = GtpuSessionAuthorityHeader::decode(authority) else {
+        return;
+    };
+    let Some((nonce, _)) = current_observation_redirect_identity(Some(authority)) else {
+        return;
+    };
+    let stamp = grouped_observation_cb_stamp(nonce);
+    // SAFETY: the tc verifier supplies a live, writable `__sk_buff` context.
+    // Aya binds `cb` as exactly `[u32; 5]`; this program owns this temporary
+    // redirect stamp and reads/clears it only on its proven re-entry.
+    unsafe {
+        (*ctx.skb.skb).cb = stamp;
+    }
+}
+
+/// Take and clear the one-shot grouped redirect stamp. A nonmatching marker is
+/// ignored so unrelated tc scratch users retain their state.
+#[inline(always)]
+fn take_grouped_uplink_observation_stamp(
+    ctx: &TcContext,
+) -> Option<[u8; GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN]> {
+    // SAFETY: the tc verifier supplies a live, writable `__sk_buff` context.
+    // The marker check prevents this program from clearing scratch state it did
+    // not write; a matching stamp is consumed before any map lookup or event.
+    unsafe {
+        let cb = &mut (*ctx.skb.skb).cb;
+        let nonce = nonce_from_grouped_observation_cb_stamp(*cb)?;
+        *cb = [0; 5];
+        Some(nonce)
+    }
+}
+
+/// Clear only a matching internal stamp when this frame is not a proven
+/// redirect re-entry. This prevents stale scratch state from surviving into a
+/// later classifier while preserving unrelated tc scratch users' state.
+#[inline(always)]
+fn clear_unmatched_grouped_uplink_observation_stamp(ctx: &TcContext) {
+    // SAFETY: the tc verifier supplies a live, writable `__sk_buff` context.
+    // A marker mismatch is left untouched because this program does not own it.
+    unsafe {
+        let cb = &mut (*ctx.skb.skb).cb;
+        if grouped_observation_marker(cb[0]) {
+            *cb = [0; 5];
+        }
+    }
+}
+
+/// Build an internal, direction-normalized flow key. It is hashed before any
+/// event leaves the kernel and is never included in an observation record.
+#[inline(always)]
+fn observation_l4_correlation(
+    protocol: u8,
+    version: u8,
+    direction: GtpuTrafficObservationDirection,
+    l4: [u8; 8],
+) -> Option<([u8; 2], [u8; 2])> {
+    match protocol {
+        IPPROTO_TCP | IPPROTO_UDP => {
+            let source = [l4[0], l4[1]];
+            let destination = [l4[2], l4[3]];
+            Some(match direction {
+                GtpuTrafficObservationDirection::AccessToCore => (source, destination),
+                GtpuTrafficObservationDirection::CoreToAccess => (destination, source),
+            })
+        }
+        IPPROTO_ICMP if version == 4 && l4[1] == 0 => match direction {
+            GtpuTrafficObservationDirection::AccessToCore if l4[0] == 8 => {
+                Some(([l4[4], l4[5]], [0, 0]))
+            }
+            GtpuTrafficObservationDirection::CoreToAccess if l4[0] == 0 => {
+                Some(([l4[4], l4[5]], [0, 0]))
+            }
+            _ => None,
+        },
+        IPPROTO_ICMPV6 if version == 6 && l4[1] == 0 => match direction {
+            GtpuTrafficObservationDirection::AccessToCore if l4[0] == 128 => {
+                Some(([l4[4], l4[5]], [0, 0]))
+            }
+            GtpuTrafficObservationDirection::CoreToAccess if l4[0] == 129 => {
+                Some(([l4[4], l4[5]], [0, 0]))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Validate the observation-only transport shape against the exact declared
+/// IP extent. The prefix is zero-filled for UDP/ICMP (which need only eight
+/// bytes) and complete for TCP (which needs the data-offset field at byte 12).
+/// Forwarding deliberately remains independent: malformed packets simply do
+/// not produce observation evidence.
+#[inline(always)]
+fn observation_transport_is_valid(
+    protocol: u8,
+    version: u8,
+    l4: [u8; 20],
+    transport_len: usize,
+) -> bool {
+    if transport_len < 8 {
+        return false;
+    }
+    match protocol {
+        IPPROTO_TCP => {
+            if transport_len < 20 {
+                return false;
+            }
+            let data_offset_words = usize::from(l4[12] >> 4);
+            data_offset_words >= 5
+                && data_offset_words
+                    .checked_mul(4)
+                    .is_some_and(|header_len| header_len <= transport_len)
+        }
+        IPPROTO_UDP => {
+            let declared_len = usize::from(u16::from_be_bytes([l4[4], l4[5]]));
+            declared_len != 0 && declared_len == transport_len
+        }
+        IPPROTO_ICMP if version == 4 => l4[1] == 0 && matches!(l4[0], 0 | 8),
+        IPPROTO_ICMPV6 if version == 6 => l4[1] == 0 && matches!(l4[0], 128 | 129),
+        _ => false,
+    }
+}
+
+#[inline(never)]
+fn observation_flow_key(
+    ctx: &TcContext,
+    inner_offset: usize,
+    direction: GtpuTrafficObservationDirection,
+) -> Option<&'static mut [u8; 40]> {
+    let version = ctx.load::<u8>(inner_offset).ok()? >> 4;
+    let key_ptr = GTPU_OBS_FLOW.get_ptr_mut(0)?;
+    // SAFETY: this per-CPU slot cannot be concurrently used by another packet
+    // on this CPU. The complete key is overwritten before it is hashed and no
+    // reference escapes the current tc invocation.
+    let key = unsafe { &mut *key_ptr };
+    key.fill(0);
+    key[0] = 1;
+    let (protocol, l4_offset, source, destination, ip_end) = match version {
+        4 => {
+            let version_ihl = ctx.load::<u8>(inner_offset).ok()?;
+            let header_len = usize::from(version_ihl & 0x0f).checked_mul(4)?;
+            let total_len = usize::from(u16::from_be(ctx.load::<u16>(inner_offset + 2).ok()?));
+            let fragment = u16::from_be(ctx.load::<u16>(inner_offset + 6).ok()?);
+            if version_ihl >> 4 != 4
+                || header_len < IPV4_MIN_HDR_LEN
+                || total_len < header_len
+                || fragment & 0x3fff != 0
+            {
+                return None;
+            }
+            let ip_end = inner_offset.checked_add(total_len)?;
+            if ip_end > ctx.len() as usize {
+                return None;
+            }
+            let protocol = ctx.load::<u8>(inner_offset + 9).ok()?;
+            let mut source = [0_u8; 16];
+            let mut destination = [0_u8; 16];
+            source[..4].copy_from_slice(&ctx.load::<[u8; 4]>(inner_offset + 12).ok()?);
+            destination[..4].copy_from_slice(&ctx.load::<[u8; 4]>(inner_offset + 16).ok()?);
+            (
+                protocol,
+                inner_offset.checked_add(header_len)?,
+                source,
+                destination,
+                ip_end,
+            )
+        }
+        6 => {
+            let payload_len = usize::from(u16::from_be(ctx.load::<u16>(inner_offset + 4).ok()?));
+            let base_end = inner_offset.checked_add(IPV6_HDR_LEN)?;
+            let ip_end = base_end.checked_add(payload_len)?;
+            // Observation is a non-forwarding side path, but it must still
+            // prove both the declared IPv6 payload boundary and the live skb
+            // boundary before reading its terminal eight-byte L4 selector.
+            if payload_len < 8 || ip_end > ctx.len() as usize {
+                return None;
+            }
+            let (protocol, l4_offset) = ipv6_l4_offset(
+                ctx,
+                ip_end,
+                ipv6_l4_parse_config(inner_offset, IPV6_TERMINAL_OBSERVATION, true),
+            )?;
+            if l4_offset.checked_add(8)? > ip_end {
+                return None;
+            }
+            (
+                protocol,
+                l4_offset,
+                ctx.load::<[u8; 16]>(inner_offset + 8).ok()?,
+                ctx.load::<[u8; 16]>(inner_offset + 24).ok()?,
+                ip_end,
+            )
+        }
+        _ => return None,
+    };
+    key[1] = version;
+    key[2] = protocol;
+    let transport_len = ip_end.checked_sub(l4_offset)?;
+    if transport_len < 8 {
+        return None;
+    }
+    let mut l4_header = [0_u8; 20];
+    if protocol == IPPROTO_TCP {
+        if transport_len < 20 {
+            return None;
+        }
+        l4_header = ctx.load::<[u8; 20]>(l4_offset).ok()?;
+    } else {
+        l4_header[..8].copy_from_slice(&ctx.load::<[u8; 8]>(l4_offset).ok()?);
+    }
+    if !observation_transport_is_valid(protocol, version, l4_header, transport_len) {
+        return None;
+    }
+    let l4 = [
+        l4_header[0],
+        l4_header[1],
+        l4_header[2],
+        l4_header[3],
+        l4_header[4],
+        l4_header[5],
+        l4_header[6],
+        l4_header[7],
+    ];
+    // Echo sequence numbers identify individual exchanges. Correlate echo
+    // continuity by the direction-normalized address pair and identifier so
+    // successive request/reply pairs can span the required window; TCP/UDP
+    // retain their complete direction-normalized port pair.
+    let (access_l4, core_l4) = observation_l4_correlation(protocol, version, direction, l4)?;
+    match direction {
+        GtpuTrafficObservationDirection::AccessToCore => {
+            key[4..20].copy_from_slice(&source);
+            key[20..36].copy_from_slice(&destination);
+        }
+        GtpuTrafficObservationDirection::CoreToAccess => {
+            key[4..20].copy_from_slice(&destination);
+            key[20..36].copy_from_slice(&source);
+        }
+    }
+    key[36..38].copy_from_slice(&access_l4);
+    key[38..40].copy_from_slice(&core_l4);
+    Some(key)
+}
+
+/// Emit only an exact-current local forwarding-boundary observation. Every
+/// observation failure is deliberately ignored by the forwarding path.
+#[inline(never)]
+fn emit_grouped_observation(
+    ctx: &TcContext,
+    authority: Option<&[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
+    publication_id: u32,
+    inner_offset: usize,
+    direction: GtpuTrafficObservationDirection,
+) {
+    if !begin_observation_publication() {
+        return;
+    }
+    try_emit_grouped_observation(ctx, authority, publication_id, inner_offset, direction);
+    clear_observation_flow_scratch();
+}
+
+#[inline(never)]
+fn try_emit_grouped_observation(
+    ctx: &TcContext,
+    authority: Option<&[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
+    publication_id: u32,
+    inner_offset: usize,
+    direction: GtpuTrafficObservationDirection,
+) {
+    let Some(authority) = authority else {
+        return;
+    };
+    let Some(header) = GtpuSessionAuthorityHeader::decode(authority) else {
+        return;
+    };
+    let group_key = header.group_id().to_bytes();
+    let Some(raw_registration) = GTPU_OBS_REG.get_ptr(group_key) else {
+        return;
+    };
+    // SAFETY: Aya returned this pointer from the retained registration map;
+    // this function only reads its fixed map-value extent before returning.
+    let raw_registration = unsafe { &*raw_registration };
+    if !GtpuTrafficObservationRegistration::encoded_matches_current(
+        raw_registration,
+        header.group_id(),
+        header.device_id(),
+        header.generation(),
+        publication_id,
+    ) {
+        return;
+    }
+    if observation_flow_key(ctx, inner_offset, direction).is_none() {
+        return;
+    }
+    // SAFETY: this helper returns the kernel's monotonic boot-time clock.
+    let boot_time_ns = unsafe { bpf_ktime_get_boot_ns() };
+    let Some(producer_sequence) = next_observation_sequence() else {
+        count_observation_loss();
+        return;
+    };
+    let Some(mut event) = GTPU_OBS_EVT.reserve_bytes(GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, 0) else {
+        count_observation_loss();
+        return;
+    };
+    event[..16].copy_from_slice(&raw_registration[..16]);
+    event[16..56].copy_from_slice(&raw_registration[32..72]);
+    let Some(flow_key) = GTPU_OBS_FLOW.get_ptr_mut(0) else {
+        event.discard(0);
+        count_observation_loss();
+        return;
+    };
+    // SAFETY: the per-CPU key was completely written above in this same
+    // non-preemptible program invocation.
+    let flow_key = unsafe { &mut *flow_key };
+    let first =
+        GtpuTrafficObservationRegistration::encoded_correlation_half(raw_registration, flow_key, 0);
+    event[56..64].copy_from_slice(&first.to_be_bytes());
+    let second =
+        GtpuTrafficObservationRegistration::encoded_correlation_half(raw_registration, flow_key, 1);
+    event[64..72].copy_from_slice(&second.to_be_bytes());
+    // Clear endpoint-bearing verifier scratch before publication, retaining
+    // only the active marker until the outer wrapper observes submission.
+    // The scratch is never retained as status, diagnostics, or proof evidence.
+    flow_key.fill(0);
+    flow_key[0] = u8::MAX;
+    event[72..80].copy_from_slice(&boot_time_ns.to_be_bytes());
+    event[80..88].copy_from_slice(&producer_sequence.to_be_bytes());
+    event[88] = direction as u8;
+    event[89..].fill(0);
+    event.submit(0);
+}
+
+/// Emit an uplink observation only after the strict redirect re-entry envelope
+/// proof has succeeded. This re-fetches authority by the opaque group key so a
+/// changed group generation or registration suppresses stale observations.
+#[inline(never)]
+fn emit_grouped_uplink_observation_on_reentry(ctx: &TcContext, eth_proto: u16) {
+    let Some(nonce) = take_grouped_uplink_observation_stamp(ctx) else {
+        return;
+    };
+    let Some(group_key_ptr) = GTPU_OBS_REDIR.get_ptr(nonce) else {
+        return;
+    };
+    // SAFETY: this retained map value is read only for this classifier invocation.
+    let group_key = unsafe { *group_key_ptr };
+    let Some(authority_ptr) = GTPU_SESSIONS.get_ptr(group_key) else {
+        return;
+    };
+    // SAFETY: this is one retained normal hash-map value borrowed for this tc
+    // invocation only; no view escapes this function.
+    let authority = unsafe { &*authority_ptr };
+    let Some(header) = GtpuSessionAuthorityHeader::decode(authority) else {
+        return;
+    };
+    if header.group_id().to_bytes() != group_key || header.phase() != GtpuSessionGroupPhase::Active
+    {
+        return;
+    }
+    let Some(raw_registration) = GTPU_OBS_REG.get_ptr(group_key) else {
+        return;
+    };
+    // SAFETY: this retained fixed-size registration is borrowed for this invocation.
+    let raw_registration = unsafe { &*raw_registration };
+    let Some((_, publication_id)) = GtpuTrafficObservationRegistration::encoded_redirect_identity_if_current(
+        raw_registration,
+        header.group_id(),
+        header.device_id(),
+        header.generation(),
+    ) else {
+        return;
+    };
+    if !GtpuTrafficObservationRegistration::encoded_matches_current_redirect_nonce(
+        raw_registration,
+        header.group_id(),
+        header.device_id(),
+        header.generation(),
+        publication_id,
+        &nonce,
+    ) {
+        return;
+    }
+    let inner_offset = match eth_proto {
+        ETH_P_IPV4 => ETH_HDR_LEN + GTPU_ENCAP_LEN,
+        ETH_P_IPV6 => ETH_HDR_LEN + GTPU_IPV6_ENCAP_LEN,
+        _ => return,
+    };
+    emit_grouped_observation(
+        ctx,
+        Some(authority),
+        publication_id,
+        inner_offset,
+        GtpuTrafficObservationDirection::AccessToCore,
+    );
 }
 
 #[inline(always)]
@@ -793,8 +1407,10 @@ fn grouped_uplink_authority<'a>(
     mark: u32,
     eth_proto: u16,
     status: &mut u8,
+    observation_authority: &mut Option<&'a [u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
 ) -> Option<GtpuSessionEntryWireView<'a>> {
     *status = GROUPED_LOOKUP_MISS;
+    *observation_authority = None;
     let mut key_wire = [0_u8; GTPU_SESSION_UPLINK_KEY_LEN];
     let inner_family = match eth_proto {
         ETH_P_IPV4 => {
@@ -845,6 +1461,7 @@ fn grouped_uplink_authority<'a>(
     if !entry.authorizes_uplink_key(&key_wire) {
         return None;
     }
+    *observation_authority = Some(authority);
     *status = GROUPED_LOOKUP_AUTHORIZED;
     Some(entry)
 }
@@ -860,8 +1477,10 @@ fn grouped_downlink_authority<'a>(
     teid: [u8; 4],
     packed_offsets: u64,
     status: &mut u8,
+    observation_authority: &mut Option<&'a [u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
 ) -> Option<GtpuSessionEntryWireView<'a>> {
     *status = GROUPED_LOOKUP_MISS;
+    *observation_authority = None;
     let l4_offset = usize::try_from(packed_offsets >> 32).ok()?;
     let payload_offset = usize::try_from(packed_offsets as u32).ok()?;
     let outer_family = match u16::from_be(ctx.load::<u16>(12).ok()?) {
@@ -938,6 +1557,7 @@ fn grouped_downlink_authority<'a>(
     {
         return None;
     }
+    *observation_authority = Some(authority);
     *status = GROUPED_LOOKUP_AUTHORIZED;
     Some(entry)
 }
@@ -1047,7 +1667,11 @@ fn finalize_internet_checksum(sum: u32) -> u16 {
     let first = (sum & 0xffff) + (sum >> 16);
     let second = (first & 0xffff) + (first >> 16);
     let checksum = !(second as u16);
-    if checksum == 0 { u16::MAX } else { checksum }
+    if checksum == 0 {
+        u16::MAX
+    } else {
+        checksum
+    }
 }
 
 #[inline(always)]
@@ -1056,7 +1680,12 @@ fn finalized_internet_checksum_bytes(sum: u32) -> [u8; 2] {
 }
 
 #[inline(always)]
-fn complete_grouped_uplink(ctx: &TcContext, mark: u32, ether_type: u16) -> i32 {
+fn complete_grouped_uplink(
+    ctx: &TcContext,
+    mark: u32,
+    ether_type: u16,
+    authority: Option<&[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
+) -> i32 {
     if ctx.store(12, &ether_type.to_be_bytes(), 0).is_err() {
         return TC_ACT_SHOT;
     }
@@ -1070,7 +1699,10 @@ fn complete_grouped_uplink(ctx: &TcContext, mark: u32, ether_type: u16) -> i32 {
     // SAFETY: no neighbour parameter pointer is supplied; the helper derives
     // the route and neighbour from the newly materialized outer IP header. A
     // redirect that resolves re-enters this egress hook, where
-    // `uplink_frame_is_redirect_reentry` counts COUNTER_UL_REDIRECT_RESOLVED.
+    // `uplink_frame_is_redirect_reentry` proves delivery to `dev_queue_xmit`.
+    // The opaque authority stamp is deliberately written immediately before
+    // submission, but no observation is emitted unless that later proof holds.
+    stamp_grouped_uplink_observation(ctx, authority);
     let action = unsafe { bpf_redirect_neigh((*ctx.skb.skb).ifindex, core::ptr::null_mut(), 0, 0) };
     if action == i64::from(TC_ACT_REDIRECT) {
         action as i32
@@ -1085,6 +1717,7 @@ fn encapsulate_grouped_ipv6(
     mark: u32,
     entry: GtpuSessionEntryWireView<'_>,
     inner_len: u16,
+    authority: Option<&[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
 ) -> i32 {
     if entry.outer_family() != GtpuSessionIpFamily::Ipv6
         || !checksum_bytes_are_materialized(ctx)
@@ -1168,7 +1801,7 @@ fn encapsulate_grouped_ipv6(
     {
         return TC_ACT_SHOT;
     }
-    complete_grouped_uplink(ctx, mark, ETH_P_IPV6)
+    complete_grouped_uplink(ctx, mark, ETH_P_IPV6, authority)
 }
 
 #[inline(never)]
@@ -1177,6 +1810,7 @@ fn encapsulate_grouped_ipv4(
     mark: u32,
     entry: GtpuSessionEntryWireView<'_>,
     inner_len: u16,
+    authority: Option<&[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
 ) -> i32 {
     if entry.outer_family() != GtpuSessionIpFamily::Ipv4 {
         return TC_ACT_SHOT;
@@ -1227,7 +1861,7 @@ fn encapsulate_grouped_ipv4(
     {
         return TC_ACT_SHOT;
     }
-    complete_grouped_uplink(ctx, mark, ETH_P_IPV4)
+    complete_grouped_uplink(ctx, mark, ETH_P_IPV4, authority)
 }
 
 #[inline(always)]
@@ -1235,13 +1869,18 @@ fn encapsulate_grouped_uplink(
     ctx: &TcContext,
     mark: u32,
     entry: GtpuSessionEntryWireView<'_>,
+    authority: Option<&[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
 ) -> i32 {
     let Some(inner_len) = grouped_inner_length(ctx, entry.inner_family()) else {
         return TC_ACT_SHOT;
     };
     match entry.outer_family() {
-        GtpuSessionIpFamily::Ipv4 => encapsulate_grouped_ipv4(ctx, mark, entry, inner_len),
-        GtpuSessionIpFamily::Ipv6 => encapsulate_grouped_ipv6(ctx, mark, entry, inner_len),
+        GtpuSessionIpFamily::Ipv4 => {
+            encapsulate_grouped_ipv4(ctx, mark, entry, inner_len, authority)
+        }
+        GtpuSessionIpFamily::Ipv6 => {
+            encapsulate_grouped_ipv6(ctx, mark, entry, inner_len, authority)
+        }
     }
 }
 
@@ -1285,12 +1924,19 @@ fn decap_grouped_downlink(
     outer_family: GtpuSessionIpFamily,
     payload_offset: usize,
     entry: GtpuSessionEntryWireView<'_>,
+    authority: Option<&[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
 ) -> i32 {
     let inner_family = entry.inner_family();
     if !grouped_inner_payload_is_exact(ctx, payload_offset, inner_family) {
         count(COUNTER_DL_MALFORMED);
         return TC_ACT_SHOT;
     }
+    // Capture the immutable proof-attempt identity while this packet is at the
+    // exact forwarding decision. Decapsulation may continue when no proof is
+    // registered, but a delayed packet can never be rebound to a registration
+    // installed after this point.
+    let observation_publication_id = current_observation_redirect_identity(authority)
+        .map(|(_, publication_id)| publication_id);
     let Some(strip) = payload_offset.checked_sub(ETH_HDR_LEN) else {
         count(COUNTER_DL_MALFORMED);
         return TC_ACT_SHOT;
@@ -1318,12 +1964,22 @@ fn decap_grouped_downlink(
     }
     ctx.set_mark(u32::from_be_bytes(entry.bearer_mark()));
     count(COUNTER_DL_DECAP);
+    if let Some(publication_id) = observation_publication_id {
+        emit_grouped_observation(
+            ctx,
+            authority,
+            publication_id,
+            ETH_HDR_LEN,
+            GtpuTrafficObservationDirection::CoreToAccess,
+        );
+    }
     TC_ACT_OK
 }
 
 #[repr(C)]
 struct Ipv6ExtensionLoopContext {
     skb: *mut __sk_buff,
+    ip_start: u32,
     ip_end: u32,
     cursor: u32,
     option_remaining: u32,
@@ -1332,6 +1988,8 @@ struct Ipv6ExtensionLoopContext {
     next_header: u32,
     flags: u32,
     state: u32,
+    terminal: u32,
+    reject_fragments: u32,
 }
 
 const IPV6_EXTENSION_STATE_WALK: u32 = 0;
@@ -1347,14 +2005,38 @@ const IPV6_EXTENSION_FLAGS_MASK: u32 = IPV6_EXTENSION_FLAG_FRAGMENT
     | IPV6_EXTENSION_FLAG_ROUTING
     | IPV6_EXTENSION_FLAG_PRE_ROUTING_DESTINATION
     | IPV6_EXTENSION_FLAG_FINAL_DESTINATION;
-const IPV6_PACKET_MAX_END: u32 = (ETH_HDR_LEN + IPV6_HDR_LEN + u16::MAX as usize) as u32;
+// Observation begins after a proven outer GTP-U envelope, while the existing
+// downlink parser starts at Ethernet. Bound both positions so bpf_loop state
+// remains verifier-friendly without assuming a fixed inner IPv6 offset.
+const IPV6_PACKET_MAX_END: u32 =
+    (ETH_HDR_LEN + GTPU_IPV6_ENCAP_LEN + IPV6_HDR_LEN + u16::MAX as usize) as u32;
 const IPV6_OPTIONS_MAX_BYTES: u32 = (u8::MAX as u32 + 1) * 8 - 2;
+const IPV6_TERMINAL_UDP: u32 = 0;
+const IPV6_TERMINAL_OBSERVATION: u32 = 1;
+
+#[inline(always)]
+const fn ipv6_l4_parse_config(ip_start: usize, terminal: u32, reject_fragments: bool) -> u64 {
+    (ip_start as u64) | ((terminal as u64) << 32) | ((reject_fragments as u64) << 33)
+}
 
 // One iteration discovers an extension header or consumes one option TLV.
 // Eight headers carrying the maximum 32 options each therefore require at
 // most 8 * (1 + 32) verifier-bounded steps.
 const IPV6_EXTENSION_LOOP_STEPS: u32 =
     (IPV6_MAX_EXT_HEADERS * (IPV6_MAX_OPTIONS_PER_HEADER + 1)) as u32;
+
+#[inline(always)]
+const fn ipv6_terminal_is_accepted(next_header: u32, terminal: u32) -> bool {
+    match terminal {
+        IPV6_TERMINAL_UDP => next_header == IPV6_NH_UDP as u32,
+        IPV6_TERMINAL_OBSERVATION => {
+            next_header == IPPROTO_TCP as u32
+                || next_header == IPPROTO_UDP as u32
+                || next_header == IPPROTO_ICMPV6 as u32
+        }
+        _ => false,
+    }
+}
 
 /// Advance one state in the complete IPv6 extension-chain walk.
 ///
@@ -1372,15 +2054,24 @@ unsafe extern "C" fn walk_ipv6_extension_step(_index: u64, context: *mut c_void)
     // `bpf_loop` revisits this callback with caller-stack scalars. Reassert
     // every protocol bound so imprecise merged states cannot turn a bounded
     // packet cursor or state field into an unbounded branch.
-    if context.ip_end < (ETH_HDR_LEN + IPV6_HDR_LEN) as u32
+    if context.ip_start < ETH_HDR_LEN as u32
+        || context.ip_start > (ETH_HDR_LEN + GTPU_IPV6_ENCAP_LEN) as u32
+    {
+        context.state = IPV6_EXTENSION_STATE_FAILED;
+        return 1;
+    }
+    let base_end = context.ip_start + IPV6_HDR_LEN as u32;
+    if context.ip_end < base_end
         || context.ip_end > IPV6_PACKET_MAX_END
-        || context.cursor < (ETH_HDR_LEN + IPV6_HDR_LEN) as u32
+        || context.cursor < base_end
         || context.cursor > context.ip_end
         || context.option_remaining > IPV6_OPTIONS_MAX_BYTES
         || context.walked > IPV6_MAX_EXT_HEADERS as u32
         || context.options_walked > IPV6_MAX_OPTIONS_PER_HEADER as u32
         || context.next_header > u32::from(u8::MAX)
         || context.flags & !IPV6_EXTENSION_FLAGS_MASK != 0
+        || context.terminal > IPV6_TERMINAL_OBSERVATION
+        || context.reject_fragments > 1
     {
         context.state = IPV6_EXTENSION_STATE_FAILED;
         return 1;
@@ -1460,7 +2151,7 @@ unsafe extern "C" fn walk_ipv6_extension_step(_index: u64, context: *mut c_void)
         }
 
         context.state = IPV6_EXTENSION_STATE_WALK;
-        if context.next_header == u32::from(IPV6_NH_UDP) {
+        if ipv6_terminal_is_accepted(context.next_header, context.terminal) {
             context.state = IPV6_EXTENSION_STATE_DONE;
             return 1;
         }
@@ -1471,7 +2162,7 @@ unsafe extern "C" fn walk_ipv6_extension_step(_index: u64, context: *mut c_void)
         return 0;
     }
 
-    if context.next_header == u32::from(IPV6_NH_UDP) {
+    if ipv6_terminal_is_accepted(context.next_header, context.terminal) {
         context.state = IPV6_EXTENSION_STATE_DONE;
         return 1;
     }
@@ -1524,23 +2215,23 @@ unsafe extern "C" fn walk_ipv6_extension_step(_index: u64, context: *mut c_void)
     // SAFETY: the preceding helper initialized the complete array.
     let prefix = unsafe { prefix.assume_init() };
     let available = context.ip_end - context.cursor;
-    let header_len = match current_header {
-        IPV6_NH_HOP_BY_HOP | IPV6_NH_ROUTING | IPV6_NH_DESTINATION_OPTIONS => {
-            (u32::from(prefix[1]) + 1) * 8
-        }
-        IPV6_NH_FRAGMENT => {
-            let fragment = u16::from_be_bytes([prefix[2], prefix[3]]);
-            if fragment & 0xfff8 != 0 || fragment & 0x0001 != 0 {
-                context.state = IPV6_EXTENSION_STATE_FAILED;
-                return 1;
-            }
-            8
-        }
-        _ => {
-            context.state = IPV6_EXTENSION_STATE_FAILED;
-            return 1;
-        }
+    // Keep the observation and forwarding walkers aligned with the shared
+    // host-model classifier. The callback owns only skb loading and bounded
+    // option/routing validation that cannot use a borrowed packet slice.
+    let Ok(Ipv6ExtensionStep::Skip {
+        next_header,
+        header_len,
+        atomic_fragment,
+    }) = classify_ipv6_extension_step(current_header, prefix, available as usize)
+    else {
+        context.state = IPV6_EXTENSION_STATE_FAILED;
+        return 1;
     };
+    if context.reject_fragments != 0 && atomic_fragment {
+        context.state = IPV6_EXTENSION_STATE_FAILED;
+        return 1;
+    }
+    let header_len = u32::from(header_len);
     if header_len > available {
         context.state = IPV6_EXTENSION_STATE_FAILED;
         return 1;
@@ -1568,7 +2259,7 @@ unsafe extern "C" fn walk_ipv6_extension_step(_index: u64, context: *mut c_void)
         _ => {}
     }
     context.walked += 1;
-    context.next_header = u32::from(prefix[0]);
+    context.next_header = u32::from(next_header);
 
     if current_header == IPV6_NH_HOP_BY_HOP || current_header == IPV6_NH_DESTINATION_OPTIONS {
         context.cursor += 2;
@@ -1579,7 +2270,7 @@ unsafe extern "C" fn walk_ipv6_extension_step(_index: u64, context: *mut c_void)
     }
 
     context.cursor = header_end;
-    if context.next_header == u32::from(IPV6_NH_UDP) {
+    if ipv6_terminal_is_accepted(context.next_header, context.terminal) {
         context.state = IPV6_EXTENSION_STATE_DONE;
         return 1;
     }
@@ -1609,21 +2300,27 @@ fn validate_ipv6_routing_skb(prefix: [u8; 8], header_len: usize) -> bool {
     }
 }
 
-/// Walk the declared IPv6 extension chain without materializing it.
+/// Walk one bounded IPv6 extension chain without materializing it.
 ///
-/// `None` always means "let the IPv6 stack decide": the caller has not yet
-/// proven a UDP/2152 candidate. Atomic fragments are accepted; packets that
-/// require reassembly, AH/ESP, active routing, and discard-required options
-/// remain untouched for the host stack.
+/// The terminal selector retains the forwarding parser's UDP/atomic-fragment
+/// contract while observation accepts only TCP, UDP, or ICMPv6 and rejects
+/// every Fragment header. Failure is side-effect free for the caller.
 #[inline(never)]
-fn ipv6_udp_offset(ctx: &TcContext, ip_end: usize) -> Option<usize> {
-    let next_header = ctx.load::<u8>(ETH_HDR_LEN + 6).ok()?;
-    let cursor = ETH_HDR_LEN.checked_add(IPV6_HDR_LEN)?;
-    if next_header == IPV6_NH_UDP {
-        return Some(cursor);
+fn ipv6_l4_offset(ctx: &TcContext, ip_end: usize, parse_config: u64) -> Option<(u8, usize)> {
+    let ip_start = usize::try_from(parse_config as u32).ok()?;
+    let terminal = u32::try_from((parse_config >> 32) & 1).ok()?;
+    let reject_fragments = (parse_config >> 33) & 1 != 0;
+    if parse_config >> 34 != 0 {
+        return None;
     }
+    let cursor = ip_start.checked_add(IPV6_HDR_LEN)?;
+    if ip_end > ctx.len() as usize || terminal > IPV6_TERMINAL_OBSERVATION {
+        return None;
+    }
+    let next_header = ctx.load::<u8>(ip_start.checked_add(6)?).ok()?;
     let mut loop_context = Ipv6ExtensionLoopContext {
         skb: ctx.skb.skb,
+        ip_start: u32::try_from(ip_start).ok()?,
         ip_end: u32::try_from(ip_end).ok()?,
         cursor: u32::try_from(cursor).ok()?,
         option_remaining: 0,
@@ -1632,6 +2329,8 @@ fn ipv6_udp_offset(ctx: &TcContext, ip_end: usize) -> Option<usize> {
         next_header: u32::from(next_header),
         flags: 0,
         state: IPV6_EXTENSION_STATE_WALK,
+        terminal,
+        reject_fragments: u32::from(reject_fragments),
     };
     // SAFETY: the callback has the ABI required by `bpf_loop`. The mutable
     // context remains live for the synchronous helper call, and flags zero is
@@ -1647,7 +2346,26 @@ fn ipv6_udp_offset(ctx: &TcContext, ip_end: usize) -> Option<usize> {
     if performed < 0 || loop_context.state != IPV6_EXTENSION_STATE_DONE {
         return None;
     }
-    usize::try_from(loop_context.cursor).ok()
+    Some((
+        u8::try_from(loop_context.next_header).ok()?,
+        usize::try_from(loop_context.cursor).ok()?,
+    ))
+}
+
+/// Walk the declared IPv6 extension chain without materializing it.
+///
+/// `None` always means "let the IPv6 stack decide": the caller has not yet
+/// proven a UDP/2152 candidate. Atomic fragments are accepted; packets that
+/// require reassembly, AH/ESP, active routing, and discard-required options
+/// remain untouched for the host stack.
+#[inline(never)]
+fn ipv6_udp_offset(ctx: &TcContext, ip_end: usize) -> Option<usize> {
+    ipv6_l4_offset(
+        ctx,
+        ip_end,
+        ipv6_l4_parse_config(ETH_HDR_LEN, IPV6_TERMINAL_UDP, false),
+    )
+    .map(|(_, offset)| offset)
 }
 
 #[inline(never)]
@@ -1903,10 +2621,21 @@ fn handle_downlink_ipv6(ctx: &mut TcContext) -> i32 {
         return malformed_downlink();
     };
     let mut status = GROUPED_LOOKUP_MISS;
-    match grouped_downlink_authority(ctx, parsed.teid, packed_offsets, &mut status) {
-        Some(entry) => {
-            decap_grouped_downlink(ctx, GtpuSessionIpFamily::Ipv6, payload_offset, entry)
-        }
+    let mut observation_authority = None;
+    match grouped_downlink_authority(
+        ctx,
+        parsed.teid,
+        packed_offsets,
+        &mut status,
+        &mut observation_authority,
+    ) {
+        Some(entry) => decap_grouped_downlink(
+            ctx,
+            GtpuSessionIpFamily::Ipv6,
+            payload_offset,
+            entry,
+            observation_authority,
+        ),
         None if status == GROUPED_LOOKUP_ERROR => binding_drop(DownlinkBindingMismatch::Invalid),
         None => {
             // The frozen v5 schema has no outer-IPv6 selector. A valid G-PDU
@@ -1966,9 +2695,22 @@ pub fn opc_gtpu_downlink(mut ctx: TcContext) -> i32 {
         return malformed_downlink();
     };
     let mut grouped_status = GROUPED_LOOKUP_MISS;
-    match grouped_downlink_authority(&ctx, teid, packed_offsets, &mut grouped_status) {
+    let mut observation_authority = None;
+    match grouped_downlink_authority(
+        &ctx,
+        teid,
+        packed_offsets,
+        &mut grouped_status,
+        &mut observation_authority,
+    ) {
         Some(entry) => {
-            return decap_grouped_downlink(&ctx, GtpuSessionIpFamily::Ipv4, payload_offset, entry);
+            return decap_grouped_downlink(
+                &ctx,
+                GtpuSessionIpFamily::Ipv4,
+                payload_offset,
+                entry,
+                observation_authority,
+            );
         }
         None if grouped_status == GROUPED_LOOKUP_ERROR => {
             return binding_drop(DownlinkBindingMismatch::Invalid);
@@ -1994,8 +2736,10 @@ fn try_uplink(ctx: &mut TcContext, mut mark: u32) -> Result<i32, ()> {
         // successfully delivered uplink packet used to be reported as a session
         // lookup failure. Both counters now mean what they say.
         count(COUNTER_UL_REDIRECT_RESOLVED);
+        emit_grouped_uplink_observation_on_reentry(ctx, eth_proto);
         return Ok(non_encapsulation_action(mark));
     }
+    clear_unmatched_grouped_uplink_observation_stamp(ctx);
 
     match eth_proto {
         ETH_P_IPV4 => {
@@ -2030,8 +2774,22 @@ fn try_uplink(ctx: &mut TcContext, mut mark: u32) -> Result<i32, ()> {
     // must not observe an originally unmarked shared-SA packet before TFT can
     // select its dedicated bearer mark.
     let mut grouped_status = GROUPED_LOOKUP_MISS;
-    match grouped_uplink_authority(ctx, mark, eth_proto, &mut grouped_status) {
-        Some(entry) => return Ok(encapsulate_grouped_uplink(ctx, mark, entry)),
+    let mut observation_authority = None;
+    match grouped_uplink_authority(
+        ctx,
+        mark,
+        eth_proto,
+        &mut grouped_status,
+        &mut observation_authority,
+    ) {
+        Some(entry) => {
+            return Ok(encapsulate_grouped_uplink(
+                ctx,
+                mark,
+                entry,
+                observation_authority,
+            ));
+        }
         None if grouped_status == GROUPED_LOOKUP_ERROR => return Ok(TC_ACT_SHOT),
         None => {}
     }
@@ -3047,6 +3805,629 @@ fn authorize_and_decap_legacy_downlink(
 mod tests {
     use super::*;
 
+    /// Host model for the observation-only IPv6 key contract. The eBPF
+    /// implementation uses the same `classify_ipv6_extension_step` primitive,
+    /// but reads bounded skb ranges inside a verifier-safe `bpf_loop`.
+    fn modeled_ipv6_observation_key(
+        packet: &[u8],
+        direction: GtpuTrafficObservationDirection,
+    ) -> Option<[u8; 40]> {
+        if packet.len() < IPV6_HDR_LEN || packet[0] >> 4 != 6 {
+            return None;
+        }
+        let ip_end =
+            IPV6_HDR_LEN.checked_add(usize::from(u16::from_be_bytes([packet[4], packet[5]])))?;
+        if ip_end > packet.len() {
+            return None;
+        }
+        let mut next_header = packet[6];
+        let mut cursor = IPV6_HDR_LEN;
+        let mut walked = 0_usize;
+        let mut routing_seen = false;
+        let mut pre_routing_destination_seen = false;
+        let mut final_destination_seen = false;
+        loop {
+            if matches!(next_header, IPPROTO_TCP | IPPROTO_UDP | IPPROTO_ICMPV6) {
+                break;
+            }
+            if walked == IPV6_MAX_EXT_HEADERS
+                || next_header == IPV6_NH_HOP_BY_HOP && walked != 0
+                || next_header == IPV6_NH_ROUTING && routing_seen
+                || next_header == IPV6_NH_FRAGMENT
+                || next_header == IPV6_NH_ROUTING && final_destination_seen
+                || next_header == IPV6_NH_DESTINATION_OPTIONS && final_destination_seen
+                || next_header == IPV6_NH_DESTINATION_OPTIONS
+                    && pre_routing_destination_seen
+                    && !routing_seen
+            {
+                return None;
+            }
+            let prefix: [u8; 8] = packet
+                .get(cursor..cursor.checked_add(8)?)?
+                .try_into()
+                .ok()?;
+            let available = ip_end.checked_sub(cursor)?;
+            let Ipv6ExtensionStep::Skip {
+                next_header: following,
+                header_len,
+                atomic_fragment,
+            } = classify_ipv6_extension_step(next_header, prefix, available).ok()?
+            else {
+                return None;
+            };
+            // Correlation deliberately rejects even an atomic Fragment header:
+            // evidence must never depend on fragment interpretation.
+            if atomic_fragment {
+                return None;
+            }
+            let header_end = cursor.checked_add(usize::from(header_len))?;
+            let header = packet.get(cursor..header_end)?;
+            match next_header {
+                IPV6_NH_HOP_BY_HOP | IPV6_NH_DESTINATION_OPTIONS => {
+                    validate_ipv6_options_header(header).ok()?;
+                }
+                IPV6_NH_ROUTING => validate_ipv6_routing_header(header).ok()?,
+                _ => {}
+            }
+            match next_header {
+                IPV6_NH_ROUTING => routing_seen = true,
+                IPV6_NH_DESTINATION_OPTIONS if routing_seen => final_destination_seen = true,
+                IPV6_NH_DESTINATION_OPTIONS => pre_routing_destination_seen = true,
+                _ => {}
+            }
+            cursor = header_end;
+            next_header = following;
+            walked += 1;
+        }
+        let transport_len = ip_end.checked_sub(cursor)?;
+        if transport_len < 8 {
+            return None;
+        }
+        let mut l4_header = [0_u8; 20];
+        let prefix_len = core::cmp::min(transport_len, l4_header.len());
+        l4_header[..prefix_len].copy_from_slice(packet.get(cursor..cursor + prefix_len)?);
+        if !observation_transport_is_valid(next_header, 6, l4_header, transport_len) {
+            return None;
+        }
+        let l4: [u8; 8] = l4_header[..8].try_into().ok()?;
+        let (access_l4, core_l4) = observation_l4_correlation(next_header, 6, direction, l4)?;
+        let mut key = [0_u8; 40];
+        key[0] = 1;
+        key[1] = 6;
+        key[2] = next_header;
+        match direction {
+            GtpuTrafficObservationDirection::AccessToCore => {
+                key[4..20].copy_from_slice(&packet[8..24]);
+                key[20..36].copy_from_slice(&packet[24..40]);
+            }
+            GtpuTrafficObservationDirection::CoreToAccess => {
+                key[4..20].copy_from_slice(&packet[24..40]);
+                key[20..36].copy_from_slice(&packet[8..24]);
+            }
+        }
+        key[36..38].copy_from_slice(&access_l4);
+        key[38..40].copy_from_slice(&core_l4);
+        Some(key)
+    }
+
+    fn modeled_ipv6_packet(first_next_header: u8, extensions: &[u8], l4: [u8; 8]) -> Vec<u8> {
+        // Keep a twenty-byte declared transport extent so the helper can model
+        // both direct TCP and TCP reached through an extension chain. UDP and
+        // ICMP simply treat the remaining bytes as payload.
+        let transport_len = 20;
+        let mut packet = vec![0_u8; IPV6_HDR_LEN + extensions.len() + transport_len];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(
+            &u16::try_from(extensions.len() + transport_len)
+                .expect("synthetic payload fits")
+                .to_be_bytes(),
+        );
+        packet[6] = first_next_header;
+        packet[8..24].copy_from_slice(&[0x20; 16]);
+        packet[24..40].copy_from_slice(&[0x30; 16]);
+        packet[IPV6_HDR_LEN..IPV6_HDR_LEN + extensions.len()].copy_from_slice(extensions);
+        let transport_start = IPV6_HDR_LEN + extensions.len();
+        packet[transport_start..transport_start + l4.len()].copy_from_slice(&l4);
+        packet[transport_start + 12] = 0x50;
+        if first_next_header == IPPROTO_UDP && l4[4] == 0 && l4[5] == 0 {
+            packet[transport_start + 4..transport_start + 6]
+                .copy_from_slice(&u16::try_from(transport_len).expect("bounded").to_be_bytes());
+        }
+        packet
+    }
+
+    fn modeled_ipv4_observation_key(
+        packet: &[u8],
+        direction: GtpuTrafficObservationDirection,
+    ) -> Option<[u8; 40]> {
+        if packet.len() < IPV4_MIN_HDR_LEN || packet[0] >> 4 != 4 {
+            return None;
+        }
+        let header_len = usize::from(packet[0] & 0x0f).checked_mul(4)?;
+        let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+        let fragment = u16::from_be_bytes([packet[6], packet[7]]);
+        if header_len < IPV4_MIN_HDR_LEN || total_len < header_len || fragment & 0x3fff != 0 {
+            return None;
+        }
+        let ip_end = total_len;
+        if ip_end > packet.len() {
+            return None;
+        }
+        let l4_offset = header_len;
+        let transport_len = ip_end.checked_sub(l4_offset)?;
+        if transport_len < 8 {
+            return None;
+        }
+        let mut l4_header = [0_u8; 20];
+        let prefix_len = core::cmp::min(transport_len, l4_header.len());
+        l4_header[..prefix_len].copy_from_slice(packet.get(l4_offset..l4_offset + prefix_len)?);
+        let protocol = packet[9];
+        if !observation_transport_is_valid(protocol, 4, l4_header, transport_len) {
+            return None;
+        }
+        let l4: [u8; 8] = l4_header[..8].try_into().ok()?;
+        let (access_l4, core_l4) = observation_l4_correlation(protocol, 4, direction, l4)?;
+        let mut key = [0_u8; 40];
+        key[0] = 1;
+        key[1] = 4;
+        key[2] = protocol;
+        match direction {
+            GtpuTrafficObservationDirection::AccessToCore => {
+                key[4..8].copy_from_slice(&packet[12..16]);
+                key[20..24].copy_from_slice(&packet[16..20]);
+            }
+            GtpuTrafficObservationDirection::CoreToAccess => {
+                key[4..8].copy_from_slice(&packet[16..20]);
+                key[20..24].copy_from_slice(&packet[12..16]);
+            }
+        }
+        key[36..38].copy_from_slice(&access_l4);
+        key[38..40].copy_from_slice(&core_l4);
+        Some(key)
+    }
+
+    fn modeled_ipv4_packet(protocol: u8, transport: &[u8]) -> Vec<u8> {
+        let total_len = IPV4_MIN_HDR_LEN + transport.len();
+        let mut packet = vec![0_u8; total_len];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&u16::try_from(total_len).expect("bounded").to_be_bytes());
+        packet[9] = protocol;
+        packet[12..16].copy_from_slice(&[0x0a, 0, 0, 1]);
+        packet[16..20].copy_from_slice(&[0x0a, 0, 0, 2]);
+        packet[IPV4_MIN_HDR_LEN..].copy_from_slice(transport);
+        packet
+    }
+
+    #[test]
+    fn observation_ipv6_model_accepts_direct_and_canonical_extension_l4() {
+        for (protocol, l4) in [
+            (IPPROTO_TCP, [0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0]),
+            (IPPROTO_UDP, [0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0]),
+            (IPPROTO_ICMPV6, [128, 0, 0, 0, 0xab, 0xcd, 0x12, 0x34]),
+        ] {
+            assert!(modeled_ipv6_observation_key(
+                &modeled_ipv6_packet(protocol, &[], l4),
+                GtpuTrafficObservationDirection::AccessToCore,
+            )
+            .is_some());
+        }
+
+        let canonical_chain = [
+            IPV6_NH_DESTINATION_OPTIONS,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0, // Hop-by-Hop.
+            IPV6_NH_ROUTING,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0, // pre-routing Destination.
+            IPV6_NH_DESTINATION_OPTIONS,
+            0,
+            253,
+            0,
+            0,
+            0,
+            0,
+            0, // inert Routing.
+            IPPROTO_TCP,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0, // final Destination.
+        ];
+        assert!(modeled_ipv6_observation_key(
+            &modeled_ipv6_packet(
+                IPV6_NH_HOP_BY_HOP,
+                &canonical_chain,
+                [0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0],
+            ),
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_some());
+
+        // The forwarding extension contract itself rejects AH, so correlation
+        // must not broaden it merely to produce an observation.
+        assert!(modeled_ipv6_observation_key(
+            &modeled_ipv6_packet(51, &[IPPROTO_TCP, 0, 0, 0, 0, 0, 0, 0], [1; 8]),
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn observation_ipv6_model_rejects_ambiguous_or_malformed_chains() {
+        let l4 = [0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0];
+        for fragment in [
+            [IPPROTO_TCP, 0, 0, 0, 0, 0, 0, 0], // atomic
+            [IPPROTO_TCP, 0, 0, 8, 0, 0, 0, 0], // non-first
+        ] {
+            assert!(modeled_ipv6_observation_key(
+                &modeled_ipv6_packet(IPV6_NH_FRAGMENT, &fragment, l4),
+                GtpuTrafficObservationDirection::AccessToCore,
+            )
+            .is_none());
+        }
+        let mut too_many = Vec::new();
+        for _ in 0..=IPV6_MAX_EXT_HEADERS {
+            too_many.extend_from_slice(&[IPV6_NH_HOP_BY_HOP, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        assert!(modeled_ipv6_observation_key(
+            &modeled_ipv6_packet(IPV6_NH_HOP_BY_HOP, &too_many, l4),
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_none());
+        let malformed = modeled_ipv6_packet(
+            IPV6_NH_DESTINATION_OPTIONS,
+            &[IPPROTO_TCP, 1, 0, 0, 0, 0, 0, 0],
+            l4,
+        );
+        assert!(modeled_ipv6_observation_key(
+            &malformed,
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_none());
+        let mut truncated = modeled_ipv6_packet(IPPROTO_TCP, &[], l4);
+        truncated[4..6]
+            .copy_from_slice(&u16::try_from(l4.len() + 8).expect("bounded").to_be_bytes());
+        assert!(modeled_ipv6_observation_key(
+            &truncated,
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn observation_ipv6_model_normalizes_reverse_tcp_and_echo_flows() {
+        let forward = modeled_ipv6_packet(IPPROTO_TCP, &[], [0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0]);
+        let mut reverse =
+            modeled_ipv6_packet(IPPROTO_TCP, &[], [0x56, 0x78, 0x12, 0x34, 0, 0, 0, 0]);
+        reverse[8..24].copy_from_slice(&forward[24..40]);
+        reverse[24..40].copy_from_slice(&forward[8..24]);
+        assert_eq!(
+            modeled_ipv6_observation_key(&forward, GtpuTrafficObservationDirection::AccessToCore),
+            modeled_ipv6_observation_key(&reverse, GtpuTrafficObservationDirection::CoreToAccess),
+        );
+
+        let echo = modeled_ipv6_packet(IPPROTO_ICMPV6, &[], [128, 0, 0, 0, 0xab, 0xcd, 0x12, 0x34]);
+        let mut reply =
+            modeled_ipv6_packet(IPPROTO_ICMPV6, &[], [129, 0, 0, 0, 0xab, 0xcd, 0x12, 0x34]);
+        reply[8..24].copy_from_slice(&echo[24..40]);
+        reply[24..40].copy_from_slice(&echo[8..24]);
+        assert_eq!(
+            modeled_ipv6_observation_key(&echo, GtpuTrafficObservationDirection::AccessToCore),
+            modeled_ipv6_observation_key(&reply, GtpuTrafficObservationDirection::CoreToAccess),
+        );
+
+        let mut later_echo = echo.clone();
+        later_echo[46..48].copy_from_slice(&0x5678_u16.to_be_bytes());
+        let mut later_reply = reply.clone();
+        later_reply[46..48].copy_from_slice(&0x5678_u16.to_be_bytes());
+        assert_eq!(
+            modeled_ipv6_observation_key(&echo, GtpuTrafficObservationDirection::AccessToCore),
+            modeled_ipv6_observation_key(
+                &later_echo,
+                GtpuTrafficObservationDirection::AccessToCore,
+            ),
+        );
+        assert_eq!(
+            modeled_ipv6_observation_key(
+                &later_echo,
+                GtpuTrafficObservationDirection::AccessToCore
+            ),
+            modeled_ipv6_observation_key(
+                &later_reply,
+                GtpuTrafficObservationDirection::CoreToAccess
+            ),
+        );
+    }
+
+    #[test]
+    fn observation_echo_correlation_spans_successive_ipv4_and_ipv6_exchanges() {
+        for (protocol, version, request_type, reply_type) in
+            [(IPPROTO_ICMP, 4, 8, 0), (IPPROTO_ICMPV6, 6, 128, 129)]
+        {
+            let request_one = [request_type, 0, 0, 0, 0xab, 0xcd, 0, 1];
+            let reply_one = [reply_type, 0, 0, 0, 0xab, 0xcd, 0, 1];
+            let request_two = [request_type, 0, 0, 0, 0xab, 0xcd, 0, 2];
+            let reply_two = [reply_type, 0, 0, 0, 0xab, 0xcd, 0, 2];
+            let expected = observation_l4_correlation(
+                protocol,
+                version,
+                GtpuTrafficObservationDirection::AccessToCore,
+                request_one,
+            );
+            assert_eq!(
+                expected,
+                observation_l4_correlation(
+                    protocol,
+                    version,
+                    GtpuTrafficObservationDirection::CoreToAccess,
+                    reply_one,
+                )
+            );
+            assert_eq!(
+                expected,
+                observation_l4_correlation(
+                    protocol,
+                    version,
+                    GtpuTrafficObservationDirection::AccessToCore,
+                    request_two,
+                )
+            );
+            assert_eq!(
+                expected,
+                observation_l4_correlation(
+                    protocol,
+                    version,
+                    GtpuTrafficObservationDirection::CoreToAccess,
+                    reply_two,
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn observation_ipv4_transport_shape_rejects_malformed_and_accepts_valid() {
+        let mut tcp = vec![0_u8; 20];
+        tcp[0..4].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        tcp[12] = 0x50;
+        assert!(modeled_ipv4_observation_key(
+            &modeled_ipv4_packet(IPPROTO_TCP, &tcp),
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_some());
+        let mut bad_tcp_offset = modeled_ipv4_packet(IPPROTO_TCP, &tcp);
+        bad_tcp_offset[20 + 12] = 0x40;
+        assert!(modeled_ipv4_observation_key(
+            &bad_tcp_offset,
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_none());
+        let truncated_tcp = modeled_ipv4_packet(IPPROTO_TCP, &tcp[..8]);
+        assert!(modeled_ipv4_observation_key(
+            &truncated_tcp,
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_none());
+
+        let mut udp = vec![0_u8; 8];
+        udp[0..4].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        udp[4..6].copy_from_slice(&8_u16.to_be_bytes());
+        assert!(modeled_ipv4_observation_key(
+            &modeled_ipv4_packet(IPPROTO_UDP, &udp),
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_some());
+        let mut udp_zero = modeled_ipv4_packet(IPPROTO_UDP, &udp);
+        udp_zero[20 + 4..20 + 6].copy_from_slice(&0_u16.to_be_bytes());
+        assert!(modeled_ipv4_observation_key(
+            &udp_zero,
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_none());
+        let mut udp_mismatch = modeled_ipv4_packet(IPPROTO_UDP, &udp);
+        udp_mismatch[20 + 4..20 + 6].copy_from_slice(&9_u16.to_be_bytes());
+        assert!(modeled_ipv4_observation_key(
+            &udp_mismatch,
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_none());
+
+        let echo = [8, 0, 0, 0, 0xab, 0xcd, 0, 1];
+        assert!(modeled_ipv4_observation_key(
+            &modeled_ipv4_packet(IPPROTO_ICMP, &echo),
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_some());
+        let mut nonzero_code = modeled_ipv4_packet(IPPROTO_ICMP, &echo);
+        nonzero_code[20 + 1] = 1;
+        assert!(modeled_ipv4_observation_key(
+            &nonzero_code,
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_none());
+        let truncated_echo = modeled_ipv4_packet(IPPROTO_ICMP, &echo[..7]);
+        assert!(modeled_ipv4_observation_key(
+            &truncated_echo,
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_none());
+
+        let mut ipv6_bad_code =
+            modeled_ipv6_packet(IPPROTO_ICMPV6, &[], [128, 0, 0, 0, 0xab, 0xcd, 0, 1]);
+        ipv6_bad_code[40 + 1] = 1;
+        assert!(modeled_ipv6_observation_key(
+            &ipv6_bad_code,
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_none());
+        let mut ipv6_truncated =
+            modeled_ipv6_packet(IPPROTO_ICMPV6, &[], [128, 0, 0, 0, 0xab, 0xcd, 0, 1]);
+        ipv6_truncated[4..6].copy_from_slice(&7_u16.to_be_bytes());
+        assert!(modeled_ipv6_observation_key(
+            &ipv6_truncated,
+            GtpuTrafficObservationDirection::AccessToCore,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn observation_ipv6_uses_bounded_shared_walker_and_rejects_fragments() {
+        // Mutation guard: removing the configured fragment rejection or
+        // returning to the fixed IPv6+40 L4 offset breaks this source test.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let (_, observation) = source
+            .split_once("fn observation_flow_key(")
+            .expect("observation key is present");
+        assert!(observation.contains("ipv6_l4_offset("));
+        assert!(observation.contains("IPV6_TERMINAL_OBSERVATION, true"));
+        let (_, walker) = source
+            .split_once("fn ipv6_l4_offset(")
+            .expect("shared IPv6 walker is present");
+        assert!(walker.contains("classify_ipv6_extension_step"));
+        assert!(walker.contains("context.reject_fragments != 0 && atomic_fragment"));
+        assert!(walker.contains("context.walked >= IPV6_MAX_EXT_HEADERS as u32"));
+    }
+
+    #[test]
+    fn grouped_uplink_observation_stamp_preserves_nonce_bytes_and_rejects_mutation() {
+        let nonce = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba,
+            0xdc, 0xfe,
+        ];
+        let stamp = grouped_observation_cb_stamp(nonce);
+        assert_eq!(
+            nonce_from_grouped_observation_cb_stamp(stamp),
+            Some(nonce)
+        );
+        assert_eq!(nonce_from_grouped_observation_cb_stamp([0; 5]), None);
+
+        let mut wrong_ownership = stamp;
+        wrong_ownership[0] |= 1;
+        assert_eq!(nonce_from_grouped_observation_cb_stamp(wrong_ownership), None);
+
+        let mut forged_nonce = stamp;
+        forged_nonce[3] ^= 1;
+        assert_ne!(
+            nonce_from_grouped_observation_cb_stamp(forged_nonce),
+            Some(nonce)
+        );
+    }
+
+    #[test]
+    fn grouped_uplink_observation_waits_for_proven_redirect_reentry() {
+        // The helper verdict only submits a redirect. Keep the event writer
+        // out of that branch and reachable only after the pre-existing strict
+        // outer-envelope re-entry proof has succeeded.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let (_, completion) = source
+            .split_once("fn complete_grouped_uplink(")
+            .expect("grouped completion is present");
+        let (completion, _) = completion
+            .split_once("fn encapsulate_grouped_ipv6(")
+            .expect("grouped completion terminator is present");
+        let stamp = completion
+            .find("stamp_grouped_uplink_observation(ctx, authority);")
+            .expect("grouped redirect stamps opaque authority");
+        let redirect = completion
+            .find("bpf_redirect_neigh")
+            .expect("grouped redirect is present");
+        assert!(stamp < redirect);
+        assert!(!completion.contains("emit_grouped_observation("));
+
+        let (_, uplink) = source
+            .split_once("fn try_uplink(ctx: &mut TcContext, mut mark: u32)")
+            .expect("uplink classifier is present");
+        let reentry = uplink
+            .find("if uplink_frame_is_redirect_reentry(ctx, mark, eth_proto)")
+            .expect("redirect re-entry proof is present");
+        let emit = uplink
+            .find("emit_grouped_uplink_observation_on_reentry(ctx, eth_proto);")
+            .expect("uplink event emission is on re-entry");
+        let clear = uplink
+            .find("clear_unmatched_grouped_uplink_observation_stamp(ctx);")
+            .expect("non-re-entry paths clear only matching internal stamps");
+        assert!(reentry < emit);
+        assert!(emit < clear);
+    }
+
+    #[test]
+    fn unstamped_or_wrong_nonce_reentry_cannot_select_observation_authority() {
+        // An unprivileged sender cannot set tc scratch state. This structural
+        // guard makes both a missing stamp and a mutated group ID stop before
+        // an event can be written: the stamp is consumed, resolved through
+        // redirect authority, and back-validated against the live nonce.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let (_, reentry) = source
+            .split_once("fn emit_grouped_uplink_observation_on_reentry")
+            .expect("uplink re-entry event helper is present");
+        let (reentry, _) = reentry
+            .split_once("/// Return whether this frame is one of this datapath's own")
+            .expect("uplink re-entry event helper terminator is present");
+        assert!(reentry.contains("let Some(nonce) = take_grouped_uplink_observation_stamp(ctx) else"));
+        assert!(reentry.contains("GTPU_OBS_REDIR.get_ptr(nonce)"));
+        assert!(reentry.contains("GTPU_SESSIONS.get_ptr(group_key)"));
+        assert!(reentry.contains("header.group_id().to_bytes() != group_key"));
+        assert!(reentry.contains("header.phase() != GtpuSessionGroupPhase::Active"));
+        assert!(reentry.contains("publication_id,"));
+        assert!(reentry.contains("encoded_matches_current_redirect_nonce"));
+        assert!(reentry.contains("emit_grouped_observation("));
+    }
+
+    #[test]
+    fn forwarding_boundary_identity_fences_registration_replacement() {
+        // Fix-removal guard: both directions capture an immutable publication
+        // identity before delayed forwarding work, and the final writer must
+        // compare that exact identity with the live map registration.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let (_, capture) = source
+            .split_once("fn current_observation_redirect_identity(")
+            .expect("publication capture helper is present");
+        let (capture, _) = capture
+            .split_once("/// Store opaque grouped authority")
+            .expect("publication capture helper terminator is present");
+        assert!(capture
+            .contains("GtpuTrafficObservationRegistration::encoded_redirect_identity_if_current("));
+
+        let (_, writer) = source
+            .split_once("fn try_emit_grouped_observation(")
+            .expect("observation writer is present");
+        let (writer, _) = writer
+            .split_once("/// Emit an uplink observation")
+            .expect("observation writer terminator is present");
+        assert!(writer.contains("GtpuTrafficObservationRegistration::encoded_matches_current("));
+        assert!(writer.contains("publication_id,"));
+
+        let (_, downlink) = source
+            .split_once("fn decap_grouped_downlink(")
+            .expect("grouped downlink is present");
+        let (downlink, _) = downlink
+            .split_once("struct Ipv6ExtensionLoopContext")
+            .expect("grouped downlink terminator is present");
+        let capture = downlink
+            .find("current_observation_redirect_identity(authority)")
+            .expect("downlink captures publication identity");
+        let mutation = downlink
+            .find("adjust_room")
+            .expect("downlink performs delayed packet mutation");
+        let emit = downlink
+            .find("emit_grouped_observation(")
+            .expect("downlink emits after successful forwarding work");
+        assert!(capture < mutation);
+        assert!(mutation < emit);
+    }
+
     #[test]
     fn grouped_fallback_requires_a_true_index_miss() {
         assert!(grouped_index_permits_v5_fallback(false));
@@ -3085,7 +4466,7 @@ mod tests {
             .find("ctx.set_mark(mark);")
             .expect("selected TFT mark is written");
         let grouped = uplink
-            .find("match grouped_uplink_authority(ctx, mark, eth_proto, &mut grouped_status)")
+            .find("match grouped_uplink_authority(")
             .expect("grouped authority lookup is present");
         let legacy = uplink
             .find("let far_ptr = if mark == 0")
@@ -3097,9 +4478,7 @@ mod tests {
         assert!(persisted_mark < grouped);
         assert!(grouped < legacy);
         assert!(uplink.contains("TftClassifierUplinkResult::Absent => {}"));
-        assert!(
-            uplink.contains("TftClassifierUplinkResult::Drop => return Ok(TC_ACT_SHOT as i32)")
-        );
+        assert!(uplink.contains("TftClassifierUplinkResult::Drop => return Ok(TC_ACT_SHOT as i32)"));
     }
 
     #[test]
@@ -3315,14 +4694,18 @@ mod tests {
                 atomic_fragment: true,
             })
         );
-        assert!(
-            classify_ipv6_extension_step(IPV6_NH_FRAGMENT, [IPV6_NH_UDP, 0, 0, 1, 0, 0, 0, 0], 8)
-                .is_err()
-        );
-        assert!(
-            classify_ipv6_extension_step(IPV6_NH_FRAGMENT, [IPV6_NH_UDP, 0, 0, 8, 0, 0, 0, 0], 8)
-                .is_err()
-        );
+        assert!(classify_ipv6_extension_step(
+            IPV6_NH_FRAGMENT,
+            [IPV6_NH_UDP, 0, 0, 1, 0, 0, 0, 0],
+            8
+        )
+        .is_err());
+        assert!(classify_ipv6_extension_step(
+            IPV6_NH_FRAGMENT,
+            [IPV6_NH_UDP, 0, 0, 8, 0, 0, 0, 0],
+            8
+        )
+        .is_err());
     }
 
     #[test]

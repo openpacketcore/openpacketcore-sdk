@@ -183,6 +183,111 @@ interface and `bind_address` is the local outer IPv4 address. It pins maps under
 downlink PDR state from one `GtpPdpContext`, and supports restore through
 `resolve_device`. It only supports IPv4 session state today.
 
+### Generation-fenced traffic-continuity proof
+
+`GtpuDataplaneBackend` exposes an additive, session-scoped traffic-proof port.
+Only the production `EbpfGtpuDataplaneBackend` can implement that port;
+structural reconciliation, object readback, aggregate counters, the mock
+backend, and unsupported adapters cannot mint a proof. The ownership boundary
+is one complete `GtpuSessionGroup`, matching the unit whose entries and indexes
+are activated under one dataplane generation. It is not a pod-wide aggregate
+and evidence from separate groups is never combined.
+
+The product begins an attempt with the exact desired group, its nonzero owner
+generation, a nonzero 128-bit reconcile fence, a nonzero reconcile revision,
+and an immutable `TrafficContinuityPolicy`. The dataplane generation is never
+caller supplied: the adapter obtains it from a stable, complete `Active`
+group readback and binds it into the private attempt. A successful proof retains
+all of those dimensions plus the exact device attachment, backend incarnation,
+observation-source epoch, and monotonic-clock origin. Validation repeats the
+live readback under the adapter's writer authority; equality of a previously
+read object is not sufficient.
+
+Direction is relative to the access gateway:
+
+- `AccessToCore` is emitted only after a grouped inner packet has been
+  successfully submitted to the local GTP-U uplink redirect.
+- `CoreToAccess` is emitted only after a grouped G-PDU has passed the live
+  downlink checks, been decapsulated, and been accepted past the local tc
+  ingress hook into the access-side network stack.
+
+These are authenticated observations at the local forwarding boundaries, not
+claims that a remote peer or a later local XFRM/routing stage delivered a
+packet. An end-to-end claim must compose them with the protocol-specific
+delivery proof, such as a disposable real XFRM-to-GTP-U round trip. The
+observation ABI carries no addresses, TEIDs,
+SPIs, packet lengths, packet bytes, subscriber fields, or reusable raw flow
+identifier. Its direction-normalized flow correlation is opaque, freshly
+keyed per attempt, and never logged.
+Correlation is deliberately limited to exact, unfragmented TCP/UDP tuples and
+ICMPv4/ICMPv6 echo request/reply identifiers (including bounded canonical IPv6
+extension chains). Other protocols and fragments continue forwarding but do
+not contribute proof evidence.
+
+Continuity is deliberately policy-bound instead of inferred from one packet or
+from aggregate traffic. One opaque flow must independently have at least
+`minimum_samples_per_direction` observations in both directions, and each
+direction's first-to-last span must be at least the nonzero
+`minimum_window_per_direction`. The last sample in each direction must be no
+older than `maximum_freshness`, every retained sample must fit within
+`maximum_evidence_age`, and storage is capped by `maximum_retained_events`.
+The retention cap must hold at least the minimum sample count for both
+directions combined, so a constructed policy is achievable.
+The product selects these nonzero bounded values for its operational readiness
+window; the proof retains the exact policy so a weaker assessment cannot be
+relabeled under a stronger one.
+
+The production adapter drains the attachment's bounded kernel ring, rejects
+malformed or excess records, and brackets every drain with the saturating
+per-CPU loss counter. Only after that producer-gap fence succeeds does it sort
+trusted boot-monotonic timestamps, breaking valid cross-CPU clock ties with a
+distinct global producer sequence. A reused sequence or replayed record fails
+closed. The sequence may be sparse, so it does not replace the kernel loss
+counter: that independently bracketed counter is the authoritative
+producer-gap fence.
+
+Each registration also receives a finite, monotonically allocated publication
+identity retained in the pinned attachment state. It remains a capacity and
+same-graph replacement fence: the downlink path captures it before
+decapsulation and verifies it again at the final observation boundary. Source
+reset never rewinds that allocator, invalid or uncertain readback burns the
+candidate identity, and exhaustion fails closed.
+
+Uplink neighbour redirect uses a separate `GTPU_OBS_REDIR` authority: the
+registration's private CSPRNG-filled correlation secret is reused as the exact
+per-attempt redirect nonce, and the 20-byte tc scratch area contains only an
+ownership marker plus all 16 nonce bytes. The nonce is never logged, emitted,
+or exposed as a metric; event correlation is instead a one-way keyed
+derivation from that secret. At publication the host atomically installs and
+reads back `nonce -> group` with `BPF_NOEXIST` alongside the exact group
+registration. Re-entry resolves the nonce through that map and then requires
+an active exact group registration with matching binding, publication identity,
+and nonce before emitting. Revocation and source reset delete both maps and
+prove them empty. Thus a delayed skb from an unpinned graph cannot be relabeled
+after a fresh graph restarts its finite publication sequence at one:
+publication high-water alone does not span graph recreation, while the fresh
+nonce closes that ABA without relying on queue quiescence.
+
+Proof lifetime is a half-open monotonic interval. Its exclusive end is the
+earliest of issuance plus `maximum_assessment_lifetime`, either direction's
+last sample plus `maximum_freshness`, and the oldest retained sample plus
+`maximum_evidence_age`. The adapter reads Linux boot-monotonic time itself;
+caller time never validates a proof. Expiry,
+event loss, malformed or overflowing observation state, a registration or
+source reset, backend restart, group restore, any generation/phase/model/index
+change, reconcile-fence drift, attachment or pinned-map/hook replacement, or
+an indeterminate readback permanently invalidates the attempt or proof. A
+fresh attempt uses a new source epoch, correlation key, and publication
+identity, so packets queued under an earlier generation or process cannot be
+replayed as current evidence.
+
+The port reports packet-continuity evidence only. Products must not derive
+PodReady, process health, structural convergence, or service admission from
+prior subscriber traffic: doing so would deadlock a correctly converged cold
+start before its first subscriber packet. A product may use a current proof as
+one input to a separate traffic-readiness condition while keeping those
+control-plane decisions independent.
+
 ### Conflict-safe PDP reconciliation
 
 Use `read_pdp_context` to inspect either the local/downlink TEID axis or the

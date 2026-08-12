@@ -139,6 +139,7 @@ jobs:
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN' "${datapath_log}"
 
           # The two lib tag proofs return Ok early without printing `skipping:`
           # when the environment is not privileged, so the skip check above
@@ -685,6 +686,7 @@ jobs:
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN' "${datapath_log}"
 
   ebpf-object:
     name: eBPF datapath object rebuild
@@ -838,6 +840,9 @@ jobs:
             encapsulate_grouped_ipv4 encapsulate_grouped_ipv6 \
             checksum_bytes_are_materialized select_gtpu_session_entry_wire \
             wire_address_is_canonical apply_uplink_mtu_policy \
+            observation_flow_key emit_grouped_observation \
+            try_emit_grouped_observation emit_grouped_uplink_observation_on_reentry \
+            encoded_is_valid \
             pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph \
             marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink \
             marked_owner_wire_authorizes_downlink classify_tft_filter_step \
@@ -846,6 +851,8 @@ jobs:
             GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_DL_BIND GTPU_DL_DROP \
             GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG GTPU_SESSIONS \
             GTPU_UL_INDEX GTPU_DL_INDEX GTPU_SESS_TXN GTPU_SCHEMA6 GTPU_CONFIG6 \
+            GTPU_OBS_REG GTPU_OBS_REDIR GTPU_OBS_EVT GTPU_OBS_LOSS GTPU_OBS_SEQ \
+            GTPU_OBS_GATE GTPU_OBS_LCK GTPU_OBS_FLOW \
             GTPU_TFT_SCHEMA GTPU_TFT_META GTPU_TFT_FILT GTPU_TFT_DROP; do
             grep -Eq "( |[[:digit:]])${symbol}$" committed.inventory
           done
