@@ -122,7 +122,7 @@ fn decode_operator_recovery_latch(
     })
 }
 
-fn open_latch_read(path: &Path) -> io::Result<File> {
+fn open_nofollow_read(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -137,7 +137,7 @@ pub(crate) fn read_operator_recovery_latch_sync(
     database: &Path,
 ) -> io::Result<Option<OperatorRecoveryLatch>> {
     let path = operator_recovery_latch_path(database)?;
-    let mut file = match open_latch_read(&path) {
+    let mut file = match open_nofollow_read(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -5452,7 +5452,7 @@ pub(crate) fn save_vote_with_authority_sync(
         return save_vote_sync(conn, identity, vote);
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
-    validate_durable_authority_for_raw_write(
+    validate_durable_authority_for_raw_access(
         &tx,
         identity,
         authority_profile,
@@ -5571,7 +5571,7 @@ pub(crate) fn save_committed_with_authority_sync(
         return save_committed_sync(conn, identity, committed);
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
-    validate_durable_authority_for_raw_write(
+    validate_durable_authority_for_raw_access(
         &tx,
         identity,
         authority_profile,
@@ -5801,7 +5801,7 @@ pub(crate) fn append_logs_with_authority_sync(
         return append_logs_sync(conn, identity, entries);
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
-    validate_durable_authority_for_raw_write(
+    validate_durable_authority_for_raw_access(
         &tx,
         identity,
         authority_profile,
@@ -5901,7 +5901,7 @@ pub(crate) fn truncate_logs_with_authority_sync(
     }
     let (_, index) = validate_log_id(since)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
-    validate_durable_authority_for_raw_write(
+    validate_durable_authority_for_raw_access(
         &tx,
         identity,
         authority_profile,
@@ -5971,7 +5971,7 @@ pub(crate) fn purge_logs_with_authority_sync(
     }
     let (_, index) = validate_log_id(through)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
-    validate_durable_authority_for_raw_write(
+    validate_durable_authority_for_raw_access(
         &tx,
         identity,
         authority_profile,
@@ -7411,12 +7411,13 @@ fn fixed_profile_intent_changes_topology(intent: &SessionMutationIntent) -> bool
     }
 }
 
-/// Revalidate fixed-quorum authority inside the transaction which performs a
-/// raw Openraft durable write. The pristine exception is limited to the
-/// initial formation interval: `read_membership_sync` rejects a pristine
-/// membership once any application state exists, while the scope/profile
-/// checks bind that interval to the configured immutable quorum.
-fn validate_durable_authority_for_raw_write(
+/// Revalidate fixed-quorum authority inside a raw Openraft durable access.
+///
+/// The pristine exception is limited to the initial formation interval:
+/// `read_membership_sync` rejects a pristine membership once any application
+/// state exists, while the scope/profile checks bind that interval to the
+/// configured immutable quorum.
+fn validate_durable_authority_for_raw_access(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     authority_profile: ConsensusAuthorityProfile,
@@ -7441,6 +7442,40 @@ fn validate_durable_authority_for_raw_write(
         ));
     }
     Ok(())
+}
+
+/// Admit one raw Openraft metadata read against an exact fixed durable head.
+///
+/// Fixed stores acquire a SQLite read transaction before checking the durable
+/// authority tuple, then perform the caller's entire read through that same
+/// snapshot. This prevents a persisted profile, placement-policy, identity,
+/// binding, scope, or applied-membership drift from racing between admission
+/// and return. Dynamic stores retain their existing read path unchanged.
+pub(crate) fn with_durable_authority_raw_read_sync<T>(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    read: impl FnOnce(&Connection) -> io::Result<T>,
+) -> io::Result<T> {
+    if authority_profile == ConsensusAuthorityProfile::Dynamic {
+        return read(conn);
+    }
+
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
+    validate_durable_authority_for_raw_access(
+        &tx,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+    )?;
+    let value = read(&tx)?;
+    tx.commit().map_err(db_error)?;
+    Ok(value)
 }
 
 fn fixed_uniform_membership_matches(
@@ -7681,7 +7716,7 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
         return build_snapshot_database_from_pinned_sync(conn, identity, destination);
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
-    validate_durable_authority_for_raw_write(
+    validate_durable_authority_for_raw_access(
         &tx,
         identity,
         authority_profile,
@@ -8558,7 +8593,7 @@ pub(crate) fn install_snapshot_database_with_authority_sync(
     byte_length: u64,
 ) -> io::Result<()> {
     let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
-        File::open(snapshot_db_path)?,
+        open_nofollow_read(snapshot_db_path)?,
         snapshot_db_path.to_path_buf(),
     )?;
     install_snapshot_database_from_pinned_with_authority_sync(
@@ -8642,7 +8677,7 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
                 // This is deliberately immediately before copying the incoming
                 // tables. A drifted local fixed store must fail closed rather than
                 // be repaired by an otherwise valid incoming snapshot.
-                validate_durable_authority_for_raw_write(
+                validate_durable_authority_for_raw_access(
                     &tx,
                     identity,
                     authority_profile,
@@ -8831,7 +8866,7 @@ pub(crate) fn save_current_snapshot_with_authority_sync(
         return save_current_snapshot_sync(conn, identity, meta, file_name, checksum, byte_length);
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
-    validate_durable_authority_for_raw_write(
+    validate_durable_authority_for_raw_access(
         &tx,
         identity,
         authority_profile,
@@ -12628,6 +12663,31 @@ mod tests {
             ConsensusAuthorityProfile::FixedImmutable,
         )
         .expect("initialize fixed target");
+        #[cfg(unix)]
+        {
+            let symlink_path = directory.path().join("symlink-source.sqlite");
+            std::os::unix::fs::symlink(&valid_path, &symlink_path)
+                .expect("create incoming snapshot symlink");
+            install_snapshot_database_with_authority_sync(
+                &target_conn,
+                identity,
+                ConsensusAuthorityProfile::FixedImmutable,
+                Some(&members),
+                Some(&bindings),
+                Some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
+                &symlink_path,
+                &meta,
+                "symlink-source.opc",
+                [0xa0; 32],
+                std::fs::metadata(&valid_path)
+                    .expect("valid source metadata")
+                    .len(),
+            )
+            .expect_err("incoming snapshot helper must not follow a symlink");
+            assert!(read_applied_sync(&target_conn, identity)
+                .expect("read unchanged target after symlink rejection")
+                .is_none());
+        }
         let replaced_error = install_snapshot_database_with_authority_sync(
             &target_conn,
             identity,

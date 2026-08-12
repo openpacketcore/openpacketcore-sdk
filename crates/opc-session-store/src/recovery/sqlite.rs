@@ -3355,15 +3355,12 @@ fn verify_snapshot_file(
     if let Some(budget) = budget {
         budget.check()?;
     }
-    let metadata = fs::symlink_metadata(path).map_err(|_| RecoveryError::CorruptReplica)?;
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() <= SNAPSHOT_FOOTER_BYTES
-        || metadata.len() > max_bytes
+    let mut file = open_regular_read(path).map_err(|_| RecoveryError::CorruptReplica)?;
+    let metadata = file.metadata().map_err(|_| RecoveryError::CorruptReplica)?;
+    if !metadata.is_file() || metadata.len() <= SNAPSHOT_FOOTER_BYTES || metadata.len() > max_bytes
     {
         return Err(RecoveryError::CorruptReplica);
     }
-    let mut file = open_regular_read(path).map_err(|_| RecoveryError::CorruptReplica)?;
     let total = metadata.len();
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::End(
