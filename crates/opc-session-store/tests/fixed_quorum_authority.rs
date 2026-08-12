@@ -912,6 +912,85 @@ async fn running_fixed_profile_drift_revokes_traffic_authority() {
 }
 
 #[tokio::test]
+async fn running_fixed_placement_policy_drift_revokes_live_authority() {
+    for (configured_policy, drifted_policy) in [
+        (
+            PlacementResiliencePolicy::RequireIndependentFailureDomains,
+            PlacementResiliencePolicy::AllowReducedResilience,
+        ),
+        (
+            PlacementResiliencePolicy::AllowReducedResilience,
+            PlacementResiliencePolicy::RequireIndependentFailureDomains,
+        ),
+    ] {
+        let (_directory, database_paths, stores) = open_fixed_cluster(3, configured_policy).await;
+        stores[0]
+            .consumer_authorization_manifest()
+            .await
+            .expect("exact fixed policy grants consumer authority");
+        assert!(
+            stores[0].status().admitted,
+            "exact fixed policy is admitted"
+        );
+        let start_sequence = stores[0]
+            .status()
+            .last_log_index
+            .map_or(0, |index| index.saturating_add(1));
+        let mut watch = SessionBackend::watch(&stores[0], start_sequence)
+            .await
+            .expect("open idle generic watch before policy drift");
+
+        let connection =
+            rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
+        let stored_policy = match drifted_policy {
+            PlacementResiliencePolicy::RequireIndependentFailureDomains => 1_i64,
+            PlacementResiliencePolicy::AllowReducedResilience => 2_i64,
+            _ => unreachable!("test policy must have a durable encoding"),
+        };
+        connection
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = ?1 WHERE singleton = 1",
+                [stored_policy],
+            )
+            .expect("persist fixed placement policy drift");
+        drop(connection);
+
+        assert!(
+            !stores[0].status().admitted,
+            "status must revoke admission after fixed policy drift"
+        );
+        assert!(
+            stores[0].consumer_authorization_manifest().await.is_err(),
+            "consumer authority must fail closed after fixed policy drift"
+        );
+        assert!(
+            SessionBackend::batch(&stores[0], Vec::new()).await.is_err(),
+            "mutation authority must fail closed after fixed policy drift"
+        );
+        let readiness = stores[0]
+            .probe_fixed_durable_quorum_readiness_at(TopologyAttestationTime::from_unix_seconds(1))
+            .await;
+        assert_eq!(
+            readiness.traffic_authority(),
+            FixedQuorumTrafficAuthority::StructuralRecoveryRequired,
+            "fixed policy drift must revoke traffic authority"
+        );
+        let item = tokio::time::timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("idle watch must revalidate fixed policy promptly")
+            .expect("idle watch must emit a terminal authority failure");
+        assert!(
+            item.is_err(),
+            "idle watch must fail closed after fixed policy drift"
+        );
+        assert!(
+            watch.next().await.is_none(),
+            "watch must terminate after fixed policy revocation"
+        );
+    }
+}
+
+#[tokio::test]
 async fn running_fixed_applied_membership_drift_revokes_status_and_mutation_authority() {
     let (_directory, database_paths, stores) =
         open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;

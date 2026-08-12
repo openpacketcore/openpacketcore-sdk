@@ -555,6 +555,7 @@ impl ConsensusSessionStore {
                 storage_identity,
                 members.clone(),
                 bindings.clone(),
+                placement_policy,
                 Arc::clone(&admitted),
             ),
         );
@@ -777,11 +778,18 @@ impl ConsensusSessionStore {
     pub fn consumer_scope(&self) -> Result<SessionConsumerScope, StoreError> {
         self.require_exact_membership_admission()?;
         if self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
-            && !self.inner.backend.fixed_quorum_authority_is_exact_now(
-                self.inner.storage_identity,
-                &self.inner.bootstrap_members,
-                &self.inner.bootstrap_bindings,
-            )
+            && !self
+                .inner
+                .topology
+                .fixed_durable_placement_policy()
+                .is_some_and(|placement_policy| {
+                    self.inner.backend.fixed_quorum_authority_is_exact_now(
+                        self.inner.storage_identity,
+                        &self.inner.bootstrap_members,
+                        &self.inner.bootstrap_bindings,
+                        placement_policy,
+                    )
+                })
         {
             return Err(consensus_unavailable());
         }
@@ -943,11 +951,18 @@ impl ConsensusSessionStore {
             && engine_running
             && current_members.contains(&self.inner.local_node_id)
             && (self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum
-                || self.inner.backend.fixed_quorum_authority_is_exact_now(
-                    self.inner.storage_identity,
-                    &self.inner.bootstrap_members,
-                    &self.inner.bootstrap_bindings,
-                ));
+                || self
+                    .inner
+                    .topology
+                    .fixed_durable_placement_policy()
+                    .is_some_and(|placement_policy| {
+                        self.inner.backend.fixed_quorum_authority_is_exact_now(
+                            self.inner.storage_identity,
+                            &self.inner.bootstrap_members,
+                            &self.inner.bootstrap_bindings,
+                            placement_policy,
+                        )
+                    }));
         SessionConsensusStatus {
             node_id: self.inner.local_node_id,
             term,
@@ -1377,7 +1392,7 @@ impl ConsensusSessionStore {
         if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum {
             return Ok(false);
         }
-        let (authority_profile, scope, applied_membership) = self
+        let (authority_profile, persisted_placement_policy, scope, applied_membership) = self
             .inner
             .backend
             .fixed_quorum_scope_snapshot(self.inner.storage_identity)
@@ -1385,6 +1400,8 @@ impl ConsensusSessionStore {
             .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
         Ok(
             authority_profile == storage::ConsensusAuthorityProfile::FixedImmutable
+                && persisted_placement_policy
+                    == self.inner.topology.fixed_durable_placement_policy()
                 && scope.current_identity == self.inner.storage_identity
                 && scope.current_members == self.inner.bootstrap_members
                 && scope.current_bindings == self.inner.bootstrap_bindings
@@ -1409,7 +1426,7 @@ impl ConsensusSessionStore {
         if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum {
             return Ok(false);
         }
-        let (authority_profile, scope, _) = self
+        let (authority_profile, persisted_placement_policy, scope, _) = self
             .inner
             .backend
             .fixed_quorum_scope_snapshot(self.inner.storage_identity)
@@ -1417,6 +1434,8 @@ impl ConsensusSessionStore {
             .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
         Ok(
             authority_profile == storage::ConsensusAuthorityProfile::FixedImmutable
+                && persisted_placement_policy
+                    == self.inner.topology.fixed_durable_placement_policy()
                 && scope.current_identity == self.inner.storage_identity
                 && scope.current_members == self.inner.bootstrap_members
                 && scope.current_bindings == self.inner.bootstrap_bindings

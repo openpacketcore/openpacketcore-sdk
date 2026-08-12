@@ -584,6 +584,7 @@ impl SqliteSessionBackend {
             crate::consensus::SessionConsensusNodeId,
             crate::consensus::SessionTopologyMemberBinding,
         >,
+        expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
     ) -> bool {
         self.conn.try_lock().is_ok_and(|conn| {
             consensus::fixed_quorum_authority_is_exact_sync(
@@ -591,6 +592,7 @@ impl SqliteSessionBackend {
                 identity,
                 expected_members,
                 expected_bindings,
+                expected_placement_policy,
                 false,
             )
             .unwrap_or(false)
@@ -608,6 +610,7 @@ impl SqliteSessionBackend {
             crate::consensus::SessionConsensusNodeId,
             crate::consensus::SessionTopologyMemberBinding,
         >,
+        expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
         allow_pristine_membership: bool,
     ) -> bool {
         let conn = self.conn.lock().await;
@@ -616,6 +619,7 @@ impl SqliteSessionBackend {
             identity,
             expected_members,
             expected_bindings,
+            expected_placement_policy,
             allow_pristine_membership,
         )
         .unwrap_or(false)

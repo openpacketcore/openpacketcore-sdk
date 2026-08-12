@@ -30,6 +30,7 @@ use super::{
     SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::membership::{SessionTopologyTransitionDigest, SessionTopologyTransitionId};
+use crate::readiness::PlacementResiliencePolicy;
 use crate::sqlite::SqliteSessionBackend;
 use crate::topology::QUORUM_TOPOLOGY_MAX_MEMBERS;
 
@@ -46,6 +47,7 @@ pub(crate) struct FixedQuorumEngineAdmission {
     storage_identity: SessionConsensusIdentity,
     members: BTreeSet<SessionConsensusNodeId>,
     bindings: BTreeMap<SessionConsensusNodeId, super::SessionTopologyMemberBinding>,
+    placement_policy: PlacementResiliencePolicy,
     admitted: Arc<AtomicBool>,
 }
 
@@ -55,6 +57,7 @@ impl FixedQuorumEngineAdmission {
         storage_identity: SessionConsensusIdentity,
         members: BTreeSet<SessionConsensusNodeId>,
         bindings: BTreeMap<super::SessionConsensusNodeId, super::SessionTopologyMemberBinding>,
+        placement_policy: PlacementResiliencePolicy,
         admitted: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -62,6 +65,7 @@ impl FixedQuorumEngineAdmission {
             storage_identity,
             members,
             bindings,
+            placement_policy,
             admitted,
         }
     }
@@ -1156,6 +1160,7 @@ impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
                     authority.storage_identity,
                     &authority.members,
                     &authority.bindings,
+                    authority.placement_policy,
                     !authority.admitted.load(Ordering::Acquire),
                 )
                 .await
@@ -2166,7 +2171,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_fixed_handler_rejects_vote_before_admission_after_durable_profile_drift() {
+    async fn raw_fixed_handler_rejects_vote_before_admission_after_durable_placement_policy_drift()
+    {
         let temp = tempfile::tempdir().expect("follower tempdir");
         let backend = SqliteSessionBackend::open(temp.path().join("sessions.sqlite"))
             .expect("follower backend");
@@ -2217,16 +2223,17 @@ mod tests {
                 storage_identity,
                 members,
                 bindings,
+                crate::readiness::PlacementResiliencePolicy::RequireIndependentFailureDomains,
                 admitted,
             ),
         );
         let conn = rusqlite::Connection::open(temp.path().join("sessions.sqlite"))
             .expect("open fixed voter database");
         conn.execute(
-            "UPDATE consensus_identity SET authority_profile = 1 WHERE singleton = 1",
+            "UPDATE consensus_identity SET fixed_placement_policy = 2 WHERE singleton = 1",
             [],
         )
-        .expect("persist fixed profile drift");
+        .expect("persist fixed placement policy drift");
         drop(conn);
 
         let payload = encode_bounded(&vote_request(leader)).expect("bounded Vote request");
@@ -2240,7 +2247,7 @@ mod tests {
         assert_eq!(
             handler.handle(leader, request).await.result,
             Err(SessionConsensusPeerError::ScopeMismatch),
-            "raw engine handler must not persist a Vote after durable fixed-profile drift"
+            "raw engine handler must not persist a Vote after fixed placement policy drift"
         );
         raft.shutdown().await.expect("shutdown fixed test Raft");
     }

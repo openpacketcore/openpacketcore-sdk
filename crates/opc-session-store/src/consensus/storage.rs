@@ -529,6 +529,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             self.core.authority_profile,
             &self.core.expected_members,
             &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
             vote,
         )
         .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Write, error))
@@ -553,6 +554,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             self.core.authority_profile,
             &self.core.expected_members,
             &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
             committed,
         )
         .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))
@@ -583,6 +585,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             self.core.authority_profile,
             &self.core.expected_members,
             &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
             &entries,
         ) {
             Ok(()) => {
@@ -608,6 +611,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             self.core.authority_profile,
             &self.core.expected_members,
             &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
             &log_id,
         )
         .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
@@ -627,6 +631,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             self.core.authority_profile,
             &self.core.expected_members,
             &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
             &log_id,
         )
         .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
@@ -705,6 +710,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 self.core.authority_profile,
                 &self.core.expected_members,
                 &self.core.expected_bindings,
+                self.core.fixed_placement_policy,
                 entries,
             )
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
@@ -971,6 +977,7 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 self.core.authority_profile,
                 &self.core.expected_members,
                 &self.core.expected_bindings,
+                self.core.fixed_placement_policy,
                 &raw_path,
             )
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))?
@@ -1016,6 +1023,7 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 self.core.authority_profile,
                 &self.core.expected_members,
                 &self.core.expected_bindings,
+                self.core.fixed_placement_policy,
                 &meta,
                 &file_name,
                 checksum,
