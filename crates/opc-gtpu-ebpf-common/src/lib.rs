@@ -18,7 +18,22 @@ mod fragment;
 mod pmtu;
 mod session;
 mod tft_classifier;
-mod traffic_observation;
+/// Privileged traffic-observation map ABI shared only by the trusted loader
+/// and tc program.
+///
+/// This module is public solely because those components are separate crates.
+/// It is hidden from the supported common-crate API: registration bytes carry
+/// private return-tag key material and must never cross a product, diagnostic,
+/// or untrusted boundary.
+///
+/// The secret-bearing registration is deliberately absent from the crate root:
+///
+/// ```compile_fail,E0432
+/// use opc_gtpu_ebpf_common::GtpuTrafficObservationRegistration;
+/// ```
+#[doc(hidden)]
+#[path = "traffic_observation.rs"]
+pub mod trusted_traffic_observation_abi;
 
 pub use envelope::{
     classify_ipv6_extension_step, classify_ipv6_gtpu_ingress, classify_udp_checksum,
@@ -57,12 +72,12 @@ pub use session::{
     GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
 };
 pub use tft_classifier::*;
-pub use traffic_observation::{
+pub use trusted_traffic_observation_abi::{
     GtpuTrafficObservationBinding, GtpuTrafficObservationDirection, GtpuTrafficObservationEvent,
-    GtpuTrafficObservationRegistration, GTPU_TRAFFIC_OBSERVATION_EVENT_LEN,
-    GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_FENCE_LEN,
-    GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_GATE_INDEX,
-    GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+    GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_FENCE_LEN, GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PROFILE, GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_MAGIC,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_VERSION, GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,

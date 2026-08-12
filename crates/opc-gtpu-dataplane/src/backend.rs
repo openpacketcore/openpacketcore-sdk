@@ -77,7 +77,7 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     ///     backend: impl GtpuDataplaneBackend,
     ///     authority: GtpuTrafficProofAuthority,
     /// ) {
-    ///     let _ = backend.begin_gtpu_traffic_proof(authority.request()).await;
+    ///     let _ = backend.begin_gtpu_traffic_proof(authority).await;
     /// }
     /// ```
     async fn begin_gtpu_traffic_proof(

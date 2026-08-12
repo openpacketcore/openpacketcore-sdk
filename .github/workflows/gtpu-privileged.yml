@@ -849,9 +849,11 @@ jobs:
             encapsulate_grouped_ipv4 encapsulate_grouped_ipv6 \
             checksum_bytes_are_materialized select_gtpu_session_entry_wire \
             wire_address_is_canonical apply_uplink_mtu_policy \
-            observation_flow_key emit_grouped_observation \
+            observation_challenge_sample observation_icmp_checksum_for_payload \
+            observation_icmpv6_checksum_is_valid rewrite_observation_icmp_echo_request \
+            emit_grouped_observation \
             try_emit_grouped_observation emit_grouped_uplink_observation_on_reentry \
-            encoded_is_valid \
+            encoded_is_valid encoded_icmp_echo_sample_if_valid \
             pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph \
             marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink \
             marked_owner_wire_authorizes_downlink classify_tft_filter_step \

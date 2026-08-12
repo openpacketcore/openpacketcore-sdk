@@ -48,6 +48,7 @@ use opc_dataplane_observation::{
     TrafficContinuityEvent, TrafficContinuityRecord, TrafficContinuitySource, TrafficDirection,
     MAX_RETAINED_EVENTS,
 };
+use opc_gtpu_ebpf_common::trusted_traffic_observation_abi::GtpuTrafficObservationRegistration;
 use opc_gtpu_ebpf_common::{
     tft_classifier_schema_is_current, DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress,
     GtpuOuterFragmentPolicy, GtpuSessionDeviceConfig, GtpuSessionDownlinkKey,
@@ -55,15 +56,14 @@ use opc_gtpu_ebpf_common::{
     GtpuSessionGroupRecord, GtpuSessionGroupRef, GtpuSessionIndexCandidate, GtpuSessionIpFamily,
     GtpuSessionTransactionId, GtpuSessionTransactionPhase, GtpuSessionTransactionRecord,
     GtpuSessionUplinkKey, GtpuTrafficObservationBinding, GtpuTrafficObservationDirection,
-    GtpuTrafficObservationEvent, GtpuTrafficObservationRegistration, GtpuUplinkMtuPolicy,
-    MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr, PdpContextCommit,
-    TftClassifierFilter, TftClassifierFilterDirection, TftClassifierFilterKey,
-    TftClassifierIpv4Address, TftClassifierIpv4FilterSpec, TftClassifierKey, TftClassifierMeta,
-    TftClassifierOwnerId, TftClassifierPortForm, TftClassifierPortRange, TftClassifierTos,
-    UplinkFar, UplinkFarKey, UplinkMtuMapState, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN,
-    DOWNLINK_PDR_VALUE_LEN, GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN,
-    GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN,
-    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
+    GtpuTrafficObservationEvent, GtpuUplinkMtuPolicy, MarkedBearerOwner, MarkedBearerOwnerPhase,
+    MarkedDownlinkPdr, PdpContextCommit, TftClassifierFilter, TftClassifierFilterDirection,
+    TftClassifierFilterKey, TftClassifierIpv4Address, TftClassifierIpv4FilterSpec,
+    TftClassifierKey, TftClassifierMeta, TftClassifierOwnerId, TftClassifierPortForm,
+    TftClassifierPortRange, TftClassifierTos, UplinkFar, UplinkFarKey, UplinkMtuMapState,
+    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, GTPU_SESSION_CONFIG_VALUE_LEN,
+    GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
+    GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
     GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN,
     GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN, MARKED_BEARER_OWNER_VALUE_LEN,
     MARKED_DOWNLINK_PDR_VALUE_LEN, TFT_CLASSIFIER_ABI_VERSION, TFT_CLASSIFIER_BANKS,
@@ -7656,10 +7656,13 @@ impl EbpfGtpuDataplaneBackend {
         let key = authority.desired().id().to_bytes();
         if let Some(existing) = stores.get(&key).cloned() {
             drop(stores);
-            if existing.blocking_exactly_matches(&authority) {
-                return Ok(existing);
-            }
-            return Err(GtpuError::AlreadyExists);
+            return match existing.try_exactly_matches(&authority) {
+                Some(true) => Ok(existing),
+                Some(false) => Err(GtpuError::AlreadyExists),
+                None => Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_traffic_authority_store",
+                }),
+            };
         }
         let store = GtpuTrafficProofAuthorityStore::registered(authority, identity);
         stores.insert(key, store.clone());
@@ -9021,18 +9024,19 @@ mod aya_runtime {
     use sha1::{Digest as Sha1Digest, Sha1};
     use sha2::{Digest as Sha2Digest, Sha256};
 
+    use opc_gtpu_ebpf_common::trusted_traffic_observation_abi::GtpuTrafficObservationRegistration;
     use opc_gtpu_ebpf_common::{
         default_bearer_graph_is_valid, tft_classifier_schema_is_current, DownlinkEndpointBinding,
         DownlinkPdr, GtpuSessionDeviceConfig, GtpuSessionIpFamily, GtpuSessionTransactionId,
-        GtpuTrafficObservationEvent, GtpuTrafficObservationRegistration, GtpuUplinkMtuPolicy,
-        GtpuUplinkSourcePortPolicy, MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr,
-        PdpContextCommit, UplinkFar, UplinkFarKey, UplinkMtuMapState,
-        COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
-        COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
-        COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
-        COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID,
-        COUNTER_SLOTS, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
-        COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
+        GtpuTrafficObservationEvent, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
+        MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr, PdpContextCommit, UplinkFar,
+        UplinkFarKey, UplinkMtuMapState, COUNTER_DL_BINDING_FAMILY_MISMATCH,
+        COUNTER_DL_BINDING_INGRESS_MISMATCH, COUNTER_DL_BINDING_INVALID,
+        COUNTER_DL_BINDING_LOCAL_MISMATCH, COUNTER_DL_BINDING_PEER_MISMATCH,
+        COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH,
+        COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_UL_ENCAP,
+        COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
+        COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
         DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, GTPU_SESSION_CONFIG_KEY,
         GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
         GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
@@ -38178,6 +38182,43 @@ mod tests {
             GtpuTrafficProofValidation::Current
         );
         backend.close_gtpu_traffic_proof(session).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_authority_replacement_cannot_deadlock_registration() {
+        let (backend, _runtime, _group, authority) = traffic_proof_fixture(0x60).await;
+        let store = registered_traffic_authority_store(&backend, &authority)
+            .await
+            .unwrap();
+        let lease = store.lease().await;
+        let replacement_authority = GtpuTrafficProofAuthority::new(
+            authority.desired().clone(),
+            authority.product_owner_generation().checked_add(1).unwrap(),
+            authority.reconcile_fence().checked_add(1).unwrap(),
+            authority.reconcile_revision().checked_add(1).unwrap(),
+            authority.policy(),
+        )
+        .unwrap();
+        let mut replacement = Box::pin(store.replace(replacement_authority));
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Future::poll(replacement.as_mut(), &mut context),
+            Poll::Pending
+        ));
+
+        let registration = backend.register_gtpu_traffic_proof_authority(authority.clone());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), registration)
+            .await
+            .expect("registration must not wait behind the queued authority writer");
+        assert!(matches!(
+            result,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_traffic_authority_store"
+            })
+        ));
+
+        drop(lease);
+        assert_eq!(replacement.await, Ok(()));
     }
 
     #[tokio::test]

@@ -218,7 +218,10 @@ with a distinct private return tag and repairs the ICMP checksum before the
 packet enters the access-side stack. The ordinary ICMP Echo Reply copies that
 private tag. The trusted uplink program accepts only that private-tagged reply,
 with the exact identifier and sequence. It never exposes the private payload in
-the public API, event ABI, readback, log, metric, or diagnostic. Consequently,
+the supported product API, event ABI, product readback, log, metric, or
+diagnostic. The unpublished low-level common crate carries the secret-bearing
+registration only through its hidden trusted loader/tc map ABI; that privileged
+wire boundary is not re-exported here. Consequently,
 copying the public request into a syntactically valid reply cannot fabricate a
 return leg. Ordinary subscriber TCP, UDP, ICMP, counters, structural readback,
 and mock packets never mint proof evidence.

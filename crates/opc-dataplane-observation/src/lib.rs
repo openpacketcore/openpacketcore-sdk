@@ -484,13 +484,26 @@ pub enum SourceOutcome {
 ///
 /// Any caller may construct this value. It carries no provenance assertion;
 /// trusted-source authentication belongs to the adapter that uses the result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TrafficContinuityEvent {
     binding: TrafficBinding,
     direction: TrafficDirection,
     flow_correlation: FlowCorrelation,
     cursor: NonZeroU128,
     observed_at: MonotonicTime,
+}
+
+impl fmt::Debug for TrafficContinuityEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TrafficContinuityEvent")
+            .field("binding", &"<redacted>")
+            .field("direction", &self.direction)
+            .field("flow_correlation", &"<redacted>")
+            .field("cursor", &"<redacted>")
+            .field("observed_at", &"<monotonic>")
+            .finish()
+    }
 }
 
 impl TrafficContinuityEvent {
@@ -1008,6 +1021,29 @@ mod tests {
         expected: TrafficContinuityError,
     ) {
         assert_eq!(result.err(), Some(expected));
+    }
+
+    #[test]
+    fn event_and_record_debug_redact_source_cursor_and_identity() {
+        let event = TrafficContinuityEvent::new(
+            binding(0x1122),
+            TrafficDirection::AccessToCore,
+            correlation(0x3344),
+            0x5566,
+            time(0x77),
+        )
+        .expect("test event");
+        let event_debug = format!("{event:?}");
+        let record_debug = format!("{:?}", TrafficContinuityRecord::Event(event));
+
+        for debug in [&event_debug, &record_debug] {
+            assert!(debug.contains("direction: AccessToCore"));
+            assert!(debug.contains("cursor: \"<redacted>\""));
+            assert!(debug.contains("observed_at: \"<monotonic>\""));
+            assert!(!debug.contains("21862"));
+            assert!(!debug.contains("13124"));
+            assert!(!debug.contains("4386"));
+        }
     }
 
     #[test]

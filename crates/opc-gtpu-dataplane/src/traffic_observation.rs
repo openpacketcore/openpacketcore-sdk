@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::num::{NonZeroU128, NonZeroU64};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
@@ -18,9 +19,8 @@ use opc_dataplane_observation::{
     SourceEpoch, TrafficBinding, TrafficContinuityAssessment, TrafficContinuityAssessmentSummary,
     TrafficContinuityPolicy,
 };
-use opc_gtpu_ebpf_common::{
-    GtpuTrafficObservationRegistration, GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN,
-};
+use opc_gtpu_ebpf_common::trusted_traffic_observation_abi::GtpuTrafficObservationRegistration;
+use opc_gtpu_ebpf_common::GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN;
 
 use crate::GtpuSessionGroup;
 
@@ -219,6 +219,8 @@ pub enum GtpuTrafficProofAuthorityStoreUpdateError {
     ProductOwnerGenerationRegressed,
     /// The candidate was exactly the currently stored authority.
     AuthorityUnchanged,
+    /// Another authority replacement is queued or in progress.
+    ReplacementInProgress,
 }
 
 impl fmt::Display for GtpuTrafficProofAuthorityStoreUpdateError {
@@ -229,6 +231,7 @@ impl fmt::Display for GtpuTrafficProofAuthorityStoreUpdateError {
             Self::ReconcileFenceUnchanged => "reconcile_fence_unchanged",
             Self::ProductOwnerGenerationRegressed => "product_owner_generation_regressed",
             Self::AuthorityUnchanged => "authority_unchanged",
+            Self::ReplacementInProgress => "replacement_in_progress",
         })
     }
 }
@@ -267,6 +270,7 @@ impl GtpuTrafficProofAuthorityStoreIdentity {
 #[derive(Clone)]
 pub struct GtpuTrafficProofAuthorityStore {
     current: Arc<RwLock<GtpuTrafficProofAuthority>>,
+    replacement_active: Arc<AtomicBool>,
     identity: GtpuTrafficProofAuthorityStoreIdentity,
 }
 
@@ -278,6 +282,7 @@ impl GtpuTrafficProofAuthorityStore {
     ) -> Self {
         Self {
             current: Arc::new(RwLock::new(authority)),
+            replacement_active: Arc::new(AtomicBool::new(false)),
             identity,
         }
     }
@@ -294,8 +299,25 @@ impl GtpuTrafficProofAuthorityStore {
         self.identity
     }
 
-    pub(crate) fn blocking_exactly_matches(&self, authority: &GtpuTrafficProofAuthority) -> bool {
-        self.current.blocking_read().exactly_matches(authority)
+    /// Compare without waiting while a backend-wide operation lock is held.
+    ///
+    /// `None` means a replacement was queued or active. Tokio's `try_read`
+    /// alone can bypass a queued writer, so the replacement marker is checked
+    /// both before and after the read guard is acquired. A writer beginning
+    /// after the second check waits for the retained read guard, making this
+    /// comparison linearize before that replacement.
+    pub(crate) fn try_exactly_matches(
+        &self,
+        authority: &GtpuTrafficProofAuthority,
+    ) -> Option<bool> {
+        if self.replacement_active.load(Ordering::Acquire) {
+            return None;
+        }
+        let current = self.current.try_read().ok()?;
+        if self.replacement_active.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(current.exactly_matches(authority))
     }
 
     /// Acquire the current authority's non-cloneable validation lease.
@@ -320,6 +342,9 @@ impl GtpuTrafficProofAuthorityStore {
         &self,
         replacement: GtpuTrafficProofAuthority,
     ) -> Result<(), GtpuTrafficProofAuthorityStoreUpdateError> {
+        let _replacement =
+            GtpuTrafficProofAuthorityStoreReplacement::begin(self.replacement_active.as_ref())
+                .ok_or(GtpuTrafficProofAuthorityStoreUpdateError::ReplacementInProgress)?;
         let mut current = self.current.write().await;
         if replacement.binding.desired != current.binding.desired {
             return Err(GtpuTrafficProofAuthorityStoreUpdateError::SessionBindingChanged);
@@ -338,6 +363,30 @@ impl GtpuTrafficProofAuthorityStore {
         }
         *current = replacement;
         Ok(())
+    }
+}
+
+/// Cancellation-safe marker covering a queued or active authority writer.
+///
+/// Only one replacement may wait at a time. Refusing overlapping writers is
+/// fail-closed and prevents a backend operation that already owns its global
+/// mutation lock from waiting behind a lease retained by another operation.
+struct GtpuTrafficProofAuthorityStoreReplacement<'a> {
+    active: &'a AtomicBool,
+}
+
+impl<'a> GtpuTrafficProofAuthorityStoreReplacement<'a> {
+    fn begin(active: &'a AtomicBool) -> Option<Self> {
+        active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self { active })
+    }
+}
+
+impl Drop for GtpuTrafficProofAuthorityStoreReplacement<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
     }
 }
 
@@ -851,7 +900,9 @@ impl fmt::Debug for GtpuTrafficProof {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -1220,6 +1271,57 @@ mod tests {
         );
         drop(lease);
         assert_eq!(completed_receiver.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn queued_authority_replacement_is_nonblocking_and_fail_closed() {
+        let original = authority();
+        let store = GtpuTrafficProofAuthorityStore::new_for_test(original.clone());
+        let lease = store.lease().await;
+        let replacement = GtpuTrafficProofAuthority::new(group(), 2, 2, 2, policy()).unwrap();
+        let mut replacement = Box::pin(store.replace(replacement));
+        let mut context = Context::from_waker(Waker::noop());
+
+        // Polling through the write-lock await to Pending deterministically
+        // enqueues the writer behind `lease`; no scheduler timing is involved.
+        assert!(matches!(
+            Future::poll(replacement.as_mut(), &mut context),
+            Poll::Pending
+        ));
+        assert_eq!(store.try_exactly_matches(&original), None);
+        assert_eq!(
+            store.replace(original.clone()).await,
+            Err(GtpuTrafficProofAuthorityStoreUpdateError::ReplacementInProgress)
+        );
+
+        drop(lease);
+        assert_eq!(replacement.await, Ok(()));
+        assert_eq!(store.try_exactly_matches(&original), Some(false));
+    }
+
+    #[tokio::test]
+    async fn canceled_queued_authority_replacement_releases_contention_marker() {
+        let original = authority();
+        let store = GtpuTrafficProofAuthorityStore::new_for_test(original.clone());
+        let lease = store.lease().await;
+        let replacement = GtpuTrafficProofAuthority::new(group(), 2, 2, 2, policy()).unwrap();
+        let mut replacement = Box::pin(store.replace(replacement));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            Future::poll(replacement.as_mut(), &mut context),
+            Poll::Pending
+        ));
+        assert_eq!(store.try_exactly_matches(&original), None);
+
+        drop(replacement);
+        assert_eq!(store.try_exactly_matches(&original), Some(true));
+        drop(lease);
+
+        assert_eq!(
+            store.replace(original).await,
+            Err(GtpuTrafficProofAuthorityStoreUpdateError::AuthorityUnchanged)
+        );
     }
 
     #[tokio::test]

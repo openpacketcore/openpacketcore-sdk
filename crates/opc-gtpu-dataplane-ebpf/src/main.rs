@@ -47,6 +47,7 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use opc_gtpu_ebpf_common::classify_ipv6_extension_step;
+use opc_gtpu_ebpf_common::trusted_traffic_observation_abi::GtpuTrafficObservationRegistration;
 use opc_gtpu_ebpf_common::{
     apply_uplink_mtu_policy, build_uplink_encap_with_dscp_and_source_port, classify_gtpu,
     classify_udp_checksum, decide_uplink_pmtu, downlink_frame_end,
@@ -60,8 +61,8 @@ use opc_gtpu_ebpf_common::{
     uplink_non_encapsulation_drops, validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch,
     DownlinkPdr, GtpuClass, GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuPmtuProtocol,
     GtpuSessionAuthorityHeader, GtpuSessionEntryWireView, GtpuSessionGroupPhase,
-    GtpuSessionIpFamily, GtpuTrafficObservationDirection, GtpuTrafficObservationRegistration,
-    GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds, Ipv6ExtensionStep, MarkedDownlinkPdr,
+    GtpuSessionIpFamily, GtpuTrafficObservationDirection, GtpuUplinkMtuPolicy,
+    Ipv4EnvelopeBounds, Ipv6ExtensionStep, MarkedDownlinkPdr,
     TftClassifierFilter, TftClassifierFilterKey, TftClassifierIpv4Packet, TftClassifierKey,
     TftClassifierMeta, UdpChecksumDisposition, UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar,
     UplinkFarKey, UplinkMtuMapState, UplinkPmtuDecision, COUNTER_DL_BINDING_FAMILY_MISMATCH,
@@ -543,11 +544,11 @@ fn store_grouped_uplink_observation_cb_stamp(ctx: &TcContext, stamp: [u32; 5]) {
     // Each explicit scalar access preserves the verifier-recognized context
     // base while covering the complete marker-plus-16-byte nonce stamp.
     unsafe {
-        (*ctx.skb.skb).cb[0] = stamp[0];
-        (*ctx.skb.skb).cb[1] = stamp[1];
-        (*ctx.skb.skb).cb[2] = stamp[2];
-        (*ctx.skb.skb).cb[3] = stamp[3];
-        (*ctx.skb.skb).cb[4] = stamp[4];
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ctx.skb.skb).cb[0]), stamp[0]);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ctx.skb.skb).cb[1]), stamp[1]);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ctx.skb.skb).cb[2]), stamp[2]);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ctx.skb.skb).cb[3]), stamp[3]);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ctx.skb.skb).cb[4]), stamp[4]);
     }
 }
 
@@ -556,13 +557,14 @@ fn store_grouped_uplink_observation_cb_stamp(ctx: &TcContext, stamp: [u32; 5]) {
 #[inline(always)]
 fn clear_grouped_uplink_observation_cb_stamp(ctx: &TcContext) {
     // SAFETY: the caller established exact ownership from word zero. Each
-    // explicit scalar access preserves the verifier-recognized context base.
+    // volatile scalar access prevents LLVM from replacing the stores with a
+    // verifier-invalid `memset` through a derived context pointer.
     unsafe {
-        (*ctx.skb.skb).cb[0] = 0;
-        (*ctx.skb.skb).cb[1] = 0;
-        (*ctx.skb.skb).cb[2] = 0;
-        (*ctx.skb.skb).cb[3] = 0;
-        (*ctx.skb.skb).cb[4] = 0;
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ctx.skb.skb).cb[0]), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ctx.skb.skb).cb[1]), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ctx.skb.skb).cb[2]), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ctx.skb.skb).cb[3]), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ctx.skb.skb).cb[4]), 0);
     }
 }
 
@@ -620,11 +622,11 @@ fn take_grouped_uplink_observation_stamp(
     // These direct, constant-offset loads avoid a whole-array context borrow.
     let stamp = unsafe {
         [
-            (*ctx.skb.skb).cb[0],
-            (*ctx.skb.skb).cb[1],
-            (*ctx.skb.skb).cb[2],
-            (*ctx.skb.skb).cb[3],
-            (*ctx.skb.skb).cb[4],
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx.skb.skb).cb[0])),
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx.skb.skb).cb[1])),
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx.skb.skb).cb[2])),
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx.skb.skb).cb[3])),
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx.skb.skb).cb[4])),
         ]
     };
     let nonce = nonce_from_grouped_observation_cb_stamp(&stamp)?;
@@ -639,7 +641,8 @@ fn take_grouped_uplink_observation_stamp(
 fn clear_unmatched_grouped_uplink_observation_stamp(ctx: &TcContext) {
     // SAFETY: the tc verifier supplies a live, writable `__sk_buff` context.
     // A marker mismatch is left untouched because this program does not own it.
-    if grouped_observation_marker(unsafe { (*ctx.skb.skb).cb[0] }) {
+    let marker = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*ctx.skb.skb).cb[0])) };
+    if grouped_observation_marker(marker) {
         clear_grouped_uplink_observation_cb_stamp(ctx);
     }
 }
@@ -5096,6 +5099,41 @@ mod tests {
         skb.cb = unrelated;
         clear_unmatched_grouped_uplink_observation_stamp(&ctx);
         assert_eq!(skb.cb, unrelated);
+    }
+
+    #[test]
+    fn grouped_control_buffer_context_accesses_remain_verifier_safe() {
+        // Fix-removal guard for the real verifier failure observed on Linux
+        // 6.8: ordinary adjacent zero stores were coalesced into `memset`
+        // through a modified context pointer. Every owned cb access must stay
+        // an explicit volatile operation rooted at the original context.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let (_, context_accesses) = source
+            .split_once("fn store_grouped_uplink_observation_cb_stamp(")
+            .expect("control-buffer store helper is present");
+        let (context_accesses, _) = context_accesses
+            .split_once("/// Return the authenticated sample carried")
+            .expect("control-buffer helper region has a terminator");
+        let cb_accesses = context_accesses
+            .lines()
+            .filter(|line| line.contains("(*ctx.skb.skb).cb["))
+            .collect::<Vec<_>>();
+
+        assert_eq!(cb_accesses.len(), 16);
+        assert!(cb_accesses.iter().all(|line| {
+            line.contains("core::ptr::write_volatile")
+                || line.contains("core::ptr::read_volatile")
+        }));
+        assert_eq!(
+            context_accesses
+                .matches("core::ptr::write_volatile")
+                .count(),
+            10
+        );
+        assert_eq!(
+            context_accesses.matches("core::ptr::read_volatile").count(),
+            6
+        );
     }
 
     #[test]
