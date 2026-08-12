@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::fs::File;
+
 use async_trait::async_trait;
 use rusqlite::{
     params, Connection, InterruptHandle, OptionalExtension, Transaction, TransactionBehavior,
@@ -52,6 +55,34 @@ const SQLITE_OPERATION_BLOCKING_WORKERS: usize = 1;
 const SQLITE_OPERATION_MAX_WORK: Duration = Duration::from_secs(2);
 const SQLITE_BUSY_TIMEOUT_MILLIS: u64 = 100;
 const SQLITE_OPERATION_PROGRESS_INTERVAL: i32 = 1_000;
+
+/// A process-lifetime shared advisory lock for a file-backed backend.
+///
+/// The offline recovery executor takes the corresponding exclusive lock
+/// before it writes its durable recovery latch. Consequently, recovery can
+/// activate only after every live backend releases this lock; ordinary
+/// operations therefore cannot cross recovery activation after their final
+/// authority observation.
+#[cfg(unix)]
+type RecoveryExecutionLock = Arc<nix::fcntl::Flock<File>>;
+
+#[cfg(not(unix))]
+type RecoveryExecutionLock = ();
+
+#[cfg(unix)]
+fn acquire_recovery_execution_lock(path: &Path) -> Result<RecoveryExecutionLock, StoreError> {
+    let file = File::open(path).map_err(|_| {
+        StoreError::BackendUnavailable("session recovery execution is active".into())
+    })?;
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockSharedNonblock)
+        .map(Arc::new)
+        .map_err(|_| StoreError::BackendUnavailable("session recovery execution is active".into()))
+}
+
+#[cfg(not(unix))]
+fn acquire_recovery_execution_lock(_path: &Path) -> Result<RecoveryExecutionLock, StoreError> {
+    Ok(())
+}
 
 /// Begin one standalone operation while holding SQLite's write reservation.
 ///
@@ -109,12 +140,17 @@ fn consensus_identity_exists(conn: &Connection) -> Result<bool, StoreError> {
 pub struct SqliteSessionBackend {
     conn: Arc<tokio::sync::Mutex<Connection>>,
     database_path: Option<Arc<PathBuf>>,
+    // Retained solely to serialize the official offline-recovery activation
+    // boundary with every live clone of this file-backed backend.
+    _recovery_execution_lock: Option<RecoveryExecutionLock>,
     caps: BackendCapabilities,
     clock: Arc<dyn Clock>,
     restore_scan_workers: Arc<tokio::sync::Semaphore>,
     operation_workers: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    consensus_operator_recovery_failure: Arc<AtomicBool>,
     watchers: Arc<tokio::sync::Mutex<Vec<ReplicationWatcher>>>,
     consumer_watchers: Arc<tokio::sync::Mutex<Vec<ConsumerReplicationWatcher>>>,
     #[cfg(test)]
@@ -220,6 +256,7 @@ impl SqliteSessionBackend {
             Connection::open(path).map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        let recovery_execution_lock = acquire_recovery_execution_lock(&canonical)?;
         if let Some(latch) =
             consensus::read_operator_recovery_latch_sync(&canonical).map_err(|_| {
                 StoreError::BackendUnavailable(
@@ -240,20 +277,21 @@ impl SqliteSessionBackend {
                     std::sync::atomic::Ordering::Relaxed,
                 );
         }
-        Self::new_with_conn(conn, false, Some(canonical))
+        Self::new_with_conn(conn, false, Some(canonical), Some(recovery_execution_lock))
     }
 
     /// Open an ephemeral in-memory SQLite database.
     pub fn in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        Self::new_with_conn(conn, true, None)
+        Self::new_with_conn(conn, true, None, None)
     }
 
     fn new_with_conn(
         conn: Connection,
         in_memory: bool,
         database_path: Option<PathBuf>,
+        recovery_execution_lock: Option<RecoveryExecutionLock>,
     ) -> Result<Self, StoreError> {
         apply_pragma_profile(&conn, in_memory)?;
 
@@ -385,6 +423,7 @@ impl SqliteSessionBackend {
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
             database_path: database_path.map(Arc::new),
+            _recovery_execution_lock: recovery_execution_lock,
             caps: sqlite_capabilities(),
             clock: Arc::new(crate::clock::SystemClock),
             restore_scan_workers: Arc::new(tokio::sync::Semaphore::new(
@@ -395,6 +434,8 @@ impl SqliteSessionBackend {
             )),
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            consensus_operator_recovery_failure: Arc::new(AtomicBool::new(false)),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             consumer_watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
@@ -807,6 +848,15 @@ impl SqliteSessionBackend {
         &self,
         identity: crate::consensus::SessionConsensusIdentity,
     ) -> Result<bool, StoreError> {
+        #[cfg(test)]
+        if self
+            .consensus_operator_recovery_failure
+            .load(Ordering::Acquire)
+        {
+            return Err(StoreError::BackendUnavailable(
+                "injected session operator recovery check failure".into(),
+            ));
+        }
         let database_path = self.database_path.clone();
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let database_latch = database_path
@@ -846,6 +896,12 @@ impl SqliteSessionBackend {
                 })
         })
         .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_consensus_operator_recovery_failure(&self, enabled: bool) {
+        self.consensus_operator_recovery_failure
+            .store(enabled, Ordering::Release);
     }
 
     pub(crate) async fn consensus_operator_recovery_committed(

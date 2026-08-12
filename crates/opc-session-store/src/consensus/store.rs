@@ -1393,24 +1393,21 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> DurableReadinessReport {
-        if !matches!(
-            tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_record_is_exact(),)
-                .await,
-            Ok(Ok(true))
-        ) {
-            return self.topology_invalid_readiness_report();
+        match tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_record_is_exact())
+            .await
+        {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return self.topology_invalid_readiness_report(),
+            Ok(Err(_)) | Err(_) => return self.unavailable_durable_readiness_report(),
         }
         let report = self.probe_durable_readiness_before(deadline).await;
         if report.state() != DurableReadinessState::Ready {
             return report;
         }
-        if matches!(
-            tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_is_exact()).await,
-            Ok(Ok(true))
-        ) {
-            report
-        } else {
-            self.topology_invalid_readiness_report()
+        match tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_is_exact()).await {
+            Ok(Ok(true)) => report,
+            Ok(Ok(false)) => self.topology_invalid_readiness_report(),
+            Ok(Err(_)) | Err(_) => self.unavailable_durable_readiness_report(),
         }
     }
 
@@ -1547,16 +1544,17 @@ impl ConsensusSessionStore {
                 metrics.purged.as_ref().map(|log_id| log_id.index),
             )
         };
-        let recovery_pending = tokio::time::timeout_at(
+        let recovery_pending = match tokio::time::timeout_at(
             deadline,
             self.inner
                 .backend
                 .consensus_operator_recovery_pending(self.inner.storage_identity),
         )
         .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or(true);
+        {
+            Ok(Ok(recovery_pending)) => recovery_pending,
+            Ok(Err(_)) | Err(_) => return self.unavailable_durable_readiness_report(),
+        };
         if recovery_pending {
             let metrics = self.inner.raft.metrics();
             let metrics = metrics.borrow();
@@ -1878,6 +1876,32 @@ impl ConsensusSessionStore {
             Vec::new(),
         )
         .with_production_topology_attestation()
+    }
+
+    /// A durable observation did not complete. This remains a transient
+    /// quorum failure: only a completed typed observation may classify the
+    /// store as structurally invalid or recovery-required.
+    fn unavailable_durable_readiness_report(&self) -> DurableReadinessReport {
+        let configured = self.current_member_count().unwrap_or(0);
+        let quorum = (configured / 2) + 1;
+        let metrics = self.inner.raft.metrics();
+        let metrics = metrics.borrow();
+        DurableReadinessReport::new(
+            DurableReadinessState::NoQuorum,
+            configured,
+            0,
+            0,
+            quorum,
+            None,
+            Vec::new(),
+        )
+        .with_recovery_progress(DurableRecoveryProgress::new(
+            DurableRecoveryState::AwaitingQuorum,
+            metrics.last_log_index,
+            metrics.last_applied.as_ref().map(|log_id| log_id.index),
+            metrics.snapshot.as_ref().map(|log_id| log_id.index),
+            metrics.purged.as_ref().map(|log_id| log_id.index),
+        ))
     }
 
     async fn submit_intent(
@@ -4826,6 +4850,43 @@ mod membership_tests {
         assert_eq!(
             initialized.recovery_progress().state(),
             DurableRecoveryState::Synchronized
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_probe_backend_error_and_deadline_are_transient_not_recovery_latches() {
+        let directory = tempfile::tempdir().expect("durable probe deadline directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("durable probe deadline SQLite backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open durable probe deadline store");
+        store
+            .inner
+            .backend
+            .inject_consensus_operator_recovery_failure(true);
+        let backend_error = store.probe_durable_readiness().await;
+        assert_eq!(backend_error.state(), DurableReadinessState::NoQuorum);
+        assert_eq!(
+            backend_error.recovery_progress().state(),
+            DurableRecoveryState::AwaitingQuorum
+        );
+        store
+            .inner
+            .backend
+            .inject_consensus_operator_recovery_failure(false);
+        let deadline = tokio::time::Instant::now();
+
+        let general = store.probe_durable_readiness_before(deadline).await;
+        assert_eq!(general.state(), DurableReadinessState::NoQuorum);
+        assert_eq!(
+            general.recovery_progress().state(),
+            DurableRecoveryState::AwaitingQuorum
         );
     }
 

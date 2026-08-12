@@ -682,6 +682,76 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn recovery_activation_is_rejected_while_a_file_backend_is_live() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let first_id = replica_id("live-backend-source-a");
+    let second_id = replica_id("live-backend-target-b");
+    let third_id = replica_id("live-backend-target-c");
+    let ids = [first_id.clone(), second_id.clone(), third_id.clone()];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), first_id.clone(), 17),
+        create_legacy_replica(temp.path(), second_id.clone(), 43),
+        create_legacy_replica(temp.path(), third_id.clone(), 67),
+    ];
+    let manager = recovery(AllowRecovery);
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            node_set(&ids),
+            &replicas,
+            &first_id,
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        )
+        .expect("legacy recovery plan");
+    let confirmation = RecoveryConfirmation::legacy(
+        &plan,
+        RecoveryConfirmation::required_legacy_acknowledgement(),
+    );
+    let live_backend = SqliteSessionBackend::open(&replicas[0].database_path)
+        .expect("open live file-backed backend");
+
+    assert_eq!(
+        manager.execute(
+            &context(),
+            &plan,
+            &confirmation,
+            &replicas,
+            backup.path(),
+            RecoveryLimits::default(),
+        ),
+        Err(RecoveryError::FileOperationFailed),
+        "the official recovery executor must not activate its latch while a backend can serve"
+    );
+    assert!(
+        consensus::read_operator_recovery_latch_sync(&replicas[0].database_path)
+            .expect("read absent recovery latch")
+            .is_none(),
+        "a rejected activation must not create a partial durable latch"
+    );
+
+    drop(live_backend);
+    assert_eq!(
+        manager
+            .execute(
+                &context(),
+                &plan,
+                &confirmation,
+                &replicas,
+                backup.path(),
+                RecoveryLimits::default(),
+            )
+            .expect("recovery after backend shutdown")
+            .state(),
+        RecoveryExecutionState::AwaitingEpochCommit
+    );
+}
+
 #[test]
 fn audit_outage_after_reset_is_durably_journaled_and_resumable() {
     let temp = tempfile::tempdir().expect("temporary directory");

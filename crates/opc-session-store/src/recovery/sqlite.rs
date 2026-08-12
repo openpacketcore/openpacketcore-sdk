@@ -1465,7 +1465,6 @@ pub(super) fn backup_and_reset_replica(
     {
         return Err(RecoveryError::StalePlan);
     }
-    let execution_locks = acquire_fleet_execution_locks(input.key, input.plan, input.replicas)?;
     let workflow_dir = workflow_directory(input.backup_root, input.plan, true)?;
     let mut workflow =
         read_workflow(input.key, input.plan, &workflow_dir)?.unwrap_or(WorkflowRecord {
@@ -1499,14 +1498,20 @@ pub(super) fn backup_and_reset_replica(
                 .collect(),
         });
     validate_workflow_shape(input.plan, &workflow)?;
+    // A completed execute retry is read-only: it neither creates nor alters a
+    // recovery latch, so it does not need to contend with a restarted live
+    // backend. Every path that can activate the latch acquires the fleet's
+    // exclusive locks below before doing so.
+    if workflow.state == RecoveryExecutionState::Rejoined {
+        return Ok(RecoveryExecutionState::Rejoined);
+    }
+    let execution_locks = acquire_fleet_execution_locks(input.key, input.plan, input.replicas)?;
     // A completed execute retry must remain read-only with respect to the
     // fleet latch. Finalization has already cleared it on the successful path,
     // and recreating it here would regress every voter back to not-ready. If a
     // prior finalization crashed before clearing an existing latch, only a
     // finalize retry is authorized to remove it.
-    if workflow.state != RecoveryExecutionState::Rejoined {
-        ensure_fleet_latches(input.key, input.plan, input.replicas)?;
-    }
+    ensure_fleet_latches(input.key, input.plan, input.replicas)?;
     let checkpoint_replica = if workflow.checkpoint_database_digest.is_some() {
         for target in input.targets {
             verify_target_backup(input.key, input.plan, target, &workflow_dir)?;
