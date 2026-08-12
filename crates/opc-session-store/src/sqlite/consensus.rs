@@ -6812,6 +6812,13 @@ pub(crate) fn apply_entries_with_authority_sync(
     let mut notifications = Vec::new();
 
     for entry in entries {
+        if authority_profile == ConsensusAuthorityProfile::FixedImmutable
+            && fixed_profile_entry_changes_topology(&entry, expected_members)
+        {
+            return Err(invalid_data(
+                "fixed session consensus authority rejects topology transitions",
+            ));
+        }
         // A preceding application command in this same committed batch may
         // have staged, fenced, or aborted a transition. Validate each entry
         // against the scope visible at its exact apply position.
@@ -6971,6 +6978,20 @@ pub(crate) fn apply_entries_with_authority_sync(
         responses.push(response);
     }
 
+    if authority_profile == ConsensusAuthorityProfile::FixedImmutable
+        && !fixed_quorum_authority_is_exact_sync(
+            &tx,
+            identity,
+            expected_members,
+            expected_bindings,
+            false,
+        )?
+    {
+        return Err(invalid_data(
+            "session consensus fixed authority changed while applying entries",
+        ));
+    }
+
     validate_persisted_membership_sync(&tx, identity)?;
     tx.commit().map_err(db_error)?;
     Ok(AppliedBatch {
@@ -6986,9 +7007,20 @@ pub(crate) fn fixed_quorum_authority_is_exact_sync(
     expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     allow_pristine_membership: bool,
 ) -> io::Result<bool> {
+    if !matches!(expected_members.len(), 3 | 5)
+        || validate_member_bindings(expected_members, expected_bindings).is_err()
+    {
+        return Ok(false);
+    }
     if read_consensus_authority_profile_sync(conn)
         .map_err(|_| invalid_data("session consensus fixed authority profile is invalid"))?
         != ConsensusAuthorityProfile::FixedImmutable
+    {
+        return Ok(false);
+    }
+    if read_storage_identity_sync(conn)
+        .map_err(|_| invalid_data("session consensus fixed storage identity is invalid"))?
+        != identity
     {
         return Ok(false);
     }
@@ -7009,6 +7041,33 @@ pub(crate) fn fixed_quorum_authority_is_exact_sync(
         && scope.terminal.is_none()
         && (applied_membership_is_exact
             || (allow_pristine_membership && membership.log_id().is_none())))
+}
+
+fn fixed_profile_entry_changes_topology(
+    entry: &Entry<SessionRaftTypeConfig>,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+) -> bool {
+    match &entry.payload {
+        EntryPayload::Membership(membership) => {
+            !fixed_uniform_membership_matches(membership, expected_members)
+        }
+        EntryPayload::Normal(command) => fixed_profile_intent_changes_topology(&command.intent),
+        EntryPayload::Blank => false,
+    }
+}
+
+fn fixed_profile_intent_changes_topology(intent: &SessionMutationIntent) -> bool {
+    match intent {
+        SessionMutationIntent::PrepareTopologyTransition { .. }
+        | SessionMutationIntent::MarkTopologyLearnersReady { .. }
+        | SessionMutationIntent::FenceTopologyAuthority { .. }
+        | SessionMutationIntent::AbortTopologyTransition { .. }
+        | SessionMutationIntent::FinalizeTopologyTransition { .. } => true,
+        SessionMutationIntent::Authorized { mutation, .. } => {
+            fixed_profile_intent_changes_topology(mutation)
+        }
+        _ => false,
+    }
 }
 
 /// Revalidate fixed-quorum authority inside the transaction which performs a
@@ -7730,9 +7789,57 @@ fn validate_fixed_immutable_membership_scope(
     }
 }
 
+/// Read-only tables that are shadowed temporarily while validating the
+/// already-attached incoming snapshot. The names are constants controlled by
+/// this adapter; no snapshot-supplied identifier is interpolated into SQL.
+const ATTACHED_SNAPSHOT_VALIDATION_TABLES: &[&str] = &[
+    "session_records",
+    "leases",
+    "key_fences",
+    "lease_globals",
+    "session_replication_log",
+    "consensus_identity",
+    "consensus_membership_scope",
+    "consensus_membership_history",
+    "consensus_membership_terminal_history",
+    "consensus_candidate_bootstrap",
+    "consensus_vote",
+    "consensus_committed",
+    "consensus_purged",
+    "consensus_log",
+    "consensus_applied",
+    "consensus_membership",
+    "consensus_machine",
+    "consensus_request_outcomes",
+    "consensus_snapshot",
+    "consensus_operator_recovery",
+    "restore_scan_state",
+];
+
+fn create_attached_snapshot_validation_views(conn: &Connection) -> io::Result<()> {
+    for table in ATTACHED_SNAPSHOT_VALIDATION_TABLES {
+        if let Err(error) = conn.execute(
+            &format!("CREATE TEMP VIEW {table} AS SELECT * FROM consensus_incoming.{table}"),
+            [],
+        ) {
+            let _ = drop_attached_snapshot_validation_views(conn);
+            return Err(db_error(error));
+        }
+    }
+    Ok(())
+}
+
+fn drop_attached_snapshot_validation_views(conn: &Connection) -> io::Result<()> {
+    for table in ATTACHED_SNAPSHOT_VALIDATION_TABLES {
+        conn.execute(&format!("DROP VIEW IF EXISTS temp.{table}"), [])
+            .map_err(db_error)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
-fn validate_snapshot_database_sync(
-    path: &std::path::Path,
+fn validate_attached_snapshot_database_sync(
+    conn: &Connection,
     identity: SessionConsensusIdentity,
     authority_profile: ConsensusAuthorityProfile,
     expected_scope: &MembershipValidationScope,
@@ -7746,34 +7853,27 @@ fn validate_snapshot_database_sync(
         opc_consensus::engine::EmptyNode,
     >,
 ) -> io::Result<()> {
-    let conn = Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(db_error)?;
-    ensure_consensus_authority_profile_sync(&conn, authority_profile, true)
-        .map_err(|_| invalid_data("session consensus snapshot authority profile is invalid"))?;
-    ensure_operator_recovery_schema_sync(&conn, identity)?;
-    ensure_membership_scope_schema_sync(
-        &conn,
-        identity,
-        expected_scope.current_identity,
-        &expected_scope.current_members,
-        &expected_scope.current_bindings,
-    )?;
     let integrity: String = conn
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .query_row("PRAGMA consensus_incoming.integrity_check", [], |row| {
+            row.get(0)
+        })
         .map_err(db_error)?;
     if integrity != "ok" {
         return Err(invalid_data(
             "session consensus snapshot integrity check failed",
         ));
     }
-    validate_existing_schema(&conn, identity)
+    validate_existing_schema(conn, identity)
         .map_err(|_| invalid_data("session consensus snapshot identity is invalid"))?;
-    let incoming_scope = read_membership_scope_sync(&conn, identity)?;
+    if read_consensus_authority_profile_sync(conn)
+        .map_err(|_| invalid_data("session consensus snapshot authority profile is invalid"))?
+        != authority_profile
+    {
+        return Err(invalid_data(
+            "session consensus snapshot authority profile is invalid",
+        ));
+    }
+    let incoming_scope = read_membership_scope_sync(conn, identity)?;
     if local_candidate_marker.is_some_and(|marker| {
         marker.state == CandidateBootstrapState::Cancelled
             && incoming_scope.pending.as_ref().is_some_and(|pending| {
@@ -7791,7 +7891,7 @@ fn validate_snapshot_database_sync(
             (fixed_expected_members, fixed_expected_bindings)
         {
             if !fixed_quorum_authority_is_exact_sync(
-                &conn,
+                conn,
                 identity,
                 expected_members,
                 expected_bindings,
@@ -7805,11 +7905,11 @@ fn validate_snapshot_database_sync(
     } else {
         validate_incoming_membership_scope(expected_scope, &incoming_scope)?;
     }
-    ops::read_restore_scan_state_sync(&conn)
+    ops::read_restore_scan_state_sync(conn)
         .map_err(|_| invalid_data("session consensus snapshot restore metadata is invalid"))?;
-    validate_sealed_state_sync(&conn)?;
-    let applied = read_applied_sync(&conn, identity)?;
-    let membership = read_membership_sync(&conn, identity)?;
+    validate_sealed_state_sync(conn)?;
+    let applied = read_applied_sync(conn, identity)?;
+    let membership = read_membership_sync(conn, identity)?;
     if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
         validate_uniform_membership(&membership, &incoming_scope.current_members)?;
     }
@@ -7917,16 +8017,6 @@ pub(crate) fn install_snapshot_database_with_authority_sync(
     validate_snapshot_floor(conn, identity, incoming_last_log_id)?;
     let expected_scope = read_membership_scope_sync(conn, identity)?;
     let local_candidate_marker = read_candidate_bootstrap_marker_sync(conn, identity)?;
-    validate_snapshot_database_sync(
-        snapshot_db_path,
-        identity,
-        authority_profile,
-        &expected_scope,
-        expected_members,
-        expected_bindings,
-        local_candidate_marker,
-        meta,
-    )?;
     if final_file_name.is_empty()
         || final_file_name.contains('/')
         || final_file_name.contains('\\')
@@ -7966,6 +8056,25 @@ pub(crate) fn install_snapshot_database_with_authority_sync(
                 )?;
             }
         }
+        // ATTACH pins the incoming database handle before this transaction
+        // begins. Shadowing only the fixed, adapter-controlled table names
+        // lets the existing read-only validators inspect that exact attached
+        // source under the transaction that will copy it. A pathname swap or
+        // later writer therefore cannot substitute bytes after validation.
+        create_attached_snapshot_validation_views(&tx)?;
+        let validation = validate_attached_snapshot_database_sync(
+            &tx,
+            identity,
+            authority_profile,
+            &expected_scope,
+            expected_members,
+            expected_bindings,
+            local_candidate_marker,
+            meta,
+        );
+        let drop_views = drop_attached_snapshot_validation_views(&tx);
+        validation?;
+        drop_views?;
         for (table, columns) in [
             (
                 "session_records",
@@ -10876,12 +10985,12 @@ mod tests {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.lock().await;
         let identity = identity();
-        let members = members(&[7, 8, 9]);
-        let bindings = test_member_bindings(&members);
+        let fixed_members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&fixed_members);
         initialize_schema_with_profile(
             &conn,
             identity,
-            &members,
+            &fixed_members,
             ConsensusAuthorityProfile::FixedImmutable,
         )
         .expect("initialize fixed authority");
@@ -10895,7 +11004,7 @@ mod tests {
             &conn,
             identity,
             ConsensusAuthorityProfile::FixedImmutable,
-            &members,
+            &fixed_members,
             &bindings,
             &Vote::new_committed(1, member(7)),
         )
@@ -10953,6 +11062,248 @@ mod tests {
                 &conn, identity, &members, &bindings, false,
             )
             .expect("read reopened fixed authority"));
+        }
+    }
+
+    #[tokio::test]
+    async fn fixed_apply_rejects_prepare_transition_without_scope_drift() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        let identity = identity();
+        let fixed_members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&fixed_members);
+        initialize_schema_with_profile(
+            &conn,
+            identity,
+            &fixed_members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed authority");
+
+        let desired_members = members(&[8, 9, 10]);
+        let desired_bindings = test_member_bindings(&desired_members);
+        let error = apply_entries_with_authority_sync(
+            &conn,
+            identity,
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &fixed_members,
+            &bindings,
+            vec![
+                membership_entry_at(0, vec![fixed_members.clone()], fixed_members.clone()),
+                topology_entry_at(
+                    1,
+                    0x81,
+                    SessionMutationIntent::PrepareTopologyTransition {
+                        transition_id: [0x81; MEMBERSHIP_TRANSITION_ID_BYTES],
+                        request_digest: [0x82; 32],
+                        desired_identity: identity_at(2, 0x83),
+                        desired_members,
+                        desired_bindings,
+                    },
+                ),
+            ],
+        )
+        .expect_err("fixed authority must reject committed topology preparation");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(read_applied_sync(&conn, identity)
+            .expect("read rolled-back applied pointer")
+            .is_none());
+        let scope = read_membership_scope_sync(&conn, identity).expect("read rolled-back scope");
+        assert!(scope.pending.is_none());
+        assert_eq!(identity, scope.current_identity);
+        assert_eq!(fixed_members, scope.current_members);
+        assert!(read_membership_sync(&conn, identity)
+            .expect("read rolled-back membership")
+            .log_id()
+            .is_none());
+    }
+
+    #[test]
+    fn fixed_profile_recursively_classifies_every_transition_intent() {
+        let transition_id = [0x84; MEMBERSHIP_TRANSITION_ID_BYTES];
+        let request_digest = [0x85; 32];
+        let desired_members = members(&[8, 9, 10]);
+        let intents = [
+            SessionMutationIntent::PrepareTopologyTransition {
+                transition_id,
+                request_digest,
+                desired_identity: identity_at(2, 0x86),
+                desired_members: desired_members.clone(),
+                desired_bindings: test_member_bindings(&desired_members),
+            },
+            SessionMutationIntent::MarkTopologyLearnersReady {
+                transition_id,
+                request_digest,
+            },
+            SessionMutationIntent::FenceTopologyAuthority {
+                transition_id,
+                request_digest,
+            },
+            SessionMutationIntent::AbortTopologyTransition {
+                transition_id,
+                request_digest,
+            },
+            SessionMutationIntent::FinalizeTopologyTransition {
+                transition_id,
+                request_digest,
+            },
+        ];
+        for intent in intents {
+            assert!(fixed_profile_intent_changes_topology(&intent));
+            assert!(fixed_profile_intent_changes_topology(
+                &SessionMutationIntent::Authorized {
+                    origin: member(7),
+                    authority_identity: identity(),
+                    mutation: Box::new(intent),
+                }
+            ));
+        }
+        assert!(!fixed_profile_intent_changes_topology(
+            &SessionMutationIntent::AdvanceLogicalTime
+        ));
+    }
+
+    #[tokio::test]
+    async fn fixed_raw_writes_reject_profile_preserving_storage_identity_drift() {
+        for drift in ["cluster_id", "configuration_id", "configuration_epoch"] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.lock().await;
+            let identity = identity();
+            let members = members(&[7, 8, 9]);
+            let bindings = test_member_bindings(&members);
+            initialize_schema_with_profile(
+                &conn,
+                identity,
+                &members,
+                ConsensusAuthorityProfile::FixedImmutable,
+            )
+            .expect("initialize fixed authority");
+            apply_entries_with_authority_sync(
+                &conn,
+                identity,
+                &backend.caps,
+                ConsensusAuthorityProfile::FixedImmutable,
+                &members,
+                &bindings,
+                vec![membership_entry_at(
+                    0,
+                    vec![members.clone()],
+                    members.clone(),
+                )],
+            )
+            .expect("form fixed quorum");
+            conn.execute_batch("PRAGMA foreign_keys = OFF")
+                .expect("allow adversarial identity drift fixture");
+            match drift {
+                "cluster_id" => {
+                    conn.execute(
+                        "UPDATE consensus_identity SET cluster_id = ?1 WHERE singleton = 1",
+                        [[0x91; 32].as_slice()],
+                    )
+                    .expect("persist cluster drift");
+                }
+                "configuration_id" => {
+                    conn.execute(
+                        "UPDATE consensus_identity SET configuration_id = ?1 WHERE singleton = 1",
+                        [[0x92; 32].as_slice()],
+                    )
+                    .expect("persist configuration-ID drift");
+                }
+                "configuration_epoch" => {
+                    conn.execute(
+                        "UPDATE consensus_identity SET configuration_epoch = 2 WHERE singleton = 1",
+                        [],
+                    )
+                    .expect("persist configuration-epoch drift");
+                }
+                _ => unreachable!("static identity drift fixture"),
+            }
+            conn.execute_batch("PRAGMA foreign_keys = ON")
+                .expect("restore foreign-key checks");
+
+            let vote = save_vote_with_authority_sync(
+                &conn,
+                identity,
+                ConsensusAuthorityProfile::FixedImmutable,
+                &members,
+                &bindings,
+                &Vote::new_committed(1, member(7)),
+            )
+            .expect_err("fixed vote must reject storage identity drift");
+            assert_eq!(io::ErrorKind::InvalidData, vote.kind(), "{drift}");
+            let append = append_logs_with_authority_sync(
+                &conn,
+                identity,
+                ConsensusAuthorityProfile::FixedImmutable,
+                &members,
+                &bindings,
+                &[blank_entry(1)],
+            )
+            .expect_err("fixed log append must reject storage identity drift");
+            assert_eq!(io::ErrorKind::InvalidData, append.kind(), "{drift}");
+            let apply = apply_entries_with_authority_sync(
+                &conn,
+                identity,
+                &backend.caps,
+                ConsensusAuthorityProfile::FixedImmutable,
+                &members,
+                &bindings,
+                vec![blank_entry(1)],
+            )
+            .expect_err("fixed apply must reject storage identity drift");
+            assert_eq!(io::ErrorKind::InvalidData, apply.kind(), "{drift}");
+            let snapshot = save_current_snapshot_with_authority_sync(
+                &conn,
+                identity,
+                ConsensusAuthorityProfile::FixedImmutable,
+                &members,
+                &bindings,
+                &opc_consensus::engine::SnapshotMeta {
+                    last_log_id: Some(log_id(0)),
+                    last_membership: StoredMembership::new(
+                        Some(log_id(0)),
+                        opc_consensus::engine::Membership::new(
+                            vec![members.clone()],
+                            members.clone(),
+                        ),
+                    ),
+                    snapshot_id: format!("fixed-identity-drift-{drift}"),
+                },
+                "fixed-identity-drift.opc",
+                [0x93; 32],
+                1,
+            )
+            .expect_err("fixed snapshot metadata must reject storage identity drift");
+            assert_eq!(io::ErrorKind::InvalidData, snapshot.kind(), "{drift}");
+            assert_eq!(
+                0_i64,
+                conn.query_row("SELECT COUNT(*) FROM consensus_vote", [], |row| row
+                    .get::<_, i64>(0))
+                    .expect("read rejected vote count"),
+                "{drift}"
+            );
+            assert_eq!(
+                0_i64,
+                conn.query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                    .get::<_, i64>(0))
+                    .expect("read rejected log count"),
+                "{drift}"
+            );
+            assert_eq!(
+                1_i64,
+                conn.query_row("SELECT COUNT(*) FROM consensus_applied", [], |row| row
+                    .get::<_, i64>(0))
+                    .expect("read unchanged applied pointer count"),
+                "{drift}"
+            );
+            assert_eq!(
+                0_i64,
+                conn.query_row("SELECT COUNT(*) FROM consensus_snapshot", [], |row| row
+                    .get::<_, i64>(0))
+                    .expect("read rejected snapshot metadata count"),
+                "{drift}"
+            );
         }
     }
 
@@ -11186,6 +11537,112 @@ mod tests {
             read_membership_scope_sync(&target_conn, identity)
                 .expect("read retained local drift")
                 .current_bindings
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_snapshot_install_rejects_replaced_incoming_source_before_copy() {
+        let identity = identity();
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.lock().await;
+        initialize_schema_with_profile(
+            &source_conn,
+            identity,
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed source");
+        apply_entries_with_authority_sync(
+            &source_conn,
+            identity,
+            &source.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            vec![membership_entry_at(
+                0,
+                vec![members.clone()],
+                members.clone(),
+            )],
+        )
+        .expect("form fixed source quorum");
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let valid_path = directory.path().join("valid-source.sqlite");
+        let (last_log_id, last_membership) = build_snapshot_database_with_authority_sync(
+            &source_conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            &valid_path,
+        )
+        .expect("build fixed source snapshot");
+        drop(source_conn);
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "fixed-replaced-source".into(),
+        };
+        let replaced_path = directory.path().join("replaced-source.sqlite");
+        std::fs::copy(&valid_path, &replaced_path).expect("stage replacement snapshot");
+        let replaced = Connection::open(&replaced_path).expect("open replacement snapshot");
+        replaced
+            .execute(
+                "UPDATE consensus_identity SET authority_profile = ?1 WHERE singleton = 1",
+                [authority_profile_i64(ConsensusAuthorityProfile::Dynamic)],
+            )
+            .expect("replace source authority after valid image was produced");
+        drop(replaced);
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.lock().await;
+        initialize_schema_with_profile(
+            &target_conn,
+            identity,
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed target");
+        let replaced_error = install_snapshot_database_with_authority_sync(
+            &target_conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            Some(&members),
+            Some(&bindings),
+            &replaced_path,
+            &meta,
+            "replaced-source.opc",
+            [0xa1; 32],
+            std::fs::metadata(&replaced_path)
+                .expect("replacement metadata")
+                .len(),
+        )
+        .expect_err("attached replacement source must be rejected before copy");
+        assert_eq!(io::ErrorKind::InvalidData, replaced_error.kind());
+        assert!(read_applied_sync(&target_conn, identity)
+            .expect("read unchanged target after replacement rejection")
+            .is_none());
+
+        install_snapshot_database_with_authority_sync(
+            &target_conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            Some(&members),
+            Some(&bindings),
+            &valid_path,
+            &meta,
+            "valid-source.opc",
+            [0xa2; 32],
+            std::fs::metadata(&valid_path)
+                .expect("valid source metadata")
+                .len(),
+        )
+        .expect("valid source installs after rejected replacement");
+        assert_eq!(
+            Some(log_id(0)),
+            read_applied_sync(&target_conn, identity).expect("read installed target")
         );
     }
 
