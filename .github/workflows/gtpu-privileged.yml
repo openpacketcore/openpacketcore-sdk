@@ -140,6 +140,7 @@ jobs:
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_IPV6_PROOF_PROVEN' "${datapath_log}"
 
           # The two lib tag proofs return Ok early without printing `skipping:`
           # when the environment is not privileged, so the skip check above
@@ -693,6 +694,7 @@ jobs:
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_IPV6_PROOF_PROVEN' "${datapath_log}"
 
   ebpf-object:
     name: eBPF datapath object rebuild
@@ -852,7 +854,8 @@ jobs:
             observation_challenge_sample observation_icmp_checksum_for_payload \
             observation_icmpv6_checksum_is_valid rewrite_observation_icmp_echo_request \
             emit_grouped_observation \
-            try_emit_grouped_observation emit_grouped_uplink_observation_on_reentry \
+            try_emit_grouped_observation publish_grouped_observation_event \
+            emit_grouped_uplink_observation_on_reentry \
             encoded_is_valid encoded_icmp_echo_sample_if_valid \
             pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph \
             marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink \

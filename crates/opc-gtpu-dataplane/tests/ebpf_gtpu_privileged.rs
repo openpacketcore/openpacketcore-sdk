@@ -183,8 +183,10 @@ const GROUP_LOCAL_TEID_V6_CROSSED: u32 = 0x7100_0002;
 const GROUP_PEER_TEID_V6_CROSSED: u32 = 0x7200_0002;
 const INBOUND_SPI_DEFAULT: u32 = 0x3000_0000;
 const INBOUND_SPI_A: u32 = 0x3000_0001;
+const INBOUND_SPI_V6_A: u32 = 0x3000_0002;
 const OUTBOUND_SPI_DEFAULT: u32 = 0x4000_0001;
 const OUTBOUND_SPI_A: u32 = 0x4000_0002;
+const OUTBOUND_SPI_V6_A: u32 = 0x4000_0003;
 const XFRM_SESSION_REQUEST_ID: u32 = 0x0a00_0001;
 const GTPU_PORT: u16 = 2152;
 const NAT_T_PORT: u16 = 4500;
@@ -196,9 +198,12 @@ const XFRM_DOWNLINK_SOURCE_PORT: u16 = 53;
 const XFRM_DOWNLINK_DESTINATION_PORT: u16 = XFRM_INNER_SOURCE_PORT;
 const IPPROTO_UDP: u8 = 17;
 const IPPROTO_ICMP: u8 = 1;
+const IPPROTO_ICMPV6: u8 = 58;
 const IPPROTO_ESP: u8 = 50;
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
+const ICMPV6_ECHO_REQUEST: u8 = 128;
+const ICMPV6_ECHO_REPLY: u8 = 129;
 const ICMP_ECHO_IDENTIFIER: u16 = 0x6550;
 const CURRENT_DATAPATH_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath.bpf.o");
 const FROZEN_V1_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v1.bpf.o");
@@ -1072,6 +1077,10 @@ fn xfrm_ip(address: Ipv4Addr) -> IpAddress {
     IpAddress::Ipv4(address.octets())
 }
 
+fn xfrm_ip_v6(address: Ipv6Addr) -> IpAddress {
+    IpAddress::Ipv6(address.octets())
+}
+
 fn xfrm_session_request_id() -> XfrmRequestId {
     XfrmRequestId::new(XFRM_SESSION_REQUEST_ID).expect("nonzero session request ID")
 }
@@ -1087,6 +1096,14 @@ fn marked_inner_selector() -> XfrmSelector {
 
 fn downlink_selector() -> XfrmSelector {
     XfrmSelector::new(xfrm_ip(REMOTE_HOST), xfrm_ip(UE_PAA), 0)
+}
+
+fn marked_inner_selector_v6() -> XfrmSelector {
+    XfrmSelector::new(xfrm_ip_v6(UE_PAA_IPV6), xfrm_ip_v6(REMOTE_HOST_IPV6), 0)
+}
+
+fn downlink_selector_v6() -> XfrmSelector {
+    XfrmSelector::new(xfrm_ip_v6(REMOTE_HOST_IPV6), xfrm_ip_v6(UE_PAA_IPV6), 0)
 }
 
 fn inbound_sa_parameters(spi: u32, output_mark: XfrmMark) -> SaParameters {
@@ -1176,6 +1193,104 @@ fn downlink_policy_parameters(spi: u32, mark: XfrmLookupMark) -> PolicyParameter
             mode: XfrmMode::Tunnel,
         }],
         mark: Some(mark),
+        if_id: None,
+    }
+}
+
+fn protected_v6_inbound_sa_parameters(output_mark: Option<XfrmMark>) -> SaParameters {
+    SaParameters {
+        selector: marked_inner_selector_v6(),
+        id: XfrmId {
+            destination: xfrm_ip(EPDG_SWU_IP),
+            spi: INBOUND_SPI_V6_A,
+            protocol: IPPROTO_ESP,
+        },
+        source_address: xfrm_ip(UE_SWU_IP),
+        request_id: Some(xfrm_session_request_id()),
+        auth: Some((
+            AuthAlgorithm::hmac_sha256(96),
+            KeyMaterial::new(vec![0x6b; 32]),
+        )),
+        crypt: Some((Algorithm::cbc_aes(), KeyMaterial::new(vec![0x6d; 16]))),
+        aead: None,
+        mode: XfrmMode::Tunnel,
+        lifetime: LifetimeConfig::default(),
+        replay_window: 32,
+        replay_state: None,
+        encap: Some(UdpEncap::esp_in_udp(NAT_T_PORT, NAT_T_PORT)),
+        mark: None,
+        output_mark,
+        if_id: None,
+        egress_dscp: None,
+    }
+}
+
+fn protected_v6_downlink_sa_parameters(mark: Option<XfrmLookupMark>) -> SaParameters {
+    SaParameters {
+        selector: downlink_selector_v6(),
+        id: XfrmId {
+            destination: xfrm_ip(UE_SWU_IP),
+            spi: OUTBOUND_SPI_V6_A,
+            protocol: IPPROTO_ESP,
+        },
+        source_address: xfrm_ip(EPDG_SWU_IP),
+        request_id: Some(xfrm_session_request_id()),
+        auth: Some((
+            AuthAlgorithm::hmac_sha256(96),
+            KeyMaterial::new(vec![0x7b; 32]),
+        )),
+        crypt: Some((Algorithm::cbc_aes(), KeyMaterial::new(vec![0x7d; 16]))),
+        aead: None,
+        mode: XfrmMode::Tunnel,
+        lifetime: LifetimeConfig::default(),
+        replay_window: 32,
+        replay_state: None,
+        encap: Some(UdpEncap::esp_in_udp(NAT_T_PORT, NAT_T_PORT)),
+        mark,
+        output_mark: None,
+        if_id: None,
+        egress_dscp: None,
+    }
+}
+
+fn protected_v6_inbound_policy_parameters(direction: XfrmDirection) -> PolicyParameters {
+    PolicyParameters {
+        selector: marked_inner_selector_v6(),
+        direction,
+        action: XfrmAction::Allow,
+        priority: 90,
+        templates: vec![XfrmTemplate {
+            id: XfrmId {
+                destination: xfrm_ip(EPDG_SWU_IP),
+                spi: 0,
+                protocol: IPPROTO_ESP,
+            },
+            source_address: xfrm_ip(UE_SWU_IP),
+            request_id: Some(xfrm_session_request_id()),
+            mode: XfrmMode::Tunnel,
+        }],
+        mark: None,
+        if_id: None,
+    }
+}
+
+fn protected_v6_downlink_policy_parameters(mark: Option<XfrmLookupMark>) -> PolicyParameters {
+    PolicyParameters {
+        selector: downlink_selector_v6(),
+        direction: XfrmDirection::Out,
+        action: XfrmAction::Allow,
+        priority: 90,
+        templates: vec![XfrmTemplate {
+            id: XfrmId {
+                destination: xfrm_ip(UE_SWU_IP),
+                spi: OUTBOUND_SPI_V6_A,
+                protocol: IPPROTO_ESP,
+            },
+            source_address: xfrm_ip(EPDG_SWU_IP),
+            request_id: Some(xfrm_session_request_id()),
+            mode: XfrmMode::Tunnel,
+        }],
+        mark,
         if_id: None,
     }
 }
@@ -1319,6 +1434,84 @@ async fn install_real_marked_outbound_xfrm_for_ue_application(
                 })
                 .await
                 .expect("install UE inbound dedicated downlink policy");
+        });
+    });
+    Ok(())
+}
+
+/// Install a distinct IPv6-inner Child SA pair over the disposable IPv4 SWu
+/// tunnel endpoints. Distinct SPIs and keys keep this proof independent from
+/// the IPv4 application path while the same bearer mark selects the v6 member
+/// of the exact session group.
+async fn install_real_marked_ipv6_xfrm(
+    ue_namespace: &str,
+) -> Result<(), opc_ipsec_xfrm::XfrmError> {
+    let backend = LinuxXfrmBackend::new();
+    let dedicated_mark = XfrmLookupMark::full(MARK_A);
+    backend
+        .install_sa(InstallSaRequest {
+            parameters: protected_v6_inbound_sa_parameters(Some(XfrmMark {
+                value: MARK_A,
+                mask: u32::MAX,
+            })),
+        })
+        .await?;
+    for direction in [XfrmDirection::In, XfrmDirection::Forward] {
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: protected_v6_inbound_policy_parameters(direction),
+            })
+            .await?;
+    }
+    backend
+        .install_sa(InstallSaRequest {
+            parameters: protected_v6_downlink_sa_parameters(Some(dedicated_mark)),
+        })
+        .await?;
+    backend
+        .install_policy(InstallPolicyRequest {
+            parameters: protected_v6_downlink_policy_parameters(Some(dedicated_mark)),
+        })
+        .await?;
+
+    let ue_namespace = ue_namespace.to_owned();
+    in_netns(&ue_namespace, move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build UE IPv6 XFRM runtime");
+        runtime.block_on(async {
+            let peer_backend = LinuxXfrmBackend::new();
+            peer_backend
+                .install_sa(InstallSaRequest {
+                    parameters: protected_v6_inbound_sa_parameters(None),
+                })
+                .await
+                .expect("install UE IPv6 outbound SA");
+            peer_backend
+                .install_policy(InstallPolicyRequest {
+                    parameters: PolicyParameters {
+                        direction: XfrmDirection::Out,
+                        ..protected_v6_inbound_policy_parameters(XfrmDirection::Out)
+                    },
+                })
+                .await
+                .expect("install UE IPv6 outbound policy");
+            peer_backend
+                .install_sa(InstallSaRequest {
+                    parameters: protected_v6_downlink_sa_parameters(None),
+                })
+                .await
+                .expect("install UE IPv6 inbound SA");
+            peer_backend
+                .install_policy(InstallPolicyRequest {
+                    parameters: PolicyParameters {
+                        direction: XfrmDirection::In,
+                        ..protected_v6_downlink_policy_parameters(None)
+                    },
+                })
+                .await
+                .expect("install UE IPv6 inbound policy");
         });
     });
     Ok(())
@@ -1653,6 +1846,117 @@ fn receive_gtpu_icmp_echo_reply(
     icmp[ICMP_HEADER_LEN..]
         .try_into()
         .expect("fixed authenticated challenge payload extent")
+}
+
+fn icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, message: &[u8]) -> u16 {
+    let message_len = u32::try_from(message.len()).expect("bounded ICMPv6 message");
+    let mut checksum_input = Vec::with_capacity(40 + message.len());
+    checksum_input.extend_from_slice(&src.octets());
+    checksum_input.extend_from_slice(&dst.octets());
+    checksum_input.extend_from_slice(&message_len.to_be_bytes());
+    checksum_input.extend_from_slice(&[0; 3]);
+    checksum_input.push(IPPROTO_ICMPV6);
+    checksum_input.extend_from_slice(message);
+    internet_checksum(&checksum_input)
+}
+
+/// Build one exact ICMPv6 Echo packet with a materialized pseudo-header
+/// checksum. The production proof writer accepts no extension headers or
+/// trailers for this fixed challenge profile.
+fn build_inner_icmpv6_echo(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    icmp_type: u8,
+    identifier: u16,
+    sequence: u16,
+    payload: &[u8; 32],
+) -> Vec<u8> {
+    const IPV6_HEADER_LEN: usize = 40;
+    const ICMP_HEADER_LEN: usize = 8;
+    let icmp_len = ICMP_HEADER_LEN + payload.len();
+    let mut packet = vec![0_u8; IPV6_HEADER_LEN + icmp_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(
+        &u16::try_from(icmp_len)
+            .expect("bounded ICMPv6 challenge")
+            .to_be_bytes(),
+    );
+    packet[6] = IPPROTO_ICMPV6;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&src.octets());
+    packet[24..40].copy_from_slice(&dst.octets());
+
+    let icmp = IPV6_HEADER_LEN;
+    packet[icmp] = icmp_type;
+    packet[icmp + 4..icmp + 6].copy_from_slice(&identifier.to_be_bytes());
+    packet[icmp + 6..icmp + 8].copy_from_slice(&sequence.to_be_bytes());
+    packet[icmp + ICMP_HEADER_LEN..].copy_from_slice(payload);
+    let checksum = icmpv6_checksum(src, dst, &packet[icmp..]);
+    packet[icmp + 2..icmp + 4].copy_from_slice(&checksum.to_be_bytes());
+    assert_eq!(
+        icmpv6_checksum(src, dst, &packet[icmp..]),
+        0,
+        "synthetic ICMPv6 checksum must validate independently"
+    );
+    packet
+}
+
+/// Receive and strictly validate one outer-IPv6 GTP-U-carried ICMPv6 Echo
+/// Reply from the disposable protected UE path.
+fn receive_gtpu_icmpv6_echo_reply(
+    socket: &UdpSocket,
+    expected_teid: u32,
+    expected_identifier: u16,
+    expected_sequence: u16,
+) -> [u8; 32] {
+    const IPV6_HEADER_LEN: usize = 40;
+    const ICMP_HEADER_LEN: usize = 8;
+    const PAYLOAD_LEN: usize = 32;
+    let expected_icmp_len = ICMP_HEADER_LEN + PAYLOAD_LEN;
+    let expected_inner_len = IPV6_HEADER_LEN + expected_icmp_len;
+    let mut buffer = [0_u8; 2048];
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set ICMPv6 reply receive timeout");
+    let (length, source) = socket
+        .recv_from(&mut buffer)
+        .expect("authenticated ICMPv6 Echo Reply must traverse GTP-U uplink");
+    assert_eq!(source, SocketAddr::from((EPDG_S2BU_IPV6, GTPU_PORT)));
+    assert_eq!(length, GTPU_MANDATORY_HDR_LEN + expected_inner_len);
+    assert_eq!(&buffer[..2], &[0x30, 0xff], "reply must be a plain G-PDU");
+    assert_eq!(
+        u16::from_be_bytes([buffer[2], buffer[3]]) as usize,
+        expected_inner_len,
+        "GTP-U length must cover exactly the ICMPv6 Echo Reply"
+    );
+    assert_eq!(
+        u32::from_be_bytes(buffer[4..8].try_into().expect("GTP-U TEID extent")),
+        expected_teid
+    );
+
+    let inner = &buffer[GTPU_MANDATORY_HDR_LEN..length];
+    assert_eq!(inner[0] >> 4, 6, "reply must be IPv6");
+    assert_eq!(
+        usize::from(u16::from_be_bytes([inner[4], inner[5]])),
+        expected_icmp_len
+    );
+    assert_eq!(inner[6], IPPROTO_ICMPV6);
+    assert_eq!(&inner[8..24], &UE_PAA_IPV6.octets());
+    assert_eq!(&inner[24..40], &REMOTE_HOST_IPV6.octets());
+
+    let icmp = &inner[IPV6_HEADER_LEN..];
+    assert_eq!(icmp[0], ICMPV6_ECHO_REPLY);
+    assert_eq!(icmp[1], 0, "ICMPv6 Echo Reply code must be zero");
+    assert_eq!(u16::from_be_bytes([icmp[4], icmp[5]]), expected_identifier);
+    assert_eq!(u16::from_be_bytes([icmp[6], icmp[7]]), expected_sequence);
+    assert_eq!(
+        icmpv6_checksum(UE_PAA_IPV6, REMOTE_HOST_IPV6, icmp),
+        0,
+        "received ICMPv6 pseudo-header checksum must validate"
+    );
+    icmp[ICMP_HEADER_LEN..]
+        .try_into()
+        .expect("fixed authenticated IPv6 challenge payload extent")
 }
 
 /// Build an inner IPv6/UDP packet with the mandatory UDP checksum
@@ -7203,6 +7507,8 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
         Teid::new(GROUP_PEER_TEID_V6_INITIAL).expect("nonzero grouped v6 peer TEID");
     grouped_v6.ms_address = IpAddr::V6(UE_PAA_IPV6);
     grouped_v6.peer_address = IpAddr::V6(PGW_IPV6);
+    grouped_v6.bearer_mark =
+        Some(GtpBearerMark::new(MARK_A).expect("nonzero IPv6 XFRM bearer mark"));
     let desired = GtpuSessionGroup::new(
         grouped_group_id(),
         grouped_device_id(),
@@ -7237,8 +7543,12 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
     // netns and its uniquely named UE peer netns; TestNet's RAII teardown
     // destroys both namespaces and every remaining XFRM object with them.
     run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
     let pgw = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind proof PGW socket")
+    });
+    let pgw_v6 = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IPV6, GTPU_PORT)).expect("bind proof IPv6 PGW socket")
     });
     let untrusted_pgw = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_ALT_IP, GTPU_PORT)).expect("bind untrusted proof PGW socket")
@@ -7250,6 +7560,7 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
     let _ue_nat_t_socket = in_netns(&net.ue_ns, || nat_t_socket(UE_SWU_IP));
     install_real_marked_inbound_xfrm(&net.ue_ns).await?;
     install_real_marked_outbound_xfrm_for_ue_application(&net.ue_ns).await?;
+    install_real_marked_ipv6_xfrm(&net.ue_ns).await?;
     let outbound_capture = packet_capture_socket(&net.ue_ns);
     let policy = TrafficContinuityPolicy::new(
         2,
@@ -7477,6 +7788,118 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
         "the final proof must validate against the exact current authority"
     );
     backend.close_gtpu_traffic_proof(session).await?;
+
+    // Prove the same authenticated challenge contract for IPv6 inner traffic
+    // over a distinct real Child SA pair and outer-IPv6 GTP-U. A fresh proof
+    // attempt prevents the preceding IPv4 samples from satisfying this gate.
+    let mut ipv6_session = backend
+        .begin_gtpu_traffic_proof(authority_store.lease().await)
+        .await?;
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut ipv6_session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+    let first_ipv6_sample = (u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 0x101;
+    let second_ipv6_sample = (u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 0x102;
+    let first_ipv6_challenge = ipv6_session
+        .challenge(first_ipv6_sample)
+        .expect("nonzero first IPv6 challenge sample");
+    let second_ipv6_challenge = ipv6_session
+        .challenge(second_ipv6_sample)
+        .expect("nonzero second IPv6 challenge sample");
+
+    let forged_ipv6_reflection = build_inner_icmpv6_echo(
+        UE_PAA_IPV6,
+        REMOTE_HOST_IPV6,
+        ICMPV6_ECHO_REPLY,
+        first_ipv6_challenge.identifier(),
+        first_ipv6_challenge.sequence(),
+        first_ipv6_challenge.payload(),
+    );
+    send_raw_ipv6_packet(&net.ue_ns, &forged_ipv6_reflection);
+    let reflected_ipv6_payload = receive_gtpu_icmpv6_echo_reply(
+        &pgw_v6,
+        GROUP_PEER_TEID_V6_INITIAL,
+        first_ipv6_challenge.identifier(),
+        first_ipv6_challenge.sequence(),
+    );
+    assert_eq!(
+        reflected_ipv6_payload,
+        *first_ipv6_challenge.payload(),
+        "protected IPv6 reflection must retain the public request tag"
+    );
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut ipv6_session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+
+    let first_ipv6_request = build_inner_icmpv6_echo(
+        REMOTE_HOST_IPV6,
+        UE_PAA_IPV6,
+        ICMPV6_ECHO_REQUEST,
+        first_ipv6_challenge.identifier(),
+        first_ipv6_challenge.sequence(),
+        first_ipv6_challenge.payload(),
+    );
+    pgw_v6.send_to(
+        &build_gpdu(GROUP_LOCAL_TEID_V6_INITIAL, None, &first_ipv6_request),
+        (EPDG_S2BU_IPV6, GTPU_PORT),
+    )?;
+    let first_ipv6_response = receive_gtpu_icmpv6_echo_reply(
+        &pgw_v6,
+        GROUP_PEER_TEID_V6_INITIAL,
+        first_ipv6_challenge.identifier(),
+        first_ipv6_challenge.sequence(),
+    );
+    assert_ne!(
+        first_ipv6_response,
+        *first_ipv6_challenge.payload(),
+        "trusted IPv6 downlink must install the private return tag before XFRM"
+    );
+
+    std::thread::sleep(policy.minimum_window_per_direction());
+    let second_ipv6_request = build_inner_icmpv6_echo(
+        REMOTE_HOST_IPV6,
+        UE_PAA_IPV6,
+        ICMPV6_ECHO_REQUEST,
+        second_ipv6_challenge.identifier(),
+        second_ipv6_challenge.sequence(),
+        second_ipv6_challenge.payload(),
+    );
+    pgw_v6.send_to(
+        &build_gpdu(GROUP_LOCAL_TEID_V6_INITIAL, None, &second_ipv6_request),
+        (EPDG_S2BU_IPV6, GTPU_PORT),
+    )?;
+    let second_ipv6_response = receive_gtpu_icmpv6_echo_reply(
+        &pgw_v6,
+        GROUP_PEER_TEID_V6_INITIAL,
+        second_ipv6_challenge.identifier(),
+        second_ipv6_challenge.sequence(),
+    );
+    assert_ne!(
+        second_ipv6_response,
+        *second_ipv6_challenge.payload(),
+        "each IPv6 request must use its private return domain"
+    );
+    let ipv6_proof = match backend.poll_gtpu_traffic_proof(&mut ipv6_session).await? {
+        GtpuTrafficProofPoll::Proven(proof) => proof,
+        GtpuTrafficProofPoll::Pending | GtpuTrafficProofPoll::Invalidated(_) | _ => {
+            panic!("protected IPv6 continuity proof did not complete")
+        }
+    };
+    let ipv6_summary = ipv6_proof.summary();
+    assert!(ipv6_summary.access_to_core_samples() >= policy.minimum_samples_per_direction());
+    assert!(ipv6_summary.core_to_access_samples() >= policy.minimum_samples_per_direction());
+    let ipv6_validation_lease = authority_store.lease().await;
+    assert_eq!(
+        backend
+            .validate_gtpu_traffic_proof(&ipv6_proof, &ipv6_validation_lease)
+            .await?,
+        GtpuTrafficProofValidation::Current,
+        "the IPv6 proof must validate against the exact current authority"
+    );
+    backend.close_gtpu_traffic_proof(ipv6_session).await?;
+    println!("OPC_GTPU_TRAFFIC_CONTINUITY_IPV6_PROOF_PROVEN");
 
     // Remove only the fresh-netns SA and policy created for this test. A new
     // attempt cannot reuse a pre-removal proof path: the peer can still emit

@@ -737,27 +737,27 @@ fn observation_challenge_sample(
     match (direction, version, protocol, icmp[0]) {
         (GtpuTrafficObservationDirection::CoreToAccess, 4, IPPROTO_ICMP, 8)
         | (GtpuTrafficObservationDirection::CoreToAccess, 6, IPPROTO_ICMPV6, 128) => {
-            let sample_id =
-                GtpuTrafficObservationRegistration::encoded_icmp_echo_request_sample_if_valid(
-                    raw_registration,
-                    identifier,
-                    sequence,
-                    &payload,
-                )?;
             let response = GtpuTrafficObservationRegistration::encoded_icmp_echo_response_payload_if_request_valid(
                 raw_registration,
                 identifier,
                 sequence,
                 &payload,
             )?;
-            let rewrite = ObservationIcmpEchoRewrite {
+            // Response derivation already authenticates the public request
+            // and rejects sample zero. Deriving the identifier/sequence value
+            // here avoids a second SipHash pass on the verifier-constrained
+            // packet path.
+            let sample_id = (u32::from(identifier) << 16) | u32::from(sequence);
+            let mut rewrite = ObservationIcmpEchoRewrite {
                 version,
                 ip_offset: inner_offset,
                 icmp_offset: l4_offset,
                 icmp_length: transport_len,
                 request: &payload,
                 response: &response,
+                checksum_bytes: [0; 2],
             };
+            rewrite.checksum_bytes = observation_icmp_checksum_for_payload(ctx, &rewrite)?;
             if rewrite_observation_icmp_echo_request(ctx, &rewrite) {
                 Some(sample_id)
             } else {
@@ -787,6 +787,7 @@ struct ObservationIcmpEchoRewrite<'a> {
     icmp_length: usize,
     request: &'a [u8; GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN],
     response: &'a [u8; GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN],
+    checksum_bytes: [u8; 2],
 }
 
 /// Replace one validated public request payload with its private response
@@ -799,9 +800,6 @@ fn rewrite_observation_icmp_echo_request(
     ctx: &TcContext,
     rewrite: &ObservationIcmpEchoRewrite<'_>,
 ) -> bool {
-    let Some(checksum) = observation_icmp_checksum_for_payload(ctx, rewrite) else {
-        return false;
-    };
     let checksum_offset = match rewrite.icmp_offset.checked_add(2) {
         Some(offset) => offset,
         None => return false,
@@ -815,7 +813,7 @@ fn rewrite_observation_icmp_echo_request(
     };
     if ctx.store(payload_offset, rewrite.response, 0).is_err()
         || ctx
-            .store(checksum_offset, &checksum.to_be_bytes(), 0)
+            .store(checksum_offset, &rewrite.checksum_bytes, 0)
             .is_err()
     {
         let _ = ctx.store(payload_offset, rewrite.request, 0);
@@ -851,7 +849,7 @@ fn rewrite_observation_icmp_echo_request(
 fn observation_icmp_checksum_for_payload(
     ctx: &TcContext,
     rewrite: &ObservationIcmpEchoRewrite<'_>,
-) -> Option<u16> {
+) -> Option<[u8; 2]> {
     let mut message = ctx.load::<[u8; 40]>(rewrite.icmp_offset).ok()?;
     message[2] = 0;
     message[3] = 0;
@@ -875,16 +873,29 @@ fn observation_icmp_checksum_for_payload(
     if sum < 0 {
         return None;
     }
-    let sum = sum as u32;
+    Some(observation_icmp_checksum_bytes_from_helper_sum(
+        sum as u32,
+        rewrite.version,
+    ))
+}
+
+/// Fold a native `__wsum` returned by `bpf_csum_diff` into wire bytes.
+///
+/// Kernel checksum helpers return native checksum scalars. `__sum16` must
+/// therefore be stored in native byte order: on bpfel, an additional
+/// big-endian conversion reverses the two bytes on the packet wire.
+#[inline(always)]
+fn observation_icmp_checksum_bytes_from_helper_sum(sum: u32, version: u8) -> [u8; 2] {
     let first = (sum & 0xffff).wrapping_add(sum >> 16);
     let second = (first & 0xffff).wrapping_add(first >> 16);
     let checksum = !(second as u16);
     // ICMPv6 has no checksum-omission representation.
-    Some(if rewrite.version == 6 && checksum == 0 {
+    let checksum = if version == 6 && checksum == 0 {
         u16::MAX
     } else {
         checksum
-    })
+    };
+    checksum.to_ne_bytes()
 }
 
 /// Emit only an exact-current local forwarding-boundary observation. Every
@@ -939,6 +950,26 @@ fn try_emit_grouped_observation(
     else {
         return;
     };
+    publish_grouped_observation_event(
+        authority,
+        raw_registration,
+        publication_id,
+        sample_id,
+        direction,
+    );
+}
+
+/// Publish one already authenticated sample. Keeping ring-record construction
+/// out of the packet parser prevents its event frame from being live while the
+/// verifier evaluates the bounded ICMP challenge and rewrite call chain.
+#[inline(never)]
+fn publish_grouped_observation_event(
+    authority: &[u8; GTPU_SESSION_GROUP_VALUE_LEN],
+    raw_registration: &[u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+    publication_id: u32,
+    sample_id: u32,
+    direction: GtpuTrafficObservationDirection,
+) {
     // SAFETY: this helper returns the kernel's monotonic boot-time clock.
     let boot_time_ns = unsafe { bpf_ktime_get_boot_ns() };
     let Some(producer_sequence) = next_observation_sequence() else {
@@ -5026,8 +5057,15 @@ mod tests {
             "transport_len != 8 + GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN"
         ));
         assert!(producer.contains("IPV6_TERMINAL_OBSERVATION, true"));
-        assert!(producer.contains("encoded_icmp_echo_request_sample_if_valid"));
+        assert!(producer.contains("encoded_icmp_echo_response_payload_if_request_valid"));
         assert!(producer.contains("rewrite_observation_icmp_echo_request"));
+        let checksum = producer
+            .find("observation_icmp_checksum_for_payload(ctx, &rewrite)")
+            .expect("checksum is completed before packet mutation");
+        let rewrite = producer
+            .find("rewrite_observation_icmp_echo_request(ctx, &rewrite)")
+            .expect("authenticated request is rewritten");
+        assert!(checksum < rewrite);
         let (_, walker) = source
             .split_once("fn ipv6_l4_offset(")
             .expect("shared IPv6 walker is present");
@@ -5042,11 +5080,15 @@ mod tests {
         let (_, writer) = source
             .split_once("fn try_emit_grouped_observation(")
             .expect("event writer is present");
-        let (writer, _) = writer
-            .split_once("/// Emit an uplink observation")
-            .expect("event writer terminator is present");
+        let (writer, publisher) = writer
+            .split_once("fn publish_grouped_observation_event(")
+            .expect("sample parser and ring publisher are separate frames");
         assert!(writer.contains("observation_challenge_sample"));
-        assert!(writer.contains("write_current_event"));
+        assert!(writer.contains("publish_grouped_observation_event("));
+        let (publisher, _) = publisher
+            .split_once("/// Emit an uplink observation")
+            .expect("ring publisher terminator is present");
+        assert!(publisher.contains("write_current_event"));
     }
 
     #[test]
@@ -5436,6 +5478,14 @@ mod tests {
         // without an additional big-endian conversion.
         let helper_sum = 0xac68;
         assert_eq!(finalized_internet_checksum_bytes(helper_sum), [0x97, 0x53]);
+        assert_eq!(
+            observation_icmp_checksum_bytes_from_helper_sum(helper_sum, 4),
+            [0x97, 0x53]
+        );
+        assert_eq!(
+            observation_icmp_checksum_bytes_from_helper_sum(helper_sum, 6),
+            [0x97, 0x53]
+        );
     }
 
     #[test]
