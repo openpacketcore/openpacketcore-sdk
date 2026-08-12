@@ -757,8 +757,19 @@ impl ConsensusSessionStore {
     /// must be recreated with a successor scope after a completed topology
     /// transition; this accessor never weakens the exact-scope check at the
     /// consumer service boundary.
-    pub fn consumer_scope(&self) -> Result<SessionConsumerScope, StoreError> {
-        self.require_exact_membership_admission()?;
+    pub async fn consumer_scope(&self) -> Result<SessionConsumerScope, StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.consumer_scope_before(deadline).await
+    }
+
+    async fn consumer_scope_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<SessionConsumerScope, StoreError> {
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
         self.current_scope()
             .map(|(identity, _)| SessionConsumerScope::new(identity))
     }
@@ -772,7 +783,7 @@ impl ConsensusSessionStore {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
-        let scope = self.consumer_scope()?;
+        let scope = self.consumer_scope_before(deadline).await?;
         let admission = self
             .admit_consumer_scope(scope, deadline)
             .await
@@ -795,9 +806,10 @@ impl ConsensusSessionStore {
         Ok(SessionConsumerAuthorizationManifest::new(scope, members))
     }
 
-    fn consumer_scope_is_current(
+    async fn consumer_scope_is_current(
         &self,
         scope: SessionConsumerScope,
+        deadline: tokio::time::Instant,
     ) -> Result<(), SessionConsumerRejection> {
         let (current_scope, _) = self
             .current_scope()
@@ -805,7 +817,8 @@ impl ConsensusSessionStore {
         if current_scope != scope.consensus_identity() {
             return Err(SessionConsumerRejection::ScopeMismatch);
         }
-        self.require_exact_membership_admission()
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await
             .map_err(|_| SessionConsumerRejection::Unavailable)
     }
 
@@ -818,10 +831,7 @@ impl ConsensusSessionStore {
         let operation_guard = tokio::time::timeout_at(deadline, operation_gate.read_owned())
             .await
             .map_err(|_| SessionConsumerRejection::Unavailable)?;
-        self.consumer_scope_is_current(scope)?;
-        self.require_durable_fixed_quorum_admission_before(deadline)
-            .await
-            .map_err(|_| SessionConsumerRejection::Unavailable)?;
+        self.consumer_scope_is_current(scope, deadline).await?;
         Ok(ConsumerScopeAdmission {
             required_scope: scope.consensus_identity(),
             _operation_guard: operation_guard,
@@ -1125,6 +1135,21 @@ impl ConsensusSessionStore {
         }
     }
 
+    async fn durable_fixed_quorum_engine_admission_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum
+            || !self.inner.admitted.load(Ordering::Acquire)
+        {
+            return true;
+        }
+        matches!(
+            tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_is_exact()).await,
+            Ok(Ok(true))
+        )
+    }
+
     /// Fresh readiness proof using the same Openraft quorum/read-index path as
     /// authoritative operations.
     ///
@@ -1247,18 +1272,14 @@ impl ConsensusSessionStore {
         placement_resilience: PlacementResilienceReport,
         durable_readiness: DurableReadinessReport,
     ) -> FixedQuorumReadinessReport {
-        let traffic_authority = if !self.fixed_durable_quorum_scope_is_exact() {
-            FixedQuorumTrafficAuthority::StructuralRecoveryRequired
-        } else {
-            match durable_readiness.state() {
-                DurableReadinessState::Ready => FixedQuorumTrafficAuthority::Granted,
-                DurableReadinessState::RecoveryRequired => {
-                    FixedQuorumTrafficAuthority::RecoveryRequired
-                }
-                DurableReadinessState::NoQuorum => FixedQuorumTrafficAuthority::NoQuorum,
-                DurableReadinessState::TopologyInvalid => {
-                    FixedQuorumTrafficAuthority::StructuralRecoveryRequired
-                }
+        let traffic_authority = match durable_readiness.state() {
+            DurableReadinessState::Ready => FixedQuorumTrafficAuthority::Granted,
+            DurableReadinessState::RecoveryRequired => {
+                FixedQuorumTrafficAuthority::RecoveryRequired
+            }
+            DurableReadinessState::NoQuorum => FixedQuorumTrafficAuthority::NoQuorum,
+            DurableReadinessState::TopologyInvalid => {
+                FixedQuorumTrafficAuthority::StructuralRecoveryRequired
             }
         };
         FixedQuorumReadinessReport::new(traffic_authority, placement_resilience, durable_readiness)
@@ -1295,24 +1316,30 @@ impl ConsensusSessionStore {
         if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum {
             return Ok(false);
         }
-        let (scope, applied_membership) = self
+        let (authority_profile, scope, applied_membership) = self
             .inner
             .backend
-            .consensus_membership_scope_snapshot(self.inner.storage_identity)
+            .fixed_quorum_scope_snapshot(self.inner.storage_identity)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
-        Ok(scope.current_identity == self.inner.storage_identity
-            && scope.current_members == self.inner.bootstrap_members
-            && scope.current_bindings == self.inner.bootstrap_bindings
-            && scope.application_authority_epoch
-                == self.inner.storage_identity.configuration_epoch()
-            && scope.application_authority_members == self.inner.bootstrap_members
-            && scope.pending.is_none()
-            && scope.predecessor.is_none()
-            && scope.history.is_empty()
-            && scope.terminal_history.is_empty()
-            && scope.terminal.is_none()
-            && exact_uniform_voter_membership(&applied_membership, &self.inner.bootstrap_members))
+        Ok(
+            authority_profile == storage::ConsensusAuthorityProfile::FixedImmutable
+                && scope.current_identity == self.inner.storage_identity
+                && scope.current_members == self.inner.bootstrap_members
+                && scope.current_bindings == self.inner.bootstrap_bindings
+                && scope.application_authority_epoch
+                    == self.inner.storage_identity.configuration_epoch()
+                && scope.application_authority_members == self.inner.bootstrap_members
+                && scope.pending.is_none()
+                && scope.predecessor.is_none()
+                && scope.history.is_empty()
+                && scope.terminal_history.is_empty()
+                && scope.terminal.is_none()
+                && exact_uniform_voter_membership(
+                    &applied_membership,
+                    &self.inner.bootstrap_members,
+                ),
+        )
     }
 
     async fn durable_fixed_quorum_scope_record_is_exact(
@@ -1321,23 +1348,26 @@ impl ConsensusSessionStore {
         if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum {
             return Ok(false);
         }
-        let (scope, _) = self
+        let (authority_profile, scope, _) = self
             .inner
             .backend
-            .consensus_membership_scope_snapshot(self.inner.storage_identity)
+            .fixed_quorum_scope_snapshot(self.inner.storage_identity)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
-        Ok(scope.current_identity == self.inner.storage_identity
-            && scope.current_members == self.inner.bootstrap_members
-            && scope.current_bindings == self.inner.bootstrap_bindings
-            && scope.application_authority_epoch
-                == self.inner.storage_identity.configuration_epoch()
-            && scope.application_authority_members == self.inner.bootstrap_members
-            && scope.pending.is_none()
-            && scope.predecessor.is_none()
-            && scope.history.is_empty()
-            && scope.terminal_history.is_empty()
-            && scope.terminal.is_none())
+        Ok(
+            authority_profile == storage::ConsensusAuthorityProfile::FixedImmutable
+                && scope.current_identity == self.inner.storage_identity
+                && scope.current_members == self.inner.bootstrap_members
+                && scope.current_bindings == self.inner.bootstrap_bindings
+                && scope.application_authority_epoch
+                    == self.inner.storage_identity.configuration_epoch()
+                && scope.application_authority_members == self.inner.bootstrap_members
+                && scope.pending.is_none()
+                && scope.predecessor.is_none()
+                && scope.history.is_empty()
+                && scope.terminal_history.is_empty()
+                && scope.terminal.is_none(),
+        )
     }
 
     fn fixed_durable_quorum_scope_is_exact(&self) -> bool {
@@ -2343,7 +2373,11 @@ impl ConsensusSessionStore {
         fence_high_water: u64,
         credential_high_water: u64,
     ) -> Result<(), OperatorRecoveryCommitError> {
-        self.require_exact_membership_admission()
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or(OperatorRecoveryCommitError::Unavailable)?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await
             .map_err(|_| OperatorRecoveryCommitError::Unavailable)?;
         if recovery_epoch == 0 {
             return Err(OperatorRecoveryCommitError::Rejected);
@@ -2352,9 +2386,6 @@ impl ConsensusSessionStore {
         if metrics.borrow().current_leader != Some(self.inner.local_node_id) {
             return Err(OperatorRecoveryCommitError::NotLocalLeader);
         }
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.inner.operation_timeout)
-            .ok_or(OperatorRecoveryCommitError::Unavailable)?;
         let reply = self
             .apply_on_local_leader_inner(
                 ForwardMutationRequest {
@@ -2396,13 +2427,17 @@ impl ConsensusSessionStore {
         recovery_epoch: u64,
         plan_digest: [u8; 32],
     ) -> bool {
-        if self.require_exact_membership_admission().is_err() {
-            return false;
-        }
         let deadline = match tokio::time::Instant::now().checked_add(self.inner.operation_timeout) {
             Some(deadline) => deadline,
             None => return false,
         };
+        if self
+            .require_durable_fixed_quorum_admission_before(deadline)
+            .await
+            .is_err()
+        {
+            return false;
+        }
         if !matches!(
             self.inner
                 .linearizability
@@ -2412,19 +2447,23 @@ impl ConsensusSessionStore {
         ) {
             return false;
         }
-        self.exact_membership_is_admitted()
-            && tokio::time::timeout_at(
-                deadline,
-                self.inner.backend.consensus_operator_recovery_committed(
-                    self.inner.storage_identity,
-                    recovery_epoch,
-                    plan_digest,
-                ),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(false)
+        let committed = tokio::time::timeout_at(
+            deadline,
+            self.inner.backend.consensus_operator_recovery_committed(
+                self.inner.storage_identity,
+                recovery_epoch,
+                plan_digest,
+            ),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false);
+        committed
+            && self
+                .require_durable_fixed_quorum_admission_before(deadline)
+                .await
+                .is_ok()
     }
 
     async fn wait_for_known_leader(
@@ -2508,7 +2547,11 @@ impl ConsensusSessionStore {
     }
 
     async fn local_read_barrier(&self, deadline: tokio::time::Instant) -> ReadBarrierReply {
-        if self.require_exact_membership_admission().is_err() {
+        if self
+            .require_durable_fixed_quorum_admission_before(deadline)
+            .await
+            .is_err()
+        {
             return ReadBarrierReply::Unavailable;
         }
         let recovery_pending = tokio::time::timeout_at(
@@ -2525,10 +2568,18 @@ impl ConsensusSessionStore {
             return ReadBarrierReply::Unavailable;
         }
         match self.inner.read_barrier.admit(deadline).await {
-            Ok(admit) if self.exact_membership_is_admitted() => {
-                ReadBarrierReply::Ready(admit.read_log_id())
+            Ok(admit) => {
+                if self
+                    .require_durable_fixed_quorum_admission_before(deadline)
+                    .await
+                    .is_ok()
+                {
+                    ReadBarrierReply::Ready(admit.read_log_id())
+                } else {
+                    ReadBarrierReply::Unavailable
+                }
             }
-            Ok(_) | Err(LinearizableReadBarrierError::Unavailable) => ReadBarrierReply::Unavailable,
+            Err(LinearizableReadBarrierError::Unavailable) => ReadBarrierReply::Unavailable,
             Err(LinearizableReadBarrierError::NotLeader { leader }) => {
                 ReadBarrierReply::NotLeader { leader }
             }
@@ -2540,7 +2591,8 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<Option<LogId<SessionConsensusNodeId>>, StoreError> {
-        self.require_exact_membership_admission()?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
         let mut preferred = None;
         loop {
             let leader = match preferred.take() {
@@ -2575,7 +2627,8 @@ impl ConsensusSessionStore {
                             .await
                             .map_err(|_| consensus_unavailable())?;
                     }
-                    self.require_exact_membership_admission()?;
+                    self.require_durable_fixed_quorum_admission_before(deadline)
+                        .await?;
                     return Ok(log_id);
                 }
                 ReadBarrierReply::NotLeader {
@@ -2672,7 +2725,14 @@ impl ConsensusSessionStore {
                 SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
                 _ => consensus_unavailable(),
             })?;
-        self.inner.backend.consensus_get_at(key, logical_time).await
+        let record = self
+            .inner
+            .backend
+            .consensus_get_at(key, logical_time)
+            .await?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
+        Ok(record)
     }
 
     async fn consumer_scan_restore_records(
@@ -2695,10 +2755,14 @@ impl ConsensusSessionStore {
                 SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
                 _ => consensus_unavailable(),
             })?;
-        self.inner
+        let page = self
+            .inner
             .backend
             .consensus_scan_restore_records_at(request, logical_time, deadline)
-            .await
+            .await?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
+        Ok(page)
     }
 
     async fn consumer_watch(
@@ -3081,6 +3145,18 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
             SessionConsensusRpcFamily::Vote
             | SessionConsensusRpcFamily::AppendEntries
             | SessionConsensusRpcFamily::InstallSnapshot => {
+                let deadline = tokio::time::Instant::now()
+                    .checked_add(self.store.inner.operation_timeout)
+                    .unwrap_or_else(tokio::time::Instant::now);
+                if !self
+                    .store
+                    .durable_fixed_quorum_engine_admission_before(deadline)
+                    .await
+                {
+                    return SessionConsensusWireResponse {
+                        result: Err(SessionConsensusPeerError::ScopeMismatch),
+                    };
+                }
                 self.store
                     .inner
                     .raft_handler
@@ -3780,8 +3856,18 @@ impl SessionBackend for ConsensusSessionStore {
     }
 
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
-        let logical_time = self.logical_read_time().await?;
-        self.inner.backend.consensus_get_at(key, logical_time).await
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        let logical_time = self.logical_read_time_before(None, deadline).await?;
+        let record = self
+            .inner
+            .backend
+            .consensus_get_at(key, logical_time)
+            .await?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
+        Ok(record)
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
@@ -3820,7 +3906,11 @@ impl SessionBackend for ConsensusSessionStore {
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
-        self.require_exact_membership_admission()?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
         let preflights = record_expiry_preflights(&ops)?;
         validate_consensus_batch(&ops)?;
         self.preflight_record_expiry(&preflights).await?;
@@ -3909,15 +3999,31 @@ impl SessionBackend for ConsensusSessionStore {
         &self,
         start_sequence: u64,
     ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await?;
         self.logical_read_time().await?;
         let stream = self.inner.backend.consensus_watch(start_sequence).await?;
         let store = self.clone();
-        Ok(stream
-            .map(move |entry| {
-                store.require_exact_membership_admission()?;
-                entry
-            })
-            .boxed())
+        Ok(futures_util::stream::unfold(
+            (stream, store, false),
+            |(mut stream, store, terminated)| async move {
+                if terminated {
+                    return None;
+                }
+                let entry = stream.next().await?;
+                let deadline =
+                    tokio::time::Instant::now().checked_add(store.inner.operation_timeout)?;
+                let admission = store
+                    .require_durable_fixed_quorum_admission_before(deadline)
+                    .await;
+                let terminated = admission.is_err();
+                Some((admission.and(entry), (stream, store, terminated)))
+            },
+        )
+        .boxed())
     }
 
     async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
@@ -4543,6 +4649,7 @@ mod membership_tests {
 
         let current = store
             .consumer_scope()
+            .await
             .expect("current admitted consumer scope")
             .consensus_identity();
         let stale_scope = SessionConsensusIdentity::new(
@@ -4587,7 +4694,10 @@ mod membership_tests {
             .await
             .expect("initialize singleton consumer service store");
 
-        let scope = store.consumer_scope().expect("current admitted scope");
+        let scope = store
+            .consumer_scope()
+            .await
+            .expect("current admitted scope");
         let key = SessionKey {
             tenant: TenantId::new("consumer-service").expect("tenant"),
             nf_kind: NetworkFunctionKind::smf(),

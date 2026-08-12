@@ -1664,7 +1664,6 @@ fn ensure_consensus_authority_profile_sync(
     }
 }
 
-#[cfg(test)]
 fn read_consensus_authority_profile_sync(
     conn: &Connection,
 ) -> Result<ConsensusAuthorityProfile, SessionConsensusStorageError> {
@@ -3383,6 +3382,28 @@ impl SqliteSessionBackend {
         let membership = read_membership_sync(&conn, storage_identity)
             .map_err(|_| MembershipScopeMutationError::CorruptState)?;
         Ok((scope, membership))
+    }
+
+    /// Atomically read fixed-quorum structural authority and applied Openraft
+    /// membership under the backend's single SQLite lock.
+    pub(crate) async fn fixed_quorum_scope_snapshot(
+        &self,
+        storage_identity: SessionConsensusIdentity,
+    ) -> Result<
+        (
+            ConsensusAuthorityProfile,
+            MembershipValidationScope,
+            StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+        ),
+        MembershipScopeMutationError,
+    > {
+        let conn = self.conn.lock().await;
+        let authority_profile = read_consensus_authority_profile_sync(&conn)
+            .map_err(|_| MembershipScopeMutationError::CorruptState)?;
+        let scope = read_scope_for_mutation(&conn, storage_identity)?;
+        let membership = read_membership_sync(&conn, storage_identity)
+            .map_err(|_| MembershipScopeMutationError::CorruptState)?;
+        Ok((authority_profile, scope, membership))
     }
 
     /// Atomically read the durable transition scope, exact evidence, and

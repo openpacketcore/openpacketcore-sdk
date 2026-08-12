@@ -8,22 +8,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use opc_session_store::{
     ConsensusSessionStore, ConsensusSessionStoreOpenError, FixedQuorumTrafficAuthority,
-    ObservedPhysicalNodeIdentity, PlacementResilienceDisposition, PlacementResiliencePolicy,
-    QuorumReplicaDescriptor, QuorumTopologyAttestor, QuorumTopologyConfig, QuorumTopologyError,
-    QuorumTopologyMode, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
-    ReplicaTlsIdentity, SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    ObservedPhysicalNodeIdentity, OwnerId, PlacementResilienceDisposition,
+    PlacementResiliencePolicy, QuorumReplicaDescriptor, QuorumTopologyAttestor,
+    QuorumTopologyConfig, QuorumTopologyError, QuorumTopologyMode, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionBackend,
+    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionTopologyAbortAdmissionProof, SessionTopologyCandidateRetirementProof,
-    SessionTopologyJointCommitAdmissionProof, SessionTopologyPrePrepareUnstageProof,
-    SessionTopologyTransitionError, SessionTopologyTransitionId, SessionTopologyTransitionRequest,
+    SessionKey, SessionKeyType, SessionLeaseManager, SessionTopologyAbortAdmissionProof,
+    SessionTopologyCandidateRetirementProof, SessionTopologyJointCommitAdmissionProof,
+    SessionTopologyPrePrepareUnstageProof, SessionTopologyTransitionError,
+    SessionTopologyTransitionId, SessionTopologyTransitionRequest,
     SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
     SessionTopologyUniformCommitAdmissionProof, SqliteSessionBackend, TopologyAttestationClaims,
     TopologyAttestationEvidence, TopologyAttestationPolicy, TopologyAttestationProvenance,
     TopologyAttestationTime, TopologyAttestationVerificationError,
     TopologyAttestationVerificationInput, TopologyCollectorId, ValidatedQuorumTopology,
 };
+use opc_types::{NetworkFunctionKind, TenantId};
 
 #[derive(Debug)]
 struct UnscopedPeer {
@@ -737,6 +741,108 @@ async fn persisted_fixed_binding_drift_revokes_consumer_and_traffic_authority() 
     assert_eq!(
         readiness.traffic_authority(),
         FixedQuorumTrafficAuthority::StructuralRecoveryRequired,
+    );
+}
+
+#[tokio::test]
+async fn running_fixed_scope_drift_revokes_linearizable_readiness_authority() {
+    let (_directory, database_paths, stores) =
+        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    for database_path in database_paths {
+        let connection =
+            rusqlite::Connection::open(database_path).expect("open fixed voter database");
+        connection
+            .execute(
+                "UPDATE consensus_membership_scope SET application_authority_epoch = application_authority_epoch + 1 WHERE singleton = 1",
+                [],
+            )
+            .expect("persist fixed structural scope drift");
+    }
+
+    let readiness = stores[0].probe_durable_readiness().await;
+    assert!(
+        !readiness.is_ready(),
+        "a linearizable read barrier must not report authority after durable fixed-scope drift"
+    );
+}
+
+#[tokio::test]
+async fn running_fixed_profile_drift_revokes_traffic_authority() {
+    let (_directory, database_paths, stores) =
+        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    for database_path in database_paths {
+        let connection =
+            rusqlite::Connection::open(database_path).expect("open fixed voter database");
+        connection
+            .execute(
+                "UPDATE consensus_identity SET authority_profile = 1 WHERE singleton = 1",
+                [],
+            )
+            .expect("persist fixed authority profile drift");
+    }
+
+    assert!(
+        stores[0].consumer_authorization_manifest().await.is_err(),
+        "consumer authority must fail closed after fixed-profile drift"
+    );
+    assert!(
+        SessionBackend::batch(&stores[0], Vec::new()).await.is_err(),
+        "mutation authority must fail closed after fixed-profile drift"
+    );
+    let readiness = stores[0]
+        .probe_fixed_durable_quorum_readiness_at(TopologyAttestationTime::from_unix_seconds(1))
+        .await;
+    assert_eq!(
+        readiness.traffic_authority(),
+        FixedQuorumTrafficAuthority::StructuralRecoveryRequired,
+    );
+}
+
+#[tokio::test]
+async fn running_fixed_scope_drift_terminates_an_already_open_generic_watch() {
+    let (_directory, database_paths, stores) =
+        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    let key = SessionKey {
+        tenant: TenantId::new("fixed-watch-drift").expect("test tenant"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: SessionKeyType::PduSession,
+        stable_id: b"fixed-watch-drift"
+            .as_slice()
+            .try_into()
+            .expect("bounded stable ID"),
+    };
+    stores[0]
+        .acquire(
+            &key,
+            OwnerId::new("fixed-watch-owner").expect("test owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("create watched consensus entry");
+    let mut watch = SessionBackend::watch(&stores[0], 0)
+        .await
+        .expect("open generic watch before drift");
+
+    let connection =
+        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
+    connection
+        .execute(
+            "UPDATE consensus_membership_scope SET application_authority_epoch = application_authority_epoch + 1 WHERE singleton = 1",
+            [],
+        )
+        .expect("persist fixed structural scope drift");
+
+    assert!(
+        watch
+            .next()
+            .await
+            .expect("watch must observe its queued entry")
+            .is_err(),
+        "an already-open fixed watch must not expose entries after durable scope drift"
+    );
+    assert!(
+        watch.next().await.is_none(),
+        "watch must terminate after revocation"
     );
 }
 
