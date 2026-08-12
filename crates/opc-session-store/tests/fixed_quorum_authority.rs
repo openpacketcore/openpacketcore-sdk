@@ -4,7 +4,10 @@ use opc_consensus::{
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,7 +20,8 @@ use opc_session_store::{
     ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionBackend,
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionKey, SessionKeyType, SessionLeaseManager, SessionTopologyAbortAdmissionProof,
+    SessionConsumerIdentity, SessionKey, SessionKeyType, SessionLeaseManager,
+    SessionQuorumConsumer, SessionTopologyAbortAdmissionProof,
     SessionTopologyCandidateRetirementProof, SessionTopologyJointCommitAdmissionProof,
     SessionTopologyPrePrepareUnstageProof, SessionTopologyTransitionError,
     SessionTopologyTransitionId, SessionTopologyTransitionRequest,
@@ -53,6 +57,7 @@ struct ScopedLoopbackPeer {
     node_id: SessionConsensusNodeId,
     identity: ConsensusIdentity,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
+    enabled: Arc<AtomicBool>,
 }
 
 impl ScopedLoopbackPeer {
@@ -61,11 +66,16 @@ impl ScopedLoopbackPeer {
             node_id,
             identity,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
+            enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
     async fn install(&self, handler: Arc<dyn SessionConsensusRpcHandler>) {
         *self.handler.write().await = Some(handler);
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
     }
 }
 
@@ -92,6 +102,9 @@ impl SessionConsensusPeer for ScopedLoopbackPeer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
         let handler = self
             .handler
             .read()
@@ -255,10 +268,24 @@ async fn open_fixed_cluster(
     member_count: usize,
     placement_policy: PlacementResiliencePolicy,
 ) -> (tempfile::TempDir, Vec<PathBuf>, Vec<ConsensusSessionStore>) {
-    let directory = tempfile::tempdir().expect("fixed cluster directory");
-    let (database_paths, stores) =
-        open_fixed_cluster_in(directory.path(), member_count, placement_policy).await;
+    let (directory, database_paths, stores, _) =
+        open_fixed_cluster_with_paths(member_count, placement_policy).await;
     (directory, database_paths, stores)
+}
+
+async fn open_fixed_cluster_with_paths(
+    member_count: usize,
+    placement_policy: PlacementResiliencePolicy,
+) -> (
+    tempfile::TempDir,
+    Vec<PathBuf>,
+    Vec<ConsensusSessionStore>,
+    BTreeMap<(usize, usize), Arc<ScopedLoopbackPeer>>,
+) {
+    let directory = tempfile::tempdir().expect("fixed cluster directory");
+    let (database_paths, stores, paths) =
+        open_fixed_cluster_in_with_paths(directory.path(), member_count, placement_policy).await;
+    (directory, database_paths, stores, paths)
 }
 
 async fn open_fixed_cluster_in(
@@ -266,6 +293,20 @@ async fn open_fixed_cluster_in(
     member_count: usize,
     placement_policy: PlacementResiliencePolicy,
 ) -> (Vec<PathBuf>, Vec<ConsensusSessionStore>) {
+    let (database_paths, stores, _) =
+        open_fixed_cluster_in_with_paths(directory, member_count, placement_policy).await;
+    (database_paths, stores)
+}
+
+async fn open_fixed_cluster_in_with_paths(
+    directory: &std::path::Path,
+    member_count: usize,
+    placement_policy: PlacementResiliencePolicy,
+) -> (
+    Vec<PathBuf>,
+    Vec<ConsensusSessionStore>,
+    BTreeMap<(usize, usize), Arc<ScopedLoopbackPeer>>,
+) {
     let members = fixed_members(member_count);
     let identity = consensus_identity(&members);
     let topologies = (0..member_count)
@@ -328,7 +369,7 @@ async fn open_fixed_cluster_in(
     {
         result.expect("initialize fixed cluster membership");
     }
-    (database_paths, stores)
+    (database_paths, stores, paths)
 }
 
 fn successor_request(identity: ConsensusIdentity) -> SessionTopologyTransitionRequest {
@@ -975,6 +1016,193 @@ async fn running_fixed_scope_drift_terminates_an_idle_generic_watch_promptly() {
     assert!(
         watch.next().await.is_none(),
         "watch must terminate after revocation"
+    );
+}
+
+#[tokio::test]
+async fn fixed_majority_loss_terminates_an_idle_generic_watch_without_an_event() {
+    let (_directory, _database_paths, stores, paths) =
+        open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    let start_sequence = stores[0]
+        .status()
+        .last_log_index
+        .map_or(0, |index| index.saturating_add(1));
+    let mut watch = SessionBackend::watch(&stores[0], start_sequence)
+        .await
+        .expect("open idle generic watch before majority loss");
+
+    paths
+        .get(&(0, 1))
+        .expect("fixed voter one path")
+        .set_enabled(false);
+    paths
+        .get(&(0, 2))
+        .expect("fixed voter two path")
+        .set_enabled(false);
+
+    let item = tokio::time::timeout(Duration::from_secs(12), watch.next())
+        .await
+        .expect("idle watch must re-establish majority authority within one bounded operation")
+        .expect("idle watch must emit a terminal majority-authority failure");
+    assert!(
+        item.is_err(),
+        "an idle fixed watch must fail closed after majority loss without a queued event"
+    );
+    assert!(
+        watch.next().await.is_none(),
+        "watch must terminate after majority authority is lost"
+    );
+}
+
+#[tokio::test]
+async fn fixed_majority_loss_terminates_an_idle_consumer_watch_without_an_event() {
+    let (_directory, _database_paths, stores, paths) =
+        open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    let scope = stores[0]
+        .consumer_scope()
+        .expect("fixed consumer scope before majority loss");
+    let start_sequence = stores[0]
+        .status()
+        .last_log_index
+        .map_or(0, |index| index.saturating_add(1));
+    let identity = SessionConsumerIdentity::new("spiffe://test/fixed-consumer")
+        .expect("test consumer identity");
+    let mut watch = stores[0]
+        .consumer_service()
+        .watch(&identity, scope, start_sequence)
+        .await
+        .expect("open idle consumer watch before majority loss");
+
+    paths
+        .get(&(0, 1))
+        .expect("fixed voter one path")
+        .set_enabled(false);
+    paths
+        .get(&(0, 2))
+        .expect("fixed voter two path")
+        .set_enabled(false);
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(12), watch.next())
+            .await
+            .expect("idle consumer watch must re-establish majority authority within one bounded operation")
+            .is_none(),
+        "an idle fixed consumer watch must terminate after majority loss without a queued event"
+    );
+}
+
+#[tokio::test]
+async fn fixed_majority_loss_revokes_readiness_reads_and_stale_lease_owner_mutations() {
+    let (_directory, _database_paths, stores, paths) =
+        open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    let key = SessionKey {
+        tenant: TenantId::new("fixed-majority-fence").expect("test tenant"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: SessionKeyType::PduSession,
+        stable_id: b"fixed-majority-fence"
+            .as_slice()
+            .try_into()
+            .expect("bounded stable ID"),
+    };
+    let lease = stores[0]
+        .acquire(
+            &key,
+            OwnerId::new("fixed-majority-owner").expect("test owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("acquire lease before majority loss");
+
+    paths
+        .get(&(0, 1))
+        .expect("fixed voter one path")
+        .set_enabled(false);
+    paths
+        .get(&(0, 2))
+        .expect("fixed voter two path")
+        .set_enabled(false);
+
+    let readiness = tokio::time::timeout(
+        Duration::from_secs(12),
+        stores[0]
+            .probe_fixed_durable_quorum_readiness_at(TopologyAttestationTime::from_unix_seconds(1)),
+    )
+    .await
+    .expect("fixed readiness must remain bounded after majority loss");
+    assert_eq!(
+        readiness.traffic_authority(),
+        FixedQuorumTrafficAuthority::NoQuorum,
+        "a previously healthy fixed member must withdraw traffic authority after majority loss"
+    );
+
+    let (read, renewal, release) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(12),
+            SessionBackend::get(&stores[0], &key),
+        ),
+        tokio::time::timeout(
+            Duration::from_secs(12),
+            SessionLeaseManager::renew(&stores[0], &lease, Duration::from_secs(30)),
+        ),
+        tokio::time::timeout(
+            Duration::from_secs(12),
+            SessionLeaseManager::release(&stores[0], lease.clone()),
+        ),
+    );
+    assert!(
+        read.expect("read must remain bounded after majority loss")
+            .is_err(),
+        "a fixed member without majority must not serve a linearizable read"
+    );
+    assert!(
+        renewal
+            .expect("lease renewal must remain bounded after majority loss")
+            .is_err(),
+        "a stale fixed lease owner must not renew without majority authority"
+    );
+    assert!(
+        release
+            .expect("lease release must remain bounded after majority loss")
+            .is_err(),
+        "a stale fixed lease owner must not release without majority authority"
+    );
+}
+
+#[tokio::test]
+async fn fixed_recovery_latch_terminates_an_idle_generic_watch_without_an_event() {
+    let (_directory, database_paths, stores) =
+        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    let start_sequence = stores[0]
+        .status()
+        .last_log_index
+        .map_or(0, |index| index.saturating_add(1));
+    let mut watch = SessionBackend::watch(&stores[0], start_sequence)
+        .await
+        .expect("open idle generic watch before recovery latch activation");
+
+    let connection =
+        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
+    connection
+        .execute(
+            "UPDATE consensus_operator_recovery \
+             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
+             WHERE singleton = 1",
+            [],
+        )
+        .expect("activate durable fixed recovery latch");
+    drop(connection);
+
+    let item = tokio::time::timeout(Duration::from_secs(1), watch.next())
+        .await
+        .expect("idle watch must recheck the durable recovery latch promptly")
+        .expect("idle watch must emit a terminal recovery-authority failure");
+    assert!(
+        item.is_err(),
+        "an idle fixed watch must fail closed after recovery latch activation without a queued event"
+    );
+    assert!(
+        watch.next().await.is_none(),
+        "watch must terminate after recovery authority is revoked"
     );
 }
 

@@ -1171,7 +1171,6 @@ impl ConsensusSessionStore {
     /// retain their original passive stream semantics.
     async fn fixed_watch_authority_before(
         &self,
-        scope: Option<SessionConsensusIdentity>,
         deadline: tokio::time::Instant,
     ) -> Result<(), StoreError> {
         if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum {
@@ -1179,7 +1178,20 @@ impl ConsensusSessionStore {
         }
         self.require_durable_fixed_quorum_admission_before(deadline)
             .await?;
-        self.logical_read_time_before(scope, deadline).await?;
+        let recovery_pending = tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .backend
+                .consensus_operator_recovery_pending(self.inner.storage_identity),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(true);
+        if recovery_pending {
+            return Err(consensus_unavailable());
+        }
+        self.linearizable_barrier_before(deadline).await?;
         self.require_durable_fixed_quorum_admission_before(deadline)
             .await
     }
@@ -2844,28 +2856,28 @@ impl ConsensusSessionStore {
             (stream, store, scope),
             |(mut stream, store, scope)| async move {
                 loop {
-                    let entry =
-                        if store.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum {
-                            tokio::select! {
-                                entry = stream.next() => entry?,
-                                _ = tokio::time::sleep(CONSUMER_WATCH_SCOPE_RECHECK_INTERVAL) => {
-                                    let deadline = tokio::time::Instant::now()
-                                        .checked_add(store.inner.operation_timeout)?;
-                                    if store.admit_consumer_scope(scope, deadline).await.is_err() {
-                                        return None;
-                                    }
-                                    continue;
+                    let entry = if store.inner.topology.mode()
+                        == QuorumTopologyMode::FixedDurableQuorum
+                    {
+                        tokio::select! {
+                            entry = stream.next() => entry?,
+                            _ = tokio::time::sleep(CONSUMER_WATCH_SCOPE_RECHECK_INTERVAL) => {
+                                let deadline = tokio::time::Instant::now()
+                                    .checked_add(store.inner.operation_timeout)?;
+                                if store.fixed_watch_authority_before(deadline).await.is_err()
+                                    || store.admit_consumer_scope(scope, deadline).await.is_err()
+                                {
+                                    return None;
                                 }
+                                continue;
                             }
-                        } else {
-                            stream.next().await?
-                        };
+                        }
+                    } else {
+                        stream.next().await?
+                    };
                     let deadline =
                         tokio::time::Instant::now().checked_add(store.inner.operation_timeout)?;
-                    if store
-                        .fixed_watch_authority_before(Some(scope.consensus_identity()), deadline)
-                        .await
-                        .is_err()
+                    if store.fixed_watch_authority_before(deadline).await.is_err()
                         || store.admit_consumer_scope(scope, deadline).await.is_err()
                     {
                         return None;
@@ -4100,7 +4112,7 @@ impl SessionBackend for ConsensusSessionStore {
                             () = tokio::time::sleep(GENERIC_WATCH_AUTHORITY_RECHECK_INTERVAL) => {
                                 let deadline = tokio::time::Instant::now()
                                     .checked_add(store.inner.operation_timeout)?;
-                                if store.require_durable_fixed_quorum_admission_before(deadline).await.is_err() {
+                                if store.fixed_watch_authority_before(deadline).await.is_err() {
                                     return Some((Err(consensus_unavailable()), (stream, store, true)));
                                 }
                                 continue;
@@ -4111,7 +4123,7 @@ impl SessionBackend for ConsensusSessionStore {
                     };
                     let deadline = tokio::time::Instant::now()
                         .checked_add(store.inner.operation_timeout)?;
-                    let admission = store.fixed_watch_authority_before(None, deadline).await;
+                    let admission = store.fixed_watch_authority_before(deadline).await;
                     let terminated = admission.is_err();
                     return Some((admission.and(entry), (stream, store, terminated)));
                 }
