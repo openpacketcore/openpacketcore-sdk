@@ -514,8 +514,15 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         vote: &Vote<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        consensus::save_vote_sync(&conn, self.core.storage_identity, vote)
-            .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Write, error))
+        consensus::save_vote_with_authority_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            vote,
+        )
+        .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Write, error))
     }
 
     async fn read_vote(
@@ -531,8 +538,15 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         committed: Option<LogId<SessionConsensusNodeId>>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        consensus::save_committed_sync(&conn, self.core.storage_identity, committed)
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))
+        consensus::save_committed_with_authority_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            committed,
+        )
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))
     }
 
     async fn read_committed(
@@ -554,7 +568,14 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     {
         let entries: Vec<_> = entries.into_iter().collect();
         let conn = self.core.conn.lock().await;
-        match consensus::append_logs_sync(&conn, self.core.storage_identity, &entries) {
+        match consensus::append_logs_with_authority_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            &entries,
+        ) {
             Ok(()) => {
                 callback.log_io_completed(Ok(()));
                 Ok(())
@@ -572,8 +593,15 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         log_id: LogId<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        consensus::truncate_logs_sync(&conn, self.core.storage_identity, &log_id)
-            .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
+        consensus::truncate_logs_with_authority_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            &log_id,
+        )
+        .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
     }
 
     async fn purge(
@@ -584,8 +612,15 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             .await
             .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))?;
         let conn = self.core.conn.lock().await;
-        consensus::purge_logs_sync(&conn, self.core.storage_identity, &log_id)
-            .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
+        consensus::purge_logs_with_authority_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            &log_id,
+        )
+        .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
     }
 }
 
@@ -773,10 +808,12 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                         error,
                     )
                 })?;
-            match consensus::install_snapshot_database_with_profile_sync(
+            match consensus::install_snapshot_database_with_authority_sync(
                 &conn,
                 self.core.storage_identity,
                 self.core.authority_profile,
+                Some(&self.core.expected_members),
+                Some(&self.core.expected_bindings),
                 &raw_path,
                 meta,
                 &file_name,
@@ -896,10 +933,15 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             .join(format!("build-{}.sqlite", uuid::Uuid::new_v4()));
         let (last_log_id, last_membership) = {
             let conn = self.core.conn.lock().await;
-            consensus::build_snapshot_database_sync(&conn, self.core.storage_identity, &raw_path)
-                .map_err(|error| {
-                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-                })?
+            consensus::build_snapshot_database_with_authority_sync(
+                &conn,
+                self.core.storage_identity,
+                self.core.authority_profile,
+                &self.core.expected_members,
+                &self.core.expected_bindings,
+                &raw_path,
+            )
+            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))?
         };
         let file_name = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
         let final_path = self.core.snapshot_dir.join(&file_name);
@@ -936,9 +978,12 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                         error,
                     )
                 })?;
-            consensus::save_current_snapshot_sync(
+            consensus::save_current_snapshot_with_authority_sync(
                 &conn,
                 self.core.storage_identity,
+                self.core.authority_profile,
+                &self.core.expected_members,
+                &self.core.expected_bindings,
                 &meta,
                 &file_name,
                 checksum,
