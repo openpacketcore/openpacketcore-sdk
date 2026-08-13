@@ -119,7 +119,7 @@ jobs:
             "OPC_GTPU_RUN_PRIVILEGED=1" \
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up
-              cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture
+              cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1
               # Both filters go after `--`: cargo accepts only one positional
               # TESTNAME, so naming two before it is a hard argument error,
               # while libtest itself takes any number.
@@ -846,18 +846,24 @@ jobs:
           for symbol in opc_gtpu_uplink opc_gtpu_downlink \
             checksum_loop_chunk parse_downlink authorize_and_decap_legacy_downlink \
             handle_downlink_ipv6 parse_downlink_ipv6 ipv6_udp_offset \
-            software_ipv6_udp_checksum_is_valid walk_ipv6_extension_step \
+            software_ipv6_udp_checksum_is_valid ipv6_udp_pseudo_sum \
+            walk_ipv6_extension_step \
             grouped_uplink_authority grouped_downlink_authority decap_grouped_downlink \
-            encapsulate_grouped_ipv4 encapsulate_grouped_ipv6 \
+            encapsulate_grouped_ipv4 prepare_grouped_ipv6_encapsulation \
+            encapsulate_grouped_ipv6 \
             checksum_bytes_are_materialized select_gtpu_session_entry_wire \
             authority_slots_are_canonical entry_wire_is_canonical bytes_80_are_zero \
             apply_uplink_mtu_policy \
-            observation_challenge_sample observation_icmp_checksum_for_payload \
-            observation_icmpv6_checksum_is_valid rewrite_observation_icmp_echo_request \
+            handle_grouped_downlink_ipv4 \
+            observation_challenge_sample validated_observation_icmp_echo \
+            authenticate_observation_icmp_echo checksum_skb_region checksum_packet_chunk \
+            observation_icmp_checksum_40_is_valid observation_icmpv6_checksum_is_valid \
+            rewrite_authenticated_observation_icmp_echo_request \
             emit_grouped_observation \
-            try_emit_grouped_observation publish_grouped_observation_event \
+            publish_grouped_observation_event \
             emit_grouped_uplink_observation_on_reentry \
-            encoded_is_valid encoded_icmp_echo_sample_if_valid \
+            encoded_is_valid validate_ipv4_downlink_binding_wire \
+            constant_time_difference_16 siphash128_from_registration_sample \
             pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph \
             marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink \
             marked_owner_wire_authorizes_downlink classify_tft_filter_step \
@@ -869,7 +875,9 @@ jobs:
             GTPU_OBS_REG GTPU_OBS_REDIR GTPU_OBS_EVT GTPU_OBS_LOSS GTPU_OBS_SEQ \
             GTPU_OBS_GATE GTPU_OBS_LCK GTPU_OBS_FLOW \
             GTPU_TFT_SCHEMA GTPU_TFT_META GTPU_TFT_FILT GTPU_TFT_DROP; do
-            grep -Eq "( |[[:digit:]])${symbol}$" committed.inventory
+            grep -Eq \
+              "( |[[:digit:]])${symbol}((Kb[01]|Kj(4|8|10|20|40))_EB[[:digit:]]+_)?$" \
+              committed.inventory
           done
 
           functional_section_names() {

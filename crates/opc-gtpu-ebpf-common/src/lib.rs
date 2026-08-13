@@ -1173,6 +1173,7 @@ fn binding_wires_equal<const N: usize>(
 /// [`DownlinkEndpointBinding::validate_ipv4_packet`]. It exists so the eBPF
 /// classifier does not materialize the full 44-byte typed value on its
 /// verifier-limited stack.
+#[inline(never)]
 pub fn validate_ipv4_downlink_binding_wire(
     value: &[u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN],
     peer_address: [u8; 4],

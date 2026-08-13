@@ -207,6 +207,146 @@ pub struct GtpuTrafficObservationRegistration {
     reserved: [u8; 3],
 }
 
+/// Borrowed registration proven canonical for one immutable map-value view.
+///
+/// Construction validates the complete registration once. Packet-path callers
+/// can then bind that same borrowed value to live forwarding authority and
+/// authenticate multiple challenge fields without repeating the canonicality
+/// walk in a deeper verifier call frame. The raw secret-bearing bytes are not
+/// exposed by this view.
+#[derive(Clone, Copy)]
+pub struct GtpuTrafficObservationRegistrationWireView<'a> {
+    wire: &'a [u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+}
+
+impl<'a> GtpuTrafficObservationRegistrationWireView<'a> {
+    /// Validate and borrow one complete encoded registration.
+    #[must_use]
+    #[inline(always)]
+    pub fn decode(wire: &'a [u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN]) -> Option<Self> {
+        encoded_is_valid(wire).then_some(Self { wire })
+    }
+
+    /// Validate and borrow a registration only when it also matches exact
+    /// live forwarding authority and the captured publication identity.
+    #[must_use]
+    #[inline(always)]
+    pub fn decode_if_current_authority(
+        wire: &'a [u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+        authority: GtpuSessionAuthorityWireView<'_>,
+        publication_id: u32,
+    ) -> Option<Self> {
+        let authority = authority.as_wire();
+        if !encoded_is_valid(wire)
+            || wire[GROUP_ID_OFFSET..DEVICE_ID_OFFSET] != authority[32..48]
+            || wire[DEVICE_ID_OFFSET..GENERATION_OFFSET] != authority[16..32]
+            || wire[GENERATION_OFFSET..BACKEND_INCARNATION_OFFSET] != authority[4..12]
+            || wire[PUBLICATION_ID_OFFSET..REGISTRATION_RESERVED_OFFSET]
+                != publication_id.to_be_bytes()
+        {
+            return None;
+        }
+        Some(Self { wire })
+    }
+
+    /// Return the validated finite publication identity.
+    #[must_use]
+    #[inline(always)]
+    pub fn publication_id(self) -> u32 {
+        u32::from_be_bytes(slice_4(self.wire, PUBLICATION_ID_OFFSET))
+    }
+
+    /// Authenticate one public request and derive its private response using
+    /// this already validated registration snapshot.
+    #[must_use]
+    #[inline(always)]
+    pub fn icmp_echo_response_payload_if_request_valid(
+        self,
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8; GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN],
+    ) -> Option<[u8; GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN]> {
+        let sample_id = encoded_icmp_echo_sample_from_valid_registration(
+            self.wire, identifier, sequence, payload, true,
+        );
+        if sample_id == 0 {
+            return None;
+        }
+        let tag = self.icmp_echo_response_tag(sample_id)?;
+        let mut response = [0; GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN];
+        response[..ICMP_ECHO_CHALLENGE_TAG_OFFSET]
+            .copy_from_slice(&payload[..ICMP_ECHO_CHALLENGE_TAG_OFFSET]);
+        response[ICMP_ECHO_CHALLENGE_TAG_OFFSET..].copy_from_slice(&tag);
+        Some(response)
+    }
+
+    /// Authenticate one private reply using this already validated
+    /// registration snapshot.
+    #[must_use]
+    #[inline(always)]
+    pub fn icmp_echo_reply_sample_if_valid(
+        self,
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8; GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN],
+    ) -> Option<u32> {
+        let sample_id = encoded_icmp_echo_sample_from_valid_registration(
+            self.wire, identifier, sequence, payload, false,
+        );
+        (sample_id != 0).then_some(sample_id)
+    }
+
+    /// Authenticate the tag of one canonical public request header.
+    ///
+    /// The packet boundary must separately prove that the fixed magic,
+    /// version, profile, reserved bytes, and publication ID are canonical;
+    /// this method binds the supplied nonzero sample identity and tag to this
+    /// already validated registration without copying the 16-byte header.
+    #[must_use]
+    #[inline(always)]
+    pub fn icmp_echo_request_tag_is_valid(
+        self,
+        identifier: u16,
+        sequence: u16,
+        sample_id: u32,
+        tag: &[u8; 16],
+    ) -> bool {
+        encoded_icmp_echo_request_tag_is_valid_from_valid_registration(
+            self.wire, identifier, sequence, sample_id, tag,
+        )
+    }
+
+    /// Authenticate the tag of one canonical private reply header.
+    #[must_use]
+    #[inline(always)]
+    pub fn icmp_echo_reply_tag_is_valid(
+        self,
+        identifier: u16,
+        sequence: u16,
+        sample_id: u32,
+        tag: &[u8; 16],
+    ) -> bool {
+        encoded_icmp_echo_reply_tag_is_valid_from_valid_registration(
+            self.wire, identifier, sequence, sample_id, tag,
+        )
+    }
+
+    /// Derive the private response tag for one nonzero canonical sample.
+    #[must_use]
+    #[inline(always)]
+    pub fn icmp_echo_response_tag(self, sample_id: u32) -> Option<[u8; 16]> {
+        if sample_id == 0 {
+            return None;
+        }
+        Some(siphash128_from_registration_sample(
+            self.wire,
+            ICMP_ECHO_RESPONSE_TAG_FIRST_DOMAIN,
+            ICMP_ECHO_RESPONSE_TAG_SECOND_DOMAIN,
+            sample_id,
+        ))
+    }
+}
+
 impl core::fmt::Debug for GtpuTrafficObservationRegistration {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("GtpuTrafficObservationRegistration")
@@ -766,30 +906,104 @@ fn encoded_icmp_echo_sample_if_valid(
     if !encoded_is_valid(encoded) {
         return 0;
     }
+    encoded_icmp_echo_sample_from_valid_registration(
+        encoded, identifier, sequence, payload, request,
+    )
+}
+
+fn encoded_icmp_echo_sample_from_valid_registration(
+    encoded: &[u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+    identifier: u16,
+    sequence: u16,
+    payload: &[u8; GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN],
+    request: bool,
+) -> u32 {
     let sample_id = u32::from_be_bytes(slice_4(payload, ICMP_ECHO_CHALLENGE_SAMPLE_ID_OFFSET));
     if sample_id == 0 || !icmp_echo_identifier_sequence_matches(sample_id, identifier, sequence) {
         return 0;
     }
-    let header = icmp_echo_challenge_header(
-        u32::from_be_bytes(slice_4(encoded, PUBLICATION_ID_OFFSET)),
-        sample_id,
-    );
-    if slice_16(payload, 0) != header {
+    if payload[0] != GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_MAGIC[0]
+        || payload[1] != GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_MAGIC[1]
+        || payload[2] != GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_MAGIC[2]
+        || payload[3] != GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_MAGIC[3]
+        || payload[4] != GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_VERSION
+        || payload[5] != GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PROFILE
+        || payload[6] != 0
+        || payload[7] != 0
+        || payload[8] != encoded[PUBLICATION_ID_OFFSET]
+        || payload[9] != encoded[PUBLICATION_ID_OFFSET + 1]
+        || payload[10] != encoded[PUBLICATION_ID_OFFSET + 2]
+        || payload[11] != encoded[PUBLICATION_ID_OFFSET + 3]
+    {
         return 0;
     }
-    let secret = slice_16(encoded, CORRELATION_SECRET_OFFSET);
-    let expected_tag = if request {
-        icmp_echo_request_tag(&secret, &header)
+    let tag = slice_16(payload, ICMP_ECHO_CHALLENGE_TAG_OFFSET);
+    let tag_is_valid = if request {
+        encoded_icmp_echo_request_tag_is_valid_from_valid_registration(
+            encoded, identifier, sequence, sample_id, &tag,
+        )
     } else {
-        icmp_echo_response_tag(&secret, &header)
+        encoded_icmp_echo_reply_tag_is_valid_from_valid_registration(
+            encoded, identifier, sequence, sample_id, &tag,
+        )
     };
-    if !constant_time_eq_16(
-        &slice_16(payload, ICMP_ECHO_CHALLENGE_TAG_OFFSET),
-        &expected_tag,
-    ) {
+    if !tag_is_valid {
         return 0;
     }
     sample_id
+}
+
+fn encoded_icmp_echo_request_tag_is_valid_from_valid_registration(
+    encoded: &[u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+    identifier: u16,
+    sequence: u16,
+    sample_id: u32,
+    tag: &[u8; 16],
+) -> bool {
+    if sample_id == 0 || !icmp_echo_identifier_sequence_matches(sample_id, identifier, sequence) {
+        return false;
+    }
+    let expected_tag = siphash128_from_registration_sample(
+        encoded,
+        ICMP_ECHO_CHALLENGE_TAG_FIRST_DOMAIN,
+        ICMP_ECHO_CHALLENGE_TAG_SECOND_DOMAIN,
+        sample_id,
+    );
+    constant_time_difference_16(tag, &expected_tag) == 0
+}
+
+fn encoded_icmp_echo_reply_tag_is_valid_from_valid_registration(
+    encoded: &[u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+    identifier: u16,
+    sequence: u16,
+    sample_id: u32,
+    tag: &[u8; 16],
+) -> bool {
+    if sample_id == 0 || !icmp_echo_identifier_sequence_matches(sample_id, identifier, sequence) {
+        return false;
+    }
+    let expected_tag = siphash128_from_registration_sample(
+        encoded,
+        ICMP_ECHO_RESPONSE_TAG_FIRST_DOMAIN,
+        ICMP_ECHO_RESPONSE_TAG_SECOND_DOMAIN,
+        sample_id,
+    );
+    constant_time_difference_16(tag, &expected_tag) == 0
+}
+
+/// Accumulate every tag-byte difference without exposing the final equality
+/// to this loop's optimizer. Keeping this arithmetic behind a BPF-to-BPF call
+/// prevents LLVM from rewriting `(xor_0 | ... | xor_15) == 0` into sixteen
+/// branchy byte comparisons whose verifier state space grows exponentially.
+#[inline(never)]
+fn constant_time_difference_16(left: &[u8; 16], right: &[u8; 16]) -> u8 {
+    let mut difference = 0_u8;
+    let mut index = 0;
+    while index < 16 {
+        difference |= left[index] ^ right[index];
+        index += 1;
+    }
+    difference
 }
 
 #[inline(always)]
@@ -875,6 +1089,97 @@ fn siphash128(
     ]
 }
 
+/// Derive a challenge tag directly from one canonical registration and sample
+/// without materializing either secret or public header in the caller's
+/// verifier stack frame.
+fn siphash128_from_registration_sample(
+    registration: &[u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+    first_domain: u64,
+    second_domain: u64,
+    sample_id: u32,
+) -> [u8; 16] {
+    let first = siphash24_registration_sample(registration, first_domain, sample_id).to_be_bytes();
+    let second =
+        siphash24_registration_sample(registration, second_domain, sample_id).to_be_bytes();
+    [
+        first[0], first[1], first[2], first[3], first[4], first[5], first[6], first[7], second[0],
+        second[1], second[2], second[3], second[4], second[5], second[6], second[7],
+    ]
+}
+
+#[inline(always)]
+fn siphash24_registration_sample(
+    registration: &[u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+    domain: u64,
+    sample_id: u32,
+) -> u64 {
+    let k0 = u64::from_le_bytes([
+        registration[CORRELATION_SECRET_OFFSET],
+        registration[CORRELATION_SECRET_OFFSET + 1],
+        registration[CORRELATION_SECRET_OFFSET + 2],
+        registration[CORRELATION_SECRET_OFFSET + 3],
+        registration[CORRELATION_SECRET_OFFSET + 4],
+        registration[CORRELATION_SECRET_OFFSET + 5],
+        registration[CORRELATION_SECRET_OFFSET + 6],
+        registration[CORRELATION_SECRET_OFFSET + 7],
+    ]);
+    let k1 = u64::from_le_bytes([
+        registration[CORRELATION_SECRET_OFFSET + 8],
+        registration[CORRELATION_SECRET_OFFSET + 9],
+        registration[CORRELATION_SECRET_OFFSET + 10],
+        registration[CORRELATION_SECRET_OFFSET + 11],
+        registration[CORRELATION_SECRET_OFFSET + 12],
+        registration[CORRELATION_SECRET_OFFSET + 13],
+        registration[CORRELATION_SECRET_OFFSET + 14],
+        registration[CORRELATION_SECRET_OFFSET + 15],
+    ]);
+    let mut v0 = k0 ^ 0x736f_6d65_7073_6575;
+    let mut v1 = k1 ^ 0x646f_7261_6e64_6f6d;
+    let mut v2 = k0 ^ 0x6c79_6765_6e65_7261;
+    let mut v3 = k1 ^ 0x7465_6462_7974_6573;
+    siphash_compress(&mut v0, &mut v1, &mut v2, &mut v3, domain);
+    siphash_compress(
+        &mut v0,
+        &mut v1,
+        &mut v2,
+        &mut v3,
+        u64::from_le_bytes([
+            GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_MAGIC[0],
+            GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_MAGIC[1],
+            GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_MAGIC[2],
+            GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_MAGIC[3],
+            GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_VERSION,
+            GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PROFILE,
+            0,
+            0,
+        ]),
+    );
+    siphash_compress(
+        &mut v0,
+        &mut v1,
+        &mut v2,
+        &mut v3,
+        u64::from_le_bytes([
+            registration[PUBLICATION_ID_OFFSET],
+            registration[PUBLICATION_ID_OFFSET + 1],
+            registration[PUBLICATION_ID_OFFSET + 2],
+            registration[PUBLICATION_ID_OFFSET + 3],
+            (sample_id >> 24) as u8,
+            (sample_id >> 16) as u8,
+            (sample_id >> 8) as u8,
+            sample_id as u8,
+        ]),
+    );
+    siphash_compress(&mut v0, &mut v1, &mut v2, &mut v3, 24_u64 << 56);
+    v2 ^= 0xff;
+    let mut round = 0;
+    while round < 4 {
+        siphash_round(&mut v0, &mut v1, &mut v2, &mut v3);
+        round += 1;
+    }
+    v0 ^ v1 ^ v2 ^ v3
+}
+
 /// SipHash-2-4 over one domain block and the fixed 16-byte public header.
 ///
 /// The message is exactly 24 bytes (`domain || header`), so the three absorbs
@@ -950,17 +1255,6 @@ fn siphash_round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
     *v1 = v1.rotate_left(17);
     *v1 ^= *v2;
     *v2 = v2.rotate_left(32);
-}
-
-#[inline(always)]
-fn constant_time_eq_16(left: &[u8; 16], right: &[u8; 16]) -> bool {
-    let mut difference = 0_u8;
-    let mut index = 0;
-    while index < 16 {
-        difference |= left[index] ^ right[index];
-        index += 1;
-    }
-    difference == 0
 }
 
 /// One successful local GTP-U forwarding-boundary observation.
@@ -1504,6 +1798,56 @@ mod tests {
             &encoded, 0x1234, 0x5678, &reply,
         )
         .is_none());
+    }
+
+    #[test]
+    fn borrowed_registration_view_authenticates_both_domains_and_rejects_tag_mutation() {
+        let registration = registration();
+        let encoded = registration.encode();
+        let authority = authority();
+        let authority = GtpuSessionAuthorityWireView::decode(&authority).unwrap();
+        let view = GtpuTrafficObservationRegistrationWireView::decode_if_current_authority(
+            &encoded,
+            authority,
+            registration.publication_id(),
+        )
+        .unwrap();
+        let sample_id = 0x1234_5678;
+        let request = registration.icmp_echo_challenge_payload(sample_id).unwrap();
+        let request_tag = slice_16(&request, ICMP_ECHO_CHALLENGE_TAG_OFFSET);
+        assert!(view.icmp_echo_request_tag_is_valid(0x1234, 0x5678, sample_id, &request_tag));
+
+        let reply = view
+            .icmp_echo_response_payload_if_request_valid(0x1234, 0x5678, &request)
+            .unwrap();
+        let reply_tag = slice_16(&reply, ICMP_ECHO_CHALLENGE_TAG_OFFSET);
+        assert_eq!(view.icmp_echo_response_tag(sample_id), Some(reply_tag));
+        assert!(view.icmp_echo_reply_tag_is_valid(0x1234, 0x5678, sample_id, &reply_tag));
+        assert_eq!(
+            view.icmp_echo_reply_sample_if_valid(0x1234, 0x5678, &reply),
+            Some(sample_id)
+        );
+
+        let mut forged_request_tag = request_tag;
+        forged_request_tag[7] ^= 1;
+        assert!(!view.icmp_echo_request_tag_is_valid(
+            0x1234,
+            0x5678,
+            sample_id,
+            &forged_request_tag,
+        ));
+        let mut forged_reply_tag = reply_tag;
+        forged_reply_tag[11] ^= 1;
+        assert!(!view.icmp_echo_reply_tag_is_valid(0x1234, 0x5678, sample_id, &forged_reply_tag,));
+        assert_eq!(view.icmp_echo_response_tag(0), None);
+        assert!(
+            GtpuTrafficObservationRegistrationWireView::decode_if_current_authority(
+                &encoded,
+                authority,
+                registration.publication_id() + 1,
+            )
+            .is_none()
+        );
     }
 
     #[test]

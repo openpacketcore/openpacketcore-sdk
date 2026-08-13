@@ -104,22 +104,27 @@ use opc_gtpu_ebpf_common::{
     GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_IPV4_SLOT, GTPU_SESSION_IPV6_SLOT,
     GTPU_SESSION_SCHEMA_MARKER_LEN, GTPU_SESSION_SCHEMA_MARKER_VALUE,
     GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
-    GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
-    GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_CONFIG_IPV6,
-    MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING,
-    MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX,
-    MAP_SESSION_GROUPS, MAP_SESSION_SCHEMA, MAP_SESSION_TRANSACTIONS, MAP_SESSION_UPLINK_INDEX,
-    MAP_TFT_CLASSIFIER_COUNTERS, MAP_TFT_CLASSIFIER_FILTERS, MAP_TFT_CLASSIFIER_META,
-    MAP_TFT_CLASSIFIER_SCHEMA, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP,
-    MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS,
-    MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
-    PROG_DOWNLINK, PROG_UPLINK, TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_KEY_LEN,
-    TFT_CLASSIFIER_FILTER_VALUE_LEN, TFT_CLASSIFIER_KEY_LEN, TFT_CLASSIFIER_META_VALUE_LEN,
-    TFT_CLASSIFIER_SCHEMA_VALUE_LEN, UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
-    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
-    UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
-    UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
-    UPLINK_SOURCE_PORT_VALUE_LEN,
+    GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES, GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_PUBLICATION_SEQUENCE_INDEX,
+    GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN,
+    GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN, GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+    IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_CONFIG_IPV6, MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS,
+    MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR,
+    MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX, MAP_SESSION_GROUPS, MAP_SESSION_SCHEMA,
+    MAP_SESSION_TRANSACTIONS, MAP_SESSION_UPLINK_INDEX, MAP_TFT_CLASSIFIER_COUNTERS,
+    MAP_TFT_CLASSIFIER_FILTERS, MAP_TFT_CLASSIFIER_META, MAP_TFT_CLASSIFIER_SCHEMA,
+    MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR,
+    MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT,
+    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
+    TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_KEY_LEN, TFT_CLASSIFIER_FILTER_VALUE_LEN,
+    TFT_CLASSIFIER_KEY_LEN, TFT_CLASSIFIER_META_VALUE_LEN, TFT_CLASSIFIER_SCHEMA_VALUE_LEN,
+    UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
+    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
+    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS,
+    UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -205,10 +210,11 @@ const ICMP_ECHO_REPLY: u8 = 0;
 const ICMPV6_ECHO_REQUEST: u8 = 128;
 const ICMPV6_ECHO_REPLY: u8 = 129;
 const ICMP_ECHO_IDENTIFIER: u16 = 0x6550;
+const OBSERVATION_FLOW_SCRATCH_VALUE_LEN: usize = 40;
 const CURRENT_DATAPATH_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath.bpf.o");
 const FROZEN_V1_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v1.bpf.o");
 const FROZEN_V2_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v2.bpf.o");
-const CURRENT_PIN_NAMES: [&str; 25] = [
+const CURRENT_PIN_NAMES: [&str; 33] = [
     MAP_UPLINK_FAR,
     MAP_UPLINK_MARK_FAR,
     MAP_UPLINK_DSCP,
@@ -234,6 +240,14 @@ const CURRENT_PIN_NAMES: [&str; 25] = [
     MAP_TFT_CLASSIFIER_META,
     MAP_TFT_CLASSIFIER_FILTERS,
     MAP_TFT_CLASSIFIER_COUNTERS,
+    GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
 ];
 /// The generation immediately before the uplink redirect-outcome counter.
 ///
@@ -896,6 +910,7 @@ impl TestNet {
 impl Drop for TestNet {
     fn drop(&mut self) {
         // Best-effort teardown; the CI netns is discarded anyway.
+        cleanup_owned_root_xfrm_objects();
         let _ = Command::new("ip").args(["link", "del", "s2bu"]).output();
         let _ = Command::new("ip").args(["link", "del", "ue0"]).output();
         let _ = Command::new("ip")
@@ -1398,6 +1413,99 @@ async fn install_real_marked_outbound_xfrm() -> Result<(), opc_ipsec_xfrm::XfrmE
             .await?;
     }
     Ok(())
+}
+
+async fn remove_real_marked_outbound_xfrm() -> Result<(), opc_ipsec_xfrm::XfrmError> {
+    let backend = LinuxXfrmBackend::new();
+    let default_mark = XfrmLookupMark::full(0);
+    let dedicated_mark = XfrmLookupMark::full(MARK_A);
+    for mark in [default_mark, dedicated_mark] {
+        backend
+            .remove_policy(
+                RemovePolicyRequest::new(downlink_selector(), XfrmDirection::Out).with_mark(mark),
+            )
+            .await?;
+    }
+    backend
+        .remove_sa(RemoveSaRequest::new(
+            xfrm_ip(UE_SWU_IP),
+            IPPROTO_ESP,
+            OUTBOUND_SPI_DEFAULT,
+        ))
+        .await?;
+    backend
+        .remove_sa(
+            RemoveSaRequest::new(xfrm_ip(UE_SWU_IP), IPPROTO_ESP, OUTBOUND_SPI_A)
+                .with_mark(dedicated_mark),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn remove_owned_root_xfrm_objects_best_effort() -> bool {
+    let backend = LinuxXfrmBackend::new();
+    let default_mark = XfrmLookupMark::full(0);
+    let dedicated_mark = XfrmLookupMark::full(MARK_A);
+    let policies = [
+        RemovePolicyRequest::new(marked_inner_selector(), XfrmDirection::In),
+        RemovePolicyRequest::new(marked_inner_selector(), XfrmDirection::Forward),
+        RemovePolicyRequest::new(downlink_selector(), XfrmDirection::Out).with_mark(default_mark),
+        RemovePolicyRequest::new(downlink_selector(), XfrmDirection::Out).with_mark(dedicated_mark),
+        RemovePolicyRequest::new(marked_inner_selector_v6(), XfrmDirection::In),
+        RemovePolicyRequest::new(marked_inner_selector_v6(), XfrmDirection::Forward),
+        RemovePolicyRequest::new(downlink_selector_v6(), XfrmDirection::Out)
+            .with_mark(dedicated_mark),
+    ];
+    let states = [
+        RemoveSaRequest::new(xfrm_ip(EPDG_SWU_IP), IPPROTO_ESP, INBOUND_SPI_DEFAULT),
+        RemoveSaRequest::new(xfrm_ip(EPDG_SWU_IP), IPPROTO_ESP, INBOUND_SPI_A),
+        RemoveSaRequest::new(xfrm_ip(UE_SWU_IP), IPPROTO_ESP, OUTBOUND_SPI_DEFAULT),
+        RemoveSaRequest::new(xfrm_ip(UE_SWU_IP), IPPROTO_ESP, OUTBOUND_SPI_A)
+            .with_mark(dedicated_mark),
+        RemoveSaRequest::new(xfrm_ip(EPDG_SWU_IP), IPPROTO_ESP, INBOUND_SPI_V6_A),
+        RemoveSaRequest::new(xfrm_ip(UE_SWU_IP), IPPROTO_ESP, OUTBOUND_SPI_V6_A)
+            .with_mark(dedicated_mark),
+    ];
+    let mut complete = true;
+    for request in policies {
+        if !matches!(
+            backend.remove_policy(request).await,
+            Ok(()) | Err(opc_ipsec_xfrm::XfrmError::NotFound)
+        ) {
+            complete = false;
+        }
+    }
+    for request in states {
+        if !matches!(
+            backend.remove_sa(request).await,
+            Ok(()) | Err(opc_ipsec_xfrm::XfrmError::NotFound)
+        ) {
+            complete = false;
+        }
+    }
+    complete
+}
+
+fn cleanup_owned_root_xfrm_objects() {
+    // `TestNet` is dropped from Tokio tests. Run the async SDK removals on a
+    // joined helper thread so teardown remains foreground and never nests a
+    // runtime. Every request names only an object installed by this fixture.
+    let worker = std::thread::Builder::new()
+        .name("opc-gtpu-xfrm-cleanup".to_owned())
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|runtime| runtime.block_on(remove_owned_root_xfrm_objects_best_effort()))
+                .unwrap_or(false)
+        });
+    let complete = worker
+        .ok()
+        .and_then(|worker| worker.join().ok())
+        .unwrap_or(false);
+    if !complete {
+        eprintln!("owned disposable XFRM cleanup was incomplete");
+    }
 }
 
 async fn install_real_marked_outbound_xfrm_for_ue_application(
@@ -3873,6 +3981,23 @@ fn pinned_array_values<const VALUE_LEN: usize>(
         .collect()
 }
 
+fn pinned_u64_array_values(pin_dir: &std::path::Path, name: &str, slots: u32) -> Vec<u64> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(name))
+            .unwrap_or_else(|error| panic!("open pinned {name}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("identify pinned {name}: {error}"));
+    let array = Array::<_, u64>::try_from(map)
+        .unwrap_or_else(|error| panic!("type pinned {name}: {error}"));
+    (0..slots)
+        .map(|index| {
+            array
+                .get(&index, 0)
+                .unwrap_or_else(|error| panic!("read pinned {name}[{index}]: {error}"))
+        })
+        .collect()
+}
+
 fn pinned_per_cpu_u64_values(pin_dir: &std::path::Path, name: &str, slots: u32) -> Vec<Vec<u64>> {
     let map = Map::from_map_data(
         MapData::from_pin(pin_dir.join(name))
@@ -3893,7 +4018,33 @@ fn pinned_per_cpu_u64_values(pin_dir: &std::path::Path, name: &str, slots: u32) 
         .collect()
 }
 
-/// Exact byte-for-byte state of every map in the current 25-pin graph.
+fn pinned_per_cpu_byte_values<const VALUE_LEN: usize>(
+    pin_dir: &std::path::Path,
+    name: &str,
+    slots: u32,
+) -> Vec<Vec<[u8; VALUE_LEN]>> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(name))
+            .unwrap_or_else(|error| panic!("open pinned {name}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("identify pinned {name}: {error}"));
+    let array = PerCpuArray::<_, [u8; VALUE_LEN]>::try_from(map)
+        .unwrap_or_else(|error| panic!("type pinned {name}: {error}"));
+    (0..slots)
+        .map(|index| {
+            array
+                .get(&index, 0)
+                .unwrap_or_else(|error| panic!("read pinned {name}[{index}]: {error}"))
+                .iter()
+                .copied()
+                .collect()
+        })
+        .collect()
+}
+
+/// Exact byte-for-byte state of every durable forwarding and recovery map in
+/// the current 33-pin graph. The restart-fenced observation source is captured
+/// separately because adopting a retained graph must invalidate that source.
 ///
 /// This intentionally has no `Debug` implementation: assertion failures must
 /// not print subscriber addresses, TEIDs, or grouped routing authority.
@@ -3992,8 +4143,75 @@ fn current_map_contents(pin_dir: &std::path::Path) -> CurrentMapContents {
     }
 }
 
+/// Restart-sensitive proof-source contents. This intentionally has no
+/// `Debug` implementation so a failing assertion cannot disclose subscriber
+/// or correlation material.
+#[derive(PartialEq, Eq)]
+struct TrafficObservationSourceContents {
+    registrations: Vec<(
+        [u8; GTPU_SESSION_GROUP_ID_LEN],
+        [u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+    )>,
+    redirects: Vec<(
+        [u8; GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN],
+        [u8; GTPU_SESSION_GROUP_ID_LEN],
+    )>,
+    loss: Vec<Vec<u64>>,
+    sequence: Vec<u64>,
+    gate: Vec<u64>,
+    flow_scratch: Vec<Vec<[u8; OBSERVATION_FLOW_SCRATCH_VALUE_LEN]>>,
+}
+
+fn traffic_observation_source_contents(
+    pin_dir: &std::path::Path,
+) -> TrafficObservationSourceContents {
+    TrafficObservationSourceContents {
+        registrations: pinned_hash_entries(pin_dir, GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME),
+        redirects: pinned_hash_entries(pin_dir, GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME),
+        loss: pinned_per_cpu_u64_values(pin_dir, GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME, 1),
+        sequence: pinned_u64_array_values(pin_dir, GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME, 1),
+        gate: pinned_u64_array_values(
+            pin_dir,
+            GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+        ),
+        flow_scratch: pinned_per_cpu_byte_values(
+            pin_dir,
+            GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
+            1,
+        ),
+    }
+}
+
+impl TrafficObservationSourceContents {
+    fn is_restart_fenced_from(&self, prior: &Self) -> bool {
+        let gate_index = GTPU_TRAFFIC_OBSERVATION_GATE_INDEX as usize;
+        let publication_index = GTPU_TRAFFIC_OBSERVATION_PUBLICATION_SEQUENCE_INDEX as usize;
+        self.registrations.is_empty()
+            && self.redirects.is_empty()
+            && self.loss.iter().flatten().all(|value| *value == 0)
+            && self.sequence.iter().all(|value| *value == 0)
+            && self
+                .flow_scratch
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|byte| *byte == 0)
+            && self.gate.len() == GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES as usize
+            && prior.gate.len() == GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES as usize
+            && prior.gate[gate_index] != 0
+            && prior.gate[gate_index] & 1 == 1
+            && self.gate[gate_index] != 0
+            && self.gate[gate_index] & 1 == 0
+            && self.gate[gate_index] != prior.gate[gate_index]
+            && self.gate[publication_index] == prior.gate[publication_index]
+    }
+}
+
 /// Exact retained pin graph, including path-to-kernel-ID association and all
-/// map bytes. This also has no `Debug` implementation for redaction safety.
+/// durable map bytes. Observation maps are still covered by exact pin IDs and
+/// ABI; their contents follow the explicit restart-invalidation contract.
+/// This also has no `Debug` implementation for redaction safety.
 #[derive(PartialEq, Eq)]
 struct CurrentPinGraphSnapshot {
     pins: Vec<String>,
@@ -4007,7 +4225,7 @@ fn current_pin_graph_snapshot(pin_dir: &std::path::Path) -> CurrentPinGraphSnaps
     expected.sort_unstable();
     assert_eq!(
         pins, expected,
-        "fixture must retain the exact current 25-pin graph"
+        "fixture must retain the exact current 33-pin graph"
     );
     let map_ids = pins
         .iter()
@@ -4785,8 +5003,13 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_TFT_CLASSIFIER_FILTERS,
                 MAP_TFT_CLASSIFIER_COUNTERS,
                 GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
                 GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
                 GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
             ],
         ),
         "the live uplink program must reference the exact pinned maps read by diagnostics",
@@ -4814,6 +5037,10 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
                 GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
                 GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
             ],
         ),
         "the live downlink program must reference the exact pinned maps read by diagnostics",
@@ -5167,6 +5394,10 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             > xfrm_downlink_decap_before,
         "the committed per-CPU counter must observe the marked GTP-U decapsulation",
     );
+    // The remaining scenario exercises raw S2b forwarding and mark handling,
+    // not SWu encryption. Remove exactly the two outbound SAs and policies
+    // created above so those owned XFRM objects cannot consume its packets.
+    remove_real_marked_outbound_xfrm().await?;
 
     for (socket, payload, expected_teid) in [
         (&ue_mark_a_socket, b"opc-mark-a".as_slice(), PEER_TEID_A),
@@ -7141,7 +7372,7 @@ async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
     backend.remove_device(&device).await?;
     assert!(
         !pin_dir.exists(),
-        "device removal must unlink the complete 25-map pin graph"
+        "device removal must unlink the complete current pin graph"
     );
     drop(backend);
     drop(net);
@@ -9217,8 +9448,8 @@ async fn cleanup_only_recovery_refuses_older_schema_before_mutation(
 
 /// Cleanup-only recovery exposes only the legacy PDP-context cleanup surface.
 /// A retained graph that also carries a canonical committed grouped authority
-/// is therefore outside that authority even when all 21 pins have this build's
-/// exact ABI and the legacy IPv4 endpoint matches the request. The refusal
+/// is therefore outside that authority even when every current pin has this
+/// build's exact ABI and the legacy IPv4 endpoint matches the request. The refusal
 /// must happen before either forwarding hook or any grouped byte is changed.
 #[tokio::test]
 // The serial guard is deliberately held for the entire test body; see
@@ -9252,6 +9483,7 @@ async fn cleanup_only_recovery_refuses_committed_grouped_state_before_mutation(
 
     seed_committed_grouped_state(&pin_dir, device.ifindex);
     let pins_before = current_pin_graph_snapshot(&pin_dir);
+    let proof_source_before = traffic_observation_source_contents(&pin_dir);
     let hooks_before = current_hook_snapshot();
     drop(owner);
 
@@ -9271,7 +9503,11 @@ async fn cleanup_only_recovery_refuses_committed_grouped_state_before_mutation(
 
     assert!(
         current_pin_graph_snapshot(&pin_dir) == pins_before,
-        "grouped-state refusal must preserve every pin, map ID, and map byte"
+        "grouped-state refusal must preserve every pin, map ID, and durable map byte"
+    );
+    assert!(
+        traffic_observation_source_contents(&pin_dir) == proof_source_before,
+        "grouped-state refusal must precede every proof-source mutation"
     );
     assert!(
         current_hook_snapshot() == hooks_before,
@@ -9286,7 +9522,8 @@ async fn cleanup_only_recovery_refuses_committed_grouped_state_before_mutation(
 /// Stable-map contents are untrusted retained state. An active legacy context
 /// with an out-of-range DSCP byte must be classified structurally, never
 /// adopted as cleanup authority. Safety fencing may already have removed both
-/// hooks when semantic validation discovers the corruption, but no pin or map
+/// hooks and invalidated the restart-sensitive proof source when semantic
+/// validation discovers the corruption, but no pin or durable forwarding map
 /// byte may be repaired, migrated, or discarded.
 #[tokio::test]
 // The serial guard is deliberately held for the entire test body; see
@@ -9321,6 +9558,7 @@ async fn cleanup_only_recovery_refuses_malformed_legacy_state_without_map_mutati
     let pin_dir = net.pin_root.join("s2bu");
     seed_malformed_default_dscp(&pin_dir);
     let pins_before = current_pin_graph_snapshot(&pin_dir);
+    let proof_source_before = traffic_observation_source_contents(&pin_dir);
     let hooks_before = current_hook_snapshot();
     drop(owner);
 
@@ -9335,7 +9573,12 @@ async fn cleanup_only_recovery_refuses_malformed_legacy_state_without_map_mutati
 
     assert!(
         current_pin_graph_snapshot(&pin_dir) == pins_before,
-        "malformed-state refusal must preserve every pin, map ID, and map byte"
+        "malformed-state refusal must preserve every pin, map ID, and durable map byte"
+    );
+    assert!(
+        traffic_observation_source_contents(&pin_dir)
+            .is_restart_fenced_from(&proof_source_before),
+        "malformed-state refusal after restart must leave proof publication fenced, cleared, and unable to reuse a stale source epoch"
     );
     let egress_after = tc_filters("egress");
     let ingress_after = tc_filters("ingress");
@@ -10144,6 +10387,10 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
     fs::create_dir_all(&pin_dir_b).expect("create alternate current pin directory");
     let mut alternate = EbpfLoader::new()
         .default_map_pin_directory(&pin_dir_b)
+        .map_pin_path(
+            GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+            pin_dir_b.join(GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME),
+        )
         .load(CURRENT_DATAPATH_OBJECT)
         .expect("load committed current object for alternate graph");
     {
@@ -10194,6 +10441,14 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
         MAP_TFT_CLASSIFIER_META,
         MAP_TFT_CLASSIFIER_FILTERS,
         MAP_TFT_CLASSIFIER_COUNTERS,
+        GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
     ];
     let pins_before = pin_directory_listing(&pin_dir_b);
     assert_eq!(
@@ -10247,6 +10502,14 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
             MAP_TFT_CLASSIFIER_META,
             MAP_TFT_CLASSIFIER_FILTERS,
             MAP_TFT_CLASSIFIER_COUNTERS,
+            GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
         ],
     );
     let alternate_downlink_maps = exact_pinned_map_ids(
@@ -10267,6 +10530,13 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
             MAP_SESSION_GROUPS,
             MAP_SESSION_DOWNLINK_INDEX,
             MAP_CONFIG_IPV6,
+            GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
         ],
     );
     assert_ne!(uplink_maps_before, alternate_uplink_maps);
