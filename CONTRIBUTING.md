@@ -7,7 +7,7 @@ Thank you for your interest in contributing to the OpenPacketCore SDK. This docu
 ### Required toolchain
 
 - **Rust** ≥ 1.88 (install via [rustup](https://rustup.rs/))
-- **Go** ≥ 1.26
+- **Go** ≥ 1.26.6
 - **kubectl**
 - **kustomize**
 - **helm** ≥ 3
