@@ -189,6 +189,7 @@ impl CompletedMembership {
 
 struct MembershipAdmissionState {
     current: Arc<SessionReplicationManifest>,
+    current_binding: Option<LocalReplicaBinding>,
     pending: Option<PendingMembership>,
     last_completed: Option<CompletedMembership>,
 }
@@ -213,10 +214,12 @@ impl SessionMembershipAdmission {
     /// A joining replica may be absent from `current`; it admits no connection
     /// until a staged successor contains its exact identity.
     pub fn new(current: Arc<SessionReplicationManifest>, local_replica_id: ReplicaId) -> Self {
+        let current_binding = current.bind_local(local_replica_id.clone()).ok();
         Self {
             local_replica_id,
             state: Arc::new(RwLock::new(MembershipAdmissionState {
                 current,
+                current_binding,
                 pending: None,
                 last_completed: None,
             })),
@@ -225,10 +228,15 @@ impl SessionMembershipAdmission {
 
     /// Preserve the legacy single-manifest server behavior.
     pub fn from_current_binding(binding: LocalReplicaBinding) -> Self {
-        Self::new(
-            Arc::clone(binding.manifest()),
-            binding.local_replica_id().clone(),
-        )
+        Self {
+            local_replica_id: binding.local_replica_id().clone(),
+            state: Arc::new(RwLock::new(MembershipAdmissionState {
+                current: Arc::clone(binding.manifest()),
+                current_binding: Some(binding),
+                pending: None,
+                last_completed: None,
+            })),
+        }
     }
 
     /// Stage the exact successor encoded by a validated topology request.
@@ -511,6 +519,7 @@ impl SessionMembershipAdmission {
         let from_epoch = state.current.configuration_epoch();
         let to_epoch = pending.manifest.configuration_epoch();
         state.current = pending.manifest;
+        state.current_binding = state.current.bind_local(self.local_replica_id.clone()).ok();
         state.last_completed = Some(CompletedMembership::Finalized {
             transition_id,
             request_digest: pending.request_digest,
@@ -606,7 +615,10 @@ impl SessionMembershipAdmission {
     pub async fn snapshot(&self) -> SessionMembershipAdmissionSnapshot {
         let state = self.state.read().await;
         SessionMembershipAdmissionSnapshot {
-            current_identity: state.current.consensus_identity(),
+            current_identity: state.current_binding.as_ref().map_or_else(
+                || state.current.consensus_identity(),
+                LocalReplicaBinding::consensus_identity,
+            ),
             current_epoch: state.current.configuration_epoch(),
             current_members: state.current.configured_members(),
             pending_identity: state
@@ -638,12 +650,29 @@ impl SessionMembershipAdmission {
         authenticated_spiffe: Option<&SpiffeId>,
     ) -> Result<SessionMembershipEngineScope, SessionConsensusPeerError> {
         let state = self.state.read().await;
-        for manifest in std::iter::once(&state.current)
-            .chain(state.pending.as_ref().map(|pending| &pending.manifest))
-        {
-            if manifest.consensus_identity() != identity {
+        let current_binding = state
+            .current_binding
+            .as_ref()
+            .filter(|binding| binding.consensus_identity() == identity);
+        let pending_binding = state.pending.as_ref().and_then(|pending| {
+            (pending.manifest.consensus_identity() == identity)
+                .then(|| {
+                    pending
+                        .manifest
+                        .bind_local(self.local_replica_id.clone())
+                        .ok()
+                })
+                .flatten()
+        });
+        for (manifest, binding) in std::iter::once((&state.current, current_binding)).chain(
+            state
+                .pending
+                .as_ref()
+                .map(|pending| (&pending.manifest, pending_binding.as_ref())),
+        ) {
+            let Some(binding) = binding else {
                 continue;
-            }
+            };
             let local_node_id = manifest.consensus_node_id(&self.local_replica_id);
             let configured_sender_node_id = manifest.consensus_node_id(sender_replica_id);
             if expected_server_replica_id != &self.local_replica_id
@@ -660,11 +689,8 @@ impl SessionMembershipAdmission {
             {
                 return Err(SessionConsensusPeerError::Authentication);
             }
-            let binding = manifest
-                .bind_local(self.local_replica_id.clone())
-                .map_err(|_| SessionConsensusPeerError::ScopeMismatch)?;
             return Ok(SessionMembershipEngineScope {
-                binding,
+                binding: binding.clone(),
                 sender_replica_id: sender_replica_id.clone(),
                 sender_node_id,
                 authenticated_spiffe: authenticated_spiffe.cloned(),
@@ -686,11 +712,24 @@ impl SessionMembershipAdmission {
             return Err(SessionConsensusPeerError::ScopeMismatch);
         }
 
-        let current_matches = manifest_matches_scope(&state.current, scope, &self.local_replica_id);
+        let current_matches = manifest_matches_scope(
+            &state.current,
+            state
+                .current_binding
+                .as_ref()
+                .map(LocalReplicaBinding::consensus_identity),
+            scope,
+            &self.local_replica_id,
+        );
         let (pending_matches, pending_voting_admitted) =
             state.pending.as_ref().map_or((false, false), |pending| {
                 (
-                    manifest_matches_scope(&pending.manifest, scope, &self.local_replica_id),
+                    manifest_matches_scope(
+                        &pending.manifest,
+                        Some(pending.manifest.consensus_identity()),
+                        scope,
+                        &self.local_replica_id,
+                    ),
                     pending.voting_admitted,
                 )
             });
@@ -732,10 +771,22 @@ impl SessionMembershipAdmission {
         scope: &SessionMembershipEngineScope,
     ) -> Result<SessionMembershipEngineLease, SessionConsensusPeerError> {
         let state = Arc::clone(&self.state).read_owned().await;
-        let admitted = manifest_matches_scope(&state.current, scope, &self.local_replica_id)
-            || state.pending.as_ref().is_some_and(|pending| {
-                manifest_matches_scope(&pending.manifest, scope, &self.local_replica_id)
-            });
+        let admitted = manifest_matches_scope(
+            &state.current,
+            state
+                .current_binding
+                .as_ref()
+                .map(LocalReplicaBinding::consensus_identity),
+            scope,
+            &self.local_replica_id,
+        ) || state.pending.as_ref().is_some_and(|pending| {
+            manifest_matches_scope(
+                &pending.manifest,
+                Some(pending.manifest.consensus_identity()),
+                scope,
+                &self.local_replica_id,
+            )
+        });
         if !admitted {
             return Err(SessionConsensusPeerError::ScopeMismatch);
         }
@@ -830,10 +881,11 @@ pub(crate) struct SessionMembershipEngineLease {
 
 fn manifest_matches_scope(
     manifest: &SessionReplicationManifest,
+    admitted_identity: Option<ConsensusIdentity>,
     scope: &SessionMembershipEngineScope,
     local_replica_id: &ReplicaId,
 ) -> bool {
-    manifest.consensus_identity() == scope.binding.consensus_identity()
+    admitted_identity == Some(scope.binding.consensus_identity())
         && manifest.consensus_node_id(local_replica_id)
             == Some(scope.binding.local_consensus_node_id())
         && manifest.consensus_node_id(&scope.sender_replica_id) == Some(scope.sender_node_id)

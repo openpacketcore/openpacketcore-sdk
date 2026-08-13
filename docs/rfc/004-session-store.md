@@ -866,6 +866,17 @@ declared backing identities. It does not promote a caller-declared failure
 domain into physical-placement evidence. The default rejects correlated
 failure-domain descriptors; only an explicit reduced-resilience policy admits
 them so the deployment can report their resilience disposition truthfully.
+The fixed authority-profile marker and explicit placement policy are part of a
+domain-separated fixed-quorum authority identity: otherwise-identical strict
+and reduced-resilience fixed profiles MUST derive different authenticated peer,
+durable-store, and snapshot scopes. A fixed profile and a dynamic profile with
+the same descriptor set MUST also derive different scopes. Mixed-policy or
+mixed-profile peers MUST fail authenticated admission before Openraft or durable
+Raft initialization. Dynamic-profile identities remain descriptor- and
+epoch-derived and do not include the fixed-profile or placement-policy binding.
+`ConsensusSessionStore::open_fixed_durable_quorum` is supported only on Linux,
+where descriptor-pinned SQLite snapshots are available; other platforms MUST
+return `FixedQuorumUnsupportedPlatform` before durable initialization.
 Fixed membership does not authorize dynamic membership transitions, a second
 consensus engine, a controller feed, or a new packet-core protocol path.
 `try_from_fixed_durable_quorum_with_authenticated_placement` may additionally

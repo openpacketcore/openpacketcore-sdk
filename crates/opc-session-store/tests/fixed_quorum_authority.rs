@@ -13,12 +13,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use opc_session_store::{
-    ConsensusSessionStore, ConsensusSessionStoreOpenError, FixedQuorumTrafficAuthority,
-    ObservedPhysicalNodeIdentity, OwnerId, PlacementResilienceDisposition,
-    PlacementResiliencePolicy, QuorumReplicaDescriptor, QuorumTopologyAttestor,
-    QuorumTopologyConfig, QuorumTopologyError, QuorumTopologyMode, ReplicaBackingIdentity,
-    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionBackend,
-    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    derive_fixed_durable_quorum_consensus_identity, ConsensusSessionStore,
+    ConsensusSessionStoreOpenError, FixedQuorumTrafficAuthority, ObservedPhysicalNodeIdentity,
+    OwnerId, PlacementResilienceDisposition, PlacementResiliencePolicy, QuorumReplicaDescriptor,
+    QuorumTopologyAttestor, QuorumTopologyConfig, QuorumTopologyError, QuorumTopologyMode,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    SessionBackend, SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
     SessionConsumerIdentity, SessionKey, SessionKeyType, SessionLeaseManager,
     SessionQuorumConsumer, SessionTopologyAbortAdmissionProof,
@@ -210,6 +210,25 @@ fn consensus_identity(members: &[QuorumReplicaDescriptor]) -> ConsensusIdentity 
     ConsensusIdentity::new(cluster_id, configuration_id, epoch)
 }
 
+fn fixed_consensus_identity(
+    members: &[QuorumReplicaDescriptor],
+    placement_policy: PlacementResiliencePolicy,
+) -> ConsensusIdentity {
+    let cluster_id =
+        ConsensusClusterId::new("fixed-quorum-authority-tests").expect("test cluster ID");
+    let epoch = ConsensusConfigurationEpoch::new(1).expect("test configuration epoch");
+    let fingerprints = members
+        .iter()
+        .map(QuorumReplicaDescriptor::configuration_fingerprint)
+        .collect::<Vec<_>>();
+    derive_fixed_durable_quorum_consensus_identity(
+        cluster_id,
+        epoch,
+        &fingerprints,
+        placement_policy,
+    )
+}
+
 fn fixed_topology(
     members: Vec<QuorumReplicaDescriptor>,
 ) -> Result<ValidatedQuorumTopology, QuorumTopologyError> {
@@ -232,10 +251,121 @@ fn fixed_topology_for_local(
         QuorumTopologyConfig::new_consensus(
             replica_id(local_index),
             members.clone(),
-            consensus_identity(&members),
+            fixed_consensus_identity(&members, placement_policy),
         ),
         placement_policy,
     )
+}
+
+#[tokio::test]
+async fn fixed_placement_policy_changes_authenticated_scope_before_durable_open() {
+    for voter_count in [3, 5] {
+        let members = fixed_members(voter_count);
+        let strict = fixed_topology_for_local(
+            0,
+            members.clone(),
+            PlacementResiliencePolicy::RequireIndependentFailureDomains,
+        )
+        .expect("strict fixed topology");
+        let reduced = fixed_topology_for_local(
+            0,
+            members,
+            PlacementResiliencePolicy::AllowReducedResilience,
+        )
+        .expect("reduced fixed topology");
+
+        assert_ne!(
+            strict.consensus_identity(),
+            reduced.consensus_identity(),
+            "fixed {voter_count}-voter policies must not share an authenticated scope"
+        );
+        let dynamic_members = fixed_members(voter_count);
+        let dynamic = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+            replica_id(0),
+            dynamic_members.clone(),
+            consensus_identity(&dynamic_members),
+        ))
+        .expect("dynamic topology");
+        assert_ne!(
+            strict.consensus_identity(),
+            dynamic.consensus_identity(),
+            "fixed {voter_count}-voter authority must not share the dynamic profile scope"
+        );
+
+        let directory = tempfile::tempdir().expect("fixed policy test directory");
+        let database_path = directory.path().join("voter.sqlite");
+        let result = ConsensusSessionStore::open_fixed_durable_quorum(
+            strict.clone(),
+            SqliteSessionBackend::open(&database_path).expect("file-backed voter store"),
+            directory.path().join("snapshots"),
+            scoped_peers(&reduced),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ConsensusSessionStoreOpenError::PeerSetMismatch)
+        ));
+
+        let connection = rusqlite::Connection::open(database_path).expect("open voter database");
+        let durable_raft_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query durable raft schema");
+        assert_eq!(
+            durable_raft_rows, 0,
+            "mixed policies must fail before durable Raft initialization"
+        );
+
+        let dynamic_database_path = directory.path().join("dynamic-voter.sqlite");
+        let dynamic_result = ConsensusSessionStore::open_fixed_durable_quorum(
+            strict,
+            SqliteSessionBackend::open(&dynamic_database_path).expect("file-backed voter store"),
+            directory.path().join("dynamic-snapshots"),
+            scoped_peers(&dynamic),
+        )
+        .await;
+        assert!(matches!(
+            dynamic_result,
+            Err(ConsensusSessionStoreOpenError::PeerSetMismatch)
+        ));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn fixed_durable_quorum_rejects_unsupported_platform_before_durable_initialization() {
+    let members = fixed_members(3);
+    let topology = fixed_topology(members).expect("fixed topology admission");
+    let directory = tempfile::tempdir().expect("fixed platform test directory");
+    let database_path = directory.path().join("voter.sqlite");
+
+    let result = ConsensusSessionStore::open_fixed_durable_quorum(
+        topology.clone(),
+        SqliteSessionBackend::open(&database_path).expect("file-backed voter store"),
+        directory.path().join("snapshots"),
+        scoped_peers(&topology),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(ConsensusSessionStoreOpenError::FixedQuorumUnsupportedPlatform)
+    ));
+
+    let connection = rusqlite::Connection::open(database_path).expect("open voter database");
+    let durable_raft_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query durable raft schema");
+    assert_eq!(
+        durable_raft_rows, 0,
+        "unsupported fixed quorum must fail before durable Raft initialization"
+    );
 }
 
 fn fixed_members(count: usize) -> Vec<QuorumReplicaDescriptor> {
@@ -273,6 +403,75 @@ async fn open_fixed_cluster(
     (directory, database_paths, stores)
 }
 
+async fn open_fixed_cluster_with_members(
+    members: Vec<QuorumReplicaDescriptor>,
+    placement_policy: PlacementResiliencePolicy,
+) -> (tempfile::TempDir, Vec<ConsensusSessionStore>) {
+    let member_count = members.len();
+    let directory = tempfile::tempdir().expect("fixed cluster directory");
+    let identity = fixed_consensus_identity(&members, placement_policy);
+    let topologies = (0..member_count)
+        .map(|index| {
+            fixed_topology_for_local(index, members.clone(), placement_policy)
+                .map(|topology| (index, topology))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .expect("fixed cluster topologies");
+    let node_ids = topologies
+        .iter()
+        .map(|(_, topology)| {
+            topology
+                .local_consensus_node_id()
+                .expect("fixed local node ID")
+        })
+        .collect::<Vec<_>>();
+    let mut paths = BTreeMap::new();
+    for source in 0..member_count {
+        for (target, node_id) in node_ids.iter().copied().enumerate() {
+            if source != target {
+                paths.insert(
+                    (source, target),
+                    Arc::new(ScopedLoopbackPeer::new(node_id, identity)),
+                );
+            }
+        }
+    }
+    let mut stores = Vec::new();
+    for (source, topology) in topologies {
+        let peers = (0..member_count)
+            .filter(|target| *target != source)
+            .map(|target| {
+                let peer: Arc<dyn SessionConsensusPeer> = paths
+                    .get(&(source, target))
+                    .expect("fixed scoped path")
+                    .clone();
+                (node_ids[target], peer)
+            })
+            .collect::<BTreeMap<_, _>>();
+        stores.push(
+            ConsensusSessionStore::open_fixed_durable_quorum(
+                topology,
+                SqliteSessionBackend::open(directory.path().join(format!("voter-{source}.sqlite")))
+                    .expect("file-backed voter store"),
+                directory.path().join(format!("snapshots-{source}")),
+                peers,
+            )
+            .await
+            .expect("open fixed cluster voter"),
+        );
+    }
+    for ((_, target), peer) in &paths {
+        peer.install(stores[*target].rpc_handler()).await;
+    }
+    for result in
+        futures_util::future::join_all(stores.iter().map(ConsensusSessionStore::initialize_cluster))
+            .await
+    {
+        result.expect("initialize fixed cluster membership");
+    }
+    (directory, stores)
+}
+
 async fn open_fixed_cluster_with_paths(
     member_count: usize,
     placement_policy: PlacementResiliencePolicy,
@@ -308,7 +507,7 @@ async fn open_fixed_cluster_in_with_paths(
     BTreeMap<(usize, usize), Arc<ScopedLoopbackPeer>>,
 ) {
     let members = fixed_members(member_count);
-    let identity = consensus_identity(&members);
+    let identity = fixed_consensus_identity(&members, placement_policy);
     let topologies = (0..member_count)
         .map(|index| {
             fixed_topology_for_local(index, members.clone(), placement_policy)
@@ -490,6 +689,35 @@ fn fixed_durable_quorum_admits_correlated_descriptors_without_claiming_independe
     ));
 }
 
+#[tokio::test]
+async fn reduced_policy_forms_a_live_correlated_fixed_three_voter_quorum() {
+    let members = (0..3)
+        .map(|index| descriptor(index, 0, index, index))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        fixed_topology_with_policy(
+            members.clone(),
+            PlacementResiliencePolicy::RequireIndependentFailureDomains,
+        ),
+        Err(QuorumTopologyError::DuplicateFailureDomain)
+    ));
+
+    let (_directory, stores) =
+        open_fixed_cluster_with_members(members, PlacementResiliencePolicy::AllowReducedResilience)
+            .await;
+    let readiness = stores[0]
+        .probe_fixed_durable_quorum_readiness_at(TopologyAttestationTime::from_unix_seconds(1))
+        .await;
+    assert_eq!(
+        readiness.traffic_authority(),
+        FixedQuorumTrafficAuthority::Granted,
+    );
+    assert_eq!(
+        readiness.placement_resilience().disposition(),
+        PlacementResilienceDisposition::ReducedResilience,
+    );
+}
+
 #[test]
 fn fixed_durable_quorum_requires_exact_three_or_five_voters() {
     for count in [1_usize, 4, 7] {
@@ -634,7 +862,8 @@ async fn fixed_durable_quorum_rejects_ephemeral_storage() {
 #[tokio::test]
 async fn file_backed_fixed_five_voter_quorum_reaches_granted_authority() {
     let members = fixed_members(5);
-    let identity = consensus_identity(&members);
+    let identity =
+        fixed_consensus_identity(&members, PlacementResiliencePolicy::AllowReducedResilience);
     let topologies = (0..5)
         .map(|index| {
             fixed_topology_for_local(
@@ -1527,8 +1756,8 @@ async fn fixed_authority_profile_persists_across_reopen_and_rejects_profile_chan
     let fixed = fixed_topology(members.clone()).expect("fixed topology admission");
     let dynamic = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
         replica_id(0),
-        members,
-        fixed.consensus_identity().expect("consensus identity"),
+        members.clone(),
+        consensus_identity(&members),
     ))
     .expect("dynamic topology admission");
     let directory = tempfile::tempdir().expect("authority-profile directory");
@@ -1592,7 +1821,7 @@ async fn placement_expiry_downgrades_only_the_fixed_quorum_placement_result() {
     let members = (0..3)
         .map(|index| descriptor(index, index, index, index))
         .collect::<Vec<_>>();
-    let identity = consensus_identity(&members);
+    let identity = fixed_consensus_identity(&members, PlacementResiliencePolicy::default());
     let observed_at = TopologyAttestationTime::from_unix_seconds(100);
     let admitted_at = TopologyAttestationTime::from_unix_seconds(110);
     let expires_at = TopologyAttestationTime::from_unix_seconds(200);
@@ -1744,5 +1973,68 @@ async fn placement_expiry_downgrades_only_the_fixed_quorum_placement_result() {
     assert_eq!(
         refreshed.placement_resilience().disposition(),
         PlacementResilienceDisposition::IndependentPlacementQualified,
+    );
+}
+
+#[tokio::test]
+async fn fixed_five_voter_authenticated_placement_expiry_preserves_traffic_authority() {
+    let members = fixed_members(5);
+    let identity = fixed_consensus_identity(&members, PlacementResiliencePolicy::default());
+    let observed_at = TopologyAttestationTime::from_unix_seconds(100);
+    let qualified_at = TopologyAttestationTime::from_unix_seconds(110);
+    let expires_at = TopologyAttestationTime::from_unix_seconds(200);
+    let collector =
+        TopologyCollectorId::new("fixed-five-placement-attestor").expect("collector ID");
+    let policy = TopologyAttestationPolicy::try_new(
+        TopologyAttestationProvenance::AuthenticatedPlatform,
+        vec![collector.clone()],
+        Duration::from_secs(300),
+    )
+    .expect("placement policy");
+    let topology =
+        fixed_topology_for_local(0, members.clone(), PlacementResiliencePolicy::default())
+            .expect("fixed five-voter topology");
+    let placement = topology
+        .verify_fixed_durable_quorum_placement_evidence(
+            authenticated_placement_evidence(
+                &members,
+                identity,
+                &collector,
+                observed_at,
+                expires_at,
+            ),
+            &policy,
+            &DigestTopologyAttestor,
+            qualified_at,
+        )
+        .expect("authenticated placement");
+    let (_directory, _database_paths, stores) =
+        open_fixed_cluster(5, PlacementResiliencePolicy::default()).await;
+
+    let qualified = stores[0]
+        .probe_fixed_durable_quorum_readiness_with_placement_attestation_at(
+            &placement,
+            qualified_at,
+        )
+        .await;
+    assert_eq!(
+        qualified.traffic_authority(),
+        FixedQuorumTrafficAuthority::Granted,
+    );
+    assert_eq!(
+        qualified.placement_resilience().disposition(),
+        PlacementResilienceDisposition::IndependentPlacementQualified,
+    );
+
+    let expired = stores[0]
+        .probe_fixed_durable_quorum_readiness_with_placement_attestation_at(&placement, expires_at)
+        .await;
+    assert_eq!(
+        expired.traffic_authority(),
+        FixedQuorumTrafficAuthority::Granted,
+    );
+    assert_eq!(
+        expired.placement_resilience().disposition(),
+        PlacementResilienceDisposition::IndependentPlacementWithheld,
     );
 }

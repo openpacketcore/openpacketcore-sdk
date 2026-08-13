@@ -126,8 +126,14 @@ five `QuorumReplicaDescriptor` values, each with a distinct `ReplicaId`,
 (for example `spiffe://example.invalid/session/voter/0`), and
 `ReplicaBackingIdentity`; the strict default also requires distinct declared
 `ReplicaFailureDomain` values. For each local voter, construct the topology and
-open its file-backed SQLite store as follows (the `identity` is the one
-`ConsensusIdentity` derived for this exact descriptor set):
+open its file-backed SQLite store as follows. The `identity` must be the
+fixed-profile- and policy-bound result of
+`derive_fixed_durable_quorum_consensus_identity`; the ordinary descriptor-only
+consensus identity remains for dynamic profiles. This constructor is supported
+only on Linux because fixed quorum recovery uses descriptor-pinned SQLite
+snapshots; on other platforms it returns
+`ConsensusSessionStoreOpenError::FixedQuorumUnsupportedPlatform` before
+initializing durable Raft state.
 
 ```rust
 let members = vec![
@@ -155,6 +161,16 @@ let members = vec![
 ]; // use five entries for the fixed five-voter profile
 let policy = PlacementResiliencePolicy::default();
 // Or explicitly opt in: PlacementResiliencePolicy::AllowReducedResilience.
+let fingerprints = members
+    .iter()
+    .map(QuorumReplicaDescriptor::configuration_fingerprint)
+    .collect::<Vec<_>>();
+let identity = derive_fixed_durable_quorum_consensus_identity(
+    cluster_id,
+    configuration_epoch,
+    &fingerprints,
+    policy,
+);
 let topology = ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy(
     QuorumTopologyConfig::new_consensus(local_replica_id, members.clone(), identity),
     policy,
@@ -168,7 +184,7 @@ let store = ConsensusSessionStore::open_fixed_durable_quorum(
 ```
 
 `consensus_peers` must contain exactly the other fixed voters and each peer must
-be authenticated and bound to the same cluster/configuration/epoch identity.
+be authenticated and bound to the same policy-bound fixed-quorum identity.
 `open_fixed_durable_quorum` rejects in-memory SQLite, non-fixed topologies, and
 peer-set or scope mismatches; it does not add members dynamically. After
 `initialize_cluster`, gate live traffic only on

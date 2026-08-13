@@ -162,6 +162,10 @@ pub enum ConsensusSessionStoreOpenError {
     /// Durable storage could not be opened or validated.
     #[error("session consensus durable storage is unavailable")]
     StorageUnavailable,
+    /// Fixed durable quorum snapshots require Linux descriptor-pinned SQLite
+    /// handling and are unsupported on this platform.
+    #[error("fixed durable quorum is unsupported on this platform")]
+    FixedQuorumUnsupportedPlatform,
     /// The fixed SDK Openraft runtime profile was invalid.
     #[error("session consensus runtime configuration is invalid")]
     InvalidRuntimeConfiguration,
@@ -479,6 +483,9 @@ impl ConsensusSessionStore {
         snapshot_dir: impl Into<PathBuf>,
         peers: BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        if !cfg!(target_os = "linux") {
+            return Err(ConsensusSessionStoreOpenError::FixedQuorumUnsupportedPlatform);
+        }
         let operation_timeout = DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
         if topology.summary().mode() != QuorumTopologyMode::FixedDurableQuorum {
             return Err(ConsensusSessionStoreOpenError::InvalidTopology);

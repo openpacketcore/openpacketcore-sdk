@@ -14,12 +14,13 @@ use opc_consensus::{
     test
 ))]
 use opc_session_store::ReplicaBackingIdentity;
+use opc_session_store::{
+    derive_fixed_durable_quorum_consensus_identity, PlacementResiliencePolicy,
+    QuorumReplicaDescriptor, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    QUORUM_TOPOLOGY_MAX_MEMBERS,
+};
 #[cfg(any(feature = "legacy-session-net-compat", test))]
 use opc_session_store::{BackendPeerBinding, BackendPeerScopeIdentity};
-use opc_session_store::{
-    PlacementResiliencePolicy, QuorumReplicaDescriptor, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, QUORUM_TOPOLOGY_MAX_MEMBERS,
-};
 use opc_types::SpiffeId;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -59,6 +60,8 @@ pub enum SessionManifestError {
     MissingLocalReplica,
     #[error("remote replica is not present in the session replication manifest")]
     MissingRemoteReplica,
+    #[error("fixed durable quorum requires exactly three or five members")]
+    FixedDurableQuorumMemberCount,
 }
 
 /// Admission policy shared with fixed durable-quorum placement reporting.
@@ -183,6 +186,7 @@ pub struct SessionReplicationManifest {
     placement_policy: SessionPlacementPolicy,
     placement_disposition: SessionPlacementDisposition,
     consensus_identity: SessionConsensusIdentity,
+    fixed_quorum_consensus_identity: SessionConsensusIdentity,
     members: BTreeMap<ReplicaId, ManifestMember>,
     node_ids: BTreeMap<ReplicaId, SessionConsensusNodeId>,
 }
@@ -317,6 +321,12 @@ impl SessionReplicationManifest {
             consensus_configuration_id,
             consensus_epoch,
         );
+        let fixed_quorum_consensus_identity = derive_fixed_durable_quorum_consensus_identity(
+            consensus_cluster_id,
+            consensus_epoch,
+            &component_fingerprints,
+            placement_policy,
+        );
         let mut node_ids = BTreeMap::new();
         let mut admitted_node_ids = HashSet::with_capacity(members.len());
         for replica_id in members.keys() {
@@ -341,6 +351,7 @@ impl SessionReplicationManifest {
             placement_policy,
             placement_disposition,
             consensus_identity,
+            fixed_quorum_consensus_identity,
             members,
             node_ids,
         })
@@ -374,6 +385,14 @@ impl SessionReplicationManifest {
         self.consensus_identity
     }
 
+    /// Exact policy-bound identity for immutable fixed durable-quorum traffic.
+    ///
+    /// This intentionally differs from [`Self::consensus_identity`], which
+    /// retains the established dynamic-profile identity and behavior.
+    pub const fn fixed_durable_quorum_consensus_identity(&self) -> SessionConsensusIdentity {
+        self.fixed_quorum_consensus_identity
+    }
+
     /// Return the canonical consensus node ordinal for one admitted replica.
     pub fn consensus_node_id(&self, replica_id: &ReplicaId) -> Option<SessionConsensusNodeId> {
         self.node_ids.get(replica_id).copied()
@@ -391,9 +410,37 @@ impl SessionReplicationManifest {
         if !self.members.contains_key(&local_replica_id) {
             return Err(SessionManifestError::MissingLocalReplica);
         }
+        self.bind_local_with_consensus_identity(local_replica_id, self.consensus_identity)
+    }
+
+    /// Bind one local member to the authenticated immutable fixed-quorum
+    /// profile. The selected placement policy is part of every resulting
+    /// peer handshake scope.
+    pub fn bind_fixed_durable_quorum_local(
+        self: &Arc<Self>,
+        local_replica_id: ReplicaId,
+    ) -> Result<LocalReplicaBinding, SessionManifestError> {
+        if !matches!(self.members.len(), 3 | 5) {
+            return Err(SessionManifestError::FixedDurableQuorumMemberCount);
+        }
+        self.bind_local_with_consensus_identity(
+            local_replica_id,
+            self.fixed_quorum_consensus_identity,
+        )
+    }
+
+    fn bind_local_with_consensus_identity(
+        self: &Arc<Self>,
+        local_replica_id: ReplicaId,
+        consensus_identity: SessionConsensusIdentity,
+    ) -> Result<LocalReplicaBinding, SessionManifestError> {
+        if !self.members.contains_key(&local_replica_id) {
+            return Err(SessionManifestError::MissingLocalReplica);
+        }
         Ok(LocalReplicaBinding {
             manifest: self.clone(),
             local_replica_id,
+            consensus_identity,
         })
     }
 
@@ -446,6 +493,7 @@ impl fmt::Debug for SessionReplicationManifest {
 pub struct LocalReplicaBinding {
     manifest: Arc<SessionReplicationManifest>,
     local_replica_id: ReplicaId,
+    consensus_identity: SessionConsensusIdentity,
 }
 
 impl LocalReplicaBinding {
@@ -480,7 +528,7 @@ impl LocalReplicaBinding {
 
     /// Exact consensus identity derived from the immutable manifest and epoch.
     pub fn consensus_identity(&self) -> SessionConsensusIdentity {
-        self.manifest.consensus_identity()
+        self.consensus_identity
     }
 
     /// Canonical non-zero node ordinal for this local replica.
@@ -508,6 +556,7 @@ impl LocalReplicaBinding {
         })
     }
 
+    #[cfg(feature = "legacy-session-net-compat")]
     pub(crate) fn member_spiffe_id(&self, replica_id: &ReplicaId) -> Option<&SpiffeId> {
         self.manifest
             .member(replica_id)

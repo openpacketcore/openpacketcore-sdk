@@ -479,6 +479,48 @@ pub struct QuorumReplicaDescriptor {
 
 const REPLICA_DESCRIPTOR_FINGERPRINT_DOMAIN: &[u8] =
     b"openpacketcore/session-store/quorum-replica-descriptor/v1\0";
+const FIXED_QUORUM_AUTHORITY_PROFILE_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/fixed-quorum-authority-profile/v1\0";
+const FIXED_QUORUM_POLICY_BINDING_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/fixed-quorum-placement-policy/v1\0";
+
+/// Derive the authenticated scope for one immutable fixed durable quorum.
+///
+/// Dynamic consensus identities continue to derive directly from the member
+/// descriptor fingerprints. Fixed quorum authority additionally commits both
+/// its fixed authority-profile marker and explicit placement-resilience policy
+/// under distinct domains, preventing dynamic and fixed deployments (or fixed
+/// deployments that make different resilience claims) from sharing peers,
+/// durable state, snapshots, or Openraft traffic.
+pub fn derive_fixed_durable_quorum_consensus_identity(
+    cluster_id: crate::consensus::SessionConsensusClusterId,
+    configuration_epoch: crate::consensus::SessionConsensusConfigurationEpoch,
+    member_fingerprints: &[[u8; 32]],
+    placement_policy: PlacementResiliencePolicy,
+) -> SessionConsensusIdentity {
+    let mut profile_hasher = Sha256::new();
+    profile_hasher.update(FIXED_QUORUM_AUTHORITY_PROFILE_DOMAIN);
+    profile_hasher.update([1_u8]);
+    let profile_binding: [u8; 32] = profile_hasher.finalize().into();
+    let policy_tag = match placement_policy {
+        PlacementResiliencePolicy::RequireIndependentFailureDomains => 1_u8,
+        PlacementResiliencePolicy::AllowReducedResilience => 2_u8,
+    };
+    let mut policy_hasher = Sha256::new();
+    policy_hasher.update(FIXED_QUORUM_POLICY_BINDING_DOMAIN);
+    policy_hasher.update([policy_tag]);
+    let policy_binding: [u8; 32] = policy_hasher.finalize().into();
+
+    let mut authority_components = member_fingerprints.to_vec();
+    authority_components.push(profile_binding);
+    authority_components.push(policy_binding);
+    let configuration_id = opc_consensus::derive_configuration_id(
+        cluster_id,
+        configuration_epoch,
+        &authority_components,
+    );
+    SessionConsensusIdentity::new(cluster_id, configuration_id, configuration_epoch)
+}
 
 fn update_configuration_fingerprint_field(hasher: &mut Sha256, tag: u8, value: &[u8]) {
     // Each variable-width field is independently hashed before entering the
@@ -1020,12 +1062,26 @@ fn validate_topology(
             .iter()
             .map(QuorumReplicaDescriptor::configuration_fingerprint)
             .collect::<Vec<_>>();
-        let expected_configuration_id = opc_consensus::derive_configuration_id(
-            identity.cluster_id(),
-            identity.configuration_epoch(),
-            &component_fingerprints,
-        );
-        if identity.configuration_id() != expected_configuration_id {
+        let expected_identity = match (mode, fixed_durable_placement_policy) {
+            (QuorumTopologyMode::FixedDurableQuorum, Some(placement_policy)) => {
+                derive_fixed_durable_quorum_consensus_identity(
+                    identity.cluster_id(),
+                    identity.configuration_epoch(),
+                    &component_fingerprints,
+                    placement_policy,
+                )
+            }
+            _ => SessionConsensusIdentity::new(
+                identity.cluster_id(),
+                opc_consensus::derive_configuration_id(
+                    identity.cluster_id(),
+                    identity.configuration_epoch(),
+                    &component_fingerprints,
+                ),
+                identity.configuration_epoch(),
+            ),
+        };
+        if identity != expected_identity {
             return Err(QuorumTopologyError::ConsensusConfigurationIdMismatch);
         }
 

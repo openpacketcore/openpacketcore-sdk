@@ -22,8 +22,10 @@ and to `ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_po
 Construct one descriptor set with distinct `ReplicaId`, `.invalid`
 `ReplicaEndpoint`, example SPIFFE `ReplicaTlsIdentity`, and
 `ReplicaBackingIdentity` values (and distinct `ReplicaFailureDomain` values
-under the strict default), then reuse that set and the manifest's exact
-`consensus_identity()` when opening each local store:
+under the strict default), then use the manifest's fixed-profile- and
+policy-bound fixed-quorum binding and
+`fixed_durable_quorum_consensus_identity()` when opening each
+local store:
 
 ```rust
 let policy = SessionPlacementPolicy::RequireIndependentFailureDomains;
@@ -34,7 +36,7 @@ let manifest = Arc::new(SessionReplicationManifest::try_new_with_epoch_and_place
     descriptors.clone(),
     policy,
 )?);
-let local = manifest.bind_local(local_replica_id.clone())?;
+let local = manifest.bind_fixed_durable_quorum_local(local_replica_id.clone())?;
 let peer = RemoteSessionConsensusPeer::new_profiled(
     local.bind_remote(remote_replica_id)?,
     tls_config,
@@ -43,7 +45,7 @@ let topology = ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_place
     QuorumTopologyConfig::new_consensus(
         local_replica_id,
         descriptors,
-        manifest.consensus_identity(),
+        manifest.fixed_durable_quorum_consensus_identity(),
     ),
     policy,
 )?;
@@ -55,10 +57,17 @@ let store = ConsensusSessionStore::open_fixed_durable_quorum(
 ).await?;
 ```
 
+The fixed binding is distinct from `bind_local`: fixed and dynamic profiles
+with the same descriptors do not share an authenticated scope. Strict and
+reduced fixed policies also derive different scopes, so either mismatch is
+rejected during the authenticated Hello/Ack admission before Openraft dispatch.
+
 Create one authenticated `RemoteSessionConsensusPeer` per other voter (the
 binding supplies the endpoint, TLS identity, and exact scope) and put those
-peers in the store's complete peer map. The network manifest is an identity and
-placement admission input; the session store still enforces file-backed SQLite,
+peers in the store's complete peer map. Mixing strict and reduced-resilience
+policy bindings therefore fails during the authenticated consensus handshake,
+before Openraft or durable store initialization. The network manifest is an
+identity and placement admission input; the session store still enforces file-backed SQLite,
 immutable 3/5 membership, and quorum-majority traffic authority. An explicit
 `SessionPlacementPolicy::AllowReducedResilience` permits correlated declared
 failure domains but never lowers that majority or claims independent HA
