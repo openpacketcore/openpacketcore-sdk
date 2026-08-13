@@ -76,6 +76,9 @@ pub enum SessionMembershipAdmissionError {
     /// The staged successor has not completed learner catch-up admission.
     #[error("session membership successor is not ready for finalization")]
     SuccessorNotReady,
+    /// An immutable fixed-quorum binding cannot admit membership transitions.
+    #[error("immutable fixed-quorum binding does not admit membership transitions")]
+    ImmutableBindingTransition,
 }
 
 impl SessionMembershipAdmissionError {
@@ -91,6 +94,7 @@ impl SessionMembershipAdmissionError {
             Self::MissingLocalReplica => "session_membership_missing_local_replica",
             Self::TransitionNotStaged => "session_membership_transition_not_staged",
             Self::SuccessorNotReady => "session_membership_successor_not_ready",
+            Self::ImmutableBindingTransition => "session_membership_immutable_binding_transition",
         }
     }
 }
@@ -194,6 +198,31 @@ struct MembershipAdmissionState {
     last_completed: Option<CompletedMembership>,
 }
 
+/// Immutable authority profile selected at admission construction.
+///
+/// A plain manifest never implies the fixed profile: [`SessionMembershipAdmission::new`]
+/// always selects dynamic membership. An explicit binding carrying an identity other
+/// than its manifest's dynamic identity is treated as immutable and fails closed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MembershipAdmissionProfile {
+    Dynamic,
+    ImmutableFixedQuorum,
+}
+
+impl MembershipAdmissionProfile {
+    fn from_current_binding(binding: &LocalReplicaBinding) -> Self {
+        if binding.consensus_identity() == binding.manifest().consensus_identity() {
+            Self::Dynamic
+        } else {
+            Self::ImmutableFixedQuorum
+        }
+    }
+
+    const fn admits_membership_transitions(self) -> bool {
+        matches!(self, Self::Dynamic)
+    }
+}
+
 /// Shared, bounded admission state for one local consensus listener.
 ///
 /// Existing [`LocalReplicaBinding`] values remain immutable. During staging,
@@ -205,18 +234,22 @@ struct MembershipAdmissionState {
 #[derive(Clone)]
 pub struct SessionMembershipAdmission {
     local_replica_id: ReplicaId,
+    profile: MembershipAdmissionProfile,
     state: Arc<RwLock<MembershipAdmissionState>>,
 }
 
 impl SessionMembershipAdmission {
-    /// Start with one immutable current manifest.
+    /// Start a dynamic-membership admission from one immutable current manifest.
     ///
     /// A joining replica may be absent from `current`; it admits no connection
-    /// until a staged successor contains its exact identity.
+    /// until a staged successor contains its exact identity. This constructor
+    /// always selects the dynamic profile and never infers fixed-quorum policy
+    /// from the manifest.
     pub fn new(current: Arc<SessionReplicationManifest>, local_replica_id: ReplicaId) -> Self {
         let current_binding = current.bind_local(local_replica_id.clone()).ok();
         Self {
             local_replica_id,
+            profile: MembershipAdmissionProfile::Dynamic,
             state: Arc::new(RwLock::new(MembershipAdmissionState {
                 current,
                 current_binding,
@@ -228,8 +261,10 @@ impl SessionMembershipAdmission {
 
     /// Preserve the legacy single-manifest server behavior.
     pub fn from_current_binding(binding: LocalReplicaBinding) -> Self {
+        let profile = MembershipAdmissionProfile::from_current_binding(&binding);
         Self {
             local_replica_id: binding.local_replica_id().clone(),
+            profile,
             state: Arc::new(RwLock::new(MembershipAdmissionState {
                 current: Arc::clone(binding.manifest()),
                 current_binding: Some(binding),
@@ -237,6 +272,13 @@ impl SessionMembershipAdmission {
                 last_completed: None,
             })),
         }
+    }
+
+    fn require_dynamic_membership(&self) -> Result<(), SessionMembershipAdmissionError> {
+        self.profile
+            .admits_membership_transitions()
+            .then_some(())
+            .ok_or(SessionMembershipAdmissionError::ImmutableBindingTransition)
     }
 
     /// Stage the exact successor encoded by a validated topology request.
@@ -249,6 +291,7 @@ impl SessionMembershipAdmission {
         request: &SessionTopologyTransitionRequest,
         successor: Arc<SessionReplicationManifest>,
     ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        self.require_dynamic_membership()?;
         let mut state = self.state.write().await;
         let transition_id = request.transition_id();
         let request_digest = request.request_digest();
@@ -354,6 +397,7 @@ impl SessionMembershipAdmission {
         request: &SessionTopologyTransitionRequest,
         proof: &SessionTopologyPrePrepareUnstageProof,
     ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        self.require_dynamic_membership()?;
         if !proof.validates_request(request) {
             return Err(SessionTopologyTransitionError::IdempotencyConflict.into());
         }
@@ -391,6 +435,7 @@ impl SessionMembershipAdmission {
         request: &SessionTopologyTransitionRequest,
         proof: &SessionTopologyCandidateRetirementProof,
     ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        self.require_dynamic_membership()?;
         if !proof.validates_request(request)
             || proof.abort_cleanup_log_index() <= proof.abort_decision_log_index()
         {
@@ -411,6 +456,7 @@ impl SessionMembershipAdmission {
         request: &SessionTopologyTransitionRequest,
         proof: &SessionTopologyJointCommitAdmissionProof,
     ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        self.require_dynamic_membership()?;
         if !proof.validates_request(request) {
             return Err(SessionTopologyTransitionError::IdempotencyConflict.into());
         }
@@ -421,6 +467,7 @@ impl SessionMembershipAdmission {
         &self,
         request: &SessionTopologyTransitionRequest,
     ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        self.require_dynamic_membership()?;
         let mut state = self.state.write().await;
         let transition_id = request.transition_id();
         let request_digest = request.request_digest();
@@ -471,6 +518,7 @@ impl SessionMembershipAdmission {
         request: &SessionTopologyTransitionRequest,
         proof: &SessionTopologyUniformCommitAdmissionProof,
     ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        self.require_dynamic_membership()?;
         if !proof.validates_request(request) {
             return Err(SessionTopologyTransitionError::IdempotencyConflict.into());
         }
@@ -481,6 +529,7 @@ impl SessionMembershipAdmission {
         &self,
         request: &SessionTopologyTransitionRequest,
     ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        self.require_dynamic_membership()?;
         let mut state = self.state.write().await;
         let transition_id = request.transition_id();
         let request_digest = request.request_digest();
@@ -537,6 +586,7 @@ impl SessionMembershipAdmission {
         request: &SessionTopologyTransitionRequest,
         proof: &SessionTopologyAbortAdmissionProof,
     ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        self.require_dynamic_membership()?;
         if !proof.validates_request(request) {
             return Err(SessionTopologyTransitionError::IdempotencyConflict.into());
         }
@@ -547,6 +597,7 @@ impl SessionMembershipAdmission {
         &self,
         request: &SessionTopologyTransitionRequest,
     ) -> Result<SessionMembershipTransitionResult, SessionMembershipAdmissionError> {
+        self.require_dynamic_membership()?;
         let mut state = self.state.write().await;
         let transition_id = request.transition_id();
         let request_digest = request.request_digest();
@@ -654,16 +705,22 @@ impl SessionMembershipAdmission {
             .current_binding
             .as_ref()
             .filter(|binding| binding.consensus_identity() == identity);
-        let pending_binding = state.pending.as_ref().and_then(|pending| {
-            (pending.manifest.consensus_identity() == identity)
-                .then(|| {
-                    pending
-                        .manifest
-                        .bind_local(self.local_replica_id.clone())
-                        .ok()
+        let pending_binding = self
+            .profile
+            .admits_membership_transitions()
+            .then(|| {
+                state.pending.as_ref().and_then(|pending| {
+                    (pending.manifest.consensus_identity() == identity)
+                        .then(|| {
+                            pending
+                                .manifest
+                                .bind_local(self.local_replica_id.clone())
+                                .ok()
+                        })
+                        .flatten()
                 })
-                .flatten()
-        });
+            })
+            .flatten();
         for (manifest, binding) in std::iter::once((&state.current, current_binding)).chain(
             state
                 .pending
@@ -1001,6 +1058,81 @@ mod tests {
                 authenticated_spiffe,
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn fixed_current_binding_rejects_dynamic_successor_before_transport_admission() {
+        let current = manifest(1, &[1, 2, 3]);
+        let successor = manifest(2, &[1, 2, 3, 4, 5]);
+        let admission = SessionMembershipAdmission::from_current_binding(
+            current
+                .bind_fixed_durable_quorum_local(replica_id(3))
+                .expect("fixed local binding"),
+        );
+        let request = transition_request(
+            SessionTopologyTransitionId::from_bytes([0x65; 16]),
+            1,
+            2,
+            &[1, 2, 3, 4, 5],
+        );
+
+        assert_eq!(
+            bootstrap(&admission, &successor, 4, 3, Some(&spiffe(4)))
+                .await
+                .map(|_| ()),
+            Err(SessionConsensusPeerError::ScopeMismatch),
+            "a dynamic successor has no transport capability before admission"
+        );
+        assert_eq!(
+            admission
+                .stage_successor(&request, Arc::clone(&successor))
+                .await,
+            Err(SessionMembershipAdmissionError::ImmutableBindingTransition),
+            "a fixed current binding must reject dynamic successor staging"
+        );
+        assert_eq!(admission.snapshot().await.pending_identity(), None);
+        assert_eq!(
+            bootstrap(&admission, &successor, 4, 3, Some(&spiffe(4)))
+                .await
+                .map(|_| ()),
+            Err(SessionConsensusPeerError::ScopeMismatch),
+            "a rejected successor must not acquire dynamic transport capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_current_binding_refuses_adversarial_dynamic_pending_bootstrap() {
+        let current = manifest(1, &[1, 2, 3]);
+        let successor = manifest(2, &[1, 2, 3, 4, 5]);
+        let admission = SessionMembershipAdmission::from_current_binding(
+            current
+                .bind_fixed_durable_quorum_local(replica_id(3))
+                .expect("fixed local binding"),
+        );
+        let request = transition_request(
+            SessionTopologyTransitionId::from_bytes([0x66; 16]),
+            1,
+            2,
+            &[1, 2, 3, 4, 5],
+        );
+        {
+            let mut state = admission.state.write().await;
+            state.pending = Some(PendingMembership {
+                transition_id: request.transition_id(),
+                request_digest: request.request_digest(),
+                expected_epoch: request.expected_epoch(),
+                manifest: Arc::clone(&successor),
+                voting_admitted: false,
+            });
+        }
+
+        assert_eq!(
+            bootstrap(&admission, &successor, 4, 3, Some(&spiffe(4)))
+                .await
+                .map(|_| ()),
+            Err(SessionConsensusPeerError::ScopeMismatch),
+            "a fixed profile must not reconstruct a dynamic binding from adversarial pending state"
+        );
     }
 
     #[tokio::test]
