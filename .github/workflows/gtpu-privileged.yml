@@ -855,7 +855,7 @@ jobs:
             authority_slots_are_canonical entry_wire_is_canonical bytes_80_are_zero \
             apply_uplink_mtu_policy \
             handle_grouped_downlink_ipv4 \
-            observation_challenge_sample validated_observation_icmp_echo \
+            validated_observation_icmp_echo \
             authenticate_observation_icmp_echo checksum_skb_region checksum_packet_chunk \
             observation_icmp_checksum_40_is_valid observation_icmpv6_checksum_is_valid \
             rewrite_authenticated_observation_icmp_echo_request \
