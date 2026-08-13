@@ -13,6 +13,69 @@ immutable replication manifest. A bounded membership-transition admission
 object can temporarily admit one validated successor manifest for Raft engine
 catch-up without granting that successor consumer mutation/read authority.
 
+## Fixed-quorum identity and placement contract
+
+`SessionPlacementPolicy` is the shared `opc-session-store::PlacementResiliencePolicy`
+type. A consumer selecting the fixed three- or five-voter profile must pass the
+same policy to `SessionReplicationManifest::try_new_with_epoch_and_placement_policy`
+and to `ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy`.
+Construct one descriptor set with distinct `ReplicaId`, `.invalid`
+`ReplicaEndpoint`, example SPIFFE `ReplicaTlsIdentity`, and
+`ReplicaBackingIdentity` values (and distinct `ReplicaFailureDomain` values
+under the strict default), then use the manifest's fixed-profile- and
+policy-bound fixed-quorum binding and
+`fixed_durable_quorum_consensus_identity()` when opening each
+local store:
+
+```rust
+let policy = SessionPlacementPolicy::RequireIndependentFailureDomains;
+let manifest = Arc::new(SessionReplicationManifest::try_new_with_epoch_and_placement_policy(
+    SessionClusterId::new("session-fleet.invalid")?,
+    SessionConfigurationGeneration::new("generation-1")?,
+    SessionConfigurationEpoch::new(1)?,
+    descriptors.clone(),
+    policy,
+)?);
+let local = manifest.bind_fixed_durable_quorum_local(local_replica_id.clone())?;
+let peer = RemoteSessionConsensusPeer::new_profiled(
+    local.bind_remote(remote_replica_id)?,
+    tls_config,
+);
+let topology = ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy(
+    QuorumTopologyConfig::new_consensus(
+        local_replica_id,
+        descriptors,
+        manifest.fixed_durable_quorum_consensus_identity(),
+    ),
+    policy,
+)?;
+let store = ConsensusSessionStore::open_fixed_durable_quorum(
+    topology,
+    SqliteSessionBackend::open("voter-0.sqlite")?,
+    "snapshots-voter-0",
+    peers,
+).await?;
+```
+
+The fixed binding is distinct from `bind_local`: fixed and dynamic profiles
+with the same descriptors do not share an authenticated scope. Strict and
+reduced fixed policies also derive different scopes, so either mismatch is
+rejected during the authenticated Hello/Ack admission before Openraft dispatch.
+
+Create one authenticated `RemoteSessionConsensusPeer` per other voter (the
+binding supplies the endpoint, TLS identity, and exact scope) and put those
+peers in the store's complete peer map. Mixing strict and reduced-resilience
+policy bindings therefore fails during the authenticated consensus handshake,
+before Openraft or durable store initialization. The network manifest is an
+identity and placement admission input; the session store still enforces file-backed SQLite,
+immutable 3/5 membership, and quorum-majority traffic authority. An explicit
+`SessionPlacementPolicy::AllowReducedResilience` permits correlated declared
+failure domains but never lowers that majority or claims independent HA
+placement. Placement/controller evidence freshness may change only the separate
+placement-resilience result; it is not a live traffic gate. This contract is
+deliberately product-neutral and does not prescribe Kubernetes or other
+orchestrator behavior.
+
 ## Consensus production profile
 
 Issue #127 introduces a separate least-authority transport for the shared

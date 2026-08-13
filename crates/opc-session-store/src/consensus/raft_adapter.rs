@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use opc_consensus::engine::error::{
@@ -29,6 +30,8 @@ use super::{
     SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::membership::{SessionTopologyTransitionDigest, SessionTopologyTransitionId};
+use crate::readiness::PlacementResiliencePolicy;
+use crate::sqlite::SqliteSessionBackend;
 use crate::topology::QUORUM_TOPOLOGY_MAX_MEMBERS;
 
 type EngineRpcError<E = opc_consensus::engine::error::Infallible> =
@@ -37,6 +40,36 @@ type SessionCurrentPeerSnapshot = (
     SessionConsensusIdentity,
     BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
 );
+
+#[derive(Clone)]
+pub(crate) struct FixedQuorumEngineAdmission {
+    backend: SqliteSessionBackend,
+    storage_identity: SessionConsensusIdentity,
+    members: BTreeSet<SessionConsensusNodeId>,
+    bindings: BTreeMap<SessionConsensusNodeId, super::SessionTopologyMemberBinding>,
+    placement_policy: PlacementResiliencePolicy,
+    admitted: Arc<AtomicBool>,
+}
+
+impl FixedQuorumEngineAdmission {
+    pub(crate) fn new(
+        backend: SqliteSessionBackend,
+        storage_identity: SessionConsensusIdentity,
+        members: BTreeSet<SessionConsensusNodeId>,
+        bindings: BTreeMap<super::SessionConsensusNodeId, super::SessionTopologyMemberBinding>,
+        placement_policy: PlacementResiliencePolicy,
+        admitted: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            backend,
+            storage_identity,
+            members,
+            bindings,
+            placement_policy,
+            admitted,
+        }
+    }
+}
 
 /// Fail-closed construction error for the private Openraft network factory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -1065,6 +1098,7 @@ pub(crate) struct SessionRaftRpcHandler {
     raft: SessionRaft,
     peer_directory: SessionRaftPeerDirectory,
     local_node_id: SessionConsensusNodeId,
+    fixed_quorum_admission: Option<FixedQuorumEngineAdmission>,
 }
 
 impl SessionRaftRpcHandler {
@@ -1077,6 +1111,21 @@ impl SessionRaftRpcHandler {
             raft,
             peer_directory,
             local_node_id,
+            fixed_quorum_admission: None,
+        }
+    }
+
+    pub(crate) fn new_fixed_durable_quorum(
+        raft: SessionRaft,
+        peer_directory: SessionRaftPeerDirectory,
+        local_node_id: SessionConsensusNodeId,
+        fixed_quorum_admission: FixedQuorumEngineAdmission,
+    ) -> Self {
+        Self {
+            raft,
+            peer_directory,
+            local_node_id,
+            fixed_quorum_admission: Some(fixed_quorum_admission),
         }
     }
 }
@@ -1099,6 +1148,25 @@ impl SessionConsensusRpcHandler for SessionRaftRpcHandler {
     ) -> SessionConsensusWireResponse {
         if let Err(error) = validate_envelope(authenticated_sender, &request) {
             return rejected_response(error);
+        }
+        if let Some(authority) = &self.fixed_quorum_admission {
+            // Initial formation permits only the pristine durable membership;
+            // every other raw engine entry requires the exact durable fixed
+            // authority before it can alter vote, log, commit, or snapshot
+            // state. The record check itself distinguishes those states.
+            if !authority
+                .backend
+                .fixed_quorum_authority_record_is_exact(
+                    authority.storage_identity,
+                    &authority.members,
+                    &authority.bindings,
+                    authority.placement_policy,
+                    !authority.admitted.load(Ordering::Acquire),
+                )
+                .await
+            {
+                return rejected_response(SessionConsensusPeerError::ScopeMismatch);
+            }
         }
         // Vote and AppendEntries keep this permit through the Openraft
         // response. The pinned engine emits an AppendEntries response before
@@ -2100,6 +2168,88 @@ mod tests {
 
     fn vote_request(sender: SessionConsensusNodeId) -> VoteRequest<SessionConsensusNodeId> {
         VoteRequest::new(Vote::new(7, sender), None)
+    }
+
+    #[tokio::test]
+    async fn raw_fixed_handler_rejects_vote_before_admission_after_durable_placement_policy_drift()
+    {
+        let temp = tempfile::tempdir().expect("follower tempdir");
+        let backend = SqliteSessionBackend::open(temp.path().join("sessions.sqlite"))
+            .expect("follower backend");
+        let scope = identity(0x81);
+        let leader = node_id(1);
+        let local = node_id(2);
+        let members = BTreeSet::from([leader, local, node_id(3)]);
+        let network = SessionRaftNetworkFactory::try_new(
+            scope,
+            local,
+            members.clone(),
+            scope_peers(local, &members, scope),
+        )
+        .expect("fixed follower network");
+        let directory = network.peer_directory();
+        let bindings = member_bindings(&members);
+        let (log_store, state_machine, storage_identity) =
+            storage::open_fixed_with_member_bindings(
+                &backend,
+                temp.path().join("snapshots"),
+                scope,
+                members.clone(),
+                bindings.clone(),
+                directory.clone(),
+                crate::readiness::PlacementResiliencePolicy::RequireIndependentFailureDomains,
+            )
+            .await
+            .expect("fixed follower storage");
+        let raft = SessionRaft::new(
+            local,
+            Arc::new(
+                durable_openraft_config(DurableOpenraftDomain::SessionState)
+                    .expect("durable test Raft config"),
+            ),
+            network,
+            log_store,
+            state_machine,
+        )
+        .await
+        .expect("fixed follower Raft");
+        let admitted = Arc::new(AtomicBool::new(false));
+        let handler = SessionRaftRpcHandler::new_fixed_durable_quorum(
+            raft.clone(),
+            directory,
+            local,
+            FixedQuorumEngineAdmission::new(
+                backend.clone(),
+                storage_identity,
+                members,
+                bindings,
+                crate::readiness::PlacementResiliencePolicy::RequireIndependentFailureDomains,
+                admitted,
+            ),
+        );
+        let conn = rusqlite::Connection::open(temp.path().join("sessions.sqlite"))
+            .expect("open fixed voter database");
+        conn.execute(
+            "UPDATE consensus_identity SET fixed_placement_policy = 2 WHERE singleton = 1",
+            [],
+        )
+        .expect("persist fixed placement policy drift");
+        drop(conn);
+
+        let payload = encode_bounded(&vote_request(leader)).expect("bounded Vote request");
+        let request = SessionConsensusWireRequest::try_new(
+            scope,
+            leader,
+            SessionConsensusRpcFamily::Vote,
+            payload,
+        )
+        .expect("valid Vote envelope");
+        assert_eq!(
+            handler.handle(leader, request).await.result,
+            Err(SessionConsensusPeerError::ScopeMismatch),
+            "raw engine handler must not persist a Vote after fixed placement policy drift"
+        );
+        raft.shutdown().await.expect("shutdown fixed test Raft");
     }
 
     fn rejecting_peer_map(

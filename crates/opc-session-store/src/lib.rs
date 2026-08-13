@@ -148,8 +148,9 @@ pub use payload_codec::{
 pub use quorum::{QuorumSessionStore, SessionStoreBackend};
 pub use readiness::{
     DurableReadinessReport, DurableReadinessScope, DurableReadinessState, DurableRecoveryProgress,
-    DurableRecoveryState, ReplicaReadinessFailure, ReplicaReadinessObservation,
-    ReplicaReadinessOutcome,
+    DurableRecoveryState, FixedQuorumReadinessReport, FixedQuorumTrafficAuthority,
+    PlacementResilienceDisposition, PlacementResiliencePolicy, PlacementResilienceReport,
+    ReplicaReadinessFailure, ReplicaReadinessObservation, ReplicaReadinessOutcome,
 };
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 pub use recovery::{
@@ -171,11 +172,11 @@ pub use restore::{
 pub use sqlite::SqliteSessionBackend;
 pub use store::SessionStore;
 pub use topology::{
-    QuorumReplicaDescriptor, QuorumTopologyConfig, QuorumTopologyError, QuorumTopologyMode,
-    QuorumTopologySummary, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, ReplicaTopologyField, ReplicaTopologyFieldError,
-    ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS, REPLICA_IDENTITY_MAX_BYTES,
-    REPLICA_ID_MAX_BYTES,
+    derive_fixed_durable_quorum_consensus_identity, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    QuorumTopologyError, QuorumTopologyMode, QuorumTopologySummary, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicaTopologyField,
+    ReplicaTopologyFieldError, ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
+    REPLICA_IDENTITY_MAX_BYTES, REPLICA_ID_MAX_BYTES,
 };
 pub use topology_attestation::{
     ObservedPhysicalNodeIdentity, QuorumTopologyAttestor, TopologyAttestationBuildError,

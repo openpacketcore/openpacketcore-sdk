@@ -1158,6 +1158,14 @@ fn map_membership_storage_error(
 }
 
 impl ConsensusSessionStore {
+    fn require_dynamic_membership_profile(&self) -> Result<(), SessionTopologyTransitionError> {
+        if self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum {
+            Err(SessionTopologyTransitionError::ImmutableFixedQuorum)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Open a joining learner that is absent from the current voter topology.
     ///
     /// `bootstrap` contains the immutable database anchor, exact predecessor
@@ -1265,7 +1273,7 @@ impl ConsensusSessionStore {
             storage_anchor.0,
             current_identity,
             current_members.clone(),
-            current_bindings,
+            current_bindings.clone(),
             local_node_id,
             request.transition_id().as_bytes(),
             request.request_digest().as_bytes(),
@@ -1311,10 +1319,11 @@ impl ConsensusSessionStore {
                 peer_directory,
                 topology_coordinator,
                 bootstrap_members: current_members,
+                bootstrap_bindings: current_bindings,
                 topology: topology_summary,
                 clock: Arc::new(SystemClock),
                 operation_timeout: DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
-                admitted: AtomicBool::new(false),
+                admitted: Arc::new(AtomicBool::new(false)),
                 topology_attestation_time_high_water: AtomicU64::new(
                     topology_attestation_time_high_water,
                 ),
@@ -1349,6 +1358,7 @@ impl ConsensusSessionStore {
         &self,
         transport: Arc<dyn SessionTopologyTransportAdmission>,
     ) -> Result<(), SessionTopologyTransitionError> {
+        self.require_dynamic_membership_profile()?;
         self.inner.topology_coordinator.bind_transport(transport)?;
         self.ensure_topology_reconciliation_supervisor()?;
         self.inner.topology_coordinator.notify_supervisor();
@@ -1365,6 +1375,7 @@ impl ConsensusSessionStore {
         request: &SessionTopologyTransitionRequest,
         desired_peers: SessionTopologyTransitionPeers,
     ) -> Result<(), SessionTopologyTransitionError> {
+        self.require_dynamic_membership_profile()?;
         let desired_members =
             validate_desired_peer_map(self.inner.local_node_id, request, &desired_peers)?;
         let inserted_bindings = self
@@ -1439,6 +1450,7 @@ impl ConsensusSessionStore {
         &self,
         request: &SessionTopologyTransitionRequest,
     ) -> Result<(), SessionTopologyTransitionError> {
+        self.require_dynamic_membership_profile()?;
         let deadline = transition_deadline(request)?;
         let operation_gate = self.inner.topology_coordinator.operation_gate();
         let operation_guard = tokio::time::timeout_at(deadline, operation_gate.write_owned())
@@ -1622,6 +1634,7 @@ impl ConsensusSessionStore {
         request: &SessionTopologyTransitionRequest,
         desired_peers: SessionTopologyTransitionPeers,
     ) -> Result<SessionTopologyLearnersReadyAdmissionProof, SessionTopologyTransitionError> {
+        self.require_dynamic_membership_profile()?;
         let deadline = transition_deadline(request)?;
         let operation_gate = self.inner.topology_coordinator.operation_gate();
         let mut operation_guard = tokio::time::timeout_at(deadline, operation_gate.write_owned())
@@ -1766,6 +1779,7 @@ impl ConsensusSessionStore {
         request: &SessionTopologyTransitionRequest,
         proof: &SessionTopologyLearnersReadyAdmissionProof,
     ) -> Result<SessionTopologyTransitionStatus, SessionTopologyTransitionError> {
+        self.require_dynamic_membership_profile()?;
         if !proof.validates_request(request) {
             return Err(SessionTopologyTransitionError::IdempotencyConflict);
         }
@@ -1940,6 +1954,7 @@ impl ConsensusSessionStore {
         &self,
         request: &SessionTopologyTransitionRequest,
     ) -> Result<Option<SessionTopologyTransitionStatus>, SessionTopologyTransitionError> {
+        self.require_dynamic_membership_profile()?;
         let deadline = transition_deadline(request)?;
         let durable = self.read_transition_state_before(request, deadline).await?;
         status_from_durable(request, &durable)
@@ -1958,6 +1973,7 @@ impl ConsensusSessionStore {
         &self,
         request: &SessionTopologyTransitionRequest,
     ) -> Result<SessionTopologyTransitionStatus, SessionTopologyTransitionError> {
+        self.require_dynamic_membership_profile()?;
         let deadline = transition_deadline(request)?;
         let operation_gate = self.inner.topology_coordinator.operation_gate();
         let mut operation_guard = tokio::time::timeout_at(deadline, operation_gate.write_owned())

@@ -115,6 +115,8 @@ pub struct SqliteSessionBackend {
     operation_workers: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    consensus_operator_recovery_failure: Arc<AtomicBool>,
     watchers: Arc<tokio::sync::Mutex<Vec<ReplicationWatcher>>>,
     consumer_watchers: Arc<tokio::sync::Mutex<Vec<ConsumerReplicationWatcher>>>,
     #[cfg(test)]
@@ -216,12 +218,12 @@ impl SqliteSessionBackend {
     /// Open (or create) a SQLite database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
-        let conn =
-            Connection::open(path).map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        let canonical = std::fs::canonicalize(path)
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        let conn = Connection::open(path)
+            .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
+        let database_path = std::fs::canonicalize(path)
+            .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
         if let Some(latch) =
-            consensus::read_operator_recovery_latch_sync(&canonical).map_err(|_| {
+            consensus::read_operator_recovery_latch_sync(&database_path).map_err(|_| {
                 StoreError::BackendUnavailable(
                     "session operator recovery latch is unavailable".into(),
                 )
@@ -240,7 +242,7 @@ impl SqliteSessionBackend {
                     std::sync::atomic::Ordering::Relaxed,
                 );
         }
-        Self::new_with_conn(conn, false, Some(canonical))
+        Self::new_with_conn(conn, false, Some(database_path))
     }
 
     /// Open an ephemeral in-memory SQLite database.
@@ -395,6 +397,8 @@ impl SqliteSessionBackend {
             )),
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            consensus_operator_recovery_failure: Arc::new(AtomicBool::new(false)),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             consumer_watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
@@ -562,6 +566,67 @@ impl SqliteSessionBackend {
     /// Capabilities consumed by the consensus adapter that owns this backend.
     pub(crate) const fn consensus_capabilities(&self) -> BackendCapabilities {
         self.caps
+    }
+
+    /// Whether consensus state is backed by a filesystem database.
+    ///
+    /// Fixed durable quorums reject ephemeral in-memory stores. This is a
+    /// durability-shape check, not a claim about physical failure domains or
+    /// concrete volume identity.
+    pub(crate) const fn is_file_backed(&self) -> bool {
+        self.database_path.is_some()
+    }
+
+    /// Synchronously test a fixed-quorum authority record without waiting for
+    /// a concurrent SQLite operation. Callers must treat lock contention or a
+    /// malformed durable record as revoked authority.
+    pub(crate) fn fixed_quorum_authority_is_exact_now(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        expected_members: &std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+        expected_bindings: &std::collections::BTreeMap<
+            crate::consensus::SessionConsensusNodeId,
+            crate::consensus::SessionTopologyMemberBinding,
+        >,
+        expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
+    ) -> bool {
+        self.conn.try_lock().is_ok_and(|conn| {
+            consensus::fixed_quorum_authority_is_exact_sync(
+                &conn,
+                identity,
+                expected_members,
+                expected_bindings,
+                expected_placement_policy,
+                false,
+            )
+            .unwrap_or(false)
+        })
+    }
+
+    /// Read the immutable fixed-quorum authority record under the backend
+    /// lock. Storage failure is intentionally indistinguishable from a
+    /// revoked authority to inbound engine traffic.
+    pub(crate) async fn fixed_quorum_authority_record_is_exact(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        expected_members: &std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+        expected_bindings: &std::collections::BTreeMap<
+            crate::consensus::SessionConsensusNodeId,
+            crate::consensus::SessionTopologyMemberBinding,
+        >,
+        expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
+        allow_pristine_membership: bool,
+    ) -> bool {
+        let conn = self.conn.lock().await;
+        consensus::fixed_quorum_authority_is_exact_sync(
+            &conn,
+            identity,
+            expected_members,
+            expected_bindings,
+            expected_placement_policy,
+            allow_pristine_membership,
+        )
+        .unwrap_or(false)
     }
 
     /// Read the last committed state-machine logical time after a caller-owned
@@ -746,6 +811,15 @@ impl SqliteSessionBackend {
         &self,
         identity: crate::consensus::SessionConsensusIdentity,
     ) -> Result<bool, StoreError> {
+        #[cfg(test)]
+        if self
+            .consensus_operator_recovery_failure
+            .load(Ordering::Acquire)
+        {
+            return Err(StoreError::BackendUnavailable(
+                "injected session operator recovery check failure".into(),
+            ));
+        }
         let database_path = self.database_path.clone();
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let database_latch = database_path
@@ -785,6 +859,12 @@ impl SqliteSessionBackend {
                 })
         })
         .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_consensus_operator_recovery_failure(&self, enabled: bool) {
+        self.consensus_operator_recovery_failure
+            .store(enabled, Ordering::Release);
     }
 
     pub(crate) async fn consensus_operator_recovery_committed(
