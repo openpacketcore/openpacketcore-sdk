@@ -71,7 +71,7 @@ pub use error::ProtocolError;
 pub use identity::{
     LocalReplicaBinding, RemoteReplicaBinding, SessionClusterId, SessionConfigurationEpoch,
     SessionConfigurationGeneration, SessionConfigurationId, SessionManifestError,
-    SessionReplicationManifest,
+    SessionPlacementDisposition, SessionPlacementPolicy, SessionReplicationManifest,
 };
 pub use lifecycle::{
     ConnectionLifecycleError, ConnectionLifecyclePolicy, SessionReauthenticationControl,

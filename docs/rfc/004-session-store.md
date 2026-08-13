@@ -805,7 +805,7 @@ That method is engine/lab evidence only: it does not authenticate observed
 physical node, failure-domain, or durable-backing facts, and its `Ready` result
 MUST NOT authorize production traffic.
 
-Production session traffic MUST use topology admitted through
+Attested-HA production session traffic MUST use topology admitted through
 `ValidatedQuorumTopology::try_from_attested`, require `Quorum` from the store's
 time-aware production profile, then require
 `DurableReadinessScope::ProductionTopologyAttested` and
@@ -828,13 +828,16 @@ proof/replay policy decides whether a still-unexpired underlying proof may be
 re-presented or replacement evidence is required. Token non-serializability
 alone is not proof anti-replay.
 
-The shared readiness report MUST carry the bounded `DurableReadinessScope`.
-Production callers MUST require `ProductionTopologyAttested` and
-`is_production_traffic_ready()` and MUST NOT route an `EngineOnly` report into
-the traffic gate. Every readiness result is point-in-time evidence, never an
-ownership lease. Products MUST continuously gate ownership publication,
-VIP/service advertisement, and traffic on fresh production readiness. Restore
-scans MUST execute only
+The attested-HA readiness report MUST carry the bounded
+`DurableReadinessScope`. Attested-HA callers MUST require
+`ProductionTopologyAttested` and `is_production_traffic_ready()` and MUST NOT
+route an `EngineOnly` report into the traffic gate. Fixed durable quorums use
+the separate typed authority and placement results in §11.2.2.1; an attested
+report cannot be substituted for their immutable-voter authority. Every
+readiness result is point-in-time evidence, never an ownership lease. Products
+MUST continuously gate ownership publication, VIP/service advertisement, and
+traffic on fresh attested-HA readiness or, for a fixed durable quorum, a fresh
+fixed-quorum authority observation. Restore scans MUST execute only
 after the Openraft barrier and local apply. One absolute deadline MUST begin at
 the public restore entry and cover the barrier/apply path, blocking-worker and
 asynchronous connection admission, SQLite progress, and blocking-task join.
@@ -853,6 +856,52 @@ backend epoch, record revision, logical-time snapshot, scope, and examined
 progress. Any edit or mismatch MUST return `RestoreScanCursorStale` before the
 record query rather than skip, merge, or guess. Restore method availability
 alone is not readiness evidence.
+
+#### 11.2.2.1 Fixed Durable Quorum Authority and Placement Resilience
+
+`ValidatedQuorumTopology::try_from_fixed_durable_quorum` admits only an exact
+three- or five-voter immutable Openraft configuration. It requires distinct
+logical replica IDs, network endpoints, authenticated TLS identities, and
+declared backing identities. It does not promote a caller-declared failure
+domain into physical-placement evidence. The default rejects correlated
+failure-domain descriptors; only an explicit reduced-resilience policy admits
+them so the deployment can report their resilience disposition truthfully.
+The fixed authority-profile marker and explicit placement policy are part of a
+domain-separated fixed-quorum authority identity: otherwise-identical strict
+and reduced-resilience fixed profiles MUST derive different authenticated peer,
+durable-store, and snapshot scopes. A fixed profile and a dynamic profile with
+the same descriptor set MUST also derive different scopes. Mixed-policy or
+mixed-profile peers MUST fail authenticated admission before Openraft or durable
+Raft initialization. Dynamic-profile identities remain descriptor- and
+epoch-derived and do not include the fixed-profile or placement-policy binding.
+`ConsensusSessionStore::open_fixed_durable_quorum` is supported only on Linux,
+where descriptor-pinned SQLite snapshots are available; other platforms MUST
+return `FixedQuorumUnsupportedPlatform` before durable initialization.
+Fixed membership does not authorize dynamic membership transitions, a second
+consensus engine, a controller feed, or a new packet-core protocol path.
+`try_from_fixed_durable_quorum_with_authenticated_placement` may additionally
+verify a fresh exact-member `AuthenticatedPlatform` placement evidence set.
+Replacement evidence is verified through
+`verify_fixed_durable_quorum_placement_evidence`; neither constructor nor
+replacement proof changes the immutable voter configuration. A verified
+replacement proof is consumed only by the fixed probe's explicit
+placement-attestation form; it cannot refresh traffic authority.
+
+`probe_fixed_durable_quorum_readiness` MUST return separate typed results for
+traffic authority and placement resilience. Traffic authority requires the
+exact persisted consensus identity and admitted 3/5 voter set, distinct
+authenticated voter identities and declared backing bindings, a clear recovery
+latch, and a fresh linearizable Openraft majority barrier. Lost membership,
+unavailable majority, or recovery state revokes traffic authority immediately.
+Placement uses the strict `RequireIndependentFailureDomains` policy by default:
+only fresh `AuthenticatedPlatform` evidence may report independent placement.
+The explicit `AllowReducedResilience` policy may report correlated or unknown
+placement as reduced resilience, never as independent. Expiring placement
+evidence may only downgrade that placement result; it MUST NOT alter
+fixed-quorum authority, Openraft sequencing, fencing, leases, or mutation
+admission. Concrete backing-instance and voter-incarnation hardening remain a
+separate concern; this contract does not manufacture those facts from paths or
+caller descriptors.
 
 #### 11.2.3 Replication-Log Range Cursors
 

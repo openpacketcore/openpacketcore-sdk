@@ -58,6 +58,10 @@ const MAX_CAPTURED_CONSENSUS_PAYLOADS: usize = 4_096;
 // expensive snapshot-compaction qualification under the parallel test harness.
 static ELECTION_AND_SNAPSHOT_TEST_PERMIT: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(1);
+// Cluster formation uses the short qualification timeout below. Serialize only
+// that setup phase so concurrent libtest fixtures cannot consume one another's
+// formation budget; test bodies remain concurrent.
+static CLUSTER_FORMATION_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 const ENCRYPTION_NAMESPACE: &str = "consensus-boundary-qualification";
 const PLAINTEXT_CANARY_BEFORE_ROTATION: &[u8] =
     b"opc-session-consensus-plaintext-canary-before-key-rotation";
@@ -270,6 +274,10 @@ impl TestCluster {
         topologies: Vec<ValidatedQuorumTopology>,
     ) -> Self {
         assert_eq!(topologies.len(), MEMBER_COUNT);
+        let formation_permit = CLUSTER_FORMATION_PERMIT
+            .acquire()
+            .await
+            .expect("cluster-formation permit remains available");
         let directory = tempfile::tempdir().expect("create fleet directory");
         let backends = (0..MEMBER_COUNT)
             .map(|index| {
@@ -341,6 +349,7 @@ impl TestCluster {
             .wait_all_ready(CLUSTER_START_TIMEOUT)
             .await
             .expect("fresh cluster reaches durable readiness");
+        drop(formation_permit);
         cluster
     }
 

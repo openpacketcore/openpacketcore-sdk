@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proof. Events and diagnostics contain no addresses, TEIDs, SPIs, packet
   bytes, subscriber fields, or reusable flow identifiers. The port is packet
   evidence only and explicitly cannot gate pod health or service admission.
+- **Fixed durable Openraft quorum authority — `opc-session-store`:** adds an
+  exact immutable three- or five-voter topology admission path and separate
+  typed fixed-quorum traffic-authority and physical-placement-resilience
+  observations. The strict default withholds an independent-placement claim
+  without fresh authenticated evidence; an explicit reduced-resilience policy
+  reports correlated or unknown placement without changing Openraft authority,
+  recovery, fencing, or sequencing.
 - **Fail-closed canonical TFT uplink classifier contract — `opc-gtpu-dataplane`:**
   `TftUplinkClassifier` composes the existing canonical `opc-proto-tft` packet
   filter model with one shared PAA and explicit default/dedicated bearer

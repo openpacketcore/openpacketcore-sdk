@@ -1465,7 +1465,6 @@ pub(super) fn backup_and_reset_replica(
     {
         return Err(RecoveryError::StalePlan);
     }
-    let execution_locks = acquire_fleet_execution_locks(input.key, input.plan, input.replicas)?;
     let workflow_dir = workflow_directory(input.backup_root, input.plan, true)?;
     let mut workflow =
         read_workflow(input.key, input.plan, &workflow_dir)?.unwrap_or(WorkflowRecord {
@@ -1499,14 +1498,19 @@ pub(super) fn backup_and_reset_replica(
                 .collect(),
         });
     validate_workflow_shape(input.plan, &workflow)?;
+    // A completed execute retry is read-only: it neither creates nor alters a
+    // recovery latch. Every mutating path in this explicitly drained offline
+    // workflow acquires its per-file execution locks below before proceeding.
+    if workflow.state == RecoveryExecutionState::Rejoined {
+        return Ok(RecoveryExecutionState::Rejoined);
+    }
+    let execution_locks = acquire_fleet_execution_locks(input.key, input.plan, input.replicas)?;
     // A completed execute retry must remain read-only with respect to the
     // fleet latch. Finalization has already cleared it on the successful path,
     // and recreating it here would regress every voter back to not-ready. If a
     // prior finalization crashed before clearing an existing latch, only a
     // finalize retry is authorized to remove it.
-    if workflow.state != RecoveryExecutionState::Rejoined {
-        ensure_fleet_latches(input.key, input.plan, input.replicas)?;
-    }
+    ensure_fleet_latches(input.key, input.plan, input.replicas)?;
     let checkpoint_replica = if workflow.checkpoint_database_digest.is_some() {
         for target in input.targets {
             verify_target_backup(input.key, input.plan, target, &workflow_dir)?;
@@ -1580,7 +1584,7 @@ pub(super) fn backup_and_reset_replica(
         workflow.checkpoint_progress = FileProgress::Verified;
         write_workflow(input.key, &workflow_dir, &workflow)?;
         // A target may have changed while the sequential quarantine copies
-        // were being made. Re-prove every live file once more after every
+        // were being made. Re-prove every supplied file once more after every
         // backup/checkpoint and before the first destructive installation.
         inspect_planned_fleet(&input)?;
         workflow.checkpoint_database_digest = Some(checkpoint.database_digest);
@@ -3355,15 +3359,12 @@ fn verify_snapshot_file(
     if let Some(budget) = budget {
         budget.check()?;
     }
-    let metadata = fs::symlink_metadata(path).map_err(|_| RecoveryError::CorruptReplica)?;
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() <= SNAPSHOT_FOOTER_BYTES
-        || metadata.len() > max_bytes
+    let mut file = open_regular_read(path).map_err(|_| RecoveryError::CorruptReplica)?;
+    let metadata = file.metadata().map_err(|_| RecoveryError::CorruptReplica)?;
+    if !metadata.is_file() || metadata.len() <= SNAPSHOT_FOOTER_BYTES || metadata.len() > max_bytes
     {
         return Err(RecoveryError::CorruptReplica);
     }
-    let mut file = open_regular_read(path).map_err(|_| RecoveryError::CorruptReplica)?;
     let total = metadata.len();
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::End(
