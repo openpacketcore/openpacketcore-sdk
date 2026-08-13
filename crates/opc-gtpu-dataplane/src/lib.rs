@@ -128,8 +128,10 @@ pub use traffic_observation::{
     GtpuTrafficProof, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityError,
     GtpuTrafficProofAuthorityLease, GtpuTrafficProofAuthorityStore,
     GtpuTrafficProofAuthorityStoreUpdateError, GtpuTrafficProofChallenge,
-    GtpuTrafficProofInvalidation, GtpuTrafficProofPoll, GtpuTrafficProofSession,
-    GtpuTrafficProofSummary, GtpuTrafficProofValidation,
+    GtpuTrafficProofDispatchError, GtpuTrafficProofDispatchPort, GtpuTrafficProofDispatchReceipt,
+    GtpuTrafficProofDispatchRequest, GtpuTrafficProofDispatchRoute, GtpuTrafficProofInvalidation,
+    GtpuTrafficProofPoll, GtpuTrafficProofSession, GtpuTrafficProofSummary,
+    GtpuTrafficProofValidation, UnsupportedGtpuTrafficProofDispatchPort,
 };
 pub use unsupported::UnsupportedGtpuDataplaneBackend;
 
