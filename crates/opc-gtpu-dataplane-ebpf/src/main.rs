@@ -649,7 +649,12 @@ fn clear_unmatched_grouped_uplink_observation_stamp(ctx: &TcContext) {
 /// payload on an Echo reply. The declared inner IP extent must be the whole
 /// live skb payload, and the ICMP extent must be exactly its fixed header plus
 /// challenge so packets with ambiguous trailers cannot mint proof events.
-#[inline(never)]
+// Keep this scalar-only orchestrator in its caller's frame. Giving it a
+// separate eight-byte result frame pushes the otherwise bounded downlink
+// observation chain above the 512-byte combined-stack limit on Linux 5.14
+// and 6.8. The parser, authenticator, and rewrite remain non-inlined sibling
+// calls, so their packet and authority scratch is never live together.
+#[inline(always)]
 fn observation_challenge_sample<const CORE_TO_ACCESS: bool>(
     ctx: &TcContext,
     inner_offset: usize,
@@ -5217,6 +5222,9 @@ mod tests {
     #[test]
     fn challenge_producer_source_contract_excludes_generic_flow_emission() {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        assert!(source.contains(
+            "#[inline(always)]\nfn observation_challenge_sample<const CORE_TO_ACCESS: bool>("
+        ));
         let (_, producer) = source
             .split_once("fn observation_challenge_sample<const CORE_TO_ACCESS: bool>(")
             .expect("challenge orchestrator is present");
