@@ -23,6 +23,7 @@ engineers.
 | [013](013-fault-management-alarm-substrate.md) | Fault Management and Alarm Substrate | Alarms, severity, probable cause, FM sinks |
 | [014](014-interactive-operational-console.md) | Interactive Operational Console and Command Framework | CNF command catalogs, human login, typed operations, first-class TUI |
 | [015](015-live-sa-mirror.md) | Live SA Keymat Mirror | Keys-never-persist failover, standby custody, mTLS keymat transport, re-pin composition |
+| [016](016-opaque-gtpu-selector-namespace.md) | Opaque Durable GTP-U Selector Namespace | Experimental durable whole-group selector authority, affine admissions, tombstones, eBPF control binding |
 
 ## Recommended Reading Order
 
@@ -41,6 +42,7 @@ engineers.
 13. RFC 014: interactive operational console.
 14. RFC 012: testbed framework.
 15. RFC 006: evidence pipeline.
+16. RFC 016: opaque durable GTP-U selector namespace (after RFC 004, RFC 006, RFC 011, ADR 0018, and ADR 0019).
 
 RFC 006 should be revisited after each implementation slice because it defines
 the evidence required to claim that the slice is complete.
