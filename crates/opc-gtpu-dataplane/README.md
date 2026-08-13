@@ -212,6 +212,45 @@ the untrusted core side and is therefore deliberately unsupported. The public
 fixed-size request payload commits to the attempt's private registration,
 publication identity, sample, identifier, sequence, and request role.
 
+### Independent core-side challenge delivery
+
+`GtpuDataplaneBackend::dispatch_gtpu_traffic_proof_challenge` is the production
+delivery boundary. The caller supplies its affine session, an independent
+`GtpuTrafficProofDispatchPort`, one inner address family present in the exact
+live group, and a distinct nonzero sample. While holding the canonical
+authority-version lease, the SDK selects that group entry and builds the
+complete plain G-PDU plus optionless/unfragmented IPv4 or base IPv6 ICMP Echo
+Request with materialized checksums. After route resolution and construction,
+the owning backend performs a final revalidation of the exact attempt,
+authority-store version, dataplane generation, observation source, and
+readback before any transport effect. It never accepts caller-provided PAA,
+TEID, group, generation, challenge tag, or packet bytes.
+
+The port resolves one atomic deployment-configured
+`GtpuTrafficProofDispatchRoute`; the SDK checks its core origin, exact
+access-side destination (including a full IPv6 IID within the selected PAA),
+and outer source port against the selected entry before handoff. The request is
+opaque and redacted in diagnostics, although its transport implementation can
+read its exact packet and route solely to send it. The SDK defines no local
+ingress, AF_PACKET, or tc self-injection fallback: the default
+`UnsupportedGtpuTrafficProofDispatchPort` fails closed, and deployments must
+place their port on an independently trusted core-side path.
+
+A `GtpuTrafficProofDispatchReceipt` means only local transport handoff. It is
+not delivery, continuity, or proof evidence, and cannot advance or mint a
+`GtpuTrafficProof`. After handoff begins the sample is retired—even on a
+transport error or canceled caller future—because a remote send cannot be
+retracted honestly. The session bounds this retired-sample ledger by its
+continuity policy. Separate monotonic gates bind the current product-authority
+version and the individual attempt: closing or completing one attempt does not
+revoke a later attempt under the same unchanged product authority. Authority
+replacement, group mutation or removal, device detach, backend restart, and
+attempt close revoke the applicable gate and cancel a cooperative pending
+handoff. Source loss and generation/readback drift observed during final
+preflight prevent the port call; if they race an already irreversible remote
+send, the next poll or validation invalidates the attempt or proof. No receipt
+or stale packet is evidence, so neither can produce a current proof.
+
 After exact packet, checksum, binding, generation, publication, and request-tag
 validation, the trusted downlink tc program replaces the public request tag
 with a distinct private return tag and repairs the ICMP checksum before the

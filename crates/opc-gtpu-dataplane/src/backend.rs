@@ -20,10 +20,11 @@ use crate::tft_classifier::{
 };
 use crate::traffic_observation::{
     GtpuTrafficProof, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityLease,
-    GtpuTrafficProofAuthorityStore, GtpuTrafficProofPoll, GtpuTrafficProofSession,
+    GtpuTrafficProofAuthorityStore, GtpuTrafficProofDispatchError, GtpuTrafficProofDispatchPort,
+    GtpuTrafficProofDispatchReceipt, GtpuTrafficProofPoll, GtpuTrafficProofSession,
     GtpuTrafficProofValidation,
 };
-use crate::GtpuError;
+use crate::{GtpAddressFamily, GtpuError};
 
 /// Backend that can mutate Linux GTP-U dataplane state.
 ///
@@ -87,6 +88,54 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         Err(GtpuError::UnsupportedFeature {
             feature: "gtpu_traffic_proof",
         })
+    }
+
+    /// Construct and hand off one exact challenge for this backend's live attempt.
+    ///
+    /// After SDK route resolution and packet construction, the backend
+    /// revalidates its exact incarnation, canonical authority store, attempt
+    /// token, live dataplane readback, and observation source before any
+    /// transport effect. Reconciliation, removal, restart, proof issuance, or
+    /// close revokes the applicable monotonic handoff gate and cancels a
+    /// cooperative pending transport. Source loss or external drift observed
+    /// before handoff prevents the port call; if it races an irreversible
+    /// transport send, subsequent poll/validation invalidates its proof state.
+    /// Callers can select only an inner family and a fresh nonzero sample; no
+    /// PAA, TEID, generation, authentication value, or packet bytes are
+    /// accepted. Existing backends fail closed.
+    ///
+    /// ```compile_fail
+    /// use opc_gtpu_dataplane::{
+    ///     GtpAddressFamily, GtpuDataplaneBackend, GtpuTrafficProofDispatchPort,
+    ///     GtpuTrafficProofSession,
+    /// };
+    ///
+    /// async fn caller_cannot_supply_packet_identity(
+    ///     backend: &impl GtpuDataplaneBackend,
+    ///     session: &mut GtpuTrafficProofSession,
+    ///     port: &(dyn GtpuTrafficProofDispatchPort + Send + Sync),
+    /// ) {
+    ///     let _ = backend
+    ///         .dispatch_gtpu_traffic_proof_challenge(
+    ///             session,
+    ///             port,
+    ///             GtpAddressFamily::Ipv4,
+    ///             1,
+    ///             0xfeed_beef_u32,
+    ///             [10_u8, 0, 0, 1],
+    ///             vec![0x30, 0xff],
+    ///         )
+    ///         .await;
+    /// }
+    /// ```
+    async fn dispatch_gtpu_traffic_proof_challenge(
+        &self,
+        _session: &mut GtpuTrafficProofSession,
+        _port: &(dyn GtpuTrafficProofDispatchPort + Send + Sync),
+        _family: GtpAddressFamily,
+        _sample_id: u32,
+    ) -> Result<GtpuTrafficProofDispatchReceipt, GtpuTrafficProofDispatchError> {
+        Err(GtpuTrafficProofDispatchError::TransportUnavailable)
     }
 
     /// Poll one trusted traffic-proof attempt.

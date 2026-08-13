@@ -14,10 +14,13 @@ categories = ["network-programming", "os::linux-apis"]
 publish = false
 
 [dependencies]
+bytes = { workspace = true }
 opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
 opc-dataplane-observation = { path = "../opc-dataplane-observation", version = "0.2.0" }
 opc-gtpu-ebpf-common = { path = "../opc-gtpu-ebpf-common", version = "0.2.0" }
+opc-proto-gtpu = { path = "../opc-proto-gtpu", version = "0.2.0" }
 opc-proto-tft = { path = "../opc-proto-tft", version = "0.2.0" }
+opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 async-trait = { workspace = true }
 rand = { workspace = true }

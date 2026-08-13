@@ -84,7 +84,8 @@ use crate::backend::error_proves_no_requested_mutation;
 use crate::model::{classify_dual_selector_state, DualSelectorState};
 use crate::traffic_observation::{
     GtpuTrafficProofAuthorityStoreIdentity, GtpuTrafficProofAuthorityToken,
-    GtpuTrafficProofRevoker, GtpuTrafficProofValidationSnapshot,
+    GtpuTrafficProofDispatchAuthority, GtpuTrafficProofRevoker, GtpuTrafficProofSessionSnapshot,
+    GtpuTrafficProofValidationSnapshot,
 };
 use crate::{
     CreateGtpDeviceEndpointSetRequest, CreateGtpDeviceRequest, CurrentEbpfGraphRecoveryOutcome,
@@ -97,7 +98,8 @@ use crate::{
     GtpuSessionGroupReadback, GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionSelectorProvenance,
     GtpuTrafficProof, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityLease,
-    GtpuTrafficProofAuthorityStore, GtpuTrafficProofInvalidation, GtpuTrafficProofPoll,
+    GtpuTrafficProofAuthorityStore, GtpuTrafficProofDispatchError, GtpuTrafficProofDispatchPort,
+    GtpuTrafficProofDispatchReceipt, GtpuTrafficProofInvalidation, GtpuTrafficProofPoll,
     GtpuTrafficProofSession, GtpuTrafficProofValidation, GtpuUplinkChecksumOffloadContract,
     PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
     PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
@@ -1816,6 +1818,8 @@ struct EbpfTrafficProofAttempt {
     generation: GtpuSessionGeneration,
     source_epoch: u64,
     authority_store: GtpuTrafficProofAuthorityStoreIdentity,
+    authority_dispatch_gate: Arc<GtpuTrafficProofDispatchAuthority>,
+    attempt_dispatch_gate: Arc<GtpuTrafficProofDispatchAuthority>,
     loss_baseline: u64,
     events: VecDeque<GtpuTrafficObservationEvent>,
     proof_issued: bool,
@@ -3955,6 +3959,14 @@ impl EbpfGtpuDataplaneBackend {
         let desired_indexes = grouped_active_indexes(desired)
             .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?;
 
+        // Revoke before the first journal mutation, including a resumed
+        // transaction. No packet may be handed off against a generation whose
+        // authoritative graph is entering a cutover.
+        self.invalidate_traffic_attempts_on_group(
+            journal.group_id().to_bytes(),
+            GtpuTrafficProofInvalidation::DataplaneGenerationChanged,
+        );
+
         if journal.phase() == GtpuSessionTransactionPhase::Prepared {
             if base.is_none() {
                 let pending = journal
@@ -4063,6 +4075,11 @@ impl EbpfGtpuDataplaneBackend {
         let removing = prepared
             .fence_authority()
             .ok_or(GtpuSessionGroupIndeterminateReason::JournalMismatch)?;
+        // Removal fences dispatch before any authority or index mutation.
+        self.invalidate_traffic_attempts_on_group(
+            journal.group_id().to_bytes(),
+            GtpuTrafficProofInvalidation::AuthorityRevoked,
+        );
         if journal.phase() == GtpuSessionTransactionPhase::Prepared {
             self.put_grouped_authority_exact(context, Some(base), removing)?;
             let next = journal
@@ -4252,6 +4269,10 @@ impl EbpfGtpuDataplaneBackend {
                 ));
             }
             if journal.desired().is_none() {
+                self.invalidate_traffic_attempts_on_group(
+                    desired.id().to_bytes(),
+                    GtpuTrafficProofInvalidation::AuthorityRevoked,
+                );
                 return match self.execute_grouped_removal_journal(&context, journal) {
                     Ok(()) => Err(GtpuError::RetryRequired {
                         operation: "ebpf_grouped_reconcile_after_removal",
@@ -4265,6 +4286,10 @@ impl EbpfGtpuDataplaneBackend {
                     GtpuSessionGroupIndeterminateReason::JournalMismatch,
                 ));
             }
+            self.invalidate_traffic_attempts_on_group(
+                desired.id().to_bytes(),
+                GtpuTrafficProofInvalidation::DataplaneGenerationChanged,
+            );
             return match self.execute_grouped_install_journal(&context, journal) {
                 Ok(()) => Ok(GtpuSessionGroupReconcileOutcome::Activated),
                 Err(reason) => Ok(GtpuSessionGroupReconcileOutcome::Indeterminate(reason)),
@@ -4363,6 +4388,10 @@ impl EbpfGtpuDataplaneBackend {
                 GtpuSessionGroupIndeterminateReason::GenerationExhausted,
             ));
         };
+        self.invalidate_traffic_attempts_on_group(
+            desired.id().to_bytes(),
+            GtpuTrafficProofInvalidation::DataplaneGenerationChanged,
+        );
         if let Err(reason) =
             self.put_grouped_journal_exact(&context, journal, EbpfMapUpdateMode::NoExist)
         {
@@ -4420,6 +4449,10 @@ impl EbpfGtpuDataplaneBackend {
                         GtpuSessionGroupConflict::GroupMismatch,
                     ));
                 }
+                self.invalidate_traffic_attempts_on_group(
+                    expected.id().to_bytes(),
+                    GtpuTrafficProofInvalidation::DataplaneGenerationChanged,
+                );
                 return match self.execute_grouped_install_journal(&context, journal) {
                     Ok(()) => Err(GtpuError::RetryRequired {
                         operation: "ebpf_grouped_removal_after_install",
@@ -4435,6 +4468,10 @@ impl EbpfGtpuDataplaneBackend {
                     GtpuSessionGroupConflict::GroupMismatch,
                 ));
             }
+            self.invalidate_traffic_attempts_on_group(
+                expected.id().to_bytes(),
+                GtpuTrafficProofInvalidation::AuthorityRevoked,
+            );
             return match self.execute_grouped_removal_journal(&context, journal) {
                 Ok(()) => Ok(GtpuSessionGroupRemovalOutcome::Removed),
                 Err(reason) => Ok(GtpuSessionGroupRemovalOutcome::Indeterminate(reason)),
@@ -4492,6 +4529,10 @@ impl EbpfGtpuDataplaneBackend {
                 GtpuSessionGroupIndeterminateReason::GenerationExhausted,
             ));
         };
+        self.invalidate_traffic_attempts_on_group(
+            expected.id().to_bytes(),
+            GtpuTrafficProofInvalidation::AuthorityRevoked,
+        );
         if let Err(reason) =
             self.put_grouped_journal_exact(&context, journal, EbpfMapUpdateMode::NoExist)
         {
@@ -5007,10 +5048,16 @@ impl EbpfGtpuDataplaneBackend {
         // Hold the registration guard across runtime publication so a second
         // poisoned-lock acquisition cannot strand an attached runtime device
         // outside the backend's managed-device index.
-        let mut devices = self.devices()?;
+        let devices = self.devices()?;
         if devices.contains_key(&ifindex) {
             return Err(GtpuError::AlreadyExists);
         }
+        drop(devices);
+        self.invalidate_traffic_attempts_on_attachment(
+            ifindex,
+            GtpuTrafficProofInvalidation::AuthorityRevoked,
+        );
+        let mut devices = self.devices()?;
         let attachment = self.inner.runtime.attach(
             &request.name,
             ifindex,
@@ -5109,7 +5156,7 @@ impl EbpfGtpuDataplaneBackend {
         // Keep the process-local binding guard held across durable attach
         // publication. A stable device ID may bind exactly one live ifindex
         // and a mutable ifindex may belong to exactly one managed namespace.
-        let mut devices = self.devices()?;
+        let devices = self.devices()?;
         if devices.contains_key(&ifindex)
             || devices.values().any(|managed| {
                 managed
@@ -5120,6 +5167,12 @@ impl EbpfGtpuDataplaneBackend {
         {
             return Err(GtpuError::AlreadyExists);
         }
+        drop(devices);
+        self.invalidate_traffic_attempts_on_attachment(
+            ifindex,
+            GtpuTrafficProofInvalidation::AuthorityRevoked,
+        );
+        let mut devices = self.devices()?;
         let attachment = self.inner.runtime.attach_grouped(
             &request.name,
             ifindex,
@@ -5177,13 +5230,19 @@ impl EbpfGtpuDataplaneBackend {
         let _operation = self.operation_guard()?;
         validate_interface_name(&name)?;
         let ifindex = self.inner.runtime.ifindex_by_name(&name)?;
-        let mut devices = self.devices()?;
+        let devices = self.devices()?;
         if let Some(device) = devices.get(&ifindex) {
             return Ok(GtpDevice {
                 name: device.name.clone(),
                 ifindex,
             });
         }
+        drop(devices);
+        self.invalidate_traffic_attempts_on_attachment(
+            ifindex,
+            GtpuTrafficProofInvalidation::AuthorityRevoked,
+        );
+        let mut devices = self.devices()?;
         let local_ip = self.inner.runtime.adopt(
             &name,
             ifindex,
@@ -5206,8 +5265,7 @@ impl EbpfGtpuDataplaneBackend {
     fn remove_device_sync(&self, device: GtpDevice) -> Result<(), GtpuError> {
         let _operation = self.operation_guard()?;
         validate_interface_name(&device.name)?;
-        let mut devices = self.devices()?;
-        let mut traffic_sequences = self.traffic_sequence_sources()?;
+        let devices = self.devices()?;
         let is_managed = devices
             .get(&device.ifindex)
             .is_some_and(|managed| managed.name == device.name);
@@ -5234,14 +5292,38 @@ impl EbpfGtpuDataplaneBackend {
                 || self.pin_dir(&device.name),
                 |grouped| self.grouped_pin_dir(grouped.device_id),
             );
+        drop(devices);
+        let related_attempts = self
+            .traffic_attempts()?
+            .iter()
+            .filter_map(|(attempt_id, attempt)| {
+                (attempt.ifindex == device.ifindex)
+                    .then_some((*attempt_id, attempt.desired.id().to_bytes()))
+            })
+            .collect::<Vec<_>>();
+        for (attempt_id, _) in &related_attempts {
+            self.cleanup_tracked_traffic_attempt(*attempt_id)?;
+        }
+        let mut related_groups = related_attempts
+            .into_iter()
+            .map(|(_, group_key)| group_key)
+            .collect::<Vec<_>>();
+        related_groups.sort_unstable();
+        related_groups.dedup();
+        if !related_groups.is_empty() {
+            let mut stores = self.traffic_authority_stores()?;
+            for group_key in related_groups {
+                stores.remove(&group_key);
+            }
+        }
         self.inner.runtime.detach(
             &device.name,
             device.ifindex,
             &pin_dir,
             self.inner.config.tc_priority,
         )?;
-        devices.remove(&device.ifindex);
-        traffic_sequences.remove(&device.ifindex);
+        self.devices()?.remove(&device.ifindex);
+        self.traffic_sequence_sources()?.remove(&device.ifindex);
         Ok(())
     }
 
@@ -5277,6 +5359,10 @@ impl EbpfGtpuDataplaneBackend {
                 DrainedV2TeardownRefusal::ManagedAttachment,
             ));
         }
+        self.invalidate_traffic_attempts_on_attachment(
+            device.ifindex,
+            GtpuTrafficProofInvalidation::AuthorityRevoked,
+        );
         self.inner.runtime.teardown_drained_v2(
             &device.name,
             device.ifindex,
@@ -5290,6 +5376,7 @@ impl EbpfGtpuDataplaneBackend {
         request: CurrentEbpfGraphRecoveryRequest,
     ) -> Result<CurrentEbpfGraphRecoveryOutcome, GtpuError> {
         let _operation = self.operation_guard()?;
+        self.invalidate_all_traffic_attempts(GtpuTrafficProofInvalidation::AuthorityRevoked);
         validate_linux_name(request.pin_namespace(), "pin_namespace")?;
         if let Some(replacement) = request.replacement_device() {
             validate_linux_name(&replacement.name, "replacement_device.name")?;
@@ -7288,6 +7375,7 @@ impl EbpfGtpuDataplaneBackend {
         attempt: &mut EbpfTrafficProofAttempt,
         invalidation: GtpuTrafficProofInvalidation,
     ) {
+        attempt.attempt_dispatch_gate.revoke();
         attempt.events.clear();
         attempt.pending_proof = None;
         attempt.invalidated = Some(invalidation);
@@ -7302,6 +7390,29 @@ impl EbpfGtpuDataplaneBackend {
             for attempt in attempts
                 .values_mut()
                 .filter(|attempt| attempt.ifindex == ifindex)
+            {
+                Self::invalidate_traffic_attempt(attempt, invalidation);
+            }
+        }
+    }
+
+    fn invalidate_all_traffic_attempts(&self, invalidation: GtpuTrafficProofInvalidation) {
+        if let Ok(mut attempts) = self.traffic_attempts() {
+            for attempt in attempts.values_mut() {
+                Self::invalidate_traffic_attempt(attempt, invalidation);
+            }
+        }
+    }
+
+    fn invalidate_traffic_attempts_on_group(
+        &self,
+        group_key: [u8; GTPU_SESSION_GROUP_ID_LEN],
+        invalidation: GtpuTrafficProofInvalidation,
+    ) {
+        if let Ok(mut attempts) = self.traffic_attempts() {
+            for attempt in attempts
+                .values_mut()
+                .filter(|attempt| attempt.desired.id().to_bytes() == group_key)
             {
                 Self::invalidate_traffic_attempt(attempt, invalidation);
             }
@@ -7326,7 +7437,7 @@ impl EbpfGtpuDataplaneBackend {
     /// only after absence or replacement proves it no longer owns a pinned
     /// entry. Callers hold `operation_lock`.
     fn cleanup_tracked_traffic_attempt(&self, attempt_id: u64) -> Result<(), GtpuError> {
-        let (ifindex, group_key, nonce, registration, source_epoch) = {
+        let (ifindex, group_key, nonce, registration, source_epoch, attempt_dispatch_gate) = {
             let attempts = self.traffic_attempts()?;
             let attempt = attempts
                 .get(&attempt_id)
@@ -7339,8 +7450,10 @@ impl EbpfGtpuDataplaneBackend {
                 attempt.registration.redirect_nonce(),
                 attempt.registration_bytes,
                 attempt.source_epoch,
+                Arc::clone(&attempt.attempt_dispatch_gate),
             )
         };
+        attempt_dispatch_gate.revoke();
         let removal = self
             .inner
             .runtime
@@ -7417,42 +7530,62 @@ impl EbpfGtpuDataplaneBackend {
         &self,
         attempt: &EbpfTrafficProofAttempt,
     ) -> Option<GtpuTrafficProofInvalidation> {
+        self.traffic_attempt_readback_invalidation(
+            attempt.ifindex,
+            &attempt.context,
+            attempt.registration,
+            attempt.registration_bytes,
+            &attempt.desired,
+            attempt.generation,
+        )
+    }
+
+    fn traffic_attempt_readback_invalidation(
+        &self,
+        ifindex: u32,
+        context: &GroupedAttachmentContext,
+        registration: GtpuTrafficObservationRegistration,
+        registration_bytes: [u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+        desired: &GtpuSessionGroup,
+        generation: GtpuSessionGeneration,
+    ) -> Option<GtpuTrafficProofInvalidation> {
         // Any readback failure permanently revokes proof authority. A clean
         // current readback can distinguish generation and attachment drift,
         // which gives products a bounded diagnostic without exposing group
         // identity.
-        let Ok((context, record)) = self.exact_active_traffic_group(&attempt.desired) else {
+        let Ok((current_context, record)) = self.exact_active_traffic_group(desired) else {
             return Some(GtpuTrafficProofInvalidation::AuthorityRevoked);
         };
-        if context != attempt.context {
+        if current_context != *context {
             return Some(GtpuTrafficProofInvalidation::SessionBindingChanged);
         }
-        if record.generation() != attempt.generation {
+        if record.generation() != generation {
             return Some(GtpuTrafficProofInvalidation::DataplaneGenerationChanged);
         }
-        let Ok(registration) = self
+        let Ok(current_registration) = self
             .inner
             .runtime
-            .traffic_observation_registration_get(attempt.ifindex, attempt.desired.id().to_bytes())
+            .traffic_observation_registration_get(ifindex, desired.id().to_bytes())
         else {
             return Some(GtpuTrafficProofInvalidation::AuthorityRevoked);
         };
-        if registration != Some(attempt.registration_bytes) {
+        if current_registration != Some(registration_bytes) {
             return Some(GtpuTrafficProofInvalidation::ObservationBindingChanged);
         }
-        let Ok(redirect) = self.inner.runtime.traffic_observation_redirect_get(
-            attempt.ifindex,
-            attempt.registration.redirect_nonce(),
-        ) else {
+        let Ok(redirect) = self
+            .inner
+            .runtime
+            .traffic_observation_redirect_get(ifindex, registration.redirect_nonce())
+        else {
             return Some(GtpuTrafficProofInvalidation::AuthorityRevoked);
         };
-        if redirect != Some(attempt.desired.id().to_bytes()) {
+        if redirect != Some(desired.id().to_bytes()) {
             return Some(GtpuTrafficProofInvalidation::ObservationBindingChanged);
         }
         if !self
             .inner
             .runtime
-            .grouped_datapath_usable(attempt.ifindex, attempt.context.config)
+            .grouped_datapath_usable(ifindex, context.config)
         {
             return Some(GtpuTrafficProofInvalidation::AuthorityRevoked);
         }
@@ -7680,6 +7813,8 @@ impl EbpfGtpuDataplaneBackend {
             });
         }
         let authority = lease.authority();
+        let authority_dispatch_gate = lease.dispatch_authority();
+        let attempt_dispatch_gate = GtpuTrafficProofDispatchAuthority::new();
         let (context, record) = self.exact_active_traffic_group(authority.desired())?;
         self.require_registered_traffic_authority_store(
             authority.desired(),
@@ -7793,6 +7928,8 @@ impl EbpfGtpuDataplaneBackend {
                 generation: record.generation(),
                 source_epoch,
                 authority_store: lease.store_identity(),
+                authority_dispatch_gate: Arc::clone(&authority_dispatch_gate),
+                attempt_dispatch_gate: Arc::clone(&attempt_dispatch_gate),
                 loss_baseline: baseline,
                 events: VecDeque::new(),
                 proof_issued: false,
@@ -7906,6 +8043,8 @@ impl EbpfGtpuDataplaneBackend {
                 attempt_id,
             ),
             registration,
+            authority_dispatch_gate,
+            attempt_dispatch_gate,
         );
         session.install_revoker(Arc::new(EbpfTrafficProofRevoker {
             backend: Arc::clone(&self.inner),
@@ -7915,6 +8054,146 @@ impl EbpfGtpuDataplaneBackend {
         // operation executed by the blocking worker.
         let _ = lease.authority();
         Ok(session)
+    }
+
+    /// Revalidate the complete backend-owned dispatch boundary under the same
+    /// operation lock used by every grouped dataplane mutation.
+    fn preflight_gtpu_traffic_proof_dispatch_sync(
+        &self,
+        session: &GtpuTrafficProofSessionSnapshot,
+        current_authority: &GtpuTrafficProofAuthority,
+        current_authority_dispatch_gate: &Arc<GtpuTrafficProofDispatchAuthority>,
+        authority_store: GtpuTrafficProofAuthorityStoreIdentity,
+    ) -> Result<bool, GtpuError> {
+        let _operation = self.operation_guard()?;
+        let token = session.authority();
+        if !token.belongs_to_backend(self.inner.backend_incarnation)
+            || self
+                .require_registered_traffic_authority_store(session.desired(), authority_store)
+                .is_err()
+        {
+            return Ok(false);
+        }
+        if let Some(invalidation) = current_authority.invalidation_for_session_snapshot(session) {
+            self.invalidate_traffic_attempt_by_token(token, invalidation);
+            return Ok(false);
+        }
+        let ifindex = {
+            let attempts = self.traffic_attempts()?;
+            let Some(attempt) = attempts.get(&token.attempt()) else {
+                return Ok(false);
+            };
+            if !token.matches(self.inner.backend_incarnation, attempt.source_epoch)
+                || attempt.authority_store != authority_store
+                || attempt.desired != *session.desired()
+                || attempt.product_owner_generation != session.product_owner_generation()
+                || attempt.reconcile_fence != session.reconcile_fence()
+                || attempt.reconcile_revision != session.reconcile_revision()
+                || attempt.policy != session.policy()
+                || attempt.registration != session.registration()
+                || !session.shares_dispatch_gates(
+                    current_authority_dispatch_gate,
+                    &attempt.attempt_dispatch_gate,
+                )
+                || !Arc::ptr_eq(
+                    current_authority_dispatch_gate,
+                    &attempt.authority_dispatch_gate,
+                )
+                || attempt.proof_issued
+                || session.proof_issued()
+                || attempt.invalidated.is_some()
+            {
+                return Ok(false);
+            }
+            attempt.ifindex
+        };
+
+        self.drain_traffic_hub(ifindex)?;
+
+        let (context, registration, registration_bytes, desired, generation, loss_baseline) = {
+            let attempts = self.traffic_attempts()?;
+            let Some(attempt) = attempts.get(&token.attempt()) else {
+                return Ok(false);
+            };
+            if !token.matches(self.inner.backend_incarnation, attempt.source_epoch)
+                || attempt.authority_store != authority_store
+                || attempt.desired != *session.desired()
+                || attempt.registration != session.registration()
+                || !session.shares_dispatch_gates(
+                    current_authority_dispatch_gate,
+                    &attempt.attempt_dispatch_gate,
+                )
+                || !Arc::ptr_eq(
+                    current_authority_dispatch_gate,
+                    &attempt.authority_dispatch_gate,
+                )
+                || attempt.proof_issued
+                || session.proof_issued()
+            {
+                return Ok(false);
+            }
+            (
+                attempt.context.clone(),
+                attempt.registration,
+                attempt.registration_bytes,
+                attempt.desired.clone(),
+                attempt.generation,
+                attempt.loss_baseline,
+            )
+        };
+        let readback_invalidation = self.traffic_attempt_readback_invalidation(
+            ifindex,
+            &context,
+            registration,
+            registration_bytes,
+            &desired,
+            generation,
+        );
+        let source_invalidation = if self
+            .require_healthy_traffic_sequence_source(ifindex)
+            .is_err()
+            || !matches!(
+                self.inner.runtime.traffic_observation_loss(ifindex),
+                Ok(loss) if loss != u64::MAX && loss == loss_baseline
+            ) {
+            Some(GtpuTrafficProofInvalidation::ContinuityLost)
+        } else {
+            None
+        };
+
+        let mut attempts = self.traffic_attempts()?;
+        let Some(attempt) = attempts.get_mut(&token.attempt()) else {
+            return Ok(false);
+        };
+        if !token.matches(self.inner.backend_incarnation, attempt.source_epoch)
+            || attempt.authority_store != authority_store
+            || attempt.desired != desired
+            || attempt.registration != registration
+            || attempt.registration_bytes != registration_bytes
+            || attempt.generation != generation
+            || attempt.loss_baseline != loss_baseline
+            || !session.shares_dispatch_gates(
+                current_authority_dispatch_gate,
+                &attempt.attempt_dispatch_gate,
+            )
+            || !Arc::ptr_eq(
+                current_authority_dispatch_gate,
+                &attempt.authority_dispatch_gate,
+            )
+            || attempt.proof_issued
+            || session.proof_issued()
+        {
+            return Ok(false);
+        }
+        let invalidation = attempt
+            .invalidated
+            .or(readback_invalidation)
+            .or(source_invalidation);
+        if let Some(invalidation) = invalidation {
+            Self::invalidate_traffic_attempt(attempt, invalidation);
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn poll_gtpu_traffic_proof_sync(
@@ -8435,6 +8714,53 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         .await
     }
 
+    async fn dispatch_gtpu_traffic_proof_challenge(
+        &self,
+        session: &mut GtpuTrafficProofSession,
+        port: &(dyn GtpuTrafficProofDispatchPort + Send + Sync),
+        family: GtpAddressFamily,
+        sample_id: u32,
+    ) -> Result<GtpuTrafficProofDispatchReceipt, GtpuTrafficProofDispatchError> {
+        let store = match self.registered_traffic_authority_store_for_session(session) {
+            Ok(Some(store)) => store,
+            Ok(None) | Err(_) => {
+                session.revoke_attempt_dispatch();
+                return Err(GtpuTrafficProofDispatchError::AuthorityRevoked);
+            }
+        };
+        let authority = store.lease().await;
+        // Resolve deployment policy and construct the opaque request while
+        // the exact authority version is leased, but before any transport
+        // effect. The final backend readback below therefore closes a drift or
+        // source-loss race introduced by route resolution itself.
+        let prepared = session.prepare_challenge(port, family, sample_id)?;
+        let authority_snapshot = authority.authority().clone();
+        let authority_dispatch_gate = authority.dispatch_authority();
+        let authority_store = authority.store_identity();
+        let adapter_session = session.adapter_snapshot();
+        let live = self
+            .run_blocking("ebpf_dispatch_traffic_proof", move |backend| {
+                backend.preflight_gtpu_traffic_proof_dispatch_sync(
+                    &adapter_session,
+                    &authority_snapshot,
+                    &authority_dispatch_gate,
+                    authority_store,
+                )
+            })
+            .await
+            .unwrap_or(false);
+        // The lease may drop before handoff. Any authority writer or grouped
+        // mutation that wins that race revokes the shared dispatch signal,
+        // which the private session handoff checks and awaits atomically.
+        let _ = authority.authority();
+        drop(authority);
+        if !live {
+            session.revoke_attempt_dispatch();
+            return Err(GtpuTrafficProofDispatchError::AuthorityRevoked);
+        }
+        session.dispatch_prepared_challenge(port, prepared).await
+    }
+
     async fn poll_gtpu_traffic_proof(
         &self,
         session: &mut GtpuTrafficProofSession,
@@ -8504,6 +8830,10 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         mut session: GtpuTrafficProofSession,
     ) -> Result<(), GtpuError> {
         let token = *session.authority();
+        session.revoke_attempt_dispatch();
+        if !token.belongs_to_backend(self.inner.backend_incarnation) {
+            return Err(GtpuError::NotFound);
+        }
         let result = self
             .run_blocking("ebpf_close_traffic_proof", move |backend| {
                 backend.revoke_traffic_attempt_sync(token)
@@ -37979,6 +38309,294 @@ mod tests {
         (backend, runtime, group, authority)
     }
 
+    struct AcceptingTrafficProofPort {
+        handoffs: AtomicUsize,
+    }
+
+    struct PendingTrafficProofPort {
+        entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    struct SourceLossDuringRouteTrafficProofPort {
+        runtime: Arc<FakeRuntime>,
+        handoffs: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl GtpuTrafficProofDispatchPort for SourceLossDuringRouteTrafficProofPort {
+        fn resolve_route(
+            &self,
+            _family: GtpAddressFamily,
+        ) -> Result<crate::GtpuTrafficProofDispatchRoute, GtpuTrafficProofDispatchError> {
+            self.runtime
+                .state()
+                .traffic_observation_loss
+                .insert(S2BU_IFINDEX, 1);
+            Ok(crate::GtpuTrafficProofDispatchRoute::new(
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)),
+                crate::GTPU_PORT,
+                IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
+            ))
+        }
+
+        async fn dispatch(
+            &self,
+            _request: crate::GtpuTrafficProofDispatchRequest,
+        ) -> Result<GtpuTrafficProofDispatchReceipt, GtpuTrafficProofDispatchError> {
+            self.handoffs.fetch_add(1, Ordering::SeqCst);
+            Ok(GtpuTrafficProofDispatchReceipt::accepted())
+        }
+    }
+
+    #[async_trait]
+    impl GtpuTrafficProofDispatchPort for PendingTrafficProofPort {
+        fn resolve_route(
+            &self,
+            _family: GtpAddressFamily,
+        ) -> Result<crate::GtpuTrafficProofDispatchRoute, GtpuTrafficProofDispatchError> {
+            Ok(crate::GtpuTrafficProofDispatchRoute::new(
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)),
+                crate::GTPU_PORT,
+                IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
+            ))
+        }
+
+        async fn dispatch(
+            &self,
+            _request: crate::GtpuTrafficProofDispatchRequest,
+        ) -> Result<GtpuTrafficProofDispatchReceipt, GtpuTrafficProofDispatchError> {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            std::future::pending().await
+        }
+    }
+
+    impl AcceptingTrafficProofPort {
+        fn new() -> Self {
+            Self {
+                handoffs: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl GtpuTrafficProofDispatchPort for AcceptingTrafficProofPort {
+        fn resolve_route(
+            &self,
+            _family: GtpAddressFamily,
+        ) -> Result<crate::GtpuTrafficProofDispatchRoute, GtpuTrafficProofDispatchError> {
+            Ok(crate::GtpuTrafficProofDispatchRoute::new(
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)),
+                crate::GTPU_PORT,
+                IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
+            ))
+        }
+
+        async fn dispatch(
+            &self,
+            _request: crate::GtpuTrafficProofDispatchRequest,
+        ) -> Result<GtpuTrafficProofDispatchReceipt, GtpuTrafficProofDispatchError> {
+            self.handoffs.fetch_add(1, Ordering::SeqCst);
+            Ok(GtpuTrafficProofDispatchReceipt::accepted())
+        }
+    }
+
+    #[tokio::test]
+    async fn production_dispatch_requires_the_exact_current_backend_authority() {
+        let (backend, _runtime, group, authority) = traffic_proof_fixture(0x57).await;
+        let mut session = begin_traffic_proof(&backend, &authority).await.unwrap();
+        let port = AcceptingTrafficProofPort::new();
+
+        assert_eq!(
+            backend
+                .dispatch_gtpu_traffic_proof_challenge(
+                    &mut session,
+                    &port,
+                    GtpAddressFamily::Ipv4,
+                    1,
+                )
+                .await,
+            Ok(GtpuTrafficProofDispatchReceipt::accepted())
+        );
+        assert_eq!(port.handoffs.load(Ordering::SeqCst), 1);
+
+        let store = registered_traffic_authority_store(&backend, &authority)
+            .await
+            .unwrap();
+        store
+            .replace(GtpuTrafficProofAuthority::new(group, 2, 3, 4, authority.policy()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .dispatch_gtpu_traffic_proof_challenge(
+                    &mut session,
+                    &port,
+                    GtpAddressFamily::Ipv4,
+                    2,
+                )
+                .await,
+            Err(GtpuTrafficProofDispatchError::AuthorityRevoked)
+        );
+        assert_eq!(port.handoffs.load(Ordering::SeqCst), 1);
+        backend.close_gtpu_traffic_proof(session).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_one_attempt_preserves_the_current_authority_for_a_fresh_attempt() {
+        let (backend, _runtime, _group, authority) = traffic_proof_fixture(0x5b).await;
+        let first = begin_traffic_proof(&backend, &authority).await.unwrap();
+        backend.close_gtpu_traffic_proof(first).await.unwrap();
+
+        let mut replacement_attempt = begin_traffic_proof(&backend, &authority).await.unwrap();
+        assert!(matches!(
+            backend
+                .poll_gtpu_traffic_proof(&mut replacement_attempt)
+                .await
+                .unwrap(),
+            GtpuTrafficProofPoll::Pending
+        ));
+        let port = AcceptingTrafficProofPort::new();
+        assert_eq!(
+            backend
+                .dispatch_gtpu_traffic_proof_challenge(
+                    &mut replacement_attempt,
+                    &port,
+                    GtpAddressFamily::Ipv4,
+                    1,
+                )
+                .await,
+            Ok(GtpuTrafficProofDispatchReceipt::accepted())
+        );
+        assert_eq!(port.handoffs.load(Ordering::SeqCst), 1);
+        backend
+            .close_gtpu_traffic_proof(replacement_attempt)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn grouped_generation_cutover_cancels_a_pending_production_dispatch() {
+        let (backend, _runtime, group, authority) = traffic_proof_fixture(0x59).await;
+        let session = begin_traffic_proof(&backend, &authority).await.unwrap();
+        let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
+        let port = Arc::new(PendingTrafficProofPort {
+            entered: Mutex::new(Some(entered_sender)),
+        });
+        let dispatch_backend = backend.clone();
+        let dispatch_port = Arc::clone(&port);
+        let dispatch = tokio::spawn(async move {
+            let mut session = session;
+            let result = dispatch_backend
+                .dispatch_gtpu_traffic_proof_challenge(
+                    &mut session,
+                    dispatch_port.as_ref(),
+                    GtpAddressFamily::Ipv4,
+                    1,
+                )
+                .await;
+            (result, session)
+        });
+        entered_receiver
+            .await
+            .expect("dispatch must reach the cooperative pending port");
+
+        let changed = grouped_group(
+            group.id().to_bytes()[0],
+            group.device_id(),
+            vec![grouped_v4_entry(0x9000_0059, 0xa000_0059)],
+        );
+        assert_eq!(
+            backend
+                .reconcile_pdp_context_group(fresh_group_request(changed))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Activated
+        );
+        let (result, session) = tokio::time::timeout(std::time::Duration::from_secs(1), dispatch)
+            .await
+            .expect("generation revocation must cancel a cooperative pending handoff")
+            .unwrap();
+        assert_eq!(result, Err(GtpuTrafficProofDispatchError::AuthorityRevoked));
+        backend.close_gtpu_traffic_proof(session).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_loss_blocks_dispatch_before_transport_handoff() {
+        let (backend, runtime, _group, authority) = traffic_proof_fixture(0x5a).await;
+        let mut session = begin_traffic_proof(&backend, &authority).await.unwrap();
+        runtime
+            .state()
+            .traffic_observation_loss
+            .insert(S2BU_IFINDEX, 1);
+        let port = AcceptingTrafficProofPort::new();
+        assert_eq!(
+            backend
+                .dispatch_gtpu_traffic_proof_challenge(
+                    &mut session,
+                    &port,
+                    GtpAddressFamily::Ipv4,
+                    1,
+                )
+                .await,
+            Err(GtpuTrafficProofDispatchError::AuthorityRevoked)
+        );
+        assert_eq!(port.handoffs.load(Ordering::SeqCst), 0);
+        backend.close_gtpu_traffic_proof(session).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_loss_during_route_resolution_is_caught_by_final_preflight() {
+        let (backend, runtime, _group, authority) = traffic_proof_fixture(0x5c).await;
+        let mut session = begin_traffic_proof(&backend, &authority).await.unwrap();
+        let port = SourceLossDuringRouteTrafficProofPort {
+            runtime,
+            handoffs: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            backend
+                .dispatch_gtpu_traffic_proof_challenge(
+                    &mut session,
+                    &port,
+                    GtpAddressFamily::Ipv4,
+                    1,
+                )
+                .await,
+            Err(GtpuTrafficProofDispatchError::AuthorityRevoked)
+        );
+        assert_eq!(port.handoffs.load(Ordering::SeqCst), 0);
+        backend.close_gtpu_traffic_proof(session).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreign_backend_close_fails_and_preserves_owner_cleanup_authority() {
+        let (owner, runtime, _group, authority) = traffic_proof_fixture(0x58).await;
+        let session = begin_traffic_proof(&owner, &authority).await.unwrap();
+        let foreign = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert_ne!(
+            owner.inner.backend_incarnation,
+            foreign.inner.backend_incarnation
+        );
+
+        assert!(matches!(
+            foreign.close_gtpu_traffic_proof(session).await,
+            Err(GtpuError::NotFound)
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if owner.traffic_attempts().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the still-armed owner revoker must finish bounded cleanup");
+        assert!(runtime.state().traffic_observation_registrations.is_empty());
+        assert!(runtime.state().traffic_observation_redirects.is_empty());
+    }
+
     #[tokio::test]
     async fn trusted_grouped_traffic_events_are_required_and_exactly_revocable() {
         let runtime = Arc::new(FakeRuntime::new());
@@ -39305,6 +39923,9 @@ mod tests {
                 .unwrap(),
             GtpuTrafficProofValidation::Invalidated(GtpuTrafficProofInvalidation::AuthorityRevoked)
         );
-        restarted.close_gtpu_traffic_proof(session).await.unwrap();
+        assert!(matches!(
+            restarted.close_gtpu_traffic_proof(session).await,
+            Err(GtpuError::NotFound)
+        ));
     }
 }

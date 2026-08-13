@@ -75,7 +75,9 @@ use opc_gtpu_dataplane::{
     GtpuSessionGroup, GtpuSessionGroupId, GtpuSessionGroupReadback,
     GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionSelectorProvenance,
-    GtpuSourcePortPolicy, GtpuTrafficProofAuthority, GtpuTrafficProofPoll,
+    GtpuSourcePortPolicy, GtpuTrafficProofAuthority, GtpuTrafficProofDispatchError,
+    GtpuTrafficProofDispatchPort, GtpuTrafficProofDispatchReceipt, GtpuTrafficProofDispatchRequest,
+    GtpuTrafficProofDispatchRoute, GtpuTrafficProofInvalidation, GtpuTrafficProofPoll,
     GtpuTrafficProofValidation, GtpuUplinkChecksumOffloadContract, GtpuUplinkMtuPolicy,
     GtpuUplinkSourcePortPolicy, GtpuV2DrainProof, PdpContextIndeterminateReason,
     PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
@@ -205,9 +207,8 @@ const IPPROTO_UDP: u8 = 17;
 const IPPROTO_ICMP: u8 = 1;
 const IPPROTO_ICMPV6: u8 = 58;
 const IPPROTO_ESP: u8 = 50;
-const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
-const ICMPV6_ECHO_REQUEST: u8 = 128;
+const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMPV6_ECHO_REPLY: u8 = 129;
 const ICMP_ECHO_IDENTIFIER: u16 = 0x6550;
 const OBSERVATION_FLOW_SCRATCH_VALUE_LEN: usize = 40;
@@ -290,6 +291,45 @@ static PRIVILEGED_TEST_LOCK: Mutex<()> = Mutex::new(());
 /// unique across tests in the same process (the PID already keeps them
 /// unique across processes sharing one harness netns).
 static PRIVILEGED_TEST_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Test-only independently placed core-side transport. It has no access to a
+/// session selector or packet builder: the production dispatcher supplies one
+/// opaque request whose exact route is derived from the live group entry.
+struct IndependentCoreDispatchPort<'a> {
+    socket: &'a UdpSocket,
+    route: GtpuTrafficProofDispatchRoute,
+}
+
+#[async_trait::async_trait]
+impl GtpuTrafficProofDispatchPort for IndependentCoreDispatchPort<'_> {
+    fn resolve_route(
+        &self,
+        _family: opc_gtpu_dataplane::GtpAddressFamily,
+    ) -> Result<GtpuTrafficProofDispatchRoute, GtpuTrafficProofDispatchError> {
+        Ok(self.route)
+    }
+
+    async fn dispatch(
+        &self,
+        request: GtpuTrafficProofDispatchRequest,
+    ) -> Result<GtpuTrafficProofDispatchReceipt, GtpuTrafficProofDispatchError> {
+        let local_address = self
+            .socket
+            .local_addr()
+            .map_err(|_| GtpuTrafficProofDispatchError::TransportFailure)?;
+        if local_address != request.outer_source() {
+            return Err(GtpuTrafficProofDispatchError::TransportRejected);
+        }
+        if self
+            .socket
+            .send_to(request.packet(), request.outer_destination())
+            .is_err()
+        {
+            return Err(GtpuTrafficProofDispatchError::TransportFailure);
+        }
+        Ok(GtpuTrafficProofDispatchReceipt::accepted())
+    }
+}
 
 fn parse_link_address(value: &str) -> [u8; 6] {
     let mut address = [0_u8; 6];
@@ -7781,6 +7821,22 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
     let pgw_v6 = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_IPV6, GTPU_PORT)).expect("bind proof IPv6 PGW socket")
     });
+    let v4_dispatch = IndependentCoreDispatchPort {
+        socket: &pgw,
+        route: GtpuTrafficProofDispatchRoute::new(
+            IpAddr::V4(REMOTE_HOST),
+            GTPU_PORT,
+            IpAddr::V4(UE_PAA),
+        ),
+    };
+    let v6_dispatch = IndependentCoreDispatchPort {
+        socket: &pgw_v6,
+        route: GtpuTrafficProofDispatchRoute::new(
+            IpAddr::V6(REMOTE_HOST_IPV6),
+            GTPU_PORT,
+            IpAddr::V6(UE_PAA_IPV6),
+        ),
+    };
     let untrusted_pgw = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_ALT_IP, GTPU_PORT)).expect("bind untrusted proof PGW socket")
     });
@@ -7866,6 +7922,119 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
         GtpuTrafficProofPoll::Pending
     ));
     backend.close_gtpu_traffic_proof(stale_session).await?;
+
+    // Each negative packet gets a fresh affine attempt. A malformed ICMP
+    // checksum must be rejected before the protected UE can return it, and an
+    // otherwise exact request under the wrong local TEID must be rejected by
+    // the production downlink selector. Neither may contribute even one
+    // direction of evidence to a later attempt.
+    let mut malformed_session = backend
+        .begin_gtpu_traffic_proof(authority_store.lease().await)
+        .await?;
+    let malformed_sample = (u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 0x0f01;
+    let malformed_challenge = malformed_session
+        .challenge(malformed_sample)
+        .expect("nonzero malformed-checksum challenge sample");
+    let mut malformed_inner = build_inner_icmp_echo(
+        REMOTE_HOST,
+        UE_PAA,
+        ICMP_ECHO_REQUEST,
+        malformed_challenge.identifier(),
+        malformed_challenge.sequence(),
+        malformed_challenge.payload(),
+    );
+    malformed_inner[22] ^= 0x01;
+    let malformed_gpdu = build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &malformed_inner);
+    drain_datagrams(&pgw);
+    pgw.set_read_timeout(Some(Duration::from_millis(250)))?;
+    pgw.send_to(&malformed_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+    assert!(
+        pgw.recv_from(&mut uplink).is_err(),
+        "a malformed ICMP checksum must not return through the trusted uplink writer"
+    );
+    assert!(matches!(
+        backend
+            .poll_gtpu_traffic_proof(&mut malformed_session)
+            .await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+    backend.close_gtpu_traffic_proof(malformed_session).await?;
+    println!("OPC_GTPU_TRAFFIC_MALFORMED_CHECKSUM_REJECTED");
+
+    let mut wrong_teid_session = backend
+        .begin_gtpu_traffic_proof(authority_store.lease().await)
+        .await?;
+    let wrong_teid_sample = (u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 0x0f02;
+    let wrong_teid_challenge = wrong_teid_session
+        .challenge(wrong_teid_sample)
+        .expect("nonzero wrong-TEID challenge sample");
+    let wrong_teid_inner = build_inner_icmp_echo(
+        REMOTE_HOST,
+        UE_PAA,
+        ICMP_ECHO_REQUEST,
+        wrong_teid_challenge.identifier(),
+        wrong_teid_challenge.sequence(),
+        wrong_teid_challenge.payload(),
+    );
+    let wrong_teid_gpdu = build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL + 1, None, &wrong_teid_inner);
+    drain_datagrams(&pgw);
+    pgw.set_read_timeout(Some(Duration::from_millis(250)))?;
+    pgw.send_to(&wrong_teid_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+    assert!(
+        pgw.recv_from(&mut uplink).is_err(),
+        "a wrong-TEID request must not reach the protected UE or trusted uplink writer"
+    );
+    assert!(matches!(
+        backend
+            .poll_gtpu_traffic_proof(&mut wrong_teid_session)
+            .await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+    backend.close_gtpu_traffic_proof(wrong_teid_session).await?;
+    println!("OPC_GTPU_TRAFFIC_WRONG_TEID_REJECTED");
+
+    // A bit-for-bit replay can traverse the genuine protected path twice, but
+    // duplicate directional events for one sample are continuity loss rather
+    // than two observations. The attempt must fail closed and cannot be
+    // reused by the following production-dispatch proof.
+    let mut replay_session = backend
+        .begin_gtpu_traffic_proof(authority_store.lease().await)
+        .await?;
+    let replay_sample = (u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 0x0f03;
+    let replay_challenge = replay_session
+        .challenge(replay_sample)
+        .expect("nonzero replay challenge sample");
+    let replay_inner = build_inner_icmp_echo(
+        REMOTE_HOST,
+        UE_PAA,
+        ICMP_ECHO_REQUEST,
+        replay_challenge.identifier(),
+        replay_challenge.sequence(),
+        replay_challenge.payload(),
+    );
+    let replay_gpdu = build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &replay_inner);
+    drain_datagrams(&pgw);
+    for _ in 0..2 {
+        pgw.send_to(&replay_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+        let replay_response = receive_gtpu_icmp_echo_reply(
+            &pgw,
+            GROUP_PEER_TEID_V4_INITIAL,
+            replay_challenge.identifier(),
+            replay_challenge.sequence(),
+        );
+        assert_ne!(
+            replay_response,
+            *replay_challenge.payload(),
+            "each protected replay must carry the private return tag"
+        );
+    }
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut replay_session).await?,
+        GtpuTrafficProofPoll::Invalidated(GtpuTrafficProofInvalidation::ContinuityLost)
+    ));
+    backend.close_gtpu_traffic_proof(replay_session).await?;
+    println!("OPC_GTPU_TRAFFIC_REPLAY_REJECTED");
+
     let mut session = backend
         .begin_gtpu_traffic_proof(authority_store.lease().await)
         .await?;
@@ -7951,18 +8120,23 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
         GtpuTrafficProofPoll::Pending
     ));
 
-    let first_inner = build_inner_icmp_echo(
-        REMOTE_HOST,
-        UE_PAA,
-        ICMP_ECHO_REQUEST,
-        first_challenge.identifier(),
-        first_challenge.sequence(),
-        first_challenge.payload(),
+    let first_receipt = backend
+        .dispatch_gtpu_traffic_proof_challenge(
+            &mut session,
+            &v4_dispatch,
+            opc_gtpu_dataplane::GtpAddressFamily::Ipv4,
+            first_sample,
+        )
+        .await?;
+    println!("OPC_GTPU_TRAFFIC_IPV4_FIRST_CHALLENGE_DISPATCHED");
+    assert_eq!(
+        format!("{first_receipt:?}"),
+        "GtpuTrafficProofDispatchReceipt(<non_authoritative>)"
     );
-    pgw.send_to(
-        &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &first_inner),
-        (EPDG_S2BU_IP, GTPU_PORT),
-    )?;
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
     let first_response_payload = receive_gtpu_icmp_echo_reply(
         &pgw,
         GROUP_PEER_TEID_V4_INITIAL,
@@ -7978,18 +8152,14 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
     // Separate complete round trips by at least the policy's observation
     // window so both directional sample histories can mature before polling.
     std::thread::sleep(policy.minimum_window_per_direction());
-    let second_inner = build_inner_icmp_echo(
-        REMOTE_HOST,
-        UE_PAA,
-        ICMP_ECHO_REQUEST,
-        second_challenge.identifier(),
-        second_challenge.sequence(),
-        second_challenge.payload(),
-    );
-    pgw.send_to(
-        &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &second_inner),
-        (EPDG_S2BU_IP, GTPU_PORT),
-    )?;
+    let _second_receipt = backend
+        .dispatch_gtpu_traffic_proof_challenge(
+            &mut session,
+            &v4_dispatch,
+            opc_gtpu_dataplane::GtpAddressFamily::Ipv4,
+            second_sample,
+        )
+        .await?;
     let second_response_payload = receive_gtpu_icmp_echo_reply(
         &pgw,
         GROUP_PEER_TEID_V4_INITIAL,
@@ -8007,6 +8177,7 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
             panic!("bidirectional continuity proof did not complete")
         }
     };
+    println!("OPC_GTPU_TRAFFIC_IPV4_PROOF_ISSUED");
     let summary = proof.summary();
     assert!(summary.access_to_core_samples() >= policy.minimum_samples_per_direction());
     assert!(summary.core_to_access_samples() >= policy.minimum_samples_per_direction());
@@ -8064,18 +8235,15 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
         GtpuTrafficProofPoll::Pending
     ));
 
-    let first_ipv6_request = build_inner_icmpv6_echo(
-        REMOTE_HOST_IPV6,
-        UE_PAA_IPV6,
-        ICMPV6_ECHO_REQUEST,
-        first_ipv6_challenge.identifier(),
-        first_ipv6_challenge.sequence(),
-        first_ipv6_challenge.payload(),
-    );
-    pgw_v6.send_to(
-        &build_gpdu(GROUP_LOCAL_TEID_V6_INITIAL, None, &first_ipv6_request),
-        (EPDG_S2BU_IPV6, GTPU_PORT),
-    )?;
+    let _first_ipv6_receipt = backend
+        .dispatch_gtpu_traffic_proof_challenge(
+            &mut ipv6_session,
+            &v6_dispatch,
+            opc_gtpu_dataplane::GtpAddressFamily::Ipv6,
+            first_ipv6_sample,
+        )
+        .await?;
+    println!("OPC_GTPU_TRAFFIC_IPV6_FIRST_CHALLENGE_DISPATCHED");
     let first_ipv6_response = receive_gtpu_icmpv6_echo_reply(
         &pgw_v6,
         GROUP_PEER_TEID_V6_INITIAL,
@@ -8089,18 +8257,14 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
     );
 
     std::thread::sleep(policy.minimum_window_per_direction());
-    let second_ipv6_request = build_inner_icmpv6_echo(
-        REMOTE_HOST_IPV6,
-        UE_PAA_IPV6,
-        ICMPV6_ECHO_REQUEST,
-        second_ipv6_challenge.identifier(),
-        second_ipv6_challenge.sequence(),
-        second_ipv6_challenge.payload(),
-    );
-    pgw_v6.send_to(
-        &build_gpdu(GROUP_LOCAL_TEID_V6_INITIAL, None, &second_ipv6_request),
-        (EPDG_S2BU_IPV6, GTPU_PORT),
-    )?;
+    let _second_ipv6_receipt = backend
+        .dispatch_gtpu_traffic_proof_challenge(
+            &mut ipv6_session,
+            &v6_dispatch,
+            opc_gtpu_dataplane::GtpAddressFamily::Ipv6,
+            second_ipv6_sample,
+        )
+        .await?;
     let second_ipv6_response = receive_gtpu_icmpv6_echo_reply(
         &pgw_v6,
         GROUP_PEER_TEID_V6_INITIAL,
@@ -8160,21 +8324,14 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
         if separator {
             std::thread::sleep(policy.minimum_window_per_direction());
         }
-        let challenge = broken_session
-            .challenge(sample)
-            .expect("fresh nonzero broken-path challenge");
-        let request = build_inner_icmp_echo(
-            REMOTE_HOST,
-            UE_PAA,
-            ICMP_ECHO_REQUEST,
-            challenge.identifier(),
-            challenge.sequence(),
-            challenge.payload(),
-        );
-        pgw.send_to(
-            &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &request),
-            (EPDG_S2BU_IP, GTPU_PORT),
-        )?;
+        let _receipt = backend
+            .dispatch_gtpu_traffic_proof_challenge(
+                &mut broken_session,
+                &v4_dispatch,
+                opc_gtpu_dataplane::GtpAddressFamily::Ipv4,
+                sample,
+            )
+            .await?;
         assert!(
             pgw.recv_from(&mut uplink).is_err(),
             "without the owned inbound SA/policy, an authenticated Echo Reply cannot reach the production GTP-U writer"
