@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, MapInfo, PerCpuArray};
+use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, MapInfo, PerCpuArray, PerCpuValues};
 use aya::programs::tc::{NlOptions, TcAttachOptions, TcHandle};
 use aya::programs::{loaded_programs, SchedClassifier, TcAttachType};
 use aya::{Ebpf, EbpfLoader};
@@ -75,14 +75,15 @@ use opc_gtpu_dataplane::{
     GtpuSessionGroup, GtpuSessionGroupId, GtpuSessionGroupReadback,
     GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionSelectorProvenance,
-    GtpuSourcePortPolicy, GtpuUplinkChecksumOffloadContract, GtpuUplinkMtuPolicy,
+    GtpuSourcePortPolicy, GtpuTrafficProofAuthority, GtpuTrafficProofPoll,
+    GtpuTrafficProofValidation, GtpuUplinkChecksumOffloadContract, GtpuUplinkMtuPolicy,
     GtpuUplinkSourcePortPolicy, GtpuV2DrainProof, PdpContextIndeterminateReason,
     PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
     PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
     PdpContextUplinkSelector, RemovePdpContextRequest, RetainedGraphCleanupClassification,
     RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest, Teid, TftUplinkBearer,
     TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
-    TftUplinkClassifierRemovalOutcome,
+    TftUplinkClassifierRemovalOutcome, TrafficContinuityPolicy,
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, udp_ipv6_checksum,
@@ -102,27 +103,34 @@ use opc_gtpu_ebpf_common::{
     GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
     GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_IPV4_SLOT, GTPU_SESSION_IPV6_SLOT,
     GTPU_SESSION_SCHEMA_MARKER_LEN, GTPU_SESSION_SCHEMA_MARKER_VALUE,
-    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG,
-    MAP_CONFIG_IPV6, MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING,
-    MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX,
-    MAP_SESSION_GROUPS, MAP_SESSION_SCHEMA, MAP_SESSION_TRANSACTIONS, MAP_SESSION_UPLINK_INDEX,
-    MAP_TFT_CLASSIFIER_COUNTERS, MAP_TFT_CLASSIFIER_FILTERS, MAP_TFT_CLASSIFIER_META,
-    MAP_TFT_CLASSIFIER_SCHEMA, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP,
-    MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS,
-    MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
-    PROG_DOWNLINK, PROG_UPLINK, TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_KEY_LEN,
-    TFT_CLASSIFIER_FILTER_VALUE_LEN, TFT_CLASSIFIER_KEY_LEN, TFT_CLASSIFIER_META_VALUE_LEN,
-    TFT_CLASSIFIER_SCHEMA_VALUE_LEN, UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
-    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
-    UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
-    UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
-    UPLINK_SOURCE_PORT_VALUE_LEN,
+    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
+    GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES, GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_PUBLICATION_SEQUENCE_INDEX,
+    GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN,
+    GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN, GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+    IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_CONFIG_IPV6, MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS,
+    MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR,
+    MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX, MAP_SESSION_GROUPS, MAP_SESSION_SCHEMA,
+    MAP_SESSION_TRANSACTIONS, MAP_SESSION_UPLINK_INDEX, MAP_TFT_CLASSIFIER_COUNTERS,
+    MAP_TFT_CLASSIFIER_FILTERS, MAP_TFT_CLASSIFIER_META, MAP_TFT_CLASSIFIER_SCHEMA,
+    MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR,
+    MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT,
+    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
+    TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_KEY_LEN, TFT_CLASSIFIER_FILTER_VALUE_LEN,
+    TFT_CLASSIFIER_KEY_LEN, TFT_CLASSIFIER_META_VALUE_LEN, TFT_CLASSIFIER_SCHEMA_VALUE_LEN,
+    UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
+    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
+    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS,
+    UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
-    LifetimeConfig, LinuxXfrmBackend, PolicyParameters, SaParameters, UdpEncap, XfrmAction,
-    XfrmBackend, XfrmDirection, XfrmId, XfrmLookupMark, XfrmMark, XfrmMode, XfrmRequestId,
-    XfrmSelector, XfrmTemplate,
+    LifetimeConfig, LinuxXfrmBackend, PolicyParameters, RemovePolicyRequest, RemoveSaRequest,
+    SaParameters, UdpEncap, XfrmAction, XfrmBackend, XfrmDirection, XfrmId, XfrmLookupMark,
+    XfrmMark, XfrmMode, XfrmRequestId, XfrmSelector, XfrmTemplate,
 };
 use opc_proto_tft::{
     PacketFilter, PacketFilterComponent, PacketFilterDirection, PacketFilterIdentifier, PortRange,
@@ -180,21 +188,33 @@ const GROUP_LOCAL_TEID_V6_CROSSED: u32 = 0x7100_0002;
 const GROUP_PEER_TEID_V6_CROSSED: u32 = 0x7200_0002;
 const INBOUND_SPI_DEFAULT: u32 = 0x3000_0000;
 const INBOUND_SPI_A: u32 = 0x3000_0001;
+const INBOUND_SPI_V6_A: u32 = 0x3000_0002;
 const OUTBOUND_SPI_DEFAULT: u32 = 0x4000_0001;
 const OUTBOUND_SPI_A: u32 = 0x4000_0002;
+const OUTBOUND_SPI_V6_A: u32 = 0x4000_0003;
 const XFRM_SESSION_REQUEST_ID: u32 = 0x0a00_0001;
 const GTPU_PORT: u16 = 2152;
 const NAT_T_PORT: u16 = 4500;
 const XFRM_INNER_SOURCE_PORT: u16 = 5004;
 const XFRM_INNER_DESTINATION_PORT: u16 = 53;
 const XFRM_DOWNLINK_SOURCE_PORT: u16 = 53;
-const XFRM_DOWNLINK_DESTINATION_PORT: u16 = 5005;
+// The protected reply must retain the inverse five-tuple so the production
+// observation writer can correlate it with the ESP-decrypted uplink.
+const XFRM_DOWNLINK_DESTINATION_PORT: u16 = XFRM_INNER_SOURCE_PORT;
 const IPPROTO_UDP: u8 = 17;
+const IPPROTO_ICMP: u8 = 1;
+const IPPROTO_ICMPV6: u8 = 58;
 const IPPROTO_ESP: u8 = 50;
+const ICMP_ECHO_REQUEST: u8 = 8;
+const ICMP_ECHO_REPLY: u8 = 0;
+const ICMPV6_ECHO_REQUEST: u8 = 128;
+const ICMPV6_ECHO_REPLY: u8 = 129;
+const ICMP_ECHO_IDENTIFIER: u16 = 0x6550;
+const OBSERVATION_FLOW_SCRATCH_VALUE_LEN: usize = 40;
 const CURRENT_DATAPATH_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath.bpf.o");
 const FROZEN_V1_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v1.bpf.o");
 const FROZEN_V2_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v2.bpf.o");
-const CURRENT_PIN_NAMES: [&str; 25] = [
+const CURRENT_PIN_NAMES: [&str; 33] = [
     MAP_UPLINK_FAR,
     MAP_UPLINK_MARK_FAR,
     MAP_UPLINK_DSCP,
@@ -220,6 +240,14 @@ const CURRENT_PIN_NAMES: [&str; 25] = [
     MAP_TFT_CLASSIFIER_META,
     MAP_TFT_CLASSIFIER_FILTERS,
     MAP_TFT_CLASSIFIER_COUNTERS,
+    GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
 ];
 /// The generation immediately before the uplink redirect-outcome counter.
 ///
@@ -882,6 +910,7 @@ impl TestNet {
 impl Drop for TestNet {
     fn drop(&mut self) {
         // Best-effort teardown; the CI netns is discarded anyway.
+        cleanup_owned_root_xfrm_objects();
         let _ = Command::new("ip").args(["link", "del", "s2bu"]).output();
         let _ = Command::new("ip").args(["link", "del", "ue0"]).output();
         let _ = Command::new("ip")
@@ -1063,22 +1092,33 @@ fn xfrm_ip(address: Ipv4Addr) -> IpAddress {
     IpAddress::Ipv4(address.octets())
 }
 
+fn xfrm_ip_v6(address: Ipv6Addr) -> IpAddress {
+    IpAddress::Ipv6(address.octets())
+}
+
 fn xfrm_session_request_id() -> XfrmRequestId {
     XfrmRequestId::new(XFRM_SESSION_REQUEST_ID).expect("nonzero session request ID")
 }
 
 fn marked_inner_selector() -> XfrmSelector {
-    let mut selector = XfrmSelector::new(xfrm_ip(UE_PAA), xfrm_ip(REMOTE_HOST), IPPROTO_UDP);
-    selector.source_port = XFRM_INNER_SOURCE_PORT;
-    selector.destination_port = XFRM_INNER_DESTINATION_PORT;
-    selector
+    // The disposable Child SA carries both the independent application UDP
+    // assertion and the authenticated ICMP Echo challenges. Wildcarding the
+    // inner protocol and ports lets the kernel protect both exact packet
+    // classes while the proof parser remains responsible for ICMP shape and
+    // challenge authentication.
+    XfrmSelector::new(xfrm_ip(UE_PAA), xfrm_ip(REMOTE_HOST), 0)
 }
 
 fn downlink_selector() -> XfrmSelector {
-    let mut selector = XfrmSelector::new(xfrm_ip(REMOTE_HOST), xfrm_ip(UE_PAA), IPPROTO_UDP);
-    selector.source_port = XFRM_DOWNLINK_SOURCE_PORT;
-    selector.destination_port = XFRM_DOWNLINK_DESTINATION_PORT;
-    selector
+    XfrmSelector::new(xfrm_ip(REMOTE_HOST), xfrm_ip(UE_PAA), 0)
+}
+
+fn marked_inner_selector_v6() -> XfrmSelector {
+    XfrmSelector::new(xfrm_ip_v6(UE_PAA_IPV6), xfrm_ip_v6(REMOTE_HOST_IPV6), 0)
+}
+
+fn downlink_selector_v6() -> XfrmSelector {
+    XfrmSelector::new(xfrm_ip_v6(REMOTE_HOST_IPV6), xfrm_ip_v6(UE_PAA_IPV6), 0)
 }
 
 fn inbound_sa_parameters(spi: u32, output_mark: XfrmMark) -> SaParameters {
@@ -1168,6 +1208,104 @@ fn downlink_policy_parameters(spi: u32, mark: XfrmLookupMark) -> PolicyParameter
             mode: XfrmMode::Tunnel,
         }],
         mark: Some(mark),
+        if_id: None,
+    }
+}
+
+fn protected_v6_inbound_sa_parameters(output_mark: Option<XfrmMark>) -> SaParameters {
+    SaParameters {
+        selector: marked_inner_selector_v6(),
+        id: XfrmId {
+            destination: xfrm_ip(EPDG_SWU_IP),
+            spi: INBOUND_SPI_V6_A,
+            protocol: IPPROTO_ESP,
+        },
+        source_address: xfrm_ip(UE_SWU_IP),
+        request_id: Some(xfrm_session_request_id()),
+        auth: Some((
+            AuthAlgorithm::hmac_sha256(96),
+            KeyMaterial::new(vec![0x6b; 32]),
+        )),
+        crypt: Some((Algorithm::cbc_aes(), KeyMaterial::new(vec![0x6d; 16]))),
+        aead: None,
+        mode: XfrmMode::Tunnel,
+        lifetime: LifetimeConfig::default(),
+        replay_window: 32,
+        replay_state: None,
+        encap: Some(UdpEncap::esp_in_udp(NAT_T_PORT, NAT_T_PORT)),
+        mark: None,
+        output_mark,
+        if_id: None,
+        egress_dscp: None,
+    }
+}
+
+fn protected_v6_downlink_sa_parameters(mark: Option<XfrmLookupMark>) -> SaParameters {
+    SaParameters {
+        selector: downlink_selector_v6(),
+        id: XfrmId {
+            destination: xfrm_ip(UE_SWU_IP),
+            spi: OUTBOUND_SPI_V6_A,
+            protocol: IPPROTO_ESP,
+        },
+        source_address: xfrm_ip(EPDG_SWU_IP),
+        request_id: Some(xfrm_session_request_id()),
+        auth: Some((
+            AuthAlgorithm::hmac_sha256(96),
+            KeyMaterial::new(vec![0x7b; 32]),
+        )),
+        crypt: Some((Algorithm::cbc_aes(), KeyMaterial::new(vec![0x7d; 16]))),
+        aead: None,
+        mode: XfrmMode::Tunnel,
+        lifetime: LifetimeConfig::default(),
+        replay_window: 32,
+        replay_state: None,
+        encap: Some(UdpEncap::esp_in_udp(NAT_T_PORT, NAT_T_PORT)),
+        mark,
+        output_mark: None,
+        if_id: None,
+        egress_dscp: None,
+    }
+}
+
+fn protected_v6_inbound_policy_parameters(direction: XfrmDirection) -> PolicyParameters {
+    PolicyParameters {
+        selector: marked_inner_selector_v6(),
+        direction,
+        action: XfrmAction::Allow,
+        priority: 90,
+        templates: vec![XfrmTemplate {
+            id: XfrmId {
+                destination: xfrm_ip(EPDG_SWU_IP),
+                spi: 0,
+                protocol: IPPROTO_ESP,
+            },
+            source_address: xfrm_ip(UE_SWU_IP),
+            request_id: Some(xfrm_session_request_id()),
+            mode: XfrmMode::Tunnel,
+        }],
+        mark: None,
+        if_id: None,
+    }
+}
+
+fn protected_v6_downlink_policy_parameters(mark: Option<XfrmLookupMark>) -> PolicyParameters {
+    PolicyParameters {
+        selector: downlink_selector_v6(),
+        direction: XfrmDirection::Out,
+        action: XfrmAction::Allow,
+        priority: 90,
+        templates: vec![XfrmTemplate {
+            id: XfrmId {
+                destination: xfrm_ip(UE_SWU_IP),
+                spi: OUTBOUND_SPI_V6_A,
+                protocol: IPPROTO_ESP,
+            },
+            source_address: xfrm_ip(EPDG_SWU_IP),
+            request_id: Some(xfrm_session_request_id()),
+            mode: XfrmMode::Tunnel,
+        }],
+        mark,
         if_id: None,
     }
 }
@@ -1274,6 +1412,216 @@ async fn install_real_marked_outbound_xfrm() -> Result<(), opc_ipsec_xfrm::XfrmE
             })
             .await?;
     }
+    Ok(())
+}
+
+async fn remove_real_marked_outbound_xfrm() -> Result<(), opc_ipsec_xfrm::XfrmError> {
+    let backend = LinuxXfrmBackend::new();
+    let default_mark = XfrmLookupMark::full(0);
+    let dedicated_mark = XfrmLookupMark::full(MARK_A);
+    for mark in [default_mark, dedicated_mark] {
+        backend
+            .remove_policy(
+                RemovePolicyRequest::new(downlink_selector(), XfrmDirection::Out).with_mark(mark),
+            )
+            .await?;
+    }
+    backend
+        .remove_sa(RemoveSaRequest::new(
+            xfrm_ip(UE_SWU_IP),
+            IPPROTO_ESP,
+            OUTBOUND_SPI_DEFAULT,
+        ))
+        .await?;
+    backend
+        .remove_sa(
+            RemoveSaRequest::new(xfrm_ip(UE_SWU_IP), IPPROTO_ESP, OUTBOUND_SPI_A)
+                .with_mark(dedicated_mark),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn remove_owned_root_xfrm_objects_best_effort() -> bool {
+    let backend = LinuxXfrmBackend::new();
+    let default_mark = XfrmLookupMark::full(0);
+    let dedicated_mark = XfrmLookupMark::full(MARK_A);
+    let policies = [
+        RemovePolicyRequest::new(marked_inner_selector(), XfrmDirection::In),
+        RemovePolicyRequest::new(marked_inner_selector(), XfrmDirection::Forward),
+        RemovePolicyRequest::new(downlink_selector(), XfrmDirection::Out).with_mark(default_mark),
+        RemovePolicyRequest::new(downlink_selector(), XfrmDirection::Out).with_mark(dedicated_mark),
+        RemovePolicyRequest::new(marked_inner_selector_v6(), XfrmDirection::In),
+        RemovePolicyRequest::new(marked_inner_selector_v6(), XfrmDirection::Forward),
+        RemovePolicyRequest::new(downlink_selector_v6(), XfrmDirection::Out)
+            .with_mark(dedicated_mark),
+    ];
+    let states = [
+        RemoveSaRequest::new(xfrm_ip(EPDG_SWU_IP), IPPROTO_ESP, INBOUND_SPI_DEFAULT),
+        RemoveSaRequest::new(xfrm_ip(EPDG_SWU_IP), IPPROTO_ESP, INBOUND_SPI_A),
+        RemoveSaRequest::new(xfrm_ip(UE_SWU_IP), IPPROTO_ESP, OUTBOUND_SPI_DEFAULT),
+        RemoveSaRequest::new(xfrm_ip(UE_SWU_IP), IPPROTO_ESP, OUTBOUND_SPI_A)
+            .with_mark(dedicated_mark),
+        RemoveSaRequest::new(xfrm_ip(EPDG_SWU_IP), IPPROTO_ESP, INBOUND_SPI_V6_A),
+        RemoveSaRequest::new(xfrm_ip(UE_SWU_IP), IPPROTO_ESP, OUTBOUND_SPI_V6_A)
+            .with_mark(dedicated_mark),
+    ];
+    let mut complete = true;
+    for request in policies {
+        if !matches!(
+            backend.remove_policy(request).await,
+            Ok(()) | Err(opc_ipsec_xfrm::XfrmError::NotFound)
+        ) {
+            complete = false;
+        }
+    }
+    for request in states {
+        if !matches!(
+            backend.remove_sa(request).await,
+            Ok(()) | Err(opc_ipsec_xfrm::XfrmError::NotFound)
+        ) {
+            complete = false;
+        }
+    }
+    complete
+}
+
+fn cleanup_owned_root_xfrm_objects() {
+    // `TestNet` is dropped from Tokio tests. Run the async SDK removals on a
+    // joined helper thread so teardown remains foreground and never nests a
+    // runtime. Every request names only an object installed by this fixture.
+    let worker = std::thread::Builder::new()
+        .name("opc-gtpu-xfrm-cleanup".to_owned())
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|runtime| runtime.block_on(remove_owned_root_xfrm_objects_best_effort()))
+                .unwrap_or(false)
+        });
+    let complete = worker
+        .ok()
+        .and_then(|worker| worker.join().ok())
+        .unwrap_or(false);
+    if !complete {
+        eprintln!("owned disposable XFRM cleanup was incomplete");
+    }
+}
+
+async fn install_real_marked_outbound_xfrm_for_ue_application(
+    ue_namespace: &str,
+) -> Result<(), opc_ipsec_xfrm::XfrmError> {
+    install_real_marked_outbound_xfrm().await?;
+
+    // The peer receives only the dedicated Child SA. This makes the
+    // application-layer receive assertion below prove that the marked GTP-U
+    // downlink was not merely emitted as outer ESP, but was also accepted and
+    // decrypted in the disposable UE namespace.
+    let ue_namespace = ue_namespace.to_owned();
+    let dedicated_mark = XfrmLookupMark::full(MARK_A);
+    in_netns(&ue_namespace, move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build UE downlink XFRM runtime");
+        runtime.block_on(async {
+            let peer_backend = LinuxXfrmBackend::new();
+            peer_backend
+                .install_sa(InstallSaRequest {
+                    parameters: downlink_sa_parameters(OUTBOUND_SPI_A, None),
+                })
+                .await
+                .expect("install UE inbound dedicated downlink SA");
+            peer_backend
+                .install_policy(InstallPolicyRequest {
+                    parameters: PolicyParameters {
+                        direction: XfrmDirection::In,
+                        mark: None,
+                        ..downlink_policy_parameters(OUTBOUND_SPI_A, dedicated_mark)
+                    },
+                })
+                .await
+                .expect("install UE inbound dedicated downlink policy");
+        });
+    });
+    Ok(())
+}
+
+/// Install a distinct IPv6-inner Child SA pair over the disposable IPv4 SWu
+/// tunnel endpoints. Distinct SPIs and keys keep this proof independent from
+/// the IPv4 application path while the same bearer mark selects the v6 member
+/// of the exact session group.
+async fn install_real_marked_ipv6_xfrm(
+    ue_namespace: &str,
+) -> Result<(), opc_ipsec_xfrm::XfrmError> {
+    let backend = LinuxXfrmBackend::new();
+    let dedicated_mark = XfrmLookupMark::full(MARK_A);
+    backend
+        .install_sa(InstallSaRequest {
+            parameters: protected_v6_inbound_sa_parameters(Some(XfrmMark {
+                value: MARK_A,
+                mask: u32::MAX,
+            })),
+        })
+        .await?;
+    for direction in [XfrmDirection::In, XfrmDirection::Forward] {
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: protected_v6_inbound_policy_parameters(direction),
+            })
+            .await?;
+    }
+    backend
+        .install_sa(InstallSaRequest {
+            parameters: protected_v6_downlink_sa_parameters(Some(dedicated_mark)),
+        })
+        .await?;
+    backend
+        .install_policy(InstallPolicyRequest {
+            parameters: protected_v6_downlink_policy_parameters(Some(dedicated_mark)),
+        })
+        .await?;
+
+    let ue_namespace = ue_namespace.to_owned();
+    in_netns(&ue_namespace, move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build UE IPv6 XFRM runtime");
+        runtime.block_on(async {
+            let peer_backend = LinuxXfrmBackend::new();
+            peer_backend
+                .install_sa(InstallSaRequest {
+                    parameters: protected_v6_inbound_sa_parameters(None),
+                })
+                .await
+                .expect("install UE IPv6 outbound SA");
+            peer_backend
+                .install_policy(InstallPolicyRequest {
+                    parameters: PolicyParameters {
+                        direction: XfrmDirection::Out,
+                        ..protected_v6_inbound_policy_parameters(XfrmDirection::Out)
+                    },
+                })
+                .await
+                .expect("install UE IPv6 outbound policy");
+            peer_backend
+                .install_sa(InstallSaRequest {
+                    parameters: protected_v6_downlink_sa_parameters(None),
+                })
+                .await
+                .expect("install UE IPv6 inbound SA");
+            peer_backend
+                .install_policy(InstallPolicyRequest {
+                    parameters: PolicyParameters {
+                        direction: XfrmDirection::In,
+                        ..protected_v6_downlink_policy_parameters(None)
+                    },
+                })
+                .await
+                .expect("install UE IPv6 inbound policy");
+        });
+    });
     Ok(())
 }
 
@@ -1511,6 +1859,212 @@ fn build_inner_udp(
     packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
     packet[28..].copy_from_slice(payload);
     packet
+}
+
+/// Build an exact IPv4 ICMP Echo packet for one authenticated traffic-proof
+/// challenge. The challenge API fixes the payload at 32 bytes; the identifier
+/// and sequence fields remain explicit so the reply assertion can reject any
+/// kernel-generated or unrelated Echo traffic.
+fn build_inner_icmp_echo(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    icmp_type: u8,
+    identifier: u16,
+    sequence: u16,
+    payload: &[u8; 32],
+) -> Vec<u8> {
+    const IPV4_HEADER_LEN: usize = 20;
+    const ICMP_HEADER_LEN: usize = 8;
+    let total_len = IPV4_HEADER_LEN + ICMP_HEADER_LEN + payload.len();
+    let mut packet = vec![0_u8; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(
+        &u16::try_from(total_len)
+            .expect("bounded ICMP challenge packet")
+            .to_be_bytes(),
+    );
+    packet[8] = 64;
+    packet[9] = IPPROTO_ICMP;
+    packet[12..16].copy_from_slice(&src.octets());
+    packet[16..20].copy_from_slice(&dst.octets());
+    let mut ipv4_header = [0_u8; IPV4_HEADER_LEN];
+    ipv4_header.copy_from_slice(&packet[..IPV4_HEADER_LEN]);
+    packet[10..12].copy_from_slice(&ipv4_header_checksum(&ipv4_header).to_be_bytes());
+
+    let icmp = IPV4_HEADER_LEN;
+    packet[icmp] = icmp_type;
+    packet[icmp + 2..icmp + 4].fill(0);
+    packet[icmp + 4..icmp + 6].copy_from_slice(&identifier.to_be_bytes());
+    packet[icmp + 6..icmp + 8].copy_from_slice(&sequence.to_be_bytes());
+    packet[icmp + ICMP_HEADER_LEN..].copy_from_slice(payload);
+    let icmp_checksum = internet_checksum(&packet[icmp..]);
+    packet[icmp + 2..icmp + 4].copy_from_slice(&icmp_checksum.to_be_bytes());
+    packet
+}
+
+/// Receive and strictly validate one GTP-U-carried ICMP Echo Reply from the
+/// disposable UE/XFRM path.
+fn receive_gtpu_icmp_echo_reply(
+    socket: &UdpSocket,
+    expected_teid: u32,
+    expected_identifier: u16,
+    expected_sequence: u16,
+) -> [u8; 32] {
+    const IPV4_HEADER_LEN: usize = 20;
+    const ICMP_HEADER_LEN: usize = 8;
+    const PAYLOAD_LEN: usize = 32;
+    let expected_inner_len = IPV4_HEADER_LEN + ICMP_HEADER_LEN + PAYLOAD_LEN;
+    let mut buffer = [0_u8; 2048];
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set ICMP reply receive timeout");
+    let (length, source) = socket
+        .recv_from(&mut buffer)
+        .expect("authenticated ICMP Echo Reply must traverse GTP-U uplink");
+    assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(length, GTPU_MANDATORY_HDR_LEN + expected_inner_len);
+    assert_eq!(&buffer[..2], &[0x30, 0xff], "reply must be a plain G-PDU");
+    assert_eq!(
+        u16::from_be_bytes([buffer[2], buffer[3]]) as usize,
+        expected_inner_len,
+        "GTP-U length must cover exactly the ICMP Echo Reply"
+    );
+    assert_eq!(
+        u32::from_be_bytes(buffer[4..8].try_into().expect("GTP-U TEID extent")),
+        expected_teid
+    );
+
+    let inner = &buffer[GTPU_MANDATORY_HDR_LEN..length];
+    assert_eq!(inner[0], 0x45, "reply must be IPv4 without options");
+    assert_eq!(
+        u16::from_be_bytes([inner[2], inner[3]]) as usize,
+        expected_inner_len
+    );
+    assert_eq!(inner[9], IPPROTO_ICMP);
+    assert_eq!(&inner[12..16], &UE_PAA.octets());
+    assert_eq!(&inner[16..20], &REMOTE_HOST.octets());
+    assert_eq!(internet_checksum(&inner[..IPV4_HEADER_LEN]), 0);
+
+    let icmp = &inner[IPV4_HEADER_LEN..];
+    assert_eq!(icmp[0], ICMP_ECHO_REPLY);
+    assert_eq!(icmp[1], 0, "ICMP Echo Reply code must be zero");
+    assert_eq!(u16::from_be_bytes([icmp[4], icmp[5]]), expected_identifier);
+    assert_eq!(u16::from_be_bytes([icmp[6], icmp[7]]), expected_sequence);
+    assert_eq!(internet_checksum(icmp), 0);
+    icmp[ICMP_HEADER_LEN..]
+        .try_into()
+        .expect("fixed authenticated challenge payload extent")
+}
+
+fn icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, message: &[u8]) -> u16 {
+    let message_len = u32::try_from(message.len()).expect("bounded ICMPv6 message");
+    let mut checksum_input = Vec::with_capacity(40 + message.len());
+    checksum_input.extend_from_slice(&src.octets());
+    checksum_input.extend_from_slice(&dst.octets());
+    checksum_input.extend_from_slice(&message_len.to_be_bytes());
+    checksum_input.extend_from_slice(&[0; 3]);
+    checksum_input.push(IPPROTO_ICMPV6);
+    checksum_input.extend_from_slice(message);
+    internet_checksum(&checksum_input)
+}
+
+/// Build one exact ICMPv6 Echo packet with a materialized pseudo-header
+/// checksum. The production proof writer accepts no extension headers or
+/// trailers for this fixed challenge profile.
+fn build_inner_icmpv6_echo(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    icmp_type: u8,
+    identifier: u16,
+    sequence: u16,
+    payload: &[u8; 32],
+) -> Vec<u8> {
+    const IPV6_HEADER_LEN: usize = 40;
+    const ICMP_HEADER_LEN: usize = 8;
+    let icmp_len = ICMP_HEADER_LEN + payload.len();
+    let mut packet = vec![0_u8; IPV6_HEADER_LEN + icmp_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(
+        &u16::try_from(icmp_len)
+            .expect("bounded ICMPv6 challenge")
+            .to_be_bytes(),
+    );
+    packet[6] = IPPROTO_ICMPV6;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&src.octets());
+    packet[24..40].copy_from_slice(&dst.octets());
+
+    let icmp = IPV6_HEADER_LEN;
+    packet[icmp] = icmp_type;
+    packet[icmp + 4..icmp + 6].copy_from_slice(&identifier.to_be_bytes());
+    packet[icmp + 6..icmp + 8].copy_from_slice(&sequence.to_be_bytes());
+    packet[icmp + ICMP_HEADER_LEN..].copy_from_slice(payload);
+    let checksum = icmpv6_checksum(src, dst, &packet[icmp..]);
+    packet[icmp + 2..icmp + 4].copy_from_slice(&checksum.to_be_bytes());
+    assert_eq!(
+        icmpv6_checksum(src, dst, &packet[icmp..]),
+        0,
+        "synthetic ICMPv6 checksum must validate independently"
+    );
+    packet
+}
+
+/// Receive and strictly validate one outer-IPv6 GTP-U-carried ICMPv6 Echo
+/// Reply from the disposable protected UE path.
+fn receive_gtpu_icmpv6_echo_reply(
+    socket: &UdpSocket,
+    expected_teid: u32,
+    expected_identifier: u16,
+    expected_sequence: u16,
+) -> [u8; 32] {
+    const IPV6_HEADER_LEN: usize = 40;
+    const ICMP_HEADER_LEN: usize = 8;
+    const PAYLOAD_LEN: usize = 32;
+    let expected_icmp_len = ICMP_HEADER_LEN + PAYLOAD_LEN;
+    let expected_inner_len = IPV6_HEADER_LEN + expected_icmp_len;
+    let mut buffer = [0_u8; 2048];
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set ICMPv6 reply receive timeout");
+    let (length, source) = socket
+        .recv_from(&mut buffer)
+        .expect("authenticated ICMPv6 Echo Reply must traverse GTP-U uplink");
+    assert_eq!(source, SocketAddr::from((EPDG_S2BU_IPV6, GTPU_PORT)));
+    assert_eq!(length, GTPU_MANDATORY_HDR_LEN + expected_inner_len);
+    assert_eq!(&buffer[..2], &[0x30, 0xff], "reply must be a plain G-PDU");
+    assert_eq!(
+        u16::from_be_bytes([buffer[2], buffer[3]]) as usize,
+        expected_inner_len,
+        "GTP-U length must cover exactly the ICMPv6 Echo Reply"
+    );
+    assert_eq!(
+        u32::from_be_bytes(buffer[4..8].try_into().expect("GTP-U TEID extent")),
+        expected_teid
+    );
+
+    let inner = &buffer[GTPU_MANDATORY_HDR_LEN..length];
+    assert_eq!(inner[0] >> 4, 6, "reply must be IPv6");
+    assert_eq!(
+        usize::from(u16::from_be_bytes([inner[4], inner[5]])),
+        expected_icmp_len
+    );
+    assert_eq!(inner[6], IPPROTO_ICMPV6);
+    assert_eq!(&inner[8..24], &UE_PAA_IPV6.octets());
+    assert_eq!(&inner[24..40], &REMOTE_HOST_IPV6.octets());
+
+    let icmp = &inner[IPV6_HEADER_LEN..];
+    assert_eq!(icmp[0], ICMPV6_ECHO_REPLY);
+    assert_eq!(icmp[1], 0, "ICMPv6 Echo Reply code must be zero");
+    assert_eq!(u16::from_be_bytes([icmp[4], icmp[5]]), expected_identifier);
+    assert_eq!(u16::from_be_bytes([icmp[6], icmp[7]]), expected_sequence);
+    assert_eq!(
+        icmpv6_checksum(UE_PAA_IPV6, REMOTE_HOST_IPV6, icmp),
+        0,
+        "received ICMPv6 pseudo-header checksum must validate"
+    );
+    icmp[ICMP_HEADER_LEN..]
+        .try_into()
+        .expect("fixed authenticated IPv6 challenge payload extent")
 }
 
 /// Build an inner IPv6/UDP packet with the mandatory UDP checksum
@@ -2326,6 +2880,41 @@ fn receive_grouped_downlink(
         .recv_from(&mut buffer)
         .expect("authorized grouped G-PDU must decapsulate");
     assert_eq!(source, expected_source);
+    assert_eq!(&buffer[..length], expected_payload);
+}
+
+/// Assert that a marked GTP-U downlink was decrypted by the UE Child SA and
+/// delivered to the application endpoint that owns its inverse flow tuple.
+///
+/// The bounded buffer deliberately makes this an application-layer assertion,
+/// rather than allowing the raw ESP capture to be the only evidence that the
+/// ePDG forwarded a protected downlink all the way to the UE.
+fn receive_xfrm_downlink_application(socket: &UdpSocket, expected_payload: &[u8]) {
+    const MAX_CONTINUITY_PAYLOAD_LEN: usize = 256;
+
+    assert!(
+        expected_payload.len() <= MAX_CONTINUITY_PAYLOAD_LEN,
+        "continuity payload must remain bounded"
+    );
+    assert_eq!(
+        socket
+            .local_addr()
+            .expect("read proof UE application endpoint"),
+        SocketAddr::from((UE_PAA, XFRM_DOWNLINK_DESTINATION_PORT)),
+        "the proof socket must be bound to the decrypted downlink destination"
+    );
+    let mut buffer = [0_u8; MAX_CONTINUITY_PAYLOAD_LEN];
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set XFRM downlink application receive timeout");
+    let (length, source) = socket
+        .recv_from(&mut buffer)
+        .expect("marked GTP-U downlink must decrypt and reach the UE application");
+    assert_eq!(
+        source,
+        SocketAddr::from((REMOTE_HOST, XFRM_DOWNLINK_SOURCE_PORT)),
+        "the decrypted downlink source must preserve the inverse flow tuple"
+    );
     assert_eq!(&buffer[..length], expected_payload);
 }
 
@@ -3392,6 +3981,23 @@ fn pinned_array_values<const VALUE_LEN: usize>(
         .collect()
 }
 
+fn pinned_u64_array_values(pin_dir: &std::path::Path, name: &str, slots: u32) -> Vec<u64> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(name))
+            .unwrap_or_else(|error| panic!("open pinned {name}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("identify pinned {name}: {error}"));
+    let array = Array::<_, u64>::try_from(map)
+        .unwrap_or_else(|error| panic!("type pinned {name}: {error}"));
+    (0..slots)
+        .map(|index| {
+            array
+                .get(&index, 0)
+                .unwrap_or_else(|error| panic!("read pinned {name}[{index}]: {error}"))
+        })
+        .collect()
+}
+
 fn pinned_per_cpu_u64_values(pin_dir: &std::path::Path, name: &str, slots: u32) -> Vec<Vec<u64>> {
     let map = Map::from_map_data(
         MapData::from_pin(pin_dir.join(name))
@@ -3412,7 +4018,33 @@ fn pinned_per_cpu_u64_values(pin_dir: &std::path::Path, name: &str, slots: u32) 
         .collect()
 }
 
-/// Exact byte-for-byte state of every map in the current 25-pin graph.
+fn pinned_per_cpu_byte_values<const VALUE_LEN: usize>(
+    pin_dir: &std::path::Path,
+    name: &str,
+    slots: u32,
+) -> Vec<Vec<[u8; VALUE_LEN]>> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(name))
+            .unwrap_or_else(|error| panic!("open pinned {name}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("identify pinned {name}: {error}"));
+    let array = PerCpuArray::<_, [u8; VALUE_LEN]>::try_from(map)
+        .unwrap_or_else(|error| panic!("type pinned {name}: {error}"));
+    (0..slots)
+        .map(|index| {
+            array
+                .get(&index, 0)
+                .unwrap_or_else(|error| panic!("read pinned {name}[{index}]: {error}"))
+                .iter()
+                .copied()
+                .collect()
+        })
+        .collect()
+}
+
+/// Exact byte-for-byte state of every durable forwarding and recovery map in
+/// the current 33-pin graph. The restart-fenced observation source is captured
+/// separately because adopting a retained graph must invalidate that source.
 ///
 /// This intentionally has no `Debug` implementation: assertion failures must
 /// not print subscriber addresses, TEIDs, or grouped routing authority.
@@ -3511,8 +4143,75 @@ fn current_map_contents(pin_dir: &std::path::Path) -> CurrentMapContents {
     }
 }
 
+/// Restart-sensitive proof-source contents. This intentionally has no
+/// `Debug` implementation so a failing assertion cannot disclose subscriber
+/// or correlation material.
+#[derive(PartialEq, Eq)]
+struct TrafficObservationSourceContents {
+    registrations: Vec<(
+        [u8; GTPU_SESSION_GROUP_ID_LEN],
+        [u8; GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN],
+    )>,
+    redirects: Vec<(
+        [u8; GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN],
+        [u8; GTPU_SESSION_GROUP_ID_LEN],
+    )>,
+    loss: Vec<Vec<u64>>,
+    sequence: Vec<u64>,
+    gate: Vec<u64>,
+    flow_scratch: Vec<Vec<[u8; OBSERVATION_FLOW_SCRATCH_VALUE_LEN]>>,
+}
+
+fn traffic_observation_source_contents(
+    pin_dir: &std::path::Path,
+) -> TrafficObservationSourceContents {
+    TrafficObservationSourceContents {
+        registrations: pinned_hash_entries(pin_dir, GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME),
+        redirects: pinned_hash_entries(pin_dir, GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME),
+        loss: pinned_per_cpu_u64_values(pin_dir, GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME, 1),
+        sequence: pinned_u64_array_values(pin_dir, GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME, 1),
+        gate: pinned_u64_array_values(
+            pin_dir,
+            GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+        ),
+        flow_scratch: pinned_per_cpu_byte_values(
+            pin_dir,
+            GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
+            1,
+        ),
+    }
+}
+
+impl TrafficObservationSourceContents {
+    fn is_restart_fenced_from(&self, prior: &Self) -> bool {
+        let gate_index = GTPU_TRAFFIC_OBSERVATION_GATE_INDEX as usize;
+        let publication_index = GTPU_TRAFFIC_OBSERVATION_PUBLICATION_SEQUENCE_INDEX as usize;
+        self.registrations.is_empty()
+            && self.redirects.is_empty()
+            && self.loss.iter().flatten().all(|value| *value == 0)
+            && self.sequence.iter().all(|value| *value == 0)
+            && self
+                .flow_scratch
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|byte| *byte == 0)
+            && self.gate.len() == GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES as usize
+            && prior.gate.len() == GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES as usize
+            && prior.gate[gate_index] != 0
+            && prior.gate[gate_index] & 1 == 1
+            && self.gate[gate_index] != 0
+            && self.gate[gate_index] & 1 == 0
+            && self.gate[gate_index] != prior.gate[gate_index]
+            && self.gate[publication_index] == prior.gate[publication_index]
+    }
+}
+
 /// Exact retained pin graph, including path-to-kernel-ID association and all
-/// map bytes. This also has no `Debug` implementation for redaction safety.
+/// durable map bytes. Observation maps are still covered by exact pin IDs and
+/// ABI; their contents follow the explicit restart-invalidation contract.
+/// This also has no `Debug` implementation for redaction safety.
 #[derive(PartialEq, Eq)]
 struct CurrentPinGraphSnapshot {
     pins: Vec<String>,
@@ -3526,7 +4225,7 @@ fn current_pin_graph_snapshot(pin_dir: &std::path::Path) -> CurrentPinGraphSnaps
     expected.sort_unstable();
     assert_eq!(
         pins, expected,
-        "fixture must retain the exact current 25-pin graph"
+        "fixture must retain the exact current 33-pin graph"
     );
     let map_ids = pins
         .iter()
@@ -4303,6 +5002,14 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_TFT_CLASSIFIER_META,
                 MAP_TFT_CLASSIFIER_FILTERS,
                 MAP_TFT_CLASSIFIER_COUNTERS,
+                GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
             ],
         ),
         "the live uplink program must reference the exact pinned maps read by diagnostics",
@@ -4327,6 +5034,13 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_SESSION_GROUPS,
                 MAP_SESSION_DOWNLINK_INDEX,
                 MAP_CONFIG_IPV6,
+                GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+                GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
             ],
         ),
         "the live downlink program must reference the exact pinned maps read by diagnostics",
@@ -4680,6 +5394,10 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             > xfrm_downlink_decap_before,
         "the committed per-CPU counter must observe the marked GTP-U decapsulation",
     );
+    // The remaining scenario exercises raw S2b forwarding and mark handling,
+    // not SWu encryption. Remove exactly the two outbound SAs and policies
+    // created above so those owned XFRM objects cannot consume its packets.
+    remove_real_marked_outbound_xfrm().await?;
 
     for (socket, payload, expected_teid) in [
         (&ue_mark_a_socket, b"opc-mark-a".as_slice(), PEER_TEID_A),
@@ -6654,7 +7372,7 @@ async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
     backend.remove_device(&device).await?;
     assert!(
         !pin_dir.exists(),
-        "device removal must unlink the complete 25-map pin graph"
+        "device removal must unlink the complete current pin graph"
     );
     drop(backend);
     drop(net);
@@ -6978,6 +7696,516 @@ async fn ebpf_gtpu_downlink_outer_fragments_reenter_sdk_consumer_exactly_once(
     assert_eq!(counters.malformed, 0);
 
     drop(net);
+    Ok(())
+}
+
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let device = backend
+        .create_device_with_endpoints(grouped_device_request(grouped_mtu_policy()))
+        .await?;
+    // The exact grouped v4 entry is marked. This lets the production ingress
+    // writer stamp the access-to-core path from the XFRM output mark and lets
+    // the production downlink writer select the dedicated SWu Child SA.
+    let mut marked_v4 = session_context(device.ifindex);
+    marked_v4.local_teid =
+        Teid::new(GROUP_LOCAL_TEID_V4_INITIAL).expect("nonzero grouped v4 local TEID");
+    marked_v4.peer_teid =
+        Teid::new(GROUP_PEER_TEID_V4_INITIAL).expect("nonzero grouped v4 peer TEID");
+    marked_v4.bearer_mark = Some(GtpBearerMark::new(MARK_A).expect("nonzero XFRM bearer mark"));
+    let mut grouped_v6 = session_context(device.ifindex);
+    grouped_v6.local_teid =
+        Teid::new(GROUP_LOCAL_TEID_V6_INITIAL).expect("nonzero grouped v6 local TEID");
+    grouped_v6.peer_teid =
+        Teid::new(GROUP_PEER_TEID_V6_INITIAL).expect("nonzero grouped v6 peer TEID");
+    grouped_v6.ms_address = IpAddr::V6(UE_PAA_IPV6);
+    grouped_v6.peer_address = IpAddr::V6(PGW_IPV6);
+    grouped_v6.bearer_mark =
+        Some(GtpBearerMark::new(MARK_A).expect("nonzero IPv6 XFRM bearer mark"));
+    let desired = GtpuSessionGroup::new(
+        grouped_group_id(),
+        grouped_device_id(),
+        vec![
+            GtpuSessionEntry::new(marked_v4, IpAddr::V4(EPDG_S2BU_IP))?,
+            GtpuSessionEntry::new(grouped_v6, IpAddr::V6(EPDG_S2BU_IPV6))?,
+        ],
+    )?;
+    assert_eq!(
+        backend
+            .reconcile_pdp_context_group(fresh_grouped_reconcile(desired.clone()))
+            .await?,
+        GtpuSessionGroupReconcileOutcome::Activated
+    );
+    assert_eq!(
+        backend
+            .read_pdp_context_group(GtpuSessionGroupSelector::new(
+                grouped_group_id(),
+                grouped_device_id(),
+            ))
+            .await?,
+        GtpuSessionGroupReadback::Active(desired.clone())
+    );
+    assert_eq!(
+        backend.gtpu_traffic_proof_capability(),
+        GtpuCapability::Available,
+        "an exact active grouped attachment must expose trusted observations"
+    );
+
+    // Resolve the outer neighbour before registration, so no warm-up packet
+    // can become proof evidence. The SWu objects live only in this fresh
+    // netns and its uniquely named UE peer netns; TestNet's RAII teardown
+    // destroys both namespaces and every remaining XFRM object with them.
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
+    let pgw = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind proof PGW socket")
+    });
+    let pgw_v6 = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IPV6, GTPU_PORT)).expect("bind proof IPv6 PGW socket")
+    });
+    let untrusted_pgw = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_ALT_IP, GTPU_PORT)).expect("bind untrusted proof PGW socket")
+    });
+    let ue = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, XFRM_INNER_SOURCE_PORT)).expect("bind proof UE socket")
+    });
+    let _epdg_nat_t_socket = nat_t_socket(EPDG_SWU_IP);
+    let _ue_nat_t_socket = in_netns(&net.ue_ns, || nat_t_socket(UE_SWU_IP));
+    install_real_marked_inbound_xfrm(&net.ue_ns).await?;
+    install_real_marked_outbound_xfrm_for_ue_application(&net.ue_ns).await?;
+    install_real_marked_ipv6_xfrm(&net.ue_ns).await?;
+    let outbound_capture = packet_capture_socket(&net.ue_ns);
+    let policy = TrafficContinuityPolicy::new(
+        2,
+        Duration::from_millis(25),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        8,
+    )?;
+    let authority = GtpuTrafficProofAuthority::new(desired, 1, 1, 1, policy)?;
+    let authority_store = backend
+        .register_gtpu_traffic_proof_authority(authority)
+        .await?;
+
+    let downlink = build_inner_udp(
+        REMOTE_HOST,
+        UE_PAA,
+        XFRM_DOWNLINK_SOURCE_PORT,
+        XFRM_DOWNLINK_DESTINATION_PORT,
+        b"continuity",
+    );
+    let valid_gpdu = build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &downlink);
+    let mut uplink = [0_u8; 2048];
+
+    // These are complete real ESP -> XFRM -> eBPF GTP-U and grouped GTP-U ->
+    // eBPF -> XFRM -> ESP paths, but they precede every registration and are
+    // therefore structurally incapable of proving a later attempt.
+    let (uplink_len, uplink_source) = send_until_received(
+        || {
+            let _ = ue.send_to(
+                b"continuity-pre-window",
+                (REMOTE_HOST, XFRM_INNER_DESTINATION_PORT),
+            );
+        },
+        &pgw,
+        &mut uplink,
+    )
+    .expect("pre-window ESP uplink must traverse the production GTP-U writer");
+    assert_eq!(uplink_source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(
+        u32::from_be_bytes(uplink[4..8].try_into()?),
+        GROUP_PEER_TEID_V4_INITIAL
+    );
+    assert!(uplink[..uplink_len].ends_with(b"continuity-pre-window"));
+    pgw.send_to(&valid_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+    receive_xfrm_downlink_application(&ue, b"continuity");
+    assert_eq!(
+        capture_nat_t_esp_spi(&outbound_capture),
+        OUTBOUND_SPI_A,
+        "a grouped marked downlink must traverse the dedicated outbound Child SA"
+    );
+
+    // Retire one registered attempt after it observes a genuine path. Its
+    // events carry that registration's epoch and must be stale for the fresh
+    // attempt below, just like the pre-registration packets above.
+    let mut stale_session = backend
+        .begin_gtpu_traffic_proof(authority_store.lease().await)
+        .await?;
+    let _ = send_until_received(
+        || {
+            let _ = ue.send_to(
+                b"continuity-stale",
+                (REMOTE_HOST, XFRM_INNER_DESTINATION_PORT),
+            );
+        },
+        &pgw,
+        &mut uplink,
+    )
+    .expect("stale-attempt ESP uplink must traverse the production GTP-U writer");
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut stale_session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+    backend.close_gtpu_traffic_proof(stale_session).await?;
+    let mut session = backend
+        .begin_gtpu_traffic_proof(authority_store.lease().await)
+        .await?;
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+
+    // A packet from a peer excluded by the active binding, and a malformed
+    // envelope from the admitted peer, must not create trusted evidence.
+    untrusted_pgw.send_to(&valid_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+    pgw.send_to(
+        &valid_gpdu[..GTPU_MANDATORY_HDR_LEN - 1],
+        (EPDG_S2BU_IP, GTPU_PORT),
+    )?;
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+
+    // Keep the independent application assertion: this UDP packet proves the
+    // decrypted UE endpoint is reachable, but it is not an authenticated
+    // traffic-proof input and therefore cannot mint evidence by itself.
+    pgw.send_to(&valid_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+    receive_xfrm_downlink_application(&ue, b"continuity");
+    assert_eq!(
+        capture_nat_t_esp_spi(&outbound_capture),
+        OUTBOUND_SPI_A,
+        "registered grouped UDP downlink must traverse marked outbound XFRM"
+    );
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+
+    // Production challenges always start CoreToAccess. The public request tag
+    // is replaced by a private return tag only at the trusted downlink eBPF
+    // boundary before XFRM. The disposable UE kernel copies that private tag
+    // into its Echo Reply, which returns through XFRM and the trusted uplink
+    // boundary. A reflected public request therefore cannot fabricate the
+    // return leg even with exact ICMP fields and materialized checksums.
+    let first_sample = (u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 1;
+    let second_sample = (u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 2;
+    let first_challenge = session
+        .challenge(first_sample)
+        .expect("nonzero first challenge sample");
+    let second_challenge = session
+        .challenge(second_sample)
+        .expect("nonzero second challenge sample");
+    assert_ne!(first_challenge.sample_id(), 0);
+    assert_ne!(second_challenge.sample_id(), 0);
+    assert_ne!(first_challenge.sample_id(), second_challenge.sample_id());
+    assert_ne!(first_challenge.payload(), second_challenge.payload());
+    assert_eq!(first_challenge.identifier(), ICMP_ECHO_IDENTIFIER);
+    assert_eq!(second_challenge.identifier(), ICMP_ECHO_IDENTIFIER);
+
+    let forged_reflection = build_inner_icmp_echo(
+        UE_PAA,
+        REMOTE_HOST,
+        ICMP_ECHO_REPLY,
+        first_challenge.identifier(),
+        first_challenge.sequence(),
+        first_challenge.payload(),
+    );
+    send_wireguard_ipv4_packet(&net.ue_ns, &forged_reflection);
+    let reflected_payload = receive_gtpu_icmp_echo_reply(
+        &pgw,
+        GROUP_PEER_TEID_V4_INITIAL,
+        first_challenge.identifier(),
+        first_challenge.sequence(),
+    );
+    assert_eq!(
+        reflected_payload,
+        *first_challenge.payload(),
+        "the adversarial packet must carry the copied public request tag"
+    );
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+
+    let first_inner = build_inner_icmp_echo(
+        REMOTE_HOST,
+        UE_PAA,
+        ICMP_ECHO_REQUEST,
+        first_challenge.identifier(),
+        first_challenge.sequence(),
+        first_challenge.payload(),
+    );
+    pgw.send_to(
+        &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &first_inner),
+        (EPDG_S2BU_IP, GTPU_PORT),
+    )?;
+    let first_response_payload = receive_gtpu_icmp_echo_reply(
+        &pgw,
+        GROUP_PEER_TEID_V4_INITIAL,
+        first_challenge.identifier(),
+        first_challenge.sequence(),
+    );
+    assert_ne!(
+        first_response_payload,
+        *first_challenge.payload(),
+        "the trusted downlink must install a private return tag before XFRM"
+    );
+
+    // Separate complete round trips by at least the policy's observation
+    // window so both directional sample histories can mature before polling.
+    std::thread::sleep(policy.minimum_window_per_direction());
+    let second_inner = build_inner_icmp_echo(
+        REMOTE_HOST,
+        UE_PAA,
+        ICMP_ECHO_REQUEST,
+        second_challenge.identifier(),
+        second_challenge.sequence(),
+        second_challenge.payload(),
+    );
+    pgw.send_to(
+        &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &second_inner),
+        (EPDG_S2BU_IP, GTPU_PORT),
+    )?;
+    let second_response_payload = receive_gtpu_icmp_echo_reply(
+        &pgw,
+        GROUP_PEER_TEID_V4_INITIAL,
+        second_challenge.identifier(),
+        second_challenge.sequence(),
+    );
+    assert_ne!(
+        second_response_payload,
+        *second_challenge.payload(),
+        "each request must be translated to its private return domain"
+    );
+    let proof = match backend.poll_gtpu_traffic_proof(&mut session).await? {
+        GtpuTrafficProofPoll::Proven(proof) => proof,
+        GtpuTrafficProofPoll::Pending | GtpuTrafficProofPoll::Invalidated(_) | _ => {
+            panic!("bidirectional continuity proof did not complete")
+        }
+    };
+    let summary = proof.summary();
+    assert!(summary.access_to_core_samples() >= policy.minimum_samples_per_direction());
+    assert!(summary.core_to_access_samples() >= policy.minimum_samples_per_direction());
+    let validation_lease = authority_store.lease().await;
+    assert_eq!(
+        backend
+            .validate_gtpu_traffic_proof(&proof, &validation_lease)
+            .await?,
+        GtpuTrafficProofValidation::Current,
+        "the final proof must validate against the exact current authority"
+    );
+    backend.close_gtpu_traffic_proof(session).await?;
+
+    // Prove the same authenticated challenge contract for IPv6 inner traffic
+    // over a distinct real Child SA pair and outer-IPv6 GTP-U. A fresh proof
+    // attempt prevents the preceding IPv4 samples from satisfying this gate.
+    let mut ipv6_session = backend
+        .begin_gtpu_traffic_proof(authority_store.lease().await)
+        .await?;
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut ipv6_session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+    let first_ipv6_sample = (u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 0x101;
+    let second_ipv6_sample = (u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 0x102;
+    let first_ipv6_challenge = ipv6_session
+        .challenge(first_ipv6_sample)
+        .expect("nonzero first IPv6 challenge sample");
+    let second_ipv6_challenge = ipv6_session
+        .challenge(second_ipv6_sample)
+        .expect("nonzero second IPv6 challenge sample");
+
+    let forged_ipv6_reflection = build_inner_icmpv6_echo(
+        UE_PAA_IPV6,
+        REMOTE_HOST_IPV6,
+        ICMPV6_ECHO_REPLY,
+        first_ipv6_challenge.identifier(),
+        first_ipv6_challenge.sequence(),
+        first_ipv6_challenge.payload(),
+    );
+    send_raw_ipv6_packet(&net.ue_ns, &forged_ipv6_reflection);
+    let reflected_ipv6_payload = receive_gtpu_icmpv6_echo_reply(
+        &pgw_v6,
+        GROUP_PEER_TEID_V6_INITIAL,
+        first_ipv6_challenge.identifier(),
+        first_ipv6_challenge.sequence(),
+    );
+    assert_eq!(
+        reflected_ipv6_payload,
+        *first_ipv6_challenge.payload(),
+        "protected IPv6 reflection must retain the public request tag"
+    );
+    assert!(matches!(
+        backend.poll_gtpu_traffic_proof(&mut ipv6_session).await?,
+        GtpuTrafficProofPoll::Pending
+    ));
+
+    let first_ipv6_request = build_inner_icmpv6_echo(
+        REMOTE_HOST_IPV6,
+        UE_PAA_IPV6,
+        ICMPV6_ECHO_REQUEST,
+        first_ipv6_challenge.identifier(),
+        first_ipv6_challenge.sequence(),
+        first_ipv6_challenge.payload(),
+    );
+    pgw_v6.send_to(
+        &build_gpdu(GROUP_LOCAL_TEID_V6_INITIAL, None, &first_ipv6_request),
+        (EPDG_S2BU_IPV6, GTPU_PORT),
+    )?;
+    let first_ipv6_response = receive_gtpu_icmpv6_echo_reply(
+        &pgw_v6,
+        GROUP_PEER_TEID_V6_INITIAL,
+        first_ipv6_challenge.identifier(),
+        first_ipv6_challenge.sequence(),
+    );
+    assert_ne!(
+        first_ipv6_response,
+        *first_ipv6_challenge.payload(),
+        "trusted IPv6 downlink must install the private return tag before XFRM"
+    );
+
+    std::thread::sleep(policy.minimum_window_per_direction());
+    let second_ipv6_request = build_inner_icmpv6_echo(
+        REMOTE_HOST_IPV6,
+        UE_PAA_IPV6,
+        ICMPV6_ECHO_REQUEST,
+        second_ipv6_challenge.identifier(),
+        second_ipv6_challenge.sequence(),
+        second_ipv6_challenge.payload(),
+    );
+    pgw_v6.send_to(
+        &build_gpdu(GROUP_LOCAL_TEID_V6_INITIAL, None, &second_ipv6_request),
+        (EPDG_S2BU_IPV6, GTPU_PORT),
+    )?;
+    let second_ipv6_response = receive_gtpu_icmpv6_echo_reply(
+        &pgw_v6,
+        GROUP_PEER_TEID_V6_INITIAL,
+        second_ipv6_challenge.identifier(),
+        second_ipv6_challenge.sequence(),
+    );
+    assert_ne!(
+        second_ipv6_response,
+        *second_ipv6_challenge.payload(),
+        "each IPv6 request must use its private return domain"
+    );
+    let ipv6_proof = match backend.poll_gtpu_traffic_proof(&mut ipv6_session).await? {
+        GtpuTrafficProofPoll::Proven(proof) => proof,
+        GtpuTrafficProofPoll::Pending | GtpuTrafficProofPoll::Invalidated(_) | _ => {
+            panic!("protected IPv6 continuity proof did not complete")
+        }
+    };
+    let ipv6_summary = ipv6_proof.summary();
+    assert!(ipv6_summary.access_to_core_samples() >= policy.minimum_samples_per_direction());
+    assert!(ipv6_summary.core_to_access_samples() >= policy.minimum_samples_per_direction());
+    let ipv6_validation_lease = authority_store.lease().await;
+    assert_eq!(
+        backend
+            .validate_gtpu_traffic_proof(&ipv6_proof, &ipv6_validation_lease)
+            .await?,
+        GtpuTrafficProofValidation::Current,
+        "the IPv6 proof must validate against the exact current authority"
+    );
+    backend.close_gtpu_traffic_proof(ipv6_session).await?;
+    println!("OPC_GTPU_TRAFFIC_CONTINUITY_IPV6_PROOF_PROVEN");
+
+    // Remove only the fresh-netns SA and policy created for this test. A new
+    // attempt cannot reuse a pre-removal proof path: the peer can still emit
+    // ESP, but the ePDG no longer owns an inbound SA/policy that can decrypt
+    // and forward it to the production GTP-U writer.
+    let xfrm = LinuxXfrmBackend::new();
+    xfrm.remove_policy(RemovePolicyRequest::new(
+        marked_inner_selector(),
+        XfrmDirection::Forward,
+    ))
+    .await?;
+    xfrm.remove_sa(RemoveSaRequest::new(
+        xfrm_ip(EPDG_SWU_IP),
+        IPPROTO_ESP,
+        INBOUND_SPI_A,
+    ))
+    .await?;
+    drain_datagrams(&pgw);
+    let mut broken_session = backend
+        .begin_gtpu_traffic_proof(authority_store.lease().await)
+        .await?;
+    pgw.set_read_timeout(Some(Duration::from_millis(250)))?;
+    for (sample, separator) in [
+        ((u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 3, false),
+        ((u32::from(ICMP_ECHO_IDENTIFIER) << 16) | 4, true),
+    ] {
+        if separator {
+            std::thread::sleep(policy.minimum_window_per_direction());
+        }
+        let challenge = broken_session
+            .challenge(sample)
+            .expect("fresh nonzero broken-path challenge");
+        let request = build_inner_icmp_echo(
+            REMOTE_HOST,
+            UE_PAA,
+            ICMP_ECHO_REQUEST,
+            challenge.identifier(),
+            challenge.sequence(),
+            challenge.payload(),
+        );
+        pgw.send_to(
+            &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &request),
+            (EPDG_S2BU_IP, GTPU_PORT),
+        )?;
+        assert!(
+            pgw.recv_from(&mut uplink).is_err(),
+            "without the owned inbound SA/policy, an authenticated Echo Reply cannot reach the production GTP-U writer"
+        );
+        assert!(matches!(
+            backend.poll_gtpu_traffic_proof(&mut broken_session).await?,
+            GtpuTrafficProofPoll::Pending
+        ));
+    }
+    backend.close_gtpu_traffic_proof(broken_session).await?;
+
+    // A source-loss indication must revoke an otherwise valid proof rather
+    // than allowing the already-issued result to stand. This test owns the
+    // disposable pin and changes no host or foreign dataplane state.
+    let loss_pin = grouped_pin_directory(&net.pin_root, grouped_device_id())
+        .join(GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME);
+    let loss_map = Map::from_map_data(MapData::from_pin(loss_pin)?)?;
+    let mut loss = PerCpuArray::<_, u64>::try_from(loss_map)?;
+    let mut loss_values = loss.get(&0, 0)?.iter().copied().collect::<Vec<_>>();
+    let first_loss_counter = loss_values
+        .first_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing loss counter"))?;
+    *first_loss_counter = first_loss_counter.saturating_add(1);
+    loss.set(0, PerCpuValues::try_from(loss_values)?, 0)?;
+    assert!(matches!(
+        backend
+            .validate_gtpu_traffic_proof(&proof, &validation_lease)
+            .await?,
+        GtpuTrafficProofValidation::Invalidated(_)
+    ));
+    println!("OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN");
     Ok(())
 }
 
@@ -8220,8 +9448,8 @@ async fn cleanup_only_recovery_refuses_older_schema_before_mutation(
 
 /// Cleanup-only recovery exposes only the legacy PDP-context cleanup surface.
 /// A retained graph that also carries a canonical committed grouped authority
-/// is therefore outside that authority even when all 21 pins have this build's
-/// exact ABI and the legacy IPv4 endpoint matches the request. The refusal
+/// is therefore outside that authority even when every current pin has this
+/// build's exact ABI and the legacy IPv4 endpoint matches the request. The refusal
 /// must happen before either forwarding hook or any grouped byte is changed.
 #[tokio::test]
 // The serial guard is deliberately held for the entire test body; see
@@ -8255,6 +9483,7 @@ async fn cleanup_only_recovery_refuses_committed_grouped_state_before_mutation(
 
     seed_committed_grouped_state(&pin_dir, device.ifindex);
     let pins_before = current_pin_graph_snapshot(&pin_dir);
+    let proof_source_before = traffic_observation_source_contents(&pin_dir);
     let hooks_before = current_hook_snapshot();
     drop(owner);
 
@@ -8274,7 +9503,11 @@ async fn cleanup_only_recovery_refuses_committed_grouped_state_before_mutation(
 
     assert!(
         current_pin_graph_snapshot(&pin_dir) == pins_before,
-        "grouped-state refusal must preserve every pin, map ID, and map byte"
+        "grouped-state refusal must preserve every pin, map ID, and durable map byte"
+    );
+    assert!(
+        traffic_observation_source_contents(&pin_dir) == proof_source_before,
+        "grouped-state refusal must precede every proof-source mutation"
     );
     assert!(
         current_hook_snapshot() == hooks_before,
@@ -8289,7 +9522,8 @@ async fn cleanup_only_recovery_refuses_committed_grouped_state_before_mutation(
 /// Stable-map contents are untrusted retained state. An active legacy context
 /// with an out-of-range DSCP byte must be classified structurally, never
 /// adopted as cleanup authority. Safety fencing may already have removed both
-/// hooks when semantic validation discovers the corruption, but no pin or map
+/// hooks and invalidated the restart-sensitive proof source when semantic
+/// validation discovers the corruption, but no pin or durable forwarding map
 /// byte may be repaired, migrated, or discarded.
 #[tokio::test]
 // The serial guard is deliberately held for the entire test body; see
@@ -8324,6 +9558,7 @@ async fn cleanup_only_recovery_refuses_malformed_legacy_state_without_map_mutati
     let pin_dir = net.pin_root.join("s2bu");
     seed_malformed_default_dscp(&pin_dir);
     let pins_before = current_pin_graph_snapshot(&pin_dir);
+    let proof_source_before = traffic_observation_source_contents(&pin_dir);
     let hooks_before = current_hook_snapshot();
     drop(owner);
 
@@ -8338,7 +9573,12 @@ async fn cleanup_only_recovery_refuses_malformed_legacy_state_without_map_mutati
 
     assert!(
         current_pin_graph_snapshot(&pin_dir) == pins_before,
-        "malformed-state refusal must preserve every pin, map ID, and map byte"
+        "malformed-state refusal must preserve every pin, map ID, and durable map byte"
+    );
+    assert!(
+        traffic_observation_source_contents(&pin_dir)
+            .is_restart_fenced_from(&proof_source_before),
+        "malformed-state refusal after restart must leave proof publication fenced, cleared, and unable to reuse a stale source epoch"
     );
     let egress_after = tc_filters("egress");
     let ingress_after = tc_filters("ingress");
@@ -9147,6 +10387,10 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
     fs::create_dir_all(&pin_dir_b).expect("create alternate current pin directory");
     let mut alternate = EbpfLoader::new()
         .default_map_pin_directory(&pin_dir_b)
+        .map_pin_path(
+            GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+            pin_dir_b.join(GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME),
+        )
         .load(CURRENT_DATAPATH_OBJECT)
         .expect("load committed current object for alternate graph");
     {
@@ -9197,6 +10441,14 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
         MAP_TFT_CLASSIFIER_META,
         MAP_TFT_CLASSIFIER_FILTERS,
         MAP_TFT_CLASSIFIER_COUNTERS,
+        GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+        GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
     ];
     let pins_before = pin_directory_listing(&pin_dir_b);
     assert_eq!(
@@ -9250,6 +10502,14 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
             MAP_TFT_CLASSIFIER_META,
             MAP_TFT_CLASSIFIER_FILTERS,
             MAP_TFT_CLASSIFIER_COUNTERS,
+            GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
         ],
     );
     let alternate_downlink_maps = exact_pinned_map_ids(
@@ -9270,6 +10530,13 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
             MAP_SESSION_GROUPS,
             MAP_SESSION_DOWNLINK_INDEX,
             MAP_CONFIG_IPV6,
+            GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
         ],
     );
     assert_ne!(uplink_maps_before, alternate_uplink_maps);

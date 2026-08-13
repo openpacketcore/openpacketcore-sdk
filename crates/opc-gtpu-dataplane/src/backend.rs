@@ -18,6 +18,11 @@ use crate::tft_classifier::{
     TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
     TftUplinkClassifierRemovalOutcome,
 };
+use crate::traffic_observation::{
+    GtpuTrafficProof, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityLease,
+    GtpuTrafficProofAuthorityStore, GtpuTrafficProofPoll, GtpuTrafficProofSession,
+    GtpuTrafficProofValidation,
+};
 use crate::GtpuError;
 
 /// Backend that can mutate Linux GTP-U dataplane state.
@@ -27,6 +32,110 @@ use crate::GtpuError;
 /// and deterministic.
 #[async_trait]
 pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
+    /// Report whether this backend can issue a trusted production GTP-U
+    /// traffic-continuity proof.
+    ///
+    /// Reconcile, install, readback, and mock success do not issue a proof.
+    /// Only an adapter that independently authenticates observations, reads
+    /// back the exact current dataplane generation, and revalidates revocation
+    /// authority may override this fail-closed default.
+    fn gtpu_traffic_proof_capability(&self) -> GtpuCapability {
+        GtpuCapability::Missing
+    }
+
+    /// Register the sole canonical product-authority store for one session group.
+    ///
+    /// A trusted adapter mints and retains an opaque store identity bound to
+    /// its backend incarnation. This is deliberately not a public store
+    /// constructor: independently recreating a store from a stale authority
+    /// snapshot must not create a usable lease. Exact session-group removal
+    /// retires the backend's store and revokes every outstanding attempt;
+    /// orphaned store clones cannot register themselves again. Existing
+    /// backends fail closed.
+    async fn register_gtpu_traffic_proof_authority(
+        &self,
+        _authority: GtpuTrafficProofAuthority,
+    ) -> Result<GtpuTrafficProofAuthorityStore, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_traffic_proof",
+        })
+    }
+
+    /// Start one trusted traffic-proof attempt for an exact current authority.
+    ///
+    /// The non-cloneable lease is consumed and retained by the adapter's
+    /// complete begin operation, including any uncancellable blocking work, so
+    /// reconciliation cannot replace the authority after the caller cancels
+    /// this future. A trusted adapter obtains the dataplane generation from
+    /// authoritative live readback before accepting observations. Existing
+    /// backends fail closed.
+    ///
+    /// ```compile_fail
+    /// use opc_gtpu_dataplane::{GtpuDataplaneBackend, GtpuTrafficProofAuthority};
+    ///
+    /// async fn legacy_request_cannot_begin(
+    ///     backend: impl GtpuDataplaneBackend,
+    ///     authority: GtpuTrafficProofAuthority,
+    /// ) {
+    ///     let _ = backend.begin_gtpu_traffic_proof(authority).await;
+    /// }
+    /// ```
+    async fn begin_gtpu_traffic_proof(
+        &self,
+        _authority: GtpuTrafficProofAuthorityLease,
+    ) -> Result<GtpuTrafficProofSession, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_traffic_proof",
+        })
+    }
+
+    /// Poll one trusted traffic-proof attempt.
+    ///
+    /// A `Proven` result is possible only from a trusted adapter override;
+    /// successful reconcile, install, readback, or mock operations alone are
+    /// insufficient evidence. The trusted backend acquires and retains a lease
+    /// from its canonical registered store across all uncancellable work, so a
+    /// canceled caller cannot lose an affine proof or race authority
+    /// replacement. Existing backends fail closed.
+    async fn poll_gtpu_traffic_proof(
+        &self,
+        _session: &mut GtpuTrafficProofSession,
+    ) -> Result<GtpuTrafficProofPoll, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_traffic_proof",
+        })
+    }
+
+    /// Revalidate a final trusted proof against the product's exact current
+    /// authority-store lease before use.
+    ///
+    /// A trusted adapter checks exact generation, product authority, and
+    /// revocation state here. Callers must serialize this check with the
+    /// authority update and the protected use. The non-cloneable lease holds
+    /// the store read guard for this entire critical section, so a retained
+    /// authority snapshot cannot be used after reconciliation replaces the
+    /// store. Existing backends fail closed.
+    async fn validate_gtpu_traffic_proof(
+        &self,
+        _proof: &GtpuTrafficProof,
+        _authority: &GtpuTrafficProofAuthorityLease,
+    ) -> Result<GtpuTrafficProofValidation, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_traffic_proof",
+        })
+    }
+
+    /// Close one trusted traffic-proof attempt and release its adapter-owned
+    /// observation authority. Existing backends fail closed.
+    async fn close_gtpu_traffic_proof(
+        &self,
+        _session: GtpuTrafficProofSession,
+    ) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_traffic_proof",
+        })
+    }
+
     /// Report whether this backend can classify an unmarked shared-SA uplink
     /// packet by a canonical TFT before its existing bearer-mark lookup.
     ///

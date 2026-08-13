@@ -89,6 +89,23 @@ assert_eq!(encap.len(), GTPU_ENCAP_LEN);
 - Used by `opc-gtpu-dataplane` userspace code when writing pinned maps and
   validating datapath ownership.
 
+## Security boundary
+
+This unpublished crate is a privileged map ABI, not the supported product
+traffic-proof API. Rust visibility must allow the trusted loader and standalone
+tc program to share byte-exact code across crate boundaries. The hidden
+`trusted_traffic_observation_abi` module therefore contains the registration
+value and operations that handle the private correlation/redirect key. Those
+items are intentionally absent from the crate root and from
+`opc-gtpu-dataplane`'s public exports.
+
+Registration bytes are secret-bearing kernel authority. Trusted components may
+write them to the owned BPF maps and use them transiently to authenticate or
+translate the fixed challenge; they must never expose them through a product
+API, event, readback, log, metric, diagnostic, or support bundle. Product code
+uses only `GtpuTrafficProofSession::challenge`, opaque proof values, and the
+authority-store lease API from `opc-gtpu-dataplane`.
+
 ## Status And Limits
 
 - `#![no_std]`, `#![forbid(unsafe_code)]`, and dependency-free.

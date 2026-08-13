@@ -61,6 +61,7 @@ pub mod mock;
 pub mod model;
 pub mod reassembly;
 pub mod tft_classifier;
+pub mod traffic_observation;
 pub mod unsupported;
 
 pub use backend::GtpuDataplaneBackend;
@@ -107,6 +108,7 @@ pub use model::{
     RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest,
     Teid, GTPU_PORT,
 };
+pub use opc_dataplane_observation::TrafficContinuityPolicy;
 pub use opc_types::DscpCodepoint;
 #[cfg(target_os = "linux")]
 pub use reassembly::{
@@ -121,6 +123,13 @@ pub use reassembly::{
 pub use tft_classifier::{
     TftUplinkBearer, TftUplinkClassification, TftUplinkClassifier, TftUplinkClassifierReadback,
     TftUplinkClassifierReconcileOutcome, TftUplinkClassifierRemovalOutcome, TftUplinkDropReason,
+};
+pub use traffic_observation::{
+    GtpuTrafficProof, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityError,
+    GtpuTrafficProofAuthorityLease, GtpuTrafficProofAuthorityStore,
+    GtpuTrafficProofAuthorityStoreUpdateError, GtpuTrafficProofChallenge,
+    GtpuTrafficProofInvalidation, GtpuTrafficProofPoll, GtpuTrafficProofSession,
+    GtpuTrafficProofSummary, GtpuTrafficProofValidation,
 };
 pub use unsupported::UnsupportedGtpuDataplaneBackend;
 

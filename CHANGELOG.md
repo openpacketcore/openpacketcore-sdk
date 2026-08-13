@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Generation-fenced live GTP-U traffic-continuity proof —
+  `opc-dataplane-observation`, `opc-gtpu-dataplane`,
+  `opc-gtpu-dataplane-ebpf`:** adds a backend-neutral, non-authoritative
+  evaluator for bounded bidirectional continuity and a production eBPF
+  adapter that alone can promote authenticated forwarding observations into
+  a session-scoped proof. Proofs bind the exact grouped-session and device
+  identities, dataplane and product-owner generations, reconcile fence and
+  revision, backend incarnation, source epoch, clock origin, policy, and a
+  finite non-reused publication identity. The datapath records uplink packets
+  only after successful local redirect and downlink packets only after
+  validated decapsulation into the access-side stack; both directions require
+  one opaque per-attempt flow correlation across a nonzero minimum window.
+  Per-CPU loss fencing, a globally ordered producer sequence, exact pinned-map
+  and program identity, cancellation-safe authority leases, and current
+  readback reject gaps, replay, stale in-flight packets, restart, restore,
+  generation or reconcile drift, malformed state, and expiry. Structural
+  convergence, aggregate counters, mocks, and unsupported adapters cannot mint
+  proof. Events and diagnostics contain no addresses, TEIDs, SPIs, packet
+  bytes, subscriber fields, or reusable flow identifiers. The port is packet
+  evidence only and explicitly cannot gate pod health or service admission.
 - **Fixed durable Openraft quorum authority — `opc-session-store`:** adds an
   exact immutable three- or five-voter topology admission path and separate
   typed fixed-quorum traffic-authority and physical-placement-resilience

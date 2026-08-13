@@ -15,6 +15,7 @@ publish = false
 
 [dependencies]
 opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
+opc-dataplane-observation = { path = "../opc-dataplane-observation", version = "0.2.0" }
 opc-gtpu-ebpf-common = { path = "../opc-gtpu-ebpf-common", version = "0.2.0" }
 opc-proto-tft = { path = "../opc-proto-tft", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
@@ -22,13 +23,13 @@ async-trait = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.14" }
 aya-obj = { version = "0.3" }
 sha1 = { workspace = true }
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "time"] }
 # recvmsg/IP_PKTINFO provenance extraction for the reassembly consumer.
 nix = { workspace = true, features = ["net", "socket", "uio"] }
 

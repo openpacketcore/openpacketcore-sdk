@@ -119,7 +119,7 @@ jobs:
             "OPC_GTPU_RUN_PRIVILEGED=1" \
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up
-              cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture
+              cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1
               # Both filters go after `--`: cargo accepts only one positional
               # TESTNAME, so naming two before it is a hard argument error,
               # while libtest itself takes any number.
@@ -139,6 +139,8 @@ jobs:
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_IPV6_PROOF_PROVEN' "${datapath_log}"
 
           # The two lib tag proofs return Ok early without printing `skipping:`
           # when the environment is not privileged, so the skip check above
@@ -306,11 +308,14 @@ jobs:
             chmod 0755 /tmp/opc-gtpu-linux68-test
             chmod 0755 /tmp/opc-gtpu-linux68-datapath
           '
-          load_output="$(
+          if ! load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
               2>&1
-          )"
+          )"; then
+            printf '%s\n' "${load_output}"
+            exit 1
+          fi
           printf '%s\n' "${load_output}"
           grep -Fq 'test result: ok. 3 passed; 0 failed;' <<< "${load_output}"
           # Every one of these tests returns early when
@@ -530,11 +535,14 @@ jobs:
             sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
             chmod 0755 /tmp/opc-gtpu-el9-test
           '
-          load_output="$(
+          if ! load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-el9-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
               2>&1
-          )"
+          )"; then
+            printf '%s\n' "${load_output}"
+            exit 1
+          fi
           printf '%s\n' "${load_output}"
           grep -Fq 'test result: ok. 3 passed; 0 failed;' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
@@ -685,6 +693,8 @@ jobs:
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_IPV6_PROOF_PROVEN' "${datapath_log}"
 
   ebpf-object:
     name: eBPF datapath object rebuild
@@ -775,16 +785,19 @@ jobs:
           diff -u <(printf '%s\n' opc_gtpu_downlink opc_gtpu_uplink) pre-redirect.programs
           # This generation predates the TFT classifier maps. Prove that its
           # map inventory remains an exact subset of the current object and
-          # that the four versioned TFT maps are the only additions. The
-          # historical generation still differs by its instruction stream and
-          # by GTPU_COUNTERS width, so a current-object fixture cannot stand in
-          # for its byte authority.
+          # that only the versioned TFT and issue-655 observation maps were
+          # added. The historical generation still differs by its instruction
+          # stream and by GTPU_COUNTERS width, so a current-object fixture
+          # cannot stand in for its byte authority.
           readelf -sW "${current_path}" | awk '$4 == "OBJECT" && $8 ~ /^GTPU_/ {print $8}' | sort > current.maps
           comm -23 pre-redirect.maps current.maps > removed-pre-redirect.maps
           test ! -s removed-pre-redirect.maps
           comm -13 pre-redirect.maps current.maps > added-after-pre-redirect.maps
           diff -u \
-            <(printf '%s\n' GTPU_TFT_DROP GTPU_TFT_FILT GTPU_TFT_META GTPU_TFT_SCHEMA) \
+            <(printf '%s\n' \
+              GTPU_OBS_EVT GTPU_OBS_FLOW GTPU_OBS_GATE GTPU_OBS_LCK \
+              GTPU_OBS_LOSS GTPU_OBS_REDIR GTPU_OBS_REG GTPU_OBS_SEQ \
+              GTPU_TFT_DROP GTPU_TFT_FILT GTPU_TFT_META GTPU_TFT_SCHEMA) \
             added-after-pre-redirect.maps
           # The whole guard rests on these being different programs. Byte
           # equality with the current object would make the historical-upgrade
@@ -833,11 +846,24 @@ jobs:
           for symbol in opc_gtpu_uplink opc_gtpu_downlink \
             checksum_loop_chunk parse_downlink authorize_and_decap_legacy_downlink \
             handle_downlink_ipv6 parse_downlink_ipv6 ipv6_udp_offset \
-            software_ipv6_udp_checksum_is_valid walk_ipv6_extension_step \
+            software_ipv6_udp_checksum_is_valid ipv6_udp_pseudo_sum \
+            walk_ipv6_extension_step \
             grouped_uplink_authority grouped_downlink_authority decap_grouped_downlink \
-            encapsulate_grouped_ipv4 encapsulate_grouped_ipv6 \
+            encapsulate_grouped_ipv4 prepare_grouped_ipv6_encapsulation \
+            encapsulate_grouped_ipv6 \
             checksum_bytes_are_materialized select_gtpu_session_entry_wire \
-            wire_address_is_canonical apply_uplink_mtu_policy \
+            authority_slots_are_canonical entry_wire_is_canonical bytes_80_are_zero \
+            apply_uplink_mtu_policy \
+            handle_grouped_downlink_ipv4 \
+            validated_observation_icmp_echo \
+            authenticate_observation_icmp_echo checksum_skb_region checksum_packet_chunk \
+            observation_icmp_checksum_40_is_valid observation_icmpv6_checksum_is_valid \
+            rewrite_authenticated_observation_icmp_echo_request \
+            emit_grouped_observation \
+            publish_grouped_observation_event \
+            emit_grouped_uplink_observation_on_reentry \
+            encoded_is_valid validate_ipv4_downlink_binding_wire \
+            constant_time_difference_16 siphash128_from_registration_sample \
             pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph \
             marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink \
             marked_owner_wire_authorizes_downlink classify_tft_filter_step \
@@ -846,8 +872,12 @@ jobs:
             GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_DL_BIND GTPU_DL_DROP \
             GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG GTPU_SESSIONS \
             GTPU_UL_INDEX GTPU_DL_INDEX GTPU_SESS_TXN GTPU_SCHEMA6 GTPU_CONFIG6 \
+            GTPU_OBS_REG GTPU_OBS_REDIR GTPU_OBS_EVT GTPU_OBS_LOSS GTPU_OBS_SEQ \
+            GTPU_OBS_GATE GTPU_OBS_LCK GTPU_OBS_FLOW \
             GTPU_TFT_SCHEMA GTPU_TFT_META GTPU_TFT_FILT GTPU_TFT_DROP; do
-            grep -Eq "( |[[:digit:]])${symbol}$" committed.inventory
+            grep -Eq \
+              "( |[[:digit:]])${symbol}((Kb[01]|Kj(4|8|10|20|40))_EB[[:digit:]]+_)?$" \
+              committed.inventory
           done
 
           functional_section_names() {

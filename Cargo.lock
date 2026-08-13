@@ -2734,6 +2734,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-dataplane-observation"
+version = "0.2.0"
+
+[[package]]
 name = "opc-dataplane-testkit"
 version = "0.2.0"
 dependencies = [
@@ -2876,6 +2880,7 @@ dependencies = [
  "aya",
  "aya-obj",
  "nix",
+ "opc-dataplane-observation",
  "opc-gtpu-ebpf-common",
  "opc-ipsec-xfrm",
  "opc-linux-gtpu-sys",
