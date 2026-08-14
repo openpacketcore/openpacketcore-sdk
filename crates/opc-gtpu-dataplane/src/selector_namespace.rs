@@ -13,7 +13,7 @@ use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use aes_gcm_siv::{
     aead::{generic_array::GenericArray, AeadInPlace, KeyInit},
@@ -57,6 +57,8 @@ const DECOMMISSION_AEAD_KEY_DOMAIN: &[u8] = b"opc/gtpu-selector/decommission/aea
 const DECOMMISSION_NONCE_KEY_DOMAIN: &[u8] = b"opc/gtpu-selector/decommission/nonce-key/v1\0";
 const DECOMMISSION_AAD_DOMAIN: &[u8] = b"opc/gtpu-selector/decommission/aad/v1\0";
 const BACKEND_RECEIPT_DOMAIN: &[u8] = b"opc/gtpu-selector/backend-receipt/v1\0";
+const OPERATION_INVENTORY_DOMAIN: &[u8] = b"opc/gtpu-selector/operation-inventory/v1\0";
+const BACKEND_MUTATION_WINDOW_DOMAIN: &[u8] = b"opc/gtpu-selector/backend-mutation-window/v1\0";
 pub(crate) const DECOMMISSION_CAPSULE_LEN: usize = 110;
 const DECOMMISSION_COORDINATE_LEN: usize = 81;
 const SELECTOR_LEDGER_KEY_TYPE: &str = "gtpu-selector-ledger-v1";
@@ -74,6 +76,11 @@ const MAX_KNOWN_ATOMS: usize = 1_024;
 const MAX_GROUP_ATOM_REFERENCES: usize = 4_096;
 const MIN_BACKEND_RECORD_BYTES: usize = MAX_RECORD_BYTES + (64 * 1024);
 const MAX_CANONICAL_DESIRED_BYTES: usize = 192;
+/// Permanent canonical desired descriptors are retained once for every group
+/// ever admitted.  This bounded index lets a recovered authority reconstruct
+/// the exact 16-byte operation-stamp key rather than trusting a caller to
+/// restate a historic group.
+const MAX_CANONICAL_DESIRED_RECORDS: usize = MAX_PERMANENT_GROUPS;
 const MAX_REUSED_INSTALL_DESCRIPTOR_BYTES: usize =
     1 + 2 + MAX_CANONICAL_DESIRED_BYTES + 1 + (3 * 32) + 8 + 16 + 8;
 /// Bounded conflict retries for one fenced durable selector mutation.
@@ -95,6 +102,40 @@ pub const SELECTOR_NAMESPACE_LEASE_RENEW_INTERVAL: Duration = Duration::from_sec
 /// One backend effect/readback step must complete within this bound.
 pub const SELECTOR_NAMESPACE_MAX_EFFECT_DURATION: Duration = Duration::from_secs(5);
 const MAX_CAS_RETRIES: usize = SELECTOR_NAMESPACE_MAX_CAS_ATTEMPTS;
+
+/// Observe one backend step for its bounded result without ever cancelling
+/// work that has already been polled.
+///
+/// Backend adapters may cross into an uncancellable host worker (for example
+/// `spawn_blocking`). Dropping their future at the deadline would release the
+/// durable worker and namespace gate while that host worker could still hold
+/// a current mutation request. On expiry we therefore retain and poll the
+/// future to terminal completion, discard its now-late result, and only then
+/// let the caller poison/release durable authority. Bounded supervisor slots
+/// make a backend that never terminates a fail-closed availability fault
+/// rather than a stale-effect race.
+async fn settle_selector_backend_step<F, T>(future: F) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    settle_selector_backend_step_within(SELECTOR_NAMESPACE_MAX_EFFECT_DURATION, future).await
+}
+
+async fn settle_selector_backend_step_within<F, T>(duration: Duration, future: F) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    match tokio::time::timeout(duration, future.as_mut()).await {
+        Ok(value) => Some(value),
+        Err(_) => {
+            // Do not drop an already-started backend future. In particular,
+            // dropping a Tokio blocking-task join does not abort that task.
+            let _ = future.await;
+            None
+        }
+    }
+}
 
 /// Affine evidence that the eBPF backend has resolved one canonical grouped
 /// pin namespace and currently holds its host-global ownership lease.
@@ -385,6 +426,7 @@ impl fmt::Debug for GtpuSessionSelectorRetiredClaim {
 pub struct GtpuSessionSelectorReuseRequest {
     retired: GtpuSessionSelectorRetiredClaim,
     desired: GtpuSessionGroup,
+    window: SelectorBackendMutationWindow,
 }
 
 impl GtpuSessionSelectorReuseRequest {
@@ -408,6 +450,13 @@ impl GtpuSessionSelectorReuseRequest {
         self.retired.admission.binding()
     }
 
+    /// Check the short durable-worker fence immediately before the backend
+    /// performs terminal-stamp readback or its quiescence barrier.
+    #[cfg(test)]
+    pub(crate) fn is_current(&self) -> bool {
+        self.window.is_current()
+    }
+
     /// Verify a raw selector-stamp value as the exact terminal-retired stamp
     /// for this source coordinate. This is intentionally the only public
     /// stamp verifier: callers cannot request a pending or terminal stamp for
@@ -428,6 +477,7 @@ impl GtpuSessionSelectorReuseRequest {
             retired: self.retired,
             desired: self.desired,
             evidence: crate::GtpuSessionSelectorReuseEvidence::TrafficDrained,
+            window: self.window.into_receipt(),
         }
     }
 
@@ -438,6 +488,7 @@ impl GtpuSessionSelectorReuseRequest {
             retired: self.retired,
             desired: self.desired,
             evidence: crate::GtpuSessionSelectorReuseEvidence::RcuGracePeriodElapsed,
+            window: self.window.into_receipt(),
         }
     }
 }
@@ -513,6 +564,7 @@ pub struct GtpuSessionSelectorReuseReceipt {
     retired: GtpuSessionSelectorRetiredClaim,
     desired: GtpuSessionGroup,
     evidence: crate::GtpuSessionSelectorReuseEvidence,
+    window: SelectorBackendMutationWindowReceipt,
 }
 
 impl fmt::Debug for GtpuSessionSelectorReuseReceipt {
@@ -540,26 +592,45 @@ enum SelectorBackendRequestKind {
     DecommissionInspect = 6,
     DecommissionCreate = 7,
     DecommissionReadback = 8,
+    InstallingNoEffect = 9,
+    RetiringNoEffect = 10,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct SelectorBackendReceiptCoordinate([u8; 32]);
 
 impl SelectorBackendReceiptCoordinate {
-    fn for_binding(
+    fn for_binding_inventory(
+        binding: GtpuSessionSelectorBackendBinding,
+        inventory: &SelectorOperationStampInventory,
+        window: &SelectorBackendMutationWindow,
+    ) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(BACKEND_RECEIPT_DOMAIN);
+        digest.update([SelectorBackendRequestKind::Binding as u8]);
+        update_receipt_binding(&mut digest, binding);
+        digest.update(inventory.summary());
+        digest.update(window.coordinate());
+        Self(digest.finalize().into())
+    }
+
+    fn for_binding_window(
         kind: SelectorBackendRequestKind,
         binding: GtpuSessionSelectorBackendBinding,
+        window: &SelectorBackendMutationWindow,
     ) -> Self {
         let mut digest = Sha256::new();
         digest.update(BACKEND_RECEIPT_DOMAIN);
         digest.update([kind as u8]);
         update_receipt_binding(&mut digest, binding);
+        digest.update(window.coordinate());
         Self(digest.finalize().into())
     }
 
     fn for_admission(
         kind: SelectorBackendRequestKind,
         admission: &GtpuSessionSelectorAdmission,
+        window: &SelectorBackendMutationWindow,
     ) -> Self {
         let mut digest = Sha256::new();
         digest.update(BACKEND_RECEIPT_DOMAIN);
@@ -597,6 +668,7 @@ impl SelectorBackendReceiptCoordinate {
             }
             None => digest.update([0; 9]),
         }
+        digest.update(window.coordinate());
         Self(digest.finalize().into())
     }
 
@@ -604,6 +676,7 @@ impl SelectorBackendReceiptCoordinate {
         kind: SelectorBackendRequestKind,
         binding: GtpuSessionSelectorBackendBinding,
         fence: Option<DecommissionFence>,
+        window: &SelectorBackendMutationWindow,
     ) -> Self {
         let mut digest = Sha256::new();
         digest.update(BACKEND_RECEIPT_DOMAIN);
@@ -616,6 +689,7 @@ impl SelectorBackendReceiptCoordinate {
             }
             None => digest.update([0; DECOMMISSION_CAPSULE_LEN + 1]),
         }
+        digest.update(window.coordinate());
         Self(digest.finalize().into())
     }
 
@@ -633,11 +707,351 @@ fn update_receipt_binding(digest: &mut Sha256, binding: GtpuSessionSelectorBacke
     digest.update(binding.selector_key_commitment());
 }
 
+/// One exact authority coordinate which an operation-stamp inventory entry
+/// may name.  This stays crate-private so only the built-in adapter can turn
+/// it into its byte-level map value codec.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SelectorOperationStampCoordinate {
+    generation: GtpuSessionSelectorAuthorityGeneration,
+    nonce: [u8; 16],
+}
+
+impl SelectorOperationStampCoordinate {
+    const fn from_authority(coordinate: SelectorAuthorityCoordinate) -> Self {
+        Self {
+            generation: coordinate.generation,
+            nonce: coordinate.nonce,
+        }
+    }
+
+    pub(crate) const fn generation(self) -> GtpuSessionSelectorAuthorityGeneration {
+        self.generation
+    }
+
+    pub(crate) const fn nonce(self) -> [u8; 16] {
+        self.nonce
+    }
+}
+
+impl fmt::Debug for SelectorOperationStampCoordinate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SelectorOperationStampCoordinate(<redacted>)")
+    }
+}
+
+/// The exact lifecycle alternatives for one permanent operation-stamp key.
+///
+/// Pending rows expose both their precommitted pending and terminal
+/// coordinates.  A backend may accept only the alternatives documented by
+/// that row; it must never silently discard a key, synthesize a coordinate,
+/// or accept a different group under the same 16-byte map key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectorOperationStampLifecycleExpectation {
+    Installing {
+        backend_started: bool,
+        pending: SelectorOperationStampCoordinate,
+        terminal: SelectorOperationStampCoordinate,
+    },
+    Active {
+        terminal: SelectorOperationStampCoordinate,
+    },
+    Retiring {
+        backend_started: bool,
+        pending: SelectorOperationStampCoordinate,
+        terminal: SelectorOperationStampCoordinate,
+        previous_terminal: SelectorOperationStampCoordinate,
+    },
+    Retired {
+        terminal: SelectorOperationStampCoordinate,
+        retired_dataplane_generation: NonZeroU64,
+    },
+    /// A poison row is terminal for coordinator mutation, but its inventory
+    /// expectation retains every exact coordinate needed to classify the
+    /// only states that can have resulted from the already-started operation.
+    Poisoned {
+        phase: u8,
+        reason: u8,
+        pending: SelectorOperationStampCoordinate,
+        terminal: SelectorOperationStampCoordinate,
+        previous_terminal: Option<SelectorOperationStampCoordinate>,
+        retired_dataplane_generation: Option<NonZeroU64>,
+    },
+}
+
+/// Lifecycle class for a protected operation-stamp expectation. This is
+/// intentionally distinct from admission phases because a poisoned row is
+/// terminal and cannot mint an admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectorOperationStampLifecycleKind {
+    Installing,
+    Active,
+    Retiring,
+    Retired,
+    Poisoned,
+}
+
+impl fmt::Debug for SelectorOperationStampLifecycleExpectation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SelectorOperationStampLifecycleExpectation(<redacted>)")
+    }
+}
+
+impl SelectorOperationStampLifecycleExpectation {
+    /// Stable discriminant for the protected lifecycle expectation. Built-in
+    /// adapters use this with the remaining exact-coordinate accessors while
+    /// retaining ownership of the eBPF stamp byte codec.
+    pub(crate) const fn kind(self) -> SelectorOperationStampLifecycleKind {
+        match self {
+            Self::Installing { .. } => SelectorOperationStampLifecycleKind::Installing,
+            Self::Active { .. } => SelectorOperationStampLifecycleKind::Active,
+            Self::Retiring { .. } => SelectorOperationStampLifecycleKind::Retiring,
+            Self::Retired { .. } => SelectorOperationStampLifecycleKind::Retired,
+            Self::Poisoned { .. } => SelectorOperationStampLifecycleKind::Poisoned,
+        }
+    }
+
+    pub(crate) const fn backend_started(self) -> Option<bool> {
+        match self {
+            Self::Installing {
+                backend_started, ..
+            }
+            | Self::Retiring {
+                backend_started, ..
+            } => Some(backend_started),
+            Self::Active { .. } | Self::Retired { .. } | Self::Poisoned { .. } => None,
+        }
+    }
+
+    pub(crate) const fn pending(self) -> Option<SelectorOperationStampCoordinate> {
+        match self {
+            Self::Installing { pending, .. }
+            | Self::Retiring { pending, .. }
+            | Self::Poisoned { pending, .. } => Some(pending),
+            Self::Active { .. } | Self::Retired { .. } => None,
+        }
+    }
+
+    pub(crate) const fn terminal(self) -> SelectorOperationStampCoordinate {
+        match self {
+            Self::Installing { terminal, .. }
+            | Self::Active { terminal }
+            | Self::Retiring { terminal, .. }
+            | Self::Retired { terminal, .. }
+            | Self::Poisoned { terminal, .. } => terminal,
+        }
+    }
+
+    pub(crate) const fn previous_terminal(self) -> Option<SelectorOperationStampCoordinate> {
+        match self {
+            Self::Retiring {
+                previous_terminal, ..
+            } => Some(previous_terminal),
+            Self::Poisoned {
+                previous_terminal, ..
+            } => previous_terminal,
+            Self::Installing { .. } | Self::Active { .. } | Self::Retired { .. } => None,
+        }
+    }
+
+    pub(crate) const fn retired_dataplane_generation(self) -> Option<NonZeroU64> {
+        match self {
+            Self::Retired {
+                retired_dataplane_generation,
+                ..
+            }
+            | Self::Poisoned {
+                retired_dataplane_generation: Some(retired_dataplane_generation),
+                ..
+            } => Some(retired_dataplane_generation),
+            Self::Installing { .. }
+            | Self::Active { .. }
+            | Self::Retiring { .. }
+            | Self::Poisoned {
+                retired_dataplane_generation: None,
+                ..
+            } => None,
+        }
+    }
+
+    pub(crate) const fn poison_reason(self) -> Option<u8> {
+        match self {
+            Self::Poisoned { reason, .. } => Some(reason),
+            Self::Installing { .. }
+            | Self::Active { .. }
+            | Self::Retiring { .. }
+            | Self::Retired { .. } => None,
+        }
+    }
+
+    pub(crate) const fn poison_phase(self) -> Option<u8> {
+        match self {
+            Self::Poisoned { phase, .. } => Some(phase),
+            Self::Installing { .. }
+            | Self::Active { .. }
+            | Self::Retiring { .. }
+            | Self::Retired { .. } => None,
+        }
+    }
+}
+
+/// Opaque semantic expectation for exactly one existing operation-stamp key.
+/// The backend owns the stamp byte codec; this value supplies the protected,
+/// canonical fields it must encode and compare exactly.
+#[derive(Clone)]
+pub(crate) struct SelectorOperationStampInventoryExpectation {
+    group: GtpuSessionGroup,
+    device_fingerprint: [u8; 32],
+    group_fingerprint: [u8; 32],
+    selector_set_fingerprint: [u8; 32],
+    desired_fingerprint: [u8; 32],
+    lifecycle: SelectorOperationStampLifecycleExpectation,
+}
+
+impl SelectorOperationStampInventoryExpectation {
+    pub(crate) const fn group(&self) -> &GtpuSessionGroup {
+        &self.group
+    }
+
+    pub(crate) const fn device_fingerprint(&self) -> [u8; 32] {
+        self.device_fingerprint
+    }
+
+    pub(crate) const fn group_fingerprint(&self) -> [u8; 32] {
+        self.group_fingerprint
+    }
+
+    pub(crate) const fn selector_set_fingerprint(&self) -> [u8; 32] {
+        self.selector_set_fingerprint
+    }
+
+    pub(crate) const fn desired_fingerprint(&self) -> [u8; 32] {
+        self.desired_fingerprint
+    }
+
+    pub(crate) const fn lifecycle(&self) -> SelectorOperationStampLifecycleExpectation {
+        self.lifecycle
+    }
+}
+
+impl fmt::Debug for SelectorOperationStampInventoryExpectation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SelectorOperationStampInventoryExpectation(<redacted>)")
+    }
+}
+
+/// Sorted, bounded complete inventory of permanent operation-stamp keys.
+/// It is reconstructed exclusively from the protected ledger for every
+/// production binding/open check.
+#[derive(Clone)]
+pub(crate) struct SelectorOperationStampInventory {
+    expectations: Vec<SelectorOperationStampInventoryExpectation>,
+    summary: [u8; 32],
+}
+
+impl SelectorOperationStampInventory {
+    pub(crate) fn expectations(&self) -> &[SelectorOperationStampInventoryExpectation] {
+        &self.expectations
+    }
+
+    const fn summary(&self) -> [u8; 32] {
+        self.summary
+    }
+}
+
+impl fmt::Debug for SelectorOperationStampInventory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SelectorOperationStampInventory(<redacted>)")
+    }
+}
+
+/// A non-cloneable, short backend mutation authorization. It is minted only
+/// after a successful durable lease renewal and carries both monotonic and
+/// wall-clock deadlines; a clock ambiguity is always stale.
+#[must_use = "a backend mutation window must be consumed by its authorized request"]
+pub(crate) struct SelectorBackendMutationWindow {
+    coordinate: [u8; 32],
+    monotonic_deadline: Instant,
+    wall_deadline: SystemTime,
+}
+
+impl SelectorBackendMutationWindow {
+    fn mint(lease_ttl: Duration) -> Result<Self, GtpuSessionSelectorNamespaceError> {
+        let duration = SELECTOR_NAMESPACE_MAX_EFFECT_DURATION.min(lease_ttl / 2);
+        if duration.is_zero() {
+            return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+        }
+        let monotonic_deadline = Instant::now()
+            .checked_add(duration)
+            .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        let wall_deadline = SystemTime::now()
+            .checked_add(duration)
+            .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        let nonce = random_nonzero_nonce()?;
+        let mut digest = Sha256::new();
+        digest.update(BACKEND_MUTATION_WINDOW_DOMAIN);
+        digest.update(nonce);
+        digest.update(duration.as_nanos().to_be_bytes());
+        Ok(Self {
+            coordinate: digest.finalize().into(),
+            monotonic_deadline,
+            wall_deadline,
+        })
+    }
+
+    /// Built-in adapters call this immediately before every host-lock
+    /// guarded mutation/readback. It intentionally has no public equivalent.
+    pub(crate) fn is_current(&self) -> bool {
+        Instant::now() < self.monotonic_deadline
+            && SystemTime::now()
+                .duration_since(self.wall_deadline)
+                .is_err()
+    }
+
+    pub(crate) fn into_receipt(self) -> SelectorBackendMutationWindowReceipt {
+        SelectorBackendMutationWindowReceipt {
+            monotonic_deadline: self.monotonic_deadline,
+            wall_deadline: self.wall_deadline,
+        }
+    }
+
+    const fn coordinate(&self) -> [u8; 32] {
+        self.coordinate
+    }
+}
+
+impl fmt::Debug for SelectorBackendMutationWindow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SelectorBackendMutationWindow(<redacted>)")
+    }
+}
+
+pub(crate) struct SelectorBackendMutationWindowReceipt {
+    monotonic_deadline: Instant,
+    wall_deadline: SystemTime,
+}
+
+impl SelectorBackendMutationWindowReceipt {
+    pub(crate) fn is_current(&self) -> bool {
+        Instant::now() < self.monotonic_deadline
+            && SystemTime::now()
+                .duration_since(self.wall_deadline)
+                .is_err()
+    }
+}
+
+impl fmt::Debug for SelectorBackendMutationWindowReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SelectorBackendMutationWindowReceipt(<redacted>)")
+    }
+}
+
 /// An opaque lease over one immutable selector namespace binding. It can be
 /// consumed only by a backend to confirm the exact binding it acquired.
 #[must_use = "a selector binding lease must be consumed by a backend receipt"]
 pub struct GtpuSessionSelectorBindingLease {
     binding: GtpuSessionSelectorBackendBinding,
+    inventory: SelectorOperationStampInventory,
+    window: SelectorBackendMutationWindow,
 }
 
 impl GtpuSessionSelectorBindingLease {
@@ -647,17 +1061,32 @@ impl GtpuSessionSelectorBindingLease {
         self.binding
     }
 
+    /// Complete protected-ledger expectation set which the built-in adapter
+    /// must compare with its complete stamp-map inventory under its host
+    /// lock. The list is sorted by the canonical 16-byte group ID key.
+    pub(crate) const fn operation_stamp_inventory(&self) -> &SelectorOperationStampInventory {
+        &self.inventory
+    }
+
+    /// Check the short durable-worker fence immediately before inspecting
+    /// the backend inventory. A false result is not retryable with this
+    /// request; the coordinator must mint a fresh window after renewal.
+    pub(crate) fn is_current(&self) -> bool {
+        self.window.is_current()
+    }
+
     fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
-        SelectorBackendReceiptCoordinate::for_binding(
-            SelectorBackendRequestKind::Binding,
+        SelectorBackendReceiptCoordinate::for_binding_inventory(
             self.binding,
+            &self.inventory,
+            &self.window,
         )
     }
 
     /// Mint a receipt only after the backend has acquired the exact binding.
     pub fn confirm(self) -> GtpuSessionSelectorBackendReceipt {
         let coordinate = self.receipt_coordinate();
-        GtpuSessionSelectorBackendReceipt::binding_confirmed(coordinate)
+        GtpuSessionSelectorBackendReceipt::binding_confirmed(coordinate, self.window.into_receipt())
     }
 }
 
@@ -665,6 +1094,7 @@ impl GtpuSessionSelectorBindingLease {
 #[must_use = "a selector provisioning request must be consumed by a backend receipt"]
 pub struct GtpuSessionSelectorProvisionRequest {
     binding: GtpuSessionSelectorBackendBinding,
+    window: SelectorBackendMutationWindow,
 }
 
 impl GtpuSessionSelectorProvisionRequest {
@@ -674,10 +1104,15 @@ impl GtpuSessionSelectorProvisionRequest {
         self.binding
     }
 
+    pub(crate) fn is_current(&self) -> bool {
+        self.window.is_current()
+    }
+
     fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
-        SelectorBackendReceiptCoordinate::for_binding(
+        SelectorBackendReceiptCoordinate::for_binding_window(
             SelectorBackendRequestKind::Provision,
             self.binding,
+            &self.window,
         )
     }
 
@@ -685,7 +1120,122 @@ impl GtpuSessionSelectorProvisionRequest {
     /// and exact marker readback under the backend's exclusive effect lease.
     pub fn confirm(self) -> GtpuSessionSelectorBackendReceipt {
         let coordinate = self.receipt_coordinate();
-        GtpuSessionSelectorBackendReceipt::provisioned(coordinate)
+        GtpuSessionSelectorBackendReceipt::provisioned(coordinate, self.window.into_receipt())
+    }
+}
+
+/// SDK-owned recovery inspection request for one exact unstarted Installing
+/// coordinate.
+///
+/// The backend consumes this affine capability while holding its host-global
+/// inventory lock. It must check [`Self::is_current`] immediately before and
+/// after proving the exact no-effect fact, then settle the request with
+/// [`Self::confirm`]. This prevents a structural or mock observation obtained
+/// before the worker fence expired from authorizing a later durable handoff.
+#[must_use = "a negative recovery inspection must be consumed into a current receipt"]
+pub struct GtpuSessionSelectorInstallingNoEffectRequest {
+    expected: GtpuSessionGroup,
+    admission: GtpuSessionSelectorAdmission,
+    window: SelectorBackendMutationWindow,
+}
+
+impl GtpuSessionSelectorInstallingNoEffectRequest {
+    /// Exact Installing graph whose no-effect state must be proven.
+    #[must_use]
+    pub const fn expected_group(&self) -> &GtpuSessionGroup {
+        &self.expected
+    }
+
+    /// Exact durable Installing coordinate being recovered.
+    #[must_use]
+    pub const fn admission(&self) -> &GtpuSessionSelectorAdmission {
+        &self.admission
+    }
+
+    /// Check the affine worker fence while the backend retains its inventory
+    /// lock. This is crate-visible for the built-in eBPF adapter only.
+    pub(crate) fn is_current(&self) -> bool {
+        self.window.is_current()
+    }
+
+    fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
+        SelectorBackendReceiptCoordinate::for_admission(
+            SelectorBackendRequestKind::InstallingNoEffect,
+            &self.admission,
+            &self.window,
+        )
+    }
+
+    /// Consume this request into its coordinate-bound no-effect receipt.
+    ///
+    /// The built-in adapter may call this only after its exact negative proof
+    /// and a second currentness check under the same host lock.
+    pub(crate) fn confirm(self) -> Option<GtpuSessionSelectorBackendReceipt> {
+        if !self.is_current() {
+            return None;
+        }
+        let coordinate = self.receipt_coordinate();
+        Some(GtpuSessionSelectorBackendReceipt::installing_no_effect(
+            coordinate,
+            self.window.into_receipt(),
+        ))
+    }
+}
+
+/// SDK-owned recovery inspection request for one exact unstarted Retiring
+/// coordinate.
+///
+/// The backend consumes this affine capability under its host-global inventory
+/// lock only after proving the exact previous Active graph and the absence of
+/// every removal artifact. See the Installing counterpart for the required
+/// pre- and post-inspection currentness checks.
+#[must_use = "a negative recovery inspection must be consumed into a current receipt"]
+pub struct GtpuSessionSelectorRetiringNoEffectRequest {
+    expected: GtpuSessionGroup,
+    admission: GtpuSessionSelectorAdmission,
+    window: SelectorBackendMutationWindow,
+}
+
+impl GtpuSessionSelectorRetiringNoEffectRequest {
+    /// Exact previous Active graph whose no-removal state must be proven.
+    #[must_use]
+    pub const fn expected_group(&self) -> &GtpuSessionGroup {
+        &self.expected
+    }
+
+    /// Exact durable Retiring coordinate being recovered.
+    #[must_use]
+    pub const fn admission(&self) -> &GtpuSessionSelectorAdmission {
+        &self.admission
+    }
+
+    /// Check the affine worker fence while the backend retains its inventory
+    /// lock. This is crate-visible for the built-in eBPF adapter only.
+    pub(crate) fn is_current(&self) -> bool {
+        self.window.is_current()
+    }
+
+    fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
+        SelectorBackendReceiptCoordinate::for_admission(
+            SelectorBackendRequestKind::RetiringNoEffect,
+            &self.admission,
+            &self.window,
+        )
+    }
+
+    /// Consume this request into its coordinate-bound no-effect receipt.
+    ///
+    /// The built-in adapter may call this only after its exact negative proof
+    /// and a second currentness check under the same host lock.
+    pub(crate) fn confirm(self) -> Option<GtpuSessionSelectorBackendReceipt> {
+        if !self.is_current() {
+            return None;
+        }
+        let coordinate = self.receipt_coordinate();
+        Some(GtpuSessionSelectorBackendReceipt::retiring_no_effect(
+            coordinate,
+            self.window.into_receipt(),
+        ))
     }
 }
 
@@ -695,6 +1245,7 @@ impl GtpuSessionSelectorProvisionRequest {
 #[must_use = "a selector effect request must be consumed by a backend receipt"]
 pub struct GtpuSessionSelectorEffectRequest {
     request: GtpuSessionGroupReconcileRequest,
+    window: SelectorBackendMutationWindow,
 }
 
 impl GtpuSessionSelectorEffectRequest {
@@ -710,10 +1261,16 @@ impl GtpuSessionSelectorEffectRequest {
         self.request.selector_backend_binding()
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_current(&self) -> bool {
+        self.window.is_current()
+    }
+
     fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
         SelectorBackendReceiptCoordinate::for_admission(
             SelectorBackendRequestKind::Effect,
             self.request.selector_admission(),
+            &self.window,
         )
     }
 
@@ -723,7 +1280,7 @@ impl GtpuSessionSelectorEffectRequest {
         outcome: GtpuSessionGroupReconcileOutcome,
     ) -> GtpuSessionSelectorBackendReceipt {
         let coordinate = self.receipt_coordinate();
-        GtpuSessionSelectorBackendReceipt::effect(coordinate, outcome)
+        GtpuSessionSelectorBackendReceipt::effect(coordinate, outcome, self.window.into_receipt())
     }
 
     pub(crate) fn into_inner(
@@ -731,9 +1288,10 @@ impl GtpuSessionSelectorEffectRequest {
     ) -> (
         GtpuSessionGroupReconcileRequest,
         SelectorBackendReceiptCoordinate,
+        SelectorBackendMutationWindow,
     ) {
         let coordinate = self.receipt_coordinate();
-        (self.request, coordinate)
+        (self.request, coordinate, self.window)
     }
 }
 
@@ -742,6 +1300,7 @@ impl GtpuSessionSelectorEffectRequest {
 pub struct GtpuSessionSelectorReadbackRequest {
     expected: GtpuSessionGroup,
     admission: GtpuSessionSelectorAdmission,
+    window: SelectorBackendMutationWindow,
 }
 
 impl GtpuSessionSelectorReadbackRequest {
@@ -761,10 +1320,15 @@ impl GtpuSessionSelectorReadbackRequest {
         &self.admission
     }
 
+    pub(crate) fn is_current(&self) -> bool {
+        self.window.is_current()
+    }
+
     fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
         SelectorBackendReceiptCoordinate::for_admission(
             SelectorBackendRequestKind::Readback,
             &self.admission,
+            &self.window,
         )
     }
 
@@ -774,7 +1338,11 @@ impl GtpuSessionSelectorReadbackRequest {
         readback: crate::GtpuSessionGroupReadback,
     ) -> GtpuSessionSelectorBackendReceipt {
         let coordinate = self.receipt_coordinate();
-        GtpuSessionSelectorBackendReceipt::readback(coordinate, readback)
+        GtpuSessionSelectorBackendReceipt::readback(
+            coordinate,
+            readback,
+            self.window.into_receipt(),
+        )
     }
 
     /// Complete an exact terminal-retired absence readback with the full
@@ -792,7 +1360,10 @@ impl GtpuSessionSelectorReadbackRequest {
         let coordinate = self.receipt_coordinate();
         terminal_retired_stamp_generation(&self.admission, stamp).map(|generation| {
             GtpuSessionSelectorBackendReceipt::readback_terminal_retired(
-                coordinate, readback, generation,
+                coordinate,
+                readback,
+                generation,
+                self.window.into_receipt(),
             )
         })
     }
@@ -803,6 +1374,7 @@ impl GtpuSessionSelectorReadbackRequest {
 pub struct GtpuSessionSelectorRemovalRequest {
     expected: GtpuSessionGroup,
     admission: GtpuSessionSelectorAdmission,
+    window: SelectorBackendMutationWindow,
 }
 
 impl GtpuSessionSelectorRemovalRequest {
@@ -822,10 +1394,15 @@ impl GtpuSessionSelectorRemovalRequest {
         &self.admission
     }
 
+    pub(crate) fn is_current(&self) -> bool {
+        self.window.is_current()
+    }
+
     fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
         SelectorBackendReceiptCoordinate::for_admission(
             SelectorBackendRequestKind::Removal,
             &self.admission,
+            &self.window,
         )
     }
 
@@ -835,7 +1412,7 @@ impl GtpuSessionSelectorRemovalRequest {
         outcome: GtpuSessionGroupRemovalOutcome,
     ) -> GtpuSessionSelectorBackendReceipt {
         let coordinate = self.receipt_coordinate();
-        GtpuSessionSelectorBackendReceipt::removal(coordinate, outcome)
+        GtpuSessionSelectorBackendReceipt::removal(coordinate, outcome, self.window.into_receipt())
     }
 
     /// Complete removal only after an authorized backend has written and
@@ -856,7 +1433,10 @@ impl GtpuSessionSelectorRemovalRequest {
         let coordinate = self.receipt_coordinate();
         terminal_retired_stamp_generation(&self.admission, stamp).map(|generation| {
             GtpuSessionSelectorBackendReceipt::removal_terminal_retired(
-                coordinate, outcome, generation,
+                coordinate,
+                outcome,
+                generation,
+                self.window.into_receipt(),
             )
         })
     }
@@ -872,6 +1452,7 @@ impl GtpuSessionSelectorRemovalRequest {
 pub struct GtpuSessionSelectorDecommissionInspectRequest {
     binding: GtpuSessionSelectorBackendBinding,
     expected_fence: Option<DecommissionFence>,
+    window: SelectorBackendMutationWindow,
 }
 
 impl GtpuSessionSelectorDecommissionInspectRequest {
@@ -888,25 +1469,36 @@ impl GtpuSessionSelectorDecommissionInspectRequest {
         self.expected_fence.map(DecommissionFence::marker_payload)
     }
 
+    pub(crate) fn is_current(&self) -> bool {
+        self.window.is_current()
+    }
+
     fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
         SelectorBackendReceiptCoordinate::for_decommission(
             SelectorBackendRequestKind::DecommissionInspect,
             self.binding,
             self.expected_fence,
+            &self.window,
         )
     }
 
     /// Consume this request after proving no terminal capsule exists.
     pub fn confirm_absent(self) -> GtpuSessionSelectorBackendReceipt {
         let coordinate = self.receipt_coordinate();
-        GtpuSessionSelectorBackendReceipt::decommission_fence_absent(coordinate)
+        GtpuSessionSelectorBackendReceipt::decommission_fence_absent(
+            coordinate,
+            self.window.into_receipt(),
+        )
     }
 
     /// Consume this request after proving the persisted terminal capsule is
     /// byte-for-byte exact.
     pub fn confirm_exact(self) -> GtpuSessionSelectorBackendReceipt {
         let coordinate = self.receipt_coordinate();
-        GtpuSessionSelectorBackendReceipt::decommission_fence_exact(coordinate)
+        GtpuSessionSelectorBackendReceipt::decommission_fence_exact(
+            coordinate,
+            self.window.into_receipt(),
+        )
     }
 }
 
@@ -920,6 +1512,7 @@ impl GtpuSessionSelectorDecommissionInspectRequest {
 pub struct GtpuSessionSelectorDecommissionRequest {
     binding: GtpuSessionSelectorBackendBinding,
     fence: DecommissionFence,
+    window: SelectorBackendMutationWindow,
 }
 
 impl GtpuSessionSelectorDecommissionRequest {
@@ -955,11 +1548,16 @@ impl GtpuSessionSelectorDecommissionRequest {
         bool::from(self.terminal_marker_payload().ct_eq(payload))
     }
 
+    pub(crate) fn is_current(&self) -> bool {
+        self.window.is_current()
+    }
+
     fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
         SelectorBackendReceiptCoordinate::for_decommission(
             SelectorBackendRequestKind::DecommissionCreate,
             self.binding,
             Some(self.fence),
+            &self.window,
         )
     }
 
@@ -967,7 +1565,10 @@ impl GtpuSessionSelectorDecommissionRequest {
     /// committed coordinate has been durably created and read back.
     pub fn confirm(self) -> GtpuSessionSelectorBackendReceipt {
         let coordinate = self.receipt_coordinate();
-        GtpuSessionSelectorBackendReceipt::decommission_fence_exact(coordinate)
+        GtpuSessionSelectorBackendReceipt::decommission_fence_exact(
+            coordinate,
+            self.window.into_receipt(),
+        )
     }
 }
 
@@ -980,6 +1581,7 @@ impl GtpuSessionSelectorDecommissionRequest {
 pub struct GtpuSessionSelectorDecommissionReadbackRequest {
     binding: GtpuSessionSelectorBackendBinding,
     fence: DecommissionFence,
+    window: SelectorBackendMutationWindow,
 }
 
 impl GtpuSessionSelectorDecommissionReadbackRequest {
@@ -1004,18 +1606,26 @@ impl GtpuSessionSelectorDecommissionReadbackRequest {
         bool::from(self.terminal_marker_payload().ct_eq(payload))
     }
 
+    pub(crate) fn is_current(&self) -> bool {
+        self.window.is_current()
+    }
+
     fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
         SelectorBackendReceiptCoordinate::for_decommission(
             SelectorBackendRequestKind::DecommissionReadback,
             self.binding,
             Some(self.fence),
+            &self.window,
         )
     }
 
     /// Consume the request after an exact durable capsule readback.
     pub fn confirm_exact(self) -> GtpuSessionSelectorBackendReceipt {
         let coordinate = self.receipt_coordinate();
-        GtpuSessionSelectorBackendReceipt::decommission_fence_exact(coordinate)
+        GtpuSessionSelectorBackendReceipt::decommission_fence_exact(
+            coordinate,
+            self.window.into_receipt(),
+        )
     }
 }
 
@@ -1032,11 +1642,14 @@ impl GtpuSessionSelectorDecommissionReadbackRequest {
 pub struct GtpuSessionSelectorBackendReceipt {
     coordinate: SelectorBackendReceiptCoordinate,
     kind: SelectorBackendReceiptKind,
+    window: SelectorBackendMutationWindowReceipt,
 }
 
 enum SelectorBackendReceiptKind {
     BindingConfirmed,
     Provisioned,
+    InstallingNoEffect,
+    RetiringNoEffect,
     DecommissionFenceAbsent,
     DecommissionFenceExact,
     Effect(GtpuSessionGroupReconcileOutcome),
@@ -1051,47 +1664,88 @@ enum SelectorBackendReceiptKind {
 }
 
 impl GtpuSessionSelectorBackendReceipt {
-    const fn binding_confirmed(coordinate: SelectorBackendReceiptCoordinate) -> Self {
+    fn binding_confirmed(
+        coordinate: SelectorBackendReceiptCoordinate,
+        window: SelectorBackendMutationWindowReceipt,
+    ) -> Self {
         Self {
             coordinate,
             kind: SelectorBackendReceiptKind::BindingConfirmed,
+            window,
         }
     }
 
-    const fn provisioned(coordinate: SelectorBackendReceiptCoordinate) -> Self {
+    fn provisioned(
+        coordinate: SelectorBackendReceiptCoordinate,
+        window: SelectorBackendMutationWindowReceipt,
+    ) -> Self {
         Self {
             coordinate,
             kind: SelectorBackendReceiptKind::Provisioned,
+            window,
         }
     }
 
-    const fn decommission_fence_absent(coordinate: SelectorBackendReceiptCoordinate) -> Self {
+    fn installing_no_effect(
+        coordinate: SelectorBackendReceiptCoordinate,
+        window: SelectorBackendMutationWindowReceipt,
+    ) -> Self {
+        Self {
+            coordinate,
+            kind: SelectorBackendReceiptKind::InstallingNoEffect,
+            window,
+        }
+    }
+
+    fn retiring_no_effect(
+        coordinate: SelectorBackendReceiptCoordinate,
+        window: SelectorBackendMutationWindowReceipt,
+    ) -> Self {
+        Self {
+            coordinate,
+            kind: SelectorBackendReceiptKind::RetiringNoEffect,
+            window,
+        }
+    }
+
+    fn decommission_fence_absent(
+        coordinate: SelectorBackendReceiptCoordinate,
+        window: SelectorBackendMutationWindowReceipt,
+    ) -> Self {
         Self {
             coordinate,
             kind: SelectorBackendReceiptKind::DecommissionFenceAbsent,
+            window,
         }
     }
 
-    const fn decommission_fence_exact(coordinate: SelectorBackendReceiptCoordinate) -> Self {
+    fn decommission_fence_exact(
+        coordinate: SelectorBackendReceiptCoordinate,
+        window: SelectorBackendMutationWindowReceipt,
+    ) -> Self {
         Self {
             coordinate,
             kind: SelectorBackendReceiptKind::DecommissionFenceExact,
+            window,
         }
     }
 
-    pub(crate) const fn effect(
+    pub(crate) fn effect(
         coordinate: SelectorBackendReceiptCoordinate,
         outcome: GtpuSessionGroupReconcileOutcome,
+        window: SelectorBackendMutationWindowReceipt,
     ) -> Self {
         Self {
             coordinate,
             kind: SelectorBackendReceiptKind::Effect(outcome),
+            window,
         }
     }
 
-    const fn readback(
+    fn readback(
         coordinate: SelectorBackendReceiptCoordinate,
         readback: crate::GtpuSessionGroupReadback,
+        window: SelectorBackendMutationWindowReceipt,
     ) -> Self {
         Self {
             coordinate,
@@ -1099,13 +1753,15 @@ impl GtpuSessionSelectorBackendReceipt {
                 readback,
                 terminal_retired_dataplane_generation: None,
             },
+            window,
         }
     }
 
-    const fn readback_terminal_retired(
+    fn readback_terminal_retired(
         coordinate: SelectorBackendReceiptCoordinate,
         readback: crate::GtpuSessionGroupReadback,
         terminal_retired_dataplane_generation: NonZeroU64,
+        window: SelectorBackendMutationWindowReceipt,
     ) -> Self {
         Self {
             coordinate,
@@ -1113,12 +1769,14 @@ impl GtpuSessionSelectorBackendReceipt {
                 readback,
                 terminal_retired_dataplane_generation: Some(terminal_retired_dataplane_generation),
             },
+            window,
         }
     }
 
-    const fn removal(
+    fn removal(
         coordinate: SelectorBackendReceiptCoordinate,
         outcome: GtpuSessionGroupRemovalOutcome,
+        window: SelectorBackendMutationWindowReceipt,
     ) -> Self {
         Self {
             coordinate,
@@ -1126,13 +1784,15 @@ impl GtpuSessionSelectorBackendReceipt {
                 outcome,
                 terminal_retired_dataplane_generation: None,
             },
+            window,
         }
     }
 
-    const fn removal_terminal_retired(
+    fn removal_terminal_retired(
         coordinate: SelectorBackendReceiptCoordinate,
         outcome: GtpuSessionGroupRemovalOutcome,
         terminal_retired_dataplane_generation: NonZeroU64,
+        window: SelectorBackendMutationWindowReceipt,
     ) -> Self {
         Self {
             coordinate,
@@ -1140,24 +1800,40 @@ impl GtpuSessionSelectorBackendReceipt {
                 outcome,
                 terminal_retired_dataplane_generation: Some(terminal_retired_dataplane_generation),
             },
+            window,
         }
     }
 
     fn confirms_binding(&self, expected: SelectorBackendReceiptCoordinate) -> bool {
-        self.coordinate.matches(expected)
+        self.window.is_current()
+            && self.coordinate.matches(expected)
             && matches!(self.kind, SelectorBackendReceiptKind::BindingConfirmed)
     }
 
     fn confirms_provisioning(&self, expected: SelectorBackendReceiptCoordinate) -> bool {
-        self.coordinate.matches(expected)
+        self.window.is_current()
+            && self.coordinate.matches(expected)
             && matches!(self.kind, SelectorBackendReceiptKind::Provisioned)
+    }
+
+    fn confirms_installing_no_effect(&self, expected: SelectorBackendReceiptCoordinate) -> bool {
+        self.window.is_current()
+            && self.coordinate.matches(expected)
+            && matches!(self.kind, SelectorBackendReceiptKind::InstallingNoEffect)
+    }
+
+    fn confirms_retiring_no_effect(&self, expected: SelectorBackendReceiptCoordinate) -> bool {
+        self.window.is_current()
+            && self.coordinate.matches(expected)
+            && matches!(self.kind, SelectorBackendReceiptKind::RetiringNoEffect)
     }
 
     fn confirms_decommission_fence_absent(
         &self,
         expected: SelectorBackendReceiptCoordinate,
     ) -> bool {
-        self.coordinate.matches(expected)
+        self.window.is_current()
+            && self.coordinate.matches(expected)
             && matches!(
                 self.kind,
                 SelectorBackendReceiptKind::DecommissionFenceAbsent
@@ -1168,7 +1844,8 @@ impl GtpuSessionSelectorBackendReceipt {
         &self,
         expected: SelectorBackendReceiptCoordinate,
     ) -> bool {
-        self.coordinate.matches(expected)
+        self.window.is_current()
+            && self.coordinate.matches(expected)
             && matches!(
                 self.kind,
                 SelectorBackendReceiptKind::DecommissionFenceExact
@@ -1179,7 +1856,7 @@ impl GtpuSessionSelectorBackendReceipt {
         self,
         expected: SelectorBackendReceiptCoordinate,
     ) -> Option<GtpuSessionGroupReconcileOutcome> {
-        if !self.coordinate.matches(expected) {
+        if !self.window.is_current() || !self.coordinate.matches(expected) {
             return None;
         }
         match self.kind {
@@ -1192,7 +1869,7 @@ impl GtpuSessionSelectorBackendReceipt {
         self,
         expected: SelectorBackendReceiptCoordinate,
     ) -> Option<AuthorizedSelectorReadback> {
-        if !self.coordinate.matches(expected) {
+        if !self.window.is_current() || !self.coordinate.matches(expected) {
             return None;
         }
         match self.kind {
@@ -1211,7 +1888,7 @@ impl GtpuSessionSelectorBackendReceipt {
         self,
         expected: SelectorBackendReceiptCoordinate,
     ) -> Option<AuthorizedSelectorRemoval> {
-        if !self.coordinate.matches(expected) {
+        if !self.window.is_current() || !self.coordinate.matches(expected) {
             return None;
         }
         match self.kind {
@@ -1288,6 +1965,9 @@ static SELECTOR_PROCESS_SUPERVISORS: OnceLock<Arc<tokio::sync::Semaphore>> = Onc
 static SELECTOR_NAMESPACE_SUPERVISORS: OnceLock<
     Mutex<BTreeMap<[u8; 32], Weak<tokio::sync::Semaphore>>>,
 > = OnceLock::new();
+static SELECTOR_NAMESPACE_WORKERS: OnceLock<
+    Mutex<BTreeMap<[u8; 32], Weak<tokio::sync::Semaphore>>>,
+> = OnceLock::new();
 
 fn selector_process_supervisors() -> Arc<tokio::sync::Semaphore> {
     SELECTOR_PROCESS_SUPERVISORS
@@ -1320,6 +2000,30 @@ fn selector_namespace_supervisors(
     semaphore
 }
 
+/// One process-local worker may hold a durable lease for a selector storage
+/// scope at a time. `SessionStore` intentionally treats a same-owner acquire
+/// as replica recovery and replaces the prior credential; without this gate,
+/// two SDK workers in one replica could therefore invalidate each other while
+/// an already-minted backend window remained time-current. The bounded
+/// supervisor semaphores above retain at most 64 queued operations per scope,
+/// while this separate gate owns the complete acquire-to-release lifetime.
+fn selector_namespace_worker(storage_scope_commitment: [u8; 32]) -> Arc<tokio::sync::Semaphore> {
+    let registry = SELECTOR_NAMESPACE_WORKERS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.retain(|_, semaphore| semaphore.strong_count() != 0);
+    if let Some(existing) = registry
+        .get(&storage_scope_commitment)
+        .and_then(Weak::upgrade)
+    {
+        return existing;
+    }
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    registry.insert(storage_scope_commitment, Arc::downgrade(&semaphore));
+    semaphore
+}
+
 fn spawn_selector_operation<T, E, F>(
     storage_scope_commitment: [u8; 32],
     runtime_error: E,
@@ -1333,6 +2037,7 @@ where
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let process_permits = selector_process_supervisors();
     let namespace_permits = selector_namespace_supervisors(storage_scope_commitment);
+    let namespace_worker = selector_namespace_worker(storage_scope_commitment);
     let closed_error = runtime_error.clone();
     // Reserve both bounded supervisor slots before either durable admission or
     // task creation.  Spawning first would make an unbounded number of tasks
@@ -1367,6 +2072,13 @@ where
                 // observer cannot release either slot or abort the effect.
                 let _process_permit = process_permit;
                 let _namespace_permit = namespace_permit;
+                let _worker_permit = match namespace_worker.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        let _ = sender.send(Err(runtime_error));
+                        return;
+                    }
+                };
                 let result = worker.await;
                 let _ = sender.send(result);
             });
@@ -1516,15 +2228,17 @@ impl GtpuSessionSelectorAdmission {
         }
     }
 
-    pub(crate) const fn authorizes_install_effect(&self) -> bool {
+    pub(crate) fn authorizes_install_effect(&self) -> bool {
         matches!(self.phase, SelectorAdmissionPhase::Installing)
             && self.previous_terminal.is_none()
+            && self.operation_nonce != self.terminal_operation_nonce
             && self.terminal_generation.get() > self.generation.get()
     }
 
-    pub(crate) const fn authorizes_retirement_effect(&self) -> bool {
+    pub(crate) fn authorizes_retirement_effect(&self) -> bool {
         matches!(self.phase, SelectorAdmissionPhase::Retiring)
             && self.previous_terminal.is_some()
+            && self.operation_nonce != self.terminal_operation_nonce
             && self.terminal_generation.get() > self.generation.get()
     }
 
@@ -1584,12 +2298,16 @@ impl GtpuSessionSelectorAdmission {
             terminal.generation == generation && terminal.nonce == operation_nonce;
         match phase {
             SelectorAdmissionPhase::Installing => {
-                if terminal.generation.get() <= generation.get() || previous_terminal.is_some() {
+                if terminal.generation.get() <= generation.get()
+                    || terminal.nonce == operation_nonce
+                    || previous_terminal.is_some()
+                {
                     return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
                 }
             }
             SelectorAdmissionPhase::Retiring => {
                 if terminal.generation.get() <= generation.get()
+                    || terminal.nonce == operation_nonce
                     || !previous_terminal.is_some_and(|prior| {
                         prior.generation.get() < generation.get() && prior.nonce != [0; 16]
                     })
@@ -1706,11 +2424,16 @@ impl InMemoryGtpuSessionSelectorNamespace {
         }) {
             return Err(GtpuSessionSelectorNamespaceError::SelectorClaimed);
         }
+        if atoms.len() > SELECTOR_NAMESPACE_MAX_READBACK_ATOMS {
+            return Err(GtpuSessionSelectorNamespaceError::CapacityExhausted);
+        }
         state.bind_or_validate(
             group.device_id(),
             SELECTOR_NAMESPACE_MAX_READBACK_ATOMS,
             Some(self.key),
         )?;
+        state.preflight_fresh_claim(atoms.len())?;
+        state.retain_canonical_desired(claim.group_fingerprint, group)?;
         let generation = state.next_generation()?;
         let operation_nonce = test_nonzero_nonce(&self.key, claim.group_fingerprint, generation)?;
         let admission = state.issue_admission(
@@ -1772,6 +2495,11 @@ impl InMemoryGtpuSessionSelectorNamespace {
             .state
             .lock()
             .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        state.bind_or_validate(
+            desired.device_id(),
+            SELECTOR_NAMESPACE_MAX_READBACK_ATOMS,
+            Some(self.key),
+        )?;
         if state.groups.contains_key(&claim.group_fingerprint)
             || !matches!(
                 state.groups.get(&source.group_fingerprint),
@@ -1781,12 +2509,14 @@ impl InMemoryGtpuSessionSelectorNamespace {
                         && *source_desired == source.desired_fingerprint
                         && *source_atoms == atoms
             )
-            || !atoms
-                .iter()
-                .all(|atom| matches!(state.selectors.get(atom), Some(SelectorState::Retired)))
+            || !atoms.iter().all(|atom| {
+                matches!(state.selectors.get(atom), Some(SelectorState::Retired))
+                    && state.tombstones.contains(atom)
+            })
         {
             return Err(GtpuSessionSelectorNamespaceError::SelectorClaimed);
         }
+        state.preflight_reissue(atoms.len())?;
         let Some(GroupState::Retired {
             device,
             selectors,
@@ -1803,6 +2533,7 @@ impl InMemoryGtpuSessionSelectorNamespace {
         };
         let generation = state.next_generation()?;
         let operation_nonce = test_nonzero_nonce(&self.key, claim.group_fingerprint, generation)?;
+        state.retain_canonical_desired(claim.group_fingerprint, desired)?;
         state.groups.insert(
             source.group_fingerprint,
             GroupState::Retired {
@@ -2278,6 +3009,7 @@ impl<S: GtpuSessionSelectorNamespaceStore> TestGtpuSessionSelectorNamespaceAutho
                 return Err(GtpuSessionSelectorNamespaceError::SelectorClaimed);
             }
             state.preflight_fresh_claim(atoms.len())?;
+            state.retain_canonical_desired(claim.group_fingerprint, group)?;
             let generation = state.next_generation()?;
             let operation_nonce =
                 test_nonzero_nonce(&self.key, claim.group_fingerprint, generation)?;
@@ -2409,6 +3141,7 @@ impl<S: GtpuSessionSelectorNamespaceStore> TestGtpuSessionSelectorNamespaceAutho
             // tombstone is atomically replaced by its new live owner while
             // the predecessor group tombstone remains permanent.
             state.preflight_reissue(atoms.len())?;
+            state.retain_canonical_desired(claim.group_fingerprint, desired)?;
             let generation = state.next_generation()?;
             let operation_nonce =
                 test_nonzero_nonce(&self.key, claim.group_fingerprint, generation)?;
@@ -3065,33 +3798,63 @@ where
     /// Open a production selector authority over an adapter that proves
     /// authenticated payload protection. The durable key is SDK-derived from
     /// the protected boundary and stable device, never caller-selected.
-    pub async fn open_protected(
+    ///
+    /// Opening is an SDK-owned detached operation for the same reason as a
+    /// dataplane effect: dropping the caller's observer must not release the
+    /// per-namespace worker fence while a backend binding check is still
+    /// completing on a blocking host worker.
+    pub fn open_protected<D>(
         store: SessionStore<B>,
         scope: SelectorLedgerStorageScope,
         bootstrap: GtpuSelectorNamespaceBootstrap,
+        backend: Arc<D>,
         owner: OwnerId,
         lease_ttl: Duration,
         maximum_atoms: usize,
-    ) -> Result<Self, GtpuSessionSelectorNamespaceError>
+    ) -> GtpuSessionSelectorOperation<Self, GtpuSessionSelectorNamespaceError>
     where
-        B: ProtectedSessionBackend,
+        B: ProtectedSessionBackend + Send + Sync + 'static,
+        D: GtpuDataplaneBackend + Send + Sync + 'static,
     {
-        let base = store
-            .protected_selector_ledger_base(&scope)
-            .ok_or(GtpuSessionSelectorNamespaceError::UnsuitableStore)?;
-        let derivation = derive_protected_selector_ledger(base, bootstrap)?;
-        let scope = NamespaceBackendScope::from(&derivation);
-        let authority = Self::open_with_backend_scope(
-            store,
-            derivation.namespace_key,
-            owner,
-            lease_ttl,
-            maximum_atoms,
-            scope,
+        if lease_ttl != SELECTOR_NAMESPACE_MAX_LEASE_TTL {
+            return spawn_selector_operation(
+                [0; 32],
+                GtpuSessionSelectorNamespaceError::UnsuitableStore,
+                async { Err(GtpuSessionSelectorNamespaceError::UnsuitableStore) },
+            );
+        }
+        let Some(base) = store.protected_selector_ledger_base(&scope) else {
+            return spawn_selector_operation(
+                [0; 32],
+                GtpuSessionSelectorNamespaceError::UnsuitableStore,
+                async { Err(GtpuSessionSelectorNamespaceError::UnsuitableStore) },
+            );
+        };
+        let derivation = match derive_protected_selector_ledger(base, bootstrap) {
+            Ok(derivation) => derivation,
+            Err(error) => {
+                return spawn_selector_operation([0; 32], error, async move { Err(error) });
+            }
+        };
+        let storage_scope_commitment = derivation.storage_scope_commitment;
+        let backend_scope = NamespaceBackendScope::from(&derivation);
+        spawn_selector_operation(
+            storage_scope_commitment,
+            GtpuSessionSelectorNamespaceError::Indeterminate,
+            async move {
+                let authority = Self::open_with_backend_scope(
+                    store,
+                    derivation.namespace_key,
+                    owner,
+                    lease_ttl,
+                    maximum_atoms,
+                    backend_scope,
+                )
+                .await?;
+                authority.verify_open_bound(backend.as_ref()).await?;
+                Ok(authority)
+            },
         )
-        .await?;
-        authority.verify_open_bound().await?;
-        Ok(authority)
     }
 
     /// Test-only raw-key constructor for deterministic conformance fixtures.
@@ -3182,6 +3945,13 @@ where
         B: ProtectedSessionBackend + Send + Sync + 'static,
         D: GtpuDataplaneBackend + Send + Sync + 'static,
     {
+        if lease_ttl != SELECTOR_NAMESPACE_MAX_LEASE_TTL {
+            return spawn_selector_operation(
+                [0; 32],
+                GtpuSessionSelectorNamespaceError::UnsuitableStore,
+                async { Err(GtpuSessionSelectorNamespaceError::UnsuitableStore) },
+            );
+        }
         let Some(base) = store.protected_selector_ledger_base(&scope) else {
             return spawn_selector_operation(
                 [0; 32],
@@ -3338,42 +4108,59 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
-        self.ensure_backend_namespace(backend)
+        let mut lease = self
+            .acquire_worker_lease()
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
-        if retired.admission.phase != SelectorAdmissionPhase::Retired
-            || !retired.admission.validates(&retired.group)
-            || retired.group.device_id() != desired.device_id()
-            || retired.group.id() == desired.id()
-        {
-            return Err(GtpuSessionSelectorCoordinatorError::Namespace);
-        }
-        let receipt = tokio::time::timeout(
-            SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-            backend.authorize_selector_reuse(GtpuSessionSelectorReuseRequest { retired, desired }),
-        )
-        .await
-        .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?
-        .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
-        let GtpuSessionSelectorReuseReceipt {
-            retired,
-            desired,
-            evidence,
-        } = receipt;
-        if retired.admission.phase != SelectorAdmissionPhase::Retired
-            || !retired.admission.validates(&retired.group)
-        {
-            return Err(GtpuSessionSelectorCoordinatorError::Backend);
-        }
-        let proof = match evidence {
-            crate::GtpuSessionSelectorReuseEvidence::TrafficDrained => {
-                crate::GtpuSessionSelectorReuseProof::after_traffic_drain(retired.group)
+        let result = async {
+            self.ensure_backend_namespace(backend, &mut lease)
+                .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            if retired.admission.phase != SelectorAdmissionPhase::Retired
+                || !retired.admission.validates(&retired.group)
+                || retired.group.device_id() != desired.device_id()
+                || retired.group.id() == desired.id()
+            {
+                return Err(GtpuSessionSelectorCoordinatorError::Namespace);
             }
-            crate::GtpuSessionSelectorReuseEvidence::RcuGracePeriodElapsed => {
-                crate::GtpuSessionSelectorReuseProof::after_rcu_grace_period(retired.group)
+            let window = self
+                .mint_backend_mutation_window(&mut lease)
+                .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            let receipt = settle_selector_backend_step(backend.authorize_selector_reuse(
+                GtpuSessionSelectorReuseRequest {
+                    retired,
+                    desired,
+                    window,
+                },
+            ))
+            .await
+            .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?
+            .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
+            let GtpuSessionSelectorReuseReceipt {
+                retired,
+                desired,
+                evidence,
+                window,
+            } = receipt;
+            if !window.is_current()
+                || retired.admission.phase != SelectorAdmissionPhase::Retired
+                || !retired.admission.validates(&retired.group)
+            {
+                return Err(GtpuSessionSelectorCoordinatorError::Backend);
             }
-        };
-        Ok(GtpuSessionSelectorReuseAuthorization { desired, proof })
+            let proof = match evidence {
+                crate::GtpuSessionSelectorReuseEvidence::TrafficDrained => {
+                    crate::GtpuSessionSelectorReuseProof::after_traffic_drain(retired.group)
+                }
+                crate::GtpuSessionSelectorReuseEvidence::RcuGracePeriodElapsed => {
+                    crate::GtpuSessionSelectorReuseProof::after_rcu_grace_period(retired.group)
+                }
+            };
+            Ok(GtpuSessionSelectorReuseAuthorization { desired, proof })
+        }
+        .await;
+        self.finish_worker_operation(lease, result).await
     }
 
     /// Claim an exact full-set reissue from one backend-authorized retired
@@ -3511,7 +4298,7 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
-        self.ensure_backend_namespace(backend)
+        self.ensure_backend_namespace(backend, lease)
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
         // `Installing(false)` is a durable pre-effect reservation, not a
@@ -3520,23 +4307,41 @@ where
         // observation remains fail-closed rather than being reinterpreted as
         // a request to replay the effect.
         if let Ok(admission) = self.installing_admission(&desired, Some(false)).await {
-            let no_effect = tokio::time::timeout(
-                SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-                backend.inspect_installing_selector_no_effect(&desired, &admission),
+            let window = self
+                .mint_backend_mutation_window(lease)
+                .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            let request = GtpuSessionSelectorInstallingNoEffectRequest {
+                expected: desired.clone(),
+                admission,
+                window,
+            };
+            let expected_receipt = request.receipt_coordinate();
+            if !request.is_current() {
+                return Err(GtpuSessionSelectorCoordinatorError::Backend);
+            }
+            let receipt = settle_selector_backend_step(
+                backend.inspect_installing_selector_no_effect(request),
             )
             .await
-            .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?
+            .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
-            if !matches!(
-                no_effect,
-                crate::GtpuSessionSelectorInstallRecovery::NoEffect
-            ) {
+            // The backend could only settle the consumed request after its
+            // pre/post-lock currentness checks. Recheck the coordinate-bound
+            // receipt immediately on return before the durable handoff.
+            if !receipt.confirms_installing_no_effect(expected_receipt) {
                 return Err(GtpuSessionSelectorCoordinatorError::Backend);
             }
             let handoff = self
                 .mark_install_backend_started_with_lease(&desired, lease)
                 .await
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            // A durable CAS can itself be delayed. Do not let a negative
+            // proof that expired while committing the handoff launch an
+            // effect; the one-way bit remains for a later exact recovery.
+            if !receipt.confirms_installing_no_effect(expected_receipt) {
+                return Err(GtpuSessionSelectorCoordinatorError::Backend);
+            }
             return match handoff {
                 BackendStartHandoff::Transitioned(admission) => {
                     let reuse = match self.installing_reuse_proof(&desired).await {
@@ -3566,7 +4371,10 @@ where
             .installing_admission(&desired, Some(true))
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
-        let readback = match Self::authorized_readback(backend, desired.clone(), admission).await {
+        let readback = match self
+            .authorized_readback(backend, desired.clone(), admission, lease)
+            .await
+        {
             Ok(readback) => readback,
             Err(_) => {
                 let poison_admission = self
@@ -3628,7 +4436,8 @@ where
             .installing_admission(&desired, Some(true))
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
-        match Self::authorized_readback(backend, desired.clone(), readback_admission)
+        match self
+            .authorized_readback(backend, desired.clone(), readback_admission, lease)
             .await
             .map(|readback| readback.readback)
         {
@@ -3689,7 +4498,7 @@ where
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
         let result = async {
-            self.ensure_backend_namespace(backend)
+            self.ensure_backend_namespace(backend, &mut lease)
                 .await
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
             let admission = self
@@ -3701,7 +4510,7 @@ where
                 .await
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
             if self
-                .require_exact_active(backend, desired.clone(), readback_admission)
+                .require_exact_active(backend, desired.clone(), readback_admission, &mut lease)
                 .await
                 .is_err()
             {
@@ -3762,31 +4571,33 @@ where
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
         let result = async {
-            self.ensure_backend_namespace(backend)
+            self.ensure_backend_namespace(backend, &mut lease)
                 .await
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
             let admission = self
                 .retired_admission(&expected)
                 .await
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
-            let readback =
-                match Self::authorized_readback(backend, expected.clone(), admission).await {
-                    Ok(readback) => readback,
-                    Err(_) => {
-                        let poison_admission = self
-                            .retired_admission(&expected)
-                            .await
-                            .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
-                        self.poison_or_namespace(
-                            &expected,
-                            &poison_admission,
-                            PoisonReason::RecoveryIndeterminate,
-                            &mut lease,
-                        )
-                        .await?;
-                        return Err(GtpuSessionSelectorCoordinatorError::Backend);
-                    }
-                };
+            let readback = match self
+                .authorized_readback(backend, expected.clone(), admission, &mut lease)
+                .await
+            {
+                Ok(readback) => readback,
+                Err(_) => {
+                    let poison_admission = self
+                        .retired_admission(&expected)
+                        .await
+                        .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+                    self.poison_or_namespace(
+                        &expected,
+                        &poison_admission,
+                        PoisonReason::RecoveryIndeterminate,
+                        &mut lease,
+                    )
+                    .await?;
+                    return Err(GtpuSessionSelectorCoordinatorError::Backend);
+                }
+            };
             let admission = self
                 .retired_admission(&expected)
                 .await
@@ -3867,7 +4678,7 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
-        self.ensure_backend_namespace(backend)
+        self.ensure_backend_namespace(backend, lease)
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
         if !active.0.validates(&expected) {
@@ -3944,7 +4755,7 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
-        self.ensure_backend_namespace(backend)
+        self.ensure_backend_namespace(backend, lease)
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
         // The Retiring(false) coordinate still represents the exact prior
@@ -3952,23 +4763,38 @@ where
         // remove effect occurred: only the opaque backend inspection below
         // binds that negative fact to the previous terminal stamp.
         if let Ok(admission) = self.retiring_admission(&expected, Some(false)).await {
-            let no_effect = tokio::time::timeout(
-                SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-                backend.inspect_retiring_selector_no_effect(&expected, &admission),
-            )
-            .await
-            .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?
-            .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
-            if !matches!(
-                no_effect,
-                crate::GtpuSessionSelectorRetiringRecovery::ExactPreviousActive
-            ) {
+            let window = self
+                .mint_backend_mutation_window(lease)
+                .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            let request = GtpuSessionSelectorRetiringNoEffectRequest {
+                expected: expected.clone(),
+                admission,
+                window,
+            };
+            let expected_receipt = request.receipt_coordinate();
+            if !request.is_current() {
+                return Err(GtpuSessionSelectorCoordinatorError::Backend);
+            }
+            let receipt =
+                settle_selector_backend_step(backend.inspect_retiring_selector_no_effect(request))
+                    .await
+                    .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?
+                    .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
+            // See Installing recovery: the receipt carries the consumed
+            // request's exact window and is checked immediately on return.
+            if !receipt.confirms_retiring_no_effect(expected_receipt) {
                 return Err(GtpuSessionSelectorCoordinatorError::Backend);
             }
             let handoff = self
                 .mark_retirement_backend_started_with_lease(&expected, lease)
                 .await
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            // As above, a stale negative proof may not outlive the durable
+            // handoff and authorize the first removal effect.
+            if !receipt.confirms_retiring_no_effect(expected_receipt) {
+                return Err(GtpuSessionSelectorCoordinatorError::Backend);
+            }
             return match handoff {
                 BackendStartHandoff::Transitioned(admission) => {
                     self.complete_retirement_with_lease(backend, expected, admission, lease)
@@ -3989,20 +4815,22 @@ where
             .retiring_admission(&expected, Some(true))
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
-        let readback =
-            match Self::authorized_readback(backend, expected.clone(), readback_admission).await {
-                Ok(readback) => readback,
-                Err(_) => {
-                    self.poison_or_namespace(
-                        &expected,
-                        &admission,
-                        PoisonReason::RecoveryIndeterminate,
-                        lease,
-                    )
-                    .await?;
-                    return Err(GtpuSessionSelectorCoordinatorError::Backend);
-                }
-            };
+        let readback = match self
+            .authorized_readback(backend, expected.clone(), readback_admission, lease)
+            .await
+        {
+            Ok(readback) => readback,
+            Err(_) => {
+                self.poison_or_namespace(
+                    &expected,
+                    &admission,
+                    PoisonReason::RecoveryIndeterminate,
+                    lease,
+                )
+                .await?;
+                return Err(GtpuSessionSelectorCoordinatorError::Backend);
+            }
+        };
         if matches!(readback.readback, crate::GtpuSessionGroupReadback::Absent) {
             let Some(retired_dataplane_generation) = readback.terminal_retired_dataplane_generation
             else {
@@ -4059,25 +4887,27 @@ where
             .retiring_admission(&expected, Some(true))
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
-        let readback =
-            match Self::authorized_readback(backend, expected.clone(), readback_admission).await {
-                Ok(readback)
-                    if matches!(readback.readback, crate::GtpuSessionGroupReadback::Absent)
-                        && readback.terminal_retired_dataplane_generation.is_some() =>
-                {
-                    readback
-                }
-                Ok(_) | Err(_) => {
-                    self.poison_or_namespace(
-                        &expected,
-                        &admission,
-                        PoisonReason::RecoveryIndeterminate,
-                        lease,
-                    )
-                    .await?;
-                    return Err(GtpuSessionSelectorCoordinatorError::Backend);
-                }
-            };
+        let readback = match self
+            .authorized_readback(backend, expected.clone(), readback_admission, lease)
+            .await
+        {
+            Ok(readback)
+                if matches!(readback.readback, crate::GtpuSessionGroupReadback::Absent)
+                    && readback.terminal_retired_dataplane_generation.is_some() =>
+            {
+                readback
+            }
+            Ok(_) | Err(_) => {
+                self.poison_or_namespace(
+                    &expected,
+                    &admission,
+                    PoisonReason::RecoveryIndeterminate,
+                    lease,
+                )
+                .await?;
+                return Err(GtpuSessionSelectorCoordinatorError::Backend);
+            }
+        };
         let retired_dataplane_generation = readback
             .terminal_retired_dataplane_generation
             .ok_or(GtpuSessionSelectorCoordinatorError::Namespace)?;
@@ -4134,16 +4964,18 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
-        let request = GtpuSessionSelectorEffectRequest { request };
+        let window = self
+            .mint_backend_mutation_window(lease)
+            .await
+            .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+        let request = GtpuSessionSelectorEffectRequest { request, window };
         let expected_receipt = request.receipt_coordinate();
-        let receipt = tokio::time::timeout(
-            SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-            backend.reconcile_pdp_context_group_authorized(request),
-        )
-        .await;
+        let receipt =
+            settle_selector_backend_step(backend.reconcile_pdp_context_group_authorized(request))
+                .await;
         let outcome = match receipt {
-            Ok(Ok(receipt)) => receipt.into_effect(expected_receipt),
-            Ok(Err(_)) | Err(_) => None,
+            Some(Ok(receipt)) => receipt.into_effect(expected_receipt),
+            Some(Err(_)) | None => None,
         };
         if !matches!(
             outcome,
@@ -4164,7 +4996,7 @@ where
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
         if self
-            .require_exact_active(backend, desired.clone(), current_admission)
+            .require_exact_active(backend, desired.clone(), current_admission, lease)
             .await
             .is_err()
         {
@@ -4197,35 +5029,43 @@ where
         backend: &D,
         desired: GtpuSessionGroup,
         admission: GtpuSessionSelectorAdmission,
+        lease: &mut opc_session_store::LeaseGuard,
     ) -> Result<(), GtpuSessionSelectorCoordinatorError>
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
-        let readback = Self::authorized_readback(backend, desired.clone(), admission).await?;
+        let readback = self
+            .authorized_readback(backend, desired.clone(), admission, lease)
+            .await?;
         matches!(readback.readback, crate::GtpuSessionGroupReadback::Active(ref active) if active == &desired)
             .then_some(())
             .ok_or(GtpuSessionSelectorCoordinatorError::Backend)
     }
 
     async fn authorized_readback<D>(
+        &self,
         backend: &D,
         expected: GtpuSessionGroup,
         admission: GtpuSessionSelectorAdmission,
+        lease: &mut opc_session_store::LeaseGuard,
     ) -> Result<AuthorizedSelectorReadback, GtpuSessionSelectorCoordinatorError>
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
+        let window = self
+            .mint_backend_mutation_window(lease)
+            .await
+            .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
         let request = GtpuSessionSelectorReadbackRequest {
             expected,
             admission,
+            window,
         };
         let expected_receipt = request.receipt_coordinate();
-        let receipt = tokio::time::timeout(
-            SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-            backend.read_pdp_context_group_with_lease(request),
-        )
-        .await
-        .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
+        let receipt =
+            settle_selector_backend_step(backend.read_pdp_context_group_with_lease(request))
+                .await
+                .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?;
         receipt
             .ok()
             .and_then(|receipt| receipt.into_readback(expected_receipt))
@@ -4246,19 +5086,22 @@ where
             .retiring_admission(&expected, Some(true))
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+        let window = self
+            .mint_backend_mutation_window(lease)
+            .await
+            .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
         let request = GtpuSessionSelectorRemovalRequest {
             expected: expected.clone(),
             admission,
+            window,
         };
         let expected_receipt = request.receipt_coordinate();
-        let receipt = tokio::time::timeout(
-            SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-            backend.remove_pdp_context_group_with_lease(request),
-        )
-        .await;
+        let receipt =
+            settle_selector_backend_step(backend.remove_pdp_context_group_with_lease(request))
+                .await;
         let removal = match receipt {
-            Ok(Ok(receipt)) => receipt.into_removal(expected_receipt),
-            Ok(Err(_)) | Err(_) => None,
+            Some(Ok(receipt)) => receipt.into_removal(expected_receipt),
+            Some(Err(_)) | None => None,
         };
         if !matches!(
             removal.as_ref().map(|removal| removal.outcome.clone()),
@@ -4291,7 +5134,10 @@ where
             .retiring_admission(&expected, Some(true))
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
-        let readback = match Self::authorized_readback(backend, expected.clone(), admission).await {
+        let readback = match self
+            .authorized_readback(backend, expected.clone(), admission, lease)
+            .await
+        {
             Ok(readback) => readback,
             Err(_) => {
                 self.poison_or_namespace(
@@ -4370,7 +5216,7 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
-        self.ensure_backend_namespace(backend).await?;
+        self.ensure_backend_namespace(backend, lease).await?;
         let canonical = CanonicalClaim::from_group(desired);
         for _ in 0..MAX_CAS_RETRIES {
             let (record, mut state) = self.read_state().await?;
@@ -4396,10 +5242,11 @@ where
                 return Err(GtpuSessionSelectorNamespaceError::SelectorClaimed);
             }
             state.preflight_fresh_claim(atoms.len())?;
+            state.retain_canonical_desired(claim.group_fingerprint, desired)?;
             let generation = state.next_generation()?;
             let operation_nonce = random_nonzero_nonce()?;
             let terminal_generation = state.next_generation()?;
-            let terminal_operation_nonce = random_nonzero_nonce()?;
+            let terminal_operation_nonce = random_distinct_nonzero_nonce(operation_nonce)?;
             for atom in &atoms {
                 state.selectors.insert(
                     *atom,
@@ -4480,7 +5327,7 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
-        self.ensure_backend_namespace(backend).await?;
+        self.ensure_backend_namespace(backend, lease).await?;
         let canonical = CanonicalClaim::from_group(desired);
         let source_canonical = CanonicalClaim::from_group(proof.retired_group());
         if desired.device_id() != proof.retired_group().device_id()
@@ -4514,10 +5361,11 @@ where
                 return Err(GtpuSessionSelectorNamespaceError::SelectorClaimed);
             }
             state.preflight_reissue(atoms.len())?;
+            state.retain_canonical_desired(claim.group_fingerprint, desired)?;
             let generation = state.next_generation()?;
             let operation_nonce = random_nonzero_nonce()?;
             let terminal_generation = state.next_generation()?;
-            let terminal_operation_nonce = random_nonzero_nonce()?;
+            let terminal_operation_nonce = random_distinct_nonzero_nonce(operation_nonce)?;
             let Some(GroupState::Retired {
                 device,
                 selectors,
@@ -4639,9 +5487,21 @@ where
         Ok((record, state))
     }
 
-    async fn verify_open_bound(&self) -> Result<(), GtpuSessionSelectorNamespaceError> {
-        let _ = self.read_state().await?;
-        Ok(())
+    async fn verify_open_bound<D>(
+        &self,
+        backend: &D,
+    ) -> Result<(), GtpuSessionSelectorNamespaceError>
+    where
+        D: GtpuDataplaneBackend + ?Sized,
+    {
+        let mut lease = self.acquire_worker_lease().await?;
+        let result = self.ensure_backend_namespace(backend, &mut lease).await;
+        let released = self.release_worker_lease(lease).await;
+        match result {
+            Err(error) => Err(error),
+            Ok(()) if released.is_ok() => Ok(()),
+            Ok(()) => Err(GtpuSessionSelectorNamespaceError::Indeterminate),
+        }
     }
 
     fn bound_binding(
@@ -4663,21 +5523,26 @@ where
     async fn ensure_backend_namespace<D>(
         &self,
         backend: &D,
+        lease: &mut opc_session_store::LeaseGuard,
     ) -> Result<(), GtpuSessionSelectorNamespaceError>
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
         let (_, state) = self.read_state().await?;
         let binding = self.bound_binding(&state)?;
-        let request = GtpuSessionSelectorBindingLease { binding };
+        let inventory = state.operation_stamp_inventory(binding)?;
+        let window = self.mint_backend_mutation_window(lease).await?;
+        let request = GtpuSessionSelectorBindingLease {
+            binding,
+            inventory,
+            window,
+        };
         let expected_receipt = request.receipt_coordinate();
-        let receipt = tokio::time::timeout(
-            SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-            backend.acquire_selector_namespace_lease(request),
-        )
-        .await
-        .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?
-        .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        let receipt =
+            settle_selector_backend_step(backend.acquire_selector_namespace_lease(request))
+                .await
+                .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?
+                .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
         receipt
             .confirms_binding(expected_receipt)
             .then_some(())
@@ -4713,6 +5578,24 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
+        let mut lease = self.acquire_worker_lease().await?;
+        let result = self.provision_with_lease(backend, &mut lease).await;
+        let released = self.release_worker_lease(lease).await;
+        match result {
+            Err(error) => Err(error),
+            Ok(()) if released.is_ok() => Ok(()),
+            Ok(()) => Err(GtpuSessionSelectorNamespaceError::Indeterminate),
+        }
+    }
+
+    async fn provision_with_lease<D>(
+        &self,
+        backend: &D,
+        lease: &mut opc_session_store::LeaseGuard,
+    ) -> Result<(), GtpuSessionSelectorNamespaceError>
+    where
+        D: GtpuDataplaneBackend + ?Sized,
+    {
         for _ in 0..MAX_CAS_RETRIES {
             let (record, mut state) = self.read_state_for_provision().await?;
             match state.lifecycle {
@@ -4722,13 +5605,16 @@ where
                         self.pin_commitment,
                         self.storage_scope_commitment,
                     );
-                    if self.replace(None, state).await? {
+                    if self.replace_with_lease(None, state, lease).await? {
                         continue;
                     }
                 }
                 NamespaceLifecycle::Provisioned => {
                     state.initialize(self.maximum_operation_atoms)?;
-                    if self.replace(record.as_ref(), state).await? {
+                    if self
+                        .replace_with_lease(record.as_ref(), state, lease)
+                        .await?
+                    {
                         continue;
                     }
                 }
@@ -4741,27 +5627,30 @@ where
                         return Err(GtpuSessionSelectorNamespaceError::ConfigurationMismatch);
                     }
                     let binding = state.binding_with_scope(self.storage_scope_commitment)?;
-                    let request = GtpuSessionSelectorProvisionRequest { binding };
+                    let window = self.mint_backend_mutation_window(lease).await?;
+                    let request = GtpuSessionSelectorProvisionRequest { binding, window };
                     let expected_receipt = request.receipt_coordinate();
-                    let receipt = tokio::time::timeout(
-                        SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
+                    let receipt = settle_selector_backend_step(
                         backend.provision_selector_namespace_authorized(request),
                     )
                     .await
-                    .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?
+                    .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?
                     .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
                     if !receipt.confirms_provisioning(expected_receipt) {
                         return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
                     }
                     state.lifecycle = NamespaceLifecycle::Bound;
-                    if self.replace(record.as_ref(), state).await? {
-                        self.ensure_backend_namespace(backend).await?;
+                    if self
+                        .replace_with_lease(record.as_ref(), state, lease)
+                        .await?
+                    {
+                        self.ensure_backend_namespace(backend, lease).await?;
                         return Ok(());
                     }
                 }
                 NamespaceLifecycle::Bound => {
                     self.bound_binding(&state)?;
-                    self.ensure_backend_namespace(backend).await?;
+                    self.ensure_backend_namespace(backend, lease).await?;
                     return Ok(());
                 }
                 NamespaceLifecycle::Decommissioned => {
@@ -4848,19 +5737,34 @@ where
             .binding_with_scope(self.storage_scope_commitment)
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
 
+        // A Bound namespace must prove the complete persistent operation
+        // inventory before beginning an ordinary terminal operation. Once a
+        // fence is precommitted, only the exact terminal capsule protocol may
+        // proceed, so `operation_stamp_inventory` deliberately rejects that
+        // lifecycle and the recovery branch below owns the narrower proof.
+        if state.lifecycle == NamespaceLifecycle::Bound {
+            self.ensure_backend_namespace(backend, lease)
+                .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+        }
+
         let fence = match (state.lifecycle, state.decommission_fence) {
             (NamespaceLifecycle::Bound, None) => {
+                let window = self
+                    .mint_backend_mutation_window(lease)
+                    .await
+                    .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
                 let request = GtpuSessionSelectorDecommissionInspectRequest {
                     binding,
                     expected_fence: None,
+                    window,
                 };
                 let expected_receipt = request.receipt_coordinate();
-                let absence = tokio::time::timeout(
-                    SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
+                let absence = settle_selector_backend_step(
                     backend.inspect_selector_namespace_decommission_fence(request),
                 )
                 .await
-                .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?
+                .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
                 if !absence.confirms_decommission_fence_absent(expected_receipt) {
                     return Err(GtpuSessionSelectorCoordinatorError::Backend);
@@ -4885,27 +5789,38 @@ where
             _ => return Err(GtpuSessionSelectorCoordinatorError::Namespace),
         };
 
+        let window = self
+            .mint_backend_mutation_window(lease)
+            .await
+            .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
         let request = GtpuSessionSelectorDecommissionInspectRequest {
             binding,
             expected_fence: Some(fence),
+            window,
         };
         let expected_inspection = request.receipt_coordinate();
-        let inspection = tokio::time::timeout(
-            SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
+        let inspection = settle_selector_backend_step(
             backend.inspect_selector_namespace_decommission_fence(request),
         )
         .await
-        .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?
+        .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?
         .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
         if inspection.confirms_decommission_fence_absent(expected_inspection) {
-            let request = GtpuSessionSelectorDecommissionRequest { binding, fence };
+            let window = self
+                .mint_backend_mutation_window(lease)
+                .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            let request = GtpuSessionSelectorDecommissionRequest {
+                binding,
+                fence,
+                window,
+            };
             let expected_created = request.receipt_coordinate();
-            let created = tokio::time::timeout(
-                SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
+            let created = settle_selector_backend_step(
                 backend.create_selector_namespace_decommission_fence(request),
             )
             .await
-            .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?
+            .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
             if !created.confirms_decommission_fence_exact(expected_created) {
                 return Err(GtpuSessionSelectorCoordinatorError::Backend);
@@ -4914,14 +5829,21 @@ where
             return Err(GtpuSessionSelectorCoordinatorError::Backend);
         }
 
-        let request = GtpuSessionSelectorDecommissionReadbackRequest { binding, fence };
+        let window = self
+            .mint_backend_mutation_window(lease)
+            .await
+            .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+        let request = GtpuSessionSelectorDecommissionReadbackRequest {
+            binding,
+            fence,
+            window,
+        };
         let expected_readback = request.receipt_coordinate();
-        let readback = tokio::time::timeout(
-            SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
+        let readback = settle_selector_backend_step(
             backend.read_selector_namespace_decommission_fence(request),
         )
         .await
-        .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?
+        .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?
         .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
         if !readback.confirms_decommission_fence_exact(expected_readback) {
             return Err(GtpuSessionSelectorCoordinatorError::Backend);
@@ -4942,30 +5864,26 @@ where
         // after the final durable state readback. It is the terminal cleanup
         // fence: a concurrent stale worker cannot report completion unless
         // the one persisted capsule is still exact.
-        let request = GtpuSessionSelectorDecommissionReadbackRequest { binding, fence };
+        let window = self
+            .mint_backend_mutation_window(lease)
+            .await
+            .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+        let request = GtpuSessionSelectorDecommissionReadbackRequest {
+            binding,
+            fence,
+            window,
+        };
         let expected_cleanup = request.receipt_coordinate();
-        let cleanup = tokio::time::timeout(
-            SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
+        let cleanup = settle_selector_backend_step(
             backend.read_selector_namespace_decommission_fence(request),
         )
         .await
-        .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?
+        .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?
         .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
         if !cleanup.confirms_decommission_fence_exact(expected_cleanup) {
             return Err(GtpuSessionSelectorCoordinatorError::Backend);
         }
         Ok(DecommissionAttempt::Complete)
-    }
-
-    async fn replace(
-        &self,
-        current: Option<&StoredSessionRecord>,
-        state: NamespaceState,
-    ) -> Result<bool, GtpuSessionSelectorNamespaceError> {
-        let mut lease = self.acquire_worker_lease().await?;
-        let result = self.replace_with_lease(current, state, &mut lease).await;
-        self.release_worker_lease(lease).await?;
-        result
     }
 
     /// Acquire the sole durable worker lease for an operation. Callers that
@@ -4989,6 +5907,21 @@ where
             .release(lease)
             .await
             .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)
+    }
+
+    /// Renew immediately before handing authority to a backend. The returned
+    /// non-cloneable window remains valid for no more than half the durable
+    /// lease (and never more than the fixed backend-effect bound).
+    async fn mint_backend_mutation_window(
+        &self,
+        lease: &mut opc_session_store::LeaseGuard,
+    ) -> Result<SelectorBackendMutationWindow, GtpuSessionSelectorNamespaceError> {
+        *lease = self
+            .store
+            .renew(lease, self.lease_ttl)
+            .await
+            .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        SelectorBackendMutationWindow::mint(self.lease_ttl)
     }
 
     /// A release failure means a successful operation can no longer report a
@@ -5763,7 +6696,7 @@ where
                     let pending_generation = state.next_generation()?;
                     let pending_nonce = random_nonzero_nonce()?;
                     let terminal_generation = state.next_generation()?;
-                    let terminal_operation_nonce = random_nonzero_nonce()?;
+                    let terminal_operation_nonce = random_distinct_nonzero_nonce(pending_nonce)?;
                     let previous_terminal = SelectorAuthorityCoordinate {
                         generation,
                         nonce: operation_nonce,
@@ -5909,6 +6842,9 @@ struct NamespaceState {
     decommission_fence: Option<DecommissionFence>,
     selectors: BTreeMap<[u8; 32], SelectorState>,
     groups: BTreeMap<[u8; 32], GroupState>,
+    /// Protected canonical desired descriptors for every permanent group.
+    /// This is the durable source of operation-stamp key reconstruction.
+    canonical_desired: BTreeMap<[u8; 32], Zeroizing<Vec<u8>>>,
     /// Exact, permanent atom-reservation index. An entry is added in the same
     /// CAS that creates an `Installing` group, before the backend effect. It
     /// is never removed: a `Fresh` claim may therefore mean *never reserved*,
@@ -5947,6 +6883,7 @@ impl NamespaceState {
             || self.decommission_fence.is_some()
             || !self.selectors.is_empty()
             || !self.groups.is_empty()
+            || !self.canonical_desired.is_empty()
             || !self.published_atoms.is_empty()
             || !self.tombstones.is_empty()
         {
@@ -6035,12 +6972,16 @@ impl NamespaceState {
             terminal.generation == generation && terminal.nonce == operation_nonce;
         match phase {
             SelectorAdmissionPhase::Installing => {
-                if terminal.generation.get() <= generation.get() || previous_terminal.is_some() {
+                if terminal.generation.get() <= generation.get()
+                    || terminal.nonce == operation_nonce
+                    || previous_terminal.is_some()
+                {
                     return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
                 }
             }
             SelectorAdmissionPhase::Retiring => {
                 if terminal.generation.get() <= generation.get()
+                    || terminal.nonce == operation_nonce
                     || !previous_terminal.is_some_and(|prior| {
                         prior.generation.get() < generation.get() && prior.nonce != [0; 16]
                     })
@@ -6310,9 +7251,15 @@ impl NamespaceState {
         match self.stable_device {
             None if self.lifecycle == NamespaceLifecycle::Unprovisioned
                 && self.generation == 0
+                && self.pin_commitment == [0; 32]
+                && self.storage_scope_commitment == [0; 32]
                 && self.selectors.is_empty()
                 && self.groups.is_empty()
+                && self.canonical_desired.is_empty()
+                && self.published_atoms.is_empty()
+                && self.tombstones.is_empty()
                 && self.capacity == 0
+                && self.decommission_fence.is_none()
                 && self.ledger_id == [0; 16]
                 && self.backend_epoch == [0; 16]
                 && *self.selector_digest_key == [0; 32]
@@ -6403,6 +7350,11 @@ impl NamespaceState {
             .checked_add(1)
             .is_none_or(|value| value > MAX_PERMANENT_GROUPS)
             || self
+                .canonical_desired
+                .len()
+                .checked_add(1)
+                .is_none_or(|value| value > MAX_CANONICAL_DESIRED_RECORDS)
+            || self
                 .live_group_count()
                 .checked_add(1)
                 .is_none_or(|value| value > MAX_LIVE_GROUPS)
@@ -6429,11 +7381,11 @@ impl NamespaceState {
             return Err(GtpuSessionSelectorNamespaceError::CapacityExhausted);
         }
         // Selector row (73 bytes), permanent group row (157 + 32/atom), the
-        // append-only historical atom index (32/atom), and the tombstones
-        // reserved for its eventual retirement (32/atom).
+        // protected canonical desired index, append-only historical atom
+        // index (32/atom), and tombstones reserved for retirement.
         let additional = atoms
             .checked_mul(169)
-            .and_then(|value| value.checked_add(157))
+            .and_then(|value| value.checked_add(157 + 32 + 2 + MAX_CANONICAL_DESIRED_BYTES))
             .ok_or(GtpuSessionSelectorNamespaceError::CapacityExhausted)?;
         self.preflight_encoded_growth(additional)
     }
@@ -6450,6 +7402,11 @@ impl NamespaceState {
                 .checked_add(1)
                 .is_none_or(|value| value > MAX_PERMANENT_GROUPS)
             || self
+                .canonical_desired
+                .len()
+                .checked_add(1)
+                .is_none_or(|value| value > MAX_CANONICAL_DESIRED_RECORDS)
+            || self
                 .live_group_count()
                 .checked_add(1)
                 .is_none_or(|value| value > MAX_LIVE_GROUPS)
@@ -6462,7 +7419,14 @@ impl NamespaceState {
         }
         let additional = atoms
             .checked_mul(32)
-            .and_then(|value| value.checked_add(198 + MAX_REUSED_INSTALL_DESCRIPTOR_BYTES))
+            .and_then(|value| {
+                value.checked_add(
+                    223 + MAX_REUSED_INSTALL_DESCRIPTOR_BYTES
+                        + 32
+                        + 2
+                        + MAX_CANONICAL_DESIRED_BYTES,
+                )
+            })
             .ok_or(GtpuSessionSelectorNamespaceError::CapacityExhausted)?;
         self.preflight_encoded_growth(additional)
     }
@@ -6505,6 +7469,220 @@ impl NamespaceState {
                 GroupState::LegacyPoisoned => 0,
             })
             .sum()
+    }
+
+    fn retain_canonical_desired(
+        &mut self,
+        group_fingerprint: [u8; 32],
+        group: &GtpuSessionGroup,
+    ) -> Result<(), GtpuSessionSelectorNamespaceError> {
+        let desired = canonical_desired_bytes(group);
+        if desired.is_empty() || desired.len() > MAX_CANONICAL_DESIRED_BYTES {
+            return Err(GtpuSessionSelectorNamespaceError::CapacityExhausted);
+        }
+        match self.canonical_desired.get(&group_fingerprint) {
+            Some(existing) if existing.as_slice() == desired.as_slice() => Ok(()),
+            Some(_) => Err(GtpuSessionSelectorNamespaceError::Indeterminate),
+            None if self.canonical_desired.len() < MAX_CANONICAL_DESIRED_RECORDS => {
+                self.canonical_desired
+                    .insert(group_fingerprint, Zeroizing::new(desired));
+                Ok(())
+            }
+            None => Err(GtpuSessionSelectorNamespaceError::CapacityExhausted),
+        }
+    }
+
+    fn canonical_group_for(&self, group_fingerprint: [u8; 32]) -> Option<GtpuSessionGroup> {
+        let desired = self.canonical_desired.get(&group_fingerprint)?;
+        let group = decode_canonical_desired(desired)?;
+        (canonical_desired_bytes(&group) == **desired).then_some(group)
+    }
+
+    fn operation_stamp_inventory(
+        &self,
+        binding: GtpuSessionSelectorBackendBinding,
+    ) -> Result<SelectorOperationStampInventory, GtpuSessionSelectorNamespaceError> {
+        if self.lifecycle != NamespaceLifecycle::Bound
+            || self.decommission_fence.is_some()
+            || self.groups.len() != self.canonical_desired.len()
+        {
+            return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+        }
+        let mut ordered = BTreeMap::new();
+        for (group_fingerprint, group_state) in &self.groups {
+            let group = self
+                .canonical_group_for(*group_fingerprint)
+                .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
+            let claim = CanonicalClaim::from_group(&group)
+                .with_key(&self.selector_digest_key)
+                .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
+            if claim.group_fingerprint != *group_fingerprint {
+                return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+            }
+            let (device_fingerprint, selector_set_fingerprint, desired_fingerprint, lifecycle) =
+                match group_state {
+                    GroupState::Installing {
+                        device,
+                        selectors,
+                        desired,
+                        generation,
+                        operation_nonce,
+                        terminal_generation,
+                        terminal_operation_nonce,
+                        backend_started,
+                        ..
+                    } => (
+                        *device,
+                        *selectors,
+                        *desired,
+                        SelectorOperationStampLifecycleExpectation::Installing {
+                            backend_started: *backend_started,
+                            pending: SelectorOperationStampCoordinate {
+                                generation: *generation,
+                                nonce: *operation_nonce,
+                            },
+                            terminal: SelectorOperationStampCoordinate {
+                                generation: *terminal_generation,
+                                nonce: *terminal_operation_nonce,
+                            },
+                        },
+                    ),
+                    GroupState::Active {
+                        device,
+                        selectors,
+                        desired,
+                        generation,
+                        operation_nonce,
+                        ..
+                    } => (
+                        *device,
+                        *selectors,
+                        *desired,
+                        SelectorOperationStampLifecycleExpectation::Active {
+                            terminal: SelectorOperationStampCoordinate {
+                                generation: *generation,
+                                nonce: *operation_nonce,
+                            },
+                        },
+                    ),
+                    GroupState::Retiring {
+                        device,
+                        selectors,
+                        desired,
+                        generation,
+                        operation_nonce,
+                        terminal_generation,
+                        terminal_operation_nonce,
+                        previous_terminal,
+                        backend_started,
+                        ..
+                    } => (
+                        *device,
+                        *selectors,
+                        *desired,
+                        SelectorOperationStampLifecycleExpectation::Retiring {
+                            backend_started: *backend_started,
+                            pending: SelectorOperationStampCoordinate {
+                                generation: *generation,
+                                nonce: *operation_nonce,
+                            },
+                            terminal: SelectorOperationStampCoordinate {
+                                generation: *terminal_generation,
+                                nonce: *terminal_operation_nonce,
+                            },
+                            previous_terminal: SelectorOperationStampCoordinate::from_authority(
+                                *previous_terminal,
+                            ),
+                        },
+                    ),
+                    GroupState::Retired {
+                        device,
+                        selectors,
+                        desired,
+                        generation,
+                        operation_nonce,
+                        retired_dataplane_generation,
+                        ..
+                    } => (
+                        *device,
+                        *selectors,
+                        *desired,
+                        SelectorOperationStampLifecycleExpectation::Retired {
+                            terminal: SelectorOperationStampCoordinate {
+                                generation: *generation,
+                                nonce: *operation_nonce,
+                            },
+                            retired_dataplane_generation: *retired_dataplane_generation,
+                        },
+                    ),
+                    GroupState::Poisoned(poison) => (
+                        poison.device,
+                        poison.selectors,
+                        poison.desired,
+                        SelectorOperationStampLifecycleExpectation::Poisoned {
+                            phase: poison.phase,
+                            reason: poison.reason.tag(),
+                            pending: SelectorOperationStampCoordinate {
+                                generation: poison.generation,
+                                nonce: poison.operation_nonce,
+                            },
+                            terminal: SelectorOperationStampCoordinate::from_authority(
+                                poison.terminal_generation,
+                            ),
+                            previous_terminal: poison
+                                .previous_terminal
+                                .map(SelectorOperationStampCoordinate::from_authority),
+                            retired_dataplane_generation: poison.retired_dataplane_generation,
+                        },
+                    ),
+                    // An old unit poison lacks the complete canonical
+                    // inventory authority and must never serve a Bound open.
+                    GroupState::LegacyPoisoned => {
+                        return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+                    }
+                };
+            if device_fingerprint != claim.device_fingerprint
+                || selector_set_fingerprint != claim.selector_set_fingerprint
+                || desired_fingerprint != claim.desired_fingerprint
+            {
+                return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+            }
+            let key = group.id().to_bytes();
+            ordered
+                .insert(
+                    key,
+                    SelectorOperationStampInventoryExpectation {
+                        group,
+                        device_fingerprint,
+                        group_fingerprint: *group_fingerprint,
+                        selector_set_fingerprint,
+                        desired_fingerprint,
+                        lifecycle,
+                    },
+                )
+                .is_none()
+                .then_some(())
+                .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        }
+        let expectations: Vec<_> = ordered.into_values().collect();
+        if expectations.len() > SELECTOR_NAMESPACE_MAX_STAMP_SLOTS {
+            return Err(GtpuSessionSelectorNamespaceError::CapacityExhausted);
+        }
+        let mut digest = Sha256::new();
+        digest.update(OPERATION_INVENTORY_DOMAIN);
+        update_receipt_binding(&mut digest, binding);
+        for expectation in &expectations {
+            digest.update(expectation.group.id().to_bytes());
+            digest.update(expectation.device_fingerprint);
+            digest.update(expectation.group_fingerprint);
+            digest.update(expectation.selector_set_fingerprint);
+            digest.update(expectation.desired_fingerprint);
+            update_inventory_lifecycle(&mut digest, expectation.lifecycle);
+        }
+        Ok(SelectorOperationStampInventory {
+            expectations,
+            summary: digest.finalize().into(),
+        })
     }
 
     fn reused_install_descriptor_is_exact(
@@ -6603,10 +7781,11 @@ impl NamespaceState {
 
     fn encode(&self) -> Vec<u8> {
         let mut output = Vec::new();
-        // OPCSN13 extends the legacy unit poison tags with a fixed, protected
-        // forensic record.  The record remains deliberately non-identifying:
-        // it contains only keyed commitments and authority coordinates.
-        output.extend_from_slice(b"OPCSN13");
+        // OPCSN15 retains the protected canonical desired index and every
+        // poisoned-retiring prior terminal coordinate needed for exact
+        // operation-stamp inventory reconstruction. Older schemas lack this
+        // authority and therefore fail closed on production open.
+        output.extend_from_slice(b"OPCSN15");
         output.push(match self.lifecycle {
             NamespaceLifecycle::Unprovisioned => 0,
             NamespaceLifecycle::Provisioned => 1,
@@ -6667,10 +7846,6 @@ impl NamespaceState {
                     output.extend_from_slice(group);
                     output.extend_from_slice(&generation.get().to_be_bytes());
                 }
-                // OPCSN13 retains a distinct terminal representation for an
-                // OPCSN12 poison whose missing authority fields cannot be
-                // truthfully synthesized during a read/encode cycle.
-                SelectorState::LegacyPoisoned => output.push(5),
             }
         }
         output.extend_from_slice(&(self.groups.len() as u32).to_be_bytes());
@@ -6818,6 +7993,16 @@ impl NamespaceState {
                 GroupState::LegacyPoisoned => output.push(5),
             }
         }
+        output.extend_from_slice(&(self.canonical_desired.len() as u32).to_be_bytes());
+        for (group, desired) in &self.canonical_desired {
+            output.extend_from_slice(group);
+            output.extend_from_slice(
+                &u16::try_from(desired.len())
+                    .unwrap_or(u16::MAX)
+                    .to_be_bytes(),
+            );
+            output.extend_from_slice(desired);
+        }
         output.extend_from_slice(&(self.published_atoms.len() as u32).to_be_bytes());
         for atom in &self.published_atoms {
             output.extend_from_slice(atom);
@@ -6835,11 +8020,7 @@ impl NamespaceState {
         }
         let mut cursor = 0_usize;
         let version = take(bytes, &mut cursor, 7)?;
-        let poison_records = match version {
-            b"OPCSN12" => false,
-            b"OPCSN13" => true,
-            _ => return None,
-        };
+        (version == b"OPCSN15").then_some(())?;
         let lifecycle = match *take(bytes, &mut cursor, 1)?.first()? {
             0 => NamespaceLifecycle::Unprovisioned,
             1 => NamespaceLifecycle::Provisioned,
@@ -6921,16 +8102,12 @@ impl NamespaceState {
                     }
                 }
                 3 => SelectorState::Retired,
-                4 if poison_records => SelectorState::Poisoned {
+                4 => SelectorState::Poisoned {
                     group: take_array(take(bytes, &mut cursor, 32)?)?,
                     generation: GtpuSessionSelectorAuthorityGeneration(NonZeroU64::new(
                         u64::from_be_bytes(take_array(take(bytes, &mut cursor, 8)?)?),
                     )?),
                 },
-                // OPCSN12 used a unit poison tag. It is retained only for
-                // backward decoding; canonical OPCSN13 never emits it.
-                4 => SelectorState::LegacyPoisoned,
-                5 if poison_records => SelectorState::LegacyPoisoned,
                 _ => return None,
             };
             selectors.insert(digest, state).is_none().then_some(())?;
@@ -6968,6 +8145,7 @@ impl NamespaceState {
                         let terminal_operation_nonce = take_array(take(bytes, &mut cursor, 16)?)?;
                         Some(
                             (terminal_operation_nonce != [0; 16]
+                                && terminal_operation_nonce != operation_nonce
                                 && terminal_generation.get() > generation.get())
                             .then_some(SelectorAuthorityCoordinate {
                                 generation: terminal_generation,
@@ -7148,17 +8326,33 @@ impl NamespaceState {
                         }
                     }
                 }
-                4 if poison_records => {
-                    GroupState::Poisoned(PoisonRecord::decode(bytes, &mut cursor)?)
-                }
-                // A legacy poison record cannot contain the authority data
-                // required for a new forensic record. It is terminal and
-                // remains unreadable by normal lifecycle code.
-                4 => GroupState::LegacyPoisoned,
-                5 if poison_records => GroupState::LegacyPoisoned,
+                4 => GroupState::Poisoned(PoisonRecord::decode(bytes, &mut cursor)?),
                 _ => return None,
             };
             groups.insert(digest, state).is_none().then_some(())?;
+        }
+        let canonical_desired_count =
+            u32::from_be_bytes(take_array(take(bytes, &mut cursor, 4)?)?) as usize;
+        if canonical_desired_count > MAX_CANONICAL_DESIRED_RECORDS {
+            return None;
+        }
+        let mut canonical_desired = BTreeMap::new();
+        let mut previous_canonical_group = None;
+        for _ in 0..canonical_desired_count {
+            let group = take_array(take(bytes, &mut cursor, 32)?)?;
+            if previous_canonical_group.is_some_and(|previous| previous >= group) {
+                return None;
+            }
+            previous_canonical_group = Some(group);
+            let length = u16::from_be_bytes(take_array(take(bytes, &mut cursor, 2)?)?) as usize;
+            if length == 0 || length > MAX_CANONICAL_DESIRED_BYTES {
+                return None;
+            }
+            let desired = take(bytes, &mut cursor, length)?.to_vec();
+            canonical_desired
+                .insert(group, Zeroizing::new(desired))
+                .is_none()
+                .then_some(())?;
         }
         let published_atom_count =
             u32::from_be_bytes(take_array(take(bytes, &mut cursor, 4)?)?) as usize;
@@ -7204,10 +8398,77 @@ impl NamespaceState {
             decommission_fence,
             selectors,
             groups,
+            canonical_desired,
             published_atoms,
             tombstones,
         };
         (cursor == bytes.len() && state.is_complete()).then_some(state)
+    }
+
+    fn canonical_desired_index_is_exact(&self) -> bool {
+        self.groups.iter().all(|(group_fingerprint, group_state)| {
+            if self
+                .canonical_desired
+                .get(group_fingerprint)
+                .is_none_or(|desired| {
+                    desired.is_empty() || desired.len() > MAX_CANONICAL_DESIRED_BYTES
+                })
+            {
+                return false;
+            }
+            let Some(group) = self.canonical_group_for(*group_fingerprint) else {
+                return false;
+            };
+            let Some(claim) =
+                CanonicalClaim::from_group(&group).with_key(&self.selector_digest_key)
+            else {
+                return false;
+            };
+            let (device, selectors, desired, atoms) = match group_state {
+                GroupState::Installing {
+                    device,
+                    selectors,
+                    desired,
+                    atoms,
+                    ..
+                }
+                | GroupState::Active {
+                    device,
+                    selectors,
+                    desired,
+                    atoms,
+                    ..
+                }
+                | GroupState::Retiring {
+                    device,
+                    selectors,
+                    desired,
+                    atoms,
+                    ..
+                }
+                | GroupState::Retired {
+                    device,
+                    selectors,
+                    desired,
+                    atoms,
+                    ..
+                } => (*device, *selectors, *desired, atoms),
+                GroupState::Poisoned(poison) => (
+                    poison.device,
+                    poison.selectors,
+                    poison.desired,
+                    &poison.atoms,
+                ),
+                GroupState::LegacyPoisoned => return false,
+            };
+            claim.group_fingerprint == *group_fingerprint
+                && claim.device_fingerprint == device
+                && claim.selector_set_fingerprint == selectors
+                && claim.desired_fingerprint == desired
+                && claim
+                    .selector_atoms(&self.selector_digest_key)
+                    .is_some_and(|expected_atoms| expected_atoms == *atoms)
+        })
     }
 
     fn is_complete(&self) -> bool {
@@ -7223,6 +8484,7 @@ impl NamespaceState {
             && self.decommission_fence.is_none()
             && self.selectors.is_empty()
             && self.groups.is_empty()
+            && self.canonical_desired.is_empty()
             && self.published_atoms.is_empty()
             && self.tombstones.is_empty();
         let initialized = self.stable_device.is_some()
@@ -7252,6 +8514,7 @@ impl NamespaceState {
             && self.decommission_fence.is_none()
             && self.selectors.is_empty()
             && self.groups.is_empty()
+            && self.canonical_desired.is_empty()
             && self.published_atoms.is_empty()
             && self.tombstones.is_empty();
         let lifecycle_complete = match self.lifecycle {
@@ -7311,6 +8574,7 @@ impl NamespaceState {
                         && !atoms.is_empty()
                         && *operation_nonce != [0; 16]
                         && *terminal_operation_nonce != [0; 16]
+                        && *operation_nonce != *terminal_operation_nonce
                         && generation.get() < terminal_generation.get()
                         && terminal_generation.get() <= self.generation
                         && reuse.as_ref().is_none_or(|descriptor| {
@@ -7337,6 +8601,7 @@ impl NamespaceState {
                         && !atoms.is_empty()
                         && *operation_nonce != [0; 16]
                         && *terminal_operation_nonce != [0; 16]
+                        && *operation_nonce != *terminal_operation_nonce
                         && previous_terminal.nonce != [0; 16]
                         && *activation_generation == previous_terminal.generation
                         && previous_terminal.generation.get() < generation.get()
@@ -7386,17 +8651,28 @@ impl NamespaceState {
                                     .is_some_and(|next| {
                                         next == poison.terminal_generation.generation.get()
                                     })
+                                    && poison.operation_nonce != poison.terminal_generation.nonce
                                     && poison.retired_dataplane_generation.is_none()
+                                    && if poison.phase == 2 {
+                                        poison.previous_terminal.is_some_and(|previous| {
+                                            previous.generation.get() < poison.generation.get()
+                                                && previous.nonce != poison.operation_nonce
+                                        })
+                                    } else {
+                                        poison.previous_terminal.is_none()
+                                    }
                             }
                             1 => {
                                 poison.generation == poison.terminal_generation.generation
                                     && poison.operation_nonce == poison.terminal_generation.nonce
                                     && poison.retired_dataplane_generation.is_none()
+                                    && poison.previous_terminal.is_none()
                             }
                             3 => {
                                 poison.generation == poison.terminal_generation.generation
                                     && poison.operation_nonce == poison.terminal_generation.nonce
                                     && poison.retired_dataplane_generation.is_some()
+                                    && poison.previous_terminal.is_none()
                             }
                             _ => false,
                         }
@@ -7409,10 +8685,12 @@ impl NamespaceState {
                 | SelectorState::Retiring { generation, .. } => generation.get() <= self.generation,
                 SelectorState::Retired => true,
                 SelectorState::Poisoned { generation, .. } => generation.get() <= self.generation,
-                SelectorState::LegacyPoisoned => true,
             })
             && self.capacity <= SELECTOR_NAMESPACE_MAX_READBACK_ATOMS as u32
             && self.groups.len() <= MAX_PERMANENT_GROUPS
+            && self.canonical_desired.len() <= MAX_CANONICAL_DESIRED_RECORDS
+            && self.canonical_desired.len() == self.groups.len()
+            && self.canonical_desired_index_is_exact()
             && self.live_group_count() <= MAX_LIVE_GROUPS
             && self.selectors.len() <= MAX_KNOWN_ATOMS
             && self.published_atoms.len() <= MAX_KNOWN_ATOMS
@@ -7508,7 +8786,6 @@ impl NamespaceState {
                         Some(GroupState::Poisoned(poison))
                             if poison.generation == *generation && poison.atoms.contains(digest)
                     ),
-                    SelectorState::LegacyPoisoned => true,
                 })
             && self
                 .published_atoms
@@ -7526,6 +8803,77 @@ impl NamespaceState {
     }
 }
 
+fn update_inventory_coordinate(digest: &mut Sha256, coordinate: SelectorOperationStampCoordinate) {
+    digest.update(coordinate.generation().get().to_be_bytes());
+    digest.update(coordinate.nonce());
+}
+
+fn update_inventory_lifecycle(
+    digest: &mut Sha256,
+    lifecycle: SelectorOperationStampLifecycleExpectation,
+) {
+    match lifecycle {
+        SelectorOperationStampLifecycleExpectation::Installing {
+            backend_started,
+            pending,
+            terminal,
+        } => {
+            digest.update([0, u8::from(backend_started)]);
+            update_inventory_coordinate(digest, pending);
+            update_inventory_coordinate(digest, terminal);
+        }
+        SelectorOperationStampLifecycleExpectation::Active { terminal } => {
+            digest.update([1]);
+            update_inventory_coordinate(digest, terminal);
+        }
+        SelectorOperationStampLifecycleExpectation::Retiring {
+            backend_started,
+            pending,
+            terminal,
+            previous_terminal,
+        } => {
+            digest.update([2, u8::from(backend_started)]);
+            update_inventory_coordinate(digest, pending);
+            update_inventory_coordinate(digest, terminal);
+            update_inventory_coordinate(digest, previous_terminal);
+        }
+        SelectorOperationStampLifecycleExpectation::Retired {
+            terminal,
+            retired_dataplane_generation,
+        } => {
+            digest.update([3]);
+            update_inventory_coordinate(digest, terminal);
+            digest.update(retired_dataplane_generation.get().to_be_bytes());
+        }
+        SelectorOperationStampLifecycleExpectation::Poisoned {
+            phase,
+            reason,
+            pending,
+            terminal,
+            previous_terminal,
+            retired_dataplane_generation,
+        } => {
+            digest.update([4, phase, reason]);
+            update_inventory_coordinate(digest, pending);
+            update_inventory_coordinate(digest, terminal);
+            match previous_terminal {
+                Some(coordinate) => {
+                    digest.update([1]);
+                    update_inventory_coordinate(digest, coordinate);
+                }
+                None => digest.update([0; 25]),
+            }
+            match retired_dataplane_generation {
+                Some(generation) => {
+                    digest.update([1]);
+                    digest.update(generation.get().to_be_bytes());
+                }
+                None => digest.update([0; 9]),
+            }
+        }
+    }
+}
+
 fn random_nonzero_nonce() -> Result<[u8; 16], GtpuSessionSelectorNamespaceError> {
     let mut nonce = [0_u8; 16];
     SysRng
@@ -7534,6 +8882,18 @@ fn random_nonzero_nonce() -> Result<[u8; 16], GtpuSessionSelectorNamespaceError>
     (nonce != [0; 16])
         .then_some(nonce)
         .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)
+}
+
+fn random_distinct_nonzero_nonce(
+    excluded: [u8; 16],
+) -> Result<[u8; 16], GtpuSessionSelectorNamespaceError> {
+    for _ in 0..4 {
+        let nonce = random_nonzero_nonce()?;
+        if nonce != excluded {
+            return Ok(nonce);
+        }
+    }
+    Err(GtpuSessionSelectorNamespaceError::Indeterminate)
 }
 
 #[cfg(test)]
@@ -7627,9 +8987,6 @@ enum SelectorState {
         group: [u8; 32],
         generation: GtpuSessionSelectorAuthorityGeneration,
     },
-    /// Backward-compatible decoding of OPCSN12's unit poison tag. New
-    /// records never emit this form and normal operations treat it terminal.
-    LegacyPoisoned,
 }
 
 #[derive(Clone)]
@@ -7704,8 +9061,10 @@ enum GroupState {
         successor: Option<RetiredSuccessor>,
     },
     Poisoned(PoisonRecord),
-    /// Backward-compatible decoding of OPCSN12's unit poison tag. It has no
-    /// recoverable authority metadata and is therefore terminal/fail-closed.
+    /// Terminal sentinel retained for the in-memory legacy-capacity model.
+    /// Current production decoding rejects pre-OPCSN15 schemas before a row
+    /// can reach this variant.
+    #[allow(dead_code)]
     LegacyPoisoned,
 }
 
@@ -7790,6 +9149,10 @@ struct PoisonRecord {
     generation: GtpuSessionSelectorAuthorityGeneration,
     operation_nonce: [u8; 16],
     terminal_generation: SelectorAuthorityCoordinate,
+    /// The still-authoritative Active stamp coordinate preserved when a
+    /// Retiring row becomes poisoned. The adapter needs this to enumerate
+    /// every exact stamp value that may remain under the permanent group key.
+    previous_terminal: Option<SelectorAuthorityCoordinate>,
     backend_started: bool,
     retired_dataplane_generation: Option<NonZeroU64>,
     reason: PoisonReason,
@@ -7814,6 +9177,14 @@ impl PoisonRecord {
         output.extend_from_slice(&self.operation_nonce);
         output.extend_from_slice(&self.terminal_generation.generation.get().to_be_bytes());
         output.extend_from_slice(&self.terminal_generation.nonce);
+        match self.previous_terminal {
+            None => output.push(0),
+            Some(previous_terminal) => {
+                output.push(1);
+                output.extend_from_slice(&previous_terminal.generation.get().to_be_bytes());
+                output.extend_from_slice(&previous_terminal.nonce);
+            }
+        }
         output.push(u8::from(self.backend_started));
         match self.retired_dataplane_generation {
             None => output.push(0),
@@ -7857,6 +9228,19 @@ impl PoisonRecord {
             nonce: take_array(take(bytes, cursor, 16)?)?,
         };
         (terminal_generation.nonce != [0; 16]).then_some(())?;
+        let previous_terminal = match *take(bytes, cursor, 1)?.first()? {
+            0 => None,
+            1 => Some(SelectorAuthorityCoordinate {
+                generation: GtpuSessionSelectorAuthorityGeneration(NonZeroU64::new(
+                    u64::from_be_bytes(take_array(take(bytes, cursor, 8)?)?),
+                )?),
+                nonce: take_array(take(bytes, cursor, 16)?)?,
+            }),
+            _ => return None,
+        };
+        previous_terminal
+            .is_none_or(|coordinate| coordinate.nonce != [0; 16])
+            .then_some(())?;
         let backend_started = match *take(bytes, cursor, 1)?.first()? {
             0 => false,
             1 => true,
@@ -7894,6 +9278,7 @@ impl PoisonRecord {
             generation,
             operation_nonce,
             terminal_generation,
+            previous_terminal,
             backend_started,
             retired_dataplane_generation,
             reason,
@@ -7912,17 +9297,28 @@ impl PoisonRecord {
                         .get()
                         .checked_add(1)
                         .is_some_and(|next| next == record.terminal_generation.generation.get())
+                        && record.operation_nonce != record.terminal_generation.nonce
                         && record.retired_dataplane_generation.is_none()
+                        && if record.phase == 2 {
+                            record.previous_terminal.is_some_and(|previous| {
+                                previous.generation.get() < record.generation.get()
+                                    && previous.nonce != record.operation_nonce
+                            })
+                        } else {
+                            record.previous_terminal.is_none()
+                        }
                 }
                 1 => {
                     record.generation == record.terminal_generation.generation
                         && record.operation_nonce == record.terminal_generation.nonce
                         && record.retired_dataplane_generation.is_none()
+                        && record.previous_terminal.is_none()
                 }
                 3 => {
                     record.generation == record.terminal_generation.generation
                         && record.operation_nonce == record.terminal_generation.nonce
                         && record.retired_dataplane_generation.is_some()
+                        && record.previous_terminal.is_none()
                 }
                 _ => false,
             })
@@ -7943,6 +9339,7 @@ impl PoisonRecord {
             generation,
             operation_nonce,
             terminal_generation,
+            previous_terminal,
             backend_started,
             retired_dataplane_generation,
         ) = match group {
@@ -7969,6 +9366,7 @@ impl PoisonRecord {
                     generation: terminal_generation,
                     nonce: terminal_operation_nonce,
                 },
+                None,
                 backend_started,
                 None,
             ),
@@ -7991,6 +9389,7 @@ impl PoisonRecord {
                     generation,
                     nonce: operation_nonce,
                 },
+                None,
                 true,
                 None,
             ),
@@ -8003,6 +9402,7 @@ impl PoisonRecord {
                 operation_nonce,
                 terminal_generation,
                 terminal_operation_nonce,
+                previous_terminal,
                 backend_started,
                 ..
             } => (
@@ -8017,6 +9417,7 @@ impl PoisonRecord {
                     generation: terminal_generation,
                     nonce: terminal_operation_nonce,
                 },
+                Some(previous_terminal),
                 backend_started,
                 None,
             ),
@@ -8041,12 +9442,13 @@ impl PoisonRecord {
                     generation,
                     nonce: operation_nonce,
                 },
+                None,
                 true,
                 Some(retired_dataplane_generation),
             ),
             GroupState::Poisoned(_) | GroupState::LegacyPoisoned => return None,
         };
-        Some(Self {
+        let record = Self {
             lifecycle,
             phase,
             device,
@@ -8056,11 +9458,15 @@ impl PoisonRecord {
             generation,
             operation_nonce,
             terminal_generation,
+            previous_terminal,
             backend_started,
             retired_dataplane_generation,
             reason,
             stamp_evidence: PoisonStampEvidence::NotObserved,
-        })
+        };
+        ((record.phase != 0 && record.phase != 2)
+            || record.operation_nonce != record.terminal_generation.nonce)
+            .then_some(record)
     }
 }
 
@@ -8553,6 +9959,154 @@ mod tests {
         .unwrap()
     }
 
+    fn test_backend_mutation_window() -> SelectorBackendMutationWindow {
+        SelectorBackendMutationWindow::mint(SELECTOR_NAMESPACE_MAX_LEASE_TTL)
+            .expect("test mutation window")
+    }
+
+    fn test_operation_stamp_inventory() -> SelectorOperationStampInventory {
+        SelectorOperationStampInventory {
+            expectations: Vec::new(),
+            summary: [0x5a; 32],
+        }
+    }
+
+    fn inventory_generation(value: u64) -> GtpuSessionSelectorAuthorityGeneration {
+        GtpuSessionSelectorAuthorityGeneration(NonZeroU64::new(value).expect("nonzero test"))
+    }
+
+    fn inventory_matrix_state(
+        device: u8,
+        teid_offset: u32,
+    ) -> (NamespaceState, GtpuSessionSelectorBackendBinding) {
+        let mut state = NamespaceState::default();
+        let stable_device = GtpuSessionDeviceId::new([device; 16]).expect("test device");
+        state
+            .bind_or_validate(
+                stable_device,
+                SELECTOR_NAMESPACE_MAX_READBACK_ATOMS,
+                Some([0x51; 32]),
+            )
+            .expect("bound test inventory state");
+        for (index, desired) in [
+            group(1, device, 0x1000_0001 + teid_offset, None),
+            group(2, device, 0x1000_0002 + teid_offset, None),
+            group(3, device, 0x1000_0003 + teid_offset, None),
+            group(4, device, 0x1000_0004 + teid_offset, None),
+            group(5, device, 0x1000_0005 + teid_offset, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let claim = CanonicalClaim::from_group(&desired)
+                .with_key(&state.selector_digest_key)
+                .expect("canonical matrix claim");
+            let atoms = claim
+                .selector_atoms(&state.selector_digest_key)
+                .expect("matrix selector atoms");
+            state
+                .retain_canonical_desired(claim.group_fingerprint, &desired)
+                .expect("matrix canonical desired");
+            let group = match index {
+                0 => GroupState::Installing {
+                    device: claim.device_fingerprint,
+                    selectors: claim.selector_set_fingerprint,
+                    desired: claim.desired_fingerprint,
+                    atoms,
+                    generation: inventory_generation(1),
+                    operation_nonce: [0x11; 16],
+                    terminal_generation: inventory_generation(2),
+                    terminal_operation_nonce: [0x12; 16],
+                    backend_started: true,
+                    reuse: None,
+                },
+                1 => GroupState::Active {
+                    device: claim.device_fingerprint,
+                    selectors: claim.selector_set_fingerprint,
+                    desired: claim.desired_fingerprint,
+                    atoms,
+                    generation: inventory_generation(3),
+                    operation_nonce: [0x13; 16],
+                },
+                2 => GroupState::Retiring {
+                    device: claim.device_fingerprint,
+                    selectors: claim.selector_set_fingerprint,
+                    desired: claim.desired_fingerprint,
+                    atoms,
+                    generation: inventory_generation(5),
+                    operation_nonce: [0x15; 16],
+                    terminal_generation: inventory_generation(6),
+                    terminal_operation_nonce: [0x16; 16],
+                    activation_generation: inventory_generation(4),
+                    previous_terminal: SelectorAuthorityCoordinate {
+                        generation: inventory_generation(4),
+                        nonce: [0x14; 16],
+                    },
+                    backend_started: false,
+                },
+                3 => GroupState::Retired {
+                    device: claim.device_fingerprint,
+                    selectors: claim.selector_set_fingerprint,
+                    desired: claim.desired_fingerprint,
+                    atoms,
+                    activation_generation: inventory_generation(7),
+                    generation: inventory_generation(8),
+                    operation_nonce: [0x18; 16],
+                    retired_dataplane_generation: NonZeroU64::new(9).expect("nonzero test"),
+                    successor: None,
+                },
+                4 => GroupState::Poisoned(PoisonRecord {
+                    lifecycle: NamespaceLifecycle::Bound,
+                    phase: 2,
+                    device: claim.device_fingerprint,
+                    selectors: claim.selector_set_fingerprint,
+                    desired: claim.desired_fingerprint,
+                    atoms,
+                    generation: inventory_generation(10),
+                    operation_nonce: [0x1a; 16],
+                    terminal_generation: SelectorAuthorityCoordinate {
+                        generation: inventory_generation(11),
+                        nonce: [0x1b; 16],
+                    },
+                    previous_terminal: Some(SelectorAuthorityCoordinate {
+                        generation: inventory_generation(9),
+                        nonce: [0x19; 16],
+                    }),
+                    backend_started: true,
+                    retired_dataplane_generation: None,
+                    reason: PoisonReason::RemovalReadbackIndeterminate,
+                    stamp_evidence: PoisonStampEvidence::NotObserved,
+                }),
+                _ => unreachable!("five matrix lifecycles"),
+            };
+            state.groups.insert(claim.group_fingerprint, group);
+        }
+        state.generation = 11;
+        let binding = state
+            .binding_with_scope(test_storage_scope_commitment(&[0x51; 32]))
+            .expect("matrix binding");
+        (state, binding)
+    }
+
+    fn assert_inventory_receipt_binding_changes(
+        binding: GtpuSessionSelectorBackendBinding,
+        baseline: &SelectorOperationStampInventory,
+        changed_binding: GtpuSessionSelectorBackendBinding,
+        changed: &SelectorOperationStampInventory,
+    ) {
+        assert_ne!(baseline.summary(), changed.summary());
+        let window = test_backend_mutation_window();
+        assert_ne!(
+            SelectorBackendReceiptCoordinate::for_binding_inventory(binding, baseline, &window).0,
+            SelectorBackendReceiptCoordinate::for_binding_inventory(
+                changed_binding,
+                changed,
+                &window,
+            )
+            .0
+        );
+    }
+
     async fn production_authority(
         device_id: GtpuSessionDeviceId,
     ) -> GtpuSessionSelectorNamespaceAuthority<SqliteSessionBackend> {
@@ -8653,13 +10207,18 @@ mod tests {
         removal_ack_lost: std::sync::atomic::AtomicBool,
         terminal_inspect_fault: std::sync::atomic::AtomicBool,
         terminal_inspect_delay_millis: std::sync::atomic::AtomicU64,
+        no_effect_inspection_delay_millis: std::sync::atomic::AtomicU64,
+        hold_no_effect_inspection: std::sync::atomic::AtomicBool,
+        no_effect_inspection_entered: tokio::sync::Notify,
+        no_effect_inspection_release: tokio::sync::Notify,
+        installing_no_effect_inspection_calls: std::sync::atomic::AtomicUsize,
+        retiring_no_effect_inspection_calls: std::sync::atomic::AtomicUsize,
         effect_calls: std::sync::atomic::AtomicUsize,
         reused_effect_calls: std::sync::atomic::AtomicUsize,
         provision_calls: std::sync::atomic::AtomicUsize,
         removal_calls: std::sync::atomic::AtomicUsize,
         terminal_retired_readback_mode: std::sync::atomic::AtomicU8,
         dataplane: std::sync::Mutex<FaultingSelectorDataplaneState>,
-        no_effect_barrier: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
         terminal_fence: std::sync::Mutex<Option<[u8; DECOMMISSION_CAPSULE_LEN]>>,
         terminal_operations: std::sync::Mutex<Vec<TerminalFenceOperation>>,
     }
@@ -8689,31 +10248,63 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
 
+        fn set_no_effect_inspection_delay(&self, delay: Duration) {
+            self.no_effect_inspection_delay_millis.store(
+                u64::try_from(delay.as_millis()).expect("test delay fits u64"),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+
+        fn hold_no_effect_inspection(&self) {
+            self.hold_no_effect_inspection
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        async fn wait_for_no_effect_inspection_entry(&self) {
+            self.no_effect_inspection_entered.notified().await;
+        }
+
+        fn release_no_effect_inspection(&self) {
+            self.hold_no_effect_inspection
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.no_effect_inspection_release.notify_one();
+        }
+
+        async fn wait_for_no_effect_inspection_hold(&self) {
+            self.no_effect_inspection_entered.notify_one();
+            if self
+                .hold_no_effect_inspection
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.no_effect_inspection_release.notified().await;
+            }
+        }
+
         fn set_dataplane(&self, state: FaultingSelectorDataplaneState) {
             *self.dataplane.lock().expect("faulting dataplane lock") = state;
         }
 
-        fn synchronize_no_effect_inspections(&self, participants: usize) {
-            *self
-                .no_effect_barrier
-                .lock()
-                .expect("faulting no-effect barrier lock") =
-                Some(Arc::new(tokio::sync::Barrier::new(participants)));
-        }
-
-        async fn wait_for_no_effect_inspection_peer(&self) {
-            let barrier = self
-                .no_effect_barrier
-                .lock()
-                .expect("faulting no-effect barrier lock")
-                .clone();
-            if let Some(barrier) = barrier {
-                barrier.wait().await;
+        async fn wait_for_no_effect_inspection_delay(&self) {
+            let millis = self
+                .no_effect_inspection_delay_millis
+                .load(std::sync::atomic::Ordering::Acquire);
+            if millis != 0 {
+                tokio::time::sleep(Duration::from_millis(millis)).await;
             }
         }
 
         fn effect_calls(&self) -> usize {
             self.effect_calls.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn installing_no_effect_inspection_calls(&self) -> usize {
+            self.installing_no_effect_inspection_calls
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn retiring_no_effect_inspection_calls(&self) -> usize {
+            self.retiring_no_effect_inspection_calls
+                .load(std::sync::atomic::Ordering::Acquire)
         }
 
         fn reused_effect_calls(&self) -> usize {
@@ -8834,6 +10425,11 @@ mod tests {
             &self,
             lease: GtpuSessionSelectorBindingLease,
         ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+            if !lease.is_current() {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_binding_window",
+                });
+            }
             Ok(lease.confirm())
         }
 
@@ -8841,6 +10437,11 @@ mod tests {
             &self,
             request: GtpuSessionSelectorProvisionRequest,
         ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+            if !request.is_current() {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_provision_window",
+                });
+            }
             self.provision_calls
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             Ok(request.confirm())
@@ -8848,23 +10449,38 @@ mod tests {
 
         async fn inspect_installing_selector_no_effect(
             &self,
-            _expected: &GtpuSessionGroup,
-            _admission: &GtpuSessionSelectorAdmission,
-        ) -> Result<crate::GtpuSessionSelectorInstallRecovery, crate::GtpuError> {
-            self.wait_for_no_effect_inspection_peer().await;
-            matches!(
-                &*self
-                    .dataplane
+            request: GtpuSessionSelectorInstallingNoEffectRequest,
+        ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+            self.installing_no_effect_inspection_calls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.wait_for_no_effect_inspection_hold().await;
+            self.wait_for_no_effect_inspection_delay().await;
+            let dataplane =
+                self.dataplane
                     .lock()
                     .map_err(|_| crate::GtpuError::StateIndeterminate {
                         operation: "faulting_selector_dataplane_lock",
-                    })?,
-                FaultingSelectorDataplaneState::NoEffect
-            )
-            .then_some(crate::GtpuSessionSelectorInstallRecovery::NoEffect)
-            .ok_or(crate::GtpuError::StateIndeterminate {
-                operation: "faulting_selector_install_negative_proof",
-            })
+                    })?;
+            if !request.is_current() {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_install_negative_window",
+                });
+            }
+            if !matches!(&*dataplane, FaultingSelectorDataplaneState::NoEffect) {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_install_negative_proof",
+                });
+            }
+            if !request.is_current() {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_install_negative_window",
+                });
+            }
+            request
+                .confirm()
+                .ok_or(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_install_negative_window",
+                })
         }
 
         async fn inspect_installing_selector_resume(
@@ -8892,23 +10508,41 @@ mod tests {
 
         async fn inspect_retiring_selector_no_effect(
             &self,
-            expected: &GtpuSessionGroup,
-            _admission: &GtpuSessionSelectorAdmission,
-        ) -> Result<crate::GtpuSessionSelectorRetiringRecovery, crate::GtpuError> {
-            self.wait_for_no_effect_inspection_peer().await;
-            matches!(
-                &*self
-                    .dataplane
+            request: GtpuSessionSelectorRetiringNoEffectRequest,
+        ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+            self.retiring_no_effect_inspection_calls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.wait_for_no_effect_inspection_hold().await;
+            self.wait_for_no_effect_inspection_delay().await;
+            let dataplane =
+                self.dataplane
                     .lock()
                     .map_err(|_| crate::GtpuError::StateIndeterminate {
                         operation: "faulting_selector_dataplane_lock",
-                    })?,
-                FaultingSelectorDataplaneState::Active(active) if active == expected
-            )
-            .then_some(crate::GtpuSessionSelectorRetiringRecovery::ExactPreviousActive)
-            .ok_or(crate::GtpuError::StateIndeterminate {
-                operation: "faulting_selector_retiring_negative_proof",
-            })
+                    })?;
+            if !request.is_current() {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_retiring_negative_window",
+                });
+            }
+            if !matches!(
+                &*dataplane,
+                FaultingSelectorDataplaneState::Active(active) if active == request.expected_group()
+            ) {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_retiring_negative_proof",
+                });
+            }
+            if !request.is_current() {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_retiring_negative_window",
+                });
+            }
+            request
+                .confirm()
+                .ok_or(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_retiring_negative_window",
+                })
         }
 
         async fn inspect_retiring_selector_resume(
@@ -8938,6 +10572,11 @@ mod tests {
             &self,
             request: GtpuSessionSelectorReuseRequest,
         ) -> Result<GtpuSessionSelectorReuseReceipt, crate::GtpuError> {
+            if !request.is_current() {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_reuse_window",
+                });
+            }
             let stamp = Self::terminal_retired_stamp(&request.retired.admission);
             request
                 .verifies_exact_terminal_retired_stamp(&stamp)
@@ -8963,6 +10602,11 @@ mod tests {
             {
                 return Err(crate::GtpuError::StateIndeterminate {
                     operation: "faulting_selector_terminal_inspection",
+                });
+            }
+            if !request.is_current() {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_terminal_inspection_window",
                 });
             }
             let expected = request.expected_terminal_marker_payload();
@@ -9001,6 +10645,11 @@ mod tests {
             &self,
             request: GtpuSessionSelectorDecommissionRequest,
         ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+            if !request.is_current() {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_terminal_create_window",
+                });
+            }
             let expected = request.terminal_marker_payload();
             let mut stored =
                 self.terminal_fence
@@ -9030,6 +10679,11 @@ mod tests {
             &self,
             request: GtpuSessionSelectorDecommissionReadbackRequest,
         ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+            if !request.is_current() {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_terminal_readback_window",
+                });
+            }
             let expected = request.terminal_marker_payload();
             let stored =
                 *self
@@ -9055,6 +10709,11 @@ mod tests {
             &self,
             request: GtpuSessionSelectorEffectRequest,
         ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+            if !request.is_current() {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_effect_window",
+                });
+            }
             let desired = request.desired_group().clone();
             if request.request.selector_provenance().is_some() {
                 self.reused_effect_calls
@@ -9090,6 +10749,11 @@ mod tests {
             &self,
             request: GtpuSessionSelectorReadbackRequest,
         ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+            if !request.is_current() {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_readback_window",
+                });
+            }
             let expected = request.expected_group().clone();
             let readback = self.dataplane_readback(&expected)?;
             if matches!(
@@ -9120,6 +10784,11 @@ mod tests {
             &self,
             request: GtpuSessionSelectorRemovalRequest,
         ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+            if !request.is_current() {
+                return Err(crate::GtpuError::StateIndeterminate {
+                    operation: "faulting_selector_removal_window",
+                });
+            }
             let expected = request.expected_group().clone();
             self.removal_calls
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -9212,6 +10881,57 @@ mod tests {
     }
 
     #[test]
+    fn pending_admission_constructor_rejects_aliased_nonces() {
+        let namespace = InMemoryGtpuSessionSelectorNamespace::new([0x53; 32]);
+        let admission = namespace
+            .claim(&group(1, 1, 0x1000_0001, None), None)
+            .unwrap();
+        let active = SelectorAuthorityCoordinate {
+            generation: admission.generation(),
+            nonce: admission.operation_nonce(),
+        };
+        let installing_generation = GtpuSessionSelectorAuthorityGeneration(
+            NonZeroU64::new(admission.generation().get() + 1).unwrap(),
+        );
+        let installing_nonce = [0x61; 16];
+        assert!(matches!(
+            admission.with_coordinates(
+                installing_generation,
+                installing_nonce,
+                SelectorAuthorityCoordinate {
+                    generation: GtpuSessionSelectorAuthorityGeneration(
+                        NonZeroU64::new(installing_generation.get() + 1).unwrap(),
+                    ),
+                    nonce: installing_nonce,
+                },
+                None,
+                SelectorAdmissionPhase::Installing,
+            ),
+            Err(GtpuSessionSelectorNamespaceError::Indeterminate)
+        ));
+
+        let retiring_generation = GtpuSessionSelectorAuthorityGeneration(
+            NonZeroU64::new(installing_generation.get() + 1).unwrap(),
+        );
+        let retiring_nonce = [0x62; 16];
+        assert!(matches!(
+            admission.with_coordinates(
+                retiring_generation,
+                retiring_nonce,
+                SelectorAuthorityCoordinate {
+                    generation: GtpuSessionSelectorAuthorityGeneration(
+                        NonZeroU64::new(retiring_generation.get() + 1).unwrap(),
+                    ),
+                    nonce: retiring_nonce,
+                },
+                Some(active),
+                SelectorAdmissionPhase::Retiring,
+            ),
+            Err(GtpuSessionSelectorNamespaceError::Indeterminate)
+        ));
+    }
+
+    #[test]
     fn backend_receipts_are_bound_to_the_exact_consumed_request() {
         let first_namespace = InMemoryGtpuSessionSelectorNamespace::new([0x53; 32]);
         let second_namespace = InMemoryGtpuSessionSelectorNamespace::new([0x54; 32]);
@@ -9244,10 +10964,12 @@ mod tests {
 
         let first_request = GtpuSessionSelectorEffectRequest {
             request: GtpuSessionGroupReconcileRequest::new(first, first_admission).unwrap(),
+            window: test_backend_mutation_window(),
         };
         let expected = first_request.receipt_coordinate();
         let second_request = GtpuSessionSelectorEffectRequest {
             request: GtpuSessionGroupReconcileRequest::new(second, second_admission).unwrap(),
+            window: test_backend_mutation_window(),
         };
         let swapped = second_request.complete(GtpuSessionGroupReconcileOutcome::Activated);
         assert!(swapped.into_effect(expected).is_none());
@@ -9259,15 +10981,20 @@ mod tests {
         let mutated_receipt = GtpuSessionSelectorBackendReceipt::effect(
             expected,
             GtpuSessionGroupReconcileOutcome::Activated,
+            test_backend_mutation_window().into_receipt(),
         );
         assert!(mutated_receipt.into_effect(mutated).is_none());
 
         let first_lease = GtpuSessionSelectorBindingLease {
             binding: first_binding,
+            inventory: test_operation_stamp_inventory(),
+            window: test_backend_mutation_window(),
         };
         let expected_binding = first_lease.receipt_coordinate();
         let wrong_binding = GtpuSessionSelectorBindingLease {
             binding: second_binding,
+            inventory: test_operation_stamp_inventory(),
+            window: test_backend_mutation_window(),
         }
         .confirm();
         assert!(!wrong_binding.confirms_binding(expected_binding));
@@ -9287,10 +11014,12 @@ mod tests {
 
         let provision = GtpuSessionSelectorProvisionRequest {
             binding: first_binding,
+            window: test_backend_mutation_window(),
         };
         let expected_provision = provision.receipt_coordinate();
         let cross_provision = GtpuSessionSelectorProvisionRequest {
             binding: second_binding,
+            window: test_backend_mutation_window(),
         }
         .confirm();
         assert!(!cross_provision.confirms_provisioning(expected_provision));
@@ -9301,11 +11030,13 @@ mod tests {
         let readback = GtpuSessionSelectorReadbackRequest {
             expected: first_group.clone(),
             admission: first_admission,
+            window: test_backend_mutation_window(),
         };
         let expected_readback = readback.receipt_coordinate();
         let cross_readback = GtpuSessionSelectorReadbackRequest {
             expected: second_group.clone(),
             admission: second_admission,
+            window: test_backend_mutation_window(),
         }
         .complete(crate::GtpuSessionGroupReadback::Active(second_group));
         assert!(cross_readback.into_readback(expected_readback).is_none());
@@ -9351,11 +11082,13 @@ mod tests {
         let first_removal = GtpuSessionSelectorRemovalRequest {
             expected: first_remove_group,
             admission: retiring(first_active, 0x71),
+            window: test_backend_mutation_window(),
         };
         let expected_removal = first_removal.receipt_coordinate();
         let cross_removal = GtpuSessionSelectorRemovalRequest {
             expected: second_remove_group,
             admission: retiring(second_active, 0x73),
+            window: test_backend_mutation_window(),
         }
         .complete(GtpuSessionGroupRemovalOutcome::Removed);
         assert!(cross_removal.into_removal(expected_removal).is_none());
@@ -9379,11 +11112,13 @@ mod tests {
         let inspect = GtpuSessionSelectorDecommissionInspectRequest {
             binding: first_binding,
             expected_fence: None,
+            window: test_backend_mutation_window(),
         };
         let expected_inspection = inspect.receipt_coordinate();
         let cross_inspection = GtpuSessionSelectorDecommissionInspectRequest {
             binding: second_binding,
             expected_fence: None,
+            window: test_backend_mutation_window(),
         }
         .confirm_absent();
         assert!(!cross_inspection.confirms_decommission_fence_absent(expected_inspection));
@@ -9394,11 +11129,13 @@ mod tests {
         let create = GtpuSessionSelectorDecommissionRequest {
             binding: first_binding,
             fence,
+            window: test_backend_mutation_window(),
         };
         let expected_create = create.receipt_coordinate();
         let wrong_class = GtpuSessionSelectorDecommissionReadbackRequest {
             binding: first_binding,
             fence,
+            window: test_backend_mutation_window(),
         }
         .confirm_exact();
         assert!(!wrong_class.confirms_decommission_fence_exact(expected_create));
@@ -9409,6 +11146,7 @@ mod tests {
         let readback = GtpuSessionSelectorDecommissionReadbackRequest {
             binding: first_binding,
             fence,
+            window: test_backend_mutation_window(),
         };
         let expected_fence_readback = readback.receipt_coordinate();
         let wrong_fence = DecommissionFence {
@@ -9418,12 +11156,229 @@ mod tests {
         let cross_fence = GtpuSessionSelectorDecommissionReadbackRequest {
             binding: first_binding,
             fence: wrong_fence,
+            window: test_backend_mutation_window(),
         }
         .confirm_exact();
         assert!(!cross_fence.confirms_decommission_fence_exact(expected_fence_readback));
         assert!(readback
             .confirm_exact()
             .confirms_decommission_fence_exact(expected_fence_readback));
+    }
+
+    #[test]
+    fn operation_stamp_inventory_preserves_every_lifecycle_expectation_exactly() {
+        let (state, binding) = inventory_matrix_state(1, 0);
+        let inventory = state.operation_stamp_inventory(binding).unwrap();
+        let expectations = inventory.expectations();
+        assert_eq!(expectations.len(), 5);
+        assert_eq!(
+            expectations
+                .iter()
+                .map(|expectation| expectation.group().id().to_bytes())
+                .collect::<Vec<_>>(),
+            vec![[1; 16], [2; 16], [3; 16], [4; 16], [5; 16]],
+        );
+        for (index, expectation) in expectations.iter().enumerate() {
+            let expected_group = group((index + 1) as u8, 1, 0x1000_0001 + index as u32, None);
+            let claim = CanonicalClaim::from_group(&expected_group)
+                .with_key(&state.selector_digest_key)
+                .unwrap();
+            assert_eq!(expectation.group(), &expected_group);
+            assert_eq!(expectation.device_fingerprint(), claim.device_fingerprint);
+            assert_eq!(expectation.group_fingerprint(), claim.group_fingerprint);
+            assert_eq!(
+                expectation.selector_set_fingerprint(),
+                claim.selector_set_fingerprint
+            );
+            assert_eq!(expectation.desired_fingerprint(), claim.desired_fingerprint);
+        }
+        let installing = expectations[0].lifecycle();
+        assert_eq!(
+            installing.kind(),
+            SelectorOperationStampLifecycleKind::Installing
+        );
+        assert_eq!(installing.backend_started(), Some(true));
+        assert_eq!(installing.pending().unwrap().generation().get(), 1);
+        assert_eq!(installing.pending().unwrap().nonce(), [0x11; 16]);
+        assert_eq!(installing.terminal().generation().get(), 2);
+        assert_eq!(installing.terminal().nonce(), [0x12; 16]);
+        assert_eq!(installing.previous_terminal(), None);
+        assert_eq!(installing.retired_dataplane_generation(), None);
+
+        let active = expectations[1].lifecycle();
+        assert_eq!(active.kind(), SelectorOperationStampLifecycleKind::Active);
+        assert_eq!(active.backend_started(), None);
+        assert_eq!(active.pending(), None);
+        assert_eq!(active.terminal().generation().get(), 3);
+        assert_eq!(active.terminal().nonce(), [0x13; 16]);
+
+        let retiring = expectations[2].lifecycle();
+        assert_eq!(
+            retiring.kind(),
+            SelectorOperationStampLifecycleKind::Retiring
+        );
+        assert_eq!(retiring.backend_started(), Some(false));
+        assert_eq!(retiring.pending().unwrap().generation().get(), 5);
+        assert_eq!(retiring.pending().unwrap().nonce(), [0x15; 16]);
+        assert_eq!(retiring.terminal().generation().get(), 6);
+        assert_eq!(retiring.terminal().nonce(), [0x16; 16]);
+        assert_eq!(retiring.previous_terminal().unwrap().generation().get(), 4);
+        assert_eq!(retiring.previous_terminal().unwrap().nonce(), [0x14; 16]);
+        assert_eq!(retiring.retired_dataplane_generation(), None);
+
+        let retired = expectations[3].lifecycle();
+        assert_eq!(retired.kind(), SelectorOperationStampLifecycleKind::Retired);
+        assert_eq!(retired.pending(), None);
+        assert_eq!(retired.terminal().generation().get(), 8);
+        assert_eq!(retired.terminal().nonce(), [0x18; 16]);
+        assert_eq!(retired.retired_dataplane_generation().unwrap().get(), 9);
+
+        let poisoned = expectations[4].lifecycle();
+        assert_eq!(
+            poisoned.kind(),
+            SelectorOperationStampLifecycleKind::Poisoned
+        );
+        assert_eq!(poisoned.poison_phase(), Some(2));
+        assert_eq!(
+            poisoned.poison_reason(),
+            Some(PoisonReason::RemovalReadbackIndeterminate.tag())
+        );
+        assert_eq!(poisoned.pending().unwrap().generation().get(), 10);
+        assert_eq!(poisoned.pending().unwrap().nonce(), [0x1a; 16]);
+        assert_eq!(poisoned.terminal().generation().get(), 11);
+        assert_eq!(poisoned.terminal().nonce(), [0x1b; 16]);
+        assert_eq!(poisoned.previous_terminal().unwrap().generation().get(), 9);
+        assert_eq!(poisoned.previous_terminal().unwrap().nonce(), [0x19; 16]);
+        assert_eq!(poisoned.retired_dataplane_generation(), None);
+    }
+
+    #[test]
+    fn operation_stamp_inventory_rejects_duplicate_group_id_map_keys() {
+        let (mut state, binding) = inventory_matrix_state(1, 0);
+        let replaced = group(2, 1, 0x1000_0002, None);
+        let replaced_claim = CanonicalClaim::from_group(&replaced)
+            .with_key(&state.selector_digest_key)
+            .unwrap();
+        let duplicate = group(1, 2, 0x1000_1002, None);
+        let duplicate_claim = CanonicalClaim::from_group(&duplicate)
+            .with_key(&state.selector_digest_key)
+            .unwrap();
+        let duplicate_atoms = duplicate_claim
+            .selector_atoms(&state.selector_digest_key)
+            .unwrap();
+        state.groups.remove(&replaced_claim.group_fingerprint);
+        state
+            .canonical_desired
+            .remove(&replaced_claim.group_fingerprint);
+        state
+            .retain_canonical_desired(duplicate_claim.group_fingerprint, &duplicate)
+            .unwrap();
+        state.groups.insert(
+            duplicate_claim.group_fingerprint,
+            GroupState::Active {
+                device: duplicate_claim.device_fingerprint,
+                selectors: duplicate_claim.selector_set_fingerprint,
+                desired: duplicate_claim.desired_fingerprint,
+                atoms: duplicate_atoms,
+                generation: inventory_generation(3),
+                operation_nonce: [0x13; 16],
+            },
+        );
+        assert!(matches!(
+            state.operation_stamp_inventory(binding),
+            Err(GtpuSessionSelectorNamespaceError::Indeterminate)
+        ));
+    }
+
+    #[test]
+    fn operation_inventory_and_binding_receipts_commit_all_protected_inputs() {
+        let (state, binding) = inventory_matrix_state(1, 0);
+        let baseline = state.operation_stamp_inventory(binding).unwrap();
+
+        let mut changed_generation = state.clone();
+        let installing = CanonicalClaim::from_group(&group(1, 1, 0x1000_0001, None))
+            .with_key(&changed_generation.selector_digest_key)
+            .unwrap();
+        let Some(GroupState::Installing {
+            generation,
+            terminal_generation,
+            ..
+        }) = changed_generation
+            .groups
+            .get_mut(&installing.group_fingerprint)
+        else {
+            panic!("matrix installing row");
+        };
+        *generation = inventory_generation(12);
+        *terminal_generation = inventory_generation(13);
+        changed_generation.generation = 13;
+        let changed = changed_generation
+            .operation_stamp_inventory(binding)
+            .unwrap();
+        assert_inventory_receipt_binding_changes(binding, &baseline, binding, &changed);
+
+        let mut changed_canonical = state.clone();
+        let original = group(1, 1, 0x1000_0001, None);
+        let mut context = original.entries()[0].context().clone();
+        context.peer_teid = Teid::new(0x2000_0001).unwrap();
+        let changed_group = GtpuSessionGroup::new(
+            original.id(),
+            original.device_id(),
+            vec![
+                GtpuSessionEntry::new(context, original.entries()[0].local_outer_address())
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let changed_claim = CanonicalClaim::from_group(&changed_group)
+            .with_key(&changed_canonical.selector_digest_key)
+            .unwrap();
+        assert_eq!(
+            changed_claim.group_fingerprint,
+            installing.group_fingerprint
+        );
+        changed_canonical.canonical_desired.insert(
+            changed_claim.group_fingerprint,
+            Zeroizing::new(canonical_desired_bytes(&changed_group)),
+        );
+        let Some(GroupState::Installing { desired, .. }) = changed_canonical
+            .groups
+            .get_mut(&changed_claim.group_fingerprint)
+        else {
+            panic!("matrix canonical desired row");
+        };
+        *desired = changed_claim.desired_fingerprint;
+        let changed = changed_canonical
+            .operation_stamp_inventory(binding)
+            .unwrap();
+        assert_inventory_receipt_binding_changes(binding, &baseline, binding, &changed);
+
+        let (changed_device_state, changed_device_binding) = inventory_matrix_state(2, 0);
+        let changed = changed_device_state
+            .operation_stamp_inventory(changed_device_binding)
+            .unwrap();
+        assert_inventory_receipt_binding_changes(
+            binding,
+            &baseline,
+            changed_device_binding,
+            &changed,
+        );
+
+        let (changed_selector_state, changed_selector_binding) = inventory_matrix_state(1, 0x100);
+        let changed = changed_selector_state
+            .operation_stamp_inventory(changed_selector_binding)
+            .unwrap();
+        assert_inventory_receipt_binding_changes(
+            binding,
+            &baseline,
+            changed_selector_binding,
+            &changed,
+        );
+
+        let mut changed_binding = binding;
+        changed_binding.backend_epoch[0] ^= 1;
+        let changed = state.operation_stamp_inventory(changed_binding).unwrap();
+        assert_inventory_receipt_binding_changes(binding, &baseline, changed_binding, &changed);
     }
 
     #[test]
@@ -9454,6 +11409,94 @@ mod tests {
                 .get(),
             4
         );
+    }
+
+    #[test]
+    fn model_claim_applies_the_same_permanent_capacity_preflight_as_production() {
+        let namespace = InMemoryGtpuSessionSelectorNamespace::default();
+        let desired = group(1, 1, 0x1000_0001, None);
+        {
+            let mut state = namespace.state.lock().expect("model state lock");
+            state
+                .bind_or_validate(
+                    desired.device_id(),
+                    SELECTOR_NAMESPACE_MAX_READBACK_ATOMS,
+                    Some(namespace.key),
+                )
+                .unwrap();
+            for index in 0..MAX_PERMANENT_GROUPS {
+                let mut fingerprint = [0_u8; 32];
+                fingerprint[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                state.groups.insert(fingerprint, GroupState::LegacyPoisoned);
+            }
+        }
+
+        assert!(matches!(
+            namespace.claim(&desired, None),
+            Err(GtpuSessionSelectorNamespaceError::CapacityExhausted)
+        ));
+        let state = namespace.state.lock().expect("model state lock");
+        assert_eq!(state.groups.len(), MAX_PERMANENT_GROUPS);
+        assert_eq!(state.generation, 0, "capacity failure must not mint state");
+    }
+
+    #[test]
+    fn model_reissue_rejects_missing_or_malformed_predecessor_tombstones() {
+        for malformed in [false, true] {
+            let namespace = InMemoryGtpuSessionSelectorNamespace::default();
+            let original = group(1, 1, 0x1000_0001, None);
+            let source = namespace.claim(&original, None).unwrap();
+            namespace
+                .finish_retire(namespace.begin_retire(source).unwrap())
+                .unwrap();
+            let successor = GtpuSessionGroup::new(
+                GtpuSessionGroupId::new([2; 16]).unwrap(),
+                original.device_id(),
+                original.entries().to_vec(),
+            )
+            .unwrap();
+            let source_claim = CanonicalClaim::from_group(&original)
+                .with_key(&namespace.key)
+                .unwrap();
+            let successor_claim = CanonicalClaim::from_group(&successor)
+                .with_key(&namespace.key)
+                .unwrap();
+            let before_generation;
+            {
+                let mut state = namespace.state.lock().expect("model state lock");
+                let Some(GroupState::Retired { atoms, .. }) =
+                    state.groups.get(&source_claim.group_fingerprint)
+                else {
+                    panic!("retired source row");
+                };
+                let atom = *atoms.iter().next().expect("retired source atom");
+                state.tombstones.remove(&atom);
+                if malformed {
+                    state.tombstones.insert([0xff; 32]);
+                }
+                before_generation = state.generation;
+            }
+
+            assert!(matches!(
+                namespace.claim_reused(
+                    &successor,
+                    &crate::GtpuSessionSelectorReuseProof::after_traffic_drain(original),
+                ),
+                Err(GtpuSessionSelectorNamespaceError::SelectorClaimed)
+            ));
+            let state = namespace.state.lock().expect("model state lock");
+            assert_eq!(state.generation, before_generation);
+            assert!(!state
+                .groups
+                .contains_key(&successor_claim.group_fingerprint));
+            assert!(matches!(
+                state.groups.get(&source_claim.group_fingerprint),
+                Some(GroupState::Retired {
+                    successor: None,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -9609,6 +11652,7 @@ mod tests {
         let request = GtpuSessionSelectorReuseRequest {
             retired,
             desired: successor,
+            window: test_backend_mutation_window(),
         };
         let stamp = FaultingSelectorBackend::terminal_retired_stamp(&request.retired.admission);
         assert!(request.verifies_exact_terminal_retired_stamp(&stamp));
@@ -9750,6 +11794,92 @@ mod tests {
             "the rejected N+1 worker must not enter a phase or execute its future"
         );
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn namespace_worker_gate_survives_observer_drop_and_serializes_before_poll() {
+        let scope = [0xa6; 32];
+        let first_entered = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let first_entered_worker = Arc::clone(&first_entered);
+        let release_first_worker = Arc::clone(&release_first);
+        let first = spawn_selector_operation(scope, (), async move {
+            first_entered_worker.notify_one();
+            release_first_worker.notified().await;
+            Ok::<(), ()>(())
+        });
+        first_entered.notified().await;
+        drop(first);
+
+        let second_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_started_worker = Arc::clone(&second_started);
+        let second = spawn_selector_operation(scope, (), async move {
+            second_started_worker.store(true, std::sync::atomic::Ordering::Release);
+            Ok::<(), ()>(())
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !second_started.load(std::sync::atomic::Ordering::Acquire),
+            "a queued same-scope worker must not be polled before its predecessor finishes"
+        );
+
+        release_first.notify_one();
+        assert_eq!(second.await, Ok(()));
+        assert!(second_started.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_backend_step_drains_blocking_worker_before_releasing_namespace_gate() {
+        let scope = [0xa7; 32];
+        let blocking_entered = Arc::new(tokio::sync::Notify::new());
+        let blocking_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release_blocking, await_release) = std::sync::mpsc::channel::<()>();
+        let entered_worker = Arc::clone(&blocking_entered);
+        let completed_worker = Arc::clone(&blocking_completed);
+
+        let first = spawn_selector_operation(scope, (), async move {
+            settle_selector_backend_step_within(Duration::from_millis(5), async move {
+                tokio::task::spawn_blocking(move || {
+                    entered_worker.notify_one();
+                    await_release.recv().map_err(|_| ())?;
+                    completed_worker.store(true, std::sync::atomic::Ordering::Release);
+                    Ok::<(), ()>(())
+                })
+                .await
+                .map_err(|_| ())?
+            })
+            .await
+            .ok_or(())?
+        });
+        blocking_entered.notified().await;
+        drop(first);
+
+        // Let the observation deadline expire while the started blocking task
+        // remains deliberately held. The detached SDK worker must keep both
+        // the backend future and the per-namespace gate alive.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_started_worker = Arc::clone(&second_started);
+        let second = spawn_selector_operation(scope, (), async move {
+            second_started_worker.store(true, std::sync::atomic::Ordering::Release);
+            Ok::<(), ()>(())
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !second_started.load(std::sync::atomic::Ordering::Acquire),
+            "an expired observation must not cancel its live blocking worker or release the scope gate"
+        );
+        assert!(
+            !blocking_completed.load(std::sync::atomic::Ordering::Acquire),
+            "the held blocking worker must still be live at the adversarial deadline"
+        );
+
+        release_blocking
+            .send(())
+            .expect("release the exact test-owned blocking worker");
+        assert_eq!(second.await, Ok(()));
+        assert!(blocking_completed.load(std::sync::atomic::Ordering::Acquire));
+        assert!(second_started.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -10082,6 +12212,7 @@ mod tests {
                 generation: terminal_generation,
                 nonce: terminal_nonce,
             },
+            previous_terminal: None,
             backend_started: true,
             retired_dataplane_generation: None,
             reason: PoisonReason::EffectReadbackIndeterminate,
@@ -10098,11 +12229,24 @@ mod tests {
             state.published_atoms.insert(*atom);
         }
         state
+            .retain_canonical_desired(claim.group_fingerprint, &desired)
+            .unwrap();
+        state
             .groups
             .insert(claim.group_fingerprint, GroupState::Poisoned(poison));
         assert!(state.is_complete());
         let encoded = state.encode();
         assert!(NamespaceState::decode(&encoded).is_some());
+        let mut aliased_pending_nonce = state.clone();
+        let Some(GroupState::Poisoned(poison)) = aliased_pending_nonce
+            .groups
+            .get_mut(&claim.group_fingerprint)
+        else {
+            panic!("test constructed poison");
+        };
+        poison.terminal_generation.nonce = poison.operation_nonce;
+        assert!(!aliased_pending_nonce.is_complete());
+        assert!(NamespaceState::decode(&aliased_pending_nonce.encode()).is_none());
         let Some(GroupState::Poisoned(poison)) = state.groups.get_mut(&claim.group_fingerprint)
         else {
             panic!("test constructed poison");
@@ -10170,6 +12314,13 @@ mod tests {
             .with_key(&state.selector_digest_key)
             .unwrap();
         let atoms = claim.selector_atoms(&state.selector_digest_key).unwrap();
+        let previous_terminal_generation = state.next_generation().unwrap();
+        let previous_terminal_nonce = test_nonzero_nonce(
+            &state.selector_digest_key,
+            claim.group_fingerprint,
+            previous_terminal_generation,
+        )
+        .unwrap();
         let generation = state.next_generation().unwrap();
         let operation_nonce = test_nonzero_nonce(
             &state.selector_digest_key,
@@ -10194,6 +12345,9 @@ mod tests {
             );
             state.published_atoms.insert(*atom);
         }
+        state
+            .retain_canonical_desired(claim.group_fingerprint, &desired)
+            .unwrap();
         state.groups.insert(
             claim.group_fingerprint,
             GroupState::Poisoned(PoisonRecord {
@@ -10209,6 +12363,10 @@ mod tests {
                     generation: terminal_generation,
                     nonce: terminal_nonce,
                 },
+                previous_terminal: Some(SelectorAuthorityCoordinate {
+                    generation: previous_terminal_generation,
+                    nonce: previous_terminal_nonce,
+                }),
                 backend_started: true,
                 retired_dataplane_generation: None,
                 reason: PoisonReason::RemovalReadbackIndeterminate,
@@ -10217,6 +12375,63 @@ mod tests {
         );
         assert!(state.is_complete());
         assert!(NamespaceState::decode(&state.encode()).is_some());
+        let binding = state
+            .binding_with_scope(test_storage_scope_commitment(&[7; 32]))
+            .unwrap();
+        let inventory = state.operation_stamp_inventory(binding).unwrap();
+        let expectation = inventory
+            .expectations()
+            .first()
+            .expect("one permanent poison stamp key");
+        let lifecycle = expectation.lifecycle();
+        assert_eq!(
+            lifecycle.kind(),
+            SelectorOperationStampLifecycleKind::Poisoned
+        );
+        assert_eq!(lifecycle.poison_phase(), Some(2));
+        assert_eq!(
+            lifecycle.previous_terminal(),
+            Some(SelectorOperationStampCoordinate {
+                generation: previous_terminal_generation,
+                nonce: previous_terminal_nonce,
+            })
+        );
+
+        let mut aliased_pending_nonce = state.clone();
+        let Some(GroupState::Poisoned(poison)) = aliased_pending_nonce
+            .groups
+            .get_mut(&claim.group_fingerprint)
+        else {
+            panic!("test constructed poison");
+        };
+        poison.terminal_generation.nonce = poison.operation_nonce;
+        assert!(!aliased_pending_nonce.is_complete());
+        assert!(NamespaceState::decode(&aliased_pending_nonce.encode()).is_none());
+
+        let mut missing_previous_terminal = state.clone();
+        let Some(GroupState::Poisoned(poison)) = missing_previous_terminal
+            .groups
+            .get_mut(&claim.group_fingerprint)
+        else {
+            panic!("test constructed poison");
+        };
+        poison.previous_terminal = None;
+        assert!(!missing_previous_terminal.is_complete());
+        assert!(NamespaceState::decode(&missing_previous_terminal.encode()).is_none());
+
+        let mut non_predecessor_terminal = state.clone();
+        let Some(GroupState::Poisoned(poison)) = non_predecessor_terminal
+            .groups
+            .get_mut(&claim.group_fingerprint)
+        else {
+            panic!("test constructed poison");
+        };
+        poison.previous_terminal = Some(SelectorAuthorityCoordinate {
+            generation,
+            nonce: previous_terminal_nonce,
+        });
+        assert!(!non_predecessor_terminal.is_complete());
+        assert!(NamespaceState::decode(&non_predecessor_terminal.encode()).is_none());
 
         let mut wrong_phase_two_reason = state.clone();
         let Some(GroupState::Poisoned(poison)) = wrong_phase_two_reason
@@ -10258,6 +12473,7 @@ mod tests {
         poison.phase = 3;
         poison.generation = terminal_generation;
         poison.operation_nonce = terminal_nonce;
+        poison.previous_terminal = None;
         poison.retired_dataplane_generation = NonZeroU64::new(7);
         poison.reason = PoisonReason::RecoveryIndeterminate;
         for atom in &atoms {
@@ -10367,6 +12583,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_installing_no_effect_request_cannot_handoff_or_effect() {
+        let desired = group(1, 1, 0x1000_0001, None);
+        let authority = raw_production_authority_with_ttl(
+            SessionStore::new(
+                SqliteSessionBackend::in_memory().expect("in-memory durable namespace backend"),
+            ),
+            production_namespace_key(desired.device_id()),
+            "selector-expired-installing-negative-proof",
+            Duration::from_secs(1),
+            32,
+        )
+        .await;
+        let backend = Arc::new(FaultingSelectorBackend::default());
+        authority.provision(backend.as_ref()).await.unwrap();
+        authority
+            .claim_fresh(backend.as_ref(), &desired)
+            .await
+            .unwrap();
+        // The negative request's mutation window is half the worker TTL. The
+        // backend checks it while holding its inventory lock, so this delayed
+        // structural NoEffect observation cannot settle the request.
+        backend.set_no_effect_inspection_delay(Duration::from_millis(750));
+
+        assert!(matches!(
+            authority
+                .recover_install(backend.clone(), desired.clone())
+                .await,
+            Err(GtpuSessionSelectorCoordinatorError::Backend)
+        ));
+        assert_eq!(backend.effect_calls(), 0, "expired proof must not effect");
+        let (_, durable) = authority.read_state().await.unwrap();
+        let claim = CanonicalClaim::from_group(&desired)
+            .with_key(&durable.selector_digest_key)
+            .unwrap();
+        assert!(matches!(
+            durable.groups.get(&claim.group_fingerprint),
+            Some(GroupState::Installing {
+                backend_started: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_retiring_no_effect_request_cannot_handoff_or_remove() {
+        let desired = group(1, 1, 0x1000_0001, None);
+        let authority = raw_production_authority_with_ttl(
+            SessionStore::new(
+                SqliteSessionBackend::in_memory().expect("in-memory durable namespace backend"),
+            ),
+            production_namespace_key(desired.device_id()),
+            "selector-expired-retiring-negative-proof",
+            Duration::from_secs(1),
+            32,
+        )
+        .await;
+        let backend = Arc::new(FaultingSelectorBackend::default());
+        authority.provision(backend.as_ref()).await.unwrap();
+        let active = authority
+            .reconcile_fresh(backend.clone(), desired.clone())
+            .await
+            .unwrap();
+        authority.transition_retiring(&active.0).await.unwrap();
+        backend.set_no_effect_inspection_delay(Duration::from_millis(750));
+
+        assert!(matches!(
+            authority
+                .recover_retiring(backend.clone(), desired.clone())
+                .await,
+            Err(GtpuSessionSelectorCoordinatorError::Backend)
+        ));
+        assert_eq!(
+            backend.removal_calls(),
+            0,
+            "expired proof must not remove the exact Active graph"
+        );
+        let (_, durable) = authority.read_state().await.unwrap();
+        let claim = CanonicalClaim::from_group(&desired)
+            .with_key(&durable.selector_digest_key)
+            .unwrap();
+        assert!(matches!(
+            durable.groups.get(&claim.group_fingerprint),
+            Some(GroupState::Retiring {
+                backend_started: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn started_install_recovery_poisoned_without_replay_and_recovers_ack_loss() {
         let desired = group(1, 1, 0x1000_0001, None);
         let authority = production_authority(desired.device_id()).await;
@@ -10442,13 +12748,19 @@ mod tests {
             .claim_fresh(backend.as_ref(), &desired)
             .await
             .unwrap();
-        backend.synchronize_no_effect_inspections(2);
+        backend.hold_no_effect_inspection();
 
-        let (left, right) = tokio::join!(
-            authority.recover_install(backend.clone(), desired.clone()),
-            authority.recover_install(backend.clone(), desired),
-        );
+        let left = authority.recover_install(backend.clone(), desired.clone());
+        backend.wait_for_no_effect_inspection_entry().await;
+        let right = authority.recover_install(backend.clone(), desired);
+        tokio::task::yield_now().await;
+        assert_eq!(backend.installing_no_effect_inspection_calls(), 1);
+        assert_eq!(backend.effect_calls(), 0);
+        backend.release_no_effect_inspection();
+
+        let (left, right) = tokio::join!(left, right);
         assert_eq!(backend.effect_calls(), 1);
+        assert_eq!(backend.installing_no_effect_inspection_calls(), 1);
         assert!(left.is_ok() || right.is_ok());
     }
 
@@ -10463,13 +12775,19 @@ mod tests {
             .await
             .unwrap();
         authority.transition_retiring(&active.0).await.unwrap();
-        backend.synchronize_no_effect_inspections(2);
+        backend.hold_no_effect_inspection();
 
-        let (left, right) = tokio::join!(
-            authority.recover_retiring(backend.clone(), desired.clone()),
-            authority.recover_retiring(backend.clone(), desired),
-        );
+        let left = authority.recover_retiring(backend.clone(), desired.clone());
+        backend.wait_for_no_effect_inspection_entry().await;
+        let right = authority.recover_retiring(backend.clone(), desired);
+        tokio::task::yield_now().await;
+        assert_eq!(backend.retiring_no_effect_inspection_calls(), 1);
+        assert_eq!(backend.removal_calls(), 0);
+        backend.release_no_effect_inspection();
+
+        let (left, right) = tokio::join!(left, right);
         assert_eq!(backend.removal_calls(), 1);
+        assert_eq!(backend.retiring_no_effect_inspection_calls(), 1);
         assert!(left.is_ok() || right.is_ok());
     }
 
@@ -10538,15 +12856,21 @@ mod tests {
                 if poison.phase == 0 && poison.reason == PoisonReason::RecoveryIndeterminate
         ));
 
-        // The original affine request holder may resume after its store lease
-        // expires. Recovery must therefore poison rather than issue a second
-        // request; exactly this stale original request is the sole effect.
+        // An affine request holder may resume after its durable lease
+        // expires, but its short backend mutation window is already stale.
+        // Recovery must therefore poison rather than issue or accept a
+        // second effect.
         let request = GtpuSessionGroupReconcileRequest::new(desired.clone(), admission).unwrap();
-        let _ = backend
-            .reconcile_pdp_context_group_authorized(GtpuSessionSelectorEffectRequest { request })
+        let stale_window = SelectorBackendMutationWindow::mint(Duration::from_millis(1)).unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(backend
+            .reconcile_pdp_context_group_authorized(GtpuSessionSelectorEffectRequest {
+                request,
+                window: stale_window,
+            })
             .await
-            .unwrap();
-        assert_eq!(backend.effect_calls(), 1);
+            .is_err());
+        assert_eq!(backend.effect_calls(), 0);
         let (_, after_stale_effect) = recovery.read_state().await.unwrap();
         assert!(matches!(
             after_stale_effect.groups.get(&claim.group_fingerprint),
@@ -10628,14 +12952,17 @@ mod tests {
                 if poison.phase == 2 && poison.reason == PoisonReason::RecoveryIndeterminate
         ));
 
-        let _ = backend
+        let stale_window = SelectorBackendMutationWindow::mint(Duration::from_millis(1)).unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(backend
             .remove_pdp_context_group_with_lease(GtpuSessionSelectorRemovalRequest {
                 expected: desired,
                 admission,
+                window: stale_window,
             })
             .await
-            .unwrap();
-        assert_eq!(backend.removal_calls(), 1);
+            .is_err());
+        assert_eq!(backend.removal_calls(), 0);
         let (_, after_stale_removal) = recovery.read_state().await.unwrap();
         assert!(matches!(
             after_stale_removal.groups.get(&claim.group_fingerprint),
@@ -10811,10 +13138,10 @@ mod tests {
         assert!(NamespaceState::decode(empty.as_bytes()).is_some());
         let mut legacy = empty.as_bytes().to_vec();
         legacy[..7].copy_from_slice(b"OPCSN12");
-        assert!(
-            NamespaceState::decode(&legacy).is_some(),
-            "OPCSN12 remains decodable"
-        );
+        assert!(NamespaceState::decode(&legacy).is_none());
+        let mut prior_inventory_schema = empty.as_bytes().to_vec();
+        prior_inventory_schema[..7].copy_from_slice(b"OPCSN14");
+        assert!(NamespaceState::decode(&prior_inventory_schema).is_none());
         let mut trailing = empty.as_bytes().to_vec();
         trailing.push(0);
         assert!(NamespaceState::decode(&trailing).is_none());
@@ -10864,16 +13191,18 @@ mod tests {
 
     #[test]
     fn v3_codec_rejects_orphaned_or_noncanonical_ledger_rows() {
-        let mut device_codec = Vec::from([1]);
-        device_codec.extend_from_slice(&[1; 16]);
-        let device = keyed_digest(&[9; 32], GROUP_DOMAIN, &device_codec);
-        let group = [2; 32];
-        let first = [3; 32];
-        let second = [4; 32];
+        let desired_group = group(2, 1, 0x1000_0002, None);
+        let claim = CanonicalClaim::from_group(&desired_group)
+            .with_key(&[9; 32])
+            .unwrap();
+        let group = claim.group_fingerprint;
+        let device = claim.device_fingerprint;
+        let atoms = claim.selector_atoms(&[9; 32]).unwrap();
+        assert_eq!(atoms.len(), 2);
+        let mut atom_iter = atoms.iter().copied();
+        let first = atom_iter.next().unwrap();
+        let second = atom_iter.next().unwrap();
         let generation = GtpuSessionSelectorAuthorityGeneration(NonZeroU64::new(1).unwrap());
-        let mut atoms = BTreeSet::new();
-        atoms.insert(first);
-        atoms.insert(second);
         let mut state = NamespaceState {
             lifecycle: NamespaceLifecycle::Bound,
             stable_device: Some([1; 16]),
@@ -10888,6 +13217,7 @@ mod tests {
             decommission_fence: None,
             selectors: BTreeMap::new(),
             groups: BTreeMap::new(),
+            canonical_desired: BTreeMap::new(),
             published_atoms: BTreeSet::new(),
             tombstones: BTreeSet::new(),
         };
@@ -10899,12 +13229,15 @@ mod tests {
             .insert(second, SelectorState::Installing { group, generation });
         state.published_atoms.insert(first);
         state.published_atoms.insert(second);
+        state
+            .retain_canonical_desired(group, &desired_group)
+            .unwrap();
         state.groups.insert(
             group,
             GroupState::Installing {
                 device,
-                selectors: [5; 32],
-                desired: [6; 32],
+                selectors: claim.selector_set_fingerprint,
+                desired: claim.desired_fingerprint,
                 atoms: atoms.clone(),
                 generation,
                 operation_nonce: [3; 16],
@@ -10917,6 +13250,63 @@ mod tests {
             },
         );
         assert!(state.is_complete());
+
+        let mut aliased_install = state.clone();
+        if let Some(GroupState::Installing {
+            operation_nonce,
+            terminal_operation_nonce,
+            ..
+        }) = aliased_install.groups.get_mut(&group)
+        {
+            *terminal_operation_nonce = *operation_nonce;
+        }
+        assert!(!aliased_install.is_complete());
+        assert!(NamespaceState::decode(&aliased_install.encode()).is_none());
+
+        let retiring_generation =
+            GtpuSessionSelectorAuthorityGeneration(NonZeroU64::new(2).unwrap());
+        let terminal_retirement_generation =
+            GtpuSessionSelectorAuthorityGeneration(NonZeroU64::new(3).unwrap());
+        let mut retiring = state.clone();
+        retiring.generation = terminal_retirement_generation.get();
+        for selector in retiring.selectors.values_mut() {
+            *selector = SelectorState::Retiring {
+                group,
+                generation: retiring_generation,
+            };
+        }
+        retiring.groups.insert(
+            group,
+            GroupState::Retiring {
+                device,
+                selectors: claim.selector_set_fingerprint,
+                desired: claim.desired_fingerprint,
+                atoms: atoms.clone(),
+                generation: retiring_generation,
+                operation_nonce: [4; 16],
+                terminal_generation: terminal_retirement_generation,
+                terminal_operation_nonce: [5; 16],
+                activation_generation: generation,
+                previous_terminal: SelectorAuthorityCoordinate {
+                    generation,
+                    nonce: [3; 16],
+                },
+                backend_started: false,
+            },
+        );
+        assert!(retiring.is_complete());
+        assert!(NamespaceState::decode(&retiring.encode()).is_some());
+        let Some(GroupState::Retiring {
+            operation_nonce,
+            terminal_operation_nonce,
+            ..
+        }) = retiring.groups.get_mut(&group)
+        else {
+            panic!("test constructed retiring record");
+        };
+        *terminal_operation_nonce = *operation_nonce;
+        assert!(!retiring.is_complete());
+        assert!(NamespaceState::decode(&retiring.encode()).is_none());
 
         let mut altered_device = state.clone();
         if let Some(GroupState::Installing { device, .. }) = altered_device.groups.get_mut(&group) {
@@ -11015,53 +13405,68 @@ mod tests {
             decommission_fence: None,
             selectors: BTreeMap::new(),
             groups: BTreeMap::new(),
+            canonical_desired: BTreeMap::new(),
             published_atoms: BTreeSet::new(),
             tombstones: BTreeSet::new(),
         };
-        let mut atoms = Vec::with_capacity(MAX_KNOWN_ATOMS);
-        for index in 0..MAX_KNOWN_ATOMS {
-            let mut atom = [0_u8; 32];
-            atom[30..].copy_from_slice(&(index as u16).to_be_bytes());
-            state.selectors.insert(atom, SelectorState::Retired);
-            state.published_atoms.insert(atom);
-            state.tombstones.insert(atom);
-            atoms.push(atom);
+        let template = group(1, 1, 0x1000_0001, None);
+        let mut entries = template.entries().to_vec();
+        let mut second_context = template.entries()[0].context().clone();
+        second_context.local_teid = Teid::new(0x1000_0002).unwrap();
+        second_context.peer_teid = Teid::new(0x1000_0003).unwrap();
+        second_context.ms_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 1));
+        entries.push(
+            GtpuSessionEntry::new(second_context, template.entries()[0].local_outer_address())
+                .unwrap(),
+        );
+        let claims: Vec<_> = (0..MAX_PERMANENT_GROUPS)
+            .map(|index| {
+                let mut id = [0_u8; 16];
+                id[12..].copy_from_slice(&((index as u32) + 1).to_be_bytes());
+                let desired = GtpuSessionGroup::new(
+                    GtpuSessionGroupId::new(id).unwrap(),
+                    template.device_id(),
+                    entries.clone(),
+                )
+                .unwrap();
+                let claim = CanonicalClaim::from_group(&desired)
+                    .with_key(&state.selector_digest_key)
+                    .unwrap();
+                (desired, claim)
+            })
+            .collect();
+        let atoms = claims[0]
+            .1
+            .selector_atoms(&state.selector_digest_key)
+            .unwrap();
+        assert_eq!(atoms.len(), 4);
+        for atom in &atoms {
+            state.selectors.insert(*atom, SelectorState::Retired);
+            state.published_atoms.insert(*atom);
+            state.tombstones.insert(*atom);
         }
-        let mut device_codec = Vec::from([1]);
-        device_codec.extend_from_slice(&[1; 16]);
-        let device = keyed_digest(&[4; 32], GROUP_DOMAIN, &device_codec);
-        for index in 0..MAX_PERMANENT_GROUPS {
-            let mut group = [0_u8; 32];
-            group[28..].copy_from_slice(&(index as u32).to_be_bytes());
-            let next_index = index + 1;
-            let mut successor_group = [0_u8; 32];
-            successor_group[28..].copy_from_slice(&(next_index as u32).to_be_bytes());
+        for (index, (desired, claim)) in claims.iter().enumerate() {
             let activation_generation = GtpuSessionSelectorAuthorityGeneration(
                 NonZeroU64::new((index * 3 + 2) as u64).unwrap(),
             );
             let retirement_generation = GtpuSessionSelectorAuthorityGeneration(
                 NonZeroU64::new((index * 3 + 3) as u64).unwrap(),
             );
-            let group_atoms = (0..4)
-                .map(|offset| atoms[(index * 4 + offset) % MAX_KNOWN_ATOMS])
-                .collect();
+            state
+                .retain_canonical_desired(claim.group_fingerprint, desired)
+                .unwrap();
             state.groups.insert(
-                group,
+                claim.group_fingerprint,
                 GroupState::Retired {
-                    device,
-                    selectors: [5; 32],
-                    desired: [6; 32],
-                    atoms: group_atoms,
+                    device: claim.device_fingerprint,
+                    selectors: claim.selector_set_fingerprint,
+                    desired: claim.desired_fingerprint,
+                    atoms: atoms.clone(),
                     activation_generation,
                     generation: retirement_generation,
                     operation_nonce: [7; 16],
                     retired_dataplane_generation: NonZeroU64::new(1).unwrap(),
-                    successor: (next_index < MAX_PERMANENT_GROUPS).then_some(RetiredSuccessor {
-                        group: successor_group,
-                        generation: GtpuSessionSelectorAuthorityGeneration(
-                            NonZeroU64::new((index * 3 + 4) as u64).unwrap(),
-                        ),
-                    }),
+                    successor: None,
                 },
             );
         }
@@ -11075,7 +13480,7 @@ mod tests {
         // RFC 016's aggregate reference profile is exact: an already
         // published/tombstoned atom still cannot become a 4,097th durable
         // group reference through a malformed reissue lineage.
-        let excess_atom = atoms[4];
+        let excess_atom = [0xfe; 32];
         let first_group = state
             .groups
             .values_mut()

@@ -512,10 +512,12 @@ an allocation at retirement, it must reserve that capacity at claim time;
 allocation-free.
 
 The reference control profile additionally permits four CAS/readback attempts
-per transition, 64 supervised effects per namespace, 256 supervised effects per
-process, at most 16 directory entries examined while validating a marker, 256
-atoms and 512 KiB examined by one exact readback, and 4 KiB for one SDK-created
-diagnostic or evidence record. It uses a 30-second namespace lease, renews no
+per transition, 64 admitted supervisor slots per namespace, 256 admitted
+supervisor slots per process, at most 16 directory entries examined while
+validating a marker, 256 atoms and 512 KiB examined by one exact readback, and
+4 KiB for one SDK-created diagnostic or evidence record. The admitted slots
+bound queued result owners; exactly one worker per protected storage-scope
+commitment is polled at a time. It uses a 30-second namespace lease, renews no
 later than every 10 seconds, and admits only backend critical sections bounded
 to 5 seconds. Exceeding a work, byte, entry, task, retry, lease, or diagnostic
 limit fails closed before further mutation; it never truncates authority data
@@ -924,6 +926,17 @@ awaits a separate non-aborting result receiver; dropping or cancelling it MUST
 NOT release ownership or cancel blocking kernel work while a durable effect is
 pending.
 
+One process polls exactly one such worker for a protected storage-scope
+commitment from durable lease acquisition through release. Other admitted
+same-scope supervisors remain bounded and unpolled. This is required because a
+same-`OwnerId` store acquire denotes recovery by that replica and replaces its
+prior credential; overlapping local acquisitions would invalidate a live guard
+without invalidating its time-bounded backend request. Protected open and
+binding verification use the same detached ownership rule. Every concurrently
+live process MUST use a stable `OwnerId` unique to that replica. Reusing one
+owner in multiple processes is outside the session-store contract and MUST NOT
+be treated as supported failover.
+
 The SDK supervisor retains and renews the namespace lease and request until one
 terminal receipt is durably settled. It acquires the host lock only for the
 bounded validation/effect/readback sections defined by the operation, releases
@@ -941,10 +954,11 @@ per-process number of supervisors and report only a closed cancellation
 classification. If the SDK runtime cannot provide this worker ownership, the
 capability is unsupported.
 
-The durable lock/CAS authority, not a process mutex, decides ownership. A
-process-local lock may serialize same-process calls but cannot prove cross-
-process exclusivity. Concurrent processes must serialize through the durable
-generation/CAS and the host-global control-marker lock.
+The durable lock/CAS authority, not a process mutex, decides cross-process
+ownership. The process-local worker gate prevents only reentrant acquisition by
+one replica identity; it is not a distributed fence. Concurrent replicas with
+distinct owner identities still serialize through the durable generation/CAS
+and the host-global control-marker lock.
 
 ## 8. Persistent eBPF Control Marker
 

@@ -1944,6 +1944,17 @@ reissuing a retired selector set. Product assertions do not qualify.
 Diagnostics expose only bounded state classifications,
 never selector, subscriber, or digest values.
 
+Each process admits a bounded queue of selector operations but polls exactly
+one worker per protected storage-scope commitment from durable lease
+acquisition through release. This is part of the fence: a same-owner
+`SessionStore` acquire is replica recovery and replaces the prior credential,
+so concurrent local workers must never mint overlapping backend windows.
+Dropping an operation observer, including `open_protected`, does not cancel
+the owned worker or release that gate. Across processes, every replica must
+use the stable, replica-unique `OwnerId` required by the session-store
+contract; reusing one owner identity in multiple live processes is not a
+supported concurrency model.
+
 The backend trait expansion is additive, and existing `GtpuProbe` fields and
 legacy v5 map-key bytes are unchanged. The grouped-session construction
 migration is deliberately not additive: public `Fresh` assertion and public

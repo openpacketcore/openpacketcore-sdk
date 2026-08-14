@@ -628,18 +628,20 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
-    /// Inspect a pending Installing coordinate under the exact namespace
-    /// binding and the backend's inventory lock.
+    /// Consume a pending Installing no-effect inspection request under the
+    /// exact namespace binding and the backend's inventory lock.
     ///
     /// This port exists solely to decide the documented no-effect recovery
     /// branch. It must not reinterpret a terminal-retired stamp as virgin or
     /// use a generationless semantic lookup. Backends that cannot prove the
-    /// full negative fact fail closed.
+    /// full negative fact fail closed. The request's currentness fence must be
+    /// checked immediately before and after the exact negative inspection
+    /// while the host lock is retained. Only then may the backend consume it
+    /// into the returned coordinate-bound receipt.
     async fn inspect_installing_selector_no_effect(
         &self,
-        _expected: &GtpuSessionGroup,
-        _admission: &crate::GtpuSessionSelectorAdmission,
-    ) -> Result<GtpuSessionSelectorInstallRecovery, GtpuError> {
+        _request: crate::GtpuSessionSelectorInstallingNoEffectRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "gtpu_selector_installing_no_effect_recovery",
         })
@@ -662,8 +664,8 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
-    /// Inspect a pending Retiring coordinate before its first backend removal
-    /// effect.
+    /// Consume a pending Retiring no-effect inspection request before its
+    /// first backend removal effect.
     ///
     /// This port may return [`GtpuSessionSelectorRetiringRecovery::ExactPreviousActive`]
     /// only under the immutable namespace binding and exclusive inventory
@@ -672,11 +674,13 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// remove stamp. It is consumed only while durable state is
     /// `Retiring(false)`; an adapter that cannot prove that negative fact must
     /// fail closed rather than treating structural Active readback as enough.
+    /// The request's currentness fence must be checked immediately before and
+    /// after the complete negative proof under the host lock, then consumed
+    /// into the returned coordinate-bound receipt.
     async fn inspect_retiring_selector_no_effect(
         &self,
-        _expected: &GtpuSessionGroup,
-        _admission: &crate::GtpuSessionSelectorAdmission,
-    ) -> Result<GtpuSessionSelectorRetiringRecovery, GtpuError> {
+        _request: crate::GtpuSessionSelectorRetiringNoEffectRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "gtpu_selector_retiring_no_effect_recovery",
         })
