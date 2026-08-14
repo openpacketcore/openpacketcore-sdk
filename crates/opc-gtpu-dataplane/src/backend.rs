@@ -62,6 +62,76 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Authenticate one store and affine lease as this backend's canonical authority.
+    ///
+    /// The fail-closed default cannot establish ownership. Trusted adapters
+    /// bind this check to their private backend incarnation and canonical
+    /// store registry; wrappers that delegate production proof operations
+    /// must delegate this check as well. Returning `true` permits the inherited
+    /// rebind default to terminally revoke the supplied authority, but it can
+    /// never grant access to the crate-private publication transaction.
+    fn owns_gtpu_traffic_proof_authority(
+        &self,
+        _store: &GtpuTrafficProofAuthorityStore,
+        _authority: &GtpuTrafficProofAuthorityLease,
+    ) -> bool {
+        false
+    }
+
+    /// Atomically rebind one canonical proof authority to an exact changed desired group.
+    ///
+    /// The caller first reconciles the candidate group through the normal
+    /// grouped-dataplane contract. Consuming the old store's affine lease then
+    /// closes its authority gate immediately, before this method waits for any
+    /// other old lease. A trusted adapter must clean every old proof artifact,
+    /// verify the exact new active readback under its mutation boundary, and
+    /// only then publish the new authority. Failure or cancellation leaves the
+    /// old authority revoked and does not mint a new usable lease. The default
+    /// implementation begins terminal revocation only when the backend first
+    /// authenticates the store and lease as its own. An adapter that cannot
+    /// establish ownership reports unsupported without mutating a potentially
+    /// foreign authority.
+    ///
+    /// Completion is intentionally restricted to SDK-owned trusted adapters:
+    /// it requires the crate-private transaction that binds the final exact
+    /// readback to publication. External trait implementations remain useful
+    /// for non-proof dataplane operations, but cannot mint a production proof.
+    ///
+    /// ```compile_fail
+    /// use opc_gtpu_dataplane::{GtpuTrafficProofAuthorityLease, GtpuTrafficProofAuthorityStore};
+    ///
+    /// fn external_backend_cannot_publish_changed_desired_authority(
+    ///     store: &GtpuTrafficProofAuthorityStore,
+    ///     lease: GtpuTrafficProofAuthorityLease,
+    /// ) {
+    ///     let _ = store.begin_rebind(lease);
+    /// }
+    /// ```
+    async fn rebind_gtpu_traffic_proof_authority(
+        &self,
+        store: &GtpuTrafficProofAuthorityStore,
+        old_authority: GtpuTrafficProofAuthorityLease,
+        _replacement: GtpuTrafficProofAuthority,
+    ) -> Result<GtpuTrafficProofAuthorityStore, GtpuError> {
+        if !self.owns_gtpu_traffic_proof_authority(store, &old_authority) {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "gtpu_traffic_proof",
+            });
+        }
+        // Preserve the old authority's terminal state even when an adapter has
+        // not opted into rebind completion. Dropping this transaction releases
+        // writer contention but deliberately never reopens its dispatch gate.
+        let _rebind =
+            store
+                .begin_rebind(old_authority)
+                .map_err(|_| GtpuError::StateIndeterminate {
+                    operation: "gtpu_traffic_authority_rebind",
+                })?;
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_traffic_proof",
+        })
+    }
+
     /// Start one trusted traffic-proof attempt for an exact current authority.
     ///
     /// The non-cloneable lease is consumed and retained by the adapter's

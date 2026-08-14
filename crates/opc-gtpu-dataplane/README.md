@@ -203,6 +203,22 @@ observation-source epoch, and monotonic-clock origin. Validation repeats the
 live readback under the adapter's writer authority; equality of a previously
 read object is not sufficient.
 
+When reconciliation changes the exact desired group, callers consume a lease
+from the canonical store with
+`GtpuDataplaneBackend::rebind_gtpu_traffic_proof_authority` only after the
+normal grouped reconcile succeeds. Rebind closes the old authority gate before
+waiting for existing leases, retires old attempts and registrations, performs
+one final exact active readback of the new group, and only then publishes the
+new authority. A failed, canceled, stale, or concurrently mutated rebind
+leaves the old authority terminal and never reports an authority gap as traffic
+evidence. The trait's inherited implementation first authenticates the store
+and lease as belonging to that backend. A production-proof wrapper may delegate
+that ownership check and will terminally revoke before returning
+`UnsupportedFeature`; a mock, unsupported, or foreign backend cannot establish
+ownership and returns unsupported without mutating another backend's authority.
+The publish transaction is crate-private, so only SDK-owned trusted adapters
+can complete rebind.
+
 The product drives an authenticated ICMP Echo challenge through the live
 session by calling `GtpuTrafficProofSession::challenge` with a distinct nonzero
 sample ID. The sample's high and low 16-bit halves are the exact ICMP Echo
