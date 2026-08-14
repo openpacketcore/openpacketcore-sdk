@@ -1,8 +1,11 @@
 # OPC-SDK-RFC-016: Opaque Durable GTP-U Selector Namespace
 
-**Status**: Proposed  
-**Version**: 1.0.0  
-**Date**: 2026-08-13  
+**Status**: Proposed
+
+**Version**: 1.0.0
+
+**Date**: 2026-08-13
+
 **Audience**: SDK dataplane implementers, durable-store implementers, security
 reviewers, and downstream packet-core product teams
 
@@ -159,9 +162,10 @@ not offer a production `open(store, arbitrary_session_key, ...)` constructor.
 ### 5.1 Authority Record
 
 The SDK MUST mint a cryptographically random ledger ID and a fresh 32-byte
-selector secret when it creates a ledger. It first validates all configured
-capacities and the selected store profile, then creates the ledger and settles
-its first CAS by exact readback. The full record, including the ID and secret,
+selector secret when it transitions an exact `Provisioned` record into an
+`Initializing` ledger. It first validates all configured capacities and the
+selected store profile, then settles that CAS by exact readback. The full
+record, including the ID and secret,
 MUST be protected according to RFC 004 §14.1: production profiles use
 `EncryptingSessionBackend` or `RemoteSealingSessionBackend`; an explicitly
 declared same-cryptographic-boundary profile is permitted only where RFC 004
@@ -177,10 +181,12 @@ cannot implement the gate or mint its protected-payload scope. A test-only
 in-memory constructor is not a production capability. A future
 same-cryptographic-boundary adapter requires a separately named, SDK-owned and
 reviewed gate; a downstream marker trait or capability assertion is
-insufficient. The product supplies the validated administrative `TenantId` and
-NF storage scope once when creating this wrapper;
-the SDK derives the reserved selector-ledger key type and stable ID from the
-backend-bound namespace commitment. Claims cannot replace that scope or key.
+insufficient. The product supplies the validated administrative `TenantId`, NF
+kind, and protected-backend scope once when creating this wrapper. The SDK
+derives the reserved selector-ledger key type and stable ID from the exact
+storage-key seed defined below and from the backend bootstrap's device/pin
+coordinates. This happens before the random ledger material and complete
+namespace binding are minted. Claims cannot replace that scope or key.
 The AAD MUST bind the schema revision, authority purpose, storage tenant, NF
 scope, storage key type, exact device namespace, exact pin namespace, and the
 domain-separated ledger-ID commitment. A plaintext `EncryptedSessionPayload`
@@ -218,16 +224,53 @@ The secret produces keyed domain-separated commitments for group, set, and atom
 membership. It is never a substitute for encrypted record integrity, CAS,
 generation fencing, or filesystem integrity.
 
-The reference implementation uses HMAC-SHA-256 with the following ASCII NUL-
-terminated domains: `opc/gtpu-selector/group/v1`,
-`opc/gtpu-selector/set/v1`, `opc/gtpu-selector/atom/v1`,
-`opc/gtpu-selector/desired/v1`, and `opc/gtpu-selector/storage/v1`.
-The domain, including its terminating NUL, is the first HMAC input for the
-corresponding versioned codec; one generic domain cannot serve multiple
-commitment kinds. Marker/binding names use lowercase hexadecimal
-SHA-256 over the SDK codec's fixed-width versioned binding bytes. External
-backends receive those opaque bytes and the SDK-generated marker name; they do
-not reproduce canonicalization or KDF logic.
+The reference implementation uses HMAC-SHA-256 under the selector secret with
+the following ASCII NUL-terminated domains:
+`opc/gtpu-selector/group/v1`, `opc/gtpu-selector/set/v1`,
+`opc/gtpu-selector/atom/v1`, `opc/gtpu-selector/desired/v1`, and
+`opc/gtpu-selector/secret-commitment/v1`. The domain, including its terminating
+NUL, is the first HMAC input for the corresponding versioned codec; one generic
+domain cannot serve multiple commitment kinds. Storage-key and storage-scope
+derivation use the separate unkeyed SHA-256 domains defined below. Marker and
+binding names use lowercase hexadecimal SHA-256 over the SDK codec's
+fixed-width versioned binding bytes. External backends receive those opaque
+bytes and the SDK-generated marker name; they do not reproduce canonicalization
+or derivation logic.
+
+`StorageKeySeedCodecV1` has this exact, padding-free byte layout:
+
+```text
+version 1 (u8)
+tenant length (u64 big-endian) || canonical TenantId UTF-8 bytes
+NF-kind length (u64 big-endian) || canonical NetworkFunctionKind UTF-8 bytes
+key-type length (u64 big-endian) || ASCII "gtpu-selector-ledger-v1"
+backend-scope length (u64 big-endian) || canonical protected-backend-scope bytes
+stable device ID (16 bytes)
+pin-namespace commitment (32 bytes)
+```
+
+The protected-backend scope is a nonempty, NUL-free canonical UTF-8 value of at
+most 128 bytes fixed when its encryption or remote-sealing wrapper is created;
+the selector namespace constructor does not accept another value. The reserved
+`SessionKey` stable ID is exactly
+`SHA-256("opc/gtpu-selector/storage-key/v1\0" || StorageKeySeedCodecV1)` and
+therefore has the required 32-byte width. Its tenant and NF fields are the same
+canonical values, and its key type is the exact reserved string above.
+
+`StorageScopeCodecV1` is version `1`, the same length-prefixed tenant, NF kind,
+reserved key type, the derived 32-byte stable ID without a length prefix, and
+the same length-prefixed protected-backend scope, in that order. The 32-byte
+storage-scope commitment is exactly
+`SHA-256("opc/gtpu-selector/storage-scope/v1\0" || StorageScopeCodecV1)`.
+These two digests are deliberately unkeyed: the inputs are bounded
+administrative routing coordinates rather than subscriber identifiers, the SDK
+alone owns the codecs and hashing calls, callers never supply a digest, and no
+digest is emitted through diagnostics. Integrity and confidentiality remain the
+responsibility of the protected record, its AAD, and the opaque marker binding.
+Local encryption and remote-sealing wrappers consume the same SDK-built
+`SessionKey`, storage-scope bytes, and commitment before applying their distinct
+custody mechanisms; a third-party store beneath either wrapper cannot replace
+them.
 
 The canonical desired-group bytes are the SDK `GtpuSelectorDesiredCodecV1`
 projection, independent of whether the selected backend is eBPF:
@@ -261,15 +304,20 @@ valid cross-family distinctions; duplicate encoded map keys are rejected
 before hashing. Group commitment is HMAC over version `1`, stable device ID,
 and group ID; desired commitment is HMAC over desired-group bytes; set
 commitment is HMAC over complete-set bytes; each atom commitment is HMAC over
-one atom. The selector-secret commitment is HMAC under that secret over the
-storage domain, version `1`, random ledger ID, pin commitment, and stable
-device; it is not plain SHA-256 of the secret. The namespace binding codec is
-version `1` followed by the 32-byte
+one atom. After the storage key and scope commitment are fixed, the SDK mints
+the random ledger ID and selector secret. The selector-secret commitment is
+HMAC under that secret over the secret-commitment domain, version `1`, random
+ledger ID, pin commitment, stable device, and storage-scope commitment; it is
+not plain SHA-256 of the secret. The namespace binding codec is version `1`
+followed by the 32-byte
 pin-namespace commitment, 16-byte stable device, 16-byte random ledger ID,
 32-byte selector-secret commitment, 32-byte storage-scope commitment, and
 16-byte selector-backend epoch. The marker filename digest is SHA-256 over
 exactly those 145 bytes. Any change to these bytes requires a new codec/domain
-version and an explicit migration.
+version and an explicit migration. The derivation order is therefore acyclic:
+backend bootstrap coordinates, storage-key seed, reserved `SessionKey`, storage
+scope, random ledger material, selector-secret commitment, complete 145-byte
+binding, then marker name.
 
 ### 5.2 Capacity
 
@@ -299,8 +347,10 @@ A claim permanently consumes its group-record slot and every previously unseen
 atom slot at `Installing`; retirement reclassifies that same group record and
 does not allocate a tombstone or atom. Exact reissue consumes one new successor
 group-record slot but no atom slot. Claim preflight also reserves that group's
-one operation-stamp map slot; retirement and permanent terminal-stamp retention
-reuse the same key and allocate no additional slot. The ledger invariant
+one permanent operation-stamp map key. Its value is the current lifecycle fence
+and is replaced only by the legal sequence in §8.1; retirement allocates no
+additional key. The predecessor's final `Retired` value is never changed, and
+exact reissue uses the distinct successor group/key. The ledger invariant
 therefore checks byte length, permanent groups, live groups, known atoms,
 retained tombstones, cumulative group-atom references, per-operation atoms, and
 stamp slots as independent dimensions in every phase. It does not infer one
@@ -412,8 +462,9 @@ The SDK supplies a verifier/codec for external backend implementations. It
 reveals only the canonical 145-byte binding, canonical marker name, canonical
 208-byte pending and terminal stamps, and constant-time comparison operations,
 never the selector secret or fields from which a caller can mint those values.
-The lease validates the exact marker and complete permanent stamp-key inventory
-again immediately before each effect. An authorized request also exposes a borrowed read-only
+The lease validates the exact marker, complete permanent group-key inventory,
+and each key's exact current lifecycle-stamp value again immediately before
+each effect. An authorized request also exposes a borrowed read-only
 `GtpuSessionGroup` projection and closed operation kind while it is consumed,
 so an external backend can perform the requested real mutation; those semantic
 fields do not mint or validate authority. A receipt is valid only for the exact
@@ -482,8 +533,9 @@ a one-way `backend_started` bit. The coordinator sets that bit by CAS before it
 hands the request to a backend supervisor, and never clears it. A decoder
 rejects a pending phase without a greater terminal generation, a duplicate or
 zero nonce, or an allocation counter that has not advanced past both
-generations. Namespace-open validation rejects a backend-started phase whose
-required pending stamp is absent.
+generations. Namespace-open validation accepts, for a backend-started pending
+phase, only its exact pending stamp or its exact precommitted terminal stamp;
+absence or every other value is indeterminate.
 
 ### 7.2 Claim and Effect Ordering
 
@@ -694,6 +746,22 @@ The protected record and map have this exact key/value relationship:
 | `Retired` | exact terminal-retired |
 | `Poisoned` | the exact last observed stamp, or an explicit protected no-stamp poison classification |
 
+Each permanent group key has exactly one current value. The only ordinary CAS
+replacement chain is:
+
+```text
+absent -> pending-install -> terminal-active -> pending-remove -> terminal-retired
+```
+
+Every arrow compares the complete prior 208-byte value (or proven absence) and
+writes the complete precommitted successor. `terminal-active` is deliberately
+superseded by the authorized retirement operation; the ledger's immutable
+activation coordinate and group history preserve that earlier fact. The final
+`terminal-retired` value is permanent for that predecessor and is never deleted
+or replaced. Exact reissue consumes a different group identity and therefore a
+different permanent map key. No recovery, cleanup, compaction, or decommission
+may skip, reverse, normalize, or add an edge to this chain.
+
 Every other stamp key is foreign history. A started phase with an absent stamp
 is atomically converted to the no-stamp poisoned classification after the old
 host owner is fenced; it never returns to an admissible phase. A mismatched or
@@ -708,9 +776,11 @@ After exact whole-group readback it writes and exactly reads the terminal stamp
 before finalizing the journal and before the terminal
 ledger CAS. Active recovery requires the exact terminal stamp plus the existing
 authority/index graph. Retired recovery requires exact group absence and the
-terminal absent stamp. Terminal stamps are permanent namespace history and are
-never removed by retirement, cleanup, compaction, or ordinary decommission;
-their capacity is reserved one-for-one with permanent groups. On every open,
+terminal absent stamp. Group stamp keys are permanent namespace inventory, and
+each key's value must be the one exact current lifecycle fence allowed by the
+table and replacement chain. The terminal `Retired` value is never removed by
+cleanup, compaction, or decommission; capacity is reserved one-for-one with
+permanent groups. On every open,
 the coordinator compares the complete bounded stamp-key inventory with the
 protected ledger. An extra stamp proves a rolled-back or foreign ledger; a
 missing stamp for any operation recorded as backend-started proves map loss or
@@ -724,11 +794,16 @@ is a selector tombstone or admission.
 ### 8.2 Initialization and Crash Recovery
 
 Initialization is an explicit two-sided protocol; neither a ledger write nor a
-marker alone is a complete binding:
+marker alone is a complete binding. Normal runtime never interprets a missing
+record as a virgin namespace. It starts only from the exact permanent
+`Provisioned` record created by the stopped installation workflow in §11. That
+record already binds the storage scope, stable device, pin namespace, immutable
+capacities, and reserved key, but contains no selector secret, claimable atom,
+group, marker, or backend epoch:
 
-1. After all preflights, CAS an `Initializing` ledger record containing the
-   SDK-minted binding candidate, protected storage scope, zero groups, and no
-   claimable atoms.
+1. After all preflights, CAS the exact `Provisioned` record to an `Initializing`
+   ledger containing the SDK-minted random binding candidate, protected storage
+   scope, zero groups, and no claimable atoms.
 2. Under the backend ownership descriptor/lock, create or exactly read back the
    immutable marker for that candidate. The marker directory initially denotes
    only `Initializing`; it does not authorize group effects.
@@ -742,16 +817,19 @@ marker alone is a complete binding:
    then CAS the ledger to `Bound` at a higher generation/nonce before any claim.
 
 Recovery of `Initializing` plus an exact marker may complete steps 3 and 4. An
-exact ledger with no marker may create that one expected marker and settle it
-by readback because no selector has yet been claimable or published. The marker is
-created only after exact readback of the first ledger CAS, so a marker with an
-absent ledger proves rollback, corruption, or authority loss and is an orphan
-conflict requiring offline recovery; startup never recreates a secret-bearing
-ledger from marker material. A different, malformed, multiple, or unprovable
-pair fails closed. Once `Bound`, a missing marker or required control map is
-never recreated by normal startup; #663 owns an explicitly fenced
-restore/republish design. No group claim or group effect is possible until the
-protected ledger, marker, and backend graph are exactly `Bound`.
+exact `Initializing` ledger with no marker may create that one expected marker
+and settle it by readback because no selector has yet been claimable or
+published. The marker is created only after exact readback of the first ledger
+CAS, so a marker with an absent ledger proves rollback, corruption, or authority
+loss and is an orphan conflict requiring offline recovery; startup never
+recreates a record from marker material. An absent record, even with an empty
+backend and no marker, is likewise unprovisioned/indeterminate and cannot enter
+`Initializing`. A different, malformed, multiple, or unprovable pair fails
+closed. Once `Bound`, a missing marker or required control map is never
+recreated by normal startup; #663 owns an explicitly fenced restore/republish
+design. `Decommissioned` is permanent and cannot enter `Provisioned`,
+`Initializing`, or `Bound`. No group claim or group effect is possible until
+the protected ledger, marker, and backend graph are exactly `Bound`.
 
 ### 8.3 Host Filesystem Semantics
 
@@ -786,8 +864,10 @@ than recreating authority. Any other unsupported durability result, I/O, sync,
 close, ACK, enumeration, ownership, mode, link-count, or identity failure is
 ambiguous and fails closed. The marker is never renamed,
 modified, or silently recreated after deletion. A separately authorized
-decommission procedure may remove it only after preserving the durable ledger
-history; normal cleanup must not erase that history automatically.
+decommission procedure may remove mutable programs, selector maps, and journals
+only after the protected namespace record is permanently `Decommissioned`; it
+MUST retain this immutable marker and the protected record. Normal cleanup and
+decommission never erase either authority fence.
 
 ## 9. Backend Contract
 
@@ -844,8 +924,9 @@ constructor argument. The composed adapter MUST
 provide atomic compare-and-set over the whole protected ledger record,
 monotonic record generation/fencing,
 bounded value capacity, durable readback, and crash recovery. The constructor
-derives the reserved ledger key from the backend-minted namespace binding; it
-does not accept an arbitrary caller key. A sequence of per-atom writes, a
+derives the reserved ledger key from `StorageKeySeedCodecV1` before minting the
+complete namespace binding; it does not accept an arbitrary caller key. A
+sequence of per-atom writes, a
 `batch` with independently observable slots, a cache, an independent per-
 process database, or a process mutex is insufficient. A same-cryptographic-
 boundary profile is separately named and cannot claim encrypted-at-rest
@@ -855,8 +936,7 @@ The ledger record is created with `expires_at = None`. An admitted backend must
 prove that non-expiring records are excluded from TTL pruning, capacity
 eviction, ordinary session teardown, compaction, and automatic cleanup. Any
 profile that cannot retain the record and every tombstone for the namespace's
-lifetime remains unsupported; a deployment archive is used only by the
-separately authorized decommission procedure.
+lifetime, including after decommission, remains unsupported.
 
 ### 10.2 Distributed Durable Authority
 
@@ -880,24 +960,42 @@ validity was established by the control workflow.
 ## 11. Upgrade, Migration, and Decommission
 
 An upgrade MUST NOT silently adopt a nonempty legacy GTP-U map/program/pin
-graph. A fresh durable namespace may be initialized only when a complete
-privileged inspection proves the canonical namespace is empty and no legacy
-control marker is present. The proof is bounded, under the host-global lock,
-and records only a redacted classification.
+graph. A production runtime cannot create the reserved durable row from
+absence. Before first use, a separately authorized, stopped installation
+workflow authenticates and fences the target, obtains the backend-global lock,
+and performs a complete bounded privileged inspection. Only exact emptiness,
+no legacy control marker, and no prior provision/decommission fence permit it to
+CAS-allocate the permanent `Provisioned` record at the SDK-derived reserved
+key. It exactly reads the record back before release and records only a redacted
+classification. A missing record during ordinary startup means
+unprovisioned/indeterminate, not never-used.
 
-Otherwise an operator must use a separately reviewed cleanup-only procedure:
-drain product traffic, stop all writers, authenticate and fence the target,
-preserve an immutable pre-cleanup record, remove only positively identified
-legacy state, prove exact emptiness, and then initialize a fresh ledger. The
-procedure does not infer legacy selector history, issue `Fresh` admissions for
-old state, or preserve live service. It is not automatic startup behavior.
+If legacy state exists, an operator must use a separately reviewed cleanup-only
+procedure: drain product traffic, stop all writers, authenticate and fence the
+target, preserve an immutable pre-cleanup record, remove only positively
+identified legacy state, and prove exact emptiness before the installation
+workflow may create `Provisioned`. The procedure does not infer legacy selector
+history, issue `Fresh` admissions for old state, or preserve live service. It is
+not automatic startup behavior.
 
-Decommission is separately authorized and must preserve permanent ledger
-history or an approved immutable archive that continues to fence re-adoption.
-Deleting maps, pins, a database, or a control file never authorizes deletion
-of selector history. Rollback to an image lacking this RFC is unsupported once
-a namespace is durably bound, except through a stopped, explicitly approved
-recovery that preserves the authority record.
+Decommission is a terminal namespace transition, not record deletion. After
+all groups are exactly `Retired`, the separately authorized stopped workflow
+holds both authority gates, verifies the complete ledger/marker/stamp
+inventory, and CASes `Bound` to permanent `Decommissioned`, retaining the
+complete binding and all group/atom/tombstone history. It exactly reads that
+record and marker back before removing any mutable program, selector map,
+journal, or non-authority pin. Crashes before the CAS leave `Bound` and permit
+no cleanup; crashes afterward leave `Decommissioned`, forbid traffic and
+claims, and may only resume the same bounded cleanup. The protected record and
+immutable marker are never removed. `Decommissioned` can be restored or moved
+only by a future separately authorized, versioned migration that preserves this
+fence; it can never become an ordinary fresh namespace.
+
+Deleting maps, pins, a copied database, or a control file never authorizes
+deletion of selector history or creation of `Provisioned`. Rollback to an image
+lacking this RFC is unsupported once a namespace is provisioned, except through
+a stopped, explicitly approved recovery that preserves the permanent authority
+record.
 
 ## 12. Security and Privacy Analysis
 
@@ -911,7 +1009,8 @@ recovery that preserves the authority record.
 | Map/program loss or ordinary cleanup | Immutable persistent control marker plus durable ledger; absence does not prove historical absence. |
 | Control-marker tampering | Trusted descriptor traversal, no-follow/no-replace, owner/mode/link/inode checks, exact enumeration/digest binding, directory sync, and host-global lock. |
 | Symlink, hardlink, or replacement race | Descriptor-relative no-follow traversal; reject links, unexpected metadata, changed inode, and non-bpffs objects before mutation. |
-| Durable rollback or cloned database | Protected AAD plus a permanent, backend-owned complete stamp inventory; every effect revalidates the exact ledger/stamp bijection while holding the backend-global gate. Extra/missing history fails closed. |
+| Durable rollback or cloned database | Protected AAD plus permanent backend-owned group stamp keys and exact current lifecycle values; every effect revalidates the exact ledger/stamp bijection while holding the backend-global gate. Extra/missing/mismatched history fails closed. |
+| Decommission followed by re-adoption | Runtime requires a permanent exact `Provisioned` record rather than inferring virgin state from absence; terminal `Decommissioned` ledger/marker fences are never deleted or reused. |
 | Secret or subscriber disclosure | Encrypt ledger material; redact every public surface; evidence is identity-free and uses only closed classifications/counts. |
 | Capacity or operation DoS | Pre-effect finite capacities, bounded canonicalization/readback/retries/tasks, and fail-closed exhaustion. Products own admission quotas. |
 
@@ -919,15 +1018,17 @@ A coherent copy made before any selector effect initially has the same binding
 and stamp inventory as its source. It does not become a second writer: both
 copies must acquire the same backend-global ownership gate, and immediately
 before mutation each compares its exact protected ledger with every permanent
-stamp. The first backend-started operation adds its pending stamp before any
+group stamp key and exact current lifecycle value. The first backend-started
+operation adds its pending stamp before any
 selector mutation. A second copy then observes an extra stamp and fails closed;
 the first copy similarly fails if the second won. Copying or rolling back the
-ledger after publication also leaves extra terminal history. Loss or rollback
-of the stamp map makes a previously backend-started ledger entry miss its stamp
-and fails closed. A backend that cannot retain and enumerate this history does
-not support the local profile. Protected storage, key custody, backup controls,
-and ADR 0019 consensus authentication remain defense in depth rather than a
-substitute for this effect-time fence.
+ledger after publication leaves an extra key or a newer/mismatched current
+value. Loss or rollback of the stamp map makes a previously backend-started
+ledger entry miss or regress its stamp and fails closed. A backend that cannot
+retain and enumerate these permanent keys and current fences does not support
+the local profile. Protected storage, key custody, backup controls, and ADR
+0019 consensus authentication remain defense in depth rather than a substitute
+for this effect-time fence.
 
 ## 13. Observability and Evidence
 
@@ -1002,9 +1103,13 @@ passes before the implementing surface exists is not evidence of this RFC.
 11. Third-party backend conformance runs the published SDK harness against a
     real backend profile. The default backend remains unsupported; a backend
     cannot opt in with mock success alone.
-12. Upgrade tests prove live legacy maps are never silently adopted, only a
-    proven-empty namespace may initialize, cleanup-only migration is explicit,
-    and decommission does not automatically erase durable history.
+12. Upgrade tests prove live legacy maps are never silently adopted, ordinary
+    startup rejects an absent reserved record, only an exact pre-provisioned
+    record may initialize, and cleanup-only migration is explicit. Decommission
+    fault injection covers every ledger/marker/stamp/readback/graph-removal
+    boundary and proves `Decommissioned` plus all history remain permanent.
+    Removing the database, maps, stamp map, and marker after decommission still
+    cannot make ordinary startup provision or initialize the tuple.
 13. Fix-removal tests independently remove operation-stamp validation, phase
     generation advancement, protected-store admission, canonical storage-key
     derivation, and supervisor ownership; each mutation goes RED without
@@ -1019,10 +1124,24 @@ passes before the implementing surface exists is not evidence of this RFC.
 15. Restart tests reuse the durable selector-backend epoch only after fencing
     the prior host/lease owner, and reject random process incarnation,
     replacement, missing stamp map, stale stamp, and epoch rotation/adoption.
-16. Stamp-inventory tests cover every row in the ledger/stamp table, extra and
-    missing keys, pending-to-terminal replacement, response loss at each stamp/
-    journal/CAS boundary, and a clone racing the original under the real backend
-    ownership gate. No semantic readback or mock receipt settles a mismatch.
+16. Stamp-inventory tests cover every row in the ledger/stamp table; the exact
+    `absent -> pending-install -> terminal-active -> pending-remove ->
+    terminal-retired` CAS chain; the predecessor's permanent retired key plus a
+    distinct exact-reissue successor key; extra and missing keys; and response
+    loss or process death after every pending/terminal stamp write and before
+    every matching ledger CAS. Independent ledger-only and stamp-map-only
+    rollback, full-capacity inventory, and a clone racing the original under the
+    real backend ownership gate all fail closed. No semantic readback or mock
+    receipt settles a mismatch.
+17. Storage-codec golden vectors cover every byte of `StorageKeySeedCodecV1`,
+    the reserved stable ID, `StorageScopeCodecV1`, its commitment, the
+    selector-secret commitment, the exact 145-byte binding, and marker digest.
+    One-field mutations cover tenant, NF kind, key type, stable ID,
+    protected-backend scope, device, pin, ledger ID, selector-secret
+    commitment, storage-scope commitment, and backend epoch. Local and remote
+    wrappers produce identical SDK scope/binding bytes; cross-store and
+    cross-tenant aliases, external-backend substitution, unknown versions, and
+    migration without an explicit codec version are rejected.
 
 The privileged test is environment-specific evidence and may be isolated from
 ordinary unprivileged CI. It remains mandatory before a release claims the
