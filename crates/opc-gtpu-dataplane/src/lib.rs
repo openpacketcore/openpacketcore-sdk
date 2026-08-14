@@ -144,6 +144,13 @@ pub use selector_namespace::{
 pub(crate) use selector_namespace::{
     InMemoryGtpuSessionSelectorNamespace, InMemoryGtpuSessionSelectorNamespaceStore,
 };
+pub use selector_namespace_v2::{
+    GtpuSessionSelectorNamespaceLossInspectionRequest, GtpuSessionSelectorNamespaceLossObservation,
+    GtpuSessionSelectorNamespaceRestoreReadbackReceipt,
+    GtpuSessionSelectorNamespaceRestoreReadbackRequest, GtpuSessionSelectorNamespaceRestoreReceipt,
+    GtpuSessionSelectorNamespaceRestoreRequest, GtpuSessionSelectorRetiredDrainReceipt,
+    GtpuSessionSelectorRetiredDrainRequest,
+};
 pub use tft_classifier::{
     TftUplinkBearer, TftUplinkClassification, TftUplinkClassifier, TftUplinkClassifierReadback,
     TftUplinkClassifierReconcileOutcome, TftUplinkClassifierRemovalOutcome, TftUplinkDropReason,

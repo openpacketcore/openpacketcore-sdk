@@ -1,9 +1,4 @@
-//! RFC 017 canonical selector-namespace authority codecs.
-
-#![allow(
-    dead_code,
-    reason = "This staged internal RFC 017 codec is wired by the immediately following implementation slice."
-)]
+//! RFC 017 selector-namespace authority codecs and opaque backend carriers.
 
 use std::num::NonZeroU64;
 
@@ -12,22 +7,46 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 const BACKEND_FENCE_COORDINATE_V2_LEN: usize = 32;
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 const NEXT_LOSS_ENTRY_SCHEDULE_V2_LEN: usize = 120;
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 const BACKEND_FENCE_COORDINATE_DOMAIN_V2: &[u8] =
     b"opc/gtpu-selector/backend-fence-coordinate/v2\0";
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SelectorNamespaceCodecError {
     InvalidEncoding,
 }
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 impl SelectorNamespaceCodecError {
     const fn invalid() -> Self {
         Self::InvalidEncoding
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BackendFencePhaseV2 {
@@ -44,6 +63,10 @@ enum BackendFencePhaseV2 {
     Decommissioned = 11,
 }
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 impl BackendFencePhaseV2 {
     const fn from_tag(tag: u8) -> Option<Self> {
         match tag {
@@ -70,6 +93,10 @@ impl BackendFencePhaseV2 {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BackendFenceOutcomeV2 {
@@ -77,6 +104,10 @@ enum BackendFenceOutcomeV2 {
     Complete = 2,
 }
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 impl BackendFenceOutcomeV2 {
     const fn from_tag(tag: u8) -> Option<Self> {
         match tag {
@@ -87,8 +118,16 @@ impl BackendFenceOutcomeV2 {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 struct SelectorNamespaceCommitmentV2([u8; 32]);
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 impl SelectorNamespaceCommitmentV2 {
     fn new(value: [u8; 32]) -> Result<Self, SelectorNamespaceCodecError> {
         if bool::from(value.ct_eq(&[0; 32])) {
@@ -103,8 +142,16 @@ impl SelectorNamespaceCommitmentV2 {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 struct SelectorNamespaceCommitmentKeyV2(Zeroizing<[u8; 32]>);
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 impl SelectorNamespaceCommitmentKeyV2 {
     fn new(value: [u8; 32]) -> Result<Self, SelectorNamespaceCodecError> {
         if bool::from(value.ct_eq(&[0; 32])) {
@@ -127,6 +174,10 @@ impl SelectorNamespaceCommitmentKeyV2 {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 struct BackendFenceCoordinateCodecV2 {
     phase: BackendFencePhaseV2,
     outcome: BackendFenceOutcomeV2,
@@ -134,6 +185,10 @@ struct BackendFenceCoordinateCodecV2 {
     nonce: [u8; 16],
 }
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 impl BackendFenceCoordinateCodecV2 {
     fn new(
         phase: BackendFencePhaseV2,
@@ -207,6 +262,10 @@ impl BackendFenceCoordinateCodecV2 {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 struct NextLossEntryScheduleCodecV2 {
     namespace_binding: [u8; 32],
     expected_stable_coordinate_commitment: [u8; 32],
@@ -216,6 +275,10 @@ struct NextLossEntryScheduleCodecV2 {
     quiesce_completion_nonce: [u8; 16],
 }
 
+#[allow(
+    dead_code,
+    reason = "The staged RFC 017 coordinator has not yet wired the durable codec."
+)]
 impl NextLossEntryScheduleCodecV2 {
     fn new(
         namespace_binding: &SelectorNamespaceCommitmentV2,
@@ -303,6 +366,209 @@ impl NextLossEntryScheduleCodecV2 {
         encoded[96..104].copy_from_slice(&self.quiesce_completion_generation.get().to_be_bytes());
         encoded[104..120].copy_from_slice(&self.quiesce_completion_nonce);
         encoded
+    }
+}
+
+/// Opaque RFC 017 operation class carried by one SDK-minted backend request.
+#[allow(
+    dead_code,
+    reason = "The coordinator minting and receipt-verification slice follows this port definition."
+)]
+enum SelectorNamespaceBackendOperationV2 {
+    RetiredDrainQualification,
+    LossInspection,
+    NamespaceRestore,
+    NamespaceRestoreReadback,
+}
+
+/// Exact private coordinator context for one RFC 017 backend operation.
+///
+/// This is intentionally not a public capability or serialization format. It
+/// retains every commitment needed by later coordinator/backend wiring to
+/// reject namespace, group, desired graph, operation, generation, nonce, and
+/// epoch substitution before any effect.
+#[allow(
+    dead_code,
+    reason = "The coordinator minting and receipt-verification slice follows this port definition."
+)]
+struct SelectorNamespaceBackendCoordinateV2 {
+    namespace_binding_commitment: [u8; 32],
+    device_commitment: [u8; 32],
+    group_commitment: [u8; 32],
+    selector_set_commitment: [u8; 32],
+    desired_commitment: [u8; 32],
+    namespace_state_commitment: [u8; 32],
+    retained_marker_commitment: [u8; 32],
+    generation: NonZeroU64,
+    nonce: [u8; 16],
+    backend_epoch: [u8; 16],
+    operation: SelectorNamespaceBackendOperationV2,
+}
+
+/// Opaque request to qualify the complete drain of one retired selector source.
+///
+/// Only the RFC 017 coordinator can mint this request. It deliberately has no
+/// public fields, constructors, decoders, verifiers, formatting, cloning, or
+/// serialization traits.
+#[must_use = "a retired-drain request must be consumed by its backend call"]
+pub struct GtpuSessionSelectorRetiredDrainRequest {
+    #[allow(
+        dead_code,
+        reason = "The coordinator receipt-verification slice follows this port definition."
+    )]
+    coordinate: SelectorNamespaceBackendCoordinateV2,
+}
+
+/// Opaque receipt for one qualified retired-selector drain.
+///
+/// A future coordinator slice is the sole successful receipt builder.
+#[must_use = "a retired-drain receipt must be consumed by the coordinator"]
+pub struct GtpuSessionSelectorRetiredDrainReceipt {
+    #[allow(
+        dead_code,
+        reason = "The coordinator receipt-verification slice follows this port definition."
+    )]
+    coordinate: SelectorNamespaceBackendCoordinateV2,
+}
+
+/// Opaque request to inspect complete mutable-loss for one selector namespace.
+///
+/// Only the RFC 017 coordinator can mint this request. It deliberately has no
+/// public fields, constructors, decoders, verifiers, formatting, cloning, or
+/// serialization traits.
+#[must_use = "a loss-inspection request must be consumed by its backend call"]
+pub struct GtpuSessionSelectorNamespaceLossInspectionRequest {
+    #[allow(
+        dead_code,
+        reason = "The coordinator receipt-verification slice follows this port definition."
+    )]
+    coordinate: SelectorNamespaceBackendCoordinateV2,
+}
+
+/// Opaque observation of complete mutable selector-namespace loss.
+///
+/// A future coordinator slice is the sole successful observation builder.
+#[must_use = "a loss observation must be consumed by the coordinator"]
+pub struct GtpuSessionSelectorNamespaceLossObservation {
+    #[allow(
+        dead_code,
+        reason = "The coordinator receipt-verification slice follows this port definition."
+    )]
+    coordinate: SelectorNamespaceBackendCoordinateV2,
+}
+
+/// Opaque request to restore one complete selector namespace after qualified loss.
+///
+/// Only the RFC 017 coordinator can mint this request. It deliberately has no
+/// public fields, constructors, decoders, verifiers, formatting, cloning, or
+/// serialization traits.
+#[must_use = "a namespace-restore request must be consumed by its backend call"]
+pub struct GtpuSessionSelectorNamespaceRestoreRequest {
+    #[allow(
+        dead_code,
+        reason = "The coordinator receipt-verification slice follows this port definition."
+    )]
+    coordinate: SelectorNamespaceBackendCoordinateV2,
+}
+
+/// Opaque receipt for one completed selector-namespace restore effect.
+///
+/// A future coordinator slice is the sole successful receipt builder.
+#[must_use = "a restore receipt must be consumed by the readback coordinator"]
+pub struct GtpuSessionSelectorNamespaceRestoreReceipt {
+    #[allow(
+        dead_code,
+        reason = "The coordinator receipt-verification slice follows this port definition."
+    )]
+    coordinate: SelectorNamespaceBackendCoordinateV2,
+}
+
+/// Opaque request for the exact readback of one completed namespace restore.
+///
+/// Only the RFC 017 coordinator can mint this request. It deliberately has no
+/// public fields, constructors, decoders, verifiers, formatting, cloning, or
+/// serialization traits.
+#[must_use = "a restore readback request must be consumed by its backend call"]
+pub struct GtpuSessionSelectorNamespaceRestoreReadbackRequest {
+    #[allow(
+        dead_code,
+        reason = "The coordinator receipt-verification slice follows this port definition."
+    )]
+    coordinate: SelectorNamespaceBackendCoordinateV2,
+}
+
+/// Opaque exact readback receipt for one selector-namespace restore.
+///
+/// A future coordinator slice is the sole successful receipt builder.
+#[must_use = "a restore readback receipt must be consumed by the coordinator"]
+pub struct GtpuSessionSelectorNamespaceRestoreReadbackReceipt {
+    #[allow(
+        dead_code,
+        reason = "The coordinator receipt-verification slice follows this port definition."
+    )]
+    coordinate: SelectorNamespaceBackendCoordinateV2,
+}
+
+#[cfg(test)]
+fn test_backend_coordinate(
+    operation: SelectorNamespaceBackendOperationV2,
+) -> SelectorNamespaceBackendCoordinateV2 {
+    SelectorNamespaceBackendCoordinateV2 {
+        namespace_binding_commitment: [1; 32],
+        device_commitment: [2; 32],
+        group_commitment: [3; 32],
+        selector_set_commitment: [4; 32],
+        desired_commitment: [5; 32],
+        namespace_state_commitment: [6; 32],
+        retained_marker_commitment: [7; 32],
+        generation: NonZeroU64::MIN,
+        nonce: [8; 16],
+        backend_epoch: [9; 16],
+        operation,
+    }
+}
+
+#[cfg(test)]
+impl GtpuSessionSelectorRetiredDrainRequest {
+    pub(crate) fn for_test() -> Self {
+        Self {
+            coordinate: test_backend_coordinate(
+                SelectorNamespaceBackendOperationV2::RetiredDrainQualification,
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+impl GtpuSessionSelectorNamespaceLossInspectionRequest {
+    pub(crate) fn for_test() -> Self {
+        Self {
+            coordinate: test_backend_coordinate(
+                SelectorNamespaceBackendOperationV2::LossInspection,
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+impl GtpuSessionSelectorNamespaceRestoreRequest {
+    pub(crate) fn for_test() -> Self {
+        Self {
+            coordinate: test_backend_coordinate(
+                SelectorNamespaceBackendOperationV2::NamespaceRestore,
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+impl GtpuSessionSelectorNamespaceRestoreReadbackRequest {
+    pub(crate) fn for_test() -> Self {
+        Self {
+            coordinate: test_backend_coordinate(
+                SelectorNamespaceBackendOperationV2::NamespaceRestoreReadback,
+            ),
+        }
     }
 }
 
