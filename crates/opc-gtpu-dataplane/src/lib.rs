@@ -60,11 +60,15 @@ pub mod linux;
 pub mod mock;
 pub mod model;
 pub mod reassembly;
+pub mod selector_namespace;
 pub mod tft_classifier;
 pub mod traffic_observation;
 pub mod unsupported;
 
-pub use backend::GtpuDataplaneBackend;
+pub use backend::{
+    GtpuDataplaneBackend, GtpuSessionSelectorInstallRecovery, GtpuSessionSelectorInstallResume,
+    GtpuSessionSelectorRetiringRecovery, GtpuSessionSelectorRetiringResume,
+};
 pub use ebpf::{
     probe_committed_classifier_load, ClassifierLoadBlocker, ClassifierLoadCapability,
     EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuDataplaneBackend,
@@ -119,6 +123,24 @@ pub use reassembly::{
     reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuReassemblyConsumer,
     GtpuReassemblyCounters, GtpuReassemblyDrop, GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome,
     GtpuReassemblyPdr, GtpuReassemblySelector,
+};
+pub use selector_namespace::GtpuSelectorNamespaceBootstrap;
+pub use selector_namespace::{
+    GtpuSessionSelectorActiveClaim, GtpuSessionSelectorAdmission,
+    GtpuSessionSelectorAuthorityGeneration, GtpuSessionSelectorBackendBinding,
+    GtpuSessionSelectorBackendReceipt, GtpuSessionSelectorBindingLease,
+    GtpuSessionSelectorCoordinatorError, GtpuSessionSelectorDecommissionInspectRequest,
+    GtpuSessionSelectorDecommissionReadbackRequest, GtpuSessionSelectorDecommissionRequest,
+    GtpuSessionSelectorEffectRequest, GtpuSessionSelectorNamespaceAuthority,
+    GtpuSessionSelectorNamespaceError, GtpuSessionSelectorOperation,
+    GtpuSessionSelectorProvisionRequest, GtpuSessionSelectorReadbackRequest,
+    GtpuSessionSelectorRemovalRequest, GtpuSessionSelectorRetiredClaim,
+    GtpuSessionSelectorReuseAuthorization, GtpuSessionSelectorReuseReceipt,
+    GtpuSessionSelectorReuseRequest,
+};
+#[cfg(test)]
+pub(crate) use selector_namespace::{
+    InMemoryGtpuSessionSelectorNamespace, InMemoryGtpuSessionSelectorNamespaceStore,
 };
 pub use tft_classifier::{
     TftUplinkBearer, TftUplinkClassification, TftUplinkClassifier, TftUplinkClassifierReadback,

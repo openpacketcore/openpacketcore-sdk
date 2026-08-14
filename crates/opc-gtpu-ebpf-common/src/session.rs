@@ -23,6 +23,13 @@ pub const GTPU_SESSION_ENTRY_LEN: usize = 80;
 pub const GTPU_SESSION_GROUP_VALUE_LEN: usize = 208;
 /// Fixed byte width of one durable grouped-session transaction journal.
 pub const GTPU_SESSION_TRANSACTION_VALUE_LEN: usize = 464;
+
+/// Fixed byte width of one userspace-only selector-authority operation stamp.
+///
+/// This is deliberately separate from the legacy transaction journal so the
+/// journal's stable ABI remains unchanged while selector authority is bound to
+/// every grouped effect and exact terminal readback.
+pub const GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN: usize = 208;
 /// Fixed byte width of managed grouped-session device configuration.
 pub const GTPU_SESSION_CONFIG_VALUE_LEN: usize = 64;
 

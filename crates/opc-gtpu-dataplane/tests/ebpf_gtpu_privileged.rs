@@ -72,11 +72,10 @@ use opc_gtpu_dataplane::{
     GtpuLocalEndpointSet, GtpuOuterFragmentPolicy, GtpuReassemblyConsumer, GtpuReassemblyDrop,
     GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome, GtpuReassemblyPdr, GtpuReassemblySelector,
     GtpuReassemblySocket, GtpuSessionAttachmentSelector, GtpuSessionDeviceId, GtpuSessionEntry,
-    GtpuSessionGroup, GtpuSessionGroupId, GtpuSessionGroupReadback,
-    GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
-    GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionSelectorProvenance,
-    GtpuSourcePortPolicy, GtpuTrafficProofAuthority, GtpuTrafficProofDispatchError,
-    GtpuTrafficProofDispatchPort, GtpuTrafficProofDispatchReceipt, GtpuTrafficProofDispatchRequest,
+    GtpuSessionGroup, GtpuSessionGroupId, GtpuSessionGroupReadback, GtpuSessionGroupRemovalOutcome,
+    GtpuSessionGroupSelector, GtpuSessionSelectorNamespaceAuthority, GtpuSourcePortPolicy,
+    GtpuTrafficProofAuthority, GtpuTrafficProofDispatchError, GtpuTrafficProofDispatchPort,
+    GtpuTrafficProofDispatchReceipt, GtpuTrafficProofDispatchRequest,
     GtpuTrafficProofDispatchRoute, GtpuTrafficProofInvalidation, GtpuTrafficProofPoll,
     GtpuTrafficProofValidation, GtpuUplinkChecksumOffloadContract, GtpuUplinkMtuPolicy,
     GtpuUplinkSourcePortPolicy, GtpuV2DrainProof, PdpContextIndeterminateReason,
@@ -134,10 +133,16 @@ use opc_ipsec_xfrm::{
     SaParameters, UdpEncap, XfrmAction, XfrmBackend, XfrmDirection, XfrmId, XfrmLookupMark,
     XfrmMark, XfrmMode, XfrmRequestId, XfrmSelector, XfrmTemplate,
 };
+use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_proto_tft::{
     PacketFilter, PacketFilterComponent, PacketFilterDirection, PacketFilterIdentifier, PortRange,
     TrafficFlowTemplate,
 };
+use opc_session_store::{
+    EncryptingSessionBackend, OwnerId, SelectorLedgerStorageScope, SessionStore,
+    SqliteSessionBackend,
+};
+use opc_types::{NetworkFunctionKind, TenantId};
 
 sockopt_impl!(
     UdpEspInUdp,
@@ -1099,9 +1104,52 @@ fn crossed_grouped_session(link_ifindex: u32) -> GtpuSessionGroup {
     .expect("canonical crossed dual-stack group")
 }
 
-fn fresh_grouped_reconcile(group: GtpuSessionGroup) -> GtpuSessionGroupReconcileRequest {
-    GtpuSessionGroupReconcileRequest::new(group, GtpuSessionSelectorProvenance::Fresh)
-        .expect("fresh grouped selector provenance")
+async fn reconcile_fresh_grouped(
+    backend: Arc<EbpfGtpuDataplaneBackend>,
+    group: GtpuSessionGroup,
+) -> Result<(), GtpuError> {
+    let device_id = group.device_id();
+    let scope = SelectorLedgerStorageScope::new(
+        TenantId::from_static("privileged-ebpf-test"),
+        NetworkFunctionKind::from_static("epdg"),
+    );
+    let provider = Arc::new(MemoryKeyProvider::new());
+    provider
+        .insert_active_key(
+            KeyId::new("privileged-ebpf-selector-ledger-key").expect("valid test key ID"),
+            KeyPurpose::Session,
+            scope.tenant().clone(),
+            Zeroizing::new([0x5a; AES_256_GCM_SIV_KEY_LEN]),
+        )
+        .expect("install protected selector-ledger test key");
+    let bootstrap = backend.selector_namespace_bootstrap(device_id).await?;
+    let namespace = GtpuSessionSelectorNamespaceAuthority::provision_protected(
+        SessionStore::new(EncryptingSessionBackend::new(
+            Arc::new(
+                SqliteSessionBackend::in_memory()
+                    .expect("in-memory durable selector namespace store"),
+            ),
+            provider,
+            "privileged-ebpf-selector-ledger",
+        )),
+        scope,
+        bootstrap,
+        backend.clone(),
+        OwnerId::new("privileged-ebpf-test-owner").expect("valid durable namespace owner"),
+        Duration::from_secs(30),
+        32,
+    )
+    .await
+    .map_err(|_| GtpuError::UnsupportedFeature {
+        feature: "selector_namespace_test_coordinator",
+    })?;
+    namespace
+        .reconcile_fresh(backend, group)
+        .await
+        .map(|_| ())
+        .map_err(|_| GtpuError::UnsupportedFeature {
+            feature: "selector_namespace_test_coordinator",
+        })
 }
 
 fn grouped_attachment(device: &GtpDevice) -> GtpuSessionAttachmentSelector {
@@ -6491,10 +6539,12 @@ async fn ebpf_gtpu_uplink_selected_source_port_on_the_wire(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let net = TestNet::provision();
-    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
-        bpffs_pin_root: net.pin_root.clone(),
-        ..EbpfGtpuDataplaneBackendConfig::default()
-    });
+    let backend = Arc::new(EbpfGtpuDataplaneBackend::with_config(
+        EbpfGtpuDataplaneBackendConfig {
+            bpffs_pin_root: net.pin_root.clone(),
+            ..EbpfGtpuDataplaneBackendConfig::default()
+        },
+    ));
     let mut request = CreateGtpDeviceRequest::new("s2bu");
     request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
     let device = backend.create_device(request).await?;
@@ -7755,10 +7805,12 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let net = TestNet::provision();
-    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
-        bpffs_pin_root: net.pin_root.clone(),
-        ..EbpfGtpuDataplaneBackendConfig::default()
-    });
+    let backend = Arc::new(EbpfGtpuDataplaneBackend::with_config(
+        EbpfGtpuDataplaneBackendConfig {
+            bpffs_pin_root: net.pin_root.clone(),
+            ..EbpfGtpuDataplaneBackendConfig::default()
+        },
+    ));
     let device = backend
         .create_device_with_endpoints(grouped_device_request(grouped_mtu_policy()))
         .await?;
@@ -7788,12 +7840,7 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
             GtpuSessionEntry::new(grouped_v6, IpAddr::V6(EPDG_S2BU_IPV6))?,
         ],
     )?;
-    assert_eq!(
-        backend
-            .reconcile_pdp_context_group(fresh_grouped_reconcile(desired.clone()))
-            .await?,
-        GtpuSessionGroupReconcileOutcome::Activated
-    );
+    reconcile_fresh_grouped(backend.clone(), desired.clone()).await?;
     assert_eq!(
         backend
             .read_pdp_context_group(GtpuSessionGroupSelector::new(
@@ -8387,7 +8434,7 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
     };
     let policy = GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::SignalPacketTooBig)
         .expect("canonical dual-stack PMTU policy");
-    let backend = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let backend = Arc::new(EbpfGtpuDataplaneBackend::with_config(config.clone()));
     let device = backend
         .create_device_with_endpoints(grouped_device_request(policy))
         .await?;
@@ -8418,12 +8465,7 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
     );
 
     let initial = initial_grouped_session(device.ifindex);
-    assert_eq!(
-        backend
-            .reconcile_pdp_context_group(fresh_grouped_reconcile(initial.clone()))
-            .await?,
-        GtpuSessionGroupReconcileOutcome::Activated
-    );
+    reconcile_fresh_grouped(backend.clone(), initial.clone()).await?;
     assert_eq!(
         backend
             .read_pdp_context_group(GtpuSessionGroupSelector::new(
@@ -8753,12 +8795,7 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
     // One atomic N -> N+1 reconciliation crosses both outer families, rotates
     // both TEIDs, and relocates both peers while preserving one logical group.
     let crossed = crossed_grouped_session(device.ifindex);
-    assert_eq!(
-        backend
-            .reconcile_pdp_context_group(fresh_grouped_reconcile(crossed.clone()))
-            .await?,
-        GtpuSessionGroupReconcileOutcome::Activated
-    );
+    reconcile_fresh_grouped(backend.clone(), crossed.clone()).await?;
     assert_eq!(
         backend
             .read_pdp_context_group(GtpuSessionGroupSelector::new(

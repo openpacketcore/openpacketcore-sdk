@@ -1892,6 +1892,37 @@ with a boot identity if a baseline has to outlive the host.
 
 ### Grouped dual-stack eBPF contract
 
+#### Selector namespace admission
+
+Products open `GtpuSessionSelectorNamespaceAuthority` only through
+`open_protected`, using an SDK-owned `EncryptingSessionBackend` or
+`RemoteSealingSessionBackend` around the durable store, then call
+`reconcile_fresh` rather than constructing a grouped reconcile request. The
+SDK derives the ledger key from that sealed payload boundary, the explicit
+tenant/NF storage scope, and the stable device; products cannot select a raw
+namespace key or assert their own protection boundary. It creates the private
+request around an opaque, affine `GtpuSessionSelectorAdmission`, binding the
+stable device namespace, exact group ID, canonical complete set of uplink
+`(family, PAA, mark)` and downlink `(outer family, inner family, local TEID)`
+selector atoms, and a nonzero authority generation. `Fresh` is not a public
+assertion and no public constructor can replay or cross-bind an admission.
+
+`GtpuSessionSelectorNamespaceAuthority` owns this transition over the
+SDK-protected `SessionStore` boundary. The store persists the entire opaque,
+versioned ledger as one durable multiprocess compare-and-swap record, sealed
+before reaching its underlying adapter. It includes all atom claims, group/set
+bindings, permanent tombstones, the authority generation, and committed
+device/key/capacity configuration, so the ordinary sequential session-store
+batch API is not sufficient. The supplied
+`InMemoryGtpuSessionSelectorNamespaceStore` is only a deterministic
+conformance model, not a production authority. On ambiguous durable
+completion, the coordinator reads back the exact mutation fingerprint; if it
+is not exact, it fails closed. A durable adapter retains a Retiring or Poisoned
+state for unresolved external teardown. Retire the authority claim before
+dataplane removal and require product-owned drain/RCU evidence before reissuing
+a retired selector set. Diagnostics expose only bounded state classifications,
+never selector, subscriber, or digest values.
+
 The public grouped-session API is additive. Existing `GtpuProbe` fields and
 legacy v5 map-key bytes are unchanged. The current eBPF backend opts in only
 after the live attachment proves its exact schema, configuration, named map

@@ -12,7 +12,8 @@ use std::{fmt, future::Future, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use futures_util::future::join_all;
 use opc_key::{KeyProvider, RemoteSealProvider};
-use opc_types::Timestamp;
+use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+use sha2::{Digest, Sha256};
 
 use crate::{
     capability::BackendCapabilities,
@@ -1418,6 +1419,150 @@ pub trait SessionBackend: Send + Sync {
     }
 }
 
+/// Administrative RFC004 storage scope for one selector ledger.
+///
+/// The scope is supplied once by an administrator rather than derived from a
+/// crypto-provider identity.  The dataplane derives only the opaque stable ID
+/// from the protected payload boundary and stable device namespace.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SelectorLedgerStorageScope {
+    tenant: TenantId,
+    nf_kind: NetworkFunctionKind,
+}
+
+impl SelectorLedgerStorageScope {
+    /// Construct one explicit validated storage scope.
+    #[must_use]
+    pub const fn new(tenant: TenantId, nf_kind: NetworkFunctionKind) -> Self {
+        Self { tenant, nf_kind }
+    }
+
+    /// Tenant owning this durable ledger.
+    #[must_use]
+    pub const fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    /// Network-function kind owning this durable ledger.
+    #[must_use]
+    pub const fn nf_kind(&self) -> &NetworkFunctionKind {
+        &self.nf_kind
+    }
+}
+
+impl fmt::Debug for SelectorLedgerStorageScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SelectorLedgerStorageScope(<redacted>)")
+    }
+}
+
+/// SDK-minted protected base for a selector-ledger durable-key derivation.
+///
+/// This value carries the administrative routing coordinates together with the
+/// protected payload boundary's nonsecret commitment.  Its fields are private:
+/// product code may route with the accessors, but cannot construct or
+/// substitute a backend-scope commitment.  The dataplane consumes this base
+/// with an affine eBPF namespace bootstrap to derive the final durable key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProtectedSelectorLedgerBase {
+    tenant: TenantId,
+    nf_kind: NetworkFunctionKind,
+    protected_payload_scope_commitment: [u8; 32],
+}
+
+impl ProtectedSelectorLedgerBase {
+    pub(crate) fn mint(
+        scope: &SelectorLedgerStorageScope,
+        protected_payload_scope_commitment: [u8; 32],
+    ) -> Self {
+        Self {
+            tenant: scope.tenant.clone(),
+            nf_kind: scope.nf_kind.clone(),
+            protected_payload_scope_commitment,
+        }
+    }
+
+    /// Tenant that routes the resulting selector ledger.
+    #[must_use]
+    pub const fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    /// Network-function kind that routes the resulting selector ledger.
+    #[must_use]
+    pub const fn nf_kind(&self) -> &NetworkFunctionKind {
+        &self.nf_kind
+    }
+
+    /// Nonsecret commitment to the SDK-owned protected payload boundary.
+    #[must_use]
+    pub const fn protected_payload_scope_commitment(&self) -> [u8; 32] {
+        self.protected_payload_scope_commitment
+    }
+}
+
+impl fmt::Debug for ProtectedSelectorLedgerBase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProtectedSelectorLedgerBase(<redacted>)")
+    }
+}
+
+fn protected_payload_scope_commitment(namespace: &str) -> Option<[u8; 32]> {
+    if namespace.is_empty() || namespace.len() > 128 || namespace.as_bytes().contains(&b'\0') {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"opc/session-store/protected-payload-scope/v1\0");
+    digest.update([1]);
+    digest.update((namespace.len() as u64).to_be_bytes());
+    digest.update(namespace.as_bytes());
+    Some(digest.finalize().into())
+}
+
+/// SDK-owned sealing boundary for protected session backends.
+///
+/// This deliberately remains crate-private: product adapters compose under
+/// [`EncryptingSessionBackend`] or [`RemoteSealingSessionBackend`] instead of
+/// asserting their own payload-protection authority.
+pub(crate) mod protected_session_backend_seal {
+    pub trait Sealed {
+        fn protected_payload_scope_commitment(&self) -> Option<[u8; 32]>;
+    }
+}
+
+/// Product-neutral proof that a backend is wrapped by one of the SDK-owned
+/// authenticated payload-protection adapters.
+///
+/// This trait is sealed. Third-party stores compose underneath
+/// [`EncryptingSessionBackend`] or [`RemoteSealingSessionBackend`]; remote seal
+/// providers continue to compose through the latter wrapper. They cannot mint
+/// a protected selector authority by implementing this trait themselves.
+///
+/// ```compile_fail
+/// use opc_session_store::ProtectedSessionBackend;
+///
+/// struct ProductBackend;
+///
+/// // Fails: the SDK-owned sealed supertrait is not externally nameable.
+/// impl ProtectedSessionBackend for ProductBackend {}
+/// ```
+pub trait ProtectedSessionBackend:
+    SessionBackend + SessionLeaseManager + protected_session_backend_seal::Sealed
+{
+}
+
+impl<B> ProtectedSessionBackend for B where
+    B: SessionBackend + SessionLeaseManager + protected_session_backend_seal::Sealed
+{
+}
+
+pub(crate) fn protected_payload_scope_commitment_for<B>(backend: &B) -> Option<[u8; 32]>
+where
+    B: ProtectedSessionBackend + ?Sized,
+{
+    backend.protected_payload_scope_commitment()
+}
+
 /// Opaque process-local identity for standalone adapter-alias detection.
 ///
 /// Debug output is redacted because the value is derived from an allocation
@@ -2010,6 +2155,16 @@ where
     }
 }
 
+impl<B, P> protected_session_backend_seal::Sealed for EncryptingSessionBackend<B, P>
+where
+    B: SessionBackend + SessionLeaseManager + ?Sized + 'static,
+    P: KeyProvider + ?Sized + 'static,
+{
+    fn protected_payload_scope_commitment(&self) -> Option<[u8; 32]> {
+        protected_payload_scope_commitment(self.backend_namespace())
+    }
+}
+
 /// Session-backend wrapper that delegates payload sealing to a remote KMS/HSM.
 ///
 /// This is an opt-in alternative to [`EncryptingSessionBackend`]. The default
@@ -2443,6 +2598,36 @@ where
 
     async fn release(&self, lease: LeaseGuard) -> Result<(), LeaseError> {
         self.inner.release(lease).await
+    }
+}
+
+impl<B, S> protected_session_backend_seal::Sealed for RemoteSealingSessionBackend<B, S>
+where
+    B: SessionBackend + SessionLeaseManager + ?Sized + 'static,
+    S: RemoteSealProvider + ?Sized + 'static,
+{
+    fn protected_payload_scope_commitment(&self) -> Option<[u8; 32]> {
+        protected_payload_scope_commitment(self.backend_namespace())
+    }
+}
+
+#[cfg(test)]
+mod protected_session_backend_tests {
+    use super::*;
+
+    #[test]
+    fn only_sdk_owned_protection_wrappers_satisfy_the_sealed_authority_bound() {
+        fn assert_protected<B: ProtectedSessionBackend>() {}
+
+        assert_protected::<
+            EncryptingSessionBackend<crate::fake::FakeSessionBackend, opc_key::MemoryKeyProvider>,
+        >();
+        assert_protected::<
+            RemoteSealingSessionBackend<
+                crate::fake::FakeSessionBackend,
+                opc_key::MemoryRemoteSealProvider,
+            >,
+        >();
     }
 }
 
