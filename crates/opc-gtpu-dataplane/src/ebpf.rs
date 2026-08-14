@@ -47906,16 +47906,18 @@ mod tests {
             .traffic_observation_registrations
             .contains_key(&(S2BU_IFINDEX, group.id().to_bytes())));
         drop(abandoned);
-        for _ in 0..64 {
-            if !runtime
-                .state()
-                .traffic_observation_registrations
-                .contains_key(&(S2BU_IFINDEX, group.id().to_bytes()))
-            {
-                break;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                // Host-attempt removal is the terminal cleanup step, after
+                // both pinned registration and redirect removal/readback.
+                if backend.traffic_attempts().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
+        })
+        .await
+        .expect("abandoned proof cleanup must finish within its bounded worker window");
         assert!(!runtime
             .state()
             .traffic_observation_registrations
@@ -47939,16 +47941,20 @@ mod tests {
         let retained_inner = Arc::downgrade(&backend.inner);
         drop(backend);
         drop(session);
-        for _ in 0..64 {
-            if !runtime
-                .state()
-                .traffic_observation_registrations
-                .contains_key(&(S2BU_IFINDEX, group.id().to_bytes()))
-            {
-                break;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let cleanup_finished = match retained_inner.upgrade() {
+                    Some(inner) => inner.traffic_observations.lock().unwrap().is_empty(),
+                    None => true,
+                };
+                if cleanup_finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
+        })
+        .await
+        .expect("retained proof cleanup must finish within its bounded worker window");
         assert!(!runtime
             .state()
             .traffic_observation_registrations
