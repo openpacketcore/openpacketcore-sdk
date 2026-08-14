@@ -79,7 +79,8 @@ use opc_gtpu_ebpf_common::{
     GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN, GTPU_SESSION_CONFIG_KEY,
     GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
     GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
-    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
+    GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN,
+    GTPU_SESSION_UPLINK_KEY_LEN,
     GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, GTPU_TRAFFIC_OBSERVATION_GATE_INDEX,
     GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN,
@@ -254,6 +255,17 @@ static GTPU_SESS_TXN: HashMap<
     [u8; GTPU_SESSION_GROUP_ID_LEN],
     [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN],
 > = HashMap::pinned(65536, 0);
+
+/// Durable selector-authority operation stamps; tc never reads this map.
+///
+/// Kept separate from `GTPU_SESS_TXN` so the transaction journal ABI stays
+/// stable while userspace verifies authority coordinates before any effect or
+/// terminal readback.
+#[map]
+static GTPU_SEL_STAMP: HashMap<
+    [u8; GTPU_SESSION_GROUP_ID_LEN],
+    [u8; GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN],
+> = HashMap::pinned(1024, 0);
 
 /// Stable grouped-session device identity and local endpoint set.
 #[map]

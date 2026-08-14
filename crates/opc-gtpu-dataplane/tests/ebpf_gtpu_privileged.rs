@@ -48,8 +48,9 @@ use std::fs;
 use std::io::{self, IoSliceMut, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -72,16 +73,15 @@ use opc_gtpu_dataplane::{
     GtpuLocalEndpointSet, GtpuOuterFragmentPolicy, GtpuReassemblyConsumer, GtpuReassemblyDrop,
     GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome, GtpuReassemblyPdr, GtpuReassemblySelector,
     GtpuReassemblySocket, GtpuSessionAttachmentSelector, GtpuSessionDeviceId, GtpuSessionEntry,
-    GtpuSessionGroup, GtpuSessionGroupId, GtpuSessionGroupReadback,
-    GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
-    GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionSelectorProvenance,
-    GtpuSourcePortPolicy, GtpuTrafficProofAuthority, GtpuTrafficProofDispatchError,
-    GtpuTrafficProofDispatchPort, GtpuTrafficProofDispatchReceipt, GtpuTrafficProofDispatchRequest,
-    GtpuTrafficProofDispatchRoute, GtpuTrafficProofInvalidation, GtpuTrafficProofPoll,
-    GtpuTrafficProofValidation, GtpuUplinkChecksumOffloadContract, GtpuUplinkMtuPolicy,
-    GtpuUplinkSourcePortPolicy, GtpuV2DrainProof, PdpContextIndeterminateReason,
-    PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
-    PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
+    GtpuSessionGroup, GtpuSessionGroupId, GtpuSessionGroupIndeterminateReason,
+    GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionSelectorActiveClaim,
+    GtpuSessionSelectorNamespaceAuthority, GtpuSourcePortPolicy, GtpuTrafficProofAuthority,
+    GtpuTrafficProofDispatchError, GtpuTrafficProofDispatchPort, GtpuTrafficProofDispatchReceipt,
+    GtpuTrafficProofDispatchRequest, GtpuTrafficProofDispatchRoute, GtpuTrafficProofInvalidation,
+    GtpuTrafficProofPoll, GtpuTrafficProofValidation, GtpuUplinkChecksumOffloadContract,
+    GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy, GtpuV2DrainProof,
+    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
+    PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
     PdpContextUplinkSelector, RemovePdpContextRequest, RetainedGraphCleanupClassification,
     RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest, Teid, TftUplinkBearer,
     TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
@@ -105,28 +105,29 @@ use opc_gtpu_ebpf_common::{
     GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
     GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_IPV4_SLOT, GTPU_SESSION_IPV6_SLOT,
     GTPU_SESSION_SCHEMA_MARKER_LEN, GTPU_SESSION_SCHEMA_MARKER_VALUE,
-    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
-    GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
-    GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
-    GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES, GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME,
-    GTPU_TRAFFIC_OBSERVATION_PUBLICATION_SEQUENCE_INDEX,
+    GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN,
+    GTPU_SESSION_UPLINK_KEY_LEN, GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
+    GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_GATE_INDEX,
+    GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+    GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_PUBLICATION_SEQUENCE_INDEX,
     GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN,
     GTPU_TRAFFIC_OBSERVATION_REGISTRATION_LEN, GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
     GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME, GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME,
     IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_CONFIG_IPV6, MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS,
     MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR,
     MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX, MAP_SESSION_GROUPS, MAP_SESSION_SCHEMA,
-    MAP_SESSION_TRANSACTIONS, MAP_SESSION_UPLINK_INDEX, MAP_TFT_CLASSIFIER_COUNTERS,
-    MAP_TFT_CLASSIFIER_FILTERS, MAP_TFT_CLASSIFIER_META, MAP_TFT_CLASSIFIER_SCHEMA,
-    MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR,
-    MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT,
-    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
-    TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_KEY_LEN, TFT_CLASSIFIER_FILTER_VALUE_LEN,
-    TFT_CLASSIFIER_KEY_LEN, TFT_CLASSIFIER_META_VALUE_LEN, TFT_CLASSIFIER_SCHEMA_VALUE_LEN,
-    UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
-    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
-    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS,
-    UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
+    MAP_SESSION_SELECTOR_STAMPS, MAP_SESSION_TRANSACTIONS, MAP_SESSION_UPLINK_INDEX,
+    MAP_TFT_CLASSIFIER_COUNTERS, MAP_TFT_CLASSIFIER_FILTERS, MAP_TFT_CLASSIFIER_META,
+    MAP_TFT_CLASSIFIER_SCHEMA, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP,
+    MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS,
+    MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
+    PROG_DOWNLINK, PROG_UPLINK, TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_KEY_LEN,
+    TFT_CLASSIFIER_FILTER_VALUE_LEN, TFT_CLASSIFIER_KEY_LEN, TFT_CLASSIFIER_META_VALUE_LEN,
+    TFT_CLASSIFIER_SCHEMA_VALUE_LEN, UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
+    UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
+    UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
+    UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -134,10 +135,16 @@ use opc_ipsec_xfrm::{
     SaParameters, UdpEncap, XfrmAction, XfrmBackend, XfrmDirection, XfrmId, XfrmLookupMark,
     XfrmMark, XfrmMode, XfrmRequestId, XfrmSelector, XfrmTemplate,
 };
+use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_proto_tft::{
     PacketFilter, PacketFilterComponent, PacketFilterDirection, PacketFilterIdentifier, PortRange,
     TrafficFlowTemplate,
 };
+use opc_session_store::{
+    EncryptingSessionBackend, OwnerId, SelectorLedgerStorageScope, SessionStore,
+    SqliteSessionBackend,
+};
+use opc_types::{NetworkFunctionKind, TenantId};
 
 sockopt_impl!(
     UdpEspInUdp,
@@ -153,7 +160,6 @@ const PGW_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
 const PGW_ALT_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 11);
 const EPDG_S2BU_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 1);
 const PGW_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0x10);
-const PGW_ALT_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0x11);
 const EPDG_SWU_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 const UE_SWU_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
 const AUTH_GTP_IP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 10);
@@ -184,10 +190,6 @@ const GROUP_LOCAL_TEID_V4_INITIAL: u32 = 0x6100_0001;
 const GROUP_PEER_TEID_V4_INITIAL: u32 = 0x6200_0001;
 const GROUP_LOCAL_TEID_V6_INITIAL: u32 = 0x6100_0002;
 const GROUP_PEER_TEID_V6_INITIAL: u32 = 0x6200_0002;
-const GROUP_LOCAL_TEID_V4_CROSSED: u32 = 0x7100_0001;
-const GROUP_PEER_TEID_V4_CROSSED: u32 = 0x7200_0001;
-const GROUP_LOCAL_TEID_V6_CROSSED: u32 = 0x7100_0002;
-const GROUP_PEER_TEID_V6_CROSSED: u32 = 0x7200_0002;
 const INBOUND_SPI_DEFAULT: u32 = 0x3000_0000;
 const INBOUND_SPI_A: u32 = 0x3000_0001;
 const INBOUND_SPI_V6_A: u32 = 0x3000_0002;
@@ -215,7 +217,7 @@ const OBSERVATION_FLOW_SCRATCH_VALUE_LEN: usize = 40;
 const CURRENT_DATAPATH_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath.bpf.o");
 const FROZEN_V1_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v1.bpf.o");
 const FROZEN_V2_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v2.bpf.o");
-const CURRENT_PIN_NAMES: [&str; 33] = [
+const CURRENT_PIN_NAMES: [&str; 34] = [
     MAP_UPLINK_FAR,
     MAP_UPLINK_MARK_FAR,
     MAP_UPLINK_DSCP,
@@ -235,6 +237,7 @@ const CURRENT_PIN_NAMES: [&str; 33] = [
     MAP_SESSION_UPLINK_INDEX,
     MAP_SESSION_DOWNLINK_INDEX,
     MAP_SESSION_TRANSACTIONS,
+    MAP_SESSION_SELECTOR_STAMPS,
     MAP_CONFIG_IPV6,
     MAP_SESSION_SCHEMA,
     MAP_TFT_CLASSIFIER_SCHEMA,
@@ -419,7 +422,556 @@ struct TestNet {
     pgw_ns: String,
     ue_ns: String,
     pin_root: PathBuf,
+    pin_root_identity: TestOwnedDirectoryIdentity,
     nft_table: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TestOwnedDirectoryIdentity {
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+impl TestOwnedDirectoryIdentity {
+    fn matches_stat(self, metadata: &rustix::fs::Stat) -> bool {
+        rustix::fs::FileType::from_raw_mode(metadata.st_mode).is_dir()
+            && metadata.st_dev == self.dev
+            && metadata.st_ino == self.ino
+            && metadata.st_uid == self.uid
+            && metadata.st_gid == self.gid
+            && metadata.st_mode & 0o7777 == self.mode
+    }
+}
+
+/// Create one fresh private leaf below an existing directory.
+///
+/// Requiring the parent to exist keeps creation atomic: there is no partially
+/// created suffix to leak if validation fails. The existing parent is left
+/// untouched because it may be a shared mount such as `/sys/fs/bpf`.
+fn create_test_owned_private_directory_tree(
+    path: &Path,
+    context: &str,
+) -> TestOwnedDirectoryIdentity {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => panic!("{context}: test-owned leaf {path:?} must be fresh"),
+        Err(error) => panic!("{context}: inspect test-owned leaf {path:?}: {error}"),
+    }
+
+    let parent = path
+        .parent()
+        .unwrap_or_else(|| panic!("{context}: {path:?} has no parent directory"));
+    let parent_metadata = fs::symlink_metadata(parent)
+        .unwrap_or_else(|error| panic!("{context}: inspect parent {parent:?}: {error}"));
+    assert!(
+        parent_metadata.file_type().is_dir(),
+        "{context}: parent {parent:?} must be a real existing directory"
+    );
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+        .create(path)
+        .unwrap_or_else(|error| panic!("{context}: create {path:?}: {error}"));
+
+    let validated = (|| -> io::Result<TestOwnedDirectoryIdentity> {
+        let descriptor = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        rustix::fs::fchmod(&descriptor, rustix::fs::Mode::RWXU)?;
+        let metadata = rustix::fs::fstat(&descriptor)?;
+        let identity = TestOwnedDirectoryIdentity {
+            dev: metadata.st_dev,
+            ino: metadata.st_ino,
+            uid: metadata.st_uid,
+            gid: metadata.st_gid,
+            mode: metadata.st_mode & 0o7777,
+        };
+        if identity.uid != rustix::process::geteuid().as_raw()
+            || identity.gid != rustix::process::getegid().as_raw()
+            || identity.mode != 0o700
+            || !identity.matches_stat(&metadata)
+        {
+            return Err(io::Error::other("created directory identity mismatch"));
+        }
+        Ok(identity)
+    })();
+
+    match validated {
+        Ok(identity) => identity,
+        Err(error) => {
+            // The single fresh leaf is still empty here. Never leave an
+            // unregistered partial directory behind on validation failure.
+            let _ = fs::remove_dir(path);
+            panic!("{context}: validate created directory {path:?}: {error}");
+        }
+    }
+}
+
+/// Capture a directory created by the immediately preceding successful
+/// fixture-owned product operation. Callers must record this before exposing
+/// the path to any subsequent mutation or refusal scenario.
+fn capture_created_test_directory_identity(
+    path: &Path,
+    context: &str,
+) -> TestOwnedDirectoryIdentity {
+    let descriptor = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .unwrap_or_else(|error| panic!("{context}: open created directory {path:?}: {error}"));
+    let metadata = rustix::fs::fstat(&descriptor)
+        .unwrap_or_else(|error| panic!("{context}: stat created directory {path:?}: {error}"));
+    let identity = TestOwnedDirectoryIdentity {
+        dev: metadata.st_dev,
+        ino: metadata.st_ino,
+        uid: metadata.st_uid,
+        gid: metadata.st_gid,
+        mode: metadata.st_mode & 0o7777,
+    };
+    assert!(
+        identity.matches_stat(&metadata)
+            && identity.uid == rustix::process::geteuid().as_raw()
+            && identity.gid == rustix::process::getegid().as_raw()
+            && identity.mode & 0o022 == 0,
+        "{context}: created directory {path:?} must be current-user-owned and not group/world-writable"
+    );
+    identity
+}
+
+fn descriptor_mount_id(descriptor: &impl AsRawFd) -> io::Result<u64> {
+    let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{}", descriptor.as_raw_fd()))?;
+    mount_id_from_fdinfo(&fdinfo)
+        .ok_or_else(|| io::Error::other("descriptor mount ID is unavailable"))
+}
+
+fn mount_id_from_fdinfo(fdinfo: &str) -> Option<u64> {
+    fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:").map(str::trim))
+        .and_then(|value| value.parse().ok())
+}
+
+fn preflight_owned_directory_tree(directory: &OwnedFd, expected_mount_id: u64) -> io::Result<()> {
+    let mut entries = rustix::fs::Dir::read_from(directory)?;
+    for entry in &mut entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let metadata = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+        let descriptor = rustix::fs::openat(
+            directory,
+            name,
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        let observed = rustix::fs::fstat(&descriptor)?;
+        if observed.st_dev != metadata.st_dev
+            || observed.st_ino != metadata.st_ino
+            || descriptor_mount_id(&descriptor)? != expected_mount_id
+        {
+            return Err(io::Error::other(
+                "owned directory entry changed or crosses a mount boundary",
+            ));
+        }
+        if rustix::fs::FileType::from_raw_mode(metadata.st_mode).is_dir() {
+            let child = rustix::fs::openat(
+                directory,
+                name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
+            preflight_owned_directory_tree(&child, expected_mount_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn drain_owned_directory_tree(directory: &OwnedFd) -> io::Result<()> {
+    let mut entries = rustix::fs::Dir::read_from(directory)?;
+    for entry in &mut entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let before = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+        if rustix::fs::FileType::from_raw_mode(before.st_mode).is_dir() {
+            let child = rustix::fs::openat(
+                directory,
+                name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
+            let opened = rustix::fs::fstat(&child)?;
+            if opened.st_dev != before.st_dev || opened.st_ino != before.st_ino {
+                return Err(io::Error::other("owned child directory changed"));
+            }
+            drain_owned_directory_tree(&child)?;
+            let after = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+            if after.st_dev != before.st_dev || after.st_ino != before.st_ino {
+                return Err(io::Error::other("owned child directory was replaced"));
+            }
+            rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::REMOVEDIR)?;
+        } else {
+            let after = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+            if after.st_dev != before.st_dev || after.st_ino != before.st_ino {
+                return Err(io::Error::other("owned directory entry was replaced"));
+            }
+            rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty())?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_owned_test_directory(path: &Path, identity: TestOwnedDirectoryIdentity) -> bool {
+    let parent = match path.parent() {
+        Some(parent) => parent,
+        None => return false,
+    };
+    let leaf = match path.file_name() {
+        Some(leaf) => leaf,
+        None => return false,
+    };
+    let removal = (|| -> io::Result<()> {
+        let parent = rustix::fs::open(
+            parent,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        let directory = rustix::fs::openat(
+            &parent,
+            leaf,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        let metadata = rustix::fs::fstat(&directory)?;
+        if !identity.matches_stat(&metadata)
+            || descriptor_mount_id(&parent)? != descriptor_mount_id(&directory)?
+        {
+            return Err(io::Error::other(
+                "owned directory identity or mount boundary changed",
+            ));
+        }
+        preflight_owned_directory_tree(&directory, descriptor_mount_id(&directory)?)?;
+        drain_owned_directory_tree(&directory)?;
+        let visible = rustix::fs::statat(&parent, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+        if !identity.matches_stat(&visible) {
+            return Err(io::Error::other(
+                "owned directory was replaced before unlink",
+            ));
+        }
+        rustix::fs::unlinkat(&parent, leaf, rustix::fs::AtFlags::REMOVEDIR)?;
+        Ok(())
+    })();
+    removal.is_ok()
+}
+
+/// Remove one exact empty fixture-owned directory without following links or
+/// accepting a mount boundary. This narrower primitive is used for bind-mount
+/// backing paths so teardown never drains unrecorded contents.
+fn remove_owned_empty_test_directory(path: &Path, identity: TestOwnedDirectoryIdentity) -> bool {
+    let parent = match path.parent() {
+        Some(parent) => parent,
+        None => return false,
+    };
+    let leaf = match path.file_name() {
+        Some(leaf) => leaf,
+        None => return false,
+    };
+    let removal = (|| -> io::Result<()> {
+        let parent = rustix::fs::open(
+            parent,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        let directory = rustix::fs::openat(
+            &parent,
+            leaf,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        let metadata = rustix::fs::fstat(&directory)?;
+        if !identity.matches_stat(&metadata)
+            || descriptor_mount_id(&parent)? != descriptor_mount_id(&directory)?
+        {
+            return Err(io::Error::other(
+                "owned empty directory identity or mount boundary changed",
+            ));
+        }
+        let mut entries = rustix::fs::Dir::read_from(&directory)?;
+        for entry in &mut entries {
+            let entry = entry?;
+            if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
+                return Err(io::Error::other(
+                    "owned empty directory gained unexpected contents",
+                ));
+            }
+        }
+        let visible = rustix::fs::statat(&parent, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+        if !identity.matches_stat(&visible) {
+            return Err(io::Error::other(
+                "owned empty directory was replaced before unlink",
+            ));
+        }
+        rustix::fs::unlinkat(&parent, leaf, rustix::fs::AtFlags::REMOVEDIR)?;
+        Ok(())
+    })();
+    removal.is_ok()
+}
+
+/// Owns one exact bind mount created by this fixture. Explicit teardown is
+/// required in the happy path; `Drop` is only a best-effort panic fallback.
+struct TestOwnedBindMount {
+    source: PathBuf,
+    target: PathBuf,
+    parent: PathBuf,
+    source_identity: TestOwnedDirectoryIdentity,
+    target_backing_identity: Option<TestOwnedDirectoryIdentity>,
+    parent_identity: Option<TestOwnedDirectoryIdentity>,
+    mounted: bool,
+}
+
+impl TestOwnedBindMount {
+    fn mount(source: &Path, parent: PathBuf) -> Self {
+        let mut mount = Self::new_unmounted(source, parent);
+        mount.create_parent_backing();
+        mount.create_target_backing();
+        let source = mount
+            .source
+            .to_str()
+            .expect("bind-mount source must be valid UTF-8");
+        let target = mount
+            .target
+            .to_str()
+            .expect("bind-mount target must be valid UTF-8");
+        run("mount", &["--bind", source, target]);
+        mount.mounted = true;
+        assert!(
+            mount.target_is_mountpoint() == Some(true),
+            "the exact test-owned bind target must become a mountpoint"
+        );
+        assert!(
+            mount.owns_current_mount(),
+            "the exact test-owned bind mount must retain its source and parent identities"
+        );
+        mount
+    }
+
+    fn new_unmounted(source: &Path, parent: PathBuf) -> Self {
+        assert!(
+            !parent.exists(),
+            "bind-mount parent must be a fresh test-owned path"
+        );
+        Self {
+            source: source.to_path_buf(),
+            target: parent.join("root"),
+            parent,
+            source_identity: directory_identity(source, "stat bind-mount source"),
+            target_backing_identity: None,
+            parent_identity: None,
+            mounted: false,
+        }
+    }
+
+    fn create_parent_backing(&mut self) {
+        assert!(
+            self.parent_identity.is_none(),
+            "bind-mount parent ownership must be recorded exactly once"
+        );
+        let parent_identity =
+            create_test_owned_private_directory_tree(&self.parent, "create bind-mount parent");
+        self.parent_identity = Some(parent_identity);
+    }
+
+    fn create_target_backing(&mut self) {
+        assert!(
+            self.parent_identity.is_some(),
+            "bind-mount parent ownership must precede target creation"
+        );
+        assert!(
+            self.target_backing_identity.is_none(),
+            "bind-mount target ownership must be recorded exactly once"
+        );
+        let target_identity =
+            create_test_owned_private_directory_tree(&self.target, "create bind-mount target");
+        self.target_backing_identity = Some(target_identity);
+    }
+
+    fn target_is_mountpoint(&self) -> Option<bool> {
+        Command::new("mountpoint")
+            .args(["-q"])
+            .arg(&self.target)
+            .status()
+            .ok()
+            .and_then(|status| classify_mountpoint_exit_code(status.code()))
+    }
+
+    fn owns_current_mount(&self) -> bool {
+        self.mounted
+            && self.target_is_mountpoint() == Some(true)
+            && try_directory_identity(&self.parent) == self.parent_identity
+            && try_directory_identity(&self.source) == Some(self.source_identity)
+            && try_directory_identity(&self.target) == Some(self.source_identity)
+    }
+
+    fn remove_owned_directories(&self) {
+        assert!(
+            self.target_is_mountpoint() == Some(false),
+            "refuse to remove a test-owned bind target that is still a mountpoint"
+        );
+        let target_identity = self
+            .target_backing_identity
+            .expect("test-owned bind target identity must be recorded before removal");
+        let parent_identity = self
+            .parent_identity
+            .expect("test-owned bind parent identity must be recorded before removal");
+        assert_eq!(
+            try_directory_identity(&self.target),
+            Some(target_identity),
+            "test-owned bind target backing identity changed before removal"
+        );
+        assert_eq!(
+            try_directory_identity(&self.parent),
+            Some(parent_identity),
+            "test-owned bind parent identity changed before removal"
+        );
+        assert!(
+            remove_owned_empty_test_directory(&self.target, target_identity),
+            "remove exact empty test-owned bind-mount target"
+        );
+        assert!(
+            fs::symlink_metadata(&self.target)
+                .is_err_and(|error| { error.kind() == std::io::ErrorKind::NotFound }),
+            "test-owned bind-mount target must be absent after teardown"
+        );
+        assert!(
+            remove_owned_empty_test_directory(&self.parent, parent_identity),
+            "remove exact empty test-owned bind-mount parent"
+        );
+        assert!(
+            fs::symlink_metadata(&self.parent)
+                .is_err_and(|error| { error.kind() == std::io::ErrorKind::NotFound }),
+            "test-owned bind-mount parent must be absent after teardown"
+        );
+    }
+
+    fn teardown(mut self) {
+        assert!(
+            self.owns_current_mount(),
+            "refuse to unmount a bind target whose source or ownership identity changed"
+        );
+        let target = self
+            .target
+            .to_str()
+            .expect("bind-mount target must be valid UTF-8");
+        run("umount", &[target]);
+        self.mounted = false;
+        assert!(
+            self.target_is_mountpoint() == Some(false),
+            "test-owned bind target must no longer be a mountpoint after teardown"
+        );
+        self.remove_owned_directories();
+    }
+}
+
+impl Drop for TestOwnedBindMount {
+    fn drop(&mut self) {
+        if self.mounted {
+            if !self.owns_current_mount() {
+                return;
+            }
+            let unmounted = Command::new("umount")
+                .arg(&self.target)
+                .status()
+                .is_ok_and(|status| status.success());
+            if !unmounted || self.target_is_mountpoint() != Some(false) {
+                return;
+            }
+            self.mounted = false;
+        }
+        if self.target_backing_identity.is_none() {
+            let target_is_absent = fs::symlink_metadata(&self.target)
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+            if target_is_absent {
+                if let Some(parent_identity) = self.parent_identity {
+                    let _ = remove_owned_test_directory(&self.parent, parent_identity);
+                }
+            }
+            return;
+        }
+        if try_directory_identity(&self.target) == self.target_backing_identity
+            && try_directory_identity(&self.parent) == self.parent_identity
+            && self.target_is_mountpoint() == Some(false)
+        {
+            if let Some(target_identity) = self.target_backing_identity {
+                if !remove_owned_empty_test_directory(&self.target, target_identity) {
+                    return;
+                }
+            }
+            if let Some(parent_identity) = self.parent_identity {
+                let _ = remove_owned_empty_test_directory(&self.parent, parent_identity);
+            }
+        }
+    }
+}
+
+fn classify_mountpoint_exit_code(code: Option<i32>) -> Option<bool> {
+    match code {
+        Some(0) => Some(true),
+        Some(32) => Some(false),
+        _ => None,
+    }
+}
+
+fn directory_identity(path: &Path, context: &str) -> TestOwnedDirectoryIdentity {
+    try_directory_identity(path).unwrap_or_else(|| panic!("{context}: {path:?} is unavailable"))
+}
+
+fn try_directory_identity(path: &Path) -> Option<TestOwnedDirectoryIdentity> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    metadata
+        .file_type()
+        .is_dir()
+        .then_some(TestOwnedDirectoryIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: metadata.mode() & 0o7777,
+        })
 }
 
 /// Executes one best-effort partial-provision cleanup command.
@@ -445,6 +997,7 @@ impl PartialProvisionCleanupExecutor for HostPartialProvisionCleanupExecutor {
 struct PartialProvisionCleanup<Executor: PartialProvisionCleanupExecutor> {
     netns: Vec<String>,
     root_links: Vec<&'static str>,
+    pin_root: Option<(PathBuf, TestOwnedDirectoryIdentity)>,
     nft_table: Option<String>,
     executor: Executor,
     armed: bool,
@@ -461,6 +1014,7 @@ impl<Executor: PartialProvisionCleanupExecutor> PartialProvisionCleanup<Executor
         Self {
             netns: Vec::new(),
             root_links: Vec::new(),
+            pin_root: None,
             nft_table: None,
             executor,
             armed: true,
@@ -469,6 +1023,10 @@ impl<Executor: PartialProvisionCleanupExecutor> PartialProvisionCleanup<Executor
 
     fn own_nft_table(&mut self, nft_table: &str) {
         self.nft_table = Some(nft_table.to_owned());
+    }
+
+    fn own_pin_root(&mut self, path: PathBuf, identity: TestOwnedDirectoryIdentity) {
+        self.pin_root = Some((path, identity));
     }
 
     fn disarm(&mut self) {
@@ -480,6 +1038,9 @@ impl<Executor: PartialProvisionCleanupExecutor> Drop for PartialProvisionCleanup
     fn drop(&mut self) {
         if !self.armed {
             return;
+        }
+        if let Some((path, identity)) = self.pin_root.as_ref() {
+            let _ = remove_owned_test_directory(path, *identity);
         }
         if let Some(nft_table) = self.nft_table.as_deref() {
             self.executor
@@ -584,6 +1145,200 @@ fn partial_provision_cleanup_executes_nft_delete_after_chain_failure() {
     );
 }
 
+fn disposable_owned_directory_test_path(label: &str) -> (PathBuf, PathBuf) {
+    let sequence = PRIVILEGED_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = env::temp_dir().join(format!(
+        "opc-gtpu-directory-{label}-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&base).expect("create disposable directory-test base");
+    (base.clone(), base.join("leaf"))
+}
+
+#[test]
+fn test_owned_bind_mount_target_failure_removes_recorded_parent() {
+    let (base, _) = disposable_owned_directory_test_path("bind-partial");
+    let source = base.join("source");
+    let parent = base.join("bind-parent");
+    fs::create_dir(&source).expect("create disposable bind source");
+    let mut bind_mount = TestOwnedBindMount::new_unmounted(&source, parent.clone());
+
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        bind_mount.create_parent_backing();
+        panic!("injected failure before bind-target creation");
+    }));
+
+    assert!(result.is_err(), "target creation failure must unwind");
+    assert!(parent.is_dir(), "recorded parent exists before guard drop");
+    assert!(
+        fs::symlink_metadata(parent.join("root"))
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+        "failed target must remain absent"
+    );
+    drop(bind_mount);
+    assert!(
+        fs::symlink_metadata(&parent).is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+        "guard drop must remove the exact recorded partial parent"
+    );
+    fs::remove_dir(&source).expect("remove disposable bind source");
+    fs::remove_dir(base).expect("remove disposable bind-partial test base");
+}
+
+#[test]
+fn test_owned_bind_mount_cleanup_refuses_metadata_changes() {
+    let (base, _) = disposable_owned_directory_test_path("bind-metadata");
+    let source = base.join("source");
+    let parent = base.join("bind-parent");
+    fs::create_dir(&source).expect("create disposable bind source");
+    let mut bind_mount = TestOwnedBindMount::new_unmounted(&source, parent.clone());
+    bind_mount.create_parent_backing();
+    bind_mount.create_target_backing();
+
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o755))
+        .expect("change bind parent mode");
+    let parent_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        bind_mount.remove_owned_directories();
+    }));
+    assert!(
+        parent_result.is_err(),
+        "parent metadata change must refuse teardown"
+    );
+    assert!(parent.is_dir() && parent.join("root").is_dir());
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+        .expect("restore bind parent mode");
+
+    fs::set_permissions(parent.join("root"), fs::Permissions::from_mode(0o755))
+        .expect("change bind target mode");
+    let target_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        bind_mount.remove_owned_directories();
+    }));
+    assert!(
+        target_result.is_err(),
+        "target metadata change must refuse teardown"
+    );
+    assert!(parent.is_dir() && parent.join("root").is_dir());
+    fs::set_permissions(parent.join("root"), fs::Permissions::from_mode(0o700))
+        .expect("restore bind target mode");
+
+    drop(bind_mount);
+    assert!(
+        fs::symlink_metadata(&parent).is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+        "guard drop must remove the restored exact bind backing tree"
+    );
+    fs::remove_dir(&source).expect("remove disposable bind source");
+    fs::remove_dir(base).expect("remove disposable bind-metadata test base");
+}
+
+#[test]
+fn test_owned_directory_rejects_preexisting_leaf_before_modification() {
+    let (base, leaf) = disposable_owned_directory_test_path("preexisting");
+    fs::create_dir(&leaf).expect("create pre-existing leaf");
+    fs::set_permissions(&leaf, fs::Permissions::from_mode(0o755)).expect("set leaf mode");
+    let before = fs::symlink_metadata(&leaf).expect("stat pre-existing leaf");
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        create_test_owned_private_directory_tree(&leaf, "reject pre-existing leaf");
+    }));
+    assert!(result.is_err(), "pre-existing leaf must be rejected");
+    let after = fs::symlink_metadata(&leaf).expect("pre-existing leaf remains");
+    assert_eq!(before.ino(), after.ino());
+    assert_eq!(before.mode() & 0o7777, after.mode() & 0o7777);
+    fs::remove_dir(&leaf).expect("remove pre-existing test leaf");
+    fs::remove_dir(base).expect("remove disposable pre-existing test base");
+}
+
+#[test]
+fn test_owned_directory_cleanup_refuses_replacements_and_mode_mismatch() {
+    let (base, leaf) = disposable_owned_directory_test_path("replacement");
+    let identity = create_test_owned_private_directory_tree(&leaf, "create replacement test leaf");
+    let original_descriptor = rustix::fs::open(
+        &leaf,
+        rustix::fs::OFlags::PATH
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .expect("retain original inode against allocator reuse");
+    fs::remove_dir(&leaf).expect("remove owned replacement-test leaf");
+    fs::create_dir(&leaf).expect("create foreign replacement directory");
+    assert!(!remove_owned_test_directory(&leaf, identity));
+    assert!(
+        fs::symlink_metadata(&leaf).is_ok(),
+        "foreign replacement survives"
+    );
+    fs::remove_dir(&leaf).expect("remove foreign replacement");
+    drop(original_descriptor);
+
+    let identity = create_test_owned_private_directory_tree(&leaf, "create symlink test leaf");
+    let target = base.join("symlink-target");
+    fs::create_dir(&target).expect("create symlink target");
+    fs::remove_dir(&leaf).expect("remove owned symlink-test leaf");
+    std::os::unix::fs::symlink(&target, &leaf).expect("create symlink replacement");
+    assert!(!remove_owned_test_directory(&leaf, identity));
+    assert!(
+        fs::symlink_metadata(&target).is_ok(),
+        "symlink target survives"
+    );
+    fs::remove_file(&leaf).expect("remove symlink replacement");
+    fs::remove_dir(&target).expect("remove symlink target");
+
+    let identity = create_test_owned_private_directory_tree(&leaf, "create mode test leaf");
+    fs::set_permissions(&leaf, fs::Permissions::from_mode(0o755)).expect("change leaf mode");
+    assert!(!remove_owned_test_directory(&leaf, identity));
+    assert!(
+        fs::symlink_metadata(&leaf).is_ok(),
+        "mode-mismatched leaf survives"
+    );
+    fs::remove_dir(&leaf).expect("remove mode-mismatched leaf");
+    fs::remove_dir(base).expect("remove disposable replacement test base");
+}
+
+#[test]
+fn test_owned_directory_cleanup_refuses_identity_and_mount_uncertainty() {
+    let (base, leaf) = disposable_owned_directory_test_path("identity");
+    let identity = create_test_owned_private_directory_tree(&leaf, "create identity test leaf");
+    for false_identity in [
+        TestOwnedDirectoryIdentity {
+            dev: identity.dev.wrapping_add(1),
+            ..identity
+        },
+        TestOwnedDirectoryIdentity {
+            uid: identity.uid.wrapping_add(1),
+            ..identity
+        },
+        TestOwnedDirectoryIdentity {
+            gid: identity.gid.wrapping_add(1),
+            ..identity
+        },
+    ] {
+        assert!(!remove_owned_test_directory(&leaf, false_identity));
+        assert!(
+            leaf.is_dir(),
+            "identity mismatch must preserve the directory"
+        );
+    }
+    assert_eq!(mount_id_from_fdinfo("pos:\t0\nmnt_id:\t42\n"), Some(42));
+    assert_eq!(mount_id_from_fdinfo("pos:\t0\nmnt_id:\tinvalid\n"), None);
+    assert_eq!(mount_id_from_fdinfo("pos:\t0\n"), None);
+    assert_eq!(classify_mountpoint_exit_code(Some(0)), Some(true));
+    assert_eq!(classify_mountpoint_exit_code(Some(32)), Some(false));
+    assert_eq!(classify_mountpoint_exit_code(Some(1)), None);
+    assert_eq!(classify_mountpoint_exit_code(None), None);
+    assert!(remove_owned_test_directory(&leaf, identity));
+    fs::remove_dir(base).expect("remove disposable identity test base");
+}
+
+#[test]
+fn test_owned_directory_cleanup_removes_exact_nested_tree() {
+    let (base, leaf) = disposable_owned_directory_test_path("nested");
+    let identity = create_test_owned_private_directory_tree(&leaf, "create nested test leaf");
+    fs::create_dir_all(leaf.join("a").join("b")).expect("create nested test contents");
+    fs::write(leaf.join("a").join("b").join("marker"), b"fixture").expect("write marker");
+    assert!(remove_owned_test_directory(&leaf, identity));
+    assert!(fs::symlink_metadata(&leaf).is_err());
+    fs::remove_dir(base).expect("remove disposable nested test base");
+}
+
 impl TestNet {
     fn provision() -> Self {
         let pid = std::process::id();
@@ -594,6 +1349,9 @@ impl TestNet {
         let pin_root = PathBuf::from(format!("/sys/fs/bpf/opc-gtpu-test-{pid}-{sequence}"));
         let nft_table = format!("opc_gtpu_{pid}_{sequence}");
         let mut cleanup = PartialProvisionCleanup::new();
+        let pin_root_identity =
+            create_test_owned_private_directory_tree(&pin_root, "create test pin root");
+        cleanup.own_pin_root(pin_root.clone(), pin_root_identity);
 
         run("ip", &["netns", "add", &auth_ns]);
         cleanup.netns.push(auth_ns.clone());
@@ -839,6 +1597,7 @@ impl TestNet {
             pgw_ns,
             ue_ns,
             pin_root,
+            pin_root_identity,
             nft_table,
         };
         cleanup.disarm();
@@ -949,7 +1708,11 @@ impl TestNet {
 
 impl Drop for TestNet {
     fn drop(&mut self) {
-        // Best-effort teardown; the CI netns is discarded anyway.
+        // Best-effort teardown. The recursively drained pin tree is
+        // descriptor/identity-qualified; names for links, netns objects, and
+        // the nft table are owned by the successful creates recorded above
+        // while the process-local privileged-test lock excludes another
+        // fixture writer.
         cleanup_owned_root_xfrm_objects();
         let _ = Command::new("ip").args(["link", "del", "s2bu"]).output();
         let _ = Command::new("ip").args(["link", "del", "ue0"]).output();
@@ -962,7 +1725,7 @@ impl Drop for TestNet {
         let _ = Command::new("ip")
             .args(["netns", "del", &self.ue_ns])
             .output();
-        let _ = fs::remove_dir_all(&self.pin_root);
+        let _ = remove_owned_test_directory(&self.pin_root, self.pin_root_identity);
         let _ = Command::new("nft")
             .args(["delete", "table", "inet", &self.nft_table])
             .output();
@@ -1073,35 +1836,60 @@ fn initial_grouped_session(link_ifindex: u32) -> GtpuSessionGroup {
     .expect("canonical initial dual-stack group")
 }
 
-fn crossed_grouped_session(link_ifindex: u32) -> GtpuSessionGroup {
-    GtpuSessionGroup::new(
-        grouped_group_id(),
-        grouped_device_id(),
-        vec![
-            grouped_entry(
-                link_ifindex,
-                IpAddr::V4(UE_PAA),
-                IpAddr::V6(EPDG_S2BU_IPV6),
-                IpAddr::V6(PGW_ALT_IPV6),
-                GROUP_LOCAL_TEID_V4_CROSSED,
-                GROUP_PEER_TEID_V4_CROSSED,
+async fn reconcile_fresh_grouped(
+    backend: Arc<EbpfGtpuDataplaneBackend>,
+    group: GtpuSessionGroup,
+) -> Result<
+    (
+        GtpuSessionSelectorNamespaceAuthority<
+            EncryptingSessionBackend<SqliteSessionBackend, MemoryKeyProvider>,
+        >,
+        GtpuSessionSelectorActiveClaim,
+    ),
+    GtpuError,
+> {
+    let device_id = group.device_id();
+    let scope = SelectorLedgerStorageScope::new(
+        TenantId::from_static("privileged-ebpf-test"),
+        NetworkFunctionKind::from_static("epdg"),
+    );
+    let provider = Arc::new(MemoryKeyProvider::new());
+    provider
+        .insert_active_key(
+            KeyId::new("privileged-ebpf-selector-ledger-key").expect("valid test key ID"),
+            KeyPurpose::Session,
+            scope.tenant().clone(),
+            Zeroizing::new([0x5a; AES_256_GCM_SIV_KEY_LEN]),
+        )
+        .expect("install protected selector-ledger test key");
+    let bootstrap = backend.selector_namespace_bootstrap(device_id).await?;
+    let namespace = GtpuSessionSelectorNamespaceAuthority::provision_protected(
+        SessionStore::new(EncryptingSessionBackend::new(
+            Arc::new(
+                SqliteSessionBackend::in_memory()
+                    .expect("in-memory durable selector namespace store"),
             ),
-            grouped_entry(
-                link_ifindex,
-                IpAddr::V6(UE_PAA_IPV6),
-                IpAddr::V4(EPDG_S2BU_IP),
-                IpAddr::V4(PGW_ALT_IP),
-                GROUP_LOCAL_TEID_V6_CROSSED,
-                GROUP_PEER_TEID_V6_CROSSED,
-            ),
-        ],
+            provider,
+            "privileged-ebpf-selector-ledger",
+        )),
+        scope,
+        bootstrap,
+        backend.clone(),
+        OwnerId::new("privileged-ebpf-test-owner").expect("valid durable namespace owner"),
+        Duration::from_secs(30),
+        32,
     )
-    .expect("canonical crossed dual-stack group")
-}
-
-fn fresh_grouped_reconcile(group: GtpuSessionGroup) -> GtpuSessionGroupReconcileRequest {
-    GtpuSessionGroupReconcileRequest::new(group, GtpuSessionSelectorProvenance::Fresh)
-        .expect("fresh grouped selector provenance")
+    .await
+    .map_err(|_| GtpuError::UnsupportedFeature {
+        feature: "selector_namespace_test_coordinator",
+    })?;
+    let active = namespace
+        .reconcile_fresh(backend, group)
+        .await
+        .map_err(|_| GtpuError::UnsupportedFeature {
+            feature: "selector_namespace_test_coordinator",
+        })?;
+    Ok((namespace, active))
 }
 
 fn grouped_attachment(device: &GtpDevice) -> GtpuSessionAttachmentSelector {
@@ -3723,8 +4511,9 @@ fn attach_frozen_program_at(
     program_id
 }
 
-fn install_frozen_v1_datapath(pin_dir: &std::path::Path) -> (u32, u32) {
-    fs::create_dir_all(pin_dir).expect("create frozen v1 pin directory");
+fn install_frozen_v1_datapath(pin_dir: &std::path::Path) -> (u32, u32, TestOwnedDirectoryIdentity) {
+    let identity =
+        create_test_owned_private_directory_tree(pin_dir, "create frozen v1 pin directory");
     let mut ebpf = EbpfLoader::new()
         .default_map_pin_directory(pin_dir)
         .load(FROZEN_V1_OBJECT)
@@ -3777,7 +4566,7 @@ fn install_frozen_v1_datapath(pin_dir: &std::path::Path) -> (u32, u32) {
     let uplink_id = attach_frozen_program(&mut ebpf, PROG_UPLINK, TcAttachType::Egress);
     let downlink_id = attach_frozen_program(&mut ebpf, PROG_DOWNLINK, TcAttachType::Ingress);
     drop(ebpf);
-    (uplink_id, downlink_id)
+    (uplink_id, downlink_id, identity)
 }
 
 fn frozen_v1_map_ids(pin_dir: &std::path::Path) -> Vec<u32> {
@@ -3806,9 +4595,12 @@ fn frozen_v1_map_ids(pin_dir: &std::path::Path) -> Vec<u32> {
 /// `GTPU_COUNTERS` comes from the historical object's own maps section, which
 /// is the point: the shape and the program generation have to come from the
 /// same artifact, or the fixture proves nothing about either.
-fn install_pre_redirect_generation(pin_dir: &std::path::Path) -> (u32, u32) {
+fn install_pre_redirect_generation(
+    pin_dir: &std::path::Path,
+) -> (u32, u32, TestOwnedDirectoryIdentity) {
     ensure_clsact("s2bu");
-    fs::create_dir_all(pin_dir).expect("create pre-redirect pin directory");
+    let identity =
+        create_test_owned_private_directory_tree(pin_dir, "create pre-redirect pin directory");
     let mut ebpf = EbpfLoader::new()
         .default_map_pin_directory(pin_dir)
         .load(FROZEN_PRE_REDIRECT_OBJECT)
@@ -3861,7 +4653,7 @@ fn install_pre_redirect_generation(pin_dir: &std::path::Path) -> (u32, u32) {
     let uplink_id = attach_frozen_program(&mut ebpf, PROG_UPLINK, TcAttachType::Egress);
     let downlink_id = attach_frozen_program(&mut ebpf, PROG_DOWNLINK, TcAttachType::Ingress);
     drop(ebpf);
-    (uplink_id, downlink_id)
+    (uplink_id, downlink_id, identity)
 }
 
 /// Leave one authentic historical SDK hook outside the slot managed by the
@@ -3873,9 +4665,12 @@ fn install_pre_redirect_generation(pin_dir: &std::path::Path) -> (u32, u32) {
 /// a later pin ABI check.
 fn install_off_slot_pre_redirect_generation_with_current_capacity(
     pin_dir: &std::path::Path,
-) -> u32 {
+) -> (u32, TestOwnedDirectoryIdentity) {
     ensure_clsact("s2bu");
-    fs::create_dir_all(pin_dir).expect("create off-slot pre-redirect pin directory");
+    let identity = create_test_owned_private_directory_tree(
+        pin_dir,
+        "create off-slot pre-redirect pin directory",
+    );
     let mut ebpf = EbpfLoader::new()
         .map_max_entries(MAP_COUNTERS, COUNTER_SLOTS)
         .default_map_pin_directory(pin_dir)
@@ -3912,7 +4707,7 @@ fn install_off_slot_pre_redirect_generation_with_current_capacity(
         OFF_SLOT_TC_HANDLE,
     );
     drop(ebpf);
-    uplink_id
+    (uplink_id, identity)
 }
 
 /// Leave one current SDK uplink program outside the managed tc slot without
@@ -4083,7 +4878,7 @@ fn pinned_per_cpu_byte_values<const VALUE_LEN: usize>(
 }
 
 /// Exact byte-for-byte state of every durable forwarding and recovery map in
-/// the current 33-pin graph. The restart-fenced observation source is captured
+/// the current 34-pin graph. The restart-fenced observation source is captured
 /// separately because adopting a retained graph must invalidate that source.
 ///
 /// This intentionally has no `Debug` implementation: assertion failures must
@@ -4126,6 +4921,10 @@ struct CurrentMapContents {
     session_transactions: Vec<(
         [u8; GTPU_SESSION_GROUP_ID_LEN],
         [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN],
+    )>,
+    session_selector_stamps: Vec<(
+        [u8; GTPU_SESSION_GROUP_ID_LEN],
+        [u8; GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN],
     )>,
     config_ipv6: Vec<[u8; GTPU_SESSION_CONFIG_VALUE_LEN]>,
     session_schema: Vec<[u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>,
@@ -4170,6 +4969,7 @@ fn current_map_contents(pin_dir: &std::path::Path) -> CurrentMapContents {
         session_uplink_index: pinned_hash_entries(pin_dir, MAP_SESSION_UPLINK_INDEX),
         session_downlink_index: pinned_hash_entries(pin_dir, MAP_SESSION_DOWNLINK_INDEX),
         session_transactions: pinned_hash_entries(pin_dir, MAP_SESSION_TRANSACTIONS),
+        session_selector_stamps: pinned_hash_entries(pin_dir, MAP_SESSION_SELECTOR_STAMPS),
         config_ipv6: pinned_array_values(pin_dir, MAP_CONFIG_IPV6, 1),
         session_schema: pinned_array_values(pin_dir, MAP_SESSION_SCHEMA, 1),
         tft_schema: pinned_array_values(pin_dir, MAP_TFT_CLASSIFIER_SCHEMA, 1),
@@ -4265,7 +5065,7 @@ fn current_pin_graph_snapshot(pin_dir: &std::path::Path) -> CurrentPinGraphSnaps
     expected.sort_unstable();
     assert_eq!(
         pins, expected,
-        "fixture must retain the exact current 33-pin graph"
+        "fixture must retain the exact current 34-pin graph"
     );
     let map_ids = pins
         .iter()
@@ -4459,8 +5259,11 @@ fn seed_malformed_default_dscp(pin_dir: &std::path::Path) {
         .expect("seed malformed default DSCP");
 }
 
-fn install_drained_frozen_v2_datapath(pin_dir: &std::path::Path) -> (u32, u32) {
-    fs::create_dir_all(pin_dir).expect("create frozen v2 pin directory");
+fn install_drained_frozen_v2_datapath(
+    pin_dir: &std::path::Path,
+) -> (u32, u32, TestOwnedDirectoryIdentity) {
+    let identity =
+        create_test_owned_private_directory_tree(pin_dir, "create frozen v2 pin directory");
     let mut ebpf = EbpfLoader::new()
         .default_map_pin_directory(pin_dir)
         .load(FROZEN_V2_OBJECT)
@@ -4486,11 +5289,12 @@ fn install_drained_frozen_v2_datapath(pin_dir: &std::path::Path) -> (u32, u32) {
     let uplink_id = attach_frozen_program(&mut ebpf, PROG_UPLINK, TcAttachType::Egress);
     let downlink_id = attach_frozen_program(&mut ebpf, PROG_DOWNLINK, TcAttachType::Ingress);
     drop(ebpf);
-    (uplink_id, downlink_id)
+    (uplink_id, downlink_id, identity)
 }
 
-fn create_drained_legacy_v2_pins(pin_dir: &std::path::Path) {
-    fs::create_dir_all(pin_dir).expect("create legacy v2 pin directory");
+fn create_drained_legacy_v2_pins(pin_dir: &std::path::Path) -> TestOwnedDirectoryIdentity {
+    let identity =
+        create_test_owned_private_directory_tree(pin_dir, "create legacy v2 pin directory");
 
     let mut far = BpfHashMap::<MapData, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::create(65_536, 0)
         .expect("create legacy v2 FAR");
@@ -4561,6 +5365,7 @@ fn create_drained_legacy_v2_pins(pin_dir: &std::path::Path) {
     config
         .pin(pin_dir.join(MAP_CONFIG))
         .expect("pin legacy v2 config array");
+    identity
 }
 
 fn drained_v2_request(ifindex: u32) -> DrainedV2TeardownRequest {
@@ -5185,19 +5990,62 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         Err(opc_gtpu_dataplane::GtpuError::AlreadyExists)
     ));
     drop(competing);
-    let pin_alias = PathBuf::from(format!("/run/opc-gtpu-pin-alias-{}", std::process::id()));
+    let graph_before_aliases = current_pin_graph_snapshot(&marked_pin_dir);
+    let hooks_before_aliases = current_hook_snapshot();
+    let pin_alias = PathBuf::from(format!(
+        "/run/opc-gtpu-pin-alias-{}-{}",
+        std::process::id(),
+        PRIVILEGED_TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     std::os::unix::fs::symlink(&net.pin_root, &pin_alias)
         .expect("create lexical alias for pin root");
     let aliased = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
         bpffs_pin_root: pin_alias.clone(),
         ..EbpfGtpuDataplaneBackendConfig::default()
     });
-    assert!(matches!(
-        aliased.resolve_device("s2bu").await,
-        Err(opc_gtpu_dataplane::GtpuError::AlreadyExists)
-    ));
+    let alias_error = aliased
+        .resolve_device("s2bu")
+        .await
+        .expect_err("a symlink pin-root alias must be rejected before ownership arbitration");
+    assert!(
+        !matches!(alias_error, opc_gtpu_dataplane::GtpuError::AlreadyExists),
+        "descriptor-relative NOFOLLOW must reject the symlink alias, not treat it as an ownership conflict: {alias_error:?}"
+    );
     drop(aliased);
     fs::remove_file(&pin_alias).expect("remove pin-root alias");
+    assert!(
+        current_pin_graph_snapshot(&marked_pin_dir) == graph_before_aliases,
+        "the rejected symlink alias must preserve every pin and its exact map bytes"
+    );
+    assert!(
+        current_hook_snapshot() == hooks_before_aliases,
+        "the rejected symlink alias must preserve the exact hook identity"
+    );
+
+    let bind_alias_parent = PathBuf::from(format!(
+        "/run/opc-gtpu-pin-bind-alias-{}-{}",
+        std::process::id(),
+        PRIVILEGED_TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let bind_mount = TestOwnedBindMount::mount(&net.pin_root, bind_alias_parent);
+    let bind_aliased = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: bind_mount.target.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    assert!(matches!(
+        bind_aliased.resolve_device("s2bu").await,
+        Err(opc_gtpu_dataplane::GtpuError::AlreadyExists)
+    ));
+    drop(bind_aliased);
+    bind_mount.teardown();
+    assert!(
+        current_pin_graph_snapshot(&marked_pin_dir) == graph_before_aliases,
+        "the bind alias must preserve the original exact pin graph"
+    );
+    assert!(
+        current_hook_snapshot() == hooks_before_aliases,
+        "the bind alias must preserve the original exact hook identity"
+    );
     assert!(
         tc_filters("egress").contains("opc_gtpu_uplink")
             && tc_filters("ingress").contains("opc_gtpu_downlink"),
@@ -5909,7 +6757,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     // Build the exact prior-generation state: five retained pins, committed
     // v1 marker, populated default session, and both old tc programs live.
     let v1_pin_dir = net.pin_root.join("s2bu");
-    let (v1_uplink_id, v1_downlink_id) = install_frozen_v1_datapath(&v1_pin_dir);
+    let (v1_uplink_id, v1_downlink_id, v1_pin_identity) = install_frozen_v1_datapath(&v1_pin_dir);
     let retained_map_ids = frozen_v1_map_ids(&v1_pin_dir);
     assert_eq!(
         pinned_map_abi(&v1_pin_dir, MAP_COUNTERS)
@@ -6079,12 +6927,15 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         pinned_schema_marker(&v1_pin_dir),
         UPLINK_DSCP_SCHEMA_MARKER_VALUE
     );
-    fs::remove_dir_all(&v1_pin_dir).expect("drain endpoint-unbound v1 pins");
+    assert!(
+        remove_owned_test_directory(&v1_pin_dir, v1_pin_identity),
+        "drain exact endpoint-unbound v1 pins"
+    );
 
     // --- Explicit drained bearer-v2 teardown before source-port-v4. ---
     // A map-only same-shape namespace has no positive program-to-map binding
     // and must never be accepted as SDK-owned.
-    create_drained_legacy_v2_pins(&v1_pin_dir);
+    let legacy_v2_pin_identity = create_drained_legacy_v2_pins(&v1_pin_dir);
     let v2_maintenance = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
         bpffs_pin_root: net.pin_root.clone(),
         ..EbpfGtpuDataplaneBackendConfig::default()
@@ -6100,12 +6951,16 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         !v1_pin_dir.join("GTPU_V2_TEARDOWN").exists(),
         "hook identity refusal must precede proof mutation"
     );
-    fs::remove_dir_all(&v1_pin_dir).expect("remove unproven map-only graph");
+    assert!(
+        remove_owned_test_directory(&v1_pin_dir, legacy_v2_pin_identity),
+        "remove exact unproven map-only graph"
+    );
 
     // The exact hash-pinned historical object is loaded only in this isolated
     // qualification netns. No traffic is sent while either v2 program is
     // attached. Production parses these bytes solely as identity authority.
-    let (v2_uplink_id, v2_downlink_id) = install_drained_frozen_v2_datapath(&v1_pin_dir);
+    let (v2_uplink_id, v2_downlink_id, v2_replacement_pin_identity) =
+        install_drained_frozen_v2_datapath(&v1_pin_dir);
     assert_eq!(tc_program_id("egress"), v2_uplink_id);
     assert_eq!(tc_program_id("ingress"), v2_downlink_id);
     let replaced_pin = v1_pin_dir.join(MAP_MARKED_BEARER_OWNER);
@@ -6143,9 +6998,13 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             ],
         );
     }
-    fs::remove_dir_all(&v1_pin_dir).expect("remove negative replacement graph");
+    assert!(
+        remove_owned_test_directory(&v1_pin_dir, v2_replacement_pin_identity),
+        "remove exact negative replacement graph"
+    );
 
-    let (_v2_uplink_id, v2_downlink_id) = install_drained_frozen_v2_datapath(&v1_pin_dir);
+    let (_v2_uplink_id, v2_downlink_id, v2_foreign_hook_pin_identity) =
+        install_drained_frozen_v2_datapath(&v1_pin_dir);
     run(
         "tc",
         &[
@@ -6187,9 +7046,13 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             "filter", "del", "dev", "s2bu", "ingress", "handle", "0x1", "pref", "50", "bpf",
         ],
     );
-    fs::remove_dir_all(&v1_pin_dir).expect("remove negative foreign-hook graph");
+    assert!(
+        remove_owned_test_directory(&v1_pin_dir, v2_foreign_hook_pin_identity),
+        "remove exact negative foreign-hook graph"
+    );
 
-    let (v2_uplink_id, v2_downlink_id) = install_drained_frozen_v2_datapath(&v1_pin_dir);
+    let (v2_uplink_id, v2_downlink_id, _populated_v2_pin_identity) =
+        install_drained_frozen_v2_datapath(&v1_pin_dir);
     {
         let map = Map::from_map_data(
             MapData::from_pin(v1_pin_dir.join(MAP_UPLINK_FAR))
@@ -6330,6 +7193,70 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     let mut replacement_request = CreateGtpDeviceRequest::new("s2bu");
     replacement_request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
     let replacement_device = replacement_owner.create_device(replacement_request).await?;
+    let replacement_pin_dir = net.pin_root.join("s2bu");
+    let replacement_pin_identity = capture_created_test_directory_identity(
+        &replacement_pin_dir,
+        "capture external-replacement proof pins",
+    );
+
+    // A second current SDK hook outside the canonical slot is still an
+    // external graph replacement. It must withdraw capability and block every
+    // map effect even while both exact-slot hooks retain their original IDs.
+    let duplicate_graph_before = current_pin_graph_snapshot(&replacement_pin_dir);
+    let duplicate_proof_source_before = traffic_observation_source_contents(&replacement_pin_dir);
+    let duplicate_hooks_before = current_hook_snapshot();
+    let duplicate_program_id = install_off_slot_current_uplink_without_pins();
+    let duplicate_egress = tc_filters("egress");
+    let duplicate_ingress = tc_filters("ingress");
+    assert!(
+        duplicate_egress.contains("pref 51")
+            && duplicate_egress.contains("handle 0x2")
+            && duplicate_egress.contains(&format!("id {duplicate_program_id}")),
+        "the adversarial current-program duplicate must remain visible off-slot: {duplicate_egress}"
+    );
+    let duplicate_probe = replacement_owner.probe().await?;
+    assert_eq!(duplicate_probe.egress_dscp_marking, GtpuCapability::Missing);
+    assert_eq!(
+        duplicate_probe.downlink_endpoint_binding,
+        GtpuCapability::Missing
+    );
+    assert!(matches!(
+        replacement_owner
+            .install_pdp_context(marked_session_context(replacement_device.ifindex))
+            .await,
+        Err(opc_gtpu_dataplane::GtpuError::StateIndeterminate {
+            operation: "ebpf_graph_effect"
+        })
+    ));
+    assert!(
+        current_pin_graph_snapshot(&replacement_pin_dir) == duplicate_graph_before,
+        "off-slot duplicate refusal must preserve every pin, map ID, and durable map byte"
+    );
+    assert!(
+        traffic_observation_source_contents(&replacement_pin_dir) == duplicate_proof_source_before,
+        "off-slot duplicate refusal must precede every proof-source mutation"
+    );
+    assert_eq!(tc_filters("egress"), duplicate_egress);
+    assert_eq!(tc_filters("ingress"), duplicate_ingress);
+    run(
+        "tc",
+        &[
+            "filter", "del", "dev", "s2bu", "egress", "handle", "0x2", "pref", "51", "bpf",
+        ],
+    );
+    assert!(
+        current_pin_graph_snapshot(&replacement_pin_dir) == duplicate_graph_before,
+        "removing the test-owned duplicate must preserve the exact canonical pin graph"
+    );
+    assert!(
+        traffic_observation_source_contents(&replacement_pin_dir) == duplicate_proof_source_before,
+        "removing the test-owned duplicate must preserve proof-source state"
+    );
+    assert!(
+        current_hook_snapshot() == duplicate_hooks_before,
+        "removing the test-owned duplicate must restore the exact canonical hooks"
+    );
+
     for direction in ["egress", "ingress"] {
         run(
             "tc",
@@ -6354,31 +7281,62 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         replacement_probe.downlink_endpoint_binding,
         GtpuCapability::Missing
     );
+    let replacement_graph_before = current_pin_graph_snapshot(&replacement_pin_dir);
+    let replacement_proof_source_before = traffic_observation_source_contents(&replacement_pin_dir);
+    let replacement_egress_before = tc_filters("egress");
+    let replacement_ingress_before = tc_filters("ingress");
+    assert!(
+        replacement_egress_before.contains("matchall")
+            && replacement_ingress_before.contains("matchall"),
+        "the external replacement fixture must own both exact tc slots"
+    );
     assert!(matches!(
         replacement_owner
             .install_pdp_context(marked_session_context(replacement_device.ifindex))
             .await,
-        Err(opc_gtpu_dataplane::GtpuError::Io {
-            operation: "ebpf_downlink_endpoint_datapath",
-            ..
+        Err(opc_gtpu_dataplane::GtpuError::StateIndeterminate {
+            operation: "ebpf_graph_effect"
         })
     ));
+    assert!(
+        current_pin_graph_snapshot(&replacement_pin_dir) == replacement_graph_before,
+        "graph-effect refusal must preserve every pin, map ID, and durable map byte"
+    );
+    assert!(
+        traffic_observation_source_contents(&replacement_pin_dir)
+            == replacement_proof_source_before,
+        "graph-effect refusal must precede every proof-source mutation"
+    );
+    assert_eq!(tc_filters("egress"), replacement_egress_before);
+    assert_eq!(tc_filters("ingress"), replacement_ingress_before);
     assert!(matches!(
         replacement_owner.remove_device(&replacement_device).await,
         Err(opc_gtpu_dataplane::GtpuError::AlreadyExists)
     ));
-    for direction in ["egress", "ingress"] {
-        assert!(
-            tc_filters(direction).contains("matchall"),
-            "remove_device must preserve the external {direction} replacement"
-        );
-    }
+    assert!(
+        current_pin_graph_snapshot(&replacement_pin_dir) == replacement_graph_before,
+        "remove_device refusal must preserve every pin, map ID, and durable map byte"
+    );
+    assert!(
+        traffic_observation_source_contents(&replacement_pin_dir)
+            == replacement_proof_source_before,
+        "remove_device refusal must precede every proof-source mutation"
+    );
+    assert_eq!(tc_filters("egress"), replacement_egress_before);
+    assert_eq!(tc_filters("ingress"), replacement_ingress_before);
     drop(replacement_owner);
+    assert!(
+        current_pin_graph_snapshot(&replacement_pin_dir) == replacement_graph_before,
+        "old loader drop must preserve every pin, map ID, and durable map byte"
+    );
+    assert!(
+        traffic_observation_source_contents(&replacement_pin_dir)
+            == replacement_proof_source_before,
+        "old loader drop must preserve the proof-source state"
+    );
+    assert_eq!(tc_filters("egress"), replacement_egress_before);
+    assert_eq!(tc_filters("ingress"), replacement_ingress_before);
     for direction in ["egress", "ingress"] {
-        assert!(
-            tc_filters(direction).contains("matchall"),
-            "old loader drop must preserve the external {direction} replacement"
-        );
         run(
             "tc",
             &[
@@ -6387,8 +7345,10 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             ],
         );
     }
-    fs::remove_dir_all(net.pin_root.join("s2bu"))
-        .expect("remove pins after external replacement proof");
+    assert!(
+        remove_owned_test_directory(&replacement_pin_dir, replacement_pin_identity),
+        "remove exact pins after external replacement proof"
+    );
 
     // With the datapath removed, uplink packets are no longer encapsulated.
     ue_socket.send_to(b"opc-uplink-3", (REMOTE_HOST, 53))?;
@@ -6491,10 +7451,12 @@ async fn ebpf_gtpu_uplink_selected_source_port_on_the_wire(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let net = TestNet::provision();
-    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
-        bpffs_pin_root: net.pin_root.clone(),
-        ..EbpfGtpuDataplaneBackendConfig::default()
-    });
+    let backend = Arc::new(EbpfGtpuDataplaneBackend::with_config(
+        EbpfGtpuDataplaneBackendConfig {
+            bpffs_pin_root: net.pin_root.clone(),
+            ..EbpfGtpuDataplaneBackendConfig::default()
+        },
+    ));
     let mut request = CreateGtpDeviceRequest::new("s2bu");
     request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
     let device = backend.create_device(request).await?;
@@ -7755,10 +8717,12 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let net = TestNet::provision();
-    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
-        bpffs_pin_root: net.pin_root.clone(),
-        ..EbpfGtpuDataplaneBackendConfig::default()
-    });
+    let backend = Arc::new(EbpfGtpuDataplaneBackend::with_config(
+        EbpfGtpuDataplaneBackendConfig {
+            bpffs_pin_root: net.pin_root.clone(),
+            ..EbpfGtpuDataplaneBackendConfig::default()
+        },
+    ));
     let device = backend
         .create_device_with_endpoints(grouped_device_request(grouped_mtu_policy()))
         .await?;
@@ -7788,21 +8752,8 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
             GtpuSessionEntry::new(grouped_v6, IpAddr::V6(EPDG_S2BU_IPV6))?,
         ],
     )?;
-    assert_eq!(
-        backend
-            .reconcile_pdp_context_group(fresh_grouped_reconcile(desired.clone()))
-            .await?,
-        GtpuSessionGroupReconcileOutcome::Activated
-    );
-    assert_eq!(
-        backend
-            .read_pdp_context_group(GtpuSessionGroupSelector::new(
-                grouped_group_id(),
-                grouped_device_id(),
-            ))
-            .await?,
-        GtpuSessionGroupReadback::Active(desired.clone())
-    );
+    let (_selector_namespace, _active_claim) =
+        reconcile_fresh_grouped(backend.clone(), desired.clone()).await?;
     assert_eq!(
         backend.gtpu_traffic_proof_capability(),
         GtpuCapability::Available,
@@ -8387,7 +9338,7 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
     };
     let policy = GtpuUplinkMtuPolicy::new(1500, GtpuOuterFragmentPolicy::SignalPacketTooBig)
         .expect("canonical dual-stack PMTU policy");
-    let backend = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let backend = Arc::new(EbpfGtpuDataplaneBackend::with_config(config.clone()));
     let device = backend
         .create_device_with_endpoints(grouped_device_request(policy))
         .await?;
@@ -8418,21 +9369,8 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
     );
 
     let initial = initial_grouped_session(device.ifindex);
-    assert_eq!(
-        backend
-            .reconcile_pdp_context_group(fresh_grouped_reconcile(initial.clone()))
-            .await?,
-        GtpuSessionGroupReconcileOutcome::Activated
-    );
-    assert_eq!(
-        backend
-            .read_pdp_context_group(GtpuSessionGroupSelector::new(
-                grouped_group_id(),
-                grouped_device_id(),
-            ))
-            .await?,
-        GtpuSessionGroupReadback::Active(initial.clone())
-    );
+    let (selector_namespace, initial_active) =
+        reconcile_fresh_grouped(backend.clone(), initial.clone()).await?;
 
     // Resolve outer neighbours before opening capture sockets so every
     // subsequent single send is an exact one-packet counter assertion.
@@ -8750,236 +9688,24 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
         exact_after.counters.uplink_encapsulated
     );
 
-    // One atomic N -> N+1 reconciliation crosses both outer families, rotates
-    // both TEIDs, and relocates both peers while preserving one logical group.
-    let crossed = crossed_grouped_session(device.ifindex);
-    assert_eq!(
-        backend
-            .reconcile_pdp_context_group(fresh_grouped_reconcile(crossed.clone()))
-            .await?,
-        GtpuSessionGroupReconcileOutcome::Activated
-    );
-    assert_eq!(
-        backend
-            .read_pdp_context_group(GtpuSessionGroupSelector::new(
-                grouped_group_id(),
-                grouped_device_id(),
-            ))
-            .await?,
-        GtpuSessionGroupReadback::Active(crossed.clone())
-    );
-    run("ping", &["-c", "1", "-W", "1", "192.0.2.11"]);
-    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::11"]);
-    let pgw_alt_v4 = in_netns(&net.pgw_ns, || {
-        UdpSocket::bind((PGW_ALT_IP, GTPU_PORT)).expect("bind relocated PGW IPv4 GTP-U socket")
-    });
-    let pgw_alt_v6 = in_netns(&net.pgw_ns, || {
-        UdpSocket::bind((PGW_ALT_IPV6, GTPU_PORT)).expect("bind relocated PGW IPv6 GTP-U socket")
-    });
-
-    let crossed_v4_payload = b"grouped-v4-inner-v6-outer";
-    ue_v4.send_to(crossed_v4_payload, (REMOTE_HOST, 53))?;
-    let crossed_v4_inner = capture_inner_udp_packet(
-        &ue_capture,
-        IpAddr::V4(UE_PAA),
-        IpAddr::V4(REMOTE_HOST),
-        5600,
-        53,
-        crossed_v4_payload,
-    );
-    receive_grouped_uplink(
-        &pgw_alt_v6,
-        SocketAddr::from((EPDG_S2BU_IPV6, GTPU_PORT)),
-        GROUP_PEER_TEID_V4_CROSSED,
-        &crossed_v4_inner,
-    );
-    capture_grouped_outer_ipv6(
-        &pgw_capture,
-        EPDG_S2BU_IPV6,
-        PGW_ALT_IPV6,
-        GROUP_PEER_TEID_V4_CROSSED,
-        &crossed_v4_inner,
-    );
-
-    let crossed_v6_payload = b"grouped-v6-inner-v4-outer";
-    let crossed_v6_sent =
-        build_inner_udp_v6(UE_PAA_IPV6, REMOTE_HOST_IPV6, 5601, 53, crossed_v6_payload);
-    send_raw_ipv6_packet(&net.ue_ns, &crossed_v6_sent);
-    let crossed_v6_inner = forwarded_ipv6_packet(crossed_v6_sent);
-    receive_grouped_uplink(
-        &pgw_alt_v4,
-        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
-        GROUP_PEER_TEID_V6_CROSSED,
-        &crossed_v6_inner,
-    );
-
-    let crossed_v4_down_payload = b"crossed-downlink-v4";
-    let crossed_v4_down_inner =
-        build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5600, crossed_v4_down_payload);
-    let old_v4 = build_outer_gtpu_frame(
-        destination_mac,
-        source_mac,
-        &[],
-        &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &crossed_v4_down_inner),
-        true,
-        0,
-    );
-    send_raw_gtpu_frame(
-        &net.pgw_ns,
-        "s2bup",
-        &old_v4,
-        RawChecksumMetadata::Unverified,
-    );
-    expect_no_datagram(&ue_v4);
-    let old_v4_on_new_peer = build_outer_ipv6_gtpu_frame(
-        destination_mac,
-        source_mac,
-        PGW_ALT_IPV6,
-        EPDG_S2BU_IPV6,
-        &build_gpdu(GROUP_LOCAL_TEID_V4_INITIAL, None, &crossed_v4_down_inner),
-        OuterIpv6Extension::None,
-    );
-    send_raw_gtpu_frame(
-        &net.pgw_ns,
-        "s2bup",
-        &old_v4_on_new_peer,
-        RawChecksumMetadata::Unverified,
-    );
-    expect_no_datagram(&ue_v4);
-    let new_v4_on_old_peer = build_outer_gtpu_frame(
-        destination_mac,
-        source_mac,
-        &[],
-        &build_gpdu(GROUP_LOCAL_TEID_V4_CROSSED, None, &crossed_v4_down_inner),
-        true,
-        0,
-    );
-    send_raw_gtpu_frame(
-        &net.pgw_ns,
-        "s2bup",
-        &new_v4_on_old_peer,
-        RawChecksumMetadata::Unverified,
-    );
-    expect_no_datagram(&ue_v4);
-    let new_v4 = build_outer_ipv6_gtpu_frame(
-        destination_mac,
-        source_mac,
-        PGW_ALT_IPV6,
-        EPDG_S2BU_IPV6,
-        &build_gpdu(GROUP_LOCAL_TEID_V4_CROSSED, None, &crossed_v4_down_inner),
-        OuterIpv6Extension::None,
-    );
-    send_raw_gtpu_frame(
-        &net.pgw_ns,
-        "s2bup",
-        &new_v4,
-        RawChecksumMetadata::Unverified,
-    );
-    receive_grouped_downlink(
-        &ue_v4,
-        SocketAddr::from((REMOTE_HOST, 53)),
-        crossed_v4_down_payload,
-    );
-
-    let crossed_v6_down_payload = b"crossed-downlink-v6";
-    let crossed_v6_down_inner = build_inner_udp_v6(
-        REMOTE_HOST_IPV6,
-        UE_PAA_IPV6,
-        53,
-        5601,
-        crossed_v6_down_payload,
-    );
-    let old_v6 = build_outer_ipv6_gtpu_frame(
-        destination_mac,
-        source_mac,
-        PGW_IPV6,
-        EPDG_S2BU_IPV6,
-        &build_gpdu(GROUP_LOCAL_TEID_V6_INITIAL, None, &crossed_v6_down_inner),
-        OuterIpv6Extension::None,
-    );
-    send_raw_gtpu_frame(
-        &net.pgw_ns,
-        "s2bup",
-        &old_v6,
-        RawChecksumMetadata::Unverified,
-    );
-    expect_no_datagram(&ue_v6);
-    let new_v6_on_old_peer = build_outer_ipv6_gtpu_frame(
-        destination_mac,
-        source_mac,
-        PGW_IPV6,
-        EPDG_S2BU_IPV6,
-        &build_gpdu(GROUP_LOCAL_TEID_V6_CROSSED, None, &crossed_v6_down_inner),
-        OuterIpv6Extension::None,
-    );
-    send_raw_gtpu_frame(
-        &net.pgw_ns,
-        "s2bup",
-        &new_v6_on_old_peer,
-        RawChecksumMetadata::Unverified,
-    );
-    expect_no_datagram(&ue_v6);
-    let mut old_v6_on_new_peer = build_outer_gtpu_frame(
-        destination_mac,
-        source_mac,
-        &[],
-        &build_gpdu(GROUP_LOCAL_TEID_V6_INITIAL, None, &crossed_v6_down_inner),
-        true,
-        0,
-    );
-    let outer_ip = ETH_HDR_LEN;
-    old_v6_on_new_peer[outer_ip + 12..outer_ip + 16].copy_from_slice(&PGW_ALT_IP.octets());
-    refresh_outer_ipv4_checksum(&mut old_v6_on_new_peer);
-    refresh_outer_udp_checksum(&mut old_v6_on_new_peer);
-    send_raw_gtpu_frame(
-        &net.pgw_ns,
-        "s2bup",
-        &old_v6_on_new_peer,
-        RawChecksumMetadata::Unverified,
-    );
-    expect_no_datagram(&ue_v6);
-    let mut new_v6 = build_outer_gtpu_frame(
-        destination_mac,
-        source_mac,
-        &[],
-        &build_gpdu(GROUP_LOCAL_TEID_V6_CROSSED, None, &crossed_v6_down_inner),
-        true,
-        0,
-    );
-    new_v6[outer_ip + 12..outer_ip + 16].copy_from_slice(&PGW_ALT_IP.octets());
-    refresh_outer_ipv4_checksum(&mut new_v6);
-    refresh_outer_udp_checksum(&mut new_v6);
-    send_raw_gtpu_frame(
-        &net.pgw_ns,
-        "s2bup",
-        &new_v6,
-        RawChecksumMetadata::Unverified,
-    );
-    receive_grouped_downlink(
-        &ue_v6,
-        SocketAddr::from((REMOTE_HOST_IPV6, 53)),
-        crossed_v6_down_payload,
-    );
-
-    // Drop all process-local loader state, then adopt the exact retained
-    // grouped attachment through the public stable-ID/endpoint-set create
-    // boundary. Readback, capabilities, and live traffic must survive without
-    // raw-map intervention.
+    // The opaque namespace is the sole owner of this selector set. Restart
+    // adoption therefore recovers the same durable Active coordinate instead
+    // of fabricating a second ledger or using the raw grouped ports. Replacing
+    // an Active complete set is deliberately outside this boundary: mixed-set
+    // retirement/republication remains the separately tracked RFC 017 work.
+    drop(initial_active);
     drop(backend);
-    let adopted_backend = EbpfGtpuDataplaneBackend::with_config(config);
+    let adopted_backend = Arc::new(EbpfGtpuDataplaneBackend::with_config(config));
     let adopted = adopted_backend
         .create_device_with_endpoints(grouped_device_request(policy))
         .await?;
     assert_eq!(adopted, device);
-    assert_eq!(
-        adopted_backend
-            .read_pdp_context_group(GtpuSessionGroupSelector::new(
-                grouped_group_id(),
-                grouped_device_id(),
-            ))
-            .await?,
-        GtpuSessionGroupReadback::Active(crossed.clone())
-    );
+    let recovered_active = selector_namespace
+        .recover_active(adopted_backend.clone(), initial.clone())
+        .await
+        .map_err(|_| GtpuError::UnsupportedFeature {
+            feature: "selector_namespace_test_coordinator",
+        })?;
     let adopted_capabilities = adopted_backend
         .gtpu_ip_family_capabilities(grouped_attachment(&adopted))
         .await?;
@@ -8987,30 +9713,7 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
         adopted_capabilities, capabilities,
         "restart adoption must preserve the complete attachment-scoped capability report"
     );
-    assert_eq!(
-        adopted_capabilities.grouped_atomic_reconciliation,
-        GtpuCapability::Available
-    );
-    assert_eq!(
-        adopted_capabilities.local_endpoint_sets,
-        GtpuCapability::Available
-    );
-    assert_eq!(
-        adopted_capabilities.ipv6_udp_checksum,
-        GtpuCapability::Available
-    );
-    assert_eq!(
-        adopted_capabilities.uplink_checksum_offload,
-        GtpuUplinkChecksumOffloadContract::MaterializedOnly
-    );
-    assert_eq!(
-        adopted_capabilities.downlink_outer_ipv4_fragment_handling,
-        GtpuDownlinkFragmentContract::Unsupported
-    );
-    assert_eq!(
-        adopted_capabilities.downlink_outer_ipv6_fragment_handling,
-        GtpuDownlinkFragmentContract::Unsupported
-    );
+
     let adopted_payload = b"grouped-adopted-live";
     ue_v4.send_to(adopted_payload, (REMOTE_HOST, 53))?;
     let adopted_inner = capture_inner_udp_packet(
@@ -9022,9 +9725,9 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
         adopted_payload,
     );
     receive_grouped_uplink(
-        &pgw_alt_v6,
-        SocketAddr::from((EPDG_S2BU_IPV6, GTPU_PORT)),
-        GROUP_PEER_TEID_V4_CROSSED,
+        &pgw_v4,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        GROUP_PEER_TEID_V4_INITIAL,
         &adopted_inner,
     );
     let adopted_v6_payload = b"grouped-adopted-v6-live";
@@ -9033,43 +9736,48 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
     send_raw_ipv6_packet(&net.ue_ns, &adopted_v6_sent);
     let adopted_v6_inner = forwarded_ipv6_packet(adopted_v6_sent);
     receive_grouped_uplink(
-        &pgw_alt_v4,
-        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
-        GROUP_PEER_TEID_V6_CROSSED,
+        &pgw_v6,
+        SocketAddr::from((EPDG_S2BU_IPV6, GTPU_PORT)),
+        GROUP_PEER_TEID_V6_INITIAL,
         &adopted_v6_inner,
     );
     capture_grouped_outer_ipv6(
         &pgw_capture,
         EPDG_S2BU_IPV6,
-        PGW_ALT_IPV6,
-        GROUP_PEER_TEID_V4_CROSSED,
-        &adopted_inner,
+        PGW_IPV6,
+        GROUP_PEER_TEID_V6_INITIAL,
+        &adopted_v6_inner,
     );
 
-    assert_eq!(
-        adopted_backend
-            .remove_pdp_context_group_exact(crossed.clone())
-            .await?,
-        GtpuSessionGroupRemovalOutcome::Removed
-    );
-    assert_eq!(
+    let _retired = selector_namespace
+        .retire(adopted_backend.clone(), recovered_active, initial.clone())
+        .await
+        .map_err(|_| GtpuError::UnsupportedFeature {
+            feature: "selector_namespace_test_coordinator",
+        })?;
+    assert!(matches!(
         adopted_backend
             .read_pdp_context_group(GtpuSessionGroupSelector::new(
                 grouped_group_id(),
                 grouped_device_id(),
             ))
-            .await?,
-        GtpuSessionGroupReadback::Absent
-    );
+            .await,
+        Err(GtpuError::StateIndeterminate {
+            operation: "ebpf_grouped_raw_readback_bound"
+        })
+    ));
     assert_eq!(
         adopted_backend
-            .remove_pdp_context_group_exact(crossed)
+            .remove_pdp_context_group_exact(initial.clone())
             .await?,
-        GtpuSessionGroupRemovalOutcome::AlreadyAbsent
+        GtpuSessionGroupRemovalOutcome::Indeterminate(
+            GtpuSessionGroupIndeterminateReason::AuthorityUnavailable,
+        ),
+        "the raw removal port must remain denied after authorized retirement"
     );
 
     ue_v4.send_to(b"grouped-removed-uplink", (REMOTE_HOST, 53))?;
-    expect_no_datagram(&pgw_alt_v6);
+    expect_no_datagram(&pgw_v4);
     let removed_v6 = build_inner_udp_v6(
         UE_PAA_IPV6,
         REMOTE_HOST_IPV6,
@@ -9078,22 +9786,21 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
         b"grouped-removed-v6-uplink",
     );
     send_raw_ipv6_packet(&net.ue_ns, &removed_v6);
-    expect_no_datagram(&pgw_alt_v4);
+    expect_no_datagram(&pgw_v6);
     send_raw_gtpu_frame(
         &net.pgw_ns,
         "s2bup",
-        &new_v4,
+        &v4_downlink,
         RawChecksumMetadata::Unverified,
     );
     expect_no_datagram(&ue_v4);
     send_raw_gtpu_frame(
         &net.pgw_ns,
         "s2bup",
-        &new_v6,
+        &v6_downlink,
         RawChecksumMetadata::Unverified,
     );
     expect_no_datagram(&ue_v6);
-
     drop(net);
     Ok(())
 }
@@ -9418,10 +10125,13 @@ async fn cleanup_only_absence_rejects_off_slot_current_hook_without_pins(
         ("absent", net.pin_root.join("cleanup-absent"), false),
         ("empty", net.pin_root.join("cleanup-empty"), true),
     ] {
-        fs::create_dir_all(&pin_root).expect("create cleanup-only case root");
+        create_test_owned_private_directory_tree(&pin_root, "create cleanup-only case root");
         let pin_dir = pin_root.join("s2bu");
         if create_empty_namespace {
-            fs::create_dir(&pin_dir).expect("create empty cleanup-only pin namespace");
+            create_test_owned_private_directory_tree(
+                &pin_dir,
+                "create empty cleanup-only pin namespace",
+            );
         } else {
             assert!(
                 !pin_dir.exists(),
@@ -10169,7 +10879,8 @@ async fn ebpf_gtpu_live_historical_generation_refuses_every_attach_without_mutat
 
     // A real older generation: its own instruction stream on both hooks, its
     // own pin graph, and its own 6-slot counter map.
-    let (uplink_id, downlink_id) = install_pre_redirect_generation(&pin_dir);
+    let (uplink_id, downlink_id, historical_pin_identity) =
+        install_pre_redirect_generation(&pin_dir);
     assert_eq!(tc_program_id("egress"), uplink_id);
     assert_eq!(tc_program_id("ingress"), downlink_id);
     let counters_before =
@@ -10325,7 +11036,10 @@ async fn ebpf_gtpu_live_historical_generation_refuses_every_attach_without_mutat
             ],
         );
     }
-    fs::remove_dir_all(&pin_dir).expect("drained reprovision removes the historical pin graph");
+    assert!(
+        remove_owned_test_directory(&pin_dir, historical_pin_identity),
+        "drained reprovision removes the exact historical pin graph"
+    );
     let reprovisioned = EbpfGtpuDataplaneBackend::with_config(config.clone());
     let mut fresh = CreateGtpDeviceRequest::new("s2bu");
     fresh.bind_address = IpAddr::V4(EPDG_S2BU_IP);
@@ -10383,7 +11097,8 @@ async fn ebpf_gtpu_off_slot_historical_generation_refuses_before_mutation(
     };
     let pin_dir = net.pin_root.join("s2bu");
 
-    let historical_id = install_off_slot_pre_redirect_generation_with_current_capacity(&pin_dir);
+    let (historical_id, _historical_pin_identity) =
+        install_off_slot_pre_redirect_generation_with_current_capacity(&pin_dir);
     let counters_before =
         pinned_map_abi(&pin_dir, MAP_COUNTERS).expect("off-slot counter map must be pinned");
     assert_eq!(
@@ -10527,6 +11242,8 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
     let mut create = CreateGtpDeviceRequest::new("s2bu");
     create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
     owner.create_device(create).await?;
+    let root_a_identity =
+        capture_created_test_directory_identity(&root_a, "capture root-A current graph");
     drop(owner);
 
     let egress_before = tc_filters("egress");
@@ -10541,7 +11258,9 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
     // Load the committed current object under root B but attach no program.
     // Its complete map set therefore has the right current ABI and different
     // kernel IDs from the maps already referenced by the live hooks.
-    fs::create_dir_all(&pin_dir_b).expect("create alternate current pin directory");
+    let root_b_identity =
+        create_test_owned_private_directory_tree(&root_b, "create root-B current graph");
+    create_test_owned_private_directory_tree(&pin_dir_b, "create alternate current pin directory");
     let mut alternate = EbpfLoader::new()
         .default_map_pin_directory(&pin_dir_b)
         .map_pin_path(
@@ -10592,6 +11311,7 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
         MAP_SESSION_UPLINK_INDEX,
         MAP_SESSION_DOWNLINK_INDEX,
         MAP_SESSION_TRANSACTIONS,
+        MAP_SESSION_SELECTOR_STAMPS,
         MAP_CONFIG_IPV6,
         MAP_SESSION_SCHEMA,
         MAP_TFT_CLASSIFIER_SCHEMA,
@@ -10752,8 +11472,14 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
             ],
         );
     }
-    fs::remove_dir_all(&root_a).expect("remove root-A current graph");
-    fs::remove_dir_all(&root_b).expect("remove root-B current graph");
+    assert!(
+        remove_owned_test_directory(&root_a, root_a_identity),
+        "remove exact root-A current graph"
+    );
+    assert!(
+        remove_owned_test_directory(&root_b, root_b_identity),
+        "remove exact root-B current graph"
+    );
     println!("OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN");
     drop(net);
     Ok(())
@@ -10785,7 +11511,7 @@ async fn ebpf_gtpu_foreign_pin_abi_is_refused_before_any_typed_read(
     // slots empty. Nothing downstream can see this: the value type is
     // unchanged, so a typed accessor binds happily and every write to the
     // highest slot is silently discarded by the kernel.
-    let (uplink_id, downlink_id) = install_pre_redirect_generation(&pin_dir);
+    let (uplink_id, downlink_id, drifted_pin_identity) = install_pre_redirect_generation(&pin_dir);
     for direction in ["egress", "ingress"] {
         run(
             "tc",
@@ -10839,7 +11565,10 @@ async fn ebpf_gtpu_foreign_pin_abi_is_refused_before_any_typed_read(
     // which is exactly what the schema preflight's typed `BpfHashMap` binding
     // rejects — so if that binding still ran first this would surface as
     // `ebpf_bearer_schema` instead.
-    fs::remove_dir_all(&pin_dir).expect("clear the drifted pin graph");
+    assert!(
+        remove_owned_test_directory(&pin_dir, drifted_pin_identity),
+        "clear the exact drifted pin graph"
+    );
     let publisher = EbpfGtpuDataplaneBackend::with_config(config.clone());
     let mut publish = CreateGtpDeviceRequest::new("s2bu");
     publish.bind_address = IpAddr::V4(EPDG_S2BU_IP);

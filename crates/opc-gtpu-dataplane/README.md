@@ -14,9 +14,10 @@ XFRM policy, deployment defaults, or traffic-readiness policy.
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.
-  The reconciliation methods are additive defaults, so existing third-party
-  implementations remain source-compatible and report typed unsupported
-  results until they opt in.
+  New trait ports retain default unsupported bodies for third-party backend
+  compatibility. Grouped request construction is intentionally source-
+  breaking: production callers now enter through the protected selector
+  coordinator and cannot construct fresh/reused authority themselves.
 - `LinuxGtpuDataplaneBackend`: safe adapter over the Linux `gtp` netdevice and
   GTP generic-netlink family.
 - `EbpfGtpuDataplaneBackend`: tc `clsact` eBPF datapath adapter for
@@ -50,6 +51,9 @@ XFRM policy, deployment defaults, or traffic-readiness policy.
   `EbpfManagedDeviceInventoryCompleteness`,
   `MAX_EBPF_MANAGED_DEVICE_IDENTITIES`, `GtpRole`, `GtpVersion`,
   `GtpAddressFamily`, and `GTPU_PORT`.
+  The provenance and reuse-proof exports are read-only backend projections,
+  not authority: their production constructors and request constructors are
+  SDK-private, and every effect additionally consumes an opaque admission.
 - `TftUplinkClassifier` is a backend-neutral, bounded classifier contract for
   multiple GTP-U contexts sharing one PAA on an unmarked uplink packet path. It
   uses the canonical `opc-proto-tft` model, accepts only complete
@@ -1729,6 +1733,15 @@ rolling handoff must therefore stop the old writer before the new writer adopts
 the interface. Privileged processes that bypass this lease remain outside the
 supported mutation model.
 
+Selector-namespace effects additionally take a bounded `flock` on a distinct,
+persistent operation-lock inode derived from the same opaque namespace hash.
+This lets each durable effect release its critical section without releasing
+the process-lifetime writer lease. The original control-directory inode remains
+the lifetime lease so cooperating older and newer SDK writers contend on the
+same upgrade-compatible safety boundary. Its exact sibling component is the
+64-byte lowercase namespace hash followed by `-operation-v1`; the dot-free
+component is valid on bpffs, which reserves names containing a dot.
+
 The runtime takes both tc links out of Aya loader ownership, so dropping an old
 loader cannot detach a static filter that an external actor subsequently
 placed at the same priority/handle. `remove_device` preflights both live hooks
@@ -1908,8 +1921,54 @@ with a boot identity if a baseline has to outlive the host.
 
 ### Grouped dual-stack eBPF contract
 
-The public grouped-session API is additive. Existing `GtpuProbe` fields and
-legacy v5 map-key bytes are unchanged. The current eBPF backend opts in only
+#### Selector namespace admission
+
+Products open `GtpuSessionSelectorNamespaceAuthority` only through
+`open_protected`, using an SDK-owned `EncryptingSessionBackend` or
+`RemoteSealingSessionBackend` around the durable store, then call
+`reconcile_fresh` rather than constructing a grouped reconcile request. The
+SDK derives the ledger key from that sealed payload boundary, the explicit
+tenant/NF storage scope, and the stable device; products cannot select a raw
+namespace key or assert their own protection boundary. It creates the private
+request around an opaque, affine `GtpuSessionSelectorAdmission`, binding the
+stable device namespace, exact group ID, canonical complete set of uplink
+`(family, PAA, mark)` and downlink `(outer family, inner family, local TEID)`
+selector atoms, and a nonzero authority generation. `Fresh` is not a public
+assertion and no public constructor can replay or cross-bind an admission.
+
+`GtpuSessionSelectorNamespaceAuthority` owns this transition over the
+SDK-protected `SessionStore` boundary. The store persists the entire opaque,
+versioned ledger as one durable multiprocess compare-and-swap record, sealed
+before reaching its underlying adapter. It includes all atom claims, group/set
+bindings, permanent tombstones, the authority generation, and committed
+device/key/capacity configuration, so the ordinary sequential session-store
+batch API is not sufficient. The supplied
+`InMemoryGtpuSessionSelectorNamespaceStore` is only a deterministic
+conformance model, not a production authority. On ambiguous durable
+completion, the coordinator reads back the exact mutation fingerprint; if it
+is not exact, it fails closed. A durable adapter retains a Retiring or Poisoned
+state for unresolved external teardown. Retire the authority claim before
+dataplane removal and require an SDK/backend-qualified drain/RCU receipt before
+reissuing a retired selector set. Product assertions do not qualify.
+Diagnostics expose only bounded state classifications,
+never selector, subscriber, or digest values.
+
+Each process admits a bounded queue of selector operations but polls exactly
+one worker per protected storage-scope commitment from durable lease
+acquisition through release. This is part of the fence: a same-owner
+`SessionStore` acquire is replica recovery and replaces the prior credential,
+so concurrent local workers must never mint overlapping backend windows.
+Dropping an operation observer, including `open_protected`, does not cancel
+the owned worker or release that gate. Across processes, every replica must
+use the stable, replica-unique `OwnerId` required by the session-store
+contract; reusing one owner identity in multiple live processes is not a
+supported concurrency model.
+
+The backend trait expansion is additive, and existing `GtpuProbe` fields and
+legacy v5 map-key bytes are unchanged. The grouped-session construction
+migration is deliberately not additive: public `Fresh` assertion and public
+request construction are removed, so callers must use the protected
+coordinator. The current eBPF backend opts in only
 after the live attachment proves its exact schema, configuration, named map
 identities, tc programs, and held namespace lease. The async, fallible
 `gtpu_ip_family_capabilities` query accepts a

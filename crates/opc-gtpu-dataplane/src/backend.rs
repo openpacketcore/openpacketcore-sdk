@@ -26,6 +26,62 @@ use crate::traffic_observation::{
 };
 use crate::{GtpAddressFamily, GtpuError};
 
+/// Exact no-effect evidence for recovery of a durable Installing intent.
+///
+/// This is intentionally distinct from grouped authorized readback. Ordinary
+/// readback may report `Absent` only for an exact terminal-retired stamp;
+/// returning this value requires the backend to hold the namespace binding
+/// and inventory lock while it proves no authority, journal, index, or stamp
+/// exists for the precise pending group.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GtpuSessionSelectorInstallRecovery {
+    /// The exact pending group has no dataplane effect and no selector stamp.
+    NoEffect,
+}
+
+/// Exact restart evidence for a durable Installing coordinate whose backend
+/// supervisor has already been started.
+///
+/// The no-effect variant covers a process loss after the durable handoff but
+/// before its first map write. The pending variant permits only the exact
+/// journal and pending selector-operation stamp for the same opaque
+/// coordinate; malformed, partial, or unstamped state is never resumable.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GtpuSessionSelectorInstallResume {
+    /// No dataplane effect has appeared for the exact started coordinate.
+    NoEffect,
+    /// The exact pending-install journal and selector-operation stamp remain.
+    ExactPendingInstall,
+}
+
+/// Exact restart evidence for a durable Retiring coordinate whose backend
+/// supervisor has already been started.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GtpuSessionSelectorRetiringResume {
+    /// The exact prior Active terminal remains intact before any remove write.
+    NoEffect,
+    /// The exact pending-remove journal and selector-operation stamp remain.
+    ExactPendingRemove,
+}
+
+/// Exact no-effect evidence for recovery of a durable Retiring intent.
+///
+/// This does not mean the group is absent: a `Retiring(false)` row was
+/// precommitted from one exact Active terminal. Returning this value proves
+/// that predecessor's complete active graph and terminal stamp remain exact,
+/// while no removal journal, pending-remove stamp, or terminal-retired stamp
+/// has appeared. It is deliberately distinct from ordinary Active readback.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GtpuSessionSelectorRetiringRecovery {
+    /// The exact previous Active terminal remains intact and no removal
+    /// dataplane effect has started.
+    ExactPreviousActive,
+}
+
 /// Backend that can mutate Linux GTP-U dataplane state.
 ///
 /// Implementations are async because real adapters perform netlink I/O and
@@ -513,12 +569,262 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// held exclusive lease on every call. Extra or missing indexes, duplicate
     /// family authority, and a group ID bound to another device are never
     /// collapsed into `Absent` or `Active`.
+    ///
+    /// This is a legacy diagnostic port only. A production backend MUST refuse
+    /// it whenever the attachment has an immutable durable selector namespace
+    /// binding. Bound lifecycle settlement uses
+    /// [`Self::read_pdp_context_group_with_lease`]; structural readback cannot
+    /// satisfy protected-ledger recovery.
     async fn read_pdp_context_group(
         &self,
         _selector: GtpuSessionGroupSelector,
     ) -> Result<GtpuSessionGroupReadback, GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "gtpu_session_group_readback",
+        })
+    }
+
+    /// Read one exact grouped session through the durable selector authority.
+    ///
+    /// The affine admission is consumed so an adapter can verify the opaque
+    /// stamp before inspecting kernel state without leaving replayable
+    /// authority. This is deliberately a separate
+    /// authority-bearing port: falling back to a structural semantic lookup
+    /// after an in-memory admission check would let an unauthenticated
+    /// readback settle durable recovery. Adapters that do not implement the
+    /// exact binding-and-stamp proof must fail closed.
+    async fn read_pdp_context_group_authorized(
+        &self,
+        _expected: &GtpuSessionGroup,
+        _admission: crate::GtpuSessionSelectorAdmission,
+    ) -> Result<GtpuSessionGroupReadback, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_session_group_authorized_readback",
+        })
+    }
+
+    /// Provision one previously absent selector namespace while the dataplane
+    /// is stopped. Implementations must prove the full control-map inventory
+    /// empty, create an immutable marker for this exact opaque binding, and
+    /// read it back before returning. Existing adapters fail closed.
+    async fn provision_selector_namespace(
+        &self,
+        _binding: crate::GtpuSessionSelectorBackendBinding,
+    ) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_namespace_provision",
+        })
+    }
+
+    /// Verify the exact immutable selector namespace binding before an
+    /// authorized readback, recovery, or mutation. A binding created for one
+    /// backend may not be rebound by passing another backend here.
+    async fn ensure_selector_namespace_binding(
+        &self,
+        _binding: crate::GtpuSessionSelectorBackendBinding,
+    ) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_namespace_binding",
+        })
+    }
+
+    /// Consume a pending Installing no-effect inspection request under the
+    /// exact namespace binding and the backend's inventory lock.
+    ///
+    /// This port exists solely to decide the documented no-effect recovery
+    /// branch. It must not reinterpret a terminal-retired stamp as virgin or
+    /// use a generationless semantic lookup. Backends that cannot prove the
+    /// full negative fact fail closed. The request's currentness fence must be
+    /// checked immediately before and after the exact negative inspection
+    /// while the host lock is retained. Only then may the backend consume it
+    /// into the returned coordinate-bound receipt.
+    async fn inspect_installing_selector_no_effect(
+        &self,
+        _request: crate::GtpuSessionSelectorInstallingNoEffectRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_installing_no_effect_recovery",
+        })
+    }
+
+    /// Inspect a started Installing coordinate before resuming its backend
+    /// effect after process loss.
+    ///
+    /// This is not usable by a worker that lost the false-to-true handoff
+    /// race. It may report only exact no-effect or the one exact pending
+    /// install journal/stamp for the supplied admission; any partial,
+    /// malformed, terminal, or differently bound state fails closed.
+    async fn inspect_installing_selector_resume(
+        &self,
+        _expected: &GtpuSessionGroup,
+        _admission: &crate::GtpuSessionSelectorAdmission,
+    ) -> Result<GtpuSessionSelectorInstallResume, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_installing_started_recovery",
+        })
+    }
+
+    /// Consume a pending Retiring no-effect inspection request before its
+    /// first backend removal effect.
+    ///
+    /// This port may return [`GtpuSessionSelectorRetiringRecovery::ExactPreviousActive`]
+    /// only under the immutable namespace binding and exclusive inventory
+    /// lock, after proving the exact prior Active terminal graph and stamp and
+    /// the absence of any removal journal, pending-remove stamp, or terminal
+    /// remove stamp. It is consumed only while durable state is
+    /// `Retiring(false)`; an adapter that cannot prove that negative fact must
+    /// fail closed rather than treating structural Active readback as enough.
+    /// The request's currentness fence must be checked immediately before and
+    /// after the complete negative proof under the host lock, then consumed
+    /// into the returned coordinate-bound receipt.
+    async fn inspect_retiring_selector_no_effect(
+        &self,
+        _request: crate::GtpuSessionSelectorRetiringNoEffectRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_retiring_no_effect_recovery",
+        })
+    }
+
+    /// Inspect a started Retiring coordinate before resuming its backend
+    /// removal after process loss. Implementations may classify only exact
+    /// prior Active/no-effect or the one exact pending-remove journal/stamp.
+    async fn inspect_retiring_selector_resume(
+        &self,
+        _expected: &GtpuSessionGroup,
+        _admission: &crate::GtpuSessionSelectorAdmission,
+    ) -> Result<GtpuSessionSelectorRetiringResume, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_retiring_started_recovery",
+        })
+    }
+
+    /// Prove backend quiescence for one SDK-issued retired selector source
+    /// before the exact requested successor may reuse its selectors.
+    ///
+    /// The request carries the opaque terminal-retired coordinate. An
+    /// implementation must verify its exact terminal-retired stamp and
+    /// authoritative absence, then complete a trusted traffic drain or RCU
+    /// barrier before consuming the request into its receipt. Backends without
+    /// that proof remain unsupported; callers can never mint a receipt from a
+    /// public evidence enum alone.
+    async fn authorize_selector_reuse(
+        &self,
+        _request: crate::GtpuSessionSelectorReuseRequest,
+    ) -> Result<crate::GtpuSessionSelectorReuseReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_reuse_quiescence",
+        })
+    }
+
+    /// Acquire one opaque selector namespace binding lease. This is the
+    /// backend-neutral authority port used by production selector workers;
+    /// implementations must not fall back to a raw semantic lookup.
+    async fn acquire_selector_namespace_lease(
+        &self,
+        _lease: crate::GtpuSessionSelectorBindingLease,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_namespace_binding_lease",
+        })
+    }
+
+    /// Perform the stopped-installation selector provisioning effect through
+    /// its opaque SDK request and return its consumed receipt.
+    async fn provision_selector_namespace_authorized(
+        &self,
+        _request: crate::GtpuSessionSelectorProvisionRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_namespace_authorized_provision",
+        })
+    }
+
+    /// Inspect the durable terminal-fence capsule before or after a selector
+    /// namespace decommission precommit.
+    ///
+    /// An absence request may succeed only when no capsule exists. A recovery
+    /// request may succeed only when the one retained capsule is byte-for-byte
+    /// equal to its opaque expected payload. Existing adapters fail closed.
+    async fn inspect_selector_namespace_decommission_fence(
+        &self,
+        _request: crate::GtpuSessionSelectorDecommissionInspectRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_namespace_decommission_fence_inspect",
+        })
+    }
+
+    /// Create and exactly read back the durable terminal-fence capsule for a
+    /// selector namespace decommission.
+    ///
+    /// The opaque request carries the authenticated precommitted coordinate.
+    /// A binding-only marker is insufficient because a recovery worker must
+    /// never invent the coordinate it converges.
+    async fn create_selector_namespace_decommission_fence(
+        &self,
+        _request: crate::GtpuSessionSelectorDecommissionRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_namespace_decommission_fence_create",
+        })
+    }
+
+    /// Compatibility alias for the original terminal-fence creation port.
+    /// New implementations should implement
+    /// [`Self::create_selector_namespace_decommission_fence`] together with
+    /// the required inspect and exact-readback ports.
+    async fn decommission_selector_namespace_authorized(
+        &self,
+        request: crate::GtpuSessionSelectorDecommissionRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        self.create_selector_namespace_decommission_fence(request)
+            .await
+    }
+
+    /// Read back the one exact durable terminal-fence capsule after creation
+    /// or recovery. A missing, extra, malformed, or different capsule must
+    /// not be collapsed into success.
+    async fn read_selector_namespace_decommission_fence(
+        &self,
+        _request: crate::GtpuSessionSelectorDecommissionReadbackRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_namespace_decommission_fence_readback",
+        })
+    }
+
+    /// Execute an opaque selector install/reconcile effect. The request owns
+    /// the affine admission and must be retained by the backend until it has
+    /// a terminal classified receipt.
+    async fn reconcile_pdp_context_group_authorized(
+        &self,
+        _request: crate::GtpuSessionSelectorEffectRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_session_group_authorized_reconcile",
+        })
+    }
+
+    /// Read an exact group through the opaque SDK authority request.
+    async fn read_pdp_context_group_with_lease(
+        &self,
+        _request: crate::GtpuSessionSelectorReadbackRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_session_group_leased_readback",
+        })
+    }
+
+    /// Execute an opaque selector removal effect for one exact Retiring
+    /// coordinate. Backends must retain and consume the request rather than
+    /// treating an absent marker as authorization for raw removal.
+    async fn remove_pdp_context_group_with_lease(
+        &self,
+        _request: crate::GtpuSessionSelectorRemovalRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_session_group_leased_removal",
         })
     }
 
@@ -541,9 +847,10 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// components, generation overflow, endpoint-authority loss, or uncertain
     /// ACK state produce conflict/indeterminate with no guessed cleanup.
     /// Cross-group selector transfer is always forbidden while the source is
-    /// live. Reuse after exact removal requires the source-bound drain/grace
-    /// evidence carried by [`GtpuSessionGroupReconcileRequest`]; a fresh claim
-    /// is checked against the caller's durable selector registry.
+    /// live. Reuse after exact removal requires an opaque, source-bound SDK
+    /// authorization carried by [`GtpuSessionGroupReconcileRequest`]; fresh
+    /// ownership is admitted only by the protected selector-ledger
+    /// coordinator.
     async fn reconcile_pdp_context_group(
         &self,
         _request: GtpuSessionGroupReconcileRequest,
@@ -561,12 +868,33 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// journal. The caller permanently retires the group ID; the dataplane
     /// does not retain an unbounded tombstone. Pending/Removing adoption may
     /// mutate only absent or byte-exact owned components.
+    ///
+    /// This is a legacy compatibility port only. A production backend MUST
+    /// refuse it whenever the attachment has an immutable durable selector
+    /// namespace binding, even if the caller supplies a byte-exact group.
+    /// Selector-owned removal requires the affine Retiring request accepted by
+    /// [`Self::remove_pdp_context_group_with_lease`]; otherwise a caller could
+    /// bypass durable retirement and permanently published-atom history.
     async fn remove_pdp_context_group_exact(
         &self,
         _expected: GtpuSessionGroup,
     ) -> Result<GtpuSessionGroupRemovalOutcome, GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "gtpu_session_group_exact_removal",
+        })
+    }
+
+    /// Remove one exact grouped session by consuming the affine selector
+    /// authority that created it. The default preserves third-party source
+    /// compatibility while refusing an effect it cannot bind to a durable
+    /// namespace ledger.
+    async fn remove_pdp_context_group_authorized(
+        &self,
+        _expected: GtpuSessionGroup,
+        _admission: crate::GtpuSessionSelectorAdmission,
+    ) -> Result<GtpuSessionGroupRemovalOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_session_group_authorized_removal",
         })
     }
 
@@ -749,11 +1077,14 @@ mod tests {
         ));
         let entry = crate::GtpuSessionEntry::new(context, local_outer).unwrap();
         let group = GtpuSessionGroup::new(group_id, device_id, vec![entry]).unwrap();
-        let reconcile_request = GtpuSessionGroupReconcileRequest::new(
-            group.clone(),
-            crate::GtpuSessionSelectorProvenance::Fresh,
-        )
-        .unwrap();
+        let namespace = crate::selector_namespace::TestGtpuSessionSelectorNamespaceAuthority::new(
+            crate::InMemoryGtpuSessionSelectorNamespaceStore::default(),
+            [0x53; 32],
+            32,
+        );
+        let admission = namespace.claim(&group, None).unwrap();
+        let reconcile_request =
+            GtpuSessionGroupReconcileRequest::new(group.clone(), admission).unwrap();
         assert!(matches!(
             backend.reconcile_pdp_context_group(reconcile_request).await,
             Err(GtpuError::UnsupportedFeature {
