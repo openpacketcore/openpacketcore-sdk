@@ -84,9 +84,9 @@ use sha2::{Digest, Sha256};
 use crate::backend::error_proves_no_requested_mutation;
 use crate::model::{classify_dual_selector_state, DualSelectorState};
 use crate::traffic_observation::{
-    GtpuTrafficProofAuthorityStoreIdentity, GtpuTrafficProofAuthorityToken,
-    GtpuTrafficProofDispatchAuthority, GtpuTrafficProofRevoker, GtpuTrafficProofSessionSnapshot,
-    GtpuTrafficProofValidationSnapshot,
+    GtpuTrafficProofAuthorityStoreIdentity, GtpuTrafficProofAuthorityStoreRebindReady,
+    GtpuTrafficProofAuthorityToken, GtpuTrafficProofDispatchAuthority, GtpuTrafficProofRevoker,
+    GtpuTrafficProofSessionSnapshot, GtpuTrafficProofValidationSnapshot,
 };
 use crate::{
     CreateGtpDeviceEndpointSetRequest, CreateGtpDeviceRequest, CurrentEbpfGraphRecoveryOutcome,
@@ -9001,6 +9001,68 @@ impl EbpfGtpuDataplaneBackend {
         Ok(store)
     }
 
+    /// Complete a changed-desired authority rebind while holding the backend
+    /// mutation boundary. The generic transaction has already revoked the old
+    /// gate and drained affine leases before this function starts.
+    fn rebind_gtpu_traffic_proof_authority_sync(
+        &self,
+        transaction: GtpuTrafficProofAuthorityStoreRebindReady,
+        replacement: GtpuTrafficProofAuthority,
+    ) -> Result<GtpuTrafficProofAuthorityStore, GtpuError> {
+        let _operation = self.operation_guard()?;
+        if self.inner.backend_incarnation == 0 {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_traffic_entropy",
+            });
+        }
+        let old_authority = transaction.old_authority();
+        let old_key = old_authority.desired().id().to_bytes();
+        let old_identity = transaction.store_identity();
+        self.require_registered_traffic_authority_store(old_authority.desired(), old_identity)?;
+
+        // Retire every backend-owned old artifact before the new authority can
+        // be published. Exact cleanup also revokes pending handoffs and leaves
+        // ambiguous kernel removal terminal rather than accepting a new graph.
+        let attempt_ids = self
+            .traffic_attempts()?
+            .iter()
+            .filter_map(|(attempt_id, attempt)| {
+                (attempt.authority_store == old_identity).then_some(*attempt_id)
+            })
+            .collect::<Vec<_>>();
+        for attempt_id in attempt_ids {
+            self.cleanup_tracked_traffic_attempt(attempt_id)?;
+        }
+
+        // A successful earlier reconcile is not enough: this is the final
+        // authoritative exact current readback immediately before publication.
+        self.exact_active_traffic_group(replacement.desired())?;
+        let replacement_key = replacement.desired().id().to_bytes();
+        {
+            let mut stores = self.traffic_authority_stores()?;
+            match stores.get(&old_key) {
+                Some(store) if store.identity() == old_identity => {}
+                _ => {
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_traffic_authority_store",
+                    });
+                }
+            }
+            if replacement_key != old_key && stores.contains_key(&replacement_key) {
+                return Err(GtpuError::AlreadyExists);
+            }
+            let store =
+                transaction
+                    .publish(replacement)
+                    .map_err(|_| GtpuError::StateIndeterminate {
+                        operation: "ebpf_traffic_authority_store_update",
+                    })?;
+            stores.remove(&old_key);
+            stores.insert(replacement_key, store.clone());
+            Ok(store)
+        }
+    }
+
     fn begin_gtpu_traffic_proof_sync(
         &self,
         lease: GtpuTrafficProofAuthorityLease,
@@ -9014,6 +9076,11 @@ impl EbpfGtpuDataplaneBackend {
         let authority = lease.authority();
         let authority_dispatch_gate = lease.dispatch_authority();
         let attempt_dispatch_gate = GtpuTrafficProofDispatchAuthority::new();
+        if !lease.is_live() {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_traffic_authority_revoked",
+            });
+        }
         let (context, record) = self.exact_active_traffic_group(authority.desired())?;
         self.require_registered_traffic_authority_store(
             authority.desired(),
@@ -10045,6 +10112,62 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         .await
     }
 
+    fn owns_gtpu_traffic_proof_authority(
+        &self,
+        store: &GtpuTrafficProofAuthorityStore,
+        authority: &GtpuTrafficProofAuthorityLease,
+    ) -> bool {
+        let identity = authority.store_identity();
+        if store.identity() != identity
+            || !identity.belongs_to_backend(self.inner.backend_incarnation)
+        {
+            return false;
+        }
+        self.traffic_authority_stores().is_ok_and(|stores| {
+            stores
+                .get(&authority.authority().desired().id().to_bytes())
+                .is_some_and(|registered| registered.identity() == identity)
+        })
+    }
+
+    async fn rebind_gtpu_traffic_proof_authority(
+        &self,
+        store: &GtpuTrafficProofAuthorityStore,
+        old_authority: GtpuTrafficProofAuthorityLease,
+        replacement: GtpuTrafficProofAuthority,
+    ) -> Result<GtpuTrafficProofAuthorityStore, GtpuError> {
+        if !self.owns_gtpu_traffic_proof_authority(store, &old_authority) {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_traffic_authority_backend_mismatch",
+            });
+        }
+        let transaction =
+            store
+                .begin_rebind(old_authority)
+                .map_err(|_| GtpuError::StateIndeterminate {
+                    operation: "ebpf_traffic_authority_store_rebind",
+                })?;
+        // Once revocation begins, retain the entire lease-drain and publish
+        // transition in an owned task. Dropping the caller future must not
+        // strand this canonical store with a terminal old gate and no path to
+        // the already reconciled replacement. The generic wait holds no
+        // backend operation lock; that lock begins only for final exact
+        // readback and publication.
+        let backend = self.clone();
+        tokio::spawn(async move {
+            let transaction = transaction.wait_for_leases().await;
+            backend
+                .run_blocking("ebpf_rebind_traffic_proof_authority", move |backend| {
+                    backend.rebind_gtpu_traffic_proof_authority_sync(transaction, replacement)
+                })
+                .await
+        })
+        .await
+        .map_err(|_| GtpuError::StateIndeterminate {
+            operation: "ebpf_traffic_authority_rebind_task",
+        })?
+    }
+
     async fn begin_gtpu_traffic_proof(
         &self,
         lease: GtpuTrafficProofAuthorityLease,
@@ -10116,6 +10239,12 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         // worker starts, the owned lease remains in that worker through proof
         // issuance and leaves any affine proof in `pending_proof` for retry.
         let authority = store.lease().await;
+        if !authority.is_live() {
+            session.revoke_attempt_dispatch();
+            return Ok(GtpuTrafficProofPoll::Invalidated(
+                GtpuTrafficProofInvalidation::AuthorityRevoked,
+            ));
+        }
         let mut adapter_session = session.clone_for_adapter();
         let (authority, poll) = self
             .run_blocking("ebpf_poll_traffic_proof", move |backend| {
@@ -10151,6 +10280,11 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         proof: &GtpuTrafficProof,
         current_authority: &GtpuTrafficProofAuthorityLease,
     ) -> Result<GtpuTrafficProofValidation, GtpuError> {
+        if !current_authority.is_live() {
+            return Ok(GtpuTrafficProofValidation::Invalidated(
+                GtpuTrafficProofInvalidation::AuthorityRevoked,
+            ));
+        }
         let proof = GtpuTrafficProofValidationSnapshot::from_proof(proof);
         let authority_snapshot = current_authority.authority().clone();
         let authority_store = current_authority.store_identity();
@@ -41427,6 +41561,111 @@ mod tests {
         handoffs: AtomicUsize,
     }
 
+    /// A backend that retains every existing production proof operation but
+    /// deliberately inherits the additive rebind default.
+    #[derive(Debug)]
+    struct ExistingProofBackendWithoutRebind {
+        delegate: EbpfGtpuDataplaneBackend,
+    }
+
+    #[async_trait]
+    impl GtpuDataplaneBackend for ExistingProofBackendWithoutRebind {
+        fn gtpu_traffic_proof_capability(&self) -> GtpuCapability {
+            self.delegate.gtpu_traffic_proof_capability()
+        }
+
+        async fn register_gtpu_traffic_proof_authority(
+            &self,
+            authority: GtpuTrafficProofAuthority,
+        ) -> Result<GtpuTrafficProofAuthorityStore, GtpuError> {
+            self.delegate
+                .register_gtpu_traffic_proof_authority(authority)
+                .await
+        }
+
+        fn owns_gtpu_traffic_proof_authority(
+            &self,
+            store: &GtpuTrafficProofAuthorityStore,
+            authority: &GtpuTrafficProofAuthorityLease,
+        ) -> bool {
+            self.delegate
+                .owns_gtpu_traffic_proof_authority(store, authority)
+        }
+
+        async fn begin_gtpu_traffic_proof(
+            &self,
+            authority: GtpuTrafficProofAuthorityLease,
+        ) -> Result<GtpuTrafficProofSession, GtpuError> {
+            self.delegate.begin_gtpu_traffic_proof(authority).await
+        }
+
+        async fn dispatch_gtpu_traffic_proof_challenge(
+            &self,
+            session: &mut GtpuTrafficProofSession,
+            port: &(dyn GtpuTrafficProofDispatchPort + Send + Sync),
+            family: GtpAddressFamily,
+            sample_id: u32,
+        ) -> Result<GtpuTrafficProofDispatchReceipt, GtpuTrafficProofDispatchError> {
+            self.delegate
+                .dispatch_gtpu_traffic_proof_challenge(session, port, family, sample_id)
+                .await
+        }
+
+        async fn poll_gtpu_traffic_proof(
+            &self,
+            session: &mut GtpuTrafficProofSession,
+        ) -> Result<GtpuTrafficProofPoll, GtpuError> {
+            self.delegate.poll_gtpu_traffic_proof(session).await
+        }
+
+        async fn validate_gtpu_traffic_proof(
+            &self,
+            proof: &GtpuTrafficProof,
+            authority: &GtpuTrafficProofAuthorityLease,
+        ) -> Result<GtpuTrafficProofValidation, GtpuError> {
+            self.delegate
+                .validate_gtpu_traffic_proof(proof, authority)
+                .await
+        }
+
+        async fn close_gtpu_traffic_proof(
+            &self,
+            session: GtpuTrafficProofSession,
+        ) -> Result<(), GtpuError> {
+            self.delegate.close_gtpu_traffic_proof(session).await
+        }
+
+        async fn create_device(
+            &self,
+            _request: CreateGtpDeviceRequest,
+        ) -> Result<GtpDevice, GtpuError> {
+            Err(GtpuError::UnsupportedPlatform)
+        }
+
+        async fn resolve_device(&self, _name: &str) -> Result<GtpDevice, GtpuError> {
+            Err(GtpuError::UnsupportedPlatform)
+        }
+
+        async fn remove_device(&self, _device: &GtpDevice) -> Result<(), GtpuError> {
+            Err(GtpuError::UnsupportedPlatform)
+        }
+
+        async fn install_pdp_context(&self, _request: GtpPdpContext) -> Result<(), GtpuError> {
+            Err(GtpuError::UnsupportedPlatform)
+        }
+
+        async fn remove_pdp_context(
+            &self,
+            _request: RemovePdpContextRequest,
+        ) -> Result<(), GtpuError> {
+            Err(GtpuError::UnsupportedPlatform)
+        }
+
+        async fn probe(&self) -> Result<GtpuProbe, GtpuError> {
+            Ok(GtpuProbe::unsupported())
+        }
+    }
+
     #[async_trait]
     impl GtpuTrafficProofDispatchPort for SourceLossDuringRouteTrafficProofPort {
         fn resolve_route(
@@ -41700,6 +41939,427 @@ mod tests {
         .expect("the still-armed owner revoker must finish bounded cleanup");
         assert!(runtime.state().traffic_observation_registrations.is_empty());
         assert!(runtime.state().traffic_observation_redirects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn traffic_proof_rebind_revokes_old_artifacts_before_publishing_exact_new_readback() {
+        let (backend, runtime, group, authority) = traffic_proof_fixture(0x63).await;
+        let store = registered_traffic_authority_store(&backend, &authority)
+            .await
+            .unwrap();
+        let mut old_session = backend
+            .begin_gtpu_traffic_proof(store.lease().await)
+            .await
+            .unwrap();
+        let replacement_group = GtpuSessionGroup::new(
+            group.id(),
+            group.device_id(),
+            vec![grouped_v4_entry(0x5063, 0x6063)],
+        )
+        .unwrap();
+        assert!(matches!(
+            backend
+                .reconcile_pdp_context_group(fresh_group_request(replacement_group.clone()))
+                .await
+                .unwrap(),
+            GtpuSessionGroupReconcileOutcome::Activated
+                | GtpuSessionGroupReconcileOutcome::ExactAlreadyActive
+        ));
+        let replacement =
+            GtpuTrafficProofAuthority::new(replacement_group.clone(), 2, 3, 4, authority.policy())
+                .unwrap();
+
+        let new_store = backend
+            .rebind_gtpu_traffic_proof_authority(&store, store.lease().await, replacement.clone())
+            .await
+            .unwrap();
+        assert!(backend.traffic_attempts().unwrap().is_empty());
+        assert!(runtime.state().traffic_observation_registrations.is_empty());
+        assert!(runtime.state().traffic_observation_redirects.is_empty());
+        assert!(matches!(
+            backend
+                .poll_gtpu_traffic_proof(&mut old_session)
+                .await
+                .unwrap(),
+            GtpuTrafficProofPoll::Invalidated(GtpuTrafficProofInvalidation::AuthorityRevoked)
+        ));
+        assert!(backend.close_gtpu_traffic_proof(old_session).await.is_ok());
+
+        let new_lease = new_store.lease().await;
+        assert!(new_lease.is_live());
+        assert_eq!(new_lease.policy(), replacement.policy());
+        let new_session = backend.begin_gtpu_traffic_proof(new_lease).await;
+        assert!(new_session.is_ok());
+    }
+
+    #[tokio::test]
+    async fn inherited_rebind_default_revokes_a_registered_live_proof_authority() {
+        let (delegate, runtime, group, authority) = traffic_proof_fixture(0x65).await;
+        let backend = ExistingProofBackendWithoutRebind { delegate };
+        assert_eq!(
+            backend.gtpu_traffic_proof_capability(),
+            GtpuCapability::Available
+        );
+        let store = backend
+            .register_gtpu_traffic_proof_authority(authority.clone())
+            .await
+            .unwrap();
+        let mut session = backend
+            .begin_gtpu_traffic_proof(store.lease().await)
+            .await
+            .unwrap();
+        let events = enqueue_public_request_and_private_return_traffic(&runtime, &group);
+        runtime
+            .state()
+            .traffic_observation_events
+            .insert(S2BU_IFINDEX, events);
+        let proof = match backend.poll_gtpu_traffic_proof(&mut session).await.unwrap() {
+            GtpuTrafficProofPoll::Proven(proof) => proof,
+            other => panic!("test expected proof, got {other:?}"),
+        };
+        let replacement = GtpuTrafficProofAuthority::new(
+            GtpuSessionGroup::new(
+                group.id(),
+                group.device_id(),
+                vec![grouped_v4_entry(0x5065, 0x6065)],
+            )
+            .unwrap(),
+            2,
+            3,
+            4,
+            authority.policy(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            backend
+                .rebind_gtpu_traffic_proof_authority(&store, store.lease().await, replacement)
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "gtpu_traffic_proof"
+            })
+        ));
+        let old_lease = store.lease().await;
+        assert!(!old_lease.is_live());
+        assert_eq!(
+            backend
+                .validate_gtpu_traffic_proof(&proof, &old_lease)
+                .await
+                .unwrap(),
+            GtpuTrafficProofValidation::Invalidated(GtpuTrafficProofInvalidation::AuthorityRevoked)
+        );
+        drop(old_lease);
+        let port = AcceptingTrafficProofPort::new();
+        assert_eq!(
+            backend
+                .dispatch_gtpu_traffic_proof_challenge(
+                    &mut session,
+                    &port,
+                    GtpAddressFamily::Ipv4,
+                    3,
+                )
+                .await,
+            Err(GtpuTrafficProofDispatchError::AuthorityRevoked)
+        );
+        assert!(matches!(
+            backend.poll_gtpu_traffic_proof(&mut session).await.unwrap(),
+            GtpuTrafficProofPoll::Invalidated(GtpuTrafficProofInvalidation::AuthorityRevoked)
+        ));
+        assert!(backend
+            .begin_gtpu_traffic_proof(store.lease().await)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn foreign_backend_rebind_cannot_revoke_the_canonical_authority() {
+        let (backend_a, _runtime_a, _group_a, authority_a) = traffic_proof_fixture(0x69).await;
+        let store_a = registered_traffic_authority_store(&backend_a, &authority_a)
+            .await
+            .unwrap();
+        let (backend_b, _runtime_b, _group_b, authority_b) = traffic_proof_fixture(0x6a).await;
+        assert_ne!(
+            backend_a.inner.backend_incarnation,
+            backend_b.inner.backend_incarnation
+        );
+
+        assert!(matches!(
+            backend_b
+                .rebind_gtpu_traffic_proof_authority(&store_a, store_a.lease().await, authority_b,)
+                .await,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_traffic_authority_backend_mismatch"
+            })
+        ));
+        let lease = store_a.lease().await;
+        assert!(lease.is_live());
+        let session = backend_a.begin_gtpu_traffic_proof(lease).await.unwrap();
+        assert!(backend_a.close_gtpu_traffic_proof(session).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn traffic_proof_rebind_fails_closed_when_readback_is_adversarially_mutated() {
+        let (backend, runtime, group, authority) = traffic_proof_fixture(0x64).await;
+        let store = registered_traffic_authority_store(&backend, &authority)
+            .await
+            .unwrap();
+        let rebind_lease = store.lease().await;
+        let held_lease = store.lease().await;
+        let replacement_group = GtpuSessionGroup::new(
+            group.id(),
+            group.device_id(),
+            vec![grouped_v4_entry(0x5064, 0x6064)],
+        )
+        .unwrap();
+        backend
+            .reconcile_pdp_context_group(fresh_group_request(replacement_group.clone()))
+            .await
+            .unwrap();
+        let replacement =
+            GtpuTrafficProofAuthority::new(replacement_group, 2, 3, 4, authority.policy()).unwrap();
+        let mut rebind = Box::pin(backend.rebind_gtpu_traffic_proof_authority(
+            &store,
+            rebind_lease,
+            replacement,
+        ));
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Future::poll(rebind.as_mut(), &mut context),
+            Poll::Pending
+        ));
+
+        // A competing reconcile wins before the rebind's final exact readback.
+        backend
+            .reconcile_pdp_context_group(fresh_group_request(group.clone()))
+            .await
+            .unwrap();
+        drop(held_lease);
+        assert!(rebind.await.is_err());
+        assert!(backend.traffic_attempts().unwrap().is_empty());
+        assert!(runtime.state().traffic_observation_registrations.is_empty());
+        assert!(runtime.state().traffic_observation_redirects.is_empty());
+        assert!(backend
+            .begin_gtpu_traffic_proof(store.lease().await)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_removal_winning_a_rebind_race_leaves_no_usable_authority_or_old_proof() {
+        let (backend, runtime, group, authority) = traffic_proof_fixture(0x67).await;
+        let store = registered_traffic_authority_store(&backend, &authority)
+            .await
+            .unwrap();
+        let mut old_session = backend
+            .begin_gtpu_traffic_proof(store.lease().await)
+            .await
+            .unwrap();
+        let events = enqueue_public_request_and_private_return_traffic(&runtime, &group);
+        runtime
+            .state()
+            .traffic_observation_events
+            .insert(S2BU_IFINDEX, events);
+        let proof = match backend
+            .poll_gtpu_traffic_proof(&mut old_session)
+            .await
+            .unwrap()
+        {
+            GtpuTrafficProofPoll::Proven(proof) => proof,
+            other => panic!("test expected proof, got {other:?}"),
+        };
+        let replacement_group = GtpuSessionGroup::new(
+            group.id(),
+            group.device_id(),
+            vec![grouped_v4_entry(0x5067, 0x6067)],
+        )
+        .unwrap();
+        backend
+            .reconcile_pdp_context_group(fresh_group_request(replacement_group.clone()))
+            .await
+            .unwrap();
+        let replacement =
+            GtpuTrafficProofAuthority::new(replacement_group.clone(), 2, 3, 4, authority.policy())
+                .unwrap();
+        let rebind_lease = store.lease().await;
+        let held_lease = store.lease().await;
+        let mut rebind = Box::pin(backend.rebind_gtpu_traffic_proof_authority(
+            &store,
+            rebind_lease,
+            replacement,
+        ));
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Future::poll(rebind.as_mut(), &mut context),
+            Poll::Pending
+        ));
+
+        assert_eq!(
+            backend
+                .remove_pdp_context_group_exact(replacement_group)
+                .await
+                .unwrap(),
+            GtpuSessionGroupRemovalOutcome::Removed
+        );
+        drop(held_lease);
+        assert!(rebind.await.is_err());
+        assert!(backend.traffic_attempts().unwrap().is_empty());
+        assert!(backend.traffic_authority_stores().unwrap().is_empty());
+        assert!(runtime.state().traffic_observation_registrations.is_empty());
+        assert!(runtime.state().traffic_observation_redirects.is_empty());
+        let old_lease = store.lease().await;
+        assert!(!old_lease.is_live());
+        assert_eq!(
+            backend
+                .validate_gtpu_traffic_proof(&proof, &old_lease)
+                .await
+                .unwrap(),
+            GtpuTrafficProofValidation::Invalidated(GtpuTrafficProofInvalidation::AuthorityRevoked)
+        );
+        drop(old_lease);
+        assert!(matches!(
+            backend
+                .poll_gtpu_traffic_proof(&mut old_session)
+                .await
+                .unwrap(),
+            GtpuTrafficProofPoll::Invalidated(GtpuTrafficProofInvalidation::AuthorityRevoked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn canceled_rebind_finishes_the_exact_replacement_after_old_leases_drain() {
+        let (backend, runtime, group, authority) = traffic_proof_fixture(0x66).await;
+        let store = registered_traffic_authority_store(&backend, &authority)
+            .await
+            .unwrap();
+        let mut old_session = backend
+            .begin_gtpu_traffic_proof(store.lease().await)
+            .await
+            .unwrap();
+        let replacement_group = GtpuSessionGroup::new(
+            group.id(),
+            group.device_id(),
+            vec![grouped_v4_entry(0x5066, 0x6066)],
+        )
+        .unwrap();
+        backend
+            .reconcile_pdp_context_group(fresh_group_request(replacement_group.clone()))
+            .await
+            .unwrap();
+        let replacement =
+            GtpuTrafficProofAuthority::new(replacement_group, 2, 3, 4, authority.policy()).unwrap();
+        let rebind_lease = store.lease().await;
+        let held_lease = store.lease().await;
+        let mut rebind = Box::pin(backend.rebind_gtpu_traffic_proof_authority(
+            &store,
+            rebind_lease,
+            replacement.clone(),
+        ));
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Future::poll(rebind.as_mut(), &mut context),
+            Poll::Pending
+        ));
+        drop(rebind);
+        drop(held_lease);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if store.try_exactly_matches(&replacement) == Some(true)
+                    && store.lease().await.is_live()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned rebind must publish after caller cancellation");
+        assert!(backend.traffic_attempts().unwrap().is_empty());
+        assert!(runtime.state().traffic_observation_registrations.is_empty());
+        assert!(runtime.state().traffic_observation_redirects.is_empty());
+        assert!(matches!(
+            backend
+                .poll_gtpu_traffic_proof(&mut old_session)
+                .await
+                .unwrap(),
+            GtpuTrafficProofPoll::Invalidated(GtpuTrafficProofInvalidation::AuthorityRevoked)
+        ));
+        assert!(backend
+            .begin_gtpu_traffic_proof(store.lease().await)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_old_rebind_authority_and_registers_only_exact_current_readback() {
+        let (backend, runtime, group, authority) = traffic_proof_fixture(0x68).await;
+        let store = registered_traffic_authority_store(&backend, &authority)
+            .await
+            .unwrap();
+        let mut old_session = backend
+            .begin_gtpu_traffic_proof(store.lease().await)
+            .await
+            .unwrap();
+        let events = enqueue_public_request_and_private_return_traffic(&runtime, &group);
+        runtime
+            .state()
+            .traffic_observation_events
+            .insert(S2BU_IFINDEX, events);
+        let proof = match backend
+            .poll_gtpu_traffic_proof(&mut old_session)
+            .await
+            .unwrap()
+        {
+            GtpuTrafficProofPoll::Proven(proof) => proof,
+            other => panic!("test expected proof, got {other:?}"),
+        };
+        let old_lease = store.lease().await;
+        let endpoints =
+            GtpuLocalEndpointSet::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), None).unwrap();
+        let restarted = restart_grouped_fake(runtime, group.device_id(), endpoints).await;
+        assert_ne!(
+            backend.inner.backend_incarnation,
+            restarted.inner.backend_incarnation
+        );
+        assert!(restarted.begin_gtpu_traffic_proof(old_lease).await.is_err());
+
+        let old_validation = restarted
+            .validate_gtpu_traffic_proof(&proof, &store.lease().await)
+            .await;
+        assert!(!matches!(
+            old_validation,
+            Ok(GtpuTrafficProofValidation::Current)
+        ));
+
+        let stale_authority = GtpuTrafficProofAuthority::new(
+            GtpuSessionGroup::new(
+                group.id(),
+                group.device_id(),
+                vec![grouped_v4_entry(0x5068, 0x6068)],
+            )
+            .unwrap(),
+            2,
+            3,
+            4,
+            authority.policy(),
+        )
+        .unwrap();
+        assert!(restarted
+            .register_gtpu_traffic_proof_authority(stale_authority)
+            .await
+            .is_err());
+        let current_store = restarted
+            .register_gtpu_traffic_proof_authority(authority)
+            .await
+            .unwrap();
+        assert!(current_store.lease().await.is_live());
+        assert!(matches!(
+            restarted
+                .validate_gtpu_traffic_proof(&proof, &current_store.lease().await)
+                .await
+                .unwrap(),
+            GtpuTrafficProofValidation::Invalidated(_)
+        ));
     }
 
     #[tokio::test]

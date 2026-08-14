@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use tokio::sync::{watch, OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{watch, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use opc_dataplane_observation::{
     BackendIncarnation, CallerOwnershipFence, ClockOriginIdentity, DataplaneSessionGeneration,
@@ -473,6 +473,10 @@ pub enum GtpuTrafficProofAuthorityStoreUpdateError {
     AuthorityUnchanged,
     /// Another authority replacement is queued or in progress.
     ReplacementInProgress,
+    /// The supplied affine lease was minted by another authority store.
+    AuthorityLeaseMismatch,
+    /// The supplied affine lease no longer names this store's exact authority.
+    AuthorityLeaseStale,
 }
 
 impl fmt::Display for GtpuTrafficProofAuthorityStoreUpdateError {
@@ -484,6 +488,8 @@ impl fmt::Display for GtpuTrafficProofAuthorityStoreUpdateError {
             Self::ProductOwnerGenerationRegressed => "product_owner_generation_regressed",
             Self::AuthorityUnchanged => "authority_unchanged",
             Self::ReplacementInProgress => "replacement_in_progress",
+            Self::AuthorityLeaseMismatch => "authority_lease_mismatch",
+            Self::AuthorityLeaseStale => "authority_lease_stale",
         })
     }
 }
@@ -510,6 +516,10 @@ impl GtpuTrafficProofAuthorityStoreIdentity {
             backend_incarnation,
             registration,
         })
+    }
+
+    pub(crate) const fn belongs_to_backend(self, backend_incarnation: u64) -> bool {
+        backend_incarnation != 0 && self.backend_incarnation == backend_incarnation
     }
 }
 
@@ -647,7 +657,7 @@ impl GtpuTrafficProofAuthorityStore {
         replacement: GtpuTrafficProofAuthority,
     ) -> Result<(), GtpuTrafficProofAuthorityStoreUpdateError> {
         let _replacement =
-            GtpuTrafficProofAuthorityStoreReplacement::begin(self.replacement_active.as_ref())
+            GtpuTrafficProofAuthorityStoreReplacement::begin(Arc::clone(&self.replacement_active))
                 .ok_or(GtpuTrafficProofAuthorityStoreUpdateError::ReplacementInProgress)?;
         let mut current = self.current.write().await;
         if replacement.binding.desired != current.authority.binding.desired {
@@ -669,6 +679,38 @@ impl GtpuTrafficProofAuthorityStore {
         *current = GtpuTrafficProofAuthorityStoreCurrent::new(replacement);
         Ok(())
     }
+
+    /// Begin an affine changed-desired-authority rebind.
+    ///
+    /// This is intentionally crate-visible: a trusted backend must retain the
+    /// returned transaction through exact new-dataplane readback and publish
+    /// its result while it owns its mutation boundary. Beginning the rebind
+    /// immediately revokes the old dispatch authority, then waits for every
+    /// pre-existing lease without holding that backend boundary. Cancellation
+    /// can therefore never restore the old authority.
+    pub(crate) fn begin_rebind(
+        &self,
+        lease: GtpuTrafficProofAuthorityLease,
+    ) -> Result<GtpuTrafficProofAuthorityStoreRebind, GtpuTrafficProofAuthorityStoreUpdateError>
+    {
+        let replacement =
+            GtpuTrafficProofAuthorityStoreReplacement::begin(Arc::clone(&self.replacement_active))
+                .ok_or(GtpuTrafficProofAuthorityStoreUpdateError::ReplacementInProgress)?;
+        if lease.store_identity() != self.identity {
+            return Err(GtpuTrafficProofAuthorityStoreUpdateError::AuthorityLeaseMismatch);
+        }
+        let old_authority = lease.authority().clone();
+        if !lease.is_live() || !old_authority.exactly_matches(&lease.guard.authority) {
+            return Err(GtpuTrafficProofAuthorityStoreUpdateError::AuthorityLeaseStale);
+        }
+        lease.dispatch_authority().revoke();
+        drop(lease);
+        Ok(GtpuTrafficProofAuthorityStoreRebind {
+            store: self.clone(),
+            old_authority,
+            _replacement: replacement,
+        })
+    }
 }
 
 /// Cancellation-safe marker covering a queued or active authority writer.
@@ -676,12 +718,12 @@ impl GtpuTrafficProofAuthorityStore {
 /// Only one replacement may wait at a time. Refusing overlapping writers is
 /// fail-closed and prevents a backend operation that already owns its global
 /// mutation lock from waiting behind a lease retained by another operation.
-struct GtpuTrafficProofAuthorityStoreReplacement<'a> {
-    active: &'a AtomicBool,
+struct GtpuTrafficProofAuthorityStoreReplacement {
+    active: Arc<AtomicBool>,
 }
 
-impl<'a> GtpuTrafficProofAuthorityStoreReplacement<'a> {
-    fn begin(active: &'a AtomicBool) -> Option<Self> {
+impl GtpuTrafficProofAuthorityStoreReplacement {
+    fn begin(active: Arc<AtomicBool>) -> Option<Self> {
         active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
@@ -689,9 +731,84 @@ impl<'a> GtpuTrafficProofAuthorityStoreReplacement<'a> {
     }
 }
 
-impl Drop for GtpuTrafficProofAuthorityStoreReplacement<'_> {
+impl Drop for GtpuTrafficProofAuthorityStoreReplacement {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
+    }
+}
+
+/// One backend-owned, cancellation-safe changed-desired rebind transaction.
+///
+/// The old dispatch authority is already terminal when this value exists.
+/// Calling [`Self::wait_for_leases`] never holds a backend operation lock;
+/// the trusted adapter later publishes the exact new authority only after its
+/// own reconcile/readback checks succeed.
+pub(crate) struct GtpuTrafficProofAuthorityStoreRebind {
+    store: GtpuTrafficProofAuthorityStore,
+    old_authority: GtpuTrafficProofAuthority,
+    _replacement: GtpuTrafficProofAuthorityStoreReplacement,
+}
+
+impl GtpuTrafficProofAuthorityStoreRebind {
+    pub(crate) fn old_authority(&self) -> &GtpuTrafficProofAuthority {
+        &self.old_authority
+    }
+
+    pub(crate) const fn store_identity(&self) -> GtpuTrafficProofAuthorityStoreIdentity {
+        self.store.identity
+    }
+
+    pub(crate) async fn wait_for_leases(self) -> GtpuTrafficProofAuthorityStoreRebindReady {
+        let guard = self.store.current.clone().write_owned().await;
+        GtpuTrafficProofAuthorityStoreRebindReady {
+            transaction: self,
+            guard,
+        }
+    }
+}
+
+/// A rebind transaction after all old affine leases have drained.
+pub(crate) struct GtpuTrafficProofAuthorityStoreRebindReady {
+    transaction: GtpuTrafficProofAuthorityStoreRebind,
+    guard: OwnedRwLockWriteGuard<GtpuTrafficProofAuthorityStoreCurrent>,
+}
+
+impl GtpuTrafficProofAuthorityStoreRebindReady {
+    pub(crate) fn old_authority(&self) -> &GtpuTrafficProofAuthority {
+        self.transaction.old_authority()
+    }
+
+    pub(crate) const fn store_identity(&self) -> GtpuTrafficProofAuthorityStoreIdentity {
+        self.transaction.store_identity()
+    }
+
+    pub(crate) fn publish(
+        mut self,
+        replacement: GtpuTrafficProofAuthority,
+    ) -> Result<GtpuTrafficProofAuthorityStore, GtpuTrafficProofAuthorityStoreUpdateError> {
+        if !self
+            .guard
+            .authority
+            .exactly_matches(self.transaction.old_authority())
+        {
+            return Err(GtpuTrafficProofAuthorityStoreUpdateError::AuthorityLeaseStale);
+        }
+        if replacement.exactly_matches(&self.guard.authority) {
+            return Err(GtpuTrafficProofAuthorityStoreUpdateError::AuthorityUnchanged);
+        }
+        if replacement.reconcile_revision() <= self.guard.authority.reconcile_revision() {
+            return Err(GtpuTrafficProofAuthorityStoreUpdateError::ReconcileRevisionNotIncreasing);
+        }
+        if replacement.reconcile_fence() == self.guard.authority.reconcile_fence() {
+            return Err(GtpuTrafficProofAuthorityStoreUpdateError::ReconcileFenceUnchanged);
+        }
+        if replacement.product_owner_generation() < self.guard.authority.product_owner_generation()
+        {
+            return Err(GtpuTrafficProofAuthorityStoreUpdateError::ProductOwnerGenerationRegressed);
+        }
+        self.guard.dispatch_authority.revoke();
+        *self.guard = GtpuTrafficProofAuthorityStoreCurrent::new(replacement);
+        Ok(self.transaction.store.clone())
     }
 }
 
@@ -746,6 +863,10 @@ impl GtpuTrafficProofAuthorityLease {
 
     pub(crate) fn dispatch_authority(&self) -> Arc<GtpuTrafficProofDispatchAuthority> {
         Arc::clone(&self.guard.dispatch_authority)
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.guard.dispatch_authority.is_live()
     }
 
     pub(crate) const fn store_identity(&self) -> GtpuTrafficProofAuthorityStoreIdentity {
@@ -1569,6 +1690,26 @@ mod tests {
         };
         let entry =
             GtpuSessionEntry::new(context, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))).unwrap();
+        GtpuSessionGroup::new(group_id, device_id, vec![entry]).unwrap()
+    }
+
+    fn changed_group() -> GtpuSessionGroup {
+        let group_id = GtpuSessionGroupId::new([3; 16]).unwrap();
+        let device_id = GtpuSessionDeviceId::new([2; 16]).unwrap();
+        let context = GtpPdpContext {
+            local_teid: Teid::new(3).unwrap(),
+            peer_teid: Teid::new(4).unwrap(),
+            ms_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3)),
+            link_ifindex: 7,
+            downlink_source_port_policy: GtpuSourcePortPolicy::Any,
+            gtp_version: GtpVersion::V1,
+            bearer_mark: None,
+            egress_dscp: None,
+            uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+        };
+        let entry =
+            GtpuSessionEntry::new(context, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4))).unwrap();
         GtpuSessionGroup::new(group_id, device_id, vec![entry]).unwrap()
     }
 
@@ -2430,6 +2571,42 @@ mod tests {
                 feature: "gtpu_traffic_proof"
             })
         ));
+        let rebind_store = GtpuTrafficProofAuthorityStore::new_for_test(
+            GtpuTrafficProofAuthority::new(group(), 1, 1, 1, policy()).unwrap(),
+        );
+        let foreign_store = GtpuTrafficProofAuthorityStore::registered(
+            GtpuTrafficProofAuthority::new(changed_group(), 2, 2, 2, policy()).unwrap(),
+            GtpuTrafficProofAuthorityStoreIdentity::new(1, 2).unwrap(),
+        );
+        let replacement =
+            GtpuTrafficProofAuthority::new(changed_group(), 2, 2, 2, policy()).unwrap();
+        assert!(matches!(
+            backend
+                .rebind_gtpu_traffic_proof_authority(
+                    &rebind_store,
+                    foreign_store.lease().await,
+                    replacement.clone(),
+                )
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "gtpu_traffic_proof"
+            })
+        ));
+        assert!(rebind_store.lease().await.is_live());
+        assert!(foreign_store.lease().await.is_live());
+        assert!(matches!(
+            backend
+                .rebind_gtpu_traffic_proof_authority(
+                    &rebind_store,
+                    rebind_store.lease().await,
+                    replacement,
+                )
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "gtpu_traffic_proof"
+            })
+        ));
+        assert!(rebind_store.lease().await.is_live());
         let mut session = session(store.lease().await.authority());
         let port = CapturingPort::accepting(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)));
         assert_eq!(
@@ -2500,6 +2677,110 @@ mod tests {
         );
         drop(lease);
         assert_eq!(completed_receiver.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn authority_store_rebind_publishes_changed_desired_only_after_old_leases_drain() {
+        let store = GtpuTrafficProofAuthorityStore::new_for_test(authority());
+        let lease = store.lease().await;
+        let replacement =
+            GtpuTrafficProofAuthority::new(changed_group(), 2, 2, 2, policy()).unwrap();
+        let rebind = store.begin_rebind(lease).unwrap().wait_for_leases().await;
+        let store = rebind.publish(replacement.clone()).unwrap();
+        let lease = store.lease().await;
+        assert!(lease.is_live());
+        assert!(lease.authority().exactly_matches(&replacement));
+    }
+
+    #[tokio::test]
+    async fn authority_store_rebind_revokes_handoffs_before_leases_drain() {
+        let original = authority();
+        let store = GtpuTrafficProofAuthorityStore::new_for_test(original.clone());
+        let lease = store.lease().await;
+        let held_lease = store.lease().await;
+        let authority_dispatch_gate = lease.dispatch_authority();
+        let mut session = session_with_authority_dispatch_gate(&original, authority_dispatch_gate);
+        let port = PendingPort(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)));
+        let mut handoff = Box::pin(session.dispatch_challenge(&port, GtpAddressFamily::Ipv4, 1));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Future::poll(handoff.as_mut(), &mut context),
+            Poll::Pending
+        ));
+
+        let replacement =
+            GtpuTrafficProofAuthority::new(changed_group(), 2, 2, 2, policy()).unwrap();
+        let mut rebind = Box::pin(store.begin_rebind(lease).unwrap().wait_for_leases());
+        assert!(matches!(
+            Future::poll(rebind.as_mut(), &mut context),
+            Poll::Pending
+        ));
+
+        assert!(matches!(
+            Future::poll(handoff.as_mut(), &mut context),
+            Poll::Ready(Err(GtpuTrafficProofDispatchError::AuthorityRevoked))
+        ));
+        drop(held_lease);
+        let rebind = rebind.await;
+        let _store = rebind.publish(replacement).unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceled_rebind_never_restores_the_old_authority_gate() {
+        let store = GtpuTrafficProofAuthorityStore::new_for_test(authority());
+        let held_lease = store.lease().await;
+        let mut rebind = Box::pin(
+            store
+                .begin_rebind(store.lease().await)
+                .unwrap()
+                .wait_for_leases(),
+        );
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Future::poll(rebind.as_mut(), &mut context),
+            Poll::Pending
+        ));
+        drop(rebind);
+        drop(held_lease);
+
+        // Cancellation releases contention, but cannot make the old leased
+        // authority usable again. The trusted backend owns eventual recovery.
+        assert!(!store.lease().await.is_live());
+    }
+
+    #[tokio::test]
+    async fn rebind_rejects_a_cross_store_lease_without_revoking_either_store() {
+        let store_a = GtpuTrafficProofAuthorityStore::new_for_test(authority());
+        let store_b = GtpuTrafficProofAuthorityStore::registered(
+            GtpuTrafficProofAuthority::new(changed_group(), 2, 2, 2, policy()).unwrap(),
+            GtpuTrafficProofAuthorityStoreIdentity::new(1, 2).unwrap(),
+        );
+        assert!(matches!(
+            store_a.begin_rebind(store_b.lease().await),
+            Err(GtpuTrafficProofAuthorityStoreUpdateError::AuthorityLeaseMismatch)
+        ));
+        assert!(store_a.lease().await.is_live());
+        assert!(store_b.lease().await.is_live());
+
+        let rebind = store_a.begin_rebind(store_a.lease().await).unwrap();
+        assert!(!store_a.lease().await.is_live());
+        assert!(store_b.lease().await.is_live());
+        drop(rebind);
+    }
+
+    #[tokio::test]
+    async fn rebind_refuses_a_concurrent_same_store_replacement() {
+        let store = GtpuTrafficProofAuthorityStore::new_for_test(authority());
+        let held_lease = store.lease().await;
+        let rebind = store.begin_rebind(store.lease().await).unwrap();
+        let replacement = GtpuTrafficProofAuthority::new(group(), 2, 2, 2, policy()).unwrap();
+        assert_eq!(
+            store.replace(replacement).await,
+            Err(GtpuTrafficProofAuthorityStoreUpdateError::ReplacementInProgress)
+        );
+        drop(rebind);
+        drop(held_lease);
+        assert!(!store.lease().await.is_live());
     }
 
     #[tokio::test]
@@ -2654,6 +2935,10 @@ mod tests {
                 GtpuTrafficProofAuthorityStoreUpdateError::ReconcileFenceUnchanged
             ),
             "ReconcileFenceUnchanged"
+        );
+        assert_eq!(
+            GtpuTrafficProofAuthorityStoreUpdateError::AuthorityLeaseMismatch.to_string(),
+            "authority_lease_mismatch"
         );
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<GtpuTrafficProofAuthorityStore>();
