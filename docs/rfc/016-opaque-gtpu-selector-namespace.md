@@ -128,6 +128,18 @@ unsigned 64-bit big-endian lengths; fixed-width numeric selector fields use
 their existing model/network byte order. Public output exposes neither the
 canonical bytes nor a digest.
 
+The protected ledger also retains one immutable row for every atom commitment
+ever reserved for possible publication in this namespace. That row records
+only its keyed atom commitment and the first `Installing` group/generation
+that committed it; it is never deleted, reassigned, or inferred from the
+set/group tombstones. A failed, poisoned, or never-started installation remains
+conservatively consumed because a delayed external effect can no longer be
+excluded. A fresh claim is valid only when every atom commitment in the
+candidate is absent from this permanent atom ledger in the same whole-ledger
+snapshot. An unseen complete-set or group commitment is insufficient when even
+one constituent atom was reserved. The atom ledger is internal authority data,
+not a public per-atom claim API.
+
 ### 4.2 Device-Scoped Namespace
 
 One selector namespace is identified by this exact tuple:
@@ -339,16 +351,24 @@ entries in IPv4-then-IPv6 order; for each entry:
 
 No padding is present. The complete-set codec is version `1`, then a u16 big-
 endian atom count, then sorted unique atoms. Each atom is `tag || u16 length ||
-bytes`: tag `U` contains the existing 24-byte
-`GtpuSessionUplinkKey::encode(inner_paa, complete_mark)` and tag `D` contains
-the existing 8-byte `GtpuSessionDownlinkKey::encode(outer_family,
-inner_family, local_teid)`. This matches the exact map selector keys, including
-valid cross-family distinctions; duplicate encoded map keys are rejected
-before hashing. Group commitment is HMAC over version `1`, stable device ID,
-and group ID; desired commitment is HMAC over desired-group bytes; set
-commitment is HMAC over complete-set bytes; each atom commitment is HMAC over
-one atom. After the storage key and scope commitment are fixed, the SDK mints
-the random ledger ID and selector secret. The selector-secret commitment is
+bytes`: tag `T` contains the existing 8-byte
+`GtpuSessionDownlinkKey::encode(outer_family, inner_family, local_teid)`; tag
+`P` contains the PAA family tag (`4` or `6`), prefix length (`32` or `64`), and
+the canonical four-byte IPv4 address or eight-byte IPv6 prefix; and tag `M`
+contains a nonzero four-byte bearer mark in its model/network order followed by
+four `0xff` bytes encoding the required full-mask semantics. A zero mark emits
+no `M` atom. Sorting and deduplication occur over the complete tagged encodings.
+This deliberately tracks PAA and mark independently rather than treating the
+existing combined uplink map key as one atom: changing one component cannot
+hide reuse of the other. The `T` atom retains the exact cross-family TEID
+distinctions enforced by the map ABI. Repeated elementary atoms shared by two
+valid family entries collapse to one row; duplicate group entries or duplicate
+encoded map keys are rejected before hashing. Group commitment is HMAC over
+version `1`, stable device ID, and group ID; desired commitment is HMAC over
+desired-group bytes; set commitment is HMAC over complete-set bytes; each atom
+commitment is HMAC over one atom. After the storage key and scope commitment
+are fixed, the SDK mints the random ledger ID and selector secret. The
+selector-secret commitment is
 HMAC under that secret over the secret-commitment domain, version `1`, random
 ledger ID, pin commitment, stable device, and storage-scope commitment; it is
 not plain SHA-256 of the secret. The namespace binding codec is version `1`
@@ -363,6 +383,35 @@ reserved `SessionKey`, storage scope, bootstrap pin attestation, random ledger
 material, selector-secret commitment, complete 145-byte binding, then marker
 name. The pin attestation is authenticated inside the protected record and the
 complete binding but never feeds back into durable lookup.
+
+The stopped decommission workflow additionally commits the exact predecessor
+which may be reconstructed after protected-store rollback. Its
+`PreDecommissionBoundCodecV1` is version `1`, the exact RFC 004 record
+generation (u64 big-endian), the canonical `Bound` ledger length (u64
+big-endian), and the complete canonical protected-ledger plaintext. The
+predecessor commitment is HMAC-SHA-256 under the selector secret over
+`"opc/gtpu-selector/pre-decommission-bound/v1\0" ||
+PreDecommissionBoundCodecV1`. It therefore covers the complete group/atom/
+tombstone history, allocation counter, capacity profile, binding, and exact
+store generation without depending on AEAD framing randomness.
+
+`DecommissionFenceCoordinateV1` is the exact 81-byte plaintext containing
+version `1`, that 32-byte predecessor commitment, the nonzero
+`Decommissioning` generation (u64 big-endian) and 16-byte operation nonce, and
+the strictly greater `Decommissioned` generation and distinct 16-byte operation
+nonce. Two 32-byte subkeys are HMAC-SHA-256 under the selector secret over,
+respectively,
+`"opc/gtpu-selector/decommission-fence/aead-key/v1\0" || binding` and
+`"opc/gtpu-selector/decommission-fence/nonce-key/v1\0" || binding`. The AAD is
+`"opc/gtpu-selector/decommission-fence/aad/v1\0" || binding`. The canonical
+12-byte synthetic nonce is the first 12 bytes of HMAC-SHA-256 under the nonce
+subkey over `AAD || plaintext`. AES-256-GCM-SIV under the AEAD subkey encrypts
+the coordinate. The fixed 110-byte capsule is version `1`, the 12-byte
+synthetic nonce, 81-byte ciphertext, and 16-byte tag. Decode verifies the AEAD,
+recomputes the synthetic nonce in constant time, and rejects any length,
+version, zero/equal coordinate, or predecessor mismatch. The capsule is
+canonical URL-safe Base64 without padding when used in the terminal marker
+name. It is opaque authority material and is never emitted in diagnostics.
 
 ### 5.2 Capacity
 
@@ -388,10 +437,13 @@ the plaintext cap for envelope/framing overhead. A smaller deployment profile
 may lower these values only when creating an empty ledger; no limit is mutable
 afterward.
 
-A claim permanently consumes its group-record slot and every previously unseen
-atom slot at `Installing`; retirement reclassifies that same group record and
-does not allocate a tombstone or atom. Exact reissue consumes one new successor
-group-record slot but no atom slot. Claim preflight also reserves that group's
+A fresh claim permanently consumes its group-record slot and one immutable atom
+row for every candidate atom at `Installing`; because freshness requires every
+candidate atom row to be absent, it cannot partially extend prior history.
+Retirement reclassifies that same group record and does not allocate a
+tombstone or atom. Exact reissue consumes one new successor group-record slot
+but no atom slot and references the already-retained identical rows. Claim
+preflight also reserves that group's
 one permanent operation-stamp map key. Its value is the current lifecycle fence
 and is replaced only by the legal sequence in §8.1; retirement allocates no
 additional key. The predecessor's final `Retired` value is never changed, and
@@ -424,8 +476,12 @@ commitments, its activation and retirement generations, the retirement nonce
 commitment, and at most one successor group/generation link. The successor link
 is written in the same CAS that admits an exact reissue; a conflicting or
 second successor is indeterminate. Neither retirement nor reissue deletes atom
-history. An ordinary `Fresh` path accepts only a set with no prior publication
-history.
+history. An ordinary `Fresh` path accepts only when **every** canonical atom
+commitment is absent from the permanent atom ledger and inserts all of those
+rows in the same whole-ledger CAS as the new `Installing` group. It rejects a
+new group or newly shaped complete set that contains any previously published
+TEID, PAA, or mark atom; checking only the candidate group or complete-set
+commitment is forbidden.
 
 This RFC permits exactly one other admission form: SDK-mediated transfer of the
 *identical complete atom set* from one exact, permanently retired predecessor
@@ -443,14 +499,19 @@ Exact removal returns an opaque retired capability. A separately named,
 default-unsupported backend port consumes a request bound to that capability
 and returns the opaque quiescence authorization only after it revalidates the
 terminal-retired stamp and absence and performs its trusted drain/RCU barrier.
-The SDK's built-in eBPF implementation supplies the concrete grace barrier;
-another backend must provide and test an equivalent quiescence boundary or
-leave reissue unsupported. A public constructor, raw duration completion,
-caller assertion, sleep, mock success, or traffic-readiness proof cannot mint
-this authorization. `reissue_exact_retired_group` consumes the exact retired
-capability, exact authorization, and distinct successor group in one ledger
-transition; neither input is cloneable or reusable. This RFC does not treat
-traffic-proof authority as drain evidence and does not implement #664.
+The backend-neutral port permits a backend with a separately reviewed concrete
+quiescence boundary to implement this operation. The built-in eBPF backend
+leaves it `Unsupported` until it has a real kernel/network quiescence mechanism;
+ordinary map deletion, userspace sleep, or an in-process RCU assumption is not
+such a mechanism. A conformance fake can exercise protocol state transitions
+but cannot mint a production receipt. Any other backend must provide and test
+an equivalent trusted boundary or likewise leave reissue unsupported. A public
+constructor, raw duration completion, caller assertion, sleep, mock success,
+or traffic-readiness proof cannot mint this authorization.
+`reissue_exact_retired_group` consumes the exact retired capability, exact
+authorization, and distinct successor group in one ledger transition; neither
+input is cloneable or reusable. This RFC does not treat traffic-proof authority
+as drain evidence and does not implement #664.
 
 ## 6. Public Capability Surface
 
@@ -650,15 +711,18 @@ indeterminate; plain structural absence is never enough.
 2. Bind or exactly validate the SDK-minted ledger candidate against the
    backend's canonical device/pin namespace and immutable marker, without map
    mutation. This settles an ambiguous marker creation only by exact readback.
-3. Under the namespace ownership gate, a fresh claim CASes a new group entry
-   from absence to `Installing` with its generation/nonce, the precommitted
-   `Active` successor generation/nonce, and `backend_started = false`. An exact
-   retired reissue instead performs one whole-ledger CAS that leaves the
-   predecessor `Retired`, writes its immutable one-time successor link, and
-   creates the distinct successor group in `Installing`. The entire successor
-   group, all atom ownership, group binding, and prior tombstone lineage commit
-   together. No transition ever rewrites a predecessor `Retired` entry into
-   `Installing`.
+3. Under the namespace ownership gate, a fresh claim first proves every
+   candidate atom commitment absent in the exact expected ledger revision, then
+   uses one whole-ledger CAS to insert every immutable first-publication atom
+   row and the new group entry in `Installing` with its generation/nonce, the
+   precommitted `Active` successor generation/nonce, and
+   `backend_started = false`. The CAS fails if any atom, group, or set history
+   changed. An exact retired reissue instead performs one whole-ledger CAS that
+   leaves every atom row and the predecessor `Retired`, writes its immutable
+   one-time successor link, and creates the distinct successor group in
+   `Installing`. The entire successor group, identical atom ownership, group
+   binding, and prior tombstone lineage commit together. No transition ever
+   rewrites a predecessor `Retired` entry into `Installing`.
 4. Re-read the exact `Installing` phase, then CAS/read back
    `backend_started = true` and, without another await, consume its affine
    authorized request into a pre-reserved SDK-owned supervisor. The caller
@@ -819,18 +883,35 @@ The same control directory has a second, initially absent, append-only namespace
 lifecycle fence:
 
 ```text
-SELECTOR_DECOMMISSIONED_V1_<canonical-binding-digest>
+SELECTOR_DECOMMISSIONED_V1_<64-lower-hex-binding-digest>_<147-char-coordinate-capsule>
 ```
 
 It is an empty directory with the same creation, metadata, sync, ownership, and
-descriptor-readback requirements as the authority marker. Its digest is over
-the same exact 145-byte binding. It is created only by the stopped decommission
-workflow, is never removed, and makes the transition one-way independently of
-the protected store. `Bound` requires its proved absence. `Decommissioning` may
-have it absent or exact depending on recorded progress. `Decommissioned`
-requires it exact. A `Bound` or earlier ledger paired with this terminal fence
-is rollback/indeterminate and can only resume the precommitted decommission;
-it can never serve, claim, reprovision, or recreate prior state.
+descriptor-readback requirements as the authority marker. The first suffix is
+the SHA-256 digest over the same exact 145-byte binding; the second is the
+authenticated encrypted coordinate capsule from §5.1. The complete name is
+exactly 239 ASCII bytes, below Linux `NAME_MAX`; a different encoding, padding,
+case, length, or extra matching entry is invalid. The protected
+`Decommissioning` record retains the exact predecessor commitment, both
+precommitted coordinates, and canonical capsule before marker creation.
+
+The terminal marker is created only by the stopped decommission workflow, is
+never removed, and makes the transition one-way independently of the protected
+store. Ordinary `Bound` requires its proved absence. `Decommissioning` may have
+it absent or exact depending on recorded progress and, when present, requires
+the decoded capsule to equal its stored predecessor and coordinate fields.
+`Decommissioned` requires that same exact marker. If protected storage rolls
+back to the exact predecessor `Bound` record, the coordinator decrypts and
+authenticates the capsule, recomputes the predecessor commitment over that
+record, proves every group and stamp terminal-retired, and CASes only that exact
+record back to the capsule's `Decommissioning` coordinate while advancing the
+allocation counter past both reserved generations. It then resumes the one
+precommitted terminal transition. A different/older `Bound` record, a capsule
+whose generations are not the exact next two allocation values, or any history,
+nonce, binding, inventory, or commitment mismatch is indeterminate and remains
+offline. No path invents replacement coordinates. A `Bound` or earlier ledger
+paired with any terminal fence can never serve, claim, reprovision, or recreate
+prior state.
 
 The selector-backend epoch is a random 128-bit value minted at first binding,
 stored in the protected ledger and operation-stamp map, and stable across a
@@ -990,19 +1071,41 @@ is held across marker validation/creation and all map/program mutation/readback
 that relies on it. Network namespaces, process IDs, per-process paths, and a
 lock created in an untrusted directory are not equivalent.
 
+The total cross-boundary lock order is durable namespace lease/fence first,
+then the host-global control-directory `flock`; no path may acquire or renew a
+durable lease, perform a protected-store CAS/readback, or await another durable
+store operation while holding that `flock`. Bootstrap may briefly acquire the
+host lock to mint a bounded, affine namespace sample, but releases it before
+any store operation. That sample is not authority: after durable ownership is
+established, every initialization, recovery, effect, retirement, or
+decommission path reacquires the host lock in the declared order and exactly
+revalidates the live descriptors, binding, markers, and inventory before use.
+The admitted backend critical section must finish inside the lease safety
+margin, so it never depends on a lock-inverted renewal. Failure to reacquire or
+revalidate leaves the durable phase recoverable/offline without mutation.
+
 The backend MUST resolve each path component relative to a trusted bpffs root
 descriptor using descriptor-relative traversal. It MUST reject symlinks,
 non-directories, unexpected owner or mode, non-bpffs filesystems, unexpected
 links, and inode replacement. Creation uses descriptor-relative, no-replace
 directory creation; it never follows a replacement path. Existing markers are
 enumerated to a fixed bound, type/owner/mode/inode/link checked, and compared
-exactly to the single expected canonical marker name. The containing control
-directory and marker are re-stat'ed by descriptor before use to detect
-replacement races.
+exactly to the lifecycle-dependent canonical set: none for `Provisioned`; only
+the authority marker for `Initializing` and ordinary `Bound`; the authority
+marker alone or the authority plus the exact recorded terminal marker for
+`Decommissioning`; and both exact markers for `Decommissioned`. The sole extra
+case is the exact predecessor-`Bound` rollback recovery in §8.1, where both
+markers force offline reconstruction before any serving action. Every other
+missing, extra, duplicate, malformed, or state-inconsistent marker fails
+closed. The containing control directory and every expected marker are
+re-stat'ed by descriptor before use to detect replacement races.
 
 Creation makes the complete marker atomically, syncs the opened marker and
-containing directory, re-enumerates exactly one marker, and verifies the opened
-directory identity before allowing the first map/program mutation. The
+containing directory, re-enumerates the exact lifecycle-dependent marker set,
+and verifies every opened directory identity before allowing the first
+map/program mutation. Authority-marker creation must yield exactly the one
+authority marker; terminal-marker creation must yield exactly the authority
+marker plus its recorded terminal marker. The
 containing filesystem must match Linux `BPF_FS_MAGIC` on the trusted root and
 control descriptors. `mkdirat` success is followed by descriptor-relative
 open, `fsync` (and `syncfs` where available), close-result handling where the
@@ -1146,11 +1249,15 @@ holds both authority gates and verifies the complete ledger/authority-marker/
 stamp inventory plus absence of the terminal lifecycle fence. It then:
 
 1. CASes `Bound` to `Decommissioning`, precommitting its strictly greater
-   terminal generation/nonce while retaining the complete binding and all
-   group/atom/tombstone history, and exactly reads that record back.
+   phase generation/nonce and the strictly greater terminal
+   `Decommissioned` generation/nonce as the exact next two allocation values.
+   The same CAS retains the complete binding and all group/atom/tombstone
+   history and stores the §5.1 predecessor commitment plus canonical encrypted
+   coordinate capsule. It exactly reads that complete record back.
 2. Creates, syncs, and exactly reads the one terminal decommission fence from
-   §8.1. Once this append-only backend effect exists, no `Bound` record is
-   admissible even if the protected store is rolled back.
+   §8.1 using that exact capsule. Once this append-only backend effect exists,
+   no `Bound` record may serve even if the protected store is rolled back; only
+   an exact predecessor match may reconstruct the recorded operation.
 3. CASes the exact `Decommissioning` operation to its precommitted permanent
    `Decommissioned` coordinate, then exactly reads the record, both lifecycle
    markers, and the complete terminal stamp inventory back.
@@ -1160,10 +1267,13 @@ stamp inventory plus absence of the terminal lifecycle fence. It then:
 
 A crash before step 1 leaves `Bound` and permits no cleanup. A crash after step
 1 resumes only this exact operation. A crash or protected-store rollback after
-step 2 is fenced by the terminal marker and cannot return to serving. A crash
-after step 3 leaves `Decommissioned`, forbids traffic and claims, and may only
-resume the same bounded cleanup. Neither marker nor the protected record is ever
-removed. `Decommissioned` can be restored or moved only by a future separately
+step 2 is fenced by the terminal marker and cannot return to serving. The exact
+predecessor `Bound` record can recover only the authenticated phase/terminal
+coordinates from that marker as specified in §8.1; any other rollback remains
+indeterminate rather than inventing a generation or nonce. A crash after step
+3 leaves `Decommissioned`, forbids traffic and claims, and may only resume the
+same bounded cleanup. Neither marker nor the protected record is ever removed.
+`Decommissioned` can be restored or moved only by a future separately
 authorized, versioned migration that preserves both terminal fences; it can
 never become an ordinary fresh namespace.
 
@@ -1178,7 +1288,7 @@ record.
 | Threat | Required mitigation |
 | :--- | :--- |
 | Split brain or concurrent claimant | One complete ledger CAS, monotonic generation, host-global control lock, and exact readback; disagreement poisons or fails closed. |
-| ABA, replay, or stale effect | SDK-minted affine capabilities bind exact set, namespace, generation, and nonce; permanent tombstones and non-wrapping generations reject reuse. |
+| ABA, replay, or stale effect | SDK-minted affine capabilities bind exact set, namespace, generation, and nonce; permanent per-atom history, group/set tombstones, and non-wrapping generations reject reuse. |
 | Cross-device, cross-pin, or cross-group use | The authenticated protected record and immutable control marker bind the exact tuple; backend validates before mutation. |
 | Partial selector claim/removal | Canonical whole-group transaction and exact whole-group readback; mixed provenance is unsupported. |
 | ACK loss, cancellation, or process death | Durable progress states, operation nonce, exact recovery outcomes, bounded supervision, and poison on ambiguity. |
@@ -1186,7 +1296,7 @@ record.
 | Control-marker tampering | Trusted descriptor traversal, no-follow/no-replace, owner/mode/link/inode checks, exact enumeration/digest binding, directory sync, and host-global lock. |
 | Symlink, hardlink, or replacement race | Descriptor-relative no-follow traversal; reject links, unexpected metadata, changed inode, and non-bpffs objects before mutation. |
 | Durable rollback or cloned database | Protected AAD plus permanent backend-owned group stamp keys and exact current lifecycle values; every effect revalidates the exact ledger/stamp bijection while holding the backend-global gate. Extra/missing/mismatched history fails closed. |
-| Decommission followed by re-adoption | Runtime locates history by stable device rather than inferring virgin state from absence; the precommitted `Decommissioning -> Decommissioned` record transition and append-only backend terminal fence are never deleted or reused. |
+| Decommission followed by re-adoption | Runtime locates history by stable device rather than inferring virgin state from absence; the precommitted `Decommissioning -> Decommissioned` record transition and append-only authenticated terminal capsule bind the exact predecessor and coordinates and are never deleted or reused. |
 | Secret or subscriber disclosure | Encrypt ledger material; redact every public surface; evidence is identity-free and uses only closed classifications/counts. |
 | Capacity or operation DoS | Pre-effect finite capacities, bounded canonicalization/readback/retries/tasks, and fail-closed exhaustion. Products own admission quotas. |
 
@@ -1243,7 +1353,10 @@ passes before the implementing surface exists is not evidence of this RFC.
 2. Deterministic tests prove atomic fresh complete-set claim, exact full-set
    retired reissue, and rejection of duplicate, partial, mixed, same-group
    changed, stale-generation, replayed, cross-device, cross-pin, and
-   cross-group requests before backend mutation.
+   cross-group requests before backend mutation. A newly shaped set and new
+   group containing exactly one atom from any retired or active predecessor is
+   rejected by the permanent atom ledger even though both whole-set/group
+   commitments are unseen.
 3. Concurrent-process and split-brain tests use two real local store handles,
    two independent local databases, coherent protected-store clones made before
    and after first effect, two canonical pin namespaces, and the distributed
@@ -1262,7 +1375,8 @@ passes before the implementing surface exists is not evidence of this RFC.
    only exact whole-set retired reissue is admitted after `Retired` and a
    trusted backend quiescence receipt. Immediate reissue, caller-constructed
    drain/grace evidence, missing or foreign terminal-retired stamps, and mock
-   quiescence all fail closed.
+   quiescence all fail closed. The built-in eBPF backend reports reissue
+   `Unsupported` until a separately qualified real quiescence mechanism exists.
 7. Restart, process-death, caller cancellation, and supervisor-bound tests
    exercise every `Installing` and `Retiring` recovery outcome, including each
    side of the `backend_started` CAS, pending-stamp write/readback, journal
@@ -1283,9 +1397,10 @@ passes before the implementing surface exists is not evidence of this RFC.
    ledger/control binding fails before traffic/map mutation.
 9. Mutation tests independently make RED: admission/effect/removal/retired/
    quiescence capability opacity removal, their namespace-binding validation
-   removal, backend quiescence-receipt validation removal, and independent
-   tombstone and generation validation removal. A combined happy-path mutation
-   is insufficient evidence for these independent guards.
+   removal, backend quiescence-receipt validation removal, per-atom historical
+   freshness removal, and independent tombstone and generation validation
+   removal. A combined happy-path mutation is insufficient evidence for these
+   independent guards.
 10. Redaction tests inspect `Debug`, logs, metrics, status, errors, and RFC 006
     evidence and prove they contain only bounded classifications/counts, with
     no selector, subscriber, ledger, commitment, nonce, secret, or key data.
@@ -1298,10 +1413,14 @@ passes before the implementing surface exists is not evidence of this RFC.
     record may initialize, and cleanup-only migration is explicit. Decommission
     fault injection covers every ledger/authority-marker/decommission-fence/
     stamp/readback/graph-removal boundary, including rollback to the exact prior
-    `Bound` record after the terminal fence appears, and proves
-    `Decommissioned` plus all history remain permanent. Removing the database,
-    maps, stamp map, and markers after decommission still cannot make ordinary
-    startup provision or initialize the tuple.
+    `Bound` record after the terminal fence appears. They prove the
+    authenticated capsule reconstructs only its exact predecessor and exact
+    precommitted phase/terminal generations and nonces; older/different `Bound`,
+    capsule ciphertext/tag/nonce/AAD/predecessor/coordinate mutation, and an
+    invented coordinate all remain offline. `Decommissioned` plus all history
+    remain permanent. Removing the database, maps, stamp map, and markers after
+    decommission still cannot make ordinary startup provision or initialize
+    the tuple.
 13. Fix-removal tests independently remove operation-stamp validation, phase
     generation advancement, protected-store admission, canonical storage-key
     derivation, and supervisor ownership; each mutation goes RED without
@@ -1330,7 +1449,9 @@ passes before the implementing surface exists is not evidence of this RFC.
     `ProtectedPayloadScopeCodecV1`, its commitment,
     `StorageKeySeedCodecV1`, the reserved stable ID, `StorageScopeCodecV1`, its
     commitment, `PinNamespaceCodecV1`, the selector-secret commitment, the
-    exact 145-byte binding, and both marker digests. One-field mutations cover
+    exact 145-byte binding, predecessor-bound codec/commitment, the 110-byte
+    decommission capsule, authority-marker digest, and complete 239-byte
+    terminal-marker name. One-field mutations cover
     tenant, NF kind, key type,
     stable ID, raw protected-backend scope before sealing, protected-payload-
     scope commitment, device, pin, ledger ID, selector-secret commitment,
