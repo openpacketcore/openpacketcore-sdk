@@ -785,10 +785,10 @@ jobs:
           diff -u <(printf '%s\n' opc_gtpu_downlink opc_gtpu_uplink) pre-redirect.programs
           # This generation predates the TFT classifier maps. Prove that its
           # map inventory remains an exact subset of the current object and
-          # that only the versioned TFT and issue-655 observation maps were
-          # added. The historical generation still differs by its instruction
-          # stream and by GTPU_COUNTERS width, so a current-object fixture
-          # cannot stand in for its byte authority.
+          # that only the versioned selector, TFT, and issue-655 observation
+          # maps were added. The historical generation still differs by its
+          # instruction stream and by GTPU_COUNTERS width, so a current-object
+          # fixture cannot stand in for its byte authority.
           readelf -sW "${current_path}" | awk '$4 == "OBJECT" && $8 ~ /^GTPU_/ {print $8}' | sort > current.maps
           comm -23 pre-redirect.maps current.maps > removed-pre-redirect.maps
           test ! -s removed-pre-redirect.maps
@@ -796,7 +796,7 @@ jobs:
           diff -u \
             <(printf '%s\n' \
               GTPU_OBS_EVT GTPU_OBS_FLOW GTPU_OBS_GATE GTPU_OBS_LCK \
-              GTPU_OBS_LOSS GTPU_OBS_REDIR GTPU_OBS_REG GTPU_OBS_SEQ \
+              GTPU_OBS_LOSS GTPU_OBS_REDIR GTPU_OBS_REG GTPU_OBS_SEQ GTPU_SEL_STAMP \
               GTPU_TFT_DROP GTPU_TFT_FILT GTPU_TFT_META GTPU_TFT_SCHEMA) \
             added-after-pre-redirect.maps
           # The whole guard rests on these being different programs. Byte
@@ -874,6 +874,7 @@ jobs:
             GTPU_UL_INDEX GTPU_DL_INDEX GTPU_SESS_TXN GTPU_SCHEMA6 GTPU_CONFIG6 \
             GTPU_OBS_REG GTPU_OBS_REDIR GTPU_OBS_EVT GTPU_OBS_LOSS GTPU_OBS_SEQ \
             GTPU_OBS_GATE GTPU_OBS_LCK GTPU_OBS_FLOW \
+            GTPU_SEL_STAMP \
             GTPU_TFT_SCHEMA GTPU_TFT_META GTPU_TFT_FILT GTPU_TFT_DROP; do
             grep -Eq \
               "( |[[:digit:]])${symbol}((Kb[01]|Kj(4|8|10|20|40))_EB[[:digit:]]+_)?$" \

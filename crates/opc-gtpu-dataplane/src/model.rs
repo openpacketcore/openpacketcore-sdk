@@ -1528,7 +1528,10 @@ impl GtpuSessionGroupReconcileRequest {
         desired: GtpuSessionGroup,
         selector_admission: crate::GtpuSessionSelectorAdmission,
     ) -> Result<Self, GtpuSessionModelError> {
-        if !selector_admission.validates(&desired) {
+        if !selector_admission.validates(&desired)
+            || !selector_admission.authorizes_install_effect()
+            || selector_admission.is_retired_reissue()
+        {
             return Err(GtpuSessionModelError::SelectorAdmissionMismatch);
         }
         Ok(Self {
@@ -1549,6 +1552,7 @@ impl GtpuSessionGroupReconcileRequest {
         reuse: GtpuSessionSelectorReuseProof,
     ) -> Result<Self, GtpuSessionModelError> {
         if !selector_admission.validates(&desired)
+            || !selector_admission.authorizes_install_effect()
             || !selector_admission.is_retired_reissue()
             || reuse.retired_group.device_id != desired.device_id
             || reuse.retired_group.id == desired.id

@@ -14,9 +14,10 @@ XFRM policy, deployment defaults, or traffic-readiness policy.
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.
-  The reconciliation methods are additive defaults, so existing third-party
-  implementations remain source-compatible and report typed unsupported
-  results until they opt in.
+  New trait ports retain default unsupported bodies for third-party backend
+  compatibility. Grouped request construction is intentionally source-
+  breaking: production callers now enter through the protected selector
+  coordinator and cannot construct fresh/reused authority themselves.
 - `LinuxGtpuDataplaneBackend`: safe adapter over the Linux `gtp` netdevice and
   GTP generic-netlink family.
 - `EbpfGtpuDataplaneBackend`: tc `clsact` eBPF datapath adapter for
@@ -50,6 +51,9 @@ XFRM policy, deployment defaults, or traffic-readiness policy.
   `EbpfManagedDeviceInventoryCompleteness`,
   `MAX_EBPF_MANAGED_DEVICE_IDENTITIES`, `GtpRole`, `GtpVersion`,
   `GtpAddressFamily`, and `GTPU_PORT`.
+  The provenance and reuse-proof exports are read-only backend projections,
+  not authority: their production constructors and request constructors are
+  SDK-private, and every effect additionally consumes an opaque admission.
 - `TftUplinkClassifier` is a backend-neutral, bounded classifier contract for
   multiple GTP-U contexts sharing one PAA on an unmarked uplink packet path. It
   uses the canonical `opc-proto-tft` model, accepts only complete
@@ -1935,12 +1939,16 @@ conformance model, not a production authority. On ambiguous durable
 completion, the coordinator reads back the exact mutation fingerprint; if it
 is not exact, it fails closed. A durable adapter retains a Retiring or Poisoned
 state for unresolved external teardown. Retire the authority claim before
-dataplane removal and require product-owned drain/RCU evidence before reissuing
-a retired selector set. Diagnostics expose only bounded state classifications,
+dataplane removal and require an SDK/backend-qualified drain/RCU receipt before
+reissuing a retired selector set. Product assertions do not qualify.
+Diagnostics expose only bounded state classifications,
 never selector, subscriber, or digest values.
 
-The public grouped-session API is additive. Existing `GtpuProbe` fields and
-legacy v5 map-key bytes are unchanged. The current eBPF backend opts in only
+The backend trait expansion is additive, and existing `GtpuProbe` fields and
+legacy v5 map-key bytes are unchanged. The grouped-session construction
+migration is deliberately not additive: public `Fresh` assertion and public
+request construction are removed, so callers must use the protected
+coordinator. The current eBPF backend opts in only
 after the live attachment proves its exact schema, configuration, named map
 identities, tc programs, and held namespace lease. The async, fallible
 `gtpu_ip_family_capabilities` query accepts a

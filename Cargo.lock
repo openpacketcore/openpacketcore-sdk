@@ -2876,6 +2876,7 @@ dependencies = [
 name = "opc-gtpu-dataplane"
 version = "0.2.0"
 dependencies = [
+ "aes-gcm-siv",
  "async-trait",
  "aya",
  "aya-obj",

@@ -24,6 +24,7 @@ opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
 async-trait = { workspace = true }
+aes-gcm-siv = { workspace = true }
 hmac = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }

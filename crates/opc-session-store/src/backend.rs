@@ -1460,10 +1460,20 @@ impl fmt::Debug for SelectorLedgerStorageScope {
 ///
 /// This value carries the administrative routing coordinates together with the
 /// protected payload boundary's nonsecret commitment.  Its fields are private:
-/// product code may route with the accessors, but cannot construct or
-/// substitute a backend-scope commitment.  The dataplane consumes this base
-/// with an affine eBPF namespace bootstrap to derive the final durable key.
-#[derive(Clone, PartialEq, Eq)]
+/// product code may route with the accessors, but cannot construct, clone, or
+/// substitute a backend-scope commitment. This value is not authority by
+/// itself; the dataplane consumes it together with an affine eBPF namespace
+/// bootstrap to derive the final durable key. Making the routing projection
+/// non-cloneable prevents it from becoming a replay-friendly bootstrap input.
+///
+/// ```compile_fail
+/// use opc_session_store::ProtectedSelectorLedgerBase;
+///
+/// fn replay(base: ProtectedSelectorLedgerBase) {
+///     let _duplicate = base.clone();
+/// }
+/// ```
+#[derive(PartialEq, Eq)]
 pub struct ProtectedSelectorLedgerBase {
     tenant: TenantId,
     nf_kind: NetworkFunctionKind,

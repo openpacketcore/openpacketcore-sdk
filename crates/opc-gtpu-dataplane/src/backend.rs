@@ -569,6 +569,12 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// held exclusive lease on every call. Extra or missing indexes, duplicate
     /// family authority, and a group ID bound to another device are never
     /// collapsed into `Absent` or `Active`.
+    ///
+    /// This is a legacy diagnostic port only. A production backend MUST refuse
+    /// it whenever the attachment has an immutable durable selector namespace
+    /// binding. Bound lifecycle settlement uses
+    /// [`Self::read_pdp_context_group_with_lease`]; structural readback cannot
+    /// satisfy protected-ledger recovery.
     async fn read_pdp_context_group(
         &self,
         _selector: GtpuSessionGroupSelector,
@@ -580,8 +586,9 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
 
     /// Read one exact grouped session through the durable selector authority.
     ///
-    /// The expected graph is borrowed so an adapter can verify the opaque
-    /// stamp before inspecting kernel state. This is deliberately a separate
+    /// The affine admission is consumed so an adapter can verify the opaque
+    /// stamp before inspecting kernel state without leaving replayable
+    /// authority. This is deliberately a separate
     /// authority-bearing port: falling back to a structural semantic lookup
     /// after an in-memory admission check would let an unauthenticated
     /// readback settle durable recovery. Adapters that do not implement the
@@ -589,7 +596,7 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     async fn read_pdp_context_group_authorized(
         &self,
         _expected: &GtpuSessionGroup,
-        _admission: &crate::GtpuSessionSelectorAdmission,
+        _admission: crate::GtpuSessionSelectorAdmission,
     ) -> Result<GtpuSessionGroupReadback, GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "gtpu_session_group_authorized_readback",
@@ -836,9 +843,10 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// components, generation overflow, endpoint-authority loss, or uncertain
     /// ACK state produce conflict/indeterminate with no guessed cleanup.
     /// Cross-group selector transfer is always forbidden while the source is
-    /// live. Reuse after exact removal requires the source-bound drain/grace
-    /// evidence carried by [`GtpuSessionGroupReconcileRequest`]; a fresh claim
-    /// is checked against the caller's durable selector registry.
+    /// live. Reuse after exact removal requires an opaque, source-bound SDK
+    /// authorization carried by [`GtpuSessionGroupReconcileRequest`]; fresh
+    /// ownership is admitted only by the protected selector-ledger
+    /// coordinator.
     async fn reconcile_pdp_context_group(
         &self,
         _request: GtpuSessionGroupReconcileRequest,
@@ -872,14 +880,14 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
-    /// Remove one exact grouped session using the affine selector authority
-    /// that created it.  The default preserves third-party source
+    /// Remove one exact grouped session by consuming the affine selector
+    /// authority that created it. The default preserves third-party source
     /// compatibility while refusing an effect it cannot bind to a durable
     /// namespace ledger.
     async fn remove_pdp_context_group_authorized(
         &self,
         _expected: GtpuSessionGroup,
-        _admission: &crate::GtpuSessionSelectorAdmission,
+        _admission: crate::GtpuSessionSelectorAdmission,
     ) -> Result<GtpuSessionGroupRemovalOutcome, GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "gtpu_session_group_authorized_removal",
