@@ -254,6 +254,7 @@ pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_C
 #[cfg(unix)]
 pub use namespace::{
     XfrmObjectInstallAdmissionAuthority, XfrmObjectInstallRunError, XfrmObjectRecoveryBindError,
+    XfrmObjectRosterAdmissionAuthority, XfrmObjectRosterRunError,
     XfrmSaRelocationAdmissionAuthority, XfrmSaRelocationRunError,
 };
 pub use observation::{

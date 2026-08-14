@@ -20,12 +20,6 @@
 //! witnessed before the group's epoch burn and therefore cannot order an
 //! observation against this roster's own effect window.
 
-// The namespace actor binds this protocol in a later slice. Until then nothing
-// outside the module calls the crate-internal flow functions, which fires the
-// unused-item lint across an otherwise complete and tested module. Remove this
-// once the roster actor wiring lands.
-#![allow(dead_code)]
-
 use std::{error::Error, fmt, num::NonZeroU64};
 
 use crate::durable_install::{install, readback_object_present, remove};
@@ -187,7 +181,10 @@ fn kernel_selection_key(request: &XfrmObjectInstallRequest) -> KernelSelectionKe
 ///
 /// Construction is the only place member admissibility is decided, so every
 /// later durable step operates on a member set that is exact, uniquely
-/// removable, and unambiguous in the kernel's own selection relation.
+/// removable, and unambiguous in the kernel's own selection relation. Cloning
+/// a roster preserves that validation: the namespace actor needs an owned copy
+/// for each durable command while the consumer keeps its own for recovery.
+#[derive(Clone)]
 pub struct XfrmObjectRosterRequest {
     members: Vec<XfrmObjectRosterMemberRequest>,
 }
@@ -831,6 +828,23 @@ pub(crate) fn prepare_object_roster(
 ) -> Result<XfrmObjectRosterRecoveryHandle, XfrmObjectRosterDurableError> {
     let material = roster_member_material(store, group_id, generation, roster)?;
     store.prepare(group_id, generation, &material)
+}
+
+/// Read the authenticated current group phase for one retained roster.
+///
+/// The namespace actor needs the phase before it decides which cross-family
+/// fencing obligation a recovery call carries, so this publishes nothing and
+/// grants no authority.
+pub(crate) fn durable_object_roster_phase(
+    store: &XfrmObjectRosterRecoveryStore,
+    group_id: XfrmObjectRosterGroupId,
+    generation: XfrmObjectRosterOperationGeneration,
+    roster: &XfrmObjectRosterRequest,
+) -> Result<XfrmObjectRosterDurablePhase, XfrmObjectRosterDurableError> {
+    let fingerprint = roster_digest(store, group_id, generation, roster)?;
+    store
+        .restore(group_id, generation, fingerprint)
+        .map(|record| record.phase)
 }
 
 pub(crate) fn validate_object_roster_admission(

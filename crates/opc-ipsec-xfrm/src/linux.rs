@@ -32,6 +32,8 @@ use crate::dscp::{production_runtime, LinuxXfrmDscpMarkingConfig, XfrmDscpRuntim
 use crate::durable_object::{XfrmObjectInstallRecoveryStore, XfrmObjectRecoveryProofKey};
 #[cfg(unix)]
 use crate::durable_relocation::{XfrmSaRelocationRecoveryProofKey, XfrmSaRelocationRecoveryStore};
+#[cfg(unix)]
+use crate::durable_roster::{XfrmObjectRosterRecoveryProofKey, XfrmObjectRosterRecoveryStore};
 use crate::model::{
     sa_uses_esn, validate_exact_remove_policy_request, validate_policy_query,
     validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query,
@@ -474,6 +476,97 @@ impl LinuxXfrmBackend {
             object_proof_key,
             relocation_path,
             relocation_proof_key,
+        )
+    }
+
+    /// Bind to the calling thread's current network namespace and attach its
+    /// durable grouped object roster recovery store atomically.
+    ///
+    /// This is the RECOMMENDED constructor for consumers adopting the grouped
+    /// roster boundary. A consumer that applies every XFRM object of an IKEv2
+    /// Child SA through one roster needs only this store, and binding it alone
+    /// avoids the per-command cross-family scan and fsync cost of the
+    /// all-three constructor.
+    ///
+    /// Store authentication and the permanent lease complete on the actor
+    /// thread before any mutation-capable backend handle is returned. Durable
+    /// roster users must use this constructor on every process start so an
+    /// ordinary SDK mutation cannot occur before the retained writer epoch and
+    /// cleanup authority are active, and must call
+    /// [`NamespaceBoundLinuxXfrmBackend::adopt_durable_object_roster`] or
+    /// [`NamespaceBoundLinuxXfrmBackend::recover_durable_object_roster`] for
+    /// any retained roster before any other namespace mutation.
+    #[cfg(unix)]
+    pub fn bind_current_network_namespace_with_object_roster_recovery(
+        self,
+        path: PathBuf,
+        proof_key: XfrmObjectRosterRecoveryProofKey,
+    ) -> Result<
+        (
+            NamespaceBoundLinuxXfrmBackend,
+            XfrmObjectRosterRecoveryStore,
+        ),
+        XfrmObjectRecoveryBindError,
+    > {
+        namespace::bind_current_network_namespace_with_object_roster_recovery(self, path, proof_key)
+    }
+
+    /// Bind to the calling thread's current network namespace and attach the
+    /// durable staged-object, SA relocation, and grouped object roster recovery
+    /// stores atomically.
+    ///
+    /// This is the opt-in migration constructor, not the default. Use it while
+    /// a deployment still runs single-object installs or SA relocations
+    /// alongside rosters, so the cross-family cooperating-writer gate is active
+    /// from the first operation. The three stores must use distinct leased
+    /// roots.
+    ///
+    /// # Cost
+    ///
+    /// Binding all three stores is not free. Every ordinary namespace mutation
+    /// and every durable admission now scans and fsyncs three stores instead of
+    /// one, and the coupling is deliberately fail-closed in both directions: an
+    /// unresolved roster fences single-object installs and SA relocations, and
+    /// an unresolved install or relocation fences rosters. A roster store that
+    /// is malformed, unreadable, or over full therefore fails single-object
+    /// installs closed too. That is the intended behaviour — a namespace with
+    /// an unreadable durable writer gate must not admit a cooperating mutation
+    /// — but it is a real operational coupling, so consumers that have finished
+    /// migrating should move to
+    /// [`Self::bind_current_network_namespace_with_object_roster_recovery`].
+    ///
+    /// # Migration
+    ///
+    /// Use one roster OR the equivalent single-object operations per Child SA,
+    /// never both interleaved for the same Child SA. A half-migrated consumer
+    /// is serialized by the gates rather than corrupted, but each family then
+    /// waits for the other's resolution.
+    #[cfg(unix)]
+    pub fn bind_current_network_namespace_with_object_sa_relocation_and_roster_recovery(
+        self,
+        object_path: PathBuf,
+        object_proof_key: XfrmObjectRecoveryProofKey,
+        relocation_path: PathBuf,
+        relocation_proof_key: XfrmSaRelocationRecoveryProofKey,
+        roster_path: PathBuf,
+        roster_proof_key: XfrmObjectRosterRecoveryProofKey,
+    ) -> Result<
+        (
+            NamespaceBoundLinuxXfrmBackend,
+            XfrmObjectInstallRecoveryStore,
+            XfrmSaRelocationRecoveryStore,
+            XfrmObjectRosterRecoveryStore,
+        ),
+        XfrmObjectRecoveryBindError,
+    > {
+        namespace::bind_current_network_namespace_with_object_sa_relocation_and_roster_recovery(
+            self,
+            object_path,
+            object_proof_key,
+            relocation_path,
+            relocation_proof_key,
+            roster_path,
+            roster_proof_key,
         )
     }
 

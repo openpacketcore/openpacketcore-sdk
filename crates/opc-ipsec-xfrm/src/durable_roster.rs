@@ -22,13 +22,6 @@
 //! [`crate::durable_object`] so both families pin the same bytes-on-the-wire
 //! definition of "the same request".
 
-// This slice lands the record format and the durable store. Nothing outside the
-// module reaches it yet: `open_bound` is crate-internal and the namespace actor
-// binds it in a later slice, which makes the entire store graph unreachable and
-// fires the unused-item lint on every item in an otherwise complete and tested
-// module. Remove this once the roster flow layer and namespace wiring land.
-#![allow(dead_code)]
-
 #[cfg(target_os = "linux")]
 use std::io::Write;
 use std::{
@@ -62,7 +55,7 @@ use crate::durable_object::{
     mac_u64, mac_u8, verify_authentication_domain, CanonicalEncodeError, CanonicalMacKey,
 };
 use crate::model::validate_exact_lookup_mark;
-use crate::{XfrmInstallObject, XfrmObjectInstallRequest, XfrmObjectRemovalRequest};
+use crate::{XfrmInstallObject, XfrmObjectInstallRequest};
 
 /// Largest number of members one durable roster may carry.
 ///
@@ -569,11 +562,6 @@ impl XfrmObjectRosterMemberId {
             return Err(XfrmObjectRosterDurableError::Malformed);
         }
         Ok(Self(bytes))
-    }
-
-    /// Return the opaque correlation bytes.
-    pub(crate) const fn to_bytes(self) -> [u8; 16] {
-        self.0
     }
 }
 
@@ -2092,32 +2080,6 @@ impl XfrmObjectRosterRecoveryStore {
             deletion_identity,
             install_request,
         })
-    }
-
-    /// Compute the keyed fingerprint of one member's exact removal identity.
-    ///
-    /// Recovery holds the removal request but not the original install request,
-    /// so it correlates a durable slot through this digest alone.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`XfrmObjectRosterDurableError::NonExactRemovalIdentity`] when
-    /// the removal cannot select exactly one kernel object.
-    pub(crate) fn deletion_identity_fingerprint(
-        &self,
-        removal: &XfrmObjectRemovalRequest,
-        policy_if_id: Option<u32>,
-    ) -> Result<[u8; 32], XfrmObjectRosterDurableError> {
-        validate_exact_lookup_mark(removal.lookup_mark(), "durable_roster.member.mark")
-            .map_err(|_| XfrmObjectRosterDurableError::NonExactRemovalIdentity)?;
-        let lease = self.lease()?;
-        authenticate_deletion_identity(
-            lease.store.proof_key.canonical_mac_key(),
-            DELETION_IDENTITY_AUTH_DOMAIN,
-            removal,
-            policy_if_id,
-        )
-        .map_err(map_canonical_encode_error)
     }
 
     /// Derive the default durable identity of one roster member.
