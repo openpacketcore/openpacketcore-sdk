@@ -46,6 +46,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # PR whitespace validation compares the event's base and head, so
+          # retain enough history to resolve their exact merge-base.
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -61,7 +65,17 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Check diff whitespace
-        run: git diff --check
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            merge_base="$(git merge-base "${PR_BASE_SHA}" "${PR_HEAD_SHA}")"
+            git diff --check "${merge_base}..${PR_HEAD_SHA}"
+          else
+            git diff --check
+          fi
 
       - name: Run management-plane policy gates
         run: |
