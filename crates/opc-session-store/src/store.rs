@@ -11,11 +11,12 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 
 use crate::backend::{
-    enforce_replication_watch_cursor, record_expiry_preflights,
-    validate_replication_log_page_owned, validate_replication_prefix_owned,
-    BackendInstanceIdentity, BackendPeerBinding, CompareAndSet, CompareAndSetResult,
-    RecordExpiryPreflight, ReplicationEntry, ReplicationLogRange, SessionBackend, SessionOp,
-    SessionOpResult,
+    enforce_replication_watch_cursor, protected_payload_scope_commitment_for,
+    record_expiry_preflights, validate_replication_log_page_owned,
+    validate_replication_prefix_owned, BackendInstanceIdentity, BackendPeerBinding, CompareAndSet,
+    CompareAndSetResult, ProtectedSelectorLedgerBase, ProtectedSessionBackend,
+    RecordExpiryPreflight, ReplicationEntry, ReplicationLogRange, SelectorLedgerStorageScope,
+    SessionBackend, SessionOp, SessionOpResult,
 };
 use crate::capability::BackendCapabilities;
 use crate::error::{LeaseError, StoreError};
@@ -89,6 +90,23 @@ impl<B: SessionBackend + SessionLeaseManager> SessionStore<B> {
     /// Access the underlying backend arc.
     pub fn backend(&self) -> &Arc<B> {
         &self.backend
+    }
+}
+
+impl<B: ProtectedSessionBackend> SessionStore<B> {
+    /// Mint the protected base consumed by the dataplane's selector-ledger
+    /// key derivation.
+    ///
+    /// The raw protected backend namespace remains inside this SDK-owned
+    /// payload wrapper.  Callers receive only the routing coordinates and a
+    /// nonsecret commitment to that protected boundary.
+    #[must_use]
+    pub fn protected_selector_ledger_base(
+        &self,
+        scope: &SelectorLedgerStorageScope,
+    ) -> Option<ProtectedSelectorLedgerBase> {
+        protected_payload_scope_commitment_for(self.backend.as_ref())
+            .map(|commitment| ProtectedSelectorLedgerBase::mint(scope, commitment))
     }
 }
 

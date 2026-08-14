@@ -24,6 +24,7 @@
       "opc-consensus",
       "opc-egress-fence",
       "opc-gnmi-server",
+      "opc-gtpu-dataplane",
       "opc-ipsec-lb",
       "opc-mgmt-audit-store",
       "opc-mgmt-authz",

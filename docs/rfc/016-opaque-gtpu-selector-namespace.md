@@ -15,6 +15,23 @@ This RFC defines an experimental, product-neutral SDK authority boundary for a
 grouped GTP-U selector namespace. It replaces a caller assertion that a
 selector set is `Fresh` with an SDK-issued, affine admission capability.
 
+The selector dataplane adapter is a deliberately trusted part of that
+authority boundary. Supplying a `GtpuDataplaneBackend` implementation to a
+production selector lifecycle selects it into the trusted computing base
+(TCB): its receipt says that this adapter performed and exactly read back the
+requested mutation under its ownership gate. SDK-minted affine requests and
+exact receipt-coordinate binding prevent ordinary callers from constructing,
+replaying, or cross-binding a receipt without the corresponding request. They
+do not cryptographically attest a real kernel effect by a malicious in-process
+implementation of the public, unsealed trait, and Rust cannot distinguish a
+production adapter from a fake which a product passes to that lifecycle. The
+built-in eBPF adapter is the initial supported trusted adapter and must perform
+the real mutation, stamp validation, and exact readback specified here. A
+future third-party production profile requires the backend-neutral stamp codec
+and qualification harness described in §9; implementing or overriding the
+public trait methods alone is not conformance. This RFC defines no adapter-
+attestation credential scheme.
+
 The authority is one device-scoped durable selector ledger. It binds a stable
 device namespace, exact group, and every canonical TEID, PAA, and bearer-mark
 selector atom. It records a nonzero monotonic generation, operation nonce,
@@ -54,6 +71,8 @@ after a complete durable namespace transaction.
   and backend conformance.
 - A persistent eBPF control marker that prevents a live or cleaned pin graph
   from silently changing the ledger authority.
+- The trusted-adapter boundary, public capability protections, and qualification
+  evidence required before a product selects a backend for this feature.
 - Local and distributed composition with RFC 004 SessionStore and ADR 0019's
   single Openraft engine.
 - Bounded redacted diagnostics and RFC 006 evidence requirements.
@@ -70,6 +89,10 @@ after a complete durable namespace transaction.
   distinct work tracked by issue #664.
 - A claim that reconcile/readback proves forwarding traffic, a carrier
   qualification, or a product-safe migration.
+- Cryptographic attestation of a real effect by a malicious selected adapter,
+  remote adapter credentials, or credential provisioning, rotation, revocation,
+  and verification. Those require a distinct proposal with a concrete trust
+  root.
 
 ## 3. Design Goals
 
@@ -85,6 +108,11 @@ after a complete durable namespace transaction.
 - Each committed lifecycle transition MUST have a nonzero monotonic generation
   and a unique operation nonce. A generation MUST never wrap or be reused.
 - Retired history MUST be permanent within the selected durable authority.
+
+These safety properties constrain SDK-mediated operations initiated by ordinary
+callers and non-TCB code. They do not constrain arbitrary code inside the
+selected trusted adapter, which could bypass its contract or falsely report an
+effect.
 
 ### 3.2 Product Boundary
 
@@ -102,6 +130,32 @@ secrets, commitments, operation nonces, and cryptographic keys MUST be absent
 from `Debug`, `Display`, logs, metrics, status, errors, and RFC 006 evidence.
 Only closed classifications, count buckets, and bounded outcome summaries are
 permitted.
+
+### 3.4 Trusted Adapter Boundary
+
+`GtpuDataplaneBackend` remains public and unsealed so a product can supply a
+backend profile. Its selector methods default to `Unsupported`. The SDK does
+not issue a qualification credential or a sealed selected-backend wrapper:
+passing an implementation to a production selector lifecycle is the product's
+explicit selection of that implementation into the TCB. That trust decision
+covers every receipt class: namespace binding and provisioning; effect,
+readback, removal, and quiescence; and terminal-fence inspection, creation, and
+readback. Qualification under §9 and §14.11 is required deployment evidence,
+but it is not a runtime gate which Rust can enforce. Passing a fake or an
+unqualified implementation is an unsafe product configuration and a TCB
+compromise, not a condition the receipt type can detect.
+
+The SDK enforces opaque affine capability ownership, exact private request
+coordinates, durable CAS state, and rejection of stale, replayed, cross-request,
+and cross-namespace receipts presented without the matching request. The
+coordinate binds the request kind, namespace, complete set, phase generations
+and nonces, and durable selector-backend epoch. The receipt's private class and
+the coordinator's closed outcome checks are separate from that coordinate. It
+is not evidence that the selected adapter wrote or read an operation stamp. A
+malicious selected adapter is therefore a TCB compromise, not an attacker that
+this RFC claims to distinguish at runtime. Test-only authority constructors and
+tokens remain excluded from production builds, but a product is responsible
+for never supplying a fake backend to a production lifecycle.
 
 ## 4. Terms and Canonical Identity
 
@@ -458,10 +512,12 @@ an allocation at retirement, it must reserve that capacity at claim time;
 allocation-free.
 
 The reference control profile additionally permits four CAS/readback attempts
-per transition, 64 supervised effects per namespace, 256 supervised effects per
-process, at most 16 directory entries examined while validating a marker, 256
-atoms and 512 KiB examined by one exact readback, and 4 KiB for one SDK-created
-diagnostic or evidence record. It uses a 30-second namespace lease, renews no
+per transition, 64 admitted supervisor slots per namespace, 256 admitted
+supervisor slots per process, at most 16 directory entries examined while
+validating a marker, 256 atoms and 512 KiB examined by one exact readback, and
+4 KiB for one SDK-created diagnostic or evidence record. The admitted slots
+bound queued result owners; exactly one worker per protected storage-scope
+commitment is polled at a time. It uses a 30-second namespace lease, renews no
 later than every 10 seconds, and admits only backend critical sections bounded
 to 5 seconds. Exceeding a work, byte, entry, task, retry, lease, or diagnostic
 limit fails closed before further mutation; it never truncates authority data
@@ -504,10 +560,14 @@ quiescence boundary to implement this operation. The built-in eBPF backend
 leaves it `Unsupported` until it has a real kernel/network quiescence mechanism;
 ordinary map deletion, userspace sleep, or an in-process RCU assumption is not
 such a mechanism. A conformance fake can exercise protocol state transitions
-but cannot mint a production receipt. Any other backend must provide and test
-an equivalent trusted boundary or likewise leave reissue unsupported. A public
-constructor, raw duration completion, caller assertion, sleep, mock success,
-or traffic-readiness proof cannot mint this authorization.
+with test-only authority, but a product MUST NOT pass that fake to a production
+lifecycle. Doing so would select it into the TCB and let it assert a production
+receipt. Any other backend must be deliberately selected into the TCB and
+provide qualification evidence for an equivalent real quiescence boundary, or
+leave reissue unsupported. A public constructor, raw duration completion,
+caller assertion, sleep, mock success, or traffic-readiness proof cannot mint
+this authorization without the exact affine request; the SDK does not claim to
+detect a malicious selected adapter that lies about its own barrier.
 `reissue_exact_retired_group` consumes the exact retired capability, exact
 authorization, and distinct successor group in one ledger transition; neither
 input is cloneable or reusable. This RFC does not treat traffic-proof authority
@@ -612,48 +672,61 @@ async fn create_selector_namespace_terminal_fence(
 ) -> Result<GtpuSelectorNamespaceTerminalFenceReceipt, GtpuError>;
 ```
 
-The SDK supplies a verifier/codec for external backend implementations. It
-reveals only the canonical 145-byte binding, canonical marker name, canonical
-208-byte pending and terminal stamps, the canonical opaque 110-byte
-decommission capsule and its backend-specific terminal-fence key, and
-constant-time comparison operations, never the selector secret or fields from
-which a caller can mint those values.
-The lease validates the exact marker, complete permanent group-key inventory,
-and each key's exact current lifecycle-stamp value again immediately before
-each effect. An authorized request also exposes a borrowed read-only
-`GtpuSessionGroup` projection and closed operation kind while it is consumed,
-so an external backend can perform the requested real mutation; those semantic
-fields do not mint or validate authority. A receipt is valid only for the exact
-namespace binding, complete set, phase generation, operation nonce, marker
-commitment, requested outcome, terminal 208-byte stamp, and backend
-incarnation. A receipt codec contains the terminal stamp followed by a
-versioned, length-delimited exact desired-group readback; it has no semantic-
-equality fallback. The conformance harness
-can mint test requests, but ordinary callers cannot. This makes third-party
-implementation possible without making caller-side authority fields
-constructible.
+The SDK supplies an affine request to the adapter selected for this authority
+instance. Each request carries a private receipt coordinate and exposes only
+the semantic projection and binding comparisons needed by its operation;
+ordinary callers cannot independently mint the request or its coordinate. The
+coordinate validator is not a cryptographic attestation credential: consuming
+the request proves which SDK operation the selected adapter is answering, not
+that the adapter performed the kernel or backend effect it reports.
+
+The built-in eBPF adapter additionally uses the SDK-private canonical 145-byte
+binding, marker name, canonical 208-byte pending and terminal stamps, opaque
+110-byte decommission capsule, terminal-fence key, and constant-time comparison
+operations. Under its ownership gate it validates the exact marker, complete
+permanent group-key inventory, and each key's exact lifecycle-stamp value again
+immediately before each effect. Its receipt coordinate binds the exact
+namespace, complete set, phase generations and operation nonces, marker
+commitment, request kind, and durable selector-backend epoch. The coordinator
+separately accepts only the closed receipt class and outcome valid for that
+request. The raw operation-stamp bytes and exact readback remain trusted adapter
+assertions; the receipt does not independently attest them.
+
+A future external production adapter cannot qualify merely by consuming the
+current public request and calling its completion method. Before such a profile
+is supported, the SDK MUST publish a bounded backend-neutral stamp/capsule codec
+and conformance harness which let the adapter perform the same exact persistence
+and readback without exposing the selector secret or public authority
+constructors. That change requires its own public-API and mutation tests under
+§14.11. Until then external implementations remain `Unsupported`. Test-only
+authority may exercise protocol state transitions, but it is not production
+qualification.
 
 Terminal-fence inspection is a mandatory part of an RFC 016 backend profile,
 not an eBPF extension. Under the backend's real global ownership gate it returns
-an SDK-verifiable opaque classification proving exact absence or the exact
-append-only capsule bound to this namespace. Only the coordinator can turn an
-exact `Decommissioning` record into the affine create request. Creation must be
-no-replace/idempotent for that one exact capsule, durably settle independently
-of protected-store rollback, and return an exact readback receipt; a different
-existing capsule is indeterminate. The default methods are `Unsupported`, and a
-backend that cannot implement this independent permanent fence cannot advertise
-RFC 016 selector-namespace capability. The eBPF directory name in §8 is the
-reference implementation; another backend may use a different durable medium
-only when its conformance profile proves equivalent append-only identity,
-serialization, crash recovery, bounded inspection, and exact readback.
+an opaque classification which the selected adapter asserts from exact absence
+or the exact append-only capsule bound to this namespace. The SDK validates its
+coordinate; that validation does not independently attest the adapter's
+inspection. Only the coordinator can turn an exact `Decommissioning` record
+into the affine create request. Creation must be no-replace/idempotent for that
+one exact capsule, durably settle independently of protected-store rollback,
+and return an exact readback receipt; a different existing capsule is
+indeterminate. The default methods are `Unsupported`, and a backend that cannot
+implement this independent permanent fence cannot advertise RFC 016 selector-
+namespace capability. The eBPF directory name in §8 is the reference
+implementation; another backend may use a different durable medium only when
+its conformance profile proves equivalent append-only identity, serialization,
+crash recovery, bounded inspection, and exact readback.
 
 `GtpuSelectorNamespaceBootstrap` has no `Clone`, serialization, field getter,
-raw-parts constructor, or backend-neutral minting trait. A backend receives the
-SDK's private mint permit only inside its default-unsupported qualification
-hook; it can invoke that permit only after it has proved the stable device and
-canonical pin namespace under its real ownership gate. The built-in eBPF
-backend is the initial production implementation. Conformance-only fake minting
-is compiled for tests and cannot be linked into a production constructor.
+raw-parts constructor, or backend-neutral minting trait. The built-in eBPF
+backend mints it only after checking the stable device and canonical pin
+namespace under its real ownership gate. Passing that backend to the protected
+production lifecycle is the product's trust selection; there is no separate
+qualification credential. The built-in eBPF backend is the initial production
+implementation and must perform the real mutation, stamp validation, and exact
+readback. Test-only bootstrap minting is compiled only for tests and cannot be
+linked into a production constructor.
 The separately named provisioning call is available only to the stopped
 workflow from §11 and performs the privileged empty-backend proof before its
 absence-to-`Provisioned` CAS. The ordinary open call rejects an absent record;
@@ -853,6 +926,17 @@ awaits a separate non-aborting result receiver; dropping or cancelling it MUST
 NOT release ownership or cancel blocking kernel work while a durable effect is
 pending.
 
+One process polls exactly one such worker for a protected storage-scope
+commitment from durable lease acquisition through release. Other admitted
+same-scope supervisors remain bounded and unpolled. This is required because a
+same-`OwnerId` store acquire denotes recovery by that replica and replaces its
+prior credential; overlapping local acquisitions would invalidate a live guard
+without invalidating its time-bounded backend request. Protected open and
+binding verification use the same detached ownership rule. Every concurrently
+live process MUST use a stable `OwnerId` unique to that replica. Reusing one
+owner in multiple processes is outside the session-store contract and MUST NOT
+be treated as supported failover.
+
 The SDK supervisor retains and renews the namespace lease and request until one
 terminal receipt is durably settled. It acquires the host lock only for the
 bounded validation/effect/readback sections defined by the operation, releases
@@ -870,10 +954,11 @@ per-process number of supervisors and report only a closed cancellation
 classification. If the SDK runtime cannot provide this worker ownership, the
 capability is unsupported.
 
-The durable lock/CAS authority, not a process mutex, decides ownership. A
-process-local lock may serialize same-process calls but cannot prove cross-
-process exclusivity. Concurrent processes must serialize through the durable
-generation/CAS and the host-global control-marker lock.
+The durable lock/CAS authority, not a process mutex, decides cross-process
+ownership. The process-local worker gate prevents only reentrant acquisition by
+one replica identity; it is not a distributed fence. Concurrent replicas with
+distinct owner identities still serialize through the durable generation/CAS
+and the host-global control-marker lock.
 
 ## 8. Persistent eBPF Control Marker
 
@@ -1097,14 +1182,22 @@ the protected ledger, marker, and backend graph are exactly `Bound`.
 
 ### 8.3 Host Filesystem Semantics
 
-Control-marker operations are serialized under the existing host-global
-advisory `flock` held on the canonical control-directory descriptor. The lock
-is held across marker validation/creation and all map/program mutation/readback
-that relies on it. Network namespaces, process IDs, per-process paths, and a
-lock created in an untrusted directory are not equivalent.
+The existing host-global advisory `flock` on the canonical control-directory
+descriptor remains the process-lifetime single-writer lease. Control-marker
+operations additionally take a bounded advisory `flock` on a distinct,
+persistent sibling inode derived from the same opaque namespace commitment.
+The exact sibling component is the 64-byte lowercase namespace commitment
+followed by `-operation-v1`; it is deliberately dot-free because bpffs reserves
+names containing a dot. That operation lock is held across marker
+validation/creation and all map/program mutation/readback that relies on it,
+then released without releasing the writer lease. Keeping the original lease
+inode preserves coordination with older SDK writers during rolling upgrades.
+Network namespaces, process IDs, per-process paths, and a lock created in an
+untrusted directory are not equivalent.
 
-The total cross-boundary lock order is durable namespace lease/fence first,
-then the host-global control-directory `flock`; no path may acquire or renew a
+The total cross-boundary lock order is the process-lifetime writer lease,
+durable namespace lease/fence, then the bounded host-global operation `flock`;
+no path may acquire or renew a
 durable lease, perform a protected-store CAS/readback, or await another durable
 store operation while holding that `flock`. Bootstrap may briefly acquire the
 host lock to mint a bounded, affine namespace sample, but releases it before
@@ -1159,17 +1252,25 @@ cleanup and decommission never erase any of those authority fences.
 ## 9. Backend Contract
 
 The public `GtpuDataplaneBackend` capability default for this feature MUST be
-unsupported. The capability port is public and unsealed, but only SDK code can
-mint its qualification permit, opaque request, verifier lease, or receipt. A
-third-party backend opts in only by consuming that permit under its real
-ownership gate, declaring the selector namespace capability, and passing this
-RFC's conformance suite. An opt-in backend MUST:
+unsupported. The capability port is public and unsealed. Passing an
+implementation to a production selector lifecycle is the product's deliberate
+selection of that implementation into the TCB described in §3.4; the SDK does
+not issue a separate qualification token or sealed wrapper. SDK code constructs
+the opaque requests and validates their exact private receipt coordinates, but
+an adapter which receives a request can cause the SDK to accept its assertion
+without a separate cryptographic proof of the underlying effect. A malicious
+selected adapter can therefore lie or bypass its ownership gate; this RFC does
+not claim the public trait alone can detect that compromise.
+
+A qualified adapter MUST:
 
 - accept only the opaque capability-bound complete group operations;
 - let only the SDK supervisor poll an accepted effect future; dropping the
   caller's result observer cannot cancel or detach the backend operation;
 - atomically associate every effect and exact removal with namespace tuple,
   group/set commitment, generation, and operation nonce;
+- perform the requested real backend mutation and exact full readback under its
+  real backend-global ownership gate before it asserts a successful receipt;
 - write and exactly read the pending operation stamp before its first effect,
   and compare the complete permanent stamp-key inventory with the protected
   ledger before every recovery or mutation;
@@ -1190,10 +1291,12 @@ RFC's conformance suite. An opt-in backend MUST:
 
 An adapter that cannot make these statements remains unsupported even if it can
 reconcile maps, has a session store, or reports a successful mock operation.
-Capability reporting is an admission declaration, not a runtime liveness
-claim. A replacement backend or backend incarnation must validate the exact
-durable/control binding before it performs any action; it cannot adopt a live
-legacy graph on the basis of current map content.
+Capability reporting and conformance evidence qualify a product's trusted
+adapter selection; they are not a runtime liveness claim or a cryptographic
+trust root. A replacement adapter or restarted adapter process must validate
+the exact durable/control binding and durable selector-backend epoch before it
+performs any action; it cannot adopt a live legacy graph on the basis of current
+map content.
 
 An eBPF backend uses the directory marker defined in §8. A non-eBPF backend
 must provide an equivalent immutable, independently durable namespace binding
@@ -1204,14 +1307,27 @@ durable object, two independent durable stores could mint history or a rolled-
 back `Bound` store could reopen a decommissioned namespace, so the complete
 selector-namespace capability remains unsupported.
 
-The SDK publishes a backend conformance harness which owns the only test-token
-minting path. External implementations consume opaque authorized requests and
-use the SDK codec/verifier to persist and echo operation stamps. They do not
-reconstruct tokens from public fields. Passing pure mock success tests is not
-conformance; a backend profile must execute its real mutation, exact readback,
-restart, process loss, caller cancellation, and conflicting-binding paths. An
-implementation cannot opt in merely by implementing the semantic grouped
-reconcile methods; those remain unable to mint selector authority.
+The initial implementation publishes the built-in eBPF qualification path and
+test-only authority for state-machine tests. Those test-only authority values
+cannot enter a production constructor. This does not prevent a product from
+passing ordinary fake backend code to the public production lifecycle; doing
+that selects the fake into the TCB and is outside the safety claim. The SDK
+does not yet publish the backend-neutral operation-stamp/capsule codec required
+for a third-party
+production profile. Therefore an external implementation remains unsupported
+even if it overrides every default method and can consume an opaque request.
+Adding the missing generic codec and external-profile harness is an SDK change,
+not something a product may replace with a local authority type.
+
+Once that generic boundary exists, external implementations consume opaque
+authorized requests and use the SDK codec to persist and compare operation
+stamps; they do not reconstruct authority from public fields. Passing pure mock
+success tests is not conformance: a backend profile must execute its real
+mutation, exact readback, restart, process loss, caller cancellation, and
+conflicting-binding paths. This evidence qualifies the adapter for deliberate
+TCB selection; it does not transform a public trait implementation into a
+runtime-attested trust root. Implementing the semantic grouped reconcile
+methods alone is never qualification.
 
 ## 10. Authority Composition
 
@@ -1360,6 +1476,7 @@ record.
 | ABA, replay, or stale effect | SDK-minted affine capabilities bind exact set, namespace, generation, and nonce; permanent per-atom history, group/set tombstones, and non-wrapping generations reject reuse. |
 | Cross-device, cross-pin, or cross-group use | The authenticated protected record and immutable control marker bind the exact tuple; backend validates before mutation. |
 | Partial selector claim/removal | Canonical whole-group transaction and exact whole-group readback; mixed provenance is unsupported. |
+| Ordinary caller or non-selected mock forges evidence | Opaque affine requests and private receipt coordinates are not independently constructible; the SDK validates the exact request kind, binding, complete set, phase generations/nonces, durable selector-backend epoch, receipt class, and closed coordinator outcome. Structural or semantic equality alone cannot supply the missing request. A backend deliberately passed to the production lifecycle is selected into the TCB and is not in this attacker class. |
 | ACK loss, cancellation, or process death | Durable progress states, operation nonce, exact recovery outcomes, bounded supervision, and poison on ambiguity. |
 | Map/program loss or ordinary cleanup | Immutable persistent control marker plus durable ledger; absence does not prove historical absence. |
 | Control-marker tampering | Trusted descriptor traversal, no-follow/no-replace, owner/mode/link/inode checks, exact enumeration/digest binding, directory sync, and host-global lock. |
@@ -1368,6 +1485,15 @@ record.
 | Decommission followed by re-adoption | Runtime locates history by stable device rather than inferring virgin state from absence; the precommitted `Decommissioning -> Decommissioned` record transition and append-only authenticated terminal capsule bind the exact predecessor and coordinates and are never deleted or reused. |
 | Secret or subscriber disclosure | Encrypt ledger material; redact every public surface; evidence is identity-free and uses only closed classifications/counts. |
 | Capacity or operation DoS | Pre-effect finite capacities, bounded canonicalization/readback/retries/tasks, and fail-closed exhaustion. Products own admission quotas. |
+| Malicious selected adapter | The selected adapter is in the TCB. Product selection, implementation review, deployment control, and §14.11 qualification evidence are required; SDK types cannot cryptographically prove that malicious in-process adapter code performed a real effect. |
+
+The backend-related mitigations in this table assume the selected adapter honors
+its contract. The public capability surface prevents an ordinary caller or a
+non-selected mock from independently cross-binding or replaying a receipt, but
+it does not provide remote or in-process cryptographic attestation of the
+adapter's real kernel/backend action. In particular, an exact stamp or
+structurally valid readback reported by a malicious selected adapter is not
+independently verifiable under this RFC.
 
 A coherent copy made before any selector effect initially has the same binding
 and stamp inventory as its source. It does not become a second writer: both
@@ -1406,8 +1532,9 @@ classification, and closed outcomes. Evidence packs MUST be identity-free:
 they contain no selectors, subscriber addresses, ledger/control IDs, secrets,
 keys, commitments, operation nonces, raw path, or raw trace. A redaction
 validator must reject a pack containing any of them. Evidence proves the
-specified mechanism test ran; it does not prove traffic forwarding or product
-readiness.
+specified mechanism test ran and may qualify a trusted adapter profile; it does
+not cryptographically attest a production adapter effect, prove traffic
+forwarding, or prove product readiness.
 
 ## 14. Conformance and Acceptance Criteria
 
@@ -1474,14 +1601,26 @@ passes before the implementing surface exists is not evidence of this RFC.
 10. Redaction tests inspect `Debug`, logs, metrics, status, errors, and RFC 006
     evidence and prove they contain only bounded classifications/counts, with
     no selector, subscriber, ledger, commitment, nonce, secret, or key data.
-11. Third-party backend conformance runs the published SDK harness against a
-    real backend profile through the public unsealed port and SDK verifier,
-    without access to a raw authority constructor. It exercises independently
+11. The built-in eBPF profile exercises real mutation and exact full readback,
+    lost/wrong/duplicate acknowledgement, restart, backend replacement, stale
+    durable selector-backend epoch, cross-namespace rejection, independently
     durable terminal-fence absence inspection, exact capsule creation/readback,
-    idempotent join, conflicting capsule, protected-store rollback, restart,
-    and mutable-graph cleanup through the public opaque operations. The default
-    backend remains unsupported; semantic grouped reconcile, an immutable
-    bootstrap marker alone, or mock success cannot opt in.
+    idempotent join, conflicting capsule, protected-store rollback, and mutable-
+    graph cleanup through the opaque operations. Public-API tests prove an
+    ordinary caller cannot construct, clone, replay, or cross-bind requests,
+    coordinates, evidence, or receipts without becoming the selected backend.
+    Test-only authority values never enter production constructors. A product
+    which passes a fake backend has selected it into the TCB; runtime detection
+    of that compromise is not an acceptance claim.
+
+    Before any third-party production profile is advertised, a separate SDK
+    change MUST publish the bounded generic stamp/capsule codec and real-backend
+    harness missing from the current public port. That harness must run this
+    same matrix through the unsealed trait without a raw authority constructor,
+    and mutation tests must prove stale, wrong, duplicate, and cross-namespace
+    stamp/readback coordinates fail. Qualification is evidence for deliberately
+    selecting the adapter into the TCB, not runtime cryptographic attestation.
+    Until that change lands, all external profiles remain unsupported.
 12. Upgrade tests prove live legacy maps are never silently adopted, ordinary
     startup rejects an absent reserved record, only an exact pre-provisioned
     record may initialize, and cleanup-only migration is explicit. Decommission
@@ -1578,6 +1717,18 @@ Openraft `client_write` state-machine mechanisms.
 Rejected because both convert unprovable historical state into a false fresh
 claim and reintroduce ABA after ordinary operations.
 
+### 15.7 Runtime Attestation from an Unsealed Trait
+
+Rejected because a verifier lease, receipt codec, opaque stamp, or structural
+readback exposed to the selected `GtpuDataplaneBackend` implementation cannot
+cryptographically establish that its in-process code performed a real kernel
+effect. Moving the same inputs behind another public verifier only relocates
+the forgery point. A real attestation design would require a separate concrete
+trust root and credential lifecycle, including provisioning, rotation,
+revocation, incarnation/request/stamp binding, and replay handling. This RFC
+instead makes the selected adapter part of the TCB and treats third-party
+conformance as qualification evidence.
+
 ## 16. Rollout and Versioning
 
 The public capability and durable record use explicit `v1` domain separators
@@ -1588,6 +1739,17 @@ versioned representation and a migration that preserves all tombstones;
 in-place reinterpretation is prohibited.
 
 The new capability ports are additive and existing backends report unsupported.
+Implementing the public trait or passing structural/mock tests does not change
+that default. The built-in eBPF adapter is the initial selected profile and
+retains its requirement for real mutation, exact stamp validation, and exact
+readback. External production profiles remain unsupported until the generic
+codec and conformance boundary in §9 and §14.11 is implemented. If a product
+nonetheless passes another implementation to the public lifecycle, it has
+accepted that implementation into its TCB; the SDK does not reinterpret that
+choice as conformance. No compatibility path treats an arbitrary external
+adapter, test harness, or request coordinate as a runtime cryptographic trust
+root.
+
 Closing the forgeable-publication defect is deliberately source breaking:
 public `Fresh` and raw grouped-request construction are removed for every
 namespace, so an unbound namespace cannot continue caller-asserted fresh

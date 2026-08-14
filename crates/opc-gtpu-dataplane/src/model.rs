@@ -764,8 +764,8 @@ pub enum GtpuSessionModelError {
     AttachmentMismatch,
     /// An entry's local outer address is not in the managed endpoint set.
     LocalEndpointNotManaged,
-    /// Selector-reuse evidence names the wrong device, group, or graph.
-    ReuseProofMismatch,
+    /// An opaque SDK selector admission names another device, group, or graph.
+    SelectorAdmissionMismatch,
 }
 
 impl fmt::Display for GtpuSessionModelError {
@@ -787,7 +787,7 @@ impl fmt::Display for GtpuSessionModelError {
             Self::DeviceIdentityMismatch => "grouped GTP-U device identity differs",
             Self::AttachmentMismatch => "grouped GTP-U attachment differs",
             Self::LocalEndpointNotManaged => "grouped GTP-U local endpoint is not managed",
-            Self::ReuseProofMismatch => "grouped GTP-U selector reuse proof differs",
+            Self::SelectorAdmissionMismatch => "grouped GTP-U selector admission differs",
         })
     }
 }
@@ -1441,18 +1441,24 @@ pub struct GtpuSessionSelectorReuseProof {
 }
 
 impl GtpuSessionSelectorReuseProof {
-    /// Attest that traffic for the exact retired group was fully drained.
+    /// Mint trusted traffic-drain evidence inside the SDK/backend boundary.
+    ///
+    /// A public constructor would let a caller assert a drain it did not
+    /// observe. Production issuance is therefore intentionally restricted to
+    /// the selector authority and its backend adapters.
     #[must_use]
-    pub const fn after_traffic_drain(retired_group: GtpuSessionGroup) -> Self {
+    #[allow(dead_code)] // Issued by backend-specific trusted evidence paths.
+    pub(crate) const fn after_traffic_drain(retired_group: GtpuSessionGroup) -> Self {
         Self {
             retired_group,
             evidence: GtpuSessionSelectorReuseEvidence::TrafficDrained,
         }
     }
 
-    /// Attest that an RCU grace period completed after exact group removal.
+    /// Mint trusted RCU-grace evidence inside the SDK/backend boundary.
     #[must_use]
-    pub const fn after_rcu_grace_period(retired_group: GtpuSessionGroup) -> Self {
+    #[allow(dead_code)] // Issued by backend-specific trusted evidence paths.
+    pub(crate) const fn after_rcu_grace_period(retired_group: GtpuSessionGroup) -> Self {
         Self {
             retired_group,
             evidence: GtpuSessionSelectorReuseEvidence::RcuGracePeriodElapsed,
@@ -1485,55 +1491,78 @@ impl fmt::Debug for GtpuSessionSelectorReuseProof {
     }
 }
 
-/// Provenance of selectors newly introduced by one reconciliation.
+/// Read-only classification for an explicit retired-selector reissue.
+///
+/// Fresh admission is deliberately absent from this public type: only the
+/// selector namespace authority can issue it.  `Reused` remains available to
+/// backend implementors so they can retain the exact retired-source and
+/// drain/grace validation at their dataplane boundary.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GtpuSessionSelectorProvenance {
-    /// The caller's durable registry proves every selector not already owned
-    /// by this same active group has never been published in the stable pin
-    /// namespace.
-    Fresh,
     /// Reuse after exact removal and explicit drain/grace evidence.
-    ///
-    /// The proof's one retired graph must cover every desired selector not
-    /// retained from the active base generation.
     Reused(GtpuSessionSelectorReuseProof),
 }
 
 /// Complete request for grouped-session convergence.
 ///
-/// Selector provenance is mandatory because the bounded dataplane journal
-/// does not retain permanent selector tombstones. A backend rejects reused or
-/// historically indeterminate selectors as
-/// [`GtpuSessionGroupIndeterminateReason::GraceUnproven`] unless the request
-/// carries exact source-bound completion evidence.
-#[derive(Clone, PartialEq, Eq)]
+/// An opaque SDK-issued selector admission is mandatory because the bounded
+/// dataplane journal does not retain permanent selector tombstones.  The
+/// admission is affine: constructing this request consumes it, binding this
+/// operation to one stable device namespace, exact group, selector set, and
+/// SDK-minted generation.
 pub struct GtpuSessionGroupReconcileRequest {
     desired: GtpuSessionGroup,
-    selector_provenance: GtpuSessionSelectorProvenance,
+    selector_admission: crate::GtpuSessionSelectorAdmission,
+    selector_provenance: Option<GtpuSessionSelectorProvenance>,
 }
 
 impl GtpuSessionGroupReconcileRequest {
-    /// Construct a request with an explicit selector-history claim.
+    /// Construct a request with an SDK-issued selector namespace admission.
     ///
     /// # Errors
     ///
-    /// Reuse proof for the same group or another device is rejected before a
-    /// backend can inspect or mutate dataplane state.
-    pub fn new(
+    /// An admission bound to another device, group, or complete selector set
+    /// is rejected before a backend can inspect or mutate dataplane state.
+    pub(crate) fn new(
         desired: GtpuSessionGroup,
-        selector_provenance: GtpuSessionSelectorProvenance,
+        selector_admission: crate::GtpuSessionSelectorAdmission,
     ) -> Result<Self, GtpuSessionModelError> {
-        if let GtpuSessionSelectorProvenance::Reused(proof) = &selector_provenance {
-            if proof.retired_group.device_id != desired.device_id
-                || proof.retired_group.id == desired.id
-            {
-                return Err(GtpuSessionModelError::ReuseProofMismatch);
-            }
+        if !selector_admission.validates(&desired)
+            || !selector_admission.authorizes_install_effect()
+            || selector_admission.is_retired_reissue()
+        {
+            return Err(GtpuSessionModelError::SelectorAdmissionMismatch);
         }
         Ok(Self {
             desired,
-            selector_provenance,
+            selector_admission,
+            selector_provenance: None,
+        })
+    }
+
+    /// Construct an explicitly retired-selector reissue request.
+    ///
+    /// The opaque admission must have been issued by the authority's distinct
+    /// retired-reissue path.  Backends must continue to prove that the exact
+    /// old source is absent and that the stated drain/grace condition holds.
+    pub(crate) fn new_reused(
+        desired: GtpuSessionGroup,
+        selector_admission: crate::GtpuSessionSelectorAdmission,
+        reuse: GtpuSessionSelectorReuseProof,
+    ) -> Result<Self, GtpuSessionModelError> {
+        if !selector_admission.validates(&desired)
+            || !selector_admission.authorizes_install_effect()
+            || !selector_admission.is_retired_reissue()
+            || reuse.retired_group.device_id != desired.device_id
+            || reuse.retired_group.id == desired.id
+        {
+            return Err(GtpuSessionModelError::SelectorAdmissionMismatch);
+        }
+        Ok(Self {
+            desired,
+            selector_admission,
+            selector_provenance: Some(GtpuSessionSelectorProvenance::Reused(reuse)),
         })
     }
 
@@ -1543,16 +1572,37 @@ impl GtpuSessionGroupReconcileRequest {
         &self.desired
     }
 
-    /// Explicit freshness or reuse evidence for introduced selectors.
+    /// Return the opaque immutable backend binding carried by this SDK-issued
+    /// effect request. This exposes no selector material or admission secret.
     #[must_use]
-    pub const fn selector_provenance(&self) -> &GtpuSessionSelectorProvenance {
-        &self.selector_provenance
+    pub const fn selector_backend_binding(&self) -> crate::GtpuSessionSelectorBackendBinding {
+        self.selector_admission.binding()
     }
 
-    /// Consume the request without discarding mandatory selector provenance.
+    pub(crate) const fn selector_admission(&self) -> &crate::GtpuSessionSelectorAdmission {
+        &self.selector_admission
+    }
+
+    /// Explicit retired-selector evidence, if this is a reissue request.
     #[must_use]
-    pub fn into_parts(self) -> (GtpuSessionGroup, GtpuSessionSelectorProvenance) {
-        (self.desired, self.selector_provenance)
+    pub const fn selector_provenance(&self) -> Option<&GtpuSessionSelectorProvenance> {
+        self.selector_provenance.as_ref()
+    }
+
+    /// Consume the request without discarding mandatory selector admission.
+    #[must_use]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        GtpuSessionGroup,
+        crate::GtpuSessionSelectorAdmission,
+        Option<GtpuSessionSelectorProvenance>,
+    ) {
+        (
+            self.desired,
+            self.selector_admission,
+            self.selector_provenance,
+        )
     }
 }
 
@@ -1564,6 +1614,7 @@ impl fmt::Debug for GtpuSessionGroupReconcileRequest {
                 &GtpuSessionGroupSelector::new(self.desired.id, self.desired.device_id),
             )
             .field("semantic_graph", &"<redacted>")
+            .field("selector_admission", &self.selector_admission)
             .field("selector_provenance", &self.selector_provenance)
             .finish()
     }
@@ -3658,53 +3709,18 @@ mod tests {
             group.entries().to_vec(),
         )
         .unwrap();
-        let reuse_proof = GtpuSessionSelectorReuseProof::after_rcu_grace_period(group.clone());
-        let reconcile = GtpuSessionGroupReconcileRequest::new(
-            desired.clone(),
-            GtpuSessionSelectorProvenance::Reused(reuse_proof),
-        )
-        .unwrap();
+        let namespace = crate::selector_namespace::TestGtpuSessionSelectorNamespaceAuthority::new(
+            crate::InMemoryGtpuSessionSelectorNamespaceStore::default(),
+            [0x53; 32],
+            32,
+        );
+        let admission = namespace.claim(&desired, None).unwrap();
+        let reconcile = GtpuSessionGroupReconcileRequest::new(desired.clone(), admission).unwrap();
         assert_eq!(reconcile.desired(), &desired);
         assert!(matches!(
-            reconcile.selector_provenance(),
-            GtpuSessionSelectorProvenance::Reused(proof)
-                if proof.retired_group() == &group
-                    && proof.evidence()
-                        == GtpuSessionSelectorReuseEvidence::RcuGracePeriodElapsed
+            namespace.claim(&desired, None),
+            Err(crate::GtpuSessionSelectorNamespaceError::GroupClaimed)
         ));
-        let (round_trip_desired, round_trip_provenance) = reconcile.clone().into_parts();
-        assert_eq!(round_trip_desired, desired);
-        assert_eq!(
-            round_trip_provenance,
-            reconcile.selector_provenance().clone()
-        );
-        let parts_debug = format!("{round_trip_desired:?} {round_trip_provenance:?}");
-        for secret in ["10.23.0.2", "2001:db8", "gtp0", "ifindex", "[1, 1"] {
-            assert!(!parts_debug.contains(secret));
-        }
-        let same_group_proof = GtpuSessionSelectorReuseProof::after_traffic_drain(desired.clone());
-        assert_eq!(
-            GtpuSessionGroupReconcileRequest::new(
-                desired.clone(),
-                GtpuSessionSelectorProvenance::Reused(same_group_proof),
-            ),
-            Err(GtpuSessionModelError::ReuseProofMismatch)
-        );
-        let other_device_source = GtpuSessionGroup::new(
-            GtpuSessionGroupId::new([4; 16]).unwrap(),
-            GtpuSessionDeviceId::new([9; 16]).unwrap(),
-            group.entries().to_vec(),
-        )
-        .unwrap();
-        assert_eq!(
-            GtpuSessionGroupReconcileRequest::new(
-                desired,
-                GtpuSessionSelectorProvenance::Reused(
-                    GtpuSessionSelectorReuseProof::after_traffic_drain(other_device_source,),
-                ),
-            ),
-            Err(GtpuSessionModelError::ReuseProofMismatch)
-        );
         let debug = format!("{reconcile:?}");
         for secret in ["10.23.0.2", "2001:db8", "gtp0", "ifindex", "[1, 1"] {
             assert!(!debug.contains(secret));

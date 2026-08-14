@@ -69,7 +69,8 @@ pub use session::{
     GtpuSessionTransactionRecord, GtpuSessionUplinkKey, GTPU_SESSION_CONFIG_VALUE_LEN,
     GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_ENTRY_LEN, GTPU_SESSION_GROUP_ID_LEN,
     GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_IPV4_SLOT,
-    GTPU_SESSION_IPV6_SLOT, GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
+    GTPU_SESSION_IPV6_SLOT, GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN,
+    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
 };
 pub use tft_classifier::*;
 pub use trusted_traffic_observation_abi::{
@@ -326,6 +327,9 @@ pub const MAP_SESSION_UPLINK_INDEX: &str = "GTPU_UL_INDEX";
 pub const MAP_SESSION_DOWNLINK_INDEX: &str = "GTPU_DL_INDEX";
 /// BPF map name: durable userspace-only grouped-session transaction journal.
 pub const MAP_SESSION_TRANSACTIONS: &str = "GTPU_SESS_TXN";
+/// BPF map name: durable userspace-only selector-authority operation stamps.
+/// tc programs never read this map.
+pub const MAP_SESSION_SELECTOR_STAMPS: &str = "GTPU_SEL_STAMP";
 /// BPF map name: managed IPv6 local-endpoint/device configuration.
 pub const MAP_CONFIG_IPV6: &str = "GTPU_CONFIG6";
 /// BPF map name: independent grouped-session schema marker.
@@ -2409,6 +2413,7 @@ mod tests {
             MAP_SESSION_UPLINK_INDEX,
             MAP_SESSION_DOWNLINK_INDEX,
             MAP_SESSION_TRANSACTIONS,
+            MAP_SESSION_SELECTOR_STAMPS,
             MAP_CONFIG_IPV6,
             MAP_SESSION_SCHEMA,
             MAP_TFT_CLASSIFIER_SCHEMA,
@@ -2439,6 +2444,7 @@ mod tests {
             MAP_SESSION_UPLINK_INDEX,
             MAP_SESSION_DOWNLINK_INDEX,
             MAP_SESSION_TRANSACTIONS,
+            MAP_SESSION_SELECTOR_STAMPS,
             MAP_CONFIG_IPV6,
             MAP_SESSION_SCHEMA,
             MAP_TFT_CLASSIFIER_SCHEMA,
