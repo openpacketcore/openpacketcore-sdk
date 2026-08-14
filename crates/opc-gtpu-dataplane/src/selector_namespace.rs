@@ -56,6 +56,7 @@ const PRE_DECOMMISSION_BOUND_DOMAIN: &[u8] = b"opc/gtpu-selector/pre-decommissio
 const DECOMMISSION_AEAD_KEY_DOMAIN: &[u8] = b"opc/gtpu-selector/decommission/aead-key/v1\0";
 const DECOMMISSION_NONCE_KEY_DOMAIN: &[u8] = b"opc/gtpu-selector/decommission/nonce-key/v1\0";
 const DECOMMISSION_AAD_DOMAIN: &[u8] = b"opc/gtpu-selector/decommission/aad/v1\0";
+const BACKEND_RECEIPT_DOMAIN: &[u8] = b"opc/gtpu-selector/backend-receipt/v1\0";
 pub(crate) const DECOMMISSION_CAPSULE_LEN: usize = 110;
 const DECOMMISSION_COORDINATE_LEN: usize = 81;
 const SELECTOR_LEDGER_KEY_TYPE: &str = "gtpu-selector-ledger-v1";
@@ -528,6 +529,110 @@ pub struct GtpuSessionSelectorReuseAuthorization {
     proof: crate::GtpuSessionSelectorReuseProof,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum SelectorBackendRequestKind {
+    Binding = 1,
+    Provision = 2,
+    Effect = 3,
+    Readback = 4,
+    Removal = 5,
+    DecommissionInspect = 6,
+    DecommissionCreate = 7,
+    DecommissionReadback = 8,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SelectorBackendReceiptCoordinate([u8; 32]);
+
+impl SelectorBackendReceiptCoordinate {
+    fn for_binding(
+        kind: SelectorBackendRequestKind,
+        binding: GtpuSessionSelectorBackendBinding,
+    ) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(BACKEND_RECEIPT_DOMAIN);
+        digest.update([kind as u8]);
+        update_receipt_binding(&mut digest, binding);
+        Self(digest.finalize().into())
+    }
+
+    fn for_admission(
+        kind: SelectorBackendRequestKind,
+        admission: &GtpuSessionSelectorAdmission,
+    ) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(BACKEND_RECEIPT_DOMAIN);
+        digest.update([kind as u8]);
+        update_receipt_binding(&mut digest, admission.binding());
+        digest.update(admission.device_fingerprint);
+        digest.update(admission.group_fingerprint);
+        digest.update(admission.selector_set_fingerprint);
+        digest.update(admission.desired_fingerprint);
+        digest.update(admission.generation.get().to_be_bytes());
+        digest.update(admission.operation_nonce);
+        digest.update(admission.terminal_generation.get().to_be_bytes());
+        digest.update(admission.terminal_operation_nonce);
+        match admission.previous_terminal {
+            Some(previous) => {
+                digest.update([1]);
+                digest.update(previous.generation.get().to_be_bytes());
+                digest.update(previous.nonce);
+            }
+            None => digest.update([0; 25]),
+        }
+        digest.update([
+            match admission.phase {
+                SelectorAdmissionPhase::Installing => 1,
+                SelectorAdmissionPhase::Active => 2,
+                SelectorAdmissionPhase::Retiring => 3,
+                SelectorAdmissionPhase::Retired => 4,
+            },
+            u8::from(admission.retired_reissue),
+        ]);
+        match admission.retired_dataplane_generation {
+            Some(generation) => {
+                digest.update([1]);
+                digest.update(generation.get().to_be_bytes());
+            }
+            None => digest.update([0; 9]),
+        }
+        Self(digest.finalize().into())
+    }
+
+    fn for_decommission(
+        kind: SelectorBackendRequestKind,
+        binding: GtpuSessionSelectorBackendBinding,
+        fence: Option<DecommissionFence>,
+    ) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(BACKEND_RECEIPT_DOMAIN);
+        digest.update([kind as u8]);
+        update_receipt_binding(&mut digest, binding);
+        match fence {
+            Some(fence) => {
+                digest.update([1]);
+                digest.update(fence.marker_payload());
+            }
+            None => digest.update([0; DECOMMISSION_CAPSULE_LEN + 1]),
+        }
+        Self(digest.finalize().into())
+    }
+
+    fn matches(self, candidate: Self) -> bool {
+        bool::from(self.0.ct_eq(&candidate.0))
+    }
+}
+
+fn update_receipt_binding(digest: &mut Sha256, binding: GtpuSessionSelectorBackendBinding) {
+    digest.update(binding.stable_device().to_bytes());
+    digest.update(binding.pin_commitment());
+    digest.update(binding.ledger_id());
+    digest.update(binding.backend_epoch());
+    digest.update(binding.storage_scope_commitment());
+    digest.update(binding.selector_key_commitment());
+}
+
 /// An opaque lease over one immutable selector namespace binding. It can be
 /// consumed only by a backend to confirm the exact binding it acquired.
 #[must_use = "a selector binding lease must be consumed by a backend receipt"]
@@ -542,9 +647,17 @@ impl GtpuSessionSelectorBindingLease {
         self.binding
     }
 
+    fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
+        SelectorBackendReceiptCoordinate::for_binding(
+            SelectorBackendRequestKind::Binding,
+            self.binding,
+        )
+    }
+
     /// Mint a receipt only after the backend has acquired the exact binding.
     pub fn confirm(self) -> GtpuSessionSelectorBackendReceipt {
-        GtpuSessionSelectorBackendReceipt::binding_confirmed()
+        let coordinate = self.receipt_coordinate();
+        GtpuSessionSelectorBackendReceipt::binding_confirmed(coordinate)
     }
 }
 
@@ -561,10 +674,18 @@ impl GtpuSessionSelectorProvisionRequest {
         self.binding
     }
 
+    fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
+        SelectorBackendReceiptCoordinate::for_binding(
+            SelectorBackendRequestKind::Provision,
+            self.binding,
+        )
+    }
+
     /// Mint a receipt only after complete empty-inventory proof, marker write,
     /// and exact marker readback under the backend's exclusive effect lease.
     pub fn confirm(self) -> GtpuSessionSelectorBackendReceipt {
-        GtpuSessionSelectorBackendReceipt::provisioned()
+        let coordinate = self.receipt_coordinate();
+        GtpuSessionSelectorBackendReceipt::provisioned(coordinate)
     }
 }
 
@@ -589,16 +710,30 @@ impl GtpuSessionSelectorEffectRequest {
         self.request.selector_backend_binding()
     }
 
+    fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
+        SelectorBackendReceiptCoordinate::for_admission(
+            SelectorBackendRequestKind::Effect,
+            self.request.selector_admission(),
+        )
+    }
+
     /// Consume the exact request into the corresponding classified receipt.
     pub fn complete(
         self,
         outcome: GtpuSessionGroupReconcileOutcome,
     ) -> GtpuSessionSelectorBackendReceipt {
-        GtpuSessionSelectorBackendReceipt::effect(outcome)
+        let coordinate = self.receipt_coordinate();
+        GtpuSessionSelectorBackendReceipt::effect(coordinate, outcome)
     }
 
-    pub(crate) fn into_inner(self) -> GtpuSessionGroupReconcileRequest {
-        self.request
+    pub(crate) fn into_inner(
+        self,
+    ) -> (
+        GtpuSessionGroupReconcileRequest,
+        SelectorBackendReceiptCoordinate,
+    ) {
+        let coordinate = self.receipt_coordinate();
+        (self.request, coordinate)
     }
 }
 
@@ -626,12 +761,20 @@ impl GtpuSessionSelectorReadbackRequest {
         &self.admission
     }
 
+    fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
+        SelectorBackendReceiptCoordinate::for_admission(
+            SelectorBackendRequestKind::Readback,
+            &self.admission,
+        )
+    }
+
     /// Consume the request into the backend's exact classified readback.
     pub fn complete(
         self,
         readback: crate::GtpuSessionGroupReadback,
     ) -> GtpuSessionSelectorBackendReceipt {
-        GtpuSessionSelectorBackendReceipt::readback(readback)
+        let coordinate = self.receipt_coordinate();
+        GtpuSessionSelectorBackendReceipt::readback(coordinate, readback)
     }
 
     /// Complete an exact terminal-retired absence readback with the full
@@ -646,8 +789,11 @@ impl GtpuSessionSelectorReadbackRequest {
         if !matches!(readback, crate::GtpuSessionGroupReadback::Absent) {
             return None;
         }
+        let coordinate = self.receipt_coordinate();
         terminal_retired_stamp_generation(&self.admission, stamp).map(|generation| {
-            GtpuSessionSelectorBackendReceipt::readback_terminal_retired(readback, generation)
+            GtpuSessionSelectorBackendReceipt::readback_terminal_retired(
+                coordinate, readback, generation,
+            )
         })
     }
 }
@@ -676,12 +822,20 @@ impl GtpuSessionSelectorRemovalRequest {
         &self.admission
     }
 
+    fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
+        SelectorBackendReceiptCoordinate::for_admission(
+            SelectorBackendRequestKind::Removal,
+            &self.admission,
+        )
+    }
+
     /// Consume the request into the backend's classified removal receipt.
     pub fn complete(
         self,
         outcome: GtpuSessionGroupRemovalOutcome,
     ) -> GtpuSessionSelectorBackendReceipt {
-        GtpuSessionSelectorBackendReceipt::removal(outcome)
+        let coordinate = self.receipt_coordinate();
+        GtpuSessionSelectorBackendReceipt::removal(coordinate, outcome)
     }
 
     /// Complete removal only after an authorized backend has written and
@@ -699,8 +853,11 @@ impl GtpuSessionSelectorRemovalRequest {
         ) {
             return None;
         }
+        let coordinate = self.receipt_coordinate();
         terminal_retired_stamp_generation(&self.admission, stamp).map(|generation| {
-            GtpuSessionSelectorBackendReceipt::removal_terminal_retired(outcome, generation)
+            GtpuSessionSelectorBackendReceipt::removal_terminal_retired(
+                coordinate, outcome, generation,
+            )
         })
     }
 }
@@ -731,15 +888,25 @@ impl GtpuSessionSelectorDecommissionInspectRequest {
         self.expected_fence.map(DecommissionFence::marker_payload)
     }
 
+    fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
+        SelectorBackendReceiptCoordinate::for_decommission(
+            SelectorBackendRequestKind::DecommissionInspect,
+            self.binding,
+            self.expected_fence,
+        )
+    }
+
     /// Consume this request after proving no terminal capsule exists.
     pub fn confirm_absent(self) -> GtpuSessionSelectorBackendReceipt {
-        GtpuSessionSelectorBackendReceipt::decommission_fence_absent()
+        let coordinate = self.receipt_coordinate();
+        GtpuSessionSelectorBackendReceipt::decommission_fence_absent(coordinate)
     }
 
     /// Consume this request after proving the persisted terminal capsule is
     /// byte-for-byte exact.
     pub fn confirm_exact(self) -> GtpuSessionSelectorBackendReceipt {
-        GtpuSessionSelectorBackendReceipt::decommission_fence_exact()
+        let coordinate = self.receipt_coordinate();
+        GtpuSessionSelectorBackendReceipt::decommission_fence_exact(coordinate)
     }
 }
 
@@ -788,10 +955,19 @@ impl GtpuSessionSelectorDecommissionRequest {
         bool::from(self.terminal_marker_payload().ct_eq(payload))
     }
 
+    fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
+        SelectorBackendReceiptCoordinate::for_decommission(
+            SelectorBackendRequestKind::DecommissionCreate,
+            self.binding,
+            Some(self.fence),
+        )
+    }
+
     /// Consume the request only after an exact terminal capsule containing the
     /// committed coordinate has been durably created and read back.
     pub fn confirm(self) -> GtpuSessionSelectorBackendReceipt {
-        GtpuSessionSelectorBackendReceipt::decommission_fence_exact()
+        let coordinate = self.receipt_coordinate();
+        GtpuSessionSelectorBackendReceipt::decommission_fence_exact(coordinate)
     }
 }
 
@@ -828,21 +1004,33 @@ impl GtpuSessionSelectorDecommissionReadbackRequest {
         bool::from(self.terminal_marker_payload().ct_eq(payload))
     }
 
+    fn receipt_coordinate(&self) -> SelectorBackendReceiptCoordinate {
+        SelectorBackendReceiptCoordinate::for_decommission(
+            SelectorBackendRequestKind::DecommissionReadback,
+            self.binding,
+            Some(self.fence),
+        )
+    }
+
     /// Consume the request after an exact durable capsule readback.
     pub fn confirm_exact(self) -> GtpuSessionSelectorBackendReceipt {
-        GtpuSessionSelectorBackendReceipt::decommission_fence_exact()
+        let coordinate = self.receipt_coordinate();
+        GtpuSessionSelectorBackendReceipt::decommission_fence_exact(coordinate)
     }
 }
 
 /// SDK-minted result of consuming one opaque selector backend request.
 ///
 /// The classification is private: only consuming the matching affine request
-/// (or an in-crate backend adapter that owns it) can mint a receipt. This
-/// prevents a third-party backend from fabricating an `Activated`, `Absent`,
-/// or binding confirmation without first receiving authority for that exact
-/// operation.
+/// can mint a receipt, and the SDK accepts it only at that request's exact
+/// private coordinate. This rejects stale, replayed, cross-request, and
+/// cross-namespace receipts from ordinary callers. The deliberately selected
+/// backend adapter is trusted to perform the asserted real effect and exact
+/// readback; this coordinate is not cryptographic attestation against malicious
+/// code inside that trusted adapter.
 #[must_use = "selector backend receipts must be verified by the SDK authority"]
 pub struct GtpuSessionSelectorBackendReceipt {
+    coordinate: SelectorBackendReceiptCoordinate,
     kind: SelectorBackendReceiptKind,
 }
 
@@ -863,38 +1051,50 @@ enum SelectorBackendReceiptKind {
 }
 
 impl GtpuSessionSelectorBackendReceipt {
-    pub(crate) const fn binding_confirmed() -> Self {
+    const fn binding_confirmed(coordinate: SelectorBackendReceiptCoordinate) -> Self {
         Self {
+            coordinate,
             kind: SelectorBackendReceiptKind::BindingConfirmed,
         }
     }
 
-    pub(crate) const fn provisioned() -> Self {
+    const fn provisioned(coordinate: SelectorBackendReceiptCoordinate) -> Self {
         Self {
+            coordinate,
             kind: SelectorBackendReceiptKind::Provisioned,
         }
     }
 
-    pub(crate) const fn decommission_fence_absent() -> Self {
+    const fn decommission_fence_absent(coordinate: SelectorBackendReceiptCoordinate) -> Self {
         Self {
+            coordinate,
             kind: SelectorBackendReceiptKind::DecommissionFenceAbsent,
         }
     }
 
-    pub(crate) const fn decommission_fence_exact() -> Self {
+    const fn decommission_fence_exact(coordinate: SelectorBackendReceiptCoordinate) -> Self {
         Self {
+            coordinate,
             kind: SelectorBackendReceiptKind::DecommissionFenceExact,
         }
     }
 
-    pub(crate) const fn effect(outcome: GtpuSessionGroupReconcileOutcome) -> Self {
+    pub(crate) const fn effect(
+        coordinate: SelectorBackendReceiptCoordinate,
+        outcome: GtpuSessionGroupReconcileOutcome,
+    ) -> Self {
         Self {
+            coordinate,
             kind: SelectorBackendReceiptKind::Effect(outcome),
         }
     }
 
-    pub(crate) const fn readback(readback: crate::GtpuSessionGroupReadback) -> Self {
+    const fn readback(
+        coordinate: SelectorBackendReceiptCoordinate,
+        readback: crate::GtpuSessionGroupReadback,
+    ) -> Self {
         Self {
+            coordinate,
             kind: SelectorBackendReceiptKind::Readback {
                 readback,
                 terminal_retired_dataplane_generation: None,
@@ -903,10 +1103,12 @@ impl GtpuSessionSelectorBackendReceipt {
     }
 
     const fn readback_terminal_retired(
+        coordinate: SelectorBackendReceiptCoordinate,
         readback: crate::GtpuSessionGroupReadback,
         terminal_retired_dataplane_generation: NonZeroU64,
     ) -> Self {
         Self {
+            coordinate,
             kind: SelectorBackendReceiptKind::Readback {
                 readback,
                 terminal_retired_dataplane_generation: Some(terminal_retired_dataplane_generation),
@@ -914,8 +1116,12 @@ impl GtpuSessionSelectorBackendReceipt {
         }
     }
 
-    pub(crate) const fn removal(outcome: GtpuSessionGroupRemovalOutcome) -> Self {
+    const fn removal(
+        coordinate: SelectorBackendReceiptCoordinate,
+        outcome: GtpuSessionGroupRemovalOutcome,
+    ) -> Self {
         Self {
+            coordinate,
             kind: SelectorBackendReceiptKind::Removal {
                 outcome,
                 terminal_retired_dataplane_generation: None,
@@ -924,10 +1130,12 @@ impl GtpuSessionSelectorBackendReceipt {
     }
 
     const fn removal_terminal_retired(
+        coordinate: SelectorBackendReceiptCoordinate,
         outcome: GtpuSessionGroupRemovalOutcome,
         terminal_retired_dataplane_generation: NonZeroU64,
     ) -> Self {
         Self {
+            coordinate,
             kind: SelectorBackendReceiptKind::Removal {
                 outcome,
                 terminal_retired_dataplane_generation: Some(terminal_retired_dataplane_generation),
@@ -935,36 +1143,58 @@ impl GtpuSessionSelectorBackendReceipt {
         }
     }
 
-    pub(crate) fn confirms_binding(&self) -> bool {
-        matches!(self.kind, SelectorBackendReceiptKind::BindingConfirmed)
+    fn confirms_binding(&self, expected: SelectorBackendReceiptCoordinate) -> bool {
+        self.coordinate.matches(expected)
+            && matches!(self.kind, SelectorBackendReceiptKind::BindingConfirmed)
     }
 
-    pub(crate) fn confirms_provisioning(&self) -> bool {
-        matches!(self.kind, SelectorBackendReceiptKind::Provisioned)
+    fn confirms_provisioning(&self, expected: SelectorBackendReceiptCoordinate) -> bool {
+        self.coordinate.matches(expected)
+            && matches!(self.kind, SelectorBackendReceiptKind::Provisioned)
     }
 
-    pub(crate) fn confirms_decommission_fence_absent(&self) -> bool {
-        matches!(
-            self.kind,
-            SelectorBackendReceiptKind::DecommissionFenceAbsent
-        )
+    fn confirms_decommission_fence_absent(
+        &self,
+        expected: SelectorBackendReceiptCoordinate,
+    ) -> bool {
+        self.coordinate.matches(expected)
+            && matches!(
+                self.kind,
+                SelectorBackendReceiptKind::DecommissionFenceAbsent
+            )
     }
 
-    pub(crate) fn confirms_decommission_fence_exact(&self) -> bool {
-        matches!(
-            self.kind,
-            SelectorBackendReceiptKind::DecommissionFenceExact
-        )
+    fn confirms_decommission_fence_exact(
+        &self,
+        expected: SelectorBackendReceiptCoordinate,
+    ) -> bool {
+        self.coordinate.matches(expected)
+            && matches!(
+                self.kind,
+                SelectorBackendReceiptKind::DecommissionFenceExact
+            )
     }
 
-    pub(crate) fn into_effect(self) -> Option<GtpuSessionGroupReconcileOutcome> {
+    fn into_effect(
+        self,
+        expected: SelectorBackendReceiptCoordinate,
+    ) -> Option<GtpuSessionGroupReconcileOutcome> {
+        if !self.coordinate.matches(expected) {
+            return None;
+        }
         match self.kind {
             SelectorBackendReceiptKind::Effect(outcome) => Some(outcome),
             _ => None,
         }
     }
 
-    fn into_readback(self) -> Option<AuthorizedSelectorReadback> {
+    fn into_readback(
+        self,
+        expected: SelectorBackendReceiptCoordinate,
+    ) -> Option<AuthorizedSelectorReadback> {
+        if !self.coordinate.matches(expected) {
+            return None;
+        }
         match self.kind {
             SelectorBackendReceiptKind::Readback {
                 readback,
@@ -977,7 +1207,13 @@ impl GtpuSessionSelectorBackendReceipt {
         }
     }
 
-    fn into_removal(self) -> Option<AuthorizedSelectorRemoval> {
+    fn into_removal(
+        self,
+        expected: SelectorBackendReceiptCoordinate,
+    ) -> Option<AuthorizedSelectorRemoval> {
+        if !self.coordinate.matches(expected) {
+            return None;
+        }
         match self.kind {
             SelectorBackendReceiptKind::Removal {
                 outcome,
@@ -3787,17 +4023,17 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
+        let request = GtpuSessionSelectorEffectRequest { request };
+        let expected_receipt = request.receipt_coordinate();
         let receipt = tokio::time::timeout(
             SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-            backend.reconcile_pdp_context_group_authorized(GtpuSessionSelectorEffectRequest {
-                request,
-            }),
+            backend.reconcile_pdp_context_group_authorized(request),
         )
         .await
         .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
         let outcome = receipt
             .ok()
-            .and_then(GtpuSessionSelectorBackendReceipt::into_effect)
+            .and_then(|receipt| receipt.into_effect(expected_receipt))
             .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?;
         if !matches!(
             outcome,
@@ -3845,18 +4081,20 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
+        let request = GtpuSessionSelectorReadbackRequest {
+            expected,
+            admission,
+        };
+        let expected_receipt = request.receipt_coordinate();
         let receipt = tokio::time::timeout(
             SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-            backend.read_pdp_context_group_with_lease(GtpuSessionSelectorReadbackRequest {
-                expected,
-                admission,
-            }),
+            backend.read_pdp_context_group_with_lease(request),
         )
         .await
         .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
         receipt
             .ok()
-            .and_then(GtpuSessionSelectorBackendReceipt::into_readback)
+            .and_then(|receipt| receipt.into_readback(expected_receipt))
             .ok_or(GtpuSessionSelectorCoordinatorError::Backend)
     }
 
@@ -3870,18 +4108,20 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
+        let request = GtpuSessionSelectorRemovalRequest {
+            expected: expected.clone(),
+            admission,
+        };
+        let expected_receipt = request.receipt_coordinate();
         let receipt = tokio::time::timeout(
             SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-            backend.remove_pdp_context_group_with_lease(GtpuSessionSelectorRemovalRequest {
-                expected: expected.clone(),
-                admission,
-            }),
+            backend.remove_pdp_context_group_with_lease(request),
         )
         .await
         .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
         let removal = receipt
             .ok()
-            .and_then(GtpuSessionSelectorBackendReceipt::into_removal)
+            .and_then(|receipt| receipt.into_removal(expected_receipt))
             .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?;
         if !matches!(
             removal.outcome,
@@ -4243,15 +4483,17 @@ where
     {
         let (_, state) = self.read_state().await?;
         let binding = self.bound_binding(&state)?;
+        let request = GtpuSessionSelectorBindingLease { binding };
+        let expected_receipt = request.receipt_coordinate();
         let receipt = tokio::time::timeout(
             SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-            backend.acquire_selector_namespace_lease(GtpuSessionSelectorBindingLease { binding }),
+            backend.acquire_selector_namespace_lease(request),
         )
         .await
         .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?
         .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
         receipt
-            .confirms_binding()
+            .confirms_binding(expected_receipt)
             .then_some(())
             .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)
     }
@@ -4313,16 +4555,16 @@ where
                         return Err(GtpuSessionSelectorNamespaceError::ConfigurationMismatch);
                     }
                     let binding = state.binding_with_scope(self.storage_scope_commitment)?;
+                    let request = GtpuSessionSelectorProvisionRequest { binding };
+                    let expected_receipt = request.receipt_coordinate();
                     let receipt = tokio::time::timeout(
                         SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-                        backend.provision_selector_namespace_authorized(
-                            GtpuSessionSelectorProvisionRequest { binding },
-                        ),
+                        backend.provision_selector_namespace_authorized(request),
                     )
                     .await
                     .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?
                     .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
-                    if !receipt.confirms_provisioning() {
+                    if !receipt.confirms_provisioning(expected_receipt) {
                         return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
                     }
                     state.lifecycle = NamespaceLifecycle::Bound;
@@ -4420,19 +4662,19 @@ where
 
         let fence = match (state.lifecycle, state.decommission_fence) {
             (NamespaceLifecycle::Bound, None) => {
+                let request = GtpuSessionSelectorDecommissionInspectRequest {
+                    binding,
+                    expected_fence: None,
+                };
+                let expected_receipt = request.receipt_coordinate();
                 let absence = tokio::time::timeout(
                     SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-                    backend.inspect_selector_namespace_decommission_fence(
-                        GtpuSessionSelectorDecommissionInspectRequest {
-                            binding,
-                            expected_fence: None,
-                        },
-                    ),
+                    backend.inspect_selector_namespace_decommission_fence(request),
                 )
                 .await
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
-                if !absence.confirms_decommission_fence_absent() {
+                if !absence.confirms_decommission_fence_absent(expected_receipt) {
                     return Err(GtpuSessionSelectorCoordinatorError::Backend);
                 }
                 let predecessor_plaintext = state.encode();
@@ -4455,45 +4697,45 @@ where
             _ => return Err(GtpuSessionSelectorCoordinatorError::Namespace),
         };
 
+        let request = GtpuSessionSelectorDecommissionInspectRequest {
+            binding,
+            expected_fence: Some(fence),
+        };
+        let expected_inspection = request.receipt_coordinate();
         let inspection = tokio::time::timeout(
             SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-            backend.inspect_selector_namespace_decommission_fence(
-                GtpuSessionSelectorDecommissionInspectRequest {
-                    binding,
-                    expected_fence: Some(fence),
-                },
-            ),
+            backend.inspect_selector_namespace_decommission_fence(request),
         )
         .await
         .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?
         .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
-        if inspection.confirms_decommission_fence_absent() {
+        if inspection.confirms_decommission_fence_absent(expected_inspection) {
+            let request = GtpuSessionSelectorDecommissionRequest { binding, fence };
+            let expected_created = request.receipt_coordinate();
             let created = tokio::time::timeout(
                 SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-                backend.create_selector_namespace_decommission_fence(
-                    GtpuSessionSelectorDecommissionRequest { binding, fence },
-                ),
+                backend.create_selector_namespace_decommission_fence(request),
             )
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
-            if !created.confirms_decommission_fence_exact() {
+            if !created.confirms_decommission_fence_exact(expected_created) {
                 return Err(GtpuSessionSelectorCoordinatorError::Backend);
             }
-        } else if !inspection.confirms_decommission_fence_exact() {
+        } else if !inspection.confirms_decommission_fence_exact(expected_inspection) {
             return Err(GtpuSessionSelectorCoordinatorError::Backend);
         }
 
+        let request = GtpuSessionSelectorDecommissionReadbackRequest { binding, fence };
+        let expected_readback = request.receipt_coordinate();
         let readback = tokio::time::timeout(
             SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-            backend.read_selector_namespace_decommission_fence(
-                GtpuSessionSelectorDecommissionReadbackRequest { binding, fence },
-            ),
+            backend.read_selector_namespace_decommission_fence(request),
         )
         .await
         .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?
         .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
-        if !readback.confirms_decommission_fence_exact() {
+        if !readback.confirms_decommission_fence_exact(expected_readback) {
             return Err(GtpuSessionSelectorCoordinatorError::Backend);
         }
 
@@ -4512,16 +4754,16 @@ where
         // after the final durable state readback. It is the terminal cleanup
         // fence: a concurrent stale worker cannot report completion unless
         // the one persisted capsule is still exact.
+        let request = GtpuSessionSelectorDecommissionReadbackRequest { binding, fence };
+        let expected_cleanup = request.receipt_coordinate();
         let cleanup = tokio::time::timeout(
             SELECTOR_NAMESPACE_MAX_EFFECT_DURATION,
-            backend.read_selector_namespace_decommission_fence(
-                GtpuSessionSelectorDecommissionReadbackRequest { binding, fence },
-            ),
+            backend.read_selector_namespace_decommission_fence(request),
         )
         .await
         .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?
         .map_err(|_| GtpuSessionSelectorCoordinatorError::Backend)?;
-        if !cleanup.confirms_decommission_fence_exact() {
+        if !cleanup.confirms_decommission_fence_exact(expected_cleanup) {
             return Err(GtpuSessionSelectorCoordinatorError::Backend);
         }
         Ok(DecommissionAttempt::Complete)
@@ -8139,6 +8381,221 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn backend_receipts_are_bound_to_the_exact_consumed_request() {
+        let first_namespace = InMemoryGtpuSessionSelectorNamespace::new([0x53; 32]);
+        let second_namespace = InMemoryGtpuSessionSelectorNamespace::new([0x54; 32]);
+        let first = group(1, 1, 0x1000_0001, None);
+        let second = group(2, 2, 0x1000_0002, None);
+        let first_admission = first_namespace.claim(&first, None).unwrap();
+        let second_admission = second_namespace.claim(&second, None).unwrap();
+        let first_binding = first_admission.binding();
+        let second_binding = second_admission.binding();
+        let installing = |admission: GtpuSessionSelectorAdmission, terminal_nonce: u8| {
+            let generation = admission.generation();
+            let operation_nonce = admission.operation_nonce();
+            admission
+                .with_coordinates(
+                    generation,
+                    operation_nonce,
+                    SelectorAuthorityCoordinate {
+                        generation: GtpuSessionSelectorAuthorityGeneration(
+                            NonZeroU64::new(generation.get() + 1).unwrap(),
+                        ),
+                        nonce: [terminal_nonce; 16],
+                    },
+                    None,
+                    SelectorAdmissionPhase::Installing,
+                )
+                .unwrap()
+        };
+        let first_admission = installing(first_admission, 0x61);
+        let second_admission = installing(second_admission, 0x62);
+
+        let first_request = GtpuSessionSelectorEffectRequest {
+            request: GtpuSessionGroupReconcileRequest::new(first, first_admission).unwrap(),
+        };
+        let expected = first_request.receipt_coordinate();
+        let second_request = GtpuSessionSelectorEffectRequest {
+            request: GtpuSessionGroupReconcileRequest::new(second, second_admission).unwrap(),
+        };
+        let swapped = second_request.complete(GtpuSessionGroupReconcileOutcome::Activated);
+        assert!(swapped.into_effect(expected).is_none());
+
+        let mut mutated = expected;
+        mutated.0[0] ^= 1;
+        let exact = first_request.complete(GtpuSessionGroupReconcileOutcome::Activated);
+        assert!(exact.into_effect(expected).is_some());
+        let mutated_receipt = GtpuSessionSelectorBackendReceipt::effect(
+            expected,
+            GtpuSessionGroupReconcileOutcome::Activated,
+        );
+        assert!(mutated_receipt.into_effect(mutated).is_none());
+
+        let first_lease = GtpuSessionSelectorBindingLease {
+            binding: first_binding,
+        };
+        let expected_binding = first_lease.receipt_coordinate();
+        let wrong_binding = GtpuSessionSelectorBindingLease {
+            binding: second_binding,
+        }
+        .confirm();
+        assert!(!wrong_binding.confirms_binding(expected_binding));
+        assert!(first_lease.confirm().confirms_binding(expected_binding));
+    }
+
+    #[test]
+    fn backend_receipt_coordinates_cover_every_request_class() {
+        let first_namespace = InMemoryGtpuSessionSelectorNamespace::new([0x55; 32]);
+        let second_namespace = InMemoryGtpuSessionSelectorNamespace::new([0x56; 32]);
+        let first_group = group(3, 3, 0x1000_0003, None);
+        let second_group = group(4, 4, 0x1000_0004, None);
+        let first_admission = first_namespace.claim(&first_group, None).unwrap();
+        let second_admission = second_namespace.claim(&second_group, None).unwrap();
+        let first_binding = first_admission.binding();
+        let second_binding = second_admission.binding();
+
+        let provision = GtpuSessionSelectorProvisionRequest {
+            binding: first_binding,
+        };
+        let expected_provision = provision.receipt_coordinate();
+        let cross_provision = GtpuSessionSelectorProvisionRequest {
+            binding: second_binding,
+        }
+        .confirm();
+        assert!(!cross_provision.confirms_provisioning(expected_provision));
+        assert!(provision
+            .confirm()
+            .confirms_provisioning(expected_provision));
+
+        let readback = GtpuSessionSelectorReadbackRequest {
+            expected: first_group.clone(),
+            admission: first_admission,
+        };
+        let expected_readback = readback.receipt_coordinate();
+        let cross_readback = GtpuSessionSelectorReadbackRequest {
+            expected: second_group.clone(),
+            admission: second_admission,
+        }
+        .complete(crate::GtpuSessionGroupReadback::Active(second_group));
+        assert!(cross_readback.into_readback(expected_readback).is_none());
+        assert!(readback
+            .complete(crate::GtpuSessionGroupReadback::Active(first_group))
+            .into_readback(expected_readback)
+            .is_some());
+
+        let first_remove_group = group(5, 5, 0x1000_0005, None);
+        let second_remove_group = group(6, 6, 0x1000_0006, None);
+        let first_removal_namespace = InMemoryGtpuSessionSelectorNamespace::new([0x57; 32]);
+        let second_removal_namespace = InMemoryGtpuSessionSelectorNamespace::new([0x58; 32]);
+        let first_active = first_removal_namespace
+            .claim(&first_remove_group, None)
+            .unwrap();
+        let second_active = second_removal_namespace
+            .claim(&second_remove_group, None)
+            .unwrap();
+        let retiring = |admission: GtpuSessionSelectorAdmission, nonce: u8| {
+            let active = SelectorAuthorityCoordinate {
+                generation: admission.generation(),
+                nonce: admission.operation_nonce(),
+            };
+            let retiring_generation = GtpuSessionSelectorAuthorityGeneration(
+                NonZeroU64::new(admission.generation().get() + 1).unwrap(),
+            );
+            let retired_generation = GtpuSessionSelectorAuthorityGeneration(
+                NonZeroU64::new(retiring_generation.get() + 1).unwrap(),
+            );
+            admission
+                .with_coordinates(
+                    retiring_generation,
+                    [nonce; 16],
+                    SelectorAuthorityCoordinate {
+                        generation: retired_generation,
+                        nonce: [nonce.wrapping_add(1); 16],
+                    },
+                    Some(active),
+                    SelectorAdmissionPhase::Retiring,
+                )
+                .unwrap()
+        };
+        let first_removal = GtpuSessionSelectorRemovalRequest {
+            expected: first_remove_group,
+            admission: retiring(first_active, 0x71),
+        };
+        let expected_removal = first_removal.receipt_coordinate();
+        let cross_removal = GtpuSessionSelectorRemovalRequest {
+            expected: second_remove_group,
+            admission: retiring(second_active, 0x73),
+        }
+        .complete(GtpuSessionGroupRemovalOutcome::Removed);
+        assert!(cross_removal.into_removal(expected_removal).is_none());
+        assert!(first_removal
+            .complete(GtpuSessionGroupRemovalOutcome::Removed)
+            .into_removal(expected_removal)
+            .is_some());
+
+        let fence = DecommissionFence {
+            predecessor_commitment: [0x81; 32],
+            decommissioning: SelectorAuthorityCoordinate {
+                generation: GtpuSessionSelectorAuthorityGeneration(NonZeroU64::new(2).unwrap()),
+                nonce: [0x82; 16],
+            },
+            decommissioned: SelectorAuthorityCoordinate {
+                generation: GtpuSessionSelectorAuthorityGeneration(NonZeroU64::new(3).unwrap()),
+                nonce: [0x83; 16],
+            },
+            capsule: [0x84; DECOMMISSION_CAPSULE_LEN],
+        };
+        let inspect = GtpuSessionSelectorDecommissionInspectRequest {
+            binding: first_binding,
+            expected_fence: None,
+        };
+        let expected_inspection = inspect.receipt_coordinate();
+        let cross_inspection = GtpuSessionSelectorDecommissionInspectRequest {
+            binding: second_binding,
+            expected_fence: None,
+        }
+        .confirm_absent();
+        assert!(!cross_inspection.confirms_decommission_fence_absent(expected_inspection));
+        assert!(inspect
+            .confirm_absent()
+            .confirms_decommission_fence_absent(expected_inspection));
+
+        let create = GtpuSessionSelectorDecommissionRequest {
+            binding: first_binding,
+            fence,
+        };
+        let expected_create = create.receipt_coordinate();
+        let wrong_class = GtpuSessionSelectorDecommissionReadbackRequest {
+            binding: first_binding,
+            fence,
+        }
+        .confirm_exact();
+        assert!(!wrong_class.confirms_decommission_fence_exact(expected_create));
+        assert!(create
+            .confirm()
+            .confirms_decommission_fence_exact(expected_create));
+
+        let readback = GtpuSessionSelectorDecommissionReadbackRequest {
+            binding: first_binding,
+            fence,
+        };
+        let expected_fence_readback = readback.receipt_coordinate();
+        let wrong_fence = DecommissionFence {
+            capsule: [0x85; DECOMMISSION_CAPSULE_LEN],
+            ..fence
+        };
+        let cross_fence = GtpuSessionSelectorDecommissionReadbackRequest {
+            binding: first_binding,
+            fence: wrong_fence,
+        }
+        .confirm_exact();
+        assert!(!cross_fence.confirms_decommission_fence_exact(expected_fence_readback));
+        assert!(readback
+            .confirm_exact()
+            .confirms_decommission_fence_exact(expected_fence_readback));
     }
 
     #[test]

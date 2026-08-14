@@ -10188,13 +10188,16 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         &self,
         request: crate::GtpuSessionSelectorEffectRequest,
     ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
-        let request = request.into_inner();
+        let (request, receipt_coordinate) = request.into_inner();
         let outcome = self
             .run_blocking("ebpf_grouped_authorized_reconcile", move |backend| {
                 backend.reconcile_pdp_context_group_sync(request)
             })
             .await?;
-        Ok(crate::GtpuSessionSelectorBackendReceipt::effect(outcome))
+        Ok(crate::GtpuSessionSelectorBackendReceipt::effect(
+            receipt_coordinate,
+            outcome,
+        ))
     }
 
     async fn read_pdp_context_group_with_lease(

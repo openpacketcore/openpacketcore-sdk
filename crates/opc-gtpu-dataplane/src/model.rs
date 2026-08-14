@@ -1579,6 +1579,10 @@ impl GtpuSessionGroupReconcileRequest {
         self.selector_admission.binding()
     }
 
+    pub(crate) const fn selector_admission(&self) -> &crate::GtpuSessionSelectorAdmission {
+        &self.selector_admission
+    }
+
     /// Explicit retired-selector evidence, if this is a reissue request.
     #[must_use]
     pub const fn selector_provenance(&self) -> Option<&GtpuSessionSelectorProvenance> {
