@@ -774,7 +774,7 @@ The subject-selector tags and their class rules are closed:
 | 1 | retained fence | one fixed fence leaf; class 8 with meta-class `retained-fence` |
 | 2 | frozen v1 map | one fixed `GTPU_SELECTOR_OPERATION_STAMPS` map; standard class 6 |
 | 3 | current v2 map | one fixed `GTPU_SELECTOR_OPERATION_STAMPS_V2` map; standard class 7 |
-| 4 | v2 stamp entry | exact group-key entries sorted by protected group ID; standard class 7 |
+| 4 | v2 stamp entry | exact operation-selected group-key entries sorted by protected group ID: the one candidate for install/remove and every current active group for restore; standard class 7 |
 | 5 | selector transition | exact persistent selector-entry transitions derived from the canonical desired graph, sorted by `(class, location, logical key)`; standard class 1 |
 | 6 | reconstructible object | exact maps, non-marker pins, programs, and journals derived from the desired graph and profile, excluding stamp maps, retained authorities, and hooks, sorted by `(class, location, logical key)`; standard class 1, 2, 3, or 5 |
 | 7 | traffic hook | exact hook manifest derived from the desired graph and profile, sorted by `(location, logical key)`; standard class 4 |
@@ -999,6 +999,11 @@ coordinate decoded from the exact current raw fence. Both future quiesce
 coordinates are nonzero, strictly greater in generation than that stable
 coordinate and each other, and have mutually distinct nonces. They become the
 first row of the consumed loss schedule without renumbering or substitution.
+The protected namespace-operation row always retains the exact 120-byte codec
+alongside its keyed commitment. A terminal operation that will install it in
+`Bound` retains those same bytes before its first effect, even though its
+semantic payload binds only their commitment; this is an acyclic sibling
+cross-reference because the codec contains coordinates and no target fence.
 
 The transcript domains above are not aliases. In particular, a descriptor,
 inventory profile, enumeration, drain transcript, chunk plan, durable
@@ -1116,8 +1121,10 @@ NamespaceOperationStateCodecV2:
   nonce (16 bytes) || current backend-fence commitment (32 bytes) || current-
   fence authorizing-operation-plan commitment (32 bytes) || current-fence
   backend-inventory-projection commitment (32 bytes) || current-fence expected-
-  prior-fence commitment (32 bytes) || next-loss-entry-
-  schedule commitment (32 bytes) || complete current-operation fence-
+  prior-fence commitment (32 bytes) || bound-entry-schedule byte length (u16
+  big-endian; zero or exactly 120) || zero reserved (u16) || exact canonical
+  NextLossEntryScheduleCodecV2 bytes when length is nonzero || bound-entry-
+  schedule commitment (32 bytes; zero iff length is zero) || complete current-operation fence-
   schedule commitment (32 bytes) || operation-plan
   commitment (32 bytes) || operation-journal-plan commitment (32 bytes) ||
   inventory commitment (32 bytes) || receipt commitment (32 bytes) || chunk-
@@ -1128,6 +1135,18 @@ NamespaceOperationStateCodecV2:
   operation payload byte length (u32 big-endian) || exact canonical operation-
   specific payload selected by operation kind (zero length only for kind=none)
 ```
+
+The bound-entry schedule field stores bytes, not only a digest. In `Bound/idle`
+it is the current consumable loss-entry schedule. During any operation (or
+prebuilt successor operation) whose eventual terminal target is `Bound`, it is
+the exact target schedule already committed by that operation payload; the
+terminal target copies the same 120 bytes and commitment without regeneration.
+It is zero only when neither the current state nor a fully committed successor
+payload names a target `Bound` entry schedule. The decoder recomputes the keyed
+commitment, namespace binding, coordinate ordering, and every payload cross-
+reference. Restart therefore recovers the future generations and nonces from
+protected canonical bytes; it never attempts to invert a commitment or mint a
+replacement schedule.
 
 The group row's source/edge spans must be in range, contiguous, and owned by
 that group; atom and group references must be a bijection with their exact
@@ -1223,7 +1242,7 @@ The namespace state table is exhaustive:
 | State | Required retained fence/graph | Service or capability outcome |
 | :--- | :--- | :--- |
 | `Bound` with idle operation gate | exact current `Stable/complete` fence plus its immutable `NextLossEntryScheduleCodecV2`, exact current v2 stamps, and graph; no current operation or journal rows | service may proceed; exact retained inspection yields adoption only |
-| `Bound` with planned/running/settling operation gate | exact current group install/remove or drain operation plan, schedule, journal prefix, and prior/intent/completion fence; next-loss entry field is zero | unaffected exact active groups may continue service, but no other backend mutation, loss qualification, adoption, or decommission may begin |
+| `Bound` with planned/running/settling operation gate | exact current group install/remove or drain operation plan, schedule, journal prefix, prior/intent/completion fence, and exact target bound-entry schedule bytes committed by its payload | unaffected exact active groups may continue service, but no other backend mutation, loss qualification, adoption, or decommission may begin |
 | `StampAbiMigrating` | exact recorded v1 snapshot, operation plan/schedule, journal rows, and completed migration prefix | stopped; resume only the next step of that migration |
 | `LossQualifying` | exact root, marker, epoch, operation plan/schedule, and journal prefix; substate is `QuiescePending` with prior `Stable` or its unique quiesce intent/completion fence, or `Quiesced` with the completed quiesce fence or the separately recorded settlement operation's intent/completion fence | stopped; inspection is authorized only in `Quiesced`; a written settlement successor permits only its matching protected CAS |
 | `RestorePending` | exact `LossQualified` fence or the unique intent/completion fence for the current restore step, plus the exact recorded journal prefix | stopped; resume only the current or next step of the same namespace plan |
@@ -1232,14 +1251,16 @@ The namespace state table is exhaustive:
 | `Decommissioning` / `Decommissioned` | RFC 016 terminal authority plus v2 fence | RFC 016 decommission rules only; no restore |
 
 `Bound/idle` requires operation kind zero, gate `idle`, zero current-operation
-plan/schedule/journal fields, a nonzero next-loss entry schedule, and the
+plan/schedule/journal fields, an exact nonzero 120-byte bound-entry schedule and
+its recomputed commitment, and the
 nonzero authorizing-plan, inventory-projection, and expected-prior-fence
 commitments retained solely to validate its current `Stable` fence. The entry
 schedule's expected stable coordinate must equal the coordinate decoded from
 that fence; it never substitutes for full fence validation.
 `Bound` with a non-idle gate permits only group install, group remove, or drain
-qualification; it requires a zero next-loss entry field and complete current
-operation material. Migration, loss qualification, restore, and decommission
+qualification; it requires complete current operation material and retains the
+exact target bound-entry schedule bytes committed by that operation. Migration,
+loss qualification, restore, and decommission
 operation kinds are legal only in their named namespace states. `Poisoned`
 requires gate `poisoned`; `Decommissioned` requires no current journal. Any
 other state/gate/kind/field combination is a decode error, not a recovery hint.
@@ -1284,6 +1305,35 @@ CAS/readback attempts, 64 concurrent supervisor slots per namespace, 256 per pro
 16 marker entries, 512 KiB/256 atoms in one exact backend inspection, and a
 4 KiB diagnostic/evidence record, as in RFC 016.
 
+Those count limits are independent ceilings, not permission to combine every
+ceiling in one record. Every v2 state also satisfies a coupled **restore
+recoverability invariant**. Let `R` be the exact number of reconstructible
+objects selected by restore step 3, `T` the exact number of persistent selector
+transitions selected by step 4, `A` the exact number of current active v2 stamp
+entries selected by step 5, and `K` the exact number of traffic hooks selected
+by step 6. The canonical full-namespace restore journal contains exactly
+`5 + R + T + A + K` rows: two stamp-map publications, those four expanded
+selector lists, and the three readback/verification/settlement rows. That
+value must be at most 2,048 and its encoded journal must fit 704 KiB. The
+coordinator derives it from protected desired bytes and the immutable built-in
+profile; a backend or caller never supplies a count.
+
+The decoder enforces the invariant for every v2 record with active authority
+and independently for any fully committed terminal successor encoded by its
+current or prebuilt successor operation.
+Initialization, stopped migration, and every operation whose terminal target
+would add or change active authority preflight the exact successor restore
+journal before nonce generation or the first CAS. A candidate that would make
+the successor unrestoreable is `CapacityExceeded` while the prior recoverable
+state remains unchanged. Migration rejects such a v1 namespace before
+publishing the v2 fence or stamp map, so it remains a usable v1 namespace
+rather than becoming an unrecoverable v2 namespace. Loss qualification
+recomputes the same committed expansion before its first claim; disagreement
+with the protected profile/desired state is `Indeterminate`, never a late
+`RestorePending` capacity failure. Thus a legal active v2 namespace always has
+a fully precommittable restore journal even when several independent count
+ceilings cannot be reached together.
+
 Those inherited supervisor numbers are concurrency slots, not a lifetime or
 journal-row limit. The RFC 017 namespace mutation gate admits exactly one
 supervisor for its current operation; that supervisor executes up to 2,048
@@ -1297,9 +1347,12 @@ chunks of at most 256 atoms and 512 KiB each under the same operation-scoped
 host guard. The restore plan commits the ordered chunk boundaries and one
 whole-namespace inventory commitment; a chunk is never an independent proof or
 settlement unit. The backend must preflight that the complete operation fits
-the RFC 016 critical-section bound before the `RestorePending` CAS. An
-unrepresentable or over-bound namespace is `CapacityExceeded` or `Unsupported`,
-not partially restored.
+the RFC 016 critical-section bound before any active-authority-changing claim
+and revalidate that fact before the loss-settlement CAS. An unrepresentable or
+over-bound candidate is `CapacityExceeded` or `Unsupported` while the prior
+state is still recoverable; encountering a different expansion after v2 active
+authority exists is `Indeterminate` profile/record drift, not a partially
+started restore.
 
 The immutable capacity profile assigns simultaneous encoded-byte maxima of
 64 KiB to the header/profile/namespace-operation metadata, 128 KiB to atom rows, 1 MiB
@@ -1326,8 +1379,8 @@ L = H + sum(for each section in S: 4 +
 ```
 
 The executable codec-size proof uses the production encoder's exact `H` and
-row lengths, fills every independent dimension to its simultaneous legal
-maximum (including both retained stamp inventories during migration), and
+row lengths, fills every section to its maximum under the coupled legal-state
+invariants (including both retained stamp inventories during migration), and
 must prove `L <= 4,194,304` and each section within its independent byte cap.
 It also proves that adding one maximum-length row
 to each independent section is rejected before allocation or CAS. The durable
@@ -1337,8 +1390,8 @@ and cross-checks every field against protected group, atom, qualification, and
 operation rows. Historical coordinates therefore remain verifiable after a
 group advances; they are never guessed from its current lifecycle coordinate.
 
-All capacity is validated before capability minting, nonce generation, CAS, or
-backend work. An empty v2 ledger fixes the profile at initialization. A
+All capacity, including the successor restore-journal expansion, is validated
+before capability minting, nonce generation, CAS, or backend work. An empty v2 ledger fixes the profile at initialization. A
 nonempty v1 ledger may fix its one v2 profile only inside the stopped
 `StampAbiMigrating` transition after the backend and executable maximum-size
 proof accept it; this does not rewrite the v1 profile. Once v2 is selected the
@@ -1433,8 +1486,9 @@ one expected protected-ledger revision it validates:
 5. the union of retired subsets and SDK-derived fresh atoms equals the complete
    candidate set, and no atom occurs twice or conflicts with a recorded
    disposition; and
-6. every group, atom, transfer-edge, source, stamp-slot, byte, and lineage
-   capacity is available for the full operation; and
+6. every group, atom, transfer-edge, source, stamp-slot, byte, lineage, current-
+   operation row, and exact successor restore-journal capacity is available for
+   the full operation; and
 7. the candidate group ID is absent from every permanent `Installing`,
    `Active`, `Retiring`, `Retired`, and `Poisoned` group row and tombstone. The
    sole exception is exact same-group `Active` adoption, which returns before
@@ -1722,19 +1776,21 @@ journal rows in object/group order:
    key, verify it, and atomically publish it in the next class-4 row.
 2. Assemble and verify each complete selector map, pin, or program privately,
    then publish it with one class-4 row in canonical object/group order while
-   no traffic hook is attached. A backend object that cannot be privately
-   assembled and atomically published is restored only through one class-2 row
-   per persistent entry; the 2,048-row bound is preflighted before the claim.
+   no traffic hook is attached. The built-in profile is eligible only when
+   every selected reconstructible object supports this private-build plus
+   atomic no-replace publication contract. A profile requiring in-place or
+   per-entry reconstruction is `Unsupported`; it cannot silently expand a
+   class-4 row or introduce an uncommitted class-2 fallback.
 3. Read back the complete graph, both maps, programs, pins, operation journal,
    root, marker, and retained fence. Replace each current active v2 value with
    its precommitted terminal-active value in a separate class-2 row. The frozen
    v1 values do not change, and no row performs a multi-key update.
-4. Attach each hook in its own class-2 row in canonical order, read back the complete graph/hook
-   inventory, and sync durability. The last row uses
-   `RestoreEffect/pending` for its intent and `RestoreVerified/complete` for
-   completion. Reopen and revalidate current root, marker, and fence paths
-   before releasing the lock and producing one internal exact-readback receipt.
-5. Consume that receipt in the protected CAS
+4. Attach each hook in its own class-2 row in canonical order. Step 7 then
+   performs its separately journaled pure complete-graph/hook readback and
+   durability verification. Step 8 reopens and revalidates the current root,
+   marker, fence paths, and exact graph; its completion fence commits the
+   `RestoreVerified` target and produces one internal exact-readback receipt.
+5. Consume that receipt in the step-8 completion-target CAS
    `RestorePending -> RestoreFinalizing`. Persist its exact inventory and fence
    commitment and expose the final settlement row—already present in the
    original restore journal—as the sole next planned row; do not mint a
@@ -1860,8 +1916,11 @@ profile, all per-group v2 values to create, the terminal `Stable` coordinate
 and next-loss entry schedule, and a complete migration operation payload, fence-
 free journal plan, intent/completion schedule, journal rows, and zero completed
 prefix. The SDK validates the RFC 016 ledger/v1 map bijection, the idle v1
-operation state, and the process-lifetime writer gate before entering that
-state.
+operation state, the process-lifetime writer gate, and the exact expanded
+restore journal for the proposed terminal v2 state before entering that state.
+If the restore journal would exceed 2,048 rows or 704 KiB, migration returns
+`CapacityExceeded` without publishing a fence or v2 stamp map and leaves the
+v1 record unchanged.
 
 Migration row zero is the only fence-bootstrap exception. With the protected
 claim and process-lifetime v1 writer gate already held, the supervisor acquires
@@ -2067,7 +2126,7 @@ conformance, forwarding, or product readiness.
    retained prior fence, reserved byte, and version.
    Exact-length vectors separately prove the 200-byte descriptor body,
    304-byte step subject, 216-byte journal projection, 344-byte full journal
-   row, and 208-byte mutation fence. For the fence, 200-byte, 209-byte, and
+   row, 120-byte next-loss entry schedule, and 208-byte mutation fence. For the fence, 200-byte, 209-byte, and
    nonzero-reserved variants are RED. Unknown versions and ABI changes are
    rejected rather than normalized.
 4. Boundary suites exercise every limit and one-over: protected bytes, groups,
@@ -2078,6 +2137,12 @@ conformance, forwarding, or product readiness.
    diagnostics, lease renewal, and critical-section duration. A simultaneous
    worst-case legal v2 record, including retained v1/v2 inventories during
    migration, round trips below its cap.
+   Coupled restore-budget vectors expand the exact selector lists and prove a
+   2,048-row successor is accepted, 2,049 rows are rejected before mutation,
+   and the otherwise individually legal 512-group/1,024-transition/512-hook
+   combination is rejected rather than admitted into an unrestoreable state.
+   Stopped v1 migration and every active-authority-changing operation exercise
+   the same invariant.
 5. Two-process races use real local store handles, independent databases,
    protected-store clones before/after effects, and competing host locks. They
    race fresh claims, drain qualification, overlapping retired subsets,
@@ -2107,7 +2172,11 @@ conformance, forwarding, or product readiness.
    of `backend_started`; every quiesce prior/intent/completion, settlement
    prior/intent/completion, restore-step prior/intent/completion,
    restore-verified, and final-settlement protected/fence/inventory triple is
-   covered. Migration has the same per-row matrix and retains the
+   covered. A restart from every `Bound` and pre-terminal operation state must
+   decode the exact persisted 120-byte target/current loss-entry schedule and
+   reuse its generations/nonces; deleting the bytes, retaining only their
+   commitment, or substituting a freshly generated schedule is RED. Migration
+   has the same per-row matrix and retains the
    process-lifetime v1 writer gate. No ambiguity may issue another effect or
    create a fresh coordinate.
 7. Adoption and restore tests prove exact retained state produces adoption only;
