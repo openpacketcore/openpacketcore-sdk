@@ -648,7 +648,15 @@ where
     }
 }
 
-async fn install<B>(backend: &B, request: &XfrmObjectInstallRequest) -> Result<(), XfrmError>
+/// Issue the exact install effect for one staged object request.
+///
+/// The grouped roster flow admits each member effect through this same
+/// dispatcher, so both durable families agree byte for byte on what
+/// "installing this request" means.
+pub(crate) async fn install<B>(
+    backend: &B,
+    request: &XfrmObjectInstallRequest,
+) -> Result<(), XfrmError>
 where
     B: XfrmBackend + ?Sized,
 {
@@ -658,7 +666,13 @@ where
     }
 }
 
-async fn remove<B>(
+/// Issue the exact removal for one deletion identity, preserving policy
+/// interface scope.
+///
+/// The grouped roster flow compensates each acquired member through this same
+/// dispatcher, so an interface-scoped policy is never retired by an unscoped
+/// delete.
+pub(crate) async fn remove<B>(
     backend: &B,
     request: &XfrmObjectRemovalRequest,
     policy_if_id: Option<u32>,

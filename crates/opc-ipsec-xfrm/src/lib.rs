@@ -163,6 +163,8 @@ mod durable_relocation;
 mod durable_relocation_flow;
 #[cfg(unix)]
 mod durable_roster;
+#[cfg(unix)]
+mod durable_roster_flow;
 pub mod error;
 #[cfg(feature = "ikev2")]
 pub mod ikev2;
@@ -218,6 +220,12 @@ pub use durable_roster::{
     XfrmObjectRosterOperationGeneration, XfrmObjectRosterRecoveryHandle,
     XfrmObjectRosterRecoveryProofKey, XfrmObjectRosterRecoveryStore,
     XFRM_OBJECT_ROSTER_MAX_MEMBERS, XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES,
+};
+#[cfg(unix)]
+pub use durable_roster_flow::{
+    XfrmObjectRosterDurableOutcome, XfrmObjectRosterMemberDisposition,
+    XfrmObjectRosterMemberDispositions, XfrmObjectRosterMemberRequest, XfrmObjectRosterRequest,
+    XfrmObjectRosterRequestError, XfrmObjectRosterRestartOutcome,
 };
 pub use error::XfrmError;
 #[cfg(feature = "ikev2")]

@@ -2196,6 +2196,23 @@ impl XfrmObjectRosterRecoveryStore {
             .map_err(|_| XfrmObjectRosterDurableError::Storage)
     }
 
+    /// Test-only durable anomaly: burn the writer epoch underneath an
+    /// unresolved roster.
+    ///
+    /// [`Self::advance_writer_epoch`] refuses this by design, and the store's
+    /// lease is private, so the recovery detectors in the flow module cannot
+    /// otherwise reproduce a storage rollback or an out-of-band epoch burn.
+    /// Recovery must classify the resulting record for repair rather than let
+    /// a stale proof authorize a deletion.
+    #[cfg(test)]
+    pub(crate) fn tests_force_advance_writer_epoch(
+        &self,
+    ) -> Result<NonZeroU64, XfrmObjectRosterDurableError> {
+        let lease = self.lease()?;
+        let inventory = lease.inventory()?;
+        lease.advance_epoch(&inventory)
+    }
+
     fn lease(&self) -> Result<StoreLease<'_>, XfrmObjectRosterDurableError> {
         if self.inner.owner_process_id == 0 || self.inner.owner_process_id != std::process::id() {
             return Err(XfrmObjectRosterDurableError::WrongIncarnation);
