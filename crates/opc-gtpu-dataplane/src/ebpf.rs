@@ -24292,13 +24292,21 @@ mod aya_runtime {
                 if !Arc::ptr_eq(&loaded._reconciler_ownership, &ownership) {
                     return Err(state_indeterminate("ebpf_detach"));
                 }
-                Self::selector_namespace_graph_identity(
-                    ifindex,
-                    loaded,
-                    &ownership,
-                    &_graph_lock,
-                    "ebpf_detach",
-                )?;
+                let observed_pins = Self::pinned_map_identity(&loaded.pin_dir)
+                    .map_err(|_| state_indeterminate("ebpf_detach"))?;
+                if observed_pins != loaded.datapath_identity.pins {
+                    // All canonical pin paths were readable, so a different
+                    // complete inventory is a proven replacement rather than
+                    // an uncertain partial graph.
+                    return Err(GtpuError::AlreadyExists);
+                }
+                let observed_datapath = Self::datapath_identity(&loaded.ebpf, &loaded.pin_dir)
+                    .map_err(|_| state_indeterminate("ebpf_detach"))?;
+                if observed_datapath != loaded.datapath_identity {
+                    // The exact pin inventory is still present, so a complete
+                    // readable program-identity change is also a replacement.
+                    return Err(GtpuError::AlreadyExists);
+                }
                 if !Self::loaded_datapath_is_current(ifindex, loaded) {
                     // Leave in-process ownership and pins intact. Aya-created
                     // links are ManuallyDrop and numeric link descriptors have
@@ -24309,6 +24317,13 @@ mod aya_runtime {
                 if !Self::detach_graph_is_exclusive(ifindex, loaded) {
                     return Err(GtpuError::AlreadyExists);
                 }
+                Self::selector_namespace_graph_identity(
+                    ifindex,
+                    loaded,
+                    &ownership,
+                    &_graph_lock,
+                    "ebpf_detach",
+                )?;
                 devices.remove(&ifindex)
             }
             .ok_or(GtpuError::NotFound)?;
