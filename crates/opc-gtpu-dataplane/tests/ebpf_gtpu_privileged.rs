@@ -7198,6 +7198,65 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         &replacement_pin_dir,
         "capture external-replacement proof pins",
     );
+
+    // A second current SDK hook outside the canonical slot is still an
+    // external graph replacement. It must withdraw capability and block every
+    // map effect even while both exact-slot hooks retain their original IDs.
+    let duplicate_graph_before = current_pin_graph_snapshot(&replacement_pin_dir);
+    let duplicate_proof_source_before = traffic_observation_source_contents(&replacement_pin_dir);
+    let duplicate_hooks_before = current_hook_snapshot();
+    let duplicate_program_id = install_off_slot_current_uplink_without_pins();
+    let duplicate_egress = tc_filters("egress");
+    let duplicate_ingress = tc_filters("ingress");
+    assert!(
+        duplicate_egress.contains("pref 51")
+            && duplicate_egress.contains("handle 0x2")
+            && duplicate_egress.contains(&format!("id {duplicate_program_id}")),
+        "the adversarial current-program duplicate must remain visible off-slot: {duplicate_egress}"
+    );
+    let duplicate_probe = replacement_owner.probe().await?;
+    assert_eq!(duplicate_probe.egress_dscp_marking, GtpuCapability::Missing);
+    assert_eq!(
+        duplicate_probe.downlink_endpoint_binding,
+        GtpuCapability::Missing
+    );
+    assert!(matches!(
+        replacement_owner
+            .install_pdp_context(marked_session_context(replacement_device.ifindex))
+            .await,
+        Err(opc_gtpu_dataplane::GtpuError::StateIndeterminate {
+            operation: "ebpf_graph_effect"
+        })
+    ));
+    assert!(
+        current_pin_graph_snapshot(&replacement_pin_dir) == duplicate_graph_before,
+        "off-slot duplicate refusal must preserve every pin, map ID, and durable map byte"
+    );
+    assert!(
+        traffic_observation_source_contents(&replacement_pin_dir) == duplicate_proof_source_before,
+        "off-slot duplicate refusal must precede every proof-source mutation"
+    );
+    assert_eq!(tc_filters("egress"), duplicate_egress);
+    assert_eq!(tc_filters("ingress"), duplicate_ingress);
+    run(
+        "tc",
+        &[
+            "filter", "del", "dev", "s2bu", "egress", "handle", "0x2", "pref", "51", "bpf",
+        ],
+    );
+    assert!(
+        current_pin_graph_snapshot(&replacement_pin_dir) == duplicate_graph_before,
+        "removing the test-owned duplicate must preserve the exact canonical pin graph"
+    );
+    assert!(
+        traffic_observation_source_contents(&replacement_pin_dir) == duplicate_proof_source_before,
+        "removing the test-owned duplicate must preserve proof-source state"
+    );
+    assert!(
+        current_hook_snapshot() == duplicate_hooks_before,
+        "removing the test-owned duplicate must restore the exact canonical hooks"
+    );
+
     for direction in ["egress", "ingress"] {
         run(
             "tc",
@@ -7222,31 +7281,62 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         replacement_probe.downlink_endpoint_binding,
         GtpuCapability::Missing
     );
+    let replacement_graph_before = current_pin_graph_snapshot(&replacement_pin_dir);
+    let replacement_proof_source_before = traffic_observation_source_contents(&replacement_pin_dir);
+    let replacement_egress_before = tc_filters("egress");
+    let replacement_ingress_before = tc_filters("ingress");
+    assert!(
+        replacement_egress_before.contains("matchall")
+            && replacement_ingress_before.contains("matchall"),
+        "the external replacement fixture must own both exact tc slots"
+    );
     assert!(matches!(
         replacement_owner
             .install_pdp_context(marked_session_context(replacement_device.ifindex))
             .await,
-        Err(opc_gtpu_dataplane::GtpuError::Io {
-            operation: "ebpf_downlink_endpoint_datapath",
-            ..
+        Err(opc_gtpu_dataplane::GtpuError::StateIndeterminate {
+            operation: "ebpf_graph_effect"
         })
     ));
+    assert!(
+        current_pin_graph_snapshot(&replacement_pin_dir) == replacement_graph_before,
+        "graph-effect refusal must preserve every pin, map ID, and durable map byte"
+    );
+    assert!(
+        traffic_observation_source_contents(&replacement_pin_dir)
+            == replacement_proof_source_before,
+        "graph-effect refusal must precede every proof-source mutation"
+    );
+    assert_eq!(tc_filters("egress"), replacement_egress_before);
+    assert_eq!(tc_filters("ingress"), replacement_ingress_before);
     assert!(matches!(
         replacement_owner.remove_device(&replacement_device).await,
         Err(opc_gtpu_dataplane::GtpuError::AlreadyExists)
     ));
-    for direction in ["egress", "ingress"] {
-        assert!(
-            tc_filters(direction).contains("matchall"),
-            "remove_device must preserve the external {direction} replacement"
-        );
-    }
+    assert!(
+        current_pin_graph_snapshot(&replacement_pin_dir) == replacement_graph_before,
+        "remove_device refusal must preserve every pin, map ID, and durable map byte"
+    );
+    assert!(
+        traffic_observation_source_contents(&replacement_pin_dir)
+            == replacement_proof_source_before,
+        "remove_device refusal must precede every proof-source mutation"
+    );
+    assert_eq!(tc_filters("egress"), replacement_egress_before);
+    assert_eq!(tc_filters("ingress"), replacement_ingress_before);
     drop(replacement_owner);
+    assert!(
+        current_pin_graph_snapshot(&replacement_pin_dir) == replacement_graph_before,
+        "old loader drop must preserve every pin, map ID, and durable map byte"
+    );
+    assert!(
+        traffic_observation_source_contents(&replacement_pin_dir)
+            == replacement_proof_source_before,
+        "old loader drop must preserve the proof-source state"
+    );
+    assert_eq!(tc_filters("egress"), replacement_egress_before);
+    assert_eq!(tc_filters("ingress"), replacement_ingress_before);
     for direction in ["egress", "ingress"] {
-        assert!(
-            tc_filters(direction).contains("matchall"),
-            "old loader drop must preserve the external {direction} replacement"
-        );
         run(
             "tc",
             &[
