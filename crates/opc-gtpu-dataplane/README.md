@@ -211,11 +211,13 @@ waiting for existing leases, retires old attempts and registrations, performs
 one final exact active readback of the new group, and only then publishes the
 new authority. A failed, canceled, stale, or concurrently mutated rebind
 leaves the old authority terminal and never reports an authority gap as traffic
-evidence. The trait's inherited unsupported implementation also consumes and
-terminally revokes its supplied old lease before returning `UnsupportedFeature`;
-it cannot leave a prior proof authority usable. The publish transaction is
-crate-private, so only SDK-owned trusted adapters can complete rebind. Mock and
-unsupported backends retain their fail-closed defaults.
+evidence. The trait's inherited implementation first authenticates the store
+and lease as belonging to that backend. A production-proof wrapper may delegate
+that ownership check and will terminally revoke before returning
+`UnsupportedFeature`; a mock, unsupported, or foreign backend cannot establish
+ownership and returns unsupported without mutating another backend's authority.
+The publish transaction is crate-private, so only SDK-owned trusted adapters
+can complete rebind.
 
 The product drives an authenticated ICMP Echo challenge through the live
 session by calling `GtpuTrafficProofSession::challenge` with a distinct nonzero

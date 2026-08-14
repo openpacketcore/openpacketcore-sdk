@@ -517,6 +517,10 @@ impl GtpuTrafficProofAuthorityStoreIdentity {
             registration,
         })
     }
+
+    pub(crate) const fn belongs_to_backend(self, backend_incarnation: u64) -> bool {
+        backend_incarnation != 0 && self.backend_incarnation == backend_incarnation
+    }
 }
 
 /// Backend-owned monotonic cancellation gate for one dispatch authority.
@@ -2584,8 +2588,8 @@ mod tests {
                     replacement.clone(),
                 )
                 .await,
-            Err(GtpuError::StateIndeterminate {
-                operation: "gtpu_traffic_authority_rebind"
+            Err(GtpuError::UnsupportedFeature {
+                feature: "gtpu_traffic_proof"
             })
         ));
         assert!(rebind_store.lease().await.is_live());
@@ -2602,7 +2606,7 @@ mod tests {
                 feature: "gtpu_traffic_proof"
             })
         ));
-        assert!(!rebind_store.lease().await.is_live());
+        assert!(rebind_store.lease().await.is_live());
         let mut session = session(store.lease().await.authority());
         let port = CapturingPort::accepting(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)));
         assert_eq!(

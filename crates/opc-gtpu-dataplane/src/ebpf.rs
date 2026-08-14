@@ -8771,12 +8771,35 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         .await
     }
 
+    fn owns_gtpu_traffic_proof_authority(
+        &self,
+        store: &GtpuTrafficProofAuthorityStore,
+        authority: &GtpuTrafficProofAuthorityLease,
+    ) -> bool {
+        let identity = authority.store_identity();
+        if store.identity() != identity
+            || !identity.belongs_to_backend(self.inner.backend_incarnation)
+        {
+            return false;
+        }
+        self.traffic_authority_stores().is_ok_and(|stores| {
+            stores
+                .get(&authority.authority().desired().id().to_bytes())
+                .is_some_and(|registered| registered.identity() == identity)
+        })
+    }
+
     async fn rebind_gtpu_traffic_proof_authority(
         &self,
         store: &GtpuTrafficProofAuthorityStore,
         old_authority: GtpuTrafficProofAuthorityLease,
         replacement: GtpuTrafficProofAuthority,
     ) -> Result<GtpuTrafficProofAuthorityStore, GtpuError> {
+        if !self.owns_gtpu_traffic_proof_authority(store, &old_authority) {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_traffic_authority_backend_mismatch",
+            });
+        }
         let transaction =
             store
                 .begin_rebind(old_authority)
@@ -38455,6 +38478,15 @@ mod tests {
                 .await
         }
 
+        fn owns_gtpu_traffic_proof_authority(
+            &self,
+            store: &GtpuTrafficProofAuthorityStore,
+            authority: &GtpuTrafficProofAuthorityLease,
+        ) -> bool {
+            self.delegate
+                .owns_gtpu_traffic_proof_authority(store, authority)
+        }
+
         async fn begin_gtpu_traffic_proof(
             &self,
             authority: GtpuTrafficProofAuthorityLease,
@@ -38932,6 +38964,32 @@ mod tests {
             .begin_gtpu_traffic_proof(store.lease().await)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn foreign_backend_rebind_cannot_revoke_the_canonical_authority() {
+        let (backend_a, _runtime_a, _group_a, authority_a) = traffic_proof_fixture(0x69).await;
+        let store_a = registered_traffic_authority_store(&backend_a, &authority_a)
+            .await
+            .unwrap();
+        let (backend_b, _runtime_b, _group_b, authority_b) = traffic_proof_fixture(0x6a).await;
+        assert_ne!(
+            backend_a.inner.backend_incarnation,
+            backend_b.inner.backend_incarnation
+        );
+
+        assert!(matches!(
+            backend_b
+                .rebind_gtpu_traffic_proof_authority(&store_a, store_a.lease().await, authority_b,)
+                .await,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_traffic_authority_backend_mismatch"
+            })
+        ));
+        let lease = store_a.lease().await;
+        assert!(lease.is_live());
+        let session = backend_a.begin_gtpu_traffic_proof(lease).await.unwrap();
+        assert!(backend_a.close_gtpu_traffic_proof(session).await.is_ok());
     }
 
     #[tokio::test]
