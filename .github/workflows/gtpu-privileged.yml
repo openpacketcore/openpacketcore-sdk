@@ -45,6 +45,7 @@ jobs:
           fi
           lsmod | grep '^gtp'
           sudo modprobe wireguard
+          sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
           sudo unshare -n -- ip link set lo up
 
       - name: Build privileged GTP-U test
@@ -325,11 +326,14 @@ jobs:
           grep -Fq 'OPC_GTPU_PRE_REDIRECT_TAG_PROOF_PROVEN' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
 
-          live_output="$(
+          if ! live_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-linux68-datapath --ignored --nocapture --test-threads=1 ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract"' \
               2>&1
-          )"
+          )"; then
+            printf '%s\n' "${live_output}"
+            exit 1
+          fi
           printf '%s\n' "${live_output}"
           if grep -q 'skipping:' <<< "${live_output}"; then
             echo '::error::Linux 6.8 TFT live proof skipped instead of running'
@@ -356,12 +360,20 @@ jobs:
         with:
           shared-key: opc-gtpu-el9
 
+      - name: Install musl compiler
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
       # Statically linked so the guest's glibc is irrelevant. The runner is
       # Ubuntu and the guest is el9; a default gnu build would not start there.
       - name: Build committed-object load test for el9
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-el9-target"
+          export CC_x86_64_unknown_linux_musl=musl-gcc
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
           cargo test --locked -p opc-gtpu-dataplane --lib --no-run \
             --target x86_64-unknown-linux-musl --message-format=json \
             > "${RUNNER_TEMP}/gtpu-el9-build.jsonl"
