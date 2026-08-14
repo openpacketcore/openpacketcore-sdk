@@ -554,8 +554,11 @@ pub struct GtpuSelectorNamespaceBackendLease { /* opaque, affine */ }
 pub struct GtpuSelectorNamespaceEffectRequest { /* opaque, affine */ }
 pub struct GtpuSelectorNamespaceRemovalRequest { /* opaque, affine */ }
 pub struct GtpuSelectorNamespaceQuiescenceRequest { /* opaque, affine */ }
+pub struct GtpuSelectorNamespaceTerminalFenceInspection { /* opaque */ }
+pub struct GtpuSelectorNamespaceTerminalFenceCreateRequest { /* opaque, affine */ }
 pub struct GtpuSelectorNamespaceReadbackReceipt { /* opaque */ }
 pub struct GtpuSelectorNamespaceQuiescenceReceipt { /* opaque */ }
+pub struct GtpuSelectorNamespaceTerminalFenceReceipt { /* opaque */ }
 
 async fn bootstrap_selector_namespace(
     &self,
@@ -597,12 +600,24 @@ async fn authorize_retired_group_reuse(
     &self,
     request: GtpuSelectorNamespaceQuiescenceRequest,
 ) -> Result<GtpuSelectorNamespaceQuiescenceReceipt, GtpuError>;
+
+async fn inspect_selector_namespace_terminal_fence(
+    &self,
+    lease: &mut GtpuSelectorNamespaceBackendLease,
+) -> Result<GtpuSelectorNamespaceTerminalFenceInspection, GtpuError>;
+
+async fn create_selector_namespace_terminal_fence(
+    &self,
+    request: GtpuSelectorNamespaceTerminalFenceCreateRequest,
+) -> Result<GtpuSelectorNamespaceTerminalFenceReceipt, GtpuError>;
 ```
 
 The SDK supplies a verifier/codec for external backend implementations. It
 reveals only the canonical 145-byte binding, canonical marker name, canonical
-208-byte pending and terminal stamps, and constant-time comparison operations,
-never the selector secret or fields from which a caller can mint those values.
+208-byte pending and terminal stamps, the canonical opaque 110-byte
+decommission capsule and its backend-specific terminal-fence key, and
+constant-time comparison operations, never the selector secret or fields from
+which a caller can mint those values.
 The lease validates the exact marker, complete permanent group-key inventory,
 and each key's exact current lifecycle-stamp value again immediately before
 each effect. An authorized request also exposes a borrowed read-only
@@ -617,6 +632,20 @@ equality fallback. The conformance harness
 can mint test requests, but ordinary callers cannot. This makes third-party
 implementation possible without making caller-side authority fields
 constructible.
+
+Terminal-fence inspection is a mandatory part of an RFC 016 backend profile,
+not an eBPF extension. Under the backend's real global ownership gate it returns
+an SDK-verifiable opaque classification proving exact absence or the exact
+append-only capsule bound to this namespace. Only the coordinator can turn an
+exact `Decommissioning` record into the affine create request. Creation must be
+no-replace/idempotent for that one exact capsule, durably settle independently
+of protected-store rollback, and return an exact readback receipt; a different
+existing capsule is indeterminate. The default methods are `Unsupported`, and a
+backend that cannot implement this independent permanent fence cannot advertise
+RFC 016 selector-namespace capability. The eBPF directory name in §8 is the
+reference implementation; another backend may use a different durable medium
+only when its conformance profile proves equivalent append-only identity,
+serialization, crash recovery, bounded inspection, and exact readback.
 
 `GtpuSelectorNamespaceBootstrap` has no `Clone`, serialization, field getter,
 raw-parts constructor, or backend-neutral minting trait. A backend receives the
@@ -825,8 +854,11 @@ NOT release ownership or cancel blocking kernel work while a durable effect is
 pending.
 
 The SDK supervisor retains and renews the namespace lease and request until one
-terminal receipt is durably settled or process death releases the host lock.
-Every renewal uses the exact phase generation/fence. A failed, late, or
+terminal receipt is durably settled. It acquires the host lock only for the
+bounded validation/effect/readback sections defined by the operation, releases
+it before every durable-store await or renewal, and revalidates after every
+reacquisition; process death releases only a lock held in the current bounded
+section. Every renewal uses the exact phase generation/fence. A failed, late, or
 ambiguous renewal fences the worker before any further effect and leaves the
 phase recoverable/poisoned; it cannot continue until the prior owner is fenced.
 A watchdog may make a caller observation time out, but it cannot drop a worker
@@ -1148,7 +1180,13 @@ RFC's conformance suite. An opt-in backend MUST:
 - reject mismatched/replayed/stale/cross-boundary capabilities before traffic or
   map mutation; and
 - preserve the immutable control-marker binding across its supported restart,
-  cleanup, and replacement paths.
+  cleanup, and replacement paths;
+- under the same backend-global gate, provide bounded exact terminal-fence
+  absence/presence inspection plus no-replace creation and exact readback of
+  the SDK-authorized capsule; and
+- retain that terminal fence and its exact capsule across every supported
+  restart, cleanup, backend replacement, and mutable-graph loss independently
+  of the protected store.
 
 An adapter that cannot make these statements remains unsupported even if it can
 reconcile maps, has a session store, or reports a successful mock operation.
@@ -1159,10 +1197,12 @@ legacy graph on the basis of current map content.
 
 An eBPF backend uses the directory marker defined in §8. A non-eBPF backend
 must provide an equivalent immutable, independently durable namespace binding
-under its backend-global exclusive ownership and pass the same split-store,
-restart, rollback, replacement, and conflict cases. If it has no such binding,
-two independent durable stores could both mint history for one dataplane
-namespace, so the selector-namespace capability remains unsupported.
+and a separate append-only terminal-capsule fence under its backend-global
+exclusive ownership and pass the same split-store, restart, rollback,
+decommission, replacement, and conflict cases. If it has neither independently
+durable object, two independent durable stores could mint history or a rolled-
+back `Bound` store could reopen a decommissioned namespace, so the complete
+selector-namespace capability remains unsupported.
 
 The SDK publishes a backend conformance harness which owns the only test-token
 minting path. External implementations consume opaque authorized requests and
@@ -1227,12 +1267,16 @@ validity was established by the control workflow.
 An upgrade MUST NOT silently adopt a nonempty legacy GTP-U map/program/pin
 graph. A production runtime cannot create the reserved durable row from
 absence. Before first use, a separately authorized, stopped installation
-workflow authenticates and fences the target, obtains the backend-global lock,
-and performs a complete bounded privileged inspection. Only exact emptiness,
-no legacy control marker, and no prior provision/decommission fence permit it to
-CAS-allocate the permanent `Provisioned` record at the SDK-derived reserved
-key. It exactly reads the record back before release and records only a redacted
-classification. A missing record during ordinary startup means
+workflow authenticates and fences the target, acquires the backend-global lock,
+performs a complete bounded privileged inspection, mints an affine inspection
+receipt, and releases that lock before any store operation. Only exact
+emptiness, no legacy control marker, and no prior provision/decommission fence
+permit the durable installation owner to CAS-allocate and exactly read the
+permanent `Provisioned` record at the SDK-derived reserved key. Initialization
+later reacquires the backend lock and revalidates the complete empty backend
+before marker creation; intervening backend state fails closed rather than
+rolling back the record. The workflow records only a redacted classification.
+A missing record during ordinary startup means
 unprovisioned/indeterminate, not never-used.
 
 If legacy state exists, an operator must use a separately reviewed cleanup-only
@@ -1245,34 +1289,59 @@ not automatic startup behavior.
 
 Decommission is a terminal namespace transition, not record deletion. After
 all groups are exactly `Retired`, the separately authorized stopped workflow
-holds both authority gates and verifies the complete ledger/authority-marker/
-stamp inventory plus absence of the terminal lifecycle fence. It then:
+first acquires/fences the durable namespace lease. It obeys the §8.3 lock order
+through this complete sequence; every backend section is bounded and releases
+the host lock before a protected-store await or lease renewal:
 
-1. CASes `Bound` to `Decommissioning`, precommitting its strictly greater
+1. Acquire the backend-global lock, revalidate the live namespace binding,
+   complete terminal-retired group/stamp inventory, and exact terminal-fence
+   absence through the mandatory backend inspection port, mint an opaque
+   inspection receipt, then release the backend lock.
+2. While holding only the durable namespace lease, CAS `Bound` to
+   `Decommissioning`, precommitting its strictly greater
    phase generation/nonce and the strictly greater terminal
    `Decommissioned` generation/nonce as the exact next two allocation values.
    The same CAS retains the complete binding and all group/atom/tombstone
    history and stores the §5.1 predecessor commitment plus canonical encrypted
-   coordinate capsule. It exactly reads that complete record back.
-2. Creates, syncs, and exactly reads the one terminal decommission fence from
-   §8.1 using that exact capsule. Once this append-only backend effect exists,
-   no `Bound` record may serve even if the protected store is rolled back; only
-   an exact predecessor match may reconstruct the recorded operation.
-3. CASes the exact `Decommissioning` operation to its precommitted permanent
-   `Decommissioned` coordinate, then exactly reads the record, both lifecycle
-   markers, and the complete terminal stamp inventory back.
-4. Only then removes mutable programs, selector maps, journals, and non-
-   authority pins. It retains the protected record, authority marker,
-   decommission fence, and complete operation-stamp authority map.
+   coordinate capsule, and consumes the exact prior inspection receipt. Exactly
+   read that complete record back; renew the durable lease here if required.
+3. Reacquire the backend-global lock in that order, revalidate the binding and
+   complete inventory against the recorded operation, and inspect the terminal
+   fence again. If absent, consume the SDK-minted affine request to create,
+   settle, and exactly read the recorded capsule; if already exact, join the
+   same operation. A different or ambiguous fence fails closed. Release the
+   backend lock with an opaque exact receipt. Once this append-only backend
+   effect exists, no `Bound` record may serve even if protected storage rolls
+   back; only an exact predecessor match may reconstruct the recorded
+   operation.
+4. While holding only the durable namespace lease, validate that receipt, CAS
+   the exact `Decommissioning` operation to its precommitted permanent
+   `Decommissioned` coordinate, and exactly read the protected record back.
+5. Reacquire the backend-global lock, revalidate both lifecycle fences and the
+   complete terminal stamp inventory against the exact `Decommissioned`
+   receipt, then remove only mutable programs, selector maps, journals, and
+   non-authority pins. Exactly read back the retained authority marker,
+   terminal fence, and complete operation-stamp authority map, then release the
+   backend lock. It never removes any authority fence.
+6. With the same durable lease and no host lock held, exactly re-read the
+   `Decommissioned` protected record. Only the pair of final store/backend
+   receipts is completion; disagreement remains offline.
 
-A crash before step 1 leaves `Bound` and permits no cleanup. A crash after step
-1 resumes only this exact operation. A crash or protected-store rollback after
-step 2 is fenced by the terminal marker and cannot return to serving. The exact
-predecessor `Bound` record can recover only the authenticated phase/terminal
-coordinates from that marker as specified in §8.1; any other rollback remains
-indeterminate rather than inventing a generation or nonce. A crash after step
-3 leaves `Decommissioned`, forbids traffic and claims, and may only resume the
-same bounded cleanup. Neither marker nor the protected record is ever removed.
+Lease renewal occurs only between these bounded host-lock sections. Failure to
+renew or reacquire stops before another backend effect and leaves the exact
+recorded phase recoverable. No decommission path holds both gates while awaiting
+the store, and no lock release authorizes a skipped revalidation.
+
+A crash before or after step 1 leaves `Bound` with no terminal fence and permits
+no cleanup; a later attempt repeats the bounded inspection. A crash after step
+2 resumes only the exact stored `Decommissioning` operation. A crash or
+protected-store rollback after step 3 is fenced by the terminal marker and
+cannot return to serving. The exact predecessor `Bound` record can recover only
+the authenticated phase/terminal coordinates from that marker as specified in
+§8.1; any other rollback remains indeterminate rather than inventing a
+generation or nonce. A crash after step 4 leaves `Decommissioned`, forbids
+traffic and claims, and may only resume the same bounded steps 5–6 cleanup and
+verification. Neither marker nor the protected record is ever removed.
 `Decommissioned` can be restored or moved only by a future separately
 authorized, versioned migration that preserves both terminal fences; it can
 never become an ordinary fresh namespace.
@@ -1349,7 +1418,8 @@ passes before the implementing surface exists is not evidence of this RFC.
 1. A compile-fail public-API test is initially RED because callers can name or
    construct `Fresh`; after implementation they cannot construct, clone,
    serialize, or substitute an admission, effect, removal, retired, or
-   quiescence/reuse capability.
+   quiescence/reuse capability, terminal-fence create request, or terminal-
+   fence receipt.
 2. Deterministic tests prove atomic fresh complete-set claim, exact full-set
    retired reissue, and rejection of duplicate, partial, mixed, same-group
    changed, stale-generation, replayed, cross-device, cross-pin, and
@@ -1396,18 +1466,22 @@ passes before the implementing surface exists is not evidence of this RFC.
    finds old history while a stale pin attestation, stamp, or conflicting
    ledger/control binding fails before traffic/map mutation.
 9. Mutation tests independently make RED: admission/effect/removal/retired/
-   quiescence capability opacity removal, their namespace-binding validation
-   removal, backend quiescence-receipt validation removal, per-atom historical
-   freshness removal, and independent tombstone and generation validation
-   removal. A combined happy-path mutation is insufficient evidence for these
-   independent guards.
+   quiescence/terminal-fence capability opacity removal, their namespace-
+   binding validation removal, backend quiescence/terminal-receipt validation
+   removal, per-atom historical freshness removal, and independent tombstone
+   and generation validation removal. A combined happy-path mutation is
+   insufficient evidence for these independent guards.
 10. Redaction tests inspect `Debug`, logs, metrics, status, errors, and RFC 006
     evidence and prove they contain only bounded classifications/counts, with
     no selector, subscriber, ledger, commitment, nonce, secret, or key data.
 11. Third-party backend conformance runs the published SDK harness against a
     real backend profile through the public unsealed port and SDK verifier,
-    without access to a raw authority constructor. The default backend remains
-    unsupported; semantic grouped reconcile or mock success cannot opt in.
+    without access to a raw authority constructor. It exercises independently
+    durable terminal-fence absence inspection, exact capsule creation/readback,
+    idempotent join, conflicting capsule, protected-store rollback, restart,
+    and mutable-graph cleanup through the public opaque operations. The default
+    backend remains unsupported; semantic grouped reconcile, an immutable
+    bootstrap marker alone, or mock success cannot opt in.
 12. Upgrade tests prove live legacy maps are never silently adopted, ordinary
     startup rejects an absent reserved record, only an exact pre-provisioned
     record may initialize, and cleanup-only migration is explicit. Decommission
@@ -1420,10 +1494,14 @@ passes before the implementing surface exists is not evidence of this RFC.
     invented coordinate all remain offline. `Decommissioned` plus all history
     remain permanent. Removing the database, maps, stamp map, and markers after
     decommission still cannot make ordinary startup provision or initialize
-    the tuple.
+    the tuple. Instrumented lock tests prove the exact lease/flock sequence and
+    make any store CAS/readback or lease renewal while the host lock is held go
+    RED; response loss at every release/reacquire boundary requires complete
+    revalidation before the next effect.
 13. Fix-removal tests independently remove operation-stamp validation, phase
     generation advancement, protected-store admission, canonical storage-key
-    derivation, and supervisor ownership; each mutation goes RED without
+    derivation, supervisor ownership, generic terminal-fence validation, and
+    the durable-lease-then-host-lock order; each mutation goes RED without
     relying on a combined happy-path test.
 14. Boundary tests hit every reference-profile limit and one-over value for
     ledger bytes, permanent/live groups, unique atoms, cumulative group-atom
