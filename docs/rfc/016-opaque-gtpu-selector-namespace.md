@@ -1182,14 +1182,20 @@ the protected ledger, marker, and backend graph are exactly `Bound`.
 
 ### 8.3 Host Filesystem Semantics
 
-Control-marker operations are serialized under the existing host-global
-advisory `flock` held on the canonical control-directory descriptor. The lock
-is held across marker validation/creation and all map/program mutation/readback
-that relies on it. Network namespaces, process IDs, per-process paths, and a
-lock created in an untrusted directory are not equivalent.
+The existing host-global advisory `flock` on the canonical control-directory
+descriptor remains the process-lifetime single-writer lease. Control-marker
+operations additionally take a bounded advisory `flock` on a distinct,
+persistent sibling inode derived from the same opaque namespace commitment.
+That operation lock is held across marker validation/creation and all
+map/program mutation/readback that relies on it, then released without
+releasing the writer lease. Keeping the original lease inode preserves
+coordination with older SDK writers during rolling upgrades. Network
+namespaces, process IDs, per-process paths, and a lock created in an untrusted
+directory are not equivalent.
 
-The total cross-boundary lock order is durable namespace lease/fence first,
-then the host-global control-directory `flock`; no path may acquire or renew a
+The total cross-boundary lock order is the process-lifetime writer lease,
+durable namespace lease/fence, then the bounded host-global operation `flock`;
+no path may acquire or renew a
 durable lease, perform a protected-store CAS/readback, or await another durable
 store operation while holding that `flock`. Bootstrap may briefly acquire the
 host lock to mint a bounded, affine namespace sample, but releases it before

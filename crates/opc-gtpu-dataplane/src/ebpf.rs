@@ -295,9 +295,8 @@ fn require_ebpf_executable_pmtu_policy(
     Ok(())
 }
 
-// Off Linux the only callers are the unit tests: the map readers that consult
-// this predicate live in the kernel runtime module, which is Linux-gated.
-#[cfg(any(target_os = "linux", test))]
+// This is a pure policy predicate. Keep it available to the unsupported-host
+// readback boundary as well as the Linux kernel adapter.
 fn ebpf_pmtu_map_state_is_executable(state: UplinkMtuMapState) -> bool {
     match state {
         UplinkMtuMapState::Unset => true,
@@ -12845,13 +12844,17 @@ mod aya_runtime {
     #[derive(Debug, Default)]
     pub(super) struct AyaGtpuRuntime {
         // Effect guards retain this registry while they hold the canonical
-        // control-directory flock.  Sharing the registry with the guard lets
+        // bounded operation flock. Sharing the registry with the guard lets
         // final readback compare the exact loaded graph, rather than only its
         // selector marker path.
         devices: Arc<Mutex<HashMap<u32, LoadedDevice>>>,
     }
 
     struct ReconcilerOwnership {
+        // Preserve the original process-lifetime writer lease on the
+        // namespace control directory. Older SDK writers lock this same inode,
+        // so retaining it also keeps rolling upgrades split-brain safe.
+        _lease: File,
         // Each protected operation re-opens this configured root and compares
         // it with the identity captured below.  Keeping an old descriptor
         // alive is not authority after an unmount or pathname replacement.
@@ -12864,12 +12867,19 @@ mod aya_runtime {
         control_dir_name: String,
         control_dir_device: u64,
         control_dir_inode: u64,
+        operation_lock_name: String,
+        operation_lock_device: u64,
+        operation_lock_inode: u64,
         canonical_pin_dir: PathBuf,
         namespace_hash: [u8; 32],
     }
 
     struct OperationControlLock {
+        // Marker inventory remains rooted at the lifetime-lease directory.
         descriptor: File,
+        // Bounded RFC 016 effects use a distinct persistent inode so a writer
+        // that holds the lifetime lease can still take and release operations.
+        lock_descriptor: File,
         operation: &'static str,
         locked: bool,
     }
@@ -12899,7 +12909,7 @@ mod aya_runtime {
     impl OperationControlLock {
         fn release(mut self) -> Result<(), GtpuError> {
             if self.locked {
-                rustix::fs::flock(&self.descriptor, rustix::fs::FlockOperation::Unlock)
+                rustix::fs::flock(&self.lock_descriptor, rustix::fs::FlockOperation::Unlock)
                     .map_err(|error| GtpuError::io(self.operation, error.into()))?;
                 self.locked = false;
             }
@@ -12973,7 +12983,8 @@ mod aya_runtime {
     impl Drop for OperationControlLock {
         fn drop(&mut self) {
             if self.locked {
-                let _ = rustix::fs::flock(&self.descriptor, rustix::fs::FlockOperation::Unlock);
+                let _ =
+                    rustix::fs::flock(&self.lock_descriptor, rustix::fs::FlockOperation::Unlock);
             }
         }
     }
@@ -12982,6 +12993,7 @@ mod aya_runtime {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter
                 .debug_struct("ReconcilerOwnership")
+                .field("held", &true)
                 .finish_non_exhaustive()
         }
     }
@@ -13013,10 +13025,10 @@ mod aya_runtime {
         // cleared by any unbound operation, so a retained or observed graph
         // can never be recast as a fresh selector namespace.
         selector_namespace_fresh_provisioning: bool,
-        // Per-operation flocks on this persistent control-directory identity
-        // are host-global across pod network namespaces.  No process-lifetime
-        // flock is retained; the opaque selector effect guard owns each
-        // bounded critical section.
+        // The original process-lifetime lease remains host-global across pod
+        // network namespaces. RFC 016 operations additionally take a bounded
+        // flock on a distinct namespace-derived inode, so releasing an effect
+        // never releases the single-writer lease.
         _reconciler_ownership: Arc<ReconcilerOwnership>,
     }
 
@@ -14165,7 +14177,103 @@ mod aya_runtime {
             .map_err(|error| GtpuError::io("ebpf_reconciler_ownership_open", error.into()))?;
             let control_dir_metadata =
                 Self::verify_control_directory(&control_dir, None, "ebpf_reconciler_ownership")?;
+            match rustix::fs::flock(
+                &control_dir,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            ) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::AGAIN) => return Err(GtpuError::AlreadyExists),
+                Err(error) => {
+                    return Err(GtpuError::io(
+                        "ebpf_reconciler_ownership_lock",
+                        error.into(),
+                    ))
+                }
+            }
+
+            // Re-descend from the configured path after taking the permanent
+            // lease. A descriptor retained across path or mount replacement
+            // cannot authorize creation of the bounded operation-lock inode.
+            let (current_bpffs_root, current_bpffs_metadata) = Self::open_bpffs_namespace_root(
+                configured_root,
+                false,
+                "ebpf_reconciler_ownership_recheck",
+            )?;
+            if current_bpffs_metadata.dev() != bpffs_root_metadata.dev()
+                || current_bpffs_metadata.ino() != bpffs_root_metadata.ino()
+            {
+                return Err(state_indeterminate("ebpf_reconciler_ownership_recheck"));
+            }
+            let current_control_root = rustix::fs::openat(
+                &current_bpffs_root,
+                RECONCILER_CONTROL_DIRECTORY,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io("ebpf_reconciler_ownership_recheck", error.into()))?;
+            Self::verify_control_root(
+                &current_control_root,
+                Some((control_root_metadata.dev(), control_root_metadata.ino())),
+                "ebpf_reconciler_ownership_recheck",
+            )?;
+            let current_control_dir = rustix::fs::openat(
+                &current_control_root,
+                control_dir_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io("ebpf_reconciler_ownership_recheck", error.into()))?;
+            Self::verify_control_directory(
+                &current_control_dir,
+                Some((control_dir_metadata.dev(), control_dir_metadata.ino())),
+                "ebpf_reconciler_ownership_recheck",
+            )?;
+            Self::verify_control_directory(
+                &control_dir,
+                Some((control_dir_metadata.dev(), control_dir_metadata.ino())),
+                "ebpf_reconciler_ownership_recheck",
+            )?;
+
+            let operation_lock_name = format!("{control_dir_name}.operation-v1");
+            match rustix::fs::mkdirat(
+                &current_control_root,
+                operation_lock_name.as_str(),
+                rustix::fs::Mode::from_bits_truncate(0o700),
+            ) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => {
+                    return Err(GtpuError::io(
+                        "ebpf_reconciler_operation_lock_create",
+                        error.into(),
+                    ))
+                }
+            }
+            let operation_lock = rustix::fs::openat(
+                &current_control_root,
+                operation_lock_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io("ebpf_reconciler_operation_lock_open", error.into()))?;
+            let operation_lock_metadata = Self::verify_empty_marker_directory(
+                &operation_lock,
+                None,
+                "ebpf_reconciler_operation_lock",
+            )?;
             Ok(Arc::new(ReconcilerOwnership {
+                _lease: control_dir,
                 bpffs_root_path: configured_root.to_path_buf(),
                 bpffs_root_device: bpffs_root_metadata.dev(),
                 bpffs_root_inode: bpffs_root_metadata.ino(),
@@ -14175,6 +14283,9 @@ mod aya_runtime {
                 control_dir_name,
                 control_dir_device: control_dir_metadata.dev(),
                 control_dir_inode: control_dir_metadata.ino(),
+                operation_lock_name,
+                operation_lock_device: operation_lock_metadata.dev(),
+                operation_lock_inode: operation_lock_metadata.ino(),
                 canonical_pin_dir: pin_dir.to_path_buf(),
                 namespace_hash,
             }))
@@ -14456,8 +14567,32 @@ mod aya_runtime {
                 Some((ownership.control_dir_device, ownership.control_dir_inode)),
                 operation,
             )?;
+            Self::verify_control_directory(
+                &ownership._lease,
+                Some((ownership.control_dir_device, ownership.control_dir_inode)),
+                operation,
+            )?;
+            let lock_descriptor = rustix::fs::openat(
+                &control_root,
+                ownership.operation_lock_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(operation, error.into()))?;
+            Self::verify_empty_marker_directory(
+                &lock_descriptor,
+                Some((
+                    ownership.operation_lock_device,
+                    ownership.operation_lock_inode,
+                )),
+                operation,
+            )?;
             match rustix::fs::flock(
-                &descriptor,
+                &lock_descriptor,
                 rustix::fs::FlockOperation::NonBlockingLockExclusive,
             ) {
                 Ok(()) => {}
@@ -14500,6 +14635,25 @@ mod aya_runtime {
                 Some((ownership.control_dir_device, ownership.control_dir_inode)),
                 operation,
             )?;
+            let current_lock_descriptor = rustix::fs::openat(
+                &current_control_root,
+                ownership.operation_lock_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(operation, error.into()))?;
+            Self::verify_empty_marker_directory(
+                &current_lock_descriptor,
+                Some((
+                    ownership.operation_lock_device,
+                    ownership.operation_lock_inode,
+                )),
+                operation,
+            )?;
             // Also re-stat the locked descriptor itself.  The two exact
             // identity checks bind the flock to the path that remains current
             // after acquisition.
@@ -14508,8 +14662,17 @@ mod aya_runtime {
                 Some((ownership.control_dir_device, ownership.control_dir_inode)),
                 operation,
             )?;
+            Self::verify_empty_marker_directory(
+                &lock_descriptor,
+                Some((
+                    ownership.operation_lock_device,
+                    ownership.operation_lock_inode,
+                )),
+                operation,
+            )?;
             Ok(OperationControlLock {
                 descriptor,
+                lock_descriptor,
                 operation,
                 locked: true,
             })
@@ -14560,6 +14723,38 @@ mod aya_runtime {
             Self::verify_control_directory(
                 locked,
                 Some((ownership.control_dir_device, ownership.control_dir_inode)),
+                operation,
+            )?;
+            Self::verify_control_directory(
+                &ownership._lease,
+                Some((ownership.control_dir_device, ownership.control_dir_inode)),
+                operation,
+            )?;
+            let current_lock = rustix::fs::openat(
+                &control_root,
+                ownership.operation_lock_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(operation, error.into()))?;
+            Self::verify_empty_marker_directory(
+                &current_lock,
+                Some((
+                    ownership.operation_lock_device,
+                    ownership.operation_lock_inode,
+                )),
+                operation,
+            )?;
+            Self::verify_empty_marker_directory(
+                &locked.lock_descriptor,
+                Some((
+                    ownership.operation_lock_device,
+                    ownership.operation_lock_inode,
+                )),
                 operation,
             )?;
             Ok(current)
@@ -15275,7 +15470,7 @@ mod aya_runtime {
         }
 
         /// Capture the complete, bounded managed graph while the canonical
-        /// control-directory flock is held.  In particular, do not reduce
+        /// operation flock is held. In particular, do not reduce
         /// this to the marker: tc placement, program IDs/tags/map references,
         /// every named current pin, and the PMTU policy map are independently
         /// replaceable kernel objects.

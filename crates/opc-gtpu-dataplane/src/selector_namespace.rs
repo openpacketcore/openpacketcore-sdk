@@ -1128,9 +1128,9 @@ impl GtpuSessionSelectorProvisionRequest {
 /// coordinate.
 ///
 /// The backend consumes this affine capability while holding its host-global
-/// inventory lock. It must check [`Self::is_current`] immediately before and
+/// inventory lock. It must check `is_current` immediately before and
 /// after proving the exact no-effect fact, then settle the request with
-/// [`Self::confirm`]. This prevents a structural or mock observation obtained
+/// `confirm`. This prevents a structural or mock observation obtained
 /// before the worker fence expired from authorizing a later durable handoff.
 #[must_use = "a negative recovery inspection must be consumed into a current receipt"]
 pub struct GtpuSessionSelectorInstallingNoEffectRequest {

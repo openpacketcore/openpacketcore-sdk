@@ -1733,6 +1733,13 @@ rolling handoff must therefore stop the old writer before the new writer adopts
 the interface. Privileged processes that bypass this lease remain outside the
 supported mutation model.
 
+Selector-namespace effects additionally take a bounded `flock` on a distinct,
+persistent operation-lock inode derived from the same opaque namespace hash.
+This lets each durable effect release its critical section without releasing
+the process-lifetime writer lease. The original control-directory inode remains
+the lifetime lease so cooperating older and newer SDK writers contend on the
+same upgrade-compatible safety boundary.
+
 The runtime takes both tc links out of Aya loader ownership, so dropping an old
 loader cannot detach a static filter that an external actor subsequently
 placed at the same priority/handle. `remove_device` preflights both live hooks
