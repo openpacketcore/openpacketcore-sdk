@@ -61,6 +61,7 @@ pub mod mock;
 pub mod model;
 pub mod reassembly;
 pub mod selector_namespace;
+mod selector_namespace_v2;
 pub mod tft_classifier;
 pub mod traffic_observation;
 pub mod unsupported;
