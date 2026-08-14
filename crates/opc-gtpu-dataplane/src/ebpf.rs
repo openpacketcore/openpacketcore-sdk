@@ -14078,6 +14078,33 @@ mod aya_runtime {
         Ok(())
     }
 
+    /// Require the complete canonical hook pair to retain the exact loaded
+    /// program identities. Placement alone intentionally accepts a partial
+    /// inventory during attach, but a live graph and every map effect require
+    /// both hooks with no duplicate, off-slot, or non-default-chain SDK
+    /// occupant anywhere on the device.
+    fn validate_current_program_graph_placement(
+        occupants: &[SdkProgramOccupant],
+        tc_priority: u16,
+        uplink_program_id: u32,
+        downlink_program_id: u32,
+    ) -> Result<(), CurrentProgramGraphConflict> {
+        validate_current_program_placement(occupants, tc_priority)?;
+        if occupants.len() != 2
+            || !occupants.iter().any(|occupant| {
+                occupant.program == SdkDatapathProgram::Uplink
+                    && occupant.program_id == Some(uplink_program_id)
+            })
+            || !occupants.iter().any(|occupant| {
+                occupant.program == SdkDatapathProgram::Downlink
+                    && occupant.program_id == Some(downlink_program_id)
+            })
+        {
+            return Err(CurrentProgramGraphConflict);
+        }
+        Ok(())
+    }
+
     /// Require each current hook's complete kernel map-ID set to equal the IDs
     /// named by its exact required pin paths.
     fn validate_current_program_map_graph(
@@ -15545,21 +15572,22 @@ mod aya_runtime {
                 .map_err(|_| state_indeterminate(operation))?;
             let tc_occupants = Self::live_sdk_programs(ifindex, device.tc_priority)
                 .map_err(|_| state_indeterminate(operation))?;
-            let datapath_state =
-                if !device.cleanup_only && Self::loaded_datapath_is_current(ifindex, device) {
-                    SelectorNamespaceDatapathState::LiveCurrent
-                } else if device.cleanup_only
-                    && Self::loaded_datapath_cleanup_safe(ifindex, device)
-                    && tc_occupants.is_empty()
-                {
-                    // A cleanup-only graph has no forwarding authority.  Exact
-                    // pinned/loaded identity, both empty reserved slots, and an
-                    // empty all-placement SDK inventory keep this narrower branch
-                    // from accepting a detached or foreign replacement graph.
-                    SelectorNamespaceDatapathState::CleanupOnly
-                } else {
-                    return Err(state_indeterminate(operation));
-                };
+            let datapath_state = if !device.cleanup_only
+                && Self::loaded_datapath_is_current_with_occupants(ifindex, device, &tc_occupants)
+            {
+                SelectorNamespaceDatapathState::LiveCurrent
+            } else if device.cleanup_only
+                && Self::loaded_datapath_cleanup_safe(ifindex, device)
+                && tc_occupants.is_empty()
+            {
+                // A cleanup-only graph has no forwarding authority.  Exact
+                // pinned/loaded identity, both empty reserved slots, and an
+                // empty all-placement SDK inventory keep this narrower branch
+                // from accepting a detached or foreign replacement graph.
+                SelectorNamespaceDatapathState::CleanupOnly
+            } else {
+                return Err(state_indeterminate(operation));
+            };
             let pmtu_policy = Self::pmtu_policy_slot_for_graph(&device.ebpf, operation)?;
             if !Self::graph_pmtu_policy_validation_allows(pmtu_policy, pmtu_validation) {
                 return Err(state_indeterminate(operation));
@@ -20195,11 +20223,22 @@ mod aya_runtime {
             })
         }
 
-        fn loaded_datapath_is_current(ifindex: u32, loaded: &LoadedDevice) -> bool {
+        fn loaded_datapath_is_current_with_occupants(
+            ifindex: u32,
+            loaded: &LoadedDevice,
+            occupants: &[SdkProgramOccupant],
+        ) -> bool {
             let Ok(identity) = Self::datapath_identity(&loaded.ebpf, &loaded.pin_dir) else {
                 return false;
             };
             identity == loaded.datapath_identity
+                && validate_current_program_graph_placement(
+                    occupants,
+                    loaded.tc_priority,
+                    identity.uplink.program_id,
+                    identity.downlink.program_id,
+                )
+                .is_ok()
                 && matches!(
                     slot_owner(ifindex, TcAttachType::Egress, loaded.tc_priority),
                     Ok(Some(owner))
@@ -20212,6 +20251,13 @@ mod aya_runtime {
                         if owner.name == PROG_DOWNLINK
                             && owner.program_id == Some(identity.downlink.program_id)
                 )
+        }
+
+        fn loaded_datapath_is_current(ifindex: u32, loaded: &LoadedDevice) -> bool {
+            let Ok(occupants) = Self::live_sdk_programs(ifindex, loaded.tc_priority) else {
+                return false;
+            };
+            Self::loaded_datapath_is_current_with_occupants(ifindex, loaded, &occupants)
         }
 
         /// Detach is destructive: canonical-slot ownership alone is not
@@ -27536,6 +27582,16 @@ mod aya_runtime {
                 Ok(())
             );
             assert_eq!(
+                validate_current_program_graph_placement(
+                    &[uplink.occupant.clone(), downlink.occupant.clone()],
+                    priority,
+                    1,
+                    2,
+                ),
+                Ok(()),
+                "a live graph requires the complete canonical pair with exact IDs"
+            );
+            assert_eq!(
                 validate_current_program_map_graph(&uplink, Some(&[1, 2])),
                 Ok(())
             );
@@ -27559,16 +27615,55 @@ mod aya_runtime {
                     Err(CurrentProgramGraphConflict),
                     "a duplicate outside the desired slot must conflict in any order"
                 );
+                assert_eq!(
+                    validate_current_program_graph_placement(&programs, priority, 1, 2),
+                    Err(CurrentProgramGraphConflict),
+                    "a live graph must reject every off-slot duplicate"
+                );
             }
             let mut nondefault_chain = downlink.occupant.clone();
             nondefault_chain.chain = 1;
             assert_eq!(
                 validate_current_program_placement(
-                    &[uplink.occupant.clone(), nondefault_chain],
+                    &[uplink.occupant.clone(), nondefault_chain.clone()],
                     priority
                 ),
                 Err(CurrentProgramGraphConflict)
             );
+            assert_eq!(
+                validate_current_program_graph_placement(
+                    &[uplink.occupant.clone(), nondefault_chain],
+                    priority,
+                    1,
+                    2,
+                ),
+                Err(CurrentProgramGraphConflict),
+                "a live graph must reject a current program on a non-default chain"
+            );
+            for (programs, uplink_id, downlink_id) in [
+                (vec![uplink.occupant.clone()], 1, 2),
+                (
+                    vec![uplink.occupant.clone(), downlink.occupant.clone()],
+                    9,
+                    2,
+                ),
+                (
+                    vec![uplink.occupant.clone(), downlink.occupant.clone()],
+                    1,
+                    9,
+                ),
+            ] {
+                assert_eq!(
+                    validate_current_program_graph_placement(
+                        &programs,
+                        priority,
+                        uplink_id,
+                        downlink_id,
+                    ),
+                    Err(CurrentProgramGraphConflict),
+                    "a live graph must require both exact loaded program identities"
+                );
+            }
 
             assert_eq!(
                 validate_current_program_map_graph(&uplink, Some(&[1, 9])),
