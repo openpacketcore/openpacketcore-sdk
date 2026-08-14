@@ -59,9 +59,10 @@ const DECOMMISSION_AAD_DOMAIN: &[u8] = b"opc/gtpu-selector/decommission/aad/v1\0
 pub(crate) const DECOMMISSION_CAPSULE_LEN: usize = 110;
 const DECOMMISSION_COORDINATE_LEN: usize = 81;
 const SELECTOR_LEDGER_KEY_TYPE: &str = "gtpu-selector-ledger-v1";
-/// A conservative envelope reserve keeps plaintext ledgers below SQLite's
-/// one-MiB record capability when an `EncryptingSessionBackend` seals them.
-const MAX_RECORD_BYTES: usize = 768 * 1024;
+/// RFC 016's fixed reference-profile plaintext ceiling. The protected-store
+/// envelope receives a separate reserve below; larger plaintext profiles are
+/// never accepted implicitly.
+const MAX_RECORD_BYTES: usize = 512 * 1024;
 const MAX_PERMANENT_GROUPS: usize = 1_024;
 const MAX_LIVE_GROUPS: usize = 512;
 const MAX_KNOWN_ATOMS: usize = 1_024;
@@ -281,9 +282,10 @@ impl fmt::Debug for GtpuSessionSelectorBackendBinding {
 pub struct GtpuSessionSelectorAuthorityGeneration(NonZeroU64);
 
 impl GtpuSessionSelectorAuthorityGeneration {
-    /// Return the monotonically increasing authority generation.
+    /// Return the monotonically increasing authority generation inside the
+    /// SDK authority boundary. Public callers receive only an opaque value.
     #[must_use]
-    pub const fn get(self) -> u64 {
+    pub(crate) const fn get(self) -> u64 {
         self.0.get()
     }
 }
@@ -477,6 +479,11 @@ fn terminal_retired_stamp_generation(
     admission: &GtpuSessionSelectorAdmission,
     stamp: &[u8; GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN],
 ) -> Option<NonZeroU64> {
+    if admission.phase == SelectorAdmissionPhase::Retired {
+        return verifies_terminal_retired_stamp(admission, stamp)
+            .then_some(admission.retired_dataplane_generation)
+            .flatten();
+    }
     if admission.phase != SelectorAdmissionPhase::Retiring {
         return None;
     }
@@ -1231,9 +1238,10 @@ impl DecommissionFence {
 }
 
 impl GtpuSessionSelectorAdmission {
-    /// Return the SDK-minted authority generation without exposing selectors.
+    /// Return the SDK-minted authority generation inside the trusted backend
+    /// boundary. Raw lifecycle coordinates are not a public diagnostic API.
     #[must_use]
-    pub const fn generation(&self) -> GtpuSessionSelectorAuthorityGeneration {
+    pub(crate) const fn generation(&self) -> GtpuSessionSelectorAuthorityGeneration {
         self.generation
     }
 
@@ -1282,6 +1290,15 @@ impl GtpuSessionSelectorAdmission {
         matches!(self.phase, SelectorAdmissionPhase::Retiring)
             && self.previous_terminal.is_some()
             && self.terminal_generation.get() > self.generation.get()
+    }
+
+    pub(crate) const fn authorizes_retired_readback(&self) -> bool {
+        matches!(self.phase, SelectorAdmissionPhase::Retired)
+            && self.retired_dataplane_generation.is_some()
+    }
+
+    pub(crate) const fn retired_dataplane_generation(&self) -> Option<NonZeroU64> {
+        self.retired_dataplane_generation
     }
 
     pub(crate) const fn group_fingerprint(&self) -> [u8; 32] {
@@ -3466,12 +3483,14 @@ where
             .retired_admission(&expected)
             .await
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
-        matches!(readback.readback, crate::GtpuSessionGroupReadback::Absent)
-            .then_some(GtpuSessionSelectorRetiredClaim {
-                group: expected,
-                admission,
-            })
-            .ok_or(GtpuSessionSelectorCoordinatorError::Backend)
+        (matches!(readback.readback, crate::GtpuSessionGroupReadback::Absent)
+            && readback.terminal_retired_dataplane_generation
+                == admission.retired_dataplane_generation())
+        .then_some(GtpuSessionSelectorRetiredClaim {
+            group: expected,
+            admission,
+        })
+        .ok_or(GtpuSessionSelectorCoordinatorError::Backend)
     }
 
     /// Retire an Active claim in the only permitted order: durable Retiring,
@@ -7561,6 +7580,14 @@ mod tests {
         Readback,
     }
 
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TerminalRetiredReadbackMode {
+        Exact = 0,
+        Unstamped = 1,
+        MutatedGeneration = 2,
+    }
+
     /// Backend observations used to fault the durable coordinator exactly at
     /// its authority boundary.  `NoEffect` is the only state for which the
     /// dedicated negative-proof port may authorize a false-to-true handoff.
@@ -7583,6 +7610,7 @@ mod tests {
         reused_effect_calls: std::sync::atomic::AtomicUsize,
         provision_calls: std::sync::atomic::AtomicUsize,
         removal_calls: std::sync::atomic::AtomicUsize,
+        terminal_retired_readback_mode: std::sync::atomic::AtomicU8,
         dataplane: std::sync::Mutex<FaultingSelectorDataplaneState>,
         no_effect_barrier: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
         terminal_fence: std::sync::Mutex<Option<[u8; DECOMMISSION_CAPSULE_LEN]>>,
@@ -7647,6 +7675,11 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire)
         }
 
+        fn set_terminal_retired_readback_mode(&self, mode: TerminalRetiredReadbackMode) {
+            self.terminal_retired_readback_mode
+                .store(mode as u8, std::sync::atomic::Ordering::Release);
+        }
+
         fn dataplane_readback(
             &self,
             expected: &GtpuSessionGroup,
@@ -7685,7 +7718,11 @@ mod tests {
             stamp[96..128].copy_from_slice(&admission.group_fingerprint());
             stamp[128..160].copy_from_slice(&admission.selector_set_fingerprint());
             stamp[160..192].copy_from_slice(&admission.desired_fingerprint());
-            stamp[192..200].copy_from_slice(&1_u64.to_be_bytes());
+            let dataplane_generation = admission
+                .retired_dataplane_generation()
+                .map(NonZeroU64::get)
+                .unwrap_or(1);
+            stamp[192..200].copy_from_slice(&dataplane_generation.to_be_bytes());
             stamp
         }
     }
@@ -7985,10 +8022,21 @@ mod tests {
         ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
             let expected = request.expected_group().clone();
             let readback = self.dataplane_readback(&expected)?;
-            if request.admission.phase == SelectorAdmissionPhase::Retiring
-                && matches!(readback, crate::GtpuSessionGroupReadback::Absent)
+            if matches!(
+                request.admission.phase,
+                SelectorAdmissionPhase::Retiring | SelectorAdmissionPhase::Retired
+            ) && matches!(readback, crate::GtpuSessionGroupReadback::Absent)
             {
-                let stamp = Self::terminal_retired_stamp(&request.admission);
+                let mode = self
+                    .terminal_retired_readback_mode
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if mode == TerminalRetiredReadbackMode::Unstamped as u8 {
+                    return Ok(request.complete(readback));
+                }
+                let mut stamp = Self::terminal_retired_stamp(&request.admission);
+                if mode == TerminalRetiredReadbackMode::MutatedGeneration as u8 {
+                    stamp[199] ^= 1;
+                }
                 return request.complete_terminal_retired(readback, &stamp).ok_or(
                     crate::GtpuError::StateIndeterminate {
                         operation: "faulting_selector_terminal_stamp",
@@ -8290,6 +8338,47 @@ mod tests {
                 "mutating terminal dataplane-generation byte {byte} must fail"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn retired_recovery_requires_exact_generation_stamped_absence() {
+        let desired = group(1, 1, 0x1000_0001, None);
+        let authority = production_authority(desired.device_id()).await;
+        let backend = Arc::new(FaultingSelectorBackend::default());
+        authority.provision(backend.as_ref()).await.unwrap();
+        let active = authority
+            .reconcile_fresh(backend.clone(), desired.clone())
+            .await
+            .unwrap();
+        drop(
+            authority
+                .retire(backend.clone(), active, desired.clone())
+                .await
+                .unwrap(),
+        );
+
+        backend.set_terminal_retired_readback_mode(TerminalRetiredReadbackMode::Unstamped);
+        assert!(matches!(
+            authority
+                .recover_retired(backend.clone(), desired.clone())
+                .await,
+            Err(GtpuSessionSelectorCoordinatorError::Backend)
+        ));
+
+        backend.set_terminal_retired_readback_mode(TerminalRetiredReadbackMode::MutatedGeneration);
+        assert!(matches!(
+            authority
+                .recover_retired(backend.clone(), desired.clone())
+                .await,
+            Err(GtpuSessionSelectorCoordinatorError::Backend)
+        ));
+
+        backend.set_terminal_retired_readback_mode(TerminalRetiredReadbackMode::Exact);
+        let recovered = authority
+            .recover_retired(backend, desired.clone())
+            .await
+            .unwrap();
+        assert_eq!(recovered.group, desired);
     }
 
     #[tokio::test]
@@ -9121,6 +9210,8 @@ mod tests {
         }
         assert_eq!(state.group_atom_references(), MAX_GROUP_ATOM_REFERENCES);
         let encoded = state.encode();
+        assert_eq!(MAX_RECORD_BYTES, 512 * 1024);
+        assert_eq!(MIN_BACKEND_RECORD_BYTES, 576 * 1024);
         assert!(encoded.len() <= MAX_RECORD_BYTES, "{}", encoded.len());
         assert!(NamespaceState::decode(&encoded).is_some());
 

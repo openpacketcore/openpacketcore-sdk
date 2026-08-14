@@ -1572,14 +1572,6 @@ impl GtpuSessionGroupReconcileRequest {
         &self.desired
     }
 
-    /// The nonzero SDK-minted selector authority generation.
-    #[must_use]
-    pub const fn selector_authority_generation(
-        &self,
-    ) -> crate::GtpuSessionSelectorAuthorityGeneration {
-        self.selector_admission.generation()
-    }
-
     /// Return the opaque immutable backend binding carried by this SDK-issued
     /// effect request. This exposes no selector material or admission secret.
     #[must_use]

@@ -666,6 +666,7 @@ impl fmt::Debug for EbpfSessionIndexInventory {
 /// The production implementation loads the committed CO-RE object with `aya`,
 /// attaches tc clsact filters, and performs BPF map operations. Tests supply
 /// a deterministic fake.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SelectorNamespaceTerminalFenceState {
     Absent,
@@ -1660,6 +1661,8 @@ struct SelectorOperationStampAuthority {
     binding: crate::selector_namespace::GtpuSessionSelectorBackendBinding,
     install_effect_authority: bool,
     retirement_effect_authority: bool,
+    retired_readback_authority: bool,
+    retired_dataplane_generation: Option<GtpuSessionGeneration>,
     selector_generation: u64,
     nonce: [u8; 16],
     terminal_selector_generation: u64,
@@ -1678,6 +1681,10 @@ impl From<&crate::selector_namespace::GtpuSessionSelectorAdmission>
             binding: admission.binding(),
             install_effect_authority: admission.authorizes_install_effect(),
             retirement_effect_authority: admission.authorizes_retirement_effect(),
+            retired_readback_authority: admission.authorizes_retired_readback(),
+            retired_dataplane_generation: admission
+                .retired_dataplane_generation()
+                .and_then(|generation| GtpuSessionGeneration::new(generation.get())),
             selector_generation: admission.generation().get(),
             nonce: admission.operation_nonce(),
             terminal_selector_generation: admission.terminal_generation().get(),
@@ -1720,6 +1727,13 @@ impl SelectorOperationStampAuthority {
 
     const fn authorizes_retirement_effect(self) -> bool {
         self.retirement_effect_authority && !self.install_effect_authority
+    }
+
+    const fn authorizes_retired_readback(self) -> bool {
+        self.retired_readback_authority
+            && !self.install_effect_authority
+            && !self.retirement_effect_authority
+            && self.retired_dataplane_generation.is_some()
     }
 }
 
@@ -1923,8 +1937,14 @@ impl SelectorOperationStamp {
     }
 
     fn is_exact_terminal_retired(self, authority: SelectorOperationStampAuthority) -> bool {
-        GtpuSessionGeneration::new(self.dataplane_generation)
-            .is_some_and(|generation| self == Self::terminal_retired(authority, generation))
+        let generation = if authority.authorizes_retired_readback() {
+            authority.retired_dataplane_generation
+        } else if authority.authorizes_retirement_effect() {
+            GtpuSessionGeneration::new(self.dataplane_generation)
+        } else {
+            None
+        };
+        generation.is_some_and(|generation| self == Self::terminal_retired(authority, generation))
     }
 }
 
@@ -4240,7 +4260,7 @@ impl EbpfGtpuDataplaneBackend {
         authority: SelectorOperationStampAuthority,
     ) -> Result<[u8; GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN], GtpuError> {
         let _operation = self.operation_guard()?;
-        if !authority.authorizes_retirement_effect()
+        if !(authority.authorizes_retirement_effect() || authority.authorizes_retired_readback())
             || authority.binding.stable_device() != expected.device_id()
         {
             return Err(GtpuError::StateIndeterminate {
@@ -27389,30 +27409,26 @@ mod tests {
         }
 
         fn selector_namespace_fresh_provisioning_is_exact(state: &FakeState, ifindex: u32) -> bool {
-            super::aya_runtime::selector_namespace_fresh_provisioning_is_exact(
-                state
-                    .selector_namespace_fresh_provisioning
-                    .contains(&ifindex),
-                state.cleanup_only.contains(&ifindex),
-                state.attached.contains_key(&ifindex)
-                    && state.uplink_filter_ready.contains(&ifindex)
-                    && state.downlink_filter_ready.contains(&ifindex),
-                state.grouped_map_ready.contains(&ifindex),
-                Self::selector_namespace_maps_are_empty(state, ifindex),
-            )
+            state
+                .selector_namespace_fresh_provisioning
+                .contains(&ifindex)
+                && !state.cleanup_only.contains(&ifindex)
+                && state.attached.contains_key(&ifindex)
+                && state.uplink_filter_ready.contains(&ifindex)
+                && state.downlink_filter_ready.contains(&ifindex)
+                && state.grouped_map_ready.contains(&ifindex)
+                && Self::selector_namespace_maps_are_empty(state, ifindex)
         }
 
         fn selector_namespace_initializing_recovery_is_exact(
             state: &FakeState,
             ifindex: u32,
         ) -> bool {
-            super::aya_runtime::selector_namespace_initializing_recovery_is_exact(
-                state.cleanup_only.contains(&ifindex),
-                state.uplink_filter_ready.contains(&ifindex)
-                    || state.downlink_filter_ready.contains(&ifindex),
-                state.grouped_map_ready.contains(&ifindex),
-                Self::selector_namespace_maps_are_empty(state, ifindex),
-            )
+            state.cleanup_only.contains(&ifindex)
+                && !state.uplink_filter_ready.contains(&ifindex)
+                && !state.downlink_filter_ready.contains(&ifindex)
+                && state.grouped_map_ready.contains(&ifindex)
+                && Self::selector_namespace_maps_are_empty(state, ifindex)
         }
 
         fn pause_next_cleanup_only_adoption(&self) -> (Arc<Barrier>, Arc<Barrier>) {
