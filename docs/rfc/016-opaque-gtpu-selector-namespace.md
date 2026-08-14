@@ -1186,12 +1186,14 @@ The existing host-global advisory `flock` on the canonical control-directory
 descriptor remains the process-lifetime single-writer lease. Control-marker
 operations additionally take a bounded advisory `flock` on a distinct,
 persistent sibling inode derived from the same opaque namespace commitment.
-That operation lock is held across marker validation/creation and all
-map/program mutation/readback that relies on it, then released without
-releasing the writer lease. Keeping the original lease inode preserves
-coordination with older SDK writers during rolling upgrades. Network
-namespaces, process IDs, per-process paths, and a lock created in an untrusted
-directory are not equivalent.
+The exact sibling component is the 64-byte lowercase namespace commitment
+followed by `-operation-v1`; it is deliberately dot-free because bpffs reserves
+names containing a dot. That operation lock is held across marker
+validation/creation and all map/program mutation/readback that relies on it,
+then released without releasing the writer lease. Keeping the original lease
+inode preserves coordination with older SDK writers during rolling upgrades.
+Network namespaces, process IDs, per-process paths, and a lock created in an
+untrusted directory are not equivalent.
 
 The total cross-boundary lock order is the process-lifetime writer lease,
 durable namespace lease/fence, then the bounded host-global operation `flock`;

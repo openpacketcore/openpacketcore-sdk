@@ -12759,6 +12759,7 @@ mod aya_runtime {
 
     const TC_HANDLE: TcHandle = TcHandle::new(0, 1);
     const RECONCILER_CONTROL_DIRECTORY: &str = "GTPU_RECONCILER_LOCKS";
+    const RECONCILER_OPERATION_LOCK_SUFFIX: &str = "-operation-v1";
     const BPF_FS_MAGIC: u64 = 0xcafe_4a11;
     const CAP_NET_ADMIN: u32 = 12;
     const CAP_SYS_ADMIN: u32 = 21;
@@ -14242,7 +14243,7 @@ mod aya_runtime {
                 "ebpf_reconciler_ownership_recheck",
             )?;
 
-            let operation_lock_name = format!("{control_dir_name}.operation-v1");
+            let operation_lock_name = Self::selector_namespace_operation_lock_name(&namespace_hash);
             match rustix::fs::mkdirat(
                 &current_control_root,
                 operation_lock_name.as_str(),
@@ -14893,6 +14894,18 @@ mod aya_runtime {
             codec.extend_from_slice(&(leaf.len() as u64).to_be_bytes());
             codec.extend_from_slice(leaf);
             Ok(Sha256::digest(codec).into())
+        }
+
+        /// Produce the persistent sibling used for bounded selector-namespace
+        /// operations. bpffs reserves components containing a dot, so this
+        /// name is derived directly from the trusted commitment with a fixed,
+        /// dot-free suffix.
+        pub(super) fn selector_namespace_operation_lock_name(namespace_hash: &[u8; 32]) -> String {
+            format!(
+                "{}{}",
+                Self::lower_hex(namespace_hash),
+                RECONCILER_OPERATION_LOCK_SUFFIX
+            )
         }
 
         fn selector_binding_digest(
@@ -29043,6 +29056,24 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selector_namespace_operation_lock_name_is_bpffs_safe_and_disjoint() {
+        let namespace_hash = [0xab; 32];
+        let control_dir_name = "ab".repeat(32);
+        let operation_lock_name =
+            aya_runtime::AyaGtpuRuntime::selector_namespace_operation_lock_name(&namespace_hash);
+
+        assert_eq!(
+            operation_lock_name,
+            format!("{control_dir_name}-operation-v1")
+        );
+        assert_ne!(operation_lock_name, control_dir_name);
+        assert!(!operation_lock_name.contains('.'));
+        assert!(!operation_lock_name.contains('/'));
+        assert!(operation_lock_name.len() <= 255);
     }
     const LEGACY_V2_PIN_COUNT: usize = 9;
     const CURRENT_PIN_COUNT: usize = 25;

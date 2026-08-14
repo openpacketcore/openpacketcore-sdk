@@ -1738,7 +1738,9 @@ persistent operation-lock inode derived from the same opaque namespace hash.
 This lets each durable effect release its critical section without releasing
 the process-lifetime writer lease. The original control-directory inode remains
 the lifetime lease so cooperating older and newer SDK writers contend on the
-same upgrade-compatible safety boundary.
+same upgrade-compatible safety boundary. Its exact sibling component is the
+64-byte lowercase namespace hash followed by `-operation-v1`; the dot-free
+component is valid on bpffs, which reserves names containing a dot.
 
 The runtime takes both tc links out of Aya loader ownership, so dropping an old
 loader cannot detach a static filter that an external actor subsequently
