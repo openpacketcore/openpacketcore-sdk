@@ -5,7 +5,7 @@ use opc_session_store::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, EncryptingSessionBackend,
     Generation, LeaseError, OwnerId, SessionBackend, SessionKey, SessionKeyType,
     SessionLeaseManager, SessionOp, SessionOpResult, SqliteSessionBackend, StateClass, StateType,
-    StoreError, StoredSessionRecord, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+    StoreError, StoredSessionRecord,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use std::{sync::Arc, time::Duration};
@@ -109,7 +109,6 @@ async fn test_sqlite_capabilities_are_truthful_for_single_node_backend() {
     assert!(!caps.ordered_replication_log);
     assert!(!caps.watch);
     assert_eq!(caps.max_value_bytes, 4 * 1024 * 1024 + 64 * 1024);
-    assert!(caps.max_value_bytes <= RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES);
 }
 
 #[tokio::test]

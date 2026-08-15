@@ -34,7 +34,7 @@ pub const RESTORE_SCAN_MAX_PAGE_SIZE: usize = 1024;
 ///
 /// Backends must stop before crossing this limit. A single record whose
 /// payload exceeds the limit is rejected rather than returned partially.
-pub const RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
+pub const RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
 /// Hard maximum logical bytes retained by one restore page.
 ///
