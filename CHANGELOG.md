@@ -896,6 +896,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fixture, so no message that already round-tripped moves on the wire.
 
 ### Fixed
+- **Reconnect-time stateless consumer endpoint resolution — `opc-session-net`
+  (#688):** `StatelessSessionConsumerClient::new_with_resolver` now resolves a
+  stable endpoint before each fresh connection, so ordinary endpoint
+  replacement does not pin a process to a retired address. The authenticated
+  TLS server name, expected SPIFFE identity, and consumer scope remain fixed;
+  resolver failures are classified before request transmission, and ambiguous
+  mutations are never replayed. The existing `new(SocketAddr, ...)`
+  constructor remains a constant-address convenience.
 - **Cause-only Create Bearer rejection — `opc-proto-gtpv2c` (#653):**
   S2b Create Bearer Responses whose message-level Cause rejects the request may
   now omit Bearer Context IEs, as permitted by TS 29.274 clause 6.1.1. Typed

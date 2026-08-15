@@ -1,8 +1,9 @@
 //! Contract tests for the production stateless quorum-consumer boundary.
 
+use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,8 +12,9 @@ use futures_util::stream::BoxStream;
 use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_session_net::{
-    SessionConsumerAuthorizer, SessionConsumerClientError, SessionConsumerLeaseMutationError,
-    SessionQuorumConsumerServer, StatelessSessionConsumerClient, SESSION_QUORUM_CONSUMER_ALPN,
+    RemoteAddrResolver, SessionConsumerAuthorizer, SessionConsumerClientError,
+    SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionQuorumConsumerServer,
+    StatelessSessionConsumerClient, SESSION_QUORUM_CONSUMER_ALPN,
 };
 use opc_session_store::{
     BackendCapabilities, ConsensusSessionStore, OwnerId, QuorumReplicaDescriptor,
@@ -339,6 +341,194 @@ async fn one_authenticated_consumer_call_uses_the_dedicated_alpn_without_replay(
         "a mismatched cluster/configuration/epoch scope must not reach the service"
     );
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn consumer_resolver_reconnects_the_same_client_after_endpoint_replacement() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("resolver-server");
+    let client_spiffe = spiffe("resolver-client");
+    let first_service = Arc::new(CountingConsumer::default());
+    let (first_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (first_handle, first_address) = SessionQuorumConsumerServer::new(
+        first_service.clone(),
+        pki.server_config(&server_spiffe),
+        first_authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start first consumer listener");
+
+    let resolved_address = Arc::new(RwLock::new(first_address));
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolved_address = Arc::clone(&resolved_address);
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            let resolved_address = Arc::clone(&resolved_address);
+            let resolutions = Arc::clone(&resolutions);
+            Box::pin(async move {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Ok(*resolved_address.read().expect("resolver address lock"))
+            })
+        })
+    };
+    let client = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(first_address.ip().into()),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    );
+
+    assert_eq!(
+        client.capabilities().await,
+        Ok(BackendCapabilities::all_enabled())
+    );
+    assert_eq!(first_service.calls.load(Ordering::SeqCst), 1);
+    first_handle.abort_and_wait().await;
+
+    let second_service = Arc::new(CountingConsumer::default());
+    let (second_authorizer, second_scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    assert_eq!(scope, second_scope, "replacement listener keeps its scope");
+    let (second_handle, second_address) = SessionQuorumConsumerServer::new(
+        second_service.clone(),
+        pki.server_config(&server_spiffe),
+        second_authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start replacement consumer listener");
+    *resolved_address.write().expect("resolver address lock") = second_address;
+
+    assert_eq!(
+        client.capabilities().await,
+        Ok(BackendCapabilities::all_enabled()),
+        "the same client must reconnect through the replacement address"
+    );
+    assert_eq!(second_service.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "each new consumer connection must invoke the resolver"
+    );
+    second_handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn resolver_failure_is_unavailable_and_not_transmitted_for_mutations_and_leases() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("resolver-failure-server");
+    let client_spiffe = spiffe("resolver-failure-client");
+    let (_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            let resolutions = Arc::clone(&resolutions);
+            Box::pin(async move {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("resolver failure is redacted"))
+            })
+        })
+    };
+    let client = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).into(),
+        ),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    );
+
+    let mutation = client
+        .delete_fenced_with_id(SessionConsumerRequestId::new(), test_lease().await)
+        .await;
+    assert!(matches!(
+        mutation,
+        Err(SessionConsumerMutationError::NotTransmitted {
+            cause: SessionConsumerClientError::Unavailable
+        })
+    ));
+    let lease = client
+        .release_with_id(SessionConsumerRequestId::new(), test_lease().await)
+        .await;
+    assert!(matches!(
+        lease,
+        Err(SessionConsumerLeaseMutationError::NotTransmitted {
+            cause: SessionConsumerClientError::Unavailable
+        })
+    ));
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "each failed request resolves before its application frame is written"
+    );
+}
+
+#[tokio::test]
+async fn outcome_unknown_is_not_replayed_and_consumer_debug_is_redacted() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("debug-server");
+    let client_spiffe = spiffe("debug-client");
+    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let hanging = Arc::new(HangingConsumer::default());
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        hanging.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start hanging consumer listener");
+    let request_id = SessionConsumerRequestId::from_bytes([0x5a; 16]);
+    let client = StatelessSessionConsumerClient::new_with_resolver(
+        Arc::new(move || Box::pin(async move { Ok(address) })),
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    )
+    .with_operation_timeout(Duration::from_secs(1));
+
+    let outcome = client
+        .delete_fenced_with_id(request_id, test_lease().await)
+        .await;
+    assert!(matches!(
+        &outcome,
+        Err(SessionConsumerMutationError::OutcomeUnknown { request_id: retry_id })
+            if *retry_id == request_id
+    ));
+    assert_eq!(
+        hanging.calls.load(Ordering::SeqCst),
+        1,
+        "the client must never replay an application mutation after its outcome is unknown"
+    );
+
+    let diagnostic_address = "203.0.113.77:7443"
+        .parse::<SocketAddr>()
+        .expect("diagnostic address");
+    let diagnostic_dns = "voter.state.example";
+    let diagnostic_client = StatelessSessionConsumerClient::new_with_resolver(
+        Arc::new(move || Box::pin(async move { Ok(diagnostic_address) })),
+        rustls_pki_types::ServerName::try_from(diagnostic_dns.to_owned())
+            .expect("diagnostic DNS server name"),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    );
+    let client_debug = format!("{diagnostic_client:?}");
+    let outcome_debug = format!("{outcome:?}");
+    assert!(!client_debug.contains(&diagnostic_address.to_string()));
+    assert!(!client_debug.contains(diagnostic_dns));
+    assert!(!client_debug.contains(&server_spiffe));
+    assert!(!client_debug.contains(&format!("{scope:?}")));
+    assert!(!client_debug.contains("address"));
+    assert!(!client_debug.contains("scope"));
+    assert!(!outcome_debug.contains(&format!("{request_id:?}")));
+    assert!(!outcome_debug.contains("request_id"));
     handle.abort_and_wait().await;
 }
 
