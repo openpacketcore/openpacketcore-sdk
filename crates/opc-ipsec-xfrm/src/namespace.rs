@@ -2603,8 +2603,8 @@ impl NamespaceBoundLinuxXfrmBackend {
     /// | Record is `Applied` and the consumer's bookkeeping can still accept the group | `adopt` |
     /// | Record is `Applied` but the consumer already gave up on the group | `recover` |
     /// | Caller-side deadline expired while the actor converged | `adopt` first, `recover` if refused |
-    /// | Record is `Issuing` or `Compensating` | `recover` (adopt refuses) |
-    /// | Record is terminal | either; both report it idempotently |
+    /// | Record is `Prepared`, `Issuing`, `Compensating`, `NoMutation`, or `RolledBack` | `recover` (adopt refuses) |
+    /// | Record is `Committed` or `Retired` | either; both report it idempotently |
     ///
     /// Adoption re-authenticates the binding, incarnations, member digest, and
     /// epoch currency, reads every member back exactly, and commits only when
