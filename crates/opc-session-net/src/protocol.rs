@@ -3697,8 +3697,9 @@ pub(crate) fn ensure_replication_log_success_frame_fits_until(
 
 /// Size one successful restore response using the exact borrowed v5 wire DTO.
 ///
-/// This avoids cloning record payloads while the server progressively trims a
-/// page to the caller's response budget.
+/// This avoids cloning record payloads while validating the complete backend
+/// page against the caller's response budget. Restore transport never trims or
+/// rewrites a returned page or cursor.
 #[cfg(test)]
 pub(crate) fn ensure_restore_scan_success_frame_fits(
     page: &RestoreScanPage,

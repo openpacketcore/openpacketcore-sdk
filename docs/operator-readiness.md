@@ -418,8 +418,9 @@ remain exact, this does not enlarge the 365-day bound, and larger mismatches
 fail closed.
 
 The two new public error variants require exhaustive matches to be updated.
-Protocol v5 retains their private fixed-width DTOs and carries the current error
-revision 8; an error-revision-7 or older peer is rejected during exact
+Protocol v5 retains their private fixed-width DTOs and carries the current wire
+schema revision 7/error-set revision 9. Every non-current direct profile
+combination (including error revision 8 or older) is rejected during exact
 negotiation. Use the coordinated v5 rollout below before relying on typed
 responses.
 
@@ -1074,20 +1075,23 @@ wire-schema revision-7 upgrade remains a coordinated drained
 stop/upgrade/start; only subsequent credential rotations within a uniform
 revision-7 fleet use seamless lifecycle recycling.
 
-A session-net server first narrows the dispatched record limit from the
-negotiated 2,096,128-byte wire-payload bound. The backend may return fewer
-records than that narrowed request to respect its retained-page, aggregate
-payload, examined key/filter metadata, or 4,096 examined-candidate budget; a
-narrow scope may yield an empty page with an advancing cursor. Follow the
-confidential authenticated `next_cursor` until the issuer reports `complete`.
-Compatibility peer validation checks bounds, order, scope, cursor shape, and
-claimed progress; it cannot prove that an authenticated server did not omit a
-record or falsely report completion.
+A session-net server first conservatively narrows the dispatched record limit
+from the effective negotiated response frame using the `effective_max / 8192`
+record-count heuristic (with a minimum of one); it does not derive that count
+from the fixed 2,096,128-byte wire-payload cap. The backend may independently
+return fewer records than that narrowed request to respect its retained-page,
+aggregate-payload, examined key/filter metadata, or 4,096 examined-candidate
+budget; a narrow scope may yield an empty page with an advancing cursor. Follow
+the confidential authenticated `next_cursor` until the issuer reports
+`complete`. Compatibility peer validation checks bounds, order, scope, cursor
+shape, and claimed progress; it cannot prove that an authenticated server did
+not omit a record or falsely report completion.
 Production completeness comes only from scanning the barrier-confirmed local
-Openraft-applied state. The transport does not trim a returned page by payload
-size: a serialized page that still cannot fit the effective wire frame returns
-`RestoreScanResponseTooLarge` and is retried from the same cursor with a
-smaller record limit.
+Openraft-applied state. The transport validates the entire returned page
+against the fixed wire-payload cap and effective frame; it never trims or
+rewrites the page or cursor. An oversize page returns
+`RestoreScanResponseTooLarge` when representable and is retried from the same
+cursor with a smaller record limit, or closes the connection.
 
 Wire-schema revision 3 retains revision 2's negotiated response budget and
 adds the AES-256-GCM-SIV snapshot-bound cursor, explicit durable-page profile,
@@ -1115,10 +1119,12 @@ timeouts are valid immediate-fail settings.
 
 Every response and watch item is fully bounded-encoded before the prefix is
 written. Common non-pageable and complete-page successes use one bounded encode
-without a sizing preflight. An oversized pageable direct attempt emits no
-prefix; bounded logarithmic sizing probes and the final encode reuse the same
-absolute deadline established before the first encode/probe and continuing
-through socket delivery. This SDK uses lazy exact-length boxed chunks without a
+without a sizing preflight. For a replication-log page, an oversized pageable
+direct attempt emits no prefix; bounded logarithmic sizing probes and the final
+encode reuse the same absolute deadline established before the first encode/probe
+and continuing
+through socket delivery. Restore pages are validated as whole backend results
+and are never transport-shaped. This SDK uses lazy exact-length boxed chunks without a
 coalescing copy; retained encoded-JSON byte storage stays within the negotiated
 cap, while chunk metadata and allocator slab/RSS overhead remain separate.
 Storage/sizing sinks check deadline and server-abort cancellation cooperatively
@@ -1127,8 +1133,9 @@ is not asynchronously preemptible.
 Operationally:
 
 - never expect get/CAS records or positional batch results to be truncated;
-- continue restore pages by `next_cursor` and log pages by the next contiguous
-  sequence when the server returns a shortened complete prefix;
+- continue restore pages by `next_cursor`; the backend may return shorter
+  cursor-correct pages under its own budgets. Continue log pages by the next
+  contiguous sequence when the server returns a shortened complete prefix;
 - treat an over-limit watch item as a stream-ending gap, reconnecting from the
   last delivered sequence rather than skipping it; and
 - treat a fixed SDK-owned fallback or a connection close as fail-closed. If a
@@ -1187,9 +1194,10 @@ owner/custom-key/state-type bounds,
 depth-16/256-node trees. Stable IDs contain 1 through 64 bytes, replication
 transaction IDs contain 1 through 128 UTF-8 bytes, and CAS request IDs, when
 present, are canonical lowercase hyphenated UUIDs with the exact 36-byte encoding. A
-revision-4/error-revision-7 or older participant is incompatible, so that
-profile transition also requires the coordinated
-stop/upgrade/start above. `ContractProfile::max_frame_size` is a public Rust
+the direct profile is wire-schema revision 7/error-set revision 9; every
+non-current direct profile combination is incompatible, so that profile
+transition also requires the coordinated stop/upgrade/start above.
+`ContractProfile::max_frame_size` is a public Rust
 source break for external struct literals/destructuring and must be updated in
 that same transition.
 

@@ -313,16 +313,20 @@ mutation or rebuild authority beside Openraft.
   scope, cursor shape, and the server's claimed progress; it cannot prove that
   an authenticated server did not omit records or falsely report completion.
   Production completeness is the local Openraft-applied scan after a
-  linearizable barrier, not this compatibility RPC. The server first narrows
-  the dispatched record limit from the fixed 2,096,128-byte **wire** payload
-  bound. Backends may return fewer records than that narrowed request
-  (including an empty advancing sparse page) to stay within their retained-page,
-  aggregate-payload, examined-metadata, and 4,096 examined-candidate budgets;
-  callers continue from the confidential authenticated `next_cursor` until
-  `complete`. A server does not trim a returned page by payload size or rewrite
-  its backend cursor to fit a smaller wire frame: it returns
-  `RestoreScanResponseTooLarge`, allowing the caller to retry from the same
-  cursor with a smaller record limit. The wire omits redundant `loaded_count`
+  linearizable barrier, not this compatibility RPC. The server conservatively
+  narrows the dispatched record limit from the effective negotiated response
+  frame using the `effective_max / 8192` record-count heuristic (with a
+  minimum of one); it does not derive that count from the fixed 2,096,128-byte
+  wire-payload cap. Backends may independently return fewer records than that
+  narrowed request (including an empty advancing sparse page) to stay within
+  their retained-page, aggregate-payload, examined-metadata, and 4,096
+  examined-candidate budgets; callers continue from the confidential
+  authenticated `next_cursor` until `complete`. The transport validates the
+  entire backend page against the fixed wire-payload cap and effective frame;
+  it never trims or rewrites the page or cursor. An oversize page returns
+  `RestoreScanResponseTooLarge` when that error is representable, allowing the
+  caller to retry from the same cursor with a smaller record limit, or closes
+  the connection. The wire omits redundant `loaded_count`
   and `complete` values and recomputes both from records and cursor.
 - `SessionBackend::probe_replication_head` performs a fresh, deadline-bounded
   wire request. It does not consult the client's capability cache and reports
@@ -431,8 +435,10 @@ second independently configurable limit. The accepted response size is the
 smaller of the client's receive limit and the server's configured frame limit;
 the server request size independently bounds frames sent by that client. This
 supports unequal client/server settings without assuming either configured
-limit applies in both directions. A revision-4/error-revision-7 or older peer
-is incompatible; the ALPN is `opc-session-net/5`.
+limit applies in both directions. The exact direct profile is wire-schema
+revision 7/error-set revision 9; every non-current direct profile combination
+is incompatible. The ALPN is `opc-session-net/5`, and this profile requires a
+coordinated drained stop/upgrade/start.
 
 The 2,096,128-byte restore payload is a v5 wire-only contract value. It does
 not derive from a local backend capability or local scan budget: standalone
@@ -575,9 +581,11 @@ After bootstrap, the negotiated response budget applies to every response, not
 only restore pages. A non-pageable response, or a complete restore/log page
 that fits, takes the common single-encode path: it is bounded-encoded once and
 then emitted without a separate sizing serialization. If a complete pageable
-response is too large, that failed bounded encode emits no prefix; restore/log
-shaping may then use bounded logarithmic sizing probes and one final bounded
-encode. The direct attempt, every probe, final encode, prefix, payload, and
+response is too large, that failed bounded encode emits no prefix;
+replication-log shaping may then use bounded logarithmic sizing probes and one
+final bounded encode. Restore pages are validated as whole backend results and
+are never transport-shaped. The direct attempt, every probe, final encode,
+prefix, payload, and
 flush all share one absolute deadline established before the first encode or
 probe. Sizing counters and encoded storage check that deadline and
 `ServerHandle::abort` cancellation cooperatively between serializer
@@ -595,7 +603,7 @@ Response families use these fail-closed rules:
 | Fixed/scalar store or lease results | Replace an oversized backend-provided result/error with the operation's fixed SDK-owned, redaction-safe fallback when it fits; otherwise close. |
 | Get and CAS conflict records | Never truncate a record. Replace the record-bearing result with the fixed fallback, or close if even that cannot fit. |
 | Batch | Never truncate or reorder the positional result vector. Replace the complete batch response with its fixed fallback, or close. Earlier backend effects may already exist. |
-| Restore scan | Return a complete record prefix that fits and preserve `next_cursor`/excluded-count semantics. If the first record cannot fit, return the fixed restore-size error; never split a record. |
+| Restore scan | Return the complete backend page when it fits, preserving its `next_cursor`/excluded-count semantics. If the whole page exceeds the wire cap or effective frame, return the fixed restore-size error when representable or close; never trim, split, or rewrite records/cursors. |
 | Replication log | Return the largest complete contiguous entry prefix that fits. Never split an entry or skip a sequence; use the fixed fallback when no entry can fit. |
 | Watch | Bound the stream acknowledgement and every item independently. An item that cannot fit is not skipped; emit a fixed error item when representable and terminate the stream/connection so the client resumes from its last delivered sequence. |
 
@@ -1013,8 +1021,9 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   maximum is accepted and zero means immediate expiry. The TTL request shape is
   unchanged for entries within the operation-tree contract. The new serialized
   error variants require external exhaustive matches. Their wire representation
-  was introduced by v4 error revision 1 and is retained by current error
-  revision 8; an error-revision-7 or older peer fails exact negotiation.
+  was introduced by v4 error revision 1 and is retained by current v5 error
+  revision 9. Every non-current direct profile combination fails exact
+  negotiation.
   Legacy persisted replication logs must be
   audited before upgrade because an entry carrying a larger TTL now fails
   closed during replay or rebuild rather than being clamped. Cross-field

@@ -398,9 +398,11 @@ fail closed even if an outer layer omitted validation.
 The new errors are public enum variants, so external exhaustive matches MUST be
 updated. Protocol v4 introduced their private fixed-width DTOs in error
 revision 1; current v5 error revision 9 retains those encodings and adds
-bounded expiry-preflight and topology-authority outcomes. An error-revision-8 or older decoder is rejected
-during the exact handshake;
-deployments MUST use the coordinated v5 rollout in §12.3.
+bounded expiry-preflight and topology-authority outcomes. The exact direct v5
+profile is wire-schema revision 7/error-set revision 9; every non-current direct
+profile combination (including error revision 8 or older) MUST be rejected
+during the exact handshake. Deployments MUST use the coordinated v5 rollout in
+§12.3.
 
 ### 7.2 Absolute Record Expiry Authority
 
@@ -1129,10 +1131,12 @@ Every post-bootstrap response and watch item MUST be fully bounded-encoded into
 retained byte storage capped at the accepted response size before a length
 prefix is written.
 The common non-pageable and complete-page success path MUST perform one bounded
-encode without a separate sizing serialization. If the complete pageable
-response is oversized, that direct encode MUST emit no prefix; prefix selection
-MAY then perform bounded logarithmic sizing probes followed by one final bounded
-encode. No retained encoded-JSON byte storage may exceed the negotiated cap.
+encode without a separate sizing serialization. For a replication-log page, if
+the complete pageable response is oversized, that direct encode MUST emit no
+prefix; prefix selection MAY then perform bounded logarithmic sizing probes
+followed by one final bounded encode. Restore pages MUST be validated as whole
+backend results and MUST NOT be transport-shaped. No retained encoded-JSON byte
+storage may exceed the negotiated cap.
 The retained/requested encoded-JSON byte storage MUST remain no greater than the
 cap, including for non-power-of-two budgets. An implementation MUST NOT
 coalesce or create a temporary payload buffer when doing so would exceed that
@@ -1164,10 +1168,12 @@ Outbound behavior is family-specific:
 - Batch results MUST preserve exact request cardinality and order. They MUST NOT
   be truncated; an oversized complete result becomes one fixed batch error or a
   connection close.
-- Restore results MAY return a complete record prefix that fits, but
-  MUST preserve `next_cursor` and excluded-count semantics. A record MUST NOT be
-  split. When the first record cannot fit, the server MUST return the fixed
-  restore-size error if representable or close.
+- Restore backends MAY independently return a shorter cursor-correct page under
+  their count, payload, or work budgets. The transport MUST validate the entire
+  returned page against the fixed 2,096,128-byte wire-payload cap and the
+  negotiated frame; it MUST NOT trim or rewrite records or cursors. If the whole
+  page is oversized, the server MUST return typed
+  `RestoreScanResponseTooLarge` if representable or close.
 - Replication-log results MAY return only the largest complete contiguous entry
   prefix that fits. An entry MUST NOT be split, reordered, or skipped. If no
   requested entry fits, the server MUST use its fixed fallback or close.
@@ -1933,7 +1939,7 @@ fencing.
   fail-closed revision-1/revision-2 profile mismatch.
 - Exact-limit and one-byte-over outbound encoding for every response/watch
   family; no oversized allocation or emitted prefix on rejection; non-truncated
-  record/batch behavior; contiguous log and cursor-correct restore prefixes;
+  record/batch behavior; contiguous log and cursor-correct restore pages;
   fixed fallback redaction; and iterative consuming rejection of nested trees.
 - One absolute write deadline for prefix/payload/flush; authenticated slow-reader
   reaping; handler/connection-slot return to baseline; repeated reconnect bounds

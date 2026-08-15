@@ -4889,6 +4889,14 @@ pub(crate) fn validate_command_for_log(
     command: &SessionConsensusCommand,
     identity: SessionConsensusIdentity,
 ) -> io::Result<()> {
+    validate_command_for_log_with_cap(command, identity, true)
+}
+
+fn validate_command_for_log_with_cap(
+    command: &SessionConsensusCommand,
+    identity: SessionConsensusIdentity,
+    enforce_payload_cap: bool,
+) -> io::Result<()> {
     if command.schema_version != SESSION_CONSENSUS_SCHEMA_VERSION {
         return Err(invalid_data("unsupported session consensus command schema"));
     }
@@ -4916,18 +4924,41 @@ pub(crate) fn validate_command_for_log(
         SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
         intent => intent,
     };
+    if matches!(semantic_intent, SessionMutationIntent::Authorized { .. }) {
+        return Err(invalid_data(
+            "session consensus authorized intent nesting is invalid",
+        ));
+    }
     if let SessionMutationIntent::CompareAndSet(op) = semantic_intent {
         crate::ttl::validate_stored_record_expiry_at(&op.new_record, command.logical_time)
             .map_err(|_| invalid_data("session consensus record expiry is invalid"))?;
-        if op.new_record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
-            return Err(invalid_data(
-                "session consensus requires a sealed record payload",
-            ));
+        match super::validate_consensus_record(&op.new_record) {
+            Ok(()) => {}
+            Err(StoreError::PayloadTooLarge { .. }) if !enforce_payload_cap => {
+                if op.new_record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
+                    return Err(invalid_data(
+                        "session consensus requires a sealed record payload",
+                    ));
+                }
+                op.new_record
+                    .payload
+                    .validate_envelope_for_record(&op.new_record)
+                    .map_err(|_| invalid_data("session consensus record envelope is invalid"))?;
+            }
+            Err(StoreError::PayloadTooLarge { .. }) => {
+                return Err(invalid_data(
+                    "session consensus record payload exceeds the consensus limit",
+                ));
+            }
+            Err(StoreError::Crypto(_))
+                if op.new_record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 =>
+            {
+                return Err(invalid_data(
+                    "session consensus requires a sealed record payload",
+                ));
+            }
+            Err(_) => return Err(invalid_data("session consensus record envelope is invalid")),
         }
-        op.new_record
-            .payload
-            .validate_envelope_for_record(&op.new_record)
-            .map_err(|_| invalid_data("session consensus record envelope is invalid"))?;
     }
     Ok(())
 }
@@ -4939,6 +4970,24 @@ fn validate_entry_for_membership_scope(
 ) -> io::Result<()> {
     match &entry.payload {
         EntryPayload::Normal(command) => validate_command_for_log(command, storage_identity),
+        EntryPayload::Membership(membership) => validate_membership_for_log(
+            &StoredMembership::new(Some(entry.log_id), membership.clone()),
+            scope,
+            entry.log_id.index,
+        ),
+        EntryPayload::Blank => Ok(()),
+    }
+}
+
+fn validate_entry_for_apply(
+    entry: &Entry<SessionRaftTypeConfig>,
+    storage_identity: SessionConsensusIdentity,
+    scope: &MembershipValidationScope,
+) -> io::Result<()> {
+    match &entry.payload {
+        EntryPayload::Normal(command) => {
+            validate_command_for_log_with_cap(command, storage_identity, false)
+        }
         EntryPayload::Membership(membership) => validate_membership_for_log(
             &StoredMembership::new(Some(entry.log_id), membership.clone()),
             scope,
@@ -6546,7 +6595,12 @@ fn read_outcome_sync(
     let digest = digest.try_into().map_err(|_| {
         invalid_data("persisted session consensus request digest has invalid length")
     })?;
-    Ok(Some((digest, decode_json(&response)?)))
+    let response: SessionConsensusResponse = decode_json(&response)?;
+    if let Ok(SessionMutationOutcome::ConsumerRecord(Some(record))) = &response.result {
+        super::validate_consensus_record(record)
+            .map_err(|_| invalid_data("persisted session consensus consumer record is invalid"))?;
+    }
+    Ok(Some((digest, response)))
 }
 
 fn validate_membership_ids(
@@ -6595,10 +6649,13 @@ fn execute_application_intent_sync(
         | SessionMutationIntent::BindConsumerRequest { .. } => {
             Ok((SessionMutationOutcome::Unit, None))
         }
-        SessionMutationIntent::ReadConsumerRecord { key } => Ok((
-            SessionMutationOutcome::ConsumerRecord(ops::get_sync(conn, key, logical_time)?),
-            None,
-        )),
+        SessionMutationIntent::ReadConsumerRecord { key } => {
+            let record = ops::get_sync(conn, key, logical_time)?;
+            if let Some(record) = &record {
+                super::validate_consensus_record(record)?;
+            }
+            Ok((SessionMutationOutcome::ConsumerRecord(record), None))
+        }
         SessionMutationIntent::CompareAndSet(op) => {
             if op.new_record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
                 return Err(StoreError::Serialization(
@@ -7024,7 +7081,7 @@ pub(crate) fn apply_entries_with_authority_sync(
         // have staged, fenced, or aborted a transition. Validate each entry
         // against the scope visible at its exact apply position.
         let scope = read_membership_scope_sync(&tx, identity)?;
-        validate_entry_for_membership_scope(&entry, identity, &scope)?;
+        validate_entry_for_apply(&entry, identity, &scope)?;
         let expected_index = last_applied
             .as_ref()
             .map(|log_id| {
@@ -8614,161 +8671,6 @@ fn validate_attached_snapshot_database_sync(
     Ok(())
 }
 
-fn replace_state_from_attached_snapshot_sync(
-    tx: &Transaction<'_>,
-    identity: SessionConsensusIdentity,
-    meta: &opc_consensus::engine::SnapshotMeta<
-        SessionConsensusNodeId,
-        opc_consensus::engine::EmptyNode,
-    >,
-    final_file_name: &str,
-    checksum: [u8; 32],
-    byte_length: i64,
-) -> io::Result<()> {
-    for (table, columns) in [
-        (
-            "session_records",
-            "tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding",
-        ),
-        (
-            "leases",
-            "tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at",
-        ),
-        (
-            "key_fences",
-            "tenant, nf_kind, key_type, stable_id, fence",
-        ),
-        ("lease_globals", "key, val"),
-        (
-            "session_replication_log",
-            "sequence, tx_id, entry_json, timestamp",
-        ),
-        (
-            "consensus_request_outcomes",
-            "request_id, configuration_epoch, payload_digest, response_json",
-        ),
-        (
-            "consensus_machine",
-            "singleton, configuration_epoch, application_sequence, last_digest, logical_time, watch_sequence",
-        ),
-        (
-            "consensus_membership",
-            "singleton, configuration_epoch, membership_json",
-        ),
-        (
-            "consensus_membership_scope",
-            "singleton, storage_configuration_epoch, current_configuration_id, current_configuration_epoch, current_members_json, current_bindings_json, application_authority_epoch, application_authority_members_json, predecessor_configuration_id, predecessor_transition_id, predecessor_transition_digest, predecessor_configuration_epoch, predecessor_members_json, predecessor_transition_start_index, predecessor_cutover_index, pending_transition_id, pending_transition_digest, desired_configuration_id, desired_configuration_epoch, desired_members_json, desired_bindings_json, pending_transition_start_index, pending_learners_ready_index, pending_joint_membership_index, pending_uniform_membership_index, terminal_transition_id, terminal_transition_digest, terminal_transition_outcome, terminal_transition_start_index, terminal_learners_ready_index, terminal_joint_membership_index, terminal_uniform_membership_index, terminal_cutover_index, terminal_finalization_index, terminal_desired_configuration_id, terminal_desired_configuration_epoch, terminal_desired_members_json, terminal_desired_bindings_json, terminal_abort_learners_json, terminal_abort_decision_index, terminal_abort_cleanup_membership_index",
-        ),
-        (
-            "consensus_membership_history",
-            "configuration_epoch, storage_configuration_epoch, configuration_id, members_json, transition_id, transition_digest, transition_start_index, cutover_index",
-        ),
-        (
-            "consensus_membership_terminal_history",
-            "transition_id, storage_configuration_epoch, transition_digest, outcome, expected_member_count, transition_start_index, learners_ready_index, joint_membership_index, uniform_membership_index, cutover_index, finalization_index, abort_decision_index, abort_cleanup_membership_index",
-        ),
-        (
-            "consensus_applied",
-            "singleton, configuration_epoch, term, log_index, log_id_json",
-        ),
-        (
-            "consensus_operator_recovery",
-            "singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor",
-        ),
-        ("restore_scan_state", "singleton, epoch, revision, cursor_key"),
-    ] {
-        tx.execute(&format!("DELETE FROM {table}"), [])
-            .map_err(db_error)?;
-        tx.execute(
-            &format!(
-                "INSERT INTO {table} ({columns}) SELECT {columns} FROM consensus_incoming.{table}"
-            ),
-            [],
-        )
-        .map_err(db_error)?;
-    }
-    ops::rotate_restore_scan_incarnation_sync(tx)
-        .map_err(|_| invalid_data("installed session snapshot restore metadata failed"))?;
-    tx.execute(
-        "INSERT OR REPLACE INTO consensus_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
-        params![
-            epoch_i64(identity)?,
-            encode_json(meta)?,
-            final_file_name,
-            checksum.as_slice(),
-            byte_length,
-        ],
-    )
-    .map_err(db_error)?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn install_dynamic_snapshot_database_from_path_sync(
-    conn: &Connection,
-    identity: SessionConsensusIdentity,
-    snapshot_db_path: &Path,
-    meta: &opc_consensus::engine::SnapshotMeta<
-        SessionConsensusNodeId,
-        opc_consensus::engine::EmptyNode,
-    >,
-    final_file_name: &str,
-    checksum: [u8; 32],
-    byte_length: u64,
-) -> io::Result<()> {
-    let incoming_last_log_id = meta.last_log_id.as_ref();
-    validate_snapshot_floor(conn, identity, incoming_last_log_id)?;
-    let expected_scope = read_membership_scope_sync(conn, identity)?;
-    let local_candidate_marker = read_candidate_bootstrap_marker_sync(conn, identity)?;
-    if final_file_name.is_empty()
-        || final_file_name.contains('/')
-        || final_file_name.contains('\\')
-        || final_file_name == "."
-        || final_file_name == ".."
-    {
-        return Err(invalid_data("invalid session consensus snapshot file name"));
-    }
-    let byte_length = checked_positive_i64(byte_length)?;
-    let snapshot_path = snapshot_db_path
-        .to_str()
-        .ok_or_else(|| invalid_data("session consensus snapshot path is not UTF-8"))?;
-    conn.execute("ATTACH DATABASE ?1 AS consensus_incoming", [snapshot_path])
-        .map_err(db_error)?;
-    let result = (|| {
-        let tx =
-            Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
-        validate_snapshot_floor(&tx, identity, incoming_last_log_id)?;
-        create_attached_snapshot_validation_views(&tx)?;
-        let validation = validate_attached_snapshot_database_sync(
-            &tx,
-            identity,
-            ConsensusAuthorityProfile::Dynamic,
-            &expected_scope,
-            None,
-            None,
-            None,
-            local_candidate_marker,
-            meta,
-        );
-        let drop_views = drop_attached_snapshot_validation_views(&tx);
-        validation?;
-        drop_views?;
-        replace_state_from_attached_snapshot_sync(
-            &tx,
-            identity,
-            meta,
-            final_file_name,
-            checksum,
-            byte_length,
-        )?;
-        tx.commit().map_err(db_error)
-    })();
-    let detach = conn
-        .execute("DETACH DATABASE consensus_incoming", [])
-        .map_err(db_error);
-    result.and(detach.map(|_| ()))
-}
-
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 pub(crate) fn install_snapshot_database_sync(
@@ -8880,17 +8782,6 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
     checksum: [u8; 32],
     byte_length: u64,
 ) -> io::Result<()> {
-    if authority_profile == ConsensusAuthorityProfile::Dynamic {
-        return install_dynamic_snapshot_database_from_path_sync(
-            conn,
-            identity,
-            pinned.path(),
-            meta,
-            final_file_name,
-            checksum,
-            byte_length,
-        );
-    }
     let incoming_last_log_id = meta.last_log_id.as_ref();
     validate_snapshot_floor(conn, identity, incoming_last_log_id)?;
     let expected_scope = read_membership_scope_sync(conn, identity)?;
@@ -9739,6 +9630,195 @@ mod tests {
             mismatched.consensus_get_at(&key(), timestamp(1)).await,
             Err(StoreError::Crypto(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn committed_consumer_read_rejects_invalid_persisted_record() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("membership entry");
+        let invalid = sealed_record_for_key(key(), 1_048_577);
+        ops::insert_or_replace_record_sync(&conn, &invalid).expect("inject invalid record");
+
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![topology_entry_at(
+                1,
+                0xD1,
+                SessionMutationIntent::ReadConsumerRecord { key: key() },
+            )],
+        )
+        .expect("invalid read is a deterministic rejection");
+        assert!(matches!(
+            applied.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::PayloadTooLarge {
+                    actual: 1_048_577,
+                    max: 1_048_576,
+                }),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn replayed_consumer_outcome_rejects_invalid_serialized_record() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let request_id = SessionConsensusRequestId::from_bytes([0xD2; 16]);
+        let response = SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::ConsumerRecord(Some(
+                sealed_record_for_key(key(), 1_048_577),
+            ))),
+            sequence: 1,
+            digest: Some(SessionConsensusEntryDigest::from_bytes([0xA2; 32])),
+            logical_time: Some(timestamp(1)),
+            raft_log_index: 1,
+        };
+        conn.execute(
+            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, response_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                request_id.as_bytes().as_slice(),
+                epoch_i64(identity()).expect("epoch"),
+                [0xB2_u8; 32].as_slice(),
+                encode_json(&response).expect("response encoding"),
+            ],
+        )
+        .expect("seed invalid replay outcome");
+
+        let error = read_outcome_sync(&conn, identity(), request_id)
+            .expect_err("invalid replayed consumer record must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "persisted session consensus consumer record is invalid"
+        );
+    }
+
+    #[test]
+    fn follower_log_admission_rejects_oversized_and_nested_authorized_records() {
+        let lease = crate::LeaseGuard::new(
+            key(),
+            OwnerId::new("consensus-cap-owner").expect("owner"),
+            crate::FenceToken::new(1),
+            timestamp(1),
+            timestamp(1),
+            1,
+        );
+        let oversized = capped_cas_entry(
+            1,
+            [0xD3; 16],
+            lease,
+            None,
+            crate::Generation::new(1),
+            1_048_577,
+        );
+        let oversized_command = match oversized.payload {
+            EntryPayload::Normal(command) => command,
+            _ => panic!("oversized fixture is normal"),
+        };
+        let error = validate_command_for_log(&oversized_command, identity())
+            .expect_err("one-over sealed record must not enter the log");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let nested = SessionConsensusCommand {
+            intent: SessionMutationIntent::Authorized {
+                origin: member(7),
+                authority_identity: identity(),
+                mutation: Box::new(SessionMutationIntent::Authorized {
+                    origin: member(7),
+                    authority_identity: identity(),
+                    mutation: Box::new(oversized_command.intent),
+                }),
+            },
+            ..oversized_command
+        };
+        let error = validate_command_for_log(&nested, identity())
+            .expect_err("nested authorized intent must not enter the log");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "session consensus authorized intent nesting is invalid"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dynamic_snapshot_install_uses_pinned_source_after_path_replacement() {
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let source_a =
+            SqliteSessionBackend::open(directory.path().join("source-a.sqlite")).expect("source A");
+        let source_b =
+            SqliteSessionBackend::open(directory.path().join("source-b.sqlite")).expect("source B");
+        let snapshot_a_path = directory.path().join("snapshot-a.sqlite");
+        let snapshot_b_path = directory.path().join("snapshot-b.sqlite");
+        let (meta, byte_length_a) = {
+            let conn = source_a.conn.lock().await;
+            initialize_schema(&conn, identity(), &expected_members()).expect("source A schema");
+            let entries = vec![membership_entry(), acquire_entry(1, [0xD4; 16], "owner-a")];
+            apply_entries_sync(&conn, identity(), &source_a.caps, entries).expect("source A state");
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&conn, identity(), &snapshot_a_path)
+                    .expect("source A snapshot");
+            let byte_length = std::fs::metadata(&snapshot_a_path)
+                .expect("source A metadata")
+                .len();
+            (
+                opc_consensus::engine::SnapshotMeta {
+                    last_log_id,
+                    last_membership,
+                    snapshot_id: "pinned-dynamic-source".into(),
+                },
+                byte_length,
+            )
+        };
+        {
+            let conn = source_b.conn.lock().await;
+            initialize_schema(&conn, identity(), &expected_members()).expect("source B schema");
+            let entries = vec![membership_entry(), acquire_entry(1, [0xD5; 16], "owner-b")];
+            apply_entries_sync(&conn, identity(), &source_b.caps, entries).expect("source B state");
+            build_snapshot_database_sync(&conn, identity(), &snapshot_b_path)
+                .expect("source B snapshot");
+        }
+        drop(source_a);
+        drop(source_b);
+
+        let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+            open_nofollow_read(&snapshot_a_path).expect("pin source A"),
+            snapshot_a_path.clone(),
+        )
+        .expect("pinned source A");
+        let displaced = directory.path().join("snapshot-a.displaced.sqlite");
+        std::fs::rename(&snapshot_a_path, &displaced).expect("displace source A");
+        std::fs::rename(&snapshot_b_path, &snapshot_a_path).expect("publish source B");
+
+        let target = SqliteSessionBackend::in_memory().expect("target");
+        let conn = target.conn.lock().await;
+        initialize_schema(&conn, identity(), &expected_members()).expect("target schema");
+        install_snapshot_database_from_pinned_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+            None,
+            None,
+            pinned,
+            None,
+            &meta,
+            "pinned-dynamic.opc",
+            [0xD6; 32],
+            byte_length_a,
+        )
+        .expect("pinned source A installs");
+        let owner: String = conn
+            .query_row("SELECT owner FROM leases", [], |row| row.get(0))
+            .expect("installed lease");
+        assert_eq!(owner, "owner-a");
     }
 
     #[tokio::test]

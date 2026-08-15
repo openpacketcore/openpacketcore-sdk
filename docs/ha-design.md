@@ -344,8 +344,9 @@ backend dispatch and may return the typed response. The new public error
 variants require external exhaustive matches. Protocol v4 introduced their
 private fixed-width DTOs in error revision 1; current v5 error revision 9
 retains those encodings and adds bounded expiry-preflight and
-topology-authority outcomes. It rejects error-revision-8 or older peers during the exact
-handshake. Operators must audit legacy
+topology-authority outcomes. The exact direct v5 profile is wire-schema
+revision 7/error-set revision 9; every non-current direct profile combination is
+rejected during the exact handshake. Operators must audit legacy
 persisted logs before upgrade because a TTL-bearing entry
 above the bound now fails closed during replay/rebuild rather than being
 clamped or rewritten. Replicated deadline validation permits at most one
@@ -515,9 +516,9 @@ Error-set revision 4 adds checked replication-log range overflow, page-limit,
 and compacted-cursor outcomes; revision 5 adds non-CAS backend and lease
 ambiguity outcomes; revision 6 adds bounded-watch catch-up; revision 7 adds
 absolute-record-expiry rejection; and revision 8 adds the bounded
-expiry-preflight limit outcome. A revision-4/error-revision-7 or older peer is
-therefore
-incompatible.
+expiry-preflight limit outcome. The exact direct v5 profile is wire-schema
+revision 7/error-set revision 9; every non-current direct profile combination is
+therefore incompatible and requires a coordinated drained stop/upgrade/start.
 
 Every forwarding wrapper and authenticated CAS/batch dispatcher obtains the
 payload-free expiry-authority verdict before idempotency admission, cache
@@ -529,19 +530,25 @@ unchanged.
 
 Every server response and watch item is fully bounded-encoded before a length
 prefix is emitted. Common non-pageable and complete-page successes use one
-bounded encode without a sizing preflight. An oversized pageable direct attempt
-emits no prefix; bounded logarithmic sizing probes and the final encode share
-one absolute deadline established before the first encode/probe and continuing
-through prefix, payload, and flush. Lazy exact-length boxed chunks are not
+bounded encode without a sizing preflight. For a replication-log page, an
+oversized pageable direct attempt emits no prefix; bounded logarithmic sizing
+probes and the final encode share one absolute deadline established before the
+first encode/probe and continuing
+through prefix, payload, and flush. Restore pages are validated as whole
+backend results and are never transport-shaped. Lazy exact-length boxed chunks are not
 coalesced and retained encoded-JSON
 byte storage stays within the limit; metadata and allocator slab/RSS overhead
 remain separate. Storage/sizing sinks check deadline and server-abort
 cancellation cooperatively between serializer writes/chunks. Tokio cannot
 preempt one synchronous serializer callback, whose input remains bounded by the
 profile. Expiry closes the connection and returns the handler/connection permit.
-Get/CAS records and positional batch vectors are never truncated. Restore may
-return a complete cursor-correct prefix; replication-log reads return the
-largest complete contiguous-sequence prefix that fits. Watch cannot skip an
+Get/CAS records and positional batch vectors are never truncated. Restore
+backends may independently return shorter cursor-correct pages under their
+count, payload, or work budgets; transport validates each complete page against
+the fixed wire cap and negotiated frame and never trims or rewrites it.
+An oversize restore page returns typed `RestoreScanResponseTooLarge` when
+representable or closes. Replication-log reads return the largest complete
+contiguous-sequence prefix that fits. Watch cannot skip an
 oversized entry; it emits a fixed SDK-owned error when representable and ends,
 or closes immediately. A fixed fallback that itself cannot fit also causes a
 fail-closed close. Rejected nested entries keep iterative disposal and bounded
