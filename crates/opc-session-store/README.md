@@ -213,9 +213,10 @@ independent HA placement.
   `RestoreBlockReason`, summaries, page-size constants, and
   `summarize_restore_records`. Durable SQLite scans seek over the existing
   composite primary key, examine at most 4,096 live candidates plus one
-  lookahead per page, cap combined payloads at 4 MiB, retained page bytes at
-  8 MiB, and examined key/filter metadata at 8 MiB, and stop after 2,000,000
-  SQLite VM steps or 1 second of SQLite work. One absolute restore deadline
+  lookahead per page, cap combined **stored** payloads at 4 MiB + 64 KiB,
+  retained page bytes at 8 MiB, and examined key/filter metadata at 8 MiB,
+  and stop after 2,000,000 SQLite VM steps or 1 second of SQLite work. One
+  absolute restore deadline
   begins at the public entry point and covers the Openraft barrier/apply path,
   worker admission, asynchronous connection admission, SQLite progress, and
   task join. Each backend admits exactly one blocking restore worker, and the
@@ -238,6 +239,10 @@ independent HA placement.
   remains below 2 KiB and fits the legacy adapter's minimum frame.
   Exact response sizing returns typed `RestoreScanResponseTooLarge` without a
   partial frame unless peers negotiated a sufficient frame (up to 16 MiB).
+  The local stored-page ceiling is intentionally independent of session-net
+  v5's fixed 4 MiB wire payload ceiling: local SQLite restore can recover its
+  advertised 4 MiB + 64 KiB stored record limit, including sealing-envelope
+  overhead, but an oversized local page is never transportable as a v5 page.
 - `opc-session-net` protocol v5 can transport only the durable opaque restore
   page profile. Compatibility offset cursors from `FakeSessionBackend` are
   local test evidence and are rejected by both remote client and server; this

@@ -1313,6 +1313,16 @@ CAS/readback attempts, 64 concurrent supervisor slots per namespace, 256 per pro
 16 marker entries, 512 KiB/256 atoms in one exact backend inspection, and a
 4 KiB diagnostic/evidence record, as in RFC 016.
 
+This is a stored-envelope admission requirement: `max_value_bytes` measures
+the bytes accepted by the protected store after local-AEAD or remote sealing,
+not an equal plaintext promise made by a sealing wrapper. A local restore scan
+must therefore retain and recover one exact 4 MiB + 64 KiB stored record. That
+local recovery budget is distinct from the existing `opc-session-net` v5
+restore-page wire budget, which remains exactly 4 MiB. The wire contract
+rejects an oversized complete page during both server serialization and client
+decode; it neither splits a record nor changes the v5 wire schema/profile
+revision to carry the local envelope headroom.
+
 Those count limits are independent ceilings, not permission to combine every
 ceiling in one record. Every v2 state also satisfies a coupled **restore
 recoverability invariant**. Let `R` be the exact number of reconstructible

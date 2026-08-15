@@ -315,7 +315,7 @@ mutation or rebuild authority beside Openraft.
   Production completeness is the local Openraft-applied scan after a
   linearizable barrier, not this compatibility RPC. Backends may return fewer records than requested
   (including an empty advancing sparse page) to stay within the fixed 4 MiB
-  payload, 8 MiB retained-page, 8 MiB examined-metadata, and 4,096
+  **wire** payload, 8 MiB retained-page, 8 MiB examined-metadata, and 4,096
   examined-candidate budgets; callers continue from the
   confidential authenticated `next_cursor` until `complete`. A server does not
   rewrite a backend cursor to fit a smaller wire frame: it returns
@@ -430,6 +430,13 @@ the server request size independently bounds frames sent by that client. This
 supports unequal client/server settings without assuming either configured
 limit applies in both directions. A revision-4/error-revision-7 or older peer
 is incompatible; the ALPN is `opc-session-net/5`.
+
+The 4 MiB restore payload is a v5 wire-only contract value. It does not derive
+from a local backend capability or local scan budget: standalone SQLite may
+restore one 4 MiB + 64 KiB stored envelope locally. Server serialization and
+client response decoding both reject a page one byte over the fixed wire cap,
+without emitting or accepting a partial page, while the wire schema and
+contract-profile revision remain v5/revision 6.
 
 Error-set revision 4 adds typed replication-log range overflow, page-limit,
 and compacted-cursor outcomes. A log request normalizes `start = 0` to one;

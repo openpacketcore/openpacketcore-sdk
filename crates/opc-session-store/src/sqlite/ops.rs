@@ -20,7 +20,7 @@ use crate::{
     restore::{
         restore_record_retained_bytes_from_lengths, RestoreScanCursor, RestoreScanPage,
         RestoreScanRequest, RestoreScanScope, RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES,
-        RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+        RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE, RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES,
         RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES, RESTORE_SCAN_MAX_SQLITE_VM_STEPS,
         RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
     },
@@ -863,10 +863,10 @@ pub(crate) fn scan_restore_records_sync(
         let previous_last_examined_key = last_examined_key.clone();
 
         if candidate.matches_scope(&request.scope) {
-            if row_budget.payload_bytes > RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES {
+            if row_budget.payload_bytes > RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES {
                 if examined_count == 0 && candidates.is_empty() {
                     return Err(StoreError::RestoreScanResponseTooLarge {
-                        max_bytes: RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+                        max_bytes: RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES,
                     });
                 }
                 has_more = true;
@@ -875,7 +875,7 @@ pub(crate) fn scan_restore_records_sync(
             let next_payload_bytes = payload_bytes
                 .checked_add(row_budget.payload_bytes)
                 .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
-            if next_payload_bytes > RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES {
+            if next_payload_bytes > RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES {
                 has_more = true;
                 break;
             }

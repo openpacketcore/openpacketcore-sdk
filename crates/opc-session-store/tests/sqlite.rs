@@ -300,6 +300,52 @@ async fn test_sqlite_max_payload_bytes_is_enforced() {
 }
 
 #[tokio::test]
+async fn sqlite_restore_reopens_an_exact_stored_value_cap_record() {
+    let file = NamedTempFile::new().expect("temporary SQLite file");
+    let path = file.path().to_path_buf();
+    let backend = SqliteSessionBackend::open(&path).expect("open SQLite");
+    let caps = backend.capabilities().await;
+    let key = test_key(b"restore-exact-stored-cap");
+    let lease = backend
+        .acquire(
+            &key,
+            OwnerId::new("owner-a").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("lease");
+    let record = StoredSessionRecord {
+        payload: EncryptedSessionPayload::new(Bytes::from(vec![0xAB; caps.max_value_bytes])),
+        ..test_record(key.clone(), 1, &lease)
+    };
+    assert_eq!(
+        backend
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease,
+                expected_generation: None,
+                new_record: record,
+            })
+            .await
+            .expect("store exact cap record"),
+        CompareAndSetResult::Success
+    );
+    drop(backend);
+
+    let restarted = SqliteSessionBackend::open(&path).expect("restart SQLite");
+    let request = opc_session_store::RestoreScanRequest::all(1);
+    let page = restarted
+        .scan_restore_records(request.clone())
+        .await
+        .expect("restore exact cap record after restart");
+    page.validate_for_request(&request)
+        .expect("local restore page remains valid");
+    assert_eq!(page.records.len(), 1);
+    assert_eq!(page.records[0].key, key);
+    assert_eq!(page.records[0].payload.len(), caps.max_value_bytes);
+}
+
+#[tokio::test]
 async fn test_sqlite_duplicate_create_rejection() {
     let backend = SqliteSessionBackend::in_memory().unwrap();
     let key = test_key(b"dup-create");
@@ -816,6 +862,60 @@ async fn test_sqlite_encrypting_session_backend_round_trip() {
 
     // Verify it is a valid CryptoEnvelopeV1
     CryptoEnvelopeV1::decode(inner_record.payload.as_bytes()).expect("valid envelope");
+}
+
+#[tokio::test]
+async fn sqlite_encrypting_restore_accepts_a_near_stored_cap_envelope() {
+    let inner = Arc::new(SqliteSessionBackend::in_memory().expect("sqlite"));
+    let stored_cap = inner.capabilities().await.max_value_bytes;
+    let provider = test_provider();
+    let backend = EncryptingSessionBackend::new(Arc::clone(&inner), provider, "regional-cache-a");
+    let key = test_key(b"encrypted-restore-near-cap");
+    let lease = backend
+        .acquire(
+            &key,
+            OwnerId::new("owner-a").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("lease");
+    // The capability is a stored-envelope ceiling. Keep deterministic room
+    // for the authenticated envelope rather than treating it as plaintext.
+    let plaintext_bytes = stored_cap - 4 * 1024;
+    let record = StoredSessionRecord {
+        payload: EncryptedSessionPayload::new(Bytes::from(vec![0xCD; plaintext_bytes])),
+        ..test_record(key.clone(), 1, &lease)
+    };
+    assert_eq!(
+        backend
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease,
+                expected_generation: None,
+                new_record: record,
+            })
+            .await
+            .expect("store encrypted near-cap record"),
+        CompareAndSetResult::Success
+    );
+
+    let stored = inner
+        .get(&key)
+        .await
+        .expect("read sealed record")
+        .expect("stored record");
+    assert!(stored.payload.len() > 4 * 1024 * 1024);
+    assert!(stored.payload.len() <= stored_cap);
+
+    let request = opc_session_store::RestoreScanRequest::all(1);
+    let page = backend
+        .scan_restore_records(request.clone())
+        .await
+        .expect("restore encrypted near-cap record");
+    page.validate_for_request(&request)
+        .expect("decrypted local restore page remains valid");
+    assert_eq!(page.records.len(), 1);
+    assert_eq!(page.records[0].payload.len(), plaintext_bytes);
 }
 
 #[tokio::test]

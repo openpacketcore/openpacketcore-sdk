@@ -59,6 +59,11 @@ pub const MIN_SESSION_CONSENSUS_FRAME_SIZE: usize = 9 * 1024 * 1024;
 /// value limit while keeping per-connection response storage finite.
 pub const MAX_NEGOTIATED_FRAME_SIZE: usize = 16 * 1024 * 1024;
 pub const MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE: usize = MIN_NEGOTIATED_FRAME_SIZE;
+/// Fixed v5 restore-page payload ceiling.
+///
+/// This is a wire-contract value, intentionally independent from a local
+/// backend's stored-record and local restore-page ceiling.
+pub const RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES: usize = MAX_REPLICATION_LOG_PAGE_ENTRIES;
 pub const MAX_SESSION_NET_BATCH_OPERATIONS: usize = 256;
 pub const MAX_SESSION_NET_REBUILD_ENTRIES: usize = 65_536;
@@ -201,8 +206,7 @@ pub const CURRENT_CONTRACT_PROFILE: ContractProfile = ContractProfile {
     wire_schema_revision: WIRE_SCHEMA_REVISION,
     error_set_revision: ERROR_SET_REVISION,
     max_restore_scan_page_records: RESTORE_SCAN_MAX_PAGE_SIZE as u32,
-    max_restore_scan_page_payload_bytes: opc_session_store::RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES
-        as u32,
+    max_restore_scan_page_payload_bytes: RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES as u32,
     max_restore_scan_page_retained_bytes: opc_session_store::RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES
         as u32,
     max_restore_scan_examined_rows: opc_session_store::RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE
@@ -228,7 +232,7 @@ pub const CURRENT_CONTRACT_PROFILE: ContractProfile = ContractProfile {
 const _: () = {
     assert!(SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES <= u32::MAX as usize);
     assert!(RESTORE_SCAN_MAX_PAGE_SIZE <= u32::MAX as usize);
-    assert!(opc_session_store::RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES <= u32::MAX as usize);
+    assert!(RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES <= u32::MAX as usize);
     assert!(opc_session_store::RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES <= u32::MAX as usize);
     assert!(opc_session_store::RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE <= u32::MAX as usize);
     assert!(opc_session_store::RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES <= u32::MAX as usize);
@@ -1301,6 +1305,9 @@ impl<'a> TryFrom<&'a RestoreScanPage> for WireRestoreScanPageRef<'a> {
             ));
         }
         page.records.iter().try_for_each(validate_record_profile)?;
+        validate_restore_scan_wire_payload_bytes(&page.records).map_err(|_| {
+            WireConversionError("restore scan page exceeds the v5 wire payload limit")
+        })?;
         Ok(Self {
             records: &page.records,
             excluded_count: wire_u64_from_usize(
@@ -1321,10 +1328,37 @@ impl TryFrom<WireRestoreScanPage> for RestoreScanPage {
             page.excluded_count,
             "restore excluded count is not representable on this peer",
         )?;
-        let mut result = Self::new(page.records.into_inner(), excluded_count, page.next_cursor);
+        let records = page.records.into_inner();
+        validate_restore_scan_wire_payload_bytes(&records).map_err(|_| {
+            WireConversionError("restore scan page exceeds the v5 wire payload limit")
+        })?;
+        let mut result = Self::new(records, excluded_count, page.next_cursor);
         result.cursor_profile = page.cursor_profile;
         Ok(result)
     }
+}
+
+/// Check the fixed v5 payload contract independently of local restore limits.
+///
+/// The sum is checked before a page crosses the authenticated transport
+/// boundary. Callers receive a typed, non-identifying local error rather than
+/// a partial page.
+pub(crate) fn validate_restore_scan_wire_payload_bytes(
+    records: &[StoredSessionRecord],
+) -> Result<(), StoreError> {
+    let payload_bytes = records.iter().try_fold(0_usize, |total, record| {
+        total.checked_add(record.payload.len()).ok_or_else(|| {
+            StoreError::InvalidRestoreScanResponse(
+                "restore scan wire payload byte count overflowed".to_string(),
+            )
+        })
+    })?;
+    if payload_bytes > RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES {
+        return Err(StoreError::InvalidRestoreScanResponse(
+            "restore scan exceeds the v5 wire payload-byte limit".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -4021,6 +4055,26 @@ mod tests {
         }
     }
 
+    fn restore_record(stable_id: &'static [u8], payload_len: usize) -> StoredSessionRecord {
+        StoredSessionRecord {
+            key: SessionKey {
+                tenant: TenantId::from_static("tenant-a"),
+                nf_kind: NetworkFunctionKind::from_static("smf"),
+                key_type: SessionKeyType::PduSession,
+                stable_id: Bytes::from_static(stable_id)
+                    .try_into()
+                    .expect("valid stable ID"),
+            },
+            generation: Generation::new(1),
+            owner: OwnerId::new("owner-a").expect("owner"),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("pdu-session"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(vec![7; payload_len]),
+        }
+    }
+
     #[test]
     fn restore_scan_protocol_v5_frames_round_trip_without_redundant_fields() {
         assert_eq!(CONTRACT_VERSION, 5);
@@ -4089,6 +4143,34 @@ mod tests {
         let mut legacy = encoded_value;
         legacy["ScanRestoreRecords"]["Ok"]["loaded_count"] = serde_json::json!(0);
         assert!(serde_json::from_value::<Response>(legacy).is_err());
+    }
+
+    #[test]
+    fn restore_scan_wire_payload_cap_is_enforced_on_encode_and_decode() {
+        let exact = restore_record(b"exact-wire-cap", RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES);
+        let exact_page = RestoreScanPage::new(vec![exact.clone()], 0, None);
+        assert!(WireRestoreScanPageRef::try_from(&exact_page).is_ok());
+        assert!(RestoreScanPage::try_from(WireRestoreScanPage {
+            records: BoundedVec(vec![exact]),
+            excluded_count: 0,
+            next_cursor: None,
+            cursor_profile: RestoreScanCursorProfile::LegacyCompatibility,
+        })
+        .is_ok());
+
+        let over = restore_record(
+            b"one-byte-over-wire-cap",
+            RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES + 1,
+        );
+        let over_page = RestoreScanPage::new(vec![over.clone()], 0, None);
+        assert!(WireRestoreScanPageRef::try_from(&over_page).is_err());
+        assert!(RestoreScanPage::try_from(WireRestoreScanPage {
+            records: BoundedVec(vec![over]),
+            excluded_count: 0,
+            next_cursor: None,
+            cursor_profile: RestoreScanCursorProfile::LegacyCompatibility,
+        })
+        .is_err());
     }
 
     #[test]
