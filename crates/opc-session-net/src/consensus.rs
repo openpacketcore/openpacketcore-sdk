@@ -95,9 +95,9 @@ impl ConsensusDeadlinePolicy {
     }
 }
 
-/// Resolver callback used by [`RemoteSessionConsensusPeer::new_with_resolver`]
-/// and, when explicitly enabled, the legacy remote-backend compatibility
-/// client.
+/// Resolver callback used by [`RemoteSessionConsensusPeer::new_with_resolver`],
+/// [`crate::StatelessSessionConsumerClient::new_with_resolver`], and, when
+/// explicitly enabled, the legacy remote-backend compatibility client.
 pub type RemoteAddrResolver =
     Arc<dyn Fn() -> BoxFuture<'static, io::Result<SocketAddr>> + Send + Sync>;
 
