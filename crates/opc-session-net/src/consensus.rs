@@ -3979,6 +3979,39 @@ mod tests {
         }
     }
 
+    fn record_test_idle_retirement() {
+        let lifecycle = ConnectionLifecycle::new(
+            test_consensus_lifecycle_policy(),
+            tokio::time::Instant::now(),
+            None,
+            None,
+            0,
+            None,
+        )
+        .expect("test connection lifecycle");
+        lifecycle.record_forced_retirement(RetirementReason::IdleTimeout);
+    }
+
+    #[tokio::test]
+    async fn connection_outcome_delta_isolated_from_writer_outside_test_scope() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let before = connection_outcome_metrics();
+
+        tokio::spawn(async { record_test_idle_retirement() })
+            .await
+            .expect("outside metric writer");
+        record_test_idle_retirement();
+
+        let after = connection_outcome_metrics();
+        assert_eq!(after.idle_retirements, before.idle_retirements + 1);
+        assert_eq!(after.timeout_failures, before.timeout_failures);
+        assert_eq!(after.successes, before.successes);
+        assert_eq!(after.drain_started, before.drain_started + 1);
+        assert_eq!(after.drain_completed, before.drain_completed + 1);
+    }
+
     async fn wait_for_drain_completion(minimum: u64) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while METRICS
