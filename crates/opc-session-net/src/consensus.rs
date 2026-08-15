@@ -3407,9 +3407,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn claimant_records_explicit_retirement_before_dropping_stale_ready_connection() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
         let (_server_binding, client_binding) = bindings();
         let control = SessionReauthenticationControl::new();
         let resolver: RemoteAddrResolver =
@@ -3452,9 +3449,6 @@ mod tests {
                 lifecycle,
             }),
         };
-        let before = METRICS
-            .session_net_lifecycle_retirement_explicit
-            .load(Ordering::Relaxed);
         control
             .request_reauthentication()
             .expect("advance staged connection generation");
@@ -3466,18 +3460,13 @@ mod tests {
         ));
         assert_eq!(retirement_probe.recorded_retirement_count(), 1);
         assert_eq!(
-            METRICS
-                .session_net_lifecycle_retirement_explicit
-                .load(Ordering::Relaxed),
-            before + 1
+            retirement_probe.recorded_retirement_reason(),
+            Some(RetirementReason::Explicit)
         );
     }
 
     #[tokio::test(start_paused = true)]
     async fn claimant_records_material_retirement_before_dropping_stale_ready_connection() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
         let (_server_binding, client_binding) = bindings();
         let material = crate::test_support::RotatableClientMaterial::new(
             "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/1",
@@ -3522,12 +3511,6 @@ mod tests {
                 lifecycle,
             }),
         };
-        let material_before = METRICS
-            .session_net_lifecycle_retirement_material_epoch
-            .load(Ordering::Relaxed);
-        let explicit_before = METRICS
-            .session_net_lifecycle_retirement_explicit
-            .load(Ordering::Relaxed);
         material.rotate();
 
         assert!(matches!(
@@ -3537,16 +3520,8 @@ mod tests {
         ));
         assert_eq!(retirement_probe.recorded_retirement_count(), 1);
         assert_eq!(
-            METRICS
-                .session_net_lifecycle_retirement_material_epoch
-                .load(Ordering::Relaxed),
-            material_before + 1
-        );
-        assert_eq!(
-            METRICS
-                .session_net_lifecycle_retirement_explicit
-                .load(Ordering::Relaxed),
-            explicit_before
+            retirement_probe.recorded_retirement_reason(),
+            Some(RetirementReason::MaterialEpoch)
         );
         let mut dispatched = Vec::new();
         remote
