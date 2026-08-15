@@ -3407,6 +3407,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn claimant_records_explicit_retirement_before_dropping_stale_ready_connection() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
         let (_server_binding, client_binding) = bindings();
         let control = SessionReauthenticationControl::new();
         let resolver: RemoteAddrResolver =
@@ -3467,6 +3470,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn claimant_records_material_retirement_before_dropping_stale_ready_connection() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
         let (_server_binding, client_binding) = bindings();
         let material = crate::test_support::RotatableClientMaterial::new(
             "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/1",
