@@ -206,6 +206,32 @@ impl InspectionBudget {
         }
         Ok(())
     }
+
+    fn consume_table_scan(
+        &mut self,
+        rows: u64,
+        maximum_value_bytes: u64,
+        total_value_bytes: u64,
+    ) -> Result<(), RecoveryError> {
+        self.check()?;
+        if maximum_value_bytes > self.limits.max_value_bytes() {
+            return Err(RecoveryError::WorkLimitExceeded);
+        }
+        self.rows = self
+            .rows
+            .checked_add(rows)
+            .ok_or(RecoveryError::WorkLimitExceeded)?;
+        self.value_bytes = self
+            .value_bytes
+            .checked_add(total_value_bytes)
+            .ok_or(RecoveryError::WorkLimitExceeded)?;
+        if self.rows > self.limits.max_rows()
+            || self.value_bytes > self.limits.max_total_value_bytes()
+        {
+            return Err(RecoveryError::WorkLimitExceeded);
+        }
+        Ok(())
+    }
 }
 
 fn inspection_sql_error(error: rusqlite::Error, budget: &InspectionBudget) -> RecoveryError {
@@ -358,6 +384,7 @@ fn inspect_current(
     consensus::read_membership_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     validate_consensus_sealed_records(conn, budget)?;
+    validate_legacy_lease_state(conn, budget)?;
     let committed = consensus::read_committed_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let applied = consensus::read_applied_sync(conn, storage_identity)
@@ -727,6 +754,7 @@ fn inspect_legacy(
 ) -> Result<RecoveryReplicaEvidence, RecoveryError> {
     validate_legacy_schema(conn)?;
     validate_consensus_sealed_records(conn, budget)?;
+    validate_legacy_lease_state(conn, budget)?;
     validate_replication_sequence_domain(conn, budget, 0)?;
     let branch_digest = hash_legacy_state(conn, budget)?;
     let fence_high_water = consensus::observed_fence_high_water_sync(conn)
@@ -1247,6 +1275,44 @@ fn validate_consensus_sealed_records(
             .map_err(|_| RecoveryError::CorruptReplica)?;
     }
     Ok(())
+}
+
+fn validate_legacy_lease_state(
+    conn: &Connection,
+    budget: &mut InspectionBudget,
+) -> Result<(), RecoveryError> {
+    let mut row_count = 0_u64;
+    let mut maximum_value_bytes = 0_u64;
+    let mut total_value_bytes = 0_u64;
+    for query in [
+        "SELECT COUNT(*), COALESCE(MAX(MAX(length(tenant), length(nf_kind), length(key_type), length(stable_id), length(owner), length(guard_expires_at))), 0), COALESCE(SUM(length(tenant) + length(nf_kind) + length(key_type) + length(stable_id) + length(owner) + length(guard_expires_at)), 0) FROM leases",
+        "SELECT COUNT(*), COALESCE(MAX(MAX(length(tenant), length(nf_kind), length(key_type), length(stable_id))), 0), COALESCE(SUM(length(tenant) + length(nf_kind) + length(key_type) + length(stable_id)), 0) FROM key_fences",
+        "SELECT COUNT(*), COALESCE(MAX(length(key)), 0), COALESCE(SUM(length(key)), 0) FROM lease_globals",
+    ] {
+        let (count, maximum, total): (i64, i64, i64) = conn
+            .query_row(query, [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|error| inspection_sql_error(error, budget))?;
+        row_count = row_count
+            .checked_add(u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?)
+            .ok_or(RecoveryError::WorkLimitExceeded)?;
+        maximum_value_bytes = maximum_value_bytes.max(
+            u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?,
+        );
+        total_value_bytes = total_value_bytes
+            .checked_add(u64::try_from(total).map_err(|_| RecoveryError::CorruptReplica)?)
+            .ok_or(RecoveryError::WorkLimitExceeded)?;
+    }
+    budget.consume_table_scan(row_count, maximum_value_bytes, total_value_bytes)?;
+    consensus::validate_lease_state_sync(conn).map_err(|_| {
+        if budget.started.elapsed() >= budget.limits.max_duration() {
+            RecoveryError::WorkLimitExceeded
+        } else {
+            RecoveryError::CorruptReplica
+        }
+    })?;
+    budget.check()
 }
 
 fn validate_replication_sequence_domain(
@@ -2541,6 +2607,7 @@ fn convert_legacy_checkpoint(
     validate_database_snapshot(&source_conn, &source_budget)?;
     validate_legacy_schema(&source_conn)?;
     validate_consensus_sealed_records(&source_conn, &mut source_budget)?;
+    validate_legacy_lease_state(&source_conn, &mut source_budget)?;
     validate_replication_sequence_domain(&source_conn, &mut source_budget, 0)?;
     let before = hash_legacy_state(&source_conn, &mut source_budget)?;
 
@@ -2598,6 +2665,9 @@ fn convert_legacy_checkpoint(
     let destination_conn = open_read_only(destination)?;
     validate_legacy_schema(&destination_conn)?;
     let mut destination_budget = InspectionBudget::new(limits);
+    validate_consensus_sealed_records(&destination_conn, &mut destination_budget)?;
+    validate_legacy_lease_state(&destination_conn, &mut destination_budget)?;
+    validate_replication_sequence_domain(&destination_conn, &mut destination_budget, 0)?;
     let after = hash_legacy_state(&destination_conn, &mut destination_budget)?;
     if before != after {
         return Err(RecoveryError::SourceChanged);

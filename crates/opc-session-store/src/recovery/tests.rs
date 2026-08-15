@@ -856,8 +856,10 @@ async fn changed_source_stale_target_and_corrupt_backup_fail_closed() {
         .expect("legacy recovery plan");
     Connection::open(&replicas[0].database_path)
         .expect("open source")
-        .execute("UPDATE key_fences SET fence = 6", [])
-        .expect("change source");
+        .execute_batch(
+            "UPDATE key_fences SET fence = 6; UPDATE lease_globals SET val = 7 WHERE key = 'next_fence';",
+        )
+        .expect("change source coherently");
     let confirmation = RecoveryConfirmation::legacy(
         &plan,
         RecoveryConfirmation::required_legacy_acknowledgement(),
@@ -896,8 +898,10 @@ async fn changed_source_stale_target_and_corrupt_backup_fail_closed() {
 
     Connection::open(&replicas[0].database_path)
         .expect("restore source")
-        .execute("UPDATE key_fences SET fence = 5", [])
-        .expect("restore source");
+        .execute_batch(
+            "UPDATE key_fences SET fence = 5; UPDATE lease_globals SET val = 6 WHERE key = 'next_fence';",
+        )
+        .expect("restore source coherently");
     manager
         .execute(
             &context(),
@@ -1203,8 +1207,8 @@ fn campaign_preserves_fleet_maxima_and_preflights_sqlite_successors() {
         .expect("open exhausted fence")
         .execute("UPDATE key_fences SET fence = ?1", [i64::MAX])
         .expect("exhaust fence domain");
-    let overflow_plan = manager
-        .plan(
+    assert_eq!(
+        manager.plan(
             &context(),
             identity(),
             node_set(&overflow_ids),
@@ -1213,22 +1217,9 @@ fn campaign_preserves_fleet_maxima_and_preflights_sqlite_successors() {
             &overflow_ids,
             RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
             RecoveryLimits::default(),
-        )
-        .expect("overflow plan remains inspectable");
-    let overflow_confirmation = RecoveryConfirmation::legacy(
-        &overflow_plan,
-        RecoveryConfirmation::required_legacy_acknowledgement(),
-    );
-    assert_eq!(
-        manager.execute(
-            &context(),
-            &overflow_plan,
-            &overflow_confirmation,
-            &overflow_replicas,
-            overflow_backup.path(),
-            RecoveryLimits::default(),
         ),
-        Err(RecoveryError::WorkLimitExceeded)
+        Err(RecoveryError::CorruptReplica),
+        "an exhausted fence with no representable allocator successor is corrupt",
     );
     assert!(
         std::fs::read_dir(overflow_backup.path())
@@ -1310,8 +1301,11 @@ fn current_recovery_inspection_enforces_the_consensus_payload_cap() {
         ),
     );
     let conn = Connection::open(&replica.database_path).expect("open current replica");
-    crate::sqlite::ops::insert_or_replace_record_sync(&conn, &sealed_recovery_record(1_048_577))
+    let oversized = sealed_recovery_record(1_048_577);
+    crate::sqlite::ops::insert_or_replace_record_sync(&conn, &oversized)
         .expect("inject valid sealed record above the consensus cap");
+    crate::sqlite::ops::insert_or_replace_fence_sync(&conn, &oversized.key, oversized.fence.get())
+        .expect("persist the record fence");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("checkpoint current replica");
     drop(conn);
@@ -1324,6 +1318,85 @@ fn current_recovery_inspection_enforces_the_consensus_payload_cap() {
             expected_members: &members,
             limits: RecoveryLimits::default(),
         }),
+        Err(RecoveryError::CorruptReplica)
+    );
+}
+
+#[test]
+fn current_recovery_rejects_a_regressed_lease_allocator() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let ids = [
+        replica_id("current-allocator-replica-a"),
+        replica_id("current-allocator-replica-b"),
+        replica_id("current-allocator-replica-c"),
+    ];
+    let replica = create_legacy_replica(temp.path(), ids[0].clone(), 3);
+    let members = node_set(&ids);
+    claim_current_replica(
+        &replica,
+        &members,
+        LogId::new(
+            CommittedLeaderId::new(1, *members.iter().next().expect("member")),
+            0,
+        ),
+    );
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    conn.execute(
+        "UPDATE lease_globals SET val = 3 WHERE key = 'next_fence'",
+        [],
+    )
+    .expect("regress fence allocator");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint allocator mutation");
+    drop(conn);
+
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        }),
+        Err(RecoveryError::CorruptReplica)
+    );
+}
+
+#[test]
+fn legacy_recovery_rejects_a_regressed_lease_allocator() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let ids = [
+        replica_id("legacy-allocator-replica-a"),
+        replica_id("legacy-allocator-replica-b"),
+        replica_id("legacy-allocator-replica-c"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 3),
+        create_legacy_replica(temp.path(), ids[1].clone(), 4),
+        create_legacy_replica(temp.path(), ids[2].clone(), 5),
+    ];
+    let conn = Connection::open(&replicas[0].database_path).expect("open legacy replica");
+    conn.execute(
+        "UPDATE lease_globals SET val = 3 WHERE key = 'next_fence'",
+        [],
+    )
+    .expect("regress fence allocator");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint allocator mutation");
+    drop(conn);
+
+    let manager = recovery(AllowRecovery);
+    assert_eq!(
+        manager.plan(
+            &context(),
+            identity(),
+            node_set(&ids),
+            &replicas,
+            &ids[0],
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        ),
         Err(RecoveryError::CorruptReplica)
     );
 }

@@ -122,6 +122,28 @@ pub(crate) fn persisted_u64(value: i64) -> Result<u64, StoreError> {
         .map_err(|_| StoreError::Serialization("persisted session integer is negative".to_string()))
 }
 
+pub(crate) fn persisted_session_key(
+    tenant_str: String,
+    nf_kind_str: String,
+    key_type_str: String,
+    stable_id: Vec<u8>,
+) -> Result<SessionKey, StoreError> {
+    let tenant = opc_types::TenantId::new(tenant_str)
+        .map_err(|err| StoreError::Serialization(err.to_string()))?;
+    let nf_kind = opc_types::NetworkFunctionKind::new(nf_kind_str)
+        .map_err(|err| StoreError::Serialization(err.to_string()))?;
+    let key_type = SessionKeyType::from_str(&key_type_str).map_err(StoreError::Serialization)?;
+    let stable_id = crate::StableId::try_from(stable_id).map_err(|_| {
+        StoreError::Serialization("persisted stable session identifier is invalid".into())
+    })?;
+    Ok(SessionKey {
+        tenant,
+        nf_kind,
+        key_type,
+        stable_id,
+    })
+}
+
 pub(crate) fn sqlite_u64(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value)
         .map_err(|_| StoreError::Serialization("session integer exceeds SQLite range".to_string()))
@@ -1001,12 +1023,7 @@ pub(crate) fn stored_record_from_row(
     payload_bytes: Vec<u8>,
     encoding: i64,
 ) -> Result<StoredSessionRecord, StoreError> {
-    let tenant = opc_types::TenantId::new(tenant_str)
-        .map_err(|err| StoreError::Serialization(err.to_string()))?;
-    let nf_kind = opc_types::NetworkFunctionKind::new(nf_kind_str)
-        .map_err(|err| StoreError::Serialization(err.to_string()))?;
-    let key_type =
-        crate::SessionKeyType::from_str(&key_type_str).map_err(StoreError::Serialization)?;
+    let key = persisted_session_key(tenant_str, nf_kind_str, key_type_str, stable_id)?;
     let owner = persisted_owner_id(owner_str)?;
     let state_class = state_class_from_str(&state_class_str)?;
     let state_type = StateType::new(state_type_str).map_err(StoreError::Serialization)?;
@@ -1020,14 +1037,7 @@ pub(crate) fn stored_record_from_row(
     let payload = payload_from_row(payload_bytes, encoding)?;
 
     Ok(StoredSessionRecord {
-        key: SessionKey {
-            tenant,
-            nf_kind,
-            key_type,
-            stable_id: crate::StableId::try_from(stable_id).map_err(|_| {
-                StoreError::Serialization("persisted stable session identifier is invalid".into())
-            })?,
-        },
+        key,
         generation: Generation::new(persisted_u64(generation)?),
         owner,
         fence: FenceToken::new(persisted_u64(fence)?),

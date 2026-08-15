@@ -3103,6 +3103,11 @@ fn committed_response_matches_intent(
     let Some(logical_time) = response.logical_time else {
         return false;
     };
+    if let Ok(outcome) = &response.result {
+        if crate::sqlite::consensus::validate_consensus_outcome_records(outcome).is_err() {
+            return false;
+        }
+    }
     match (&response.result, intent) {
         (Err(error), intent) => committed_error_matches_intent(intent, error),
         (Ok(SessionMutationOutcome::Unit), SessionMutationIntent::AdvanceLogicalTime)
@@ -3117,9 +3122,7 @@ fn committed_response_matches_intent(
         (
             Ok(SessionMutationOutcome::ConsumerRecord(record)),
             SessionMutationIntent::ReadConsumerRecord { key },
-        ) => record.as_ref().is_none_or(|record| {
-            record.key == *key && crate::sqlite::validate_consensus_record(record).is_ok()
-        }),
+        ) => record.as_ref().is_none_or(|record| record.key == *key),
         (
             Ok(SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Success)),
             SessionMutationIntent::CompareAndSet(_),
@@ -4805,7 +4808,11 @@ mod membership_tests {
             &cas_intent,
             &committed(Ok(SessionMutationOutcome::CompareAndSet(
                 CompareAndSetResult::Conflict {
-                    current: Some(record(key_a.clone())),
+                    current: Some(consumer_record_with_payload_len(
+                        &key_a,
+                        &lease_a,
+                        64 * 1024,
+                    )),
                 },
             )))
         ));
@@ -5086,6 +5093,73 @@ mod membership_tests {
             ));
         }
         drop(lease);
+    }
+
+    #[test]
+    fn committed_cas_conflict_record_requires_consensus_validation() {
+        let logical_time = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let key = SessionKey {
+            tenant: TenantId::new("forwarded-cas-record").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"forwarded-cas-record")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let owner = OwnerId::new("forwarded-cas-owner").expect("owner");
+        let lease = LeaseGuard::new(
+            key.clone(),
+            owner.clone(),
+            FenceToken::new(1),
+            logical_time,
+            checked_session_deadline(logical_time, Duration::from_secs(60))
+                .expect("lease deadline"),
+            1,
+        );
+        let intent = SessionMutationIntent::CompareAndSet(Box::new(CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: consumer_record_with_payload_len(&key, &lease, 64 * 1024),
+        }));
+        let invalid_record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(1),
+            owner,
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("forwarded-cas-record"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(b"unsealed"),
+        };
+        let oversized_record = consumer_record_with_payload_len(
+            &key,
+            &lease,
+            crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 1,
+        );
+        let mut aad_mismatched_record = consumer_record_with_payload_len(
+            &key,
+            &lease,
+            crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+        );
+        aad_mismatched_record.state_type = StateType::from_static("different-state");
+
+        for current in [invalid_record, oversized_record, aad_mismatched_record] {
+            let response = SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::CompareAndSet(
+                    CompareAndSetResult::Conflict {
+                        current: Some(current),
+                    },
+                )),
+                sequence: 1,
+                digest: Some(crate::consensus::SessionConsensusEntryDigest::from_bytes(
+                    [0x56; 32],
+                )),
+                logical_time: Some(logical_time),
+                raft_log_index: 1,
+            };
+            assert!(!committed_response_matches_intent(&intent, &response));
+        }
     }
 
     fn consumer_record_with_payload_len(

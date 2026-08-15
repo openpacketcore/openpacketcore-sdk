@@ -6569,6 +6569,21 @@ pub(crate) fn logical_time_sync(
     read_machine_sync(conn, identity).map(|(_, _, logical_time, _)| logical_time)
 }
 
+pub(crate) fn validate_consensus_outcome_records(
+    outcome: &SessionMutationOutcome,
+) -> Result<(), StoreError> {
+    match outcome {
+        SessionMutationOutcome::ConsumerRecord(Some(record))
+        | SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Conflict {
+            current: Some(record),
+        }) => super::validate_consensus_record(record),
+        SessionMutationOutcome::CompareAndSet(_)
+        | SessionMutationOutcome::ConsumerRecord(None)
+        | SessionMutationOutcome::Lease(_)
+        | SessionMutationOutcome::Unit => Ok(()),
+    }
+}
+
 fn read_outcome_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -6596,9 +6611,9 @@ fn read_outcome_sync(
         invalid_data("persisted session consensus request digest has invalid length")
     })?;
     let response: SessionConsensusResponse = decode_json(&response)?;
-    if let Ok(SessionMutationOutcome::ConsumerRecord(Some(record))) = &response.result {
-        super::validate_consensus_record(record)
-            .map_err(|_| invalid_data("persisted session consensus consumer record is invalid"))?;
+    if let Ok(outcome) = &response.result {
+        validate_consensus_outcome_records(outcome)
+            .map_err(|_| invalid_data("persisted session consensus outcome record is invalid"))?;
     }
     Ok(Some((digest, response)))
 }
@@ -7679,6 +7694,8 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
         })?;
     }
 
+    validate_lease_state_sync(conn)?;
+
     let mut stmt = conn
         .prepare(
             r#"
@@ -7752,6 +7769,153 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
                 "session replication cursor does not match the persisted log",
             ));
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
+    let invalid_lease_state = || invalid_data("session consensus snapshot lease state is invalid");
+    let mut maximum_fence = 0_u64;
+    let mut maximum_credential = 0_u64;
+
+    let mut lease_stmt = conn
+        .prepare(
+            r#"
+            SELECT tenant, nf_kind, key_type, stable_id, active, credential_id,
+                   owner, fence, expires_at_unix_ms, guard_expires_at
+            FROM leases
+            "#,
+        )
+        .map_err(db_error)?;
+    let leases = lease_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, String>(9)?,
+            ))
+        })
+        .map_err(db_error)?;
+    for row in leases {
+        let (
+            tenant,
+            nf_kind,
+            key_type,
+            stable_id,
+            active,
+            credential,
+            owner,
+            fence,
+            expires_at_unix_ms,
+            guard_expires_at,
+        ) = row.map_err(db_error)?;
+        ops::persisted_session_key(tenant, nf_kind, key_type, stable_id)
+            .map_err(|_| invalid_lease_state())?;
+        if !matches!(active, 0 | 1) {
+            return Err(invalid_lease_state());
+        }
+        let credential = checked_positive_u64(credential).map_err(|_| invalid_lease_state())?;
+        let fence = checked_positive_u64(fence).map_err(|_| invalid_lease_state())?;
+        ops::persisted_owner_id(owner).map_err(|_| invalid_lease_state())?;
+        let guard_expires_at =
+            Timestamp::from_str(&guard_expires_at).map_err(|_| invalid_lease_state())?;
+        let guard_expires_at_unix_ms =
+            ops::timestamp_unix_millis(guard_expires_at).map_err(|_| invalid_lease_state())?;
+        if (active == 1 && expires_at_unix_ms != guard_expires_at_unix_ms)
+            || (active == 0 && expires_at_unix_ms < guard_expires_at_unix_ms)
+        {
+            return Err(invalid_lease_state());
+        }
+        maximum_fence = maximum_fence.max(fence);
+        maximum_credential = maximum_credential.max(credential);
+    }
+
+    let mut fence_stmt = conn
+        .prepare("SELECT tenant, nf_kind, key_type, stable_id, fence FROM key_fences")
+        .map_err(db_error)?;
+    let fences = fence_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(db_error)?;
+    for row in fences {
+        let (tenant, nf_kind, key_type, stable_id, fence) = row.map_err(db_error)?;
+        ops::persisted_session_key(tenant, nf_kind, key_type, stable_id)
+            .map_err(|_| invalid_lease_state())?;
+        maximum_fence =
+            maximum_fence.max(checked_positive_u64(fence).map_err(|_| invalid_lease_state())?);
+    }
+
+    let stale_or_missing_fence = conn
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM session_records AS record
+                LEFT JOIN key_fences AS fence
+                  ON fence.tenant = record.tenant
+                 AND fence.nf_kind = record.nf_kind
+                 AND fence.key_type = record.key_type
+                 AND fence.stable_id = record.stable_id
+                WHERE fence.fence IS NULL OR fence.fence < record.fence
+                UNION ALL
+                SELECT 1
+                FROM leases AS lease
+                LEFT JOIN key_fences AS fence
+                  ON fence.tenant = lease.tenant
+                 AND fence.nf_kind = lease.nf_kind
+                 AND fence.key_type = lease.key_type
+                 AND fence.stable_id = lease.stable_id
+                WHERE fence.fence IS NULL OR fence.fence != lease.fence
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(db_error)?;
+    if stale_or_missing_fence {
+        return Err(invalid_lease_state());
+    }
+
+    let mut next_fence = None;
+    let mut next_credential = None;
+    let mut globals_stmt = conn
+        .prepare("SELECT key, val FROM lease_globals ORDER BY key")
+        .map_err(db_error)?;
+    let globals = globals_stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(db_error)?;
+    for row in globals {
+        let (key, value) = row.map_err(db_error)?;
+        let value = checked_positive_u64(value).map_err(|_| invalid_lease_state())?;
+        let slot = match key.as_str() {
+            "next_fence" => &mut next_fence,
+            "next_credential_id" => &mut next_credential,
+            _ => return Err(invalid_lease_state()),
+        };
+        if slot.replace(value).is_some() {
+            return Err(invalid_lease_state());
+        }
+    }
+    if next_fence.is_none_or(|next| next <= maximum_fence)
+        || next_credential.is_none_or(|next| next <= maximum_credential)
+    {
+        return Err(invalid_lease_state());
     }
     Ok(())
 }
@@ -9541,6 +9705,22 @@ mod tests {
         record
     }
 
+    fn persist_sealed_record_fixture(conn: &Connection, record: &crate::StoredSessionRecord) {
+        ops::insert_or_replace_record_sync(conn, record).expect("persist sealed record fixture");
+        ops::insert_or_replace_fence_sync(conn, &record.key, record.fence.get())
+            .expect("persist sealed record fence");
+        let next_fence = record
+            .fence
+            .get()
+            .checked_add(1)
+            .expect("fixture fence successor");
+        conn.execute(
+            "UPDATE lease_globals SET val = MAX(val, ?1) WHERE key = 'next_fence'",
+            [i64::try_from(next_fence).expect("SQLite fixture fence")],
+        )
+        .expect("advance fixture fence allocator");
+    }
+
     fn sealed_replication_cas(
         operation_key: SessionKey,
         record_key: SessionKey,
@@ -9561,7 +9741,7 @@ mod tests {
             let backend = SqliteSessionBackend::in_memory().expect("backend");
             let conn = backend.conn.lock().await;
             let record = sealed_record_for_key(key(), payload_len);
-            ops::insert_or_replace_record_sync(&conn, &record).expect("persist sealed fixture");
+            persist_sealed_record_fixture(&conn, &record);
 
             let validation = validate_sealed_state_sync(&conn);
             if accepted {
@@ -9574,12 +9754,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sealed_state_validation_rejects_malformed_legacy_lease_tables() {
+        for (case, mutation) in [
+            ("lease-key", "UPDATE leases SET tenant = 'INVALID'"),
+            ("lease-active", "UPDATE leases SET active = 2"),
+            ("lease-credential", "UPDATE leases SET credential_id = 0"),
+            ("lease-owner", "UPDATE leases SET owner = ''"),
+            (
+                "lease-expiry",
+                "UPDATE leases SET expires_at_unix_ms = expires_at_unix_ms + 1",
+            ),
+            (
+                "lease-timestamp",
+                "UPDATE leases SET guard_expires_at = 'not-a-timestamp'",
+            ),
+            ("fence-key", "UPDATE key_fences SET tenant = 'INVALID'"),
+            ("fence-value", "UPDATE key_fences SET fence = 0"),
+            ("missing-fence", "DELETE FROM key_fences"),
+            (
+                "advanced-fence",
+                "UPDATE key_fences SET fence = 2; UPDATE lease_globals SET val = 3 WHERE key = 'next_fence'",
+            ),
+            (
+                "stale-fence",
+                "UPDATE leases SET fence = 2; UPDATE lease_globals SET val = 3 WHERE key = 'next_fence'",
+            ),
+            (
+                "fence-allocator",
+                "UPDATE lease_globals SET val = 1 WHERE key = 'next_fence'",
+            ),
+            (
+                "credential-allocator",
+                "UPDATE lease_globals SET val = 1 WHERE key = 'next_credential_id'",
+            ),
+            (
+                "unknown-global",
+                "INSERT INTO lease_globals (key, val) VALUES ('unexpected', 1)",
+            ),
+            (
+                "missing-global",
+                "DELETE FROM lease_globals WHERE key = 'next_fence'",
+            ),
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.lock().await;
+            lease::acquire_sync(
+                &conn,
+                &key(),
+                OwnerId::new("legacy-lease-owner").expect("owner"),
+                Duration::from_secs(60),
+                timestamp(1),
+            )
+            .expect("valid lease fixture");
+            conn.execute_batch(mutation).expect("mutate lease fixture");
+
+            let error = validate_sealed_state_sync(&conn)
+                .expect_err("malformed legacy lease state must reject");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "case {case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sealed_state_validation_accepts_released_legacy_lease() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        let lease = lease::acquire_sync(
+            &conn,
+            &key(),
+            OwnerId::new("released-legacy-owner").expect("owner"),
+            Duration::from_secs(60),
+            timestamp(1),
+        )
+        .expect("valid lease fixture");
+        lease::release_sync(&conn, lease, timestamp(2)).expect("release lease fixture");
+
+        validate_sealed_state_sync(&conn).expect("released legacy lease state remains valid");
+    }
+
+    #[tokio::test]
     async fn live_consensus_get_revalidates_persisted_payload_authority() {
         let exact = SqliteSessionBackend::in_memory().expect("exact-cap backend");
         {
             let conn = exact.conn.lock().await;
             let record = sealed_record_for_key(key(), 1_048_576);
-            ops::insert_or_replace_record_sync(&conn, &record).expect("persist exact-cap record");
+            persist_sealed_record_fixture(&conn, &record);
         }
         assert!(exact
             .consensus_get_at(&key(), timestamp(1))
@@ -9591,8 +9849,7 @@ mod tests {
         {
             let conn = oversized.conn.lock().await;
             let record = sealed_record_for_key(key(), 1_048_577);
-            ops::insert_or_replace_record_sync(&conn, &record)
-                .expect("inject oversized persisted record");
+            persist_sealed_record_fixture(&conn, &record);
         }
         assert_eq!(
             oversized
@@ -9610,8 +9867,7 @@ mod tests {
             let conn = unsealed.conn.lock().await;
             let mut record = sealed_record_for_key(key(), 64 * 1024);
             record.payload = crate::EncryptedSessionPayload::new(b"unsealed");
-            ops::insert_or_replace_record_sync(&conn, &record)
-                .expect("inject unsealed persisted record");
+            persist_sealed_record_fixture(&conn, &record);
         }
         assert!(matches!(
             unsealed.consensus_get_at(&key(), timestamp(1)).await,
@@ -9623,8 +9879,7 @@ mod tests {
             let conn = mismatched.conn.lock().await;
             let mut record = sealed_record_for_key(key(), 64 * 1024);
             record.generation = crate::Generation::new(2);
-            ops::insert_or_replace_record_sync(&conn, &record)
-                .expect("inject AAD-mismatched persisted record");
+            persist_sealed_record_fixture(&conn, &record);
         }
         assert!(matches!(
             mismatched.consensus_get_at(&key(), timestamp(1)).await,
@@ -9640,7 +9895,7 @@ mod tests {
         apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
             .expect("membership entry");
         let invalid = sealed_record_for_key(key(), 1_048_577);
-        ops::insert_or_replace_record_sync(&conn, &invalid).expect("inject invalid record");
+        persist_sealed_record_fixture(&conn, &invalid);
 
         let applied = apply_entries_sync(
             &conn,
@@ -9696,8 +9951,93 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(
             error.to_string(),
-            "persisted session consensus consumer record is invalid"
+            "persisted session consensus outcome record is invalid"
         );
+    }
+
+    #[test]
+    fn replayed_cas_conflict_rejects_invalid_serialized_record() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let request_id = SessionConsensusRequestId::from_bytes([0xD3; 16]);
+        let response = SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::CompareAndSet(
+                CompareAndSetResult::Conflict {
+                    current: Some(sealed_record_for_key(key(), 1_048_577)),
+                },
+            )),
+            sequence: 1,
+            digest: Some(SessionConsensusEntryDigest::from_bytes([0xA3; 32])),
+            logical_time: Some(timestamp(1)),
+            raft_log_index: 1,
+        };
+        conn.execute(
+            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, response_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                request_id.as_bytes().as_slice(),
+                epoch_i64(identity()).expect("epoch"),
+                [0xB3_u8; 32].as_slice(),
+                encode_json(&response).expect("response encoding"),
+            ],
+        )
+        .expect("seed invalid replay outcome");
+
+        let error = read_outcome_sync(&conn, identity(), request_id)
+            .expect_err("invalid replayed CAS conflict record must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "persisted session consensus outcome record is invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_cas_conflict_preserves_the_admitted_outcome() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                acquire_entry(1, [0xD4; 16], "consensus-cap-owner"),
+            ],
+        )
+        .expect("membership and lease entries");
+        let lease = match &applied.responses[1].result {
+            Ok(SessionMutationOutcome::Lease(lease)) => lease.clone(),
+            other => panic!("unexpected lease response: {other:?}"),
+        };
+        persist_sealed_record_fixture(&conn, &sealed_record_for_key(key(), 1_048_577));
+
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![capped_cas_entry(
+                2,
+                [0xD5; 16],
+                lease,
+                None,
+                crate::Generation::new(2),
+                64 * 1024,
+            )],
+        )
+        .expect("historical conflict remains deterministic");
+        assert!(matches!(
+            applied.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::CompareAndSet(
+                    CompareAndSetResult::Conflict {
+                        current: Some(record),
+                    },
+                )),
+                ..
+            }] if record.payload.len() == 1_048_577
+        ));
     }
 
     #[test]
@@ -9827,7 +10167,7 @@ mod tests {
         {
             let conn = exact.conn.lock().await;
             let record = sealed_record_for_key(key(), 1_048_576);
-            ops::insert_or_replace_record_sync(&conn, &record).expect("persist exact-cap record");
+            persist_sealed_record_fixture(&conn, &record);
         }
         let exact_page = exact
             .consensus_scan_restore_records_at(
@@ -9843,8 +10183,7 @@ mod tests {
         {
             let conn = oversized.conn.lock().await;
             let record = sealed_record_for_key(key(), 1_048_577);
-            ops::insert_or_replace_record_sync(&conn, &record)
-                .expect("inject oversized persisted record");
+            persist_sealed_record_fixture(&conn, &record);
         }
         assert_eq!(
             oversized
@@ -9866,8 +10205,7 @@ mod tests {
             let conn = invalid_aad.conn.lock().await;
             let mut record = sealed_record_for_key(key(), 64 * 1024);
             record.fence = crate::FenceToken::new(2);
-            ops::insert_or_replace_record_sync(&conn, &record)
-                .expect("inject AAD-mismatched persisted record");
+            persist_sealed_record_fixture(&conn, &record);
         }
         assert!(matches!(
             invalid_aad
@@ -9896,8 +10234,7 @@ mod tests {
         )
         .expect("apply membership");
         let oversized = sealed_record_for_key(key(), 1_048_577);
-        ops::insert_or_replace_record_sync(&conn, &oversized)
-            .expect("inject oversized persisted record");
+        persist_sealed_record_fixture(&conn, &oversized);
         let directory = tempfile::tempdir().expect("snapshot directory");
         let snapshot_path = directory.path().join("must-not-exist.sqlite");
 
@@ -9915,7 +10252,7 @@ mod tests {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.lock().await;
         let record = sealed_record_for_key(key(), 1_048_577);
-        ops::insert_or_replace_record_sync(&conn, &record).expect("persist sealed fixture");
+        persist_sealed_record_fixture(&conn, &record);
 
         let error = claim_legacy_checkpoint_sync(
             &conn,
@@ -9928,6 +10265,39 @@ mod tests {
             0,
         )
         .expect_err("legacy claim must not import an oversized consensus record");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!table_exists(&conn, "consensus_identity").expect("inspect ownership table"));
+    }
+
+    #[tokio::test]
+    async fn legacy_claim_rejects_a_regressed_lease_allocator() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        lease::acquire_sync(
+            &conn,
+            &key(),
+            OwnerId::new("legacy-claim-owner").expect("owner"),
+            Duration::from_secs(60),
+            timestamp(1),
+        )
+        .expect("valid lease fixture");
+        conn.execute(
+            "UPDATE lease_globals SET val = 1 WHERE key = 'next_fence'",
+            [],
+        )
+        .expect("regress fence allocator");
+
+        let error = claim_legacy_checkpoint_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            [0x35; 32],
+            1,
+            [0x36; 32],
+            0,
+            0,
+        )
+        .expect_err("legacy claim must reject a regressed lease allocator");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(!table_exists(&conn, "consensus_identity").expect("inspect ownership table"));
     }
@@ -10062,8 +10432,7 @@ mod tests {
             let conn = backend.conn.lock().await;
             initialize_schema(&conn, identity(), &members).expect("consensus schema");
             let oversized = sealed_record_for_key(key(), 1_048_577);
-            ops::insert_or_replace_record_sync(&conn, &oversized)
-                .expect("inject valid oversized envelope");
+            persist_sealed_record_fixture(&conn, &oversized);
         }
         let snapshots = tempfile::tempdir().expect("snapshot directory");
 
@@ -10107,8 +10476,7 @@ mod tests {
 
         let incoming = Connection::open(&snapshot_path).expect("open incoming snapshot");
         let oversized = sealed_record_for_key(key(), 1_048_577);
-        ops::insert_or_replace_record_sync(&incoming, &oversized)
-            .expect("inject valid oversized envelope");
+        persist_sealed_record_fixture(&incoming, &oversized);
         drop(incoming);
 
         let target = SqliteSessionBackend::in_memory().expect("target backend");
@@ -13298,8 +13666,7 @@ mod tests {
         )
         .expect("form fixed quorum");
         let oversized = sealed_record_for_key(key(), 1_048_577);
-        ops::insert_or_replace_record_sync(&conn, &oversized)
-            .expect("inject oversized persisted record");
+        persist_sealed_record_fixture(&conn, &oversized);
 
         let directory = tempfile::tempdir().expect("snapshot directory");
         let path = directory.path().join("invalid-fixed-source.sqlite");
