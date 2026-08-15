@@ -45,7 +45,12 @@ pub(crate) mod lease;
 pub(crate) mod ops;
 pub(crate) mod replication;
 
-const SQLITE_SESSION_MAX_VALUE_BYTES: usize = 1_048_576;
+const SQLITE_SESSION_MAX_VALUE_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
+// Consensus retains its existing value profile until #683 raises the shared
+// command/RPC and consumer-response ceilings together. Advertising the raw
+// SQLite limit through that adapter would accept values its 2 MiB transport
+// cannot propose and would disable every record-bearing consumer batch.
+const SQLITE_CONSENSUS_MAX_VALUE_BYTES: usize = 1_048_576;
 const CONSENSUS_AUTHORITY_REQUIRED: &str = "consensus_authority_required";
 const RESTORE_SCAN_BLOCKING_WORKERS: usize = 1;
 const SQLITE_OPERATION_BLOCKING_WORKERS: usize = 1;
@@ -565,7 +570,9 @@ impl SqliteSessionBackend {
 
     /// Capabilities consumed by the consensus adapter that owns this backend.
     pub(crate) const fn consensus_capabilities(&self) -> BackendCapabilities {
-        self.caps
+        let mut capabilities = self.caps;
+        capabilities.max_value_bytes = SQLITE_CONSENSUS_MAX_VALUE_BYTES;
+        capabilities
     }
 
     /// Whether consensus state is backed by a filesystem database.
@@ -1049,6 +1056,17 @@ fn sqlite_capabilities() -> BackendCapabilities {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn consensus_value_cap_stays_below_unexpanded_transport_contract() {
+    let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite backend");
+    assert_eq!(
+        backend.consensus_capabilities().max_value_bytes,
+        SQLITE_CONSENSUS_MAX_VALUE_BYTES
+    );
+    assert!(backend.consensus_capabilities().max_value_bytes < SQLITE_SESSION_MAX_VALUE_BYTES);
+}
+
 fn sqlite_store_outcome_unavailable(kind: SqliteStoreWorkKind) -> StoreError {
     match kind {
         SqliteStoreWorkKind::Read => {
@@ -1416,6 +1434,7 @@ impl SessionBackend for SqliteSessionBackend {
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
         let entry = entry.into_validated()?;
+        replication::validate_replication_payloads(&entry.op, &self.caps)?;
         let worker_entry = entry.clone();
         let now = self.clock.now_utc();
         let caps = self.caps;
@@ -1438,6 +1457,9 @@ impl SessionBackend for SqliteSessionBackend {
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
         let entries = validate_replication_prefix_owned(entries)?;
+        for entry in &entries {
+            replication::validate_replication_payloads(&entry.op, &self.caps)?;
+        }
         let caps = self.caps;
         self.run_store_sqlite_task(SqliteStoreWorkKind::Mutation, move |conn| {
             replication::rebuild_replication_state_sync(conn, &entries, &caps)

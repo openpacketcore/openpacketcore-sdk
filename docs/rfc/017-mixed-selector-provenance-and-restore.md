@@ -136,6 +136,14 @@ required only to qualify external adapters against the new canonical boundary;
 it does not authorize a product-local substitute and does not block defining or
 testing the SDK-owned state machine and built-in profile here.
 
+The standalone protected SQLite profile can advertise the §4.4 record ceiling.
+The HA consensus profile remains capped at its smaller existing value limit
+until [#683](https://github.com/openpacketcore/openpacketcore-sdk/issues/683)
+raises and qualifies its command/RPC and consumer-response ceilings together.
+A coordinator must return `Unsupported` when the selected protected backend
+does not advertise the §4.4 minimum; it must not chunk this one-record CAS or
+substitute product-local storage.
+
 ## 3. Terms and Safety Invariants
 
 An *introduced atom* is every atom in the new candidate's canonical desired

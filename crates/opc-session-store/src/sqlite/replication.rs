@@ -62,7 +62,7 @@ pub(crate) fn hydrate_replication_entry(
 pub(crate) fn apply_replicated_op_sync(
     conn: &Connection,
     op: ReplicationOp,
-    _caps: &BackendCapabilities,
+    caps: &BackendCapabilities,
     now: Timestamp,
 ) -> Result<(), StoreError> {
     match op {
@@ -73,6 +73,7 @@ pub(crate) fn apply_replicated_op_sync(
             guard_expires_at,
             new_record,
         } => {
+            validate_replication_payload_len(&new_record, caps)?;
             let current_fence = current_fence_sync(conn, &key)?;
             if new_record.fence.get() < current_fence {
                 return Err(StoreError::StaleFence);
@@ -363,11 +364,41 @@ pub(crate) fn apply_replicated_op_sync(
         }
         ReplicationOp::Batch { ops } => {
             for sub_op in ops {
-                apply_replicated_op_sync(conn, sub_op, _caps, now)?;
+                apply_replicated_op_sync(conn, sub_op, caps, now)?;
             }
             Ok(())
         }
     }
+}
+
+fn validate_replication_payload_len(
+    record: &crate::StoredSessionRecord,
+    caps: &BackendCapabilities,
+) -> Result<(), StoreError> {
+    if record.payload.len() > caps.max_value_bytes {
+        return Err(StoreError::PayloadTooLarge {
+            actual: record.payload.len(),
+            max: caps.max_value_bytes,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_replication_payloads(
+    root: &ReplicationOp,
+    caps: &BackendCapabilities,
+) -> Result<(), StoreError> {
+    let mut pending = vec![root];
+    while let Some(op) = pending.pop() {
+        match op {
+            ReplicationOp::CompareAndSet { new_record, .. } => {
+                validate_replication_payload_len(new_record, caps)?;
+            }
+            ReplicationOp::Batch { ops } => pending.extend(ops.iter()),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn replicate_entry_sync(
@@ -377,6 +408,7 @@ pub(crate) fn replicate_entry_sync(
     now: Timestamp,
 ) -> Result<bool, StoreError> {
     entry.validate()?;
+    validate_replication_payloads(&entry.op, caps)?;
     let sqlite_sequence = sqlite_replication_sequence(entry.sequence)?;
     let tx = super::standalone_transaction(conn)?;
 
@@ -467,6 +499,9 @@ pub(crate) fn rebuild_replication_state_sync(
     caps: &BackendCapabilities,
 ) -> Result<(), StoreError> {
     validate_replication_prefix(entries)?;
+    for entry in entries {
+        validate_replication_payloads(&entry.op, caps)?;
+    }
     let tx = super::standalone_transaction(conn)?;
 
     let removed_records = tx
