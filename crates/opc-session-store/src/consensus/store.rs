@@ -5295,9 +5295,9 @@ mod membership_tests {
             .await;
         assert_eq!(
             valid,
-            SessionConsumerResponse::Batch(Ok(vec![
-                SessionConsumerBatchResult::CompareAndSet(Ok(CompareAndSetResult::Success)),
-            ]))
+            SessionConsumerResponse::Batch(Ok(vec![SessionConsumerBatchResult::CompareAndSet(
+                Ok(CompareAndSetResult::Success)
+            ),]))
         );
     }
 
