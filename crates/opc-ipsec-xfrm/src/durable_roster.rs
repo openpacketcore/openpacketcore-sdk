@@ -5455,13 +5455,16 @@ mod tests {
             // decimal too, so a hex-only predicate would let a `#[derive(Debug)]`
             // regression on any of these types pass silently.
             for forbidden in [
-                // group id / member id / fingerprint bytes, hex and decimal
+                // group id / member id / first fingerprint 0xab bytes
                 "abab",
-                "171, 171", // second fingerprint byte, hex and decimal
+                "171, 171",
+                // second fingerprint 0xac bytes
                 "acac",
-                "172, 172", // generation 0xfeed_beef, hex and decimal
+                "172, 172",
+                // generation 0xfeed_beef
                 "feed",
-                "4276993775", // member identity fill, hex and decimal
+                "4276993775",
+                // member identity fill 0x11 bytes
                 "1111",
                 "17, 17",
             ] {

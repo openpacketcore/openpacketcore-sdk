@@ -2559,6 +2559,11 @@ impl NamespaceBoundLinuxXfrmBackend {
     /// an unresolved SA relocation, AND an unresolved sibling roster in this
     /// same store.
     ///
+    /// A returned authority must be retried or dropped promptly: while it is
+    /// held, its live admission seal defers `recover_durable_object_roster`
+    /// and `adopt_durable_object_roster` for that group with
+    /// `InvalidTransition`, exactly like any other live authority.
+    ///
     /// The DSCP and sweep rejections happen later. The sweep in particular runs
     /// inside the admitted command rather than ahead of admission consumption,
     /// so a sweep rejection has already fenced the other durable families and

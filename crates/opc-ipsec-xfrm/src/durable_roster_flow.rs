@@ -127,8 +127,11 @@ pub enum XfrmObjectRosterRequestError {
     /// durable record refuses because it would make per-member recovery
     /// ambiguous.
     ///
-    /// Only caller-supplied identities can collide: the SDK-derived identity
-    /// is separated by ordinal.
+    /// Only caller-supplied identities can collide here: the SDK-derived
+    /// identity is separated by ordinal. A caller-supplied identity equal to
+    /// another member's SDK-derived identity is not constructible without the
+    /// store's proof key; if one is ever presented it is rejected late,
+    /// fail-closed, by the durable record validator as `Malformed`.
     DuplicateMemberIdentity,
 }
 
