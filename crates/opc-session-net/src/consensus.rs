@@ -3452,9 +3452,6 @@ mod tests {
                 lifecycle,
             }),
         };
-        let before = METRICS
-            .session_net_lifecycle_retirement_explicit
-            .load(Ordering::Relaxed);
         control
             .request_reauthentication()
             .expect("advance staged connection generation");
@@ -3466,10 +3463,8 @@ mod tests {
         ));
         assert_eq!(retirement_probe.recorded_retirement_count(), 1);
         assert_eq!(
-            METRICS
-                .session_net_lifecycle_retirement_explicit
-                .load(Ordering::Relaxed),
-            before + 1
+            retirement_probe.recorded_retirement_reason(),
+            Some(RetirementReason::Explicit)
         );
     }
 
@@ -3522,12 +3517,6 @@ mod tests {
                 lifecycle,
             }),
         };
-        let material_before = METRICS
-            .session_net_lifecycle_retirement_material_epoch
-            .load(Ordering::Relaxed);
-        let explicit_before = METRICS
-            .session_net_lifecycle_retirement_explicit
-            .load(Ordering::Relaxed);
         material.rotate();
 
         assert!(matches!(
@@ -3537,16 +3526,8 @@ mod tests {
         ));
         assert_eq!(retirement_probe.recorded_retirement_count(), 1);
         assert_eq!(
-            METRICS
-                .session_net_lifecycle_retirement_material_epoch
-                .load(Ordering::Relaxed),
-            material_before + 1
-        );
-        assert_eq!(
-            METRICS
-                .session_net_lifecycle_retirement_explicit
-                .load(Ordering::Relaxed),
-            explicit_before
+            retirement_probe.recorded_retirement_reason(),
+            Some(RetirementReason::MaterialEpoch)
         );
         let mut dispatched = Vec::new();
         remote

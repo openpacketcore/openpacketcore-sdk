@@ -652,6 +652,8 @@ pub(crate) enum RetirementReason {
 
 const LIFECYCLE_METRIC_ACTIVE: u8 = 0;
 const LIFECYCLE_METRIC_DRAINING: u8 = 1;
+#[cfg(test)]
+const UNRECORDED_RETIREMENT_REASON: u8 = u8::MAX;
 
 #[derive(Debug)]
 struct LifecycleConnectionMetrics {
@@ -764,6 +766,8 @@ pub(crate) struct ConnectionLifecycle {
     generation: u64,
     rotation_retire_at: Option<(tokio::time::Instant, RetirementReason)>,
     retirement_recorded: Arc<AtomicBool>,
+    #[cfg(test)]
+    retirement_reason_recorded: Arc<AtomicU8>,
     metrics: Arc<LifecycleConnectionMetrics>,
 }
 
@@ -894,6 +898,8 @@ impl ConnectionLifecycle {
             generation,
             rotation_retire_at: None,
             retirement_recorded: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            retirement_reason_recorded: Arc::new(AtomicU8::new(UNRECORDED_RETIREMENT_REASON)),
             metrics: Arc::new(LifecycleConnectionMetrics::new()),
         })
     }
@@ -968,6 +974,35 @@ impl ConnectionLifecycle {
     }
 
     #[cfg(test)]
+    pub(crate) fn recorded_retirement_reason(&self) -> Option<RetirementReason> {
+        match self.retirement_reason_recorded.load(Ordering::Acquire) {
+            value if value == RetirementReason::MaximumAge as u8 => {
+                Some(RetirementReason::MaximumAge)
+            }
+            value if value == RetirementReason::LocalLeafExpiry as u8 => {
+                Some(RetirementReason::LocalLeafExpiry)
+            }
+            value if value == RetirementReason::PeerLeafExpiry as u8 => {
+                Some(RetirementReason::PeerLeafExpiry)
+            }
+            value if value == RetirementReason::LocalCertificateChainExpiry as u8 => {
+                Some(RetirementReason::LocalCertificateChainExpiry)
+            }
+            value if value == RetirementReason::PeerCertificateChainExpiry as u8 => {
+                Some(RetirementReason::PeerCertificateChainExpiry)
+            }
+            value if value == RetirementReason::MaterialEpoch as u8 => {
+                Some(RetirementReason::MaterialEpoch)
+            }
+            value if value == RetirementReason::Explicit as u8 => Some(RetirementReason::Explicit),
+            value if value == RetirementReason::IdleTimeout as u8 => {
+                Some(RetirementReason::IdleTimeout)
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn expire_at_final_ack_boundary_for_test(&mut self) {
         self.rotation_retire_at = None;
         self.retire_at = tokio::time::Instant::now();
@@ -977,6 +1012,9 @@ impl ConnectionLifecycle {
         if self.retirement_recorded.swap(true, Ordering::Relaxed) {
             return;
         }
+        #[cfg(test)]
+        self.retirement_reason_recorded
+            .store(reason as u8, Ordering::Release);
         self.metrics.begin_draining();
         reason.retirement_counter().fetch_add(1, Ordering::Relaxed);
         tracing::debug!(reason = reason.as_str(), "session connection retired");
@@ -1315,9 +1353,17 @@ mod tests {
             LIFECYCLE_METRIC_ACTIVE
         );
         assert!(!lifecycle.retirement_recorded.load(Ordering::Acquire));
+        assert_eq!(
+            lifecycle.retirement_reason_recorded.load(Ordering::Acquire),
+            UNRECORDED_RETIREMENT_REASON
+        );
         lifecycle.record_forced_retirement(RetirementReason::Explicit);
         sibling.record_forced_retirement(RetirementReason::MaximumAge);
-        assert!(lifecycle.retirement_recorded.load(Ordering::Acquire));
+        assert_eq!(
+            lifecycle.recorded_retirement_reason(),
+            Some(RetirementReason::Explicit),
+            "a later conflicting retirement reason must not replace the winning reason"
+        );
         assert_eq!(
             lifecycle.metrics.state.load(Ordering::Acquire),
             LIFECYCLE_METRIC_DRAINING
