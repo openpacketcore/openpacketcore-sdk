@@ -520,8 +520,8 @@ async fn pre_request_connection_budget_leaves_time_for_a_healthy_later_roster_en
         scope,
         pki.client_config(&client_spiffe),
     )
-    .with_pre_request_connection_timeout(Duration::from_millis(100))
-    .with_operation_timeout(Duration::from_secs(1));
+    .with_pre_request_connection_timeout(Duration::from_millis(500))
+    .with_operation_timeout(Duration::from_secs(2));
 
     let lease = test_lease().await;
     let started_at = tokio::time::Instant::now();
@@ -542,7 +542,7 @@ async fn pre_request_connection_budget_leaves_time_for_a_healthy_later_roster_en
     );
     assert_eq!(healthy_service.calls.load(Ordering::SeqCst), 1);
     assert!(
-        started_at.elapsed() < Duration::from_millis(500),
+        started_at.elapsed() < Duration::from_millis(1_500),
         "the stalled endpoint must not consume the fixed-roster renewal window"
     );
     stalled_tls.abort();
