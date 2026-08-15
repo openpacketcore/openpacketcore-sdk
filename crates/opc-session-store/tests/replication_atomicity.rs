@@ -117,6 +117,46 @@ fn lease_and_record_entry(
     )
 }
 
+fn cross_key_lease_and_record_entry(
+    sequence: u64,
+    op_key: SessionKey,
+    record_key: SessionKey,
+    owner: &OwnerId,
+    timestamp: Timestamp,
+) -> ReplicationEntry {
+    let fence = 2;
+    let credential_id = 2;
+    let mut compare_and_set = compare_and_set(
+        op_key.clone(),
+        owner,
+        fence,
+        credential_id,
+        1,
+        None,
+        timestamp,
+    );
+    let ReplicationOp::CompareAndSet { new_record, .. } = &mut compare_and_set else {
+        panic!("fixture is a compare-and-set");
+    };
+    new_record.key = record_key;
+
+    entry(
+        sequence,
+        "cross-key-rejected",
+        timestamp,
+        ReplicationOp::Batch {
+            ops: vec![ReplicationOp::Batch {
+                ops: vec![
+                    acquire(op_key, owner, fence, credential_id, timestamp),
+                    ReplicationOp::Batch {
+                        ops: vec![compare_and_set],
+                    },
+                ],
+            }],
+        },
+    )
+}
+
 async fn replication_snapshot<B>(backend: &B) -> (u64, Vec<ReplicationEntry>, (u64, u64))
 where
     B: SessionStoreBackend,
@@ -321,6 +361,70 @@ where
     assert_no_watch_entry(&mut watch).await;
 }
 
+async fn assert_sqlite_cross_key_replication_is_rejected_before_mutation(rebuild: bool) {
+    let backend = SqliteSessionBackend::in_memory().expect("SQLite backend");
+    let owner = OwnerId::new("owner-a").expect("owner");
+    let original_key = key(b"cross-key-original");
+    let op_key = key(b"cross-key-op");
+    let record_key = key(b"cross-key-record");
+    let original = lease_and_record_entry(
+        1,
+        "cross-key-original",
+        original_key.clone(),
+        &owner,
+        1,
+        1,
+        timestamp(),
+    );
+    backend
+        .replicate_entry(original.clone())
+        .await
+        .expect("seed original state");
+    let before = replication_snapshot(&backend).await;
+    let original_record = backend
+        .get(&original_key)
+        .await
+        .expect("read original")
+        .expect("original record");
+    let mut watch = backend.watch(2).await.expect("watch cross-key rejection");
+
+    let rejected = cross_key_lease_and_record_entry(
+        if rebuild { 1 } else { 2 },
+        op_key.clone(),
+        record_key.clone(),
+        &owner,
+        timestamp(),
+    );
+    let result = if rebuild {
+        backend.rebuild_replication_state(vec![rejected]).await
+    } else {
+        backend.replicate_entry(rejected).await
+    };
+
+    assert_eq!(
+        result.expect_err("cross-key replicated CAS must fail closed"),
+        StoreError::InvalidKey("compare-and-set key does not match record key".into())
+    );
+    // The snapshot includes the replication head/log and next lease/fence
+    // counters, proving the nested acquire never reached replay.
+    assert_eq!(replication_snapshot(&backend).await, before);
+    assert_eq!(
+        backend.get(&original_key).await.expect("read original"),
+        Some(original_record)
+    );
+    assert!(backend
+        .get(&op_key)
+        .await
+        .expect("read rejected op key")
+        .is_none());
+    assert!(backend
+        .get(&record_key)
+        .await
+        .expect("read rejected record key")
+        .is_none());
+    assert_no_watch_entry(&mut watch).await;
+}
+
 async fn assert_successful_compound_append_is_ordered_and_single_event<B>(backend: B)
 where
     B: SessionStoreBackend,
@@ -421,6 +525,7 @@ async fn assert_sqlite_oversized_replication_is_rejected_before_mutation(rebuild
         .await
         .expect("read original")
         .expect("original record");
+    let mut watch = backend.watch(2).await.expect("watch oversized rejection");
     let caps = backend.capabilities().await;
     let candidate_timestamp = timestamp();
     let mut oversized = lease_and_record_entry(
@@ -463,9 +568,10 @@ async fn assert_sqlite_oversized_replication_is_rejected_before_mutation(rebuild
         .await
         .expect("read rejected candidate")
         .is_none());
+    assert_no_watch_entry(&mut watch).await;
 }
 
-async fn assert_sqlite_exact_replication_payload_is_accepted() {
+async fn assert_sqlite_exact_replication_payload_is_accepted(rebuild: bool) {
     let backend = SqliteSessionBackend::in_memory().expect("SQLite backend");
     let owner = OwnerId::new("owner-a").expect("owner");
     let candidate_key = key(b"payload-bound-exact");
@@ -488,10 +594,17 @@ async fn assert_sqlite_exact_replication_payload_is_accepted() {
     new_record.payload =
         EncryptedSessionPayload::new(Bytes::from(vec![0xAB; caps.max_value_bytes]));
 
-    backend
-        .replicate_entry(exact)
-        .await
-        .expect("the advertised exact payload limit must replicate");
+    if rebuild {
+        backend
+            .rebuild_replication_state(vec![exact])
+            .await
+            .expect("the advertised exact payload limit must rebuild");
+    } else {
+        backend
+            .replicate_entry(exact)
+            .await
+            .expect("the advertised exact payload limit must replicate");
+    }
     let retained = backend
         .get(&candidate_key)
         .await
@@ -523,6 +636,16 @@ async fn fake_failed_rebuild_is_atomic() {
 async fn sqlite_failed_rebuild_is_atomic() {
     assert_failed_rebuild_is_atomic(SqliteSessionBackend::in_memory().expect("SQLite backend"))
         .await;
+}
+
+#[tokio::test]
+async fn sqlite_cross_key_replication_append_is_rejected_before_mutation() {
+    assert_sqlite_cross_key_replication_is_rejected_before_mutation(false).await;
+}
+
+#[tokio::test]
+async fn sqlite_cross_key_replication_rebuild_is_rejected_before_mutation() {
+    assert_sqlite_cross_key_replication_is_rejected_before_mutation(true).await;
 }
 
 #[tokio::test]
@@ -563,5 +686,10 @@ async fn sqlite_oversized_replication_rebuild_is_rejected_before_mutation() {
 
 #[tokio::test]
 async fn sqlite_exact_replication_payload_is_accepted() {
-    assert_sqlite_exact_replication_payload_is_accepted().await;
+    assert_sqlite_exact_replication_payload_is_accepted(false).await;
+}
+
+#[tokio::test]
+async fn sqlite_exact_replication_payload_rebuild_is_accepted() {
+    assert_sqlite_exact_replication_payload_is_accepted(true).await;
 }

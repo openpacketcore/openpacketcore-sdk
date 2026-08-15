@@ -1226,7 +1226,10 @@ impl SqliteConsensusCore {
             expected_members,
             expected_bindings,
             snapshot_dir: Arc::new(canonical_snapshot_dir),
-            caps: backend.caps,
+            // The core is shared by state-machine apply, snapshots, and
+            // recovery/reopen paths. It must retain the consensus adapter's
+            // advertised profile rather than SQLite's standalone ceiling.
+            caps: backend.consensus_capabilities(),
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
             applied_progress,
             watchers: Arc::clone(&backend.watchers),
@@ -9219,6 +9222,11 @@ mod tests {
 
     use bytes::Bytes;
     use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    use opc_crypto::CryptoEnvelopeV1;
+    use opc_key::{
+        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
+        AES_256_GCM_SIV_NONCE_LEN,
+    };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
     use super::*;
@@ -9541,6 +9549,208 @@ mod tests {
                 },
             }),
         }
+    }
+
+    fn sealed_payload_for_record(
+        record: &crate::StoredSessionRecord,
+        payload_len: usize,
+    ) -> crate::EncryptedSessionPayload {
+        let key_id = KeyId::new("consensus-cap-test-key").expect("key ID");
+        let aad = EnvelopeAad::session(
+            record.key.tenant.clone(),
+            1,
+            SessionAad::new(
+                record.key.nf_kind.as_str(),
+                "consensus-cap-test-keyed-session-digest",
+                record.state_type.as_str(),
+                record.generation.get(),
+                record.fence.get(),
+                "consensus-cap-test-backend",
+            )
+            .expect("session AAD"),
+        );
+        let envelope = |opaque_len| CryptoEnvelopeV1 {
+            algorithm: AeadAlgorithm::Aes256GcmSiv,
+            key_id: key_id.clone(),
+            nonce: vec![0x42; AES_256_GCM_SIV_NONCE_LEN],
+            aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+            ciphertext_and_tag: {
+                let mut ciphertext_and_tag = vec![0xA5; opaque_len];
+                ciphertext_and_tag.extend_from_slice(&[0x5A; AEAD_TAG_LEN]);
+                ciphertext_and_tag
+            },
+        };
+        let envelope_overhead = envelope(0).encode().expect("empty envelope").len();
+        let encoded = envelope(
+            payload_len
+                .checked_sub(envelope_overhead)
+                .expect("payload length exceeds envelope overhead"),
+        )
+        .encode()
+        .expect("sized envelope");
+        assert_eq!(payload_len, encoded.len());
+        crate::EncryptedSessionPayload::try_envelope(encoded).expect("valid envelope")
+    }
+
+    fn capped_cas_entry(
+        index: u64,
+        request_id: [u8; 16],
+        lease: crate::LeaseGuard,
+        expected_generation: Option<crate::Generation>,
+        generation: crate::Generation,
+        payload_len: usize,
+    ) -> Entry<SessionRaftTypeConfig> {
+        let key = key();
+        let mut record = crate::StoredSessionRecord {
+            key: key.clone(),
+            generation,
+            owner: lease.owner().clone(),
+            fence: lease.fence(),
+            state_class: crate::StateClass::AuthoritativeSession,
+            state_type: crate::StateType::from_static("consensus-cap-test"),
+            expires_at: None,
+            payload: crate::EncryptedSessionPayload::new([]),
+        };
+        record.payload = sealed_payload_for_record(&record, payload_len);
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes(request_id),
+                logical_time: timestamp(u8::try_from(index).expect("test index")),
+                intent: SessionMutationIntent::CompareAndSet(Box::new(crate::CompareAndSet {
+                    key,
+                    lease,
+                    expected_generation,
+                    new_record: record,
+                })),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn consensus_core_retains_the_capped_profile_across_reopen_and_apply() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let snapshots = tempfile::tempdir().expect("snapshot directory");
+        let members = expected_members();
+        let bindings = test_member_bindings(&members);
+        let advertised = backend.consensus_capabilities();
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshots.path().join("snapshots"),
+            identity(),
+            members.clone(),
+            bindings.clone(),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize consensus core");
+        assert_eq!(advertised, core.caps);
+        assert_eq!(1_048_576, core.caps.max_value_bytes);
+
+        let reopened = SqliteConsensusCore::initialize(
+            &backend,
+            snapshots.path().join("snapshots"),
+            identity(),
+            members,
+            bindings,
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("reopen consensus core");
+        assert_eq!(advertised, reopened.caps);
+
+        let conn = reopened.conn.lock().await;
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &reopened.caps,
+            vec![
+                membership_entry(),
+                acquire_entry(1, [0xA1; 16], "consensus-cap-owner"),
+            ],
+        )
+        .expect("apply membership and lease");
+        let lease = match &applied.responses[1].result {
+            Ok(SessionMutationOutcome::Lease(lease)) => lease.clone(),
+            other => panic!("unexpected lease response: {other:?}"),
+        };
+
+        let exact = apply_entries_sync(
+            &conn,
+            identity(),
+            &reopened.caps,
+            vec![capped_cas_entry(
+                2,
+                [0xA2; 16],
+                lease.clone(),
+                None,
+                crate::Generation::new(1),
+                advertised.max_value_bytes,
+            )],
+        )
+        .expect("exact consensus cap applies");
+        assert!(matches!(
+            exact.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::CompareAndSet(
+                    CompareAndSetResult::Success
+                )),
+                ..
+            }]
+        ));
+        let before_record: (i64, i64) = conn
+            .query_row(
+                "SELECT generation, length(payload) FROM session_records",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("exact-cap record");
+        let (_, before_revision, _) =
+            ops::read_restore_scan_state_sync(&conn).expect("restore revision");
+
+        let rejected = apply_entries_sync(
+            &conn,
+            identity(),
+            &reopened.caps,
+            vec![capped_cas_entry(
+                3,
+                [0xA3; 16],
+                lease,
+                Some(crate::Generation::new(1)),
+                crate::Generation::new(2),
+                advertised.max_value_bytes + 1,
+            )],
+        )
+        .expect("oversized command returns a deterministic rejection");
+        assert!(matches!(
+            rejected.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::PayloadTooLarge {
+                    actual: 1_048_577,
+                    max: 1_048_576,
+                }),
+                ..
+            }]
+        ));
+        assert_eq!(
+            before_record,
+            conn.query_row(
+                "SELECT generation, length(payload) FROM session_records",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("oversized command leaves record unchanged")
+        );
+        assert_eq!(
+            before_revision,
+            ops::read_restore_scan_state_sync(&conn)
+                .expect("restore revision after rejection")
+                .1
+        );
     }
 
     fn authorized_acquire_entry(

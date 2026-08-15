@@ -65,6 +65,19 @@ pub(crate) fn apply_replicated_op_sync(
     caps: &BackendCapabilities,
     now: Timestamp,
 ) -> Result<(), StoreError> {
+    // Keep this defense at the replay boundary as callers other than the
+    // public async adapter can invoke this synchronous helper directly.
+    // In particular, validate an entire nested batch before its first child
+    // can mutate the transaction.
+    validate_replication_payloads(&op, caps)?;
+    apply_validated_replicated_op_sync(conn, op, now)
+}
+
+fn apply_validated_replicated_op_sync(
+    conn: &Connection,
+    op: ReplicationOp,
+    now: Timestamp,
+) -> Result<(), StoreError> {
     match op {
         ReplicationOp::CompareAndSet {
             key,
@@ -73,7 +86,6 @@ pub(crate) fn apply_replicated_op_sync(
             guard_expires_at,
             new_record,
         } => {
-            validate_replication_payload_len(&new_record, caps)?;
             let current_fence = current_fence_sync(conn, &key)?;
             if new_record.fence.get() < current_fence {
                 return Err(StoreError::StaleFence);
@@ -364,7 +376,7 @@ pub(crate) fn apply_replicated_op_sync(
         }
         ReplicationOp::Batch { ops } => {
             for sub_op in ops {
-                apply_replicated_op_sync(conn, sub_op, caps, now)?;
+                apply_validated_replicated_op_sync(conn, sub_op, now)?;
             }
             Ok(())
         }
@@ -388,10 +400,22 @@ pub(crate) fn validate_replication_payloads(
     root: &ReplicationOp,
     caps: &BackendCapabilities,
 ) -> Result<(), StoreError> {
+    // This preflight is shared by the public adapter, append/rebuild helpers,
+    // and the replay defense above. Structure is checked first so walking an
+    // untrusted tree stays bounded before we inspect every nested CAS.
+    root.validate_structure()?;
+
     let mut pending = vec![root];
     while let Some(op) = pending.pop() {
         match op {
-            ReplicationOp::CompareAndSet { new_record, .. } => {
+            ReplicationOp::CompareAndSet {
+                key, new_record, ..
+            } => {
+                if new_record.key != *key {
+                    return Err(StoreError::InvalidKey(
+                        "compare-and-set key does not match record key".into(),
+                    ));
+                }
                 validate_replication_payload_len(new_record, caps)?;
             }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter()),
