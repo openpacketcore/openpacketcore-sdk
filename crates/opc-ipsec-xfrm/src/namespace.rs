@@ -10107,56 +10107,66 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admitted_roster_run_completes_every_member_after_observer_cancellation() {
-        let root = DurableTestRoot::new();
-        let blocking = Arc::new(BlockingState::new());
-        let (backend, _, _, store) = bind_with_capacity_and_recovery(
-            LinuxXfrmBackend::with_transport(BlockingTransport {
-                state: Arc::clone(&blocking),
-            }),
-            1,
-            None,
-            None,
-            Some((
-                root.path().to_path_buf(),
-                XfrmObjectRosterRecoveryProofKey::new([0x86; 32]).unwrap(),
-            )),
-        )
-        .unwrap();
-        let store = store.unwrap();
-        let group = roster_group(0x16);
-        let generation = roster_generation(1);
-        let roster = sa_roster(4);
-        let authority = backend
-            .prepare_durable_object_roster(&store, group, generation, roster.clone())
-            .await
+        for blocked_ordinal in 0..4 {
+            let root = DurableTestRoot::new();
+            let blocking = Arc::new(BlockingState::new());
+            let (backend, _, _, store) = bind_with_capacity_and_recovery(
+                LinuxXfrmBackend::with_transport(RecordingBlockingTransport::new(
+                    Arc::clone(&blocking),
+                    blocked_ordinal,
+                )),
+                1,
+                None,
+                None,
+                Some((
+                    root.path().to_path_buf(),
+                    XfrmObjectRosterRecoveryProofKey::new([0x86; 32]).unwrap(),
+                )),
+            )
             .unwrap();
-
-        let observer = tokio::spawn({
-            let backend = backend.clone();
-            async move { backend.run_durable_object_roster(authority).await }
-        });
-        // The barrier holds the FIRST member's install; every readback before
-        // it resolves immediately, so the durable `Issuing` publication has
-        // already landed.
-        wait_until(|| blocking.mutation_calls.load(Ordering::Acquire) == 1).await;
-        assert_eq!(
-            durable_object_roster_phase(&store, group, generation, &roster),
-            Ok(XfrmObjectRosterDurablePhase::Issuing)
-        );
-
-        observer.abort();
-        let _ = observer.await;
-        blocking.release();
-
-        // The admitted command owns completion of the whole group.
-        assert_eq!(
-            backend
-                .finalize_durable_object_roster(&store, group, generation, &roster)
+            let store = store.unwrap();
+            let group = roster_group(0x16 + u8::try_from(blocked_ordinal).unwrap());
+            let generation = roster_generation(1);
+            let roster = sa_roster(4);
+            let authority = backend
+                .prepare_durable_object_roster(&store, group, generation, roster.clone())
                 .await
-                .unwrap(),
-            XfrmObjectRosterDurablePhase::Committed
-        );
-        assert_eq!(blocking.mutation_calls.load(Ordering::Acquire), 4);
+                .unwrap();
+
+            let observer = tokio::spawn({
+                let backend = backend.clone();
+                async move { backend.run_durable_object_roster(authority).await }
+            });
+            // The configurable barrier holds the requested ordinal's install;
+            // all prior members have completed, and `Issuing` is durable.
+            wait_until(|| blocking.mutation_calls.load(Ordering::Acquire) == blocked_ordinal + 1)
+                .await;
+            assert_eq!(
+                durable_object_roster_phase(&store, group, generation, &roster),
+                Ok(XfrmObjectRosterDurablePhase::Issuing),
+                "blocked ordinal {blocked_ordinal}"
+            );
+
+            observer.abort();
+            let _ = observer.await;
+            blocking.release();
+
+            // At every ordinal the admitted command, not its lost observer,
+            // owns completion of all roster members.
+            assert_eq!(
+                backend
+                    .finalize_durable_object_roster(&store, group, generation, &roster)
+                    .await
+                    .unwrap(),
+                XfrmObjectRosterDurablePhase::Committed,
+                "blocked ordinal {blocked_ordinal}"
+            );
+            assert_eq!(
+                blocking.mutation_calls.load(Ordering::Acquire),
+                4,
+                "blocked ordinal {blocked_ordinal}"
+            );
+        }
     }
 
     #[cfg(unix)]

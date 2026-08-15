@@ -155,7 +155,14 @@
 //! value-free. The leased root carries the same trusted, non-rollback storage
 //! obligation as the install boundary; because records hold fingerprints rather
 //! than values, adopting or recovering a roster requires the consumer to have
-//! durably retained every member request, including its key material.
+//! durably retained every member request, including its key material. A
+//! finalized roster retains one terminal idempotence record but no unresolved
+//! cleanup authority; the next cooperating prepare or epoch advance prunes it
+//! deterministically. Automatic roster recovery of an `Absent` witness followed
+//! by a present object is valid only while the deployment excludes raw or
+//! independently stored XFRM writers from the namespace. The SDK epoch orders
+//! cooperating actor writes only, not that external fence: otherwise identical
+//! ownership is observationally ambiguous and Linux deletion is unconditional.
 //!
 //! Same-SPI successor activation uses
 //! [`NamespaceBoundLinuxXfrmBackend::apply_and_read_back_outbound_esp_counter`].

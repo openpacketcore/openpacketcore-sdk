@@ -1170,20 +1170,24 @@ where
             }
         }
 
-        if let Some(cut) = cut {
-            if cut.ordinal == ordinal {
-                if cut.admit_backend_effect {
-                    // The epoch is already burned and the adjacent proof is
-                    // already durable, so this is the production effect
-                    // admission with its terminal publication deliberately
-                    // omitted.
-                    let _ = install(backend, roster.request(ordinal)?).await;
-                }
+        let install_result = if cut.is_some_and(|cut| cut.ordinal == ordinal) {
+            let cut = cut.ok_or(XfrmObjectRosterDurableError::InvalidTransition)?;
+            if !cut.admit_backend_effect {
                 return Ok(Issued::Cut(store.handle_for_record(&record)?));
             }
-        }
+            // The epoch is already burned and the adjacent proof is already
+            // durable, so this is the exact production effect admission with
+            // its successful terminal publication deliberately omitted.
+            let result = install(backend, roster.request(ordinal)?).await;
+            if result.is_ok() {
+                return Ok(Issued::Cut(store.handle_for_record(&record)?));
+            }
+            result
+        } else {
+            install(backend, roster.request(ordinal)?).await
+        };
 
-        match install(backend, roster.request(ordinal)?).await {
+        match install_result {
             Ok(()) => {
                 if ordinal + 1 == arity {
                     let slot = record
@@ -1861,7 +1865,11 @@ where
 {
     let mut record = record;
     let arity = record.arity()?;
-    let mut foreign = false;
+    // A conflict can already be durable when recovery enters `Compensating`:
+    // for example, an `AbsentThenAlreadyExists` member has no residue to
+    // reconcile, but must still preserve the foreign-untouched verdict after
+    // the acquired prefix is rolled back.
+    let mut foreign = dispositions_for(&record).has_conflict();
     let from_applied = record.phase == XfrmObjectRosterDurablePhase::Applied;
 
     if record.phase == XfrmObjectRosterDurablePhase::Issuing {
@@ -1983,10 +1991,12 @@ where
 /// real, so the durable prefix is genuine acquisition authority. When
 /// `admit_backend_effect` is true the member's install is invoked exactly as
 /// the real effect admission does (the epoch is already burned and the adjacent
-/// proof already durable), so the kernel object exists while the record stays
-/// `Issuing`; when false the backend is never asked to mutate that member. No
-/// terminal phase is published, so the record stays unresolved and recoverable.
-/// This is only used by crash detectors and never grants deletion authority.
+/// proof already durable). A cut exists only after that effect acknowledges
+/// success; a diverting result is processed through the normal live transition
+/// and compensation path instead. When false the backend is never asked to
+/// mutate that member. No successful terminal phase is published, so a cut
+/// record stays unresolved and recoverable. This is only used by crash
+/// detectors and never grants deletion authority.
 ///
 /// # Errors
 ///
@@ -2140,12 +2150,12 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::Cell,
         fs::{self, DirBuilder},
         io,
         os::unix::fs::DirBuilderExt,
         path::{Path, PathBuf},
         sync::{Mutex, MutexGuard},
+        time::Duration,
     };
 
     use async_trait::async_trait;
@@ -2173,8 +2183,6 @@ mod tests {
 
     const NAMESPACE_BINDING: [u8; 40] = [0x5c; 40];
     const PROOF_KEY_BYTE: u8 = 0x71;
-    /// Synthetic cost charged at each consumer-visible durable boundary.
-    const BARRIER_COST: usize = 7;
     /// The dependency-ordered Child SA roster: inbound SA, inbound policy,
     /// inbound forward policy, outbound SA, outbound policy.
     const CHILD_SA_ROSTER: [Kind; 5] =
@@ -3375,6 +3383,108 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn issuing_cut_reports_already_exists_through_normal_compensation() {
+        // Cover homogeneous SA and policy rosters as well as the production
+        // mixed shape. In each case the middle member becomes foreign after
+        // its adjacent witness, so the cut must not hand a caller an
+        // unresolved `Pending` handle after the rejected effect.
+        for kinds in [
+            [Kind::Sa; 3],
+            [Kind::Policy; 3],
+            [Kind::Sa, Kind::Policy, Kind::Sa],
+        ] {
+            let root = TestRoot::new();
+            let roster = roster_of(&kinds);
+            let backend = ScriptedBackend::for_roster(&roster);
+            // Script both pre-effect observations absent while retaining the
+            // foreign object in the mock. The exact install then reports the
+            // injected `AlreadyExists` from the existing fault/readback rig.
+            backend.plant(roster.member(1).unwrap().request()).await;
+            backend.fail_query(1, 0, XfrmError::NotFound);
+            backend.fail_query(1, 1, XfrmError::NotFound);
+            backend.fail_install(1, XfrmError::AlreadyExists);
+            let store = open_store(&root);
+            let prepared =
+                prepare_object_roster(&store, group(0x42), generation(1), &roster).unwrap();
+
+            let error = cut_durable_object_roster_at_issuing_member(
+                &store,
+                &prepared,
+                group(0x42),
+                generation(1),
+                &roster,
+                &backend,
+                1,
+                true,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    XfrmObjectRosterIssueError::Durable(
+                        XfrmObjectRosterDurableError::InvalidTransition
+                    )
+                ),
+                "kinds {kinds:?}"
+            );
+            // Only the known acquired prefix is compensated. The foreign
+            // middle member is never passed to a delete and remains present.
+            assert_eq!(backend.ordinals(OpKind::Remove), vec![0], "kinds {kinds:?}");
+            assert!(
+                backend
+                    .is_present(roster.member(1).unwrap().request())
+                    .await,
+                "kinds {kinds:?}"
+            );
+            assert!(!store.has_unresolved_writer_authority().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn compensating_conflict_recovers_foreign_untouched_after_prefix_rollback() {
+        let root = TestRoot::new();
+        let roster = roster_of(&[Kind::Sa, Kind::Policy, Kind::Sa]);
+        let backend = ScriptedBackend::for_roster(&roster);
+        // The middle policy appears after its absent witnesses. Fail the
+        // prefix removal so the process-loss record remains `Compensating`
+        // with the already-durable conflict disposition.
+        backend.plant(roster.member(1).unwrap().request()).await;
+        backend.fail_query(1, 0, XfrmError::NotFound);
+        backend.fail_query(1, 1, XfrmError::NotFound);
+        backend.fail_remove(0, XfrmError::Unavailable);
+        let store = open_store(&root);
+
+        assert_eq!(
+            run_roster(&store, group(0x43), generation(1), &roster, &backend)
+                .await
+                .unwrap()
+                .as_str(),
+            "indeterminate"
+        );
+        assert!(store.has_unresolved_writer_authority().unwrap());
+        drop(store);
+
+        backend.clear_faults();
+        backend.clear_log();
+        let reopened = open_store(&root);
+        let recovered =
+            recover_durable_object_roster(&reopened, group(0x43), generation(1), &roster, &backend)
+                .await
+                .unwrap();
+        assert_eq!(recovered.as_str(), "foreign_untouched");
+        assert!(recovered.members().has_conflict());
+        // Restart removes only the acquired prefix. Linux deletion is never
+        // admitted for the conflict member.
+        assert_eq!(backend.ordinals(OpKind::Remove), vec![0]);
+        assert!(
+            backend
+                .is_present(roster.member(1).unwrap().request())
+                .await
+        );
+    }
+
     /// The one `Issuing` cut the detector seam cannot reach: member zero's
     /// adjacent witness found a conflict, and the process died after the
     /// `Prepared -> Issuing` publication that opened its effect window but
@@ -3806,7 +3916,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_successful_roster_retains_no_durable_entries() {
+    async fn finalize_retains_terminal_idempotence_until_next_cooperating_write() {
         let root = TestRoot::new();
         let roster = roster_of(&CHILD_SA_ROSTER);
         let backend = ScriptedBackend::for_roster(&roster);
@@ -3820,12 +3930,25 @@ mod tests {
             finalize_durable_object_roster(&store, group(0x81), generation(1), &roster).unwrap(),
             XfrmObjectRosterDurablePhase::Committed
         );
+        // Finalize deliberately retains one terminal record for reply-loss
+        // idempotence. It is not unresolved cleanup authority and therefore
+        // does not gate the next cooperating write.
         assert_eq!(root.record_files(), 1);
-        // The committed record is pruned at the next epoch advance.
+        assert!(!store.has_unresolved_writer_authority().unwrap());
+        assert_eq!(
+            recover_durable_object_roster(&store, group(0x81), generation(1), &roster, &backend)
+                .await
+                .unwrap()
+                .as_str(),
+            "committed"
+        );
+        // The next cooperating prepare or epoch advance deterministically
+        // prunes terminal idempotence records.
         assert!(store.advance_writer_epoch().is_ok());
         assert_eq!(root.record_files(), 0);
 
-        // A partial roster retains exactly one group record until it resolves.
+        // An indeterminate partial roster instead retains exactly one
+        // unresolved cleanup authority until recovery resolves it.
         let partial = roster_of(&CHILD_SA_ROSTER);
         let backend = ScriptedBackend::for_roster(&partial);
         backend.fail_install(2, XfrmError::Unavailable);
@@ -3838,6 +3961,7 @@ mod tests {
             "indeterminate"
         );
         assert_eq!(root.record_files(), 1);
+        assert!(store.has_unresolved_writer_authority().unwrap());
         backend.clear_faults();
         assert_eq!(
             recover_durable_object_roster(&store, group(0x82), generation(1), &partial, &backend)
@@ -3846,59 +3970,50 @@ mod tests {
                 .as_str(),
             "rolled_back"
         );
+        assert!(!store.has_unresolved_writer_authority().unwrap());
+        // Recovery leaves a terminal idempotence record, subject to the same
+        // deterministic pruning on the next cooperating write.
+        assert_eq!(root.record_files(), 1);
         assert!(store.advance_writer_epoch().is_ok());
         assert_eq!(root.record_files(), 0);
     }
 
-    /// Synthetic barrier charged once per consumer-visible durable boundary.
-    ///
-    /// This pins CALL SHAPE, not time. The counter is driven by the test
-    /// body's own `boundary()` calls around each API lifecycle call, so it can
-    /// only ever restate how many lifecycle calls the test made; it measures
-    /// nothing about the code under test and no latency claim rests on it. The
-    /// load-bearing evidence in
-    /// [`one_roster_lifecycle_replaces_the_serial_single_object_baseline`] is
-    /// measured from the code under test instead: the writer-epoch burn count
-    /// (1 for a roster of any arity against N for the serial baseline) and the
-    /// publication-ledger class counts (one prepare-class and one
-    /// finalize-class publication regardless of arity).
-    struct BarrierMeter {
-        charged: Cell<usize>,
+    /// Models the consumer's own remote durability boundary, not an SDK
+    /// filesystem sync. A real consumer might use this boundary to commit a
+    /// poll admission or adoption decision to its independent store.
+    struct DelayedExternalConsumerDurability {
+        delay: Duration,
     }
 
-    impl BarrierMeter {
-        fn new() -> Self {
-            Self {
-                charged: Cell::new(0),
-            }
-        }
-
-        fn boundary(&self) {
-            self.charged.set(self.charged.get() + BARRIER_COST);
-        }
-
-        fn total(&self) -> usize {
-            self.charged.get()
+    impl DelayedExternalConsumerDurability {
+        async fn persist(&self) {
+            tokio::time::sleep(self.delay).await;
         }
     }
 
     #[tokio::test]
     async fn one_roster_lifecycle_replaces_the_serial_single_object_baseline() {
-        for arity in [1, 2, 5, 8] {
-            let kinds = vec![Kind::Sa; arity];
+        const MEMBER_COUNT: usize = 5;
+        // The large margin avoids relying on scheduler precision: two external
+        // consumer commits must fit, while ten serial commits cannot.
+        const EXTERNAL_DURABILITY_DELAY: Duration = Duration::from_millis(150);
+        const HARD_BUDGET: Duration = Duration::from_millis(900);
 
-            // Roster: three consumer-visible durable boundaries and one epoch
-            // burn, independent of arity.
-            let roster_root = TestRoot::new();
-            let roster = roster_of(&kinds);
-            let backend = ScriptedBackend::for_roster(&roster);
-            let store = open_store(&roster_root);
-            let meter = BarrierMeter::new();
-            let before = store.advance_writer_epoch().unwrap().get();
-            meter.boundary();
+        let consumer = DelayedExternalConsumerDurability {
+            delay: EXTERNAL_DURABILITY_DELAY,
+        };
+        let roster_root = TestRoot::new();
+        let roster = roster_of(&[Kind::Sa; MEMBER_COUNT]);
+        let backend = ScriptedBackend::for_roster(&roster);
+        let store = open_store(&roster_root);
+        let before = store.advance_writer_epoch().unwrap().get();
+
+        let roster_lifecycle = async {
+            // The actual five-member roster lifecycle has one consumer
+            // admission and one consumer adoption publication.
+            consumer.persist().await;
             let prepared =
                 prepare_object_roster(&store, group(0x91), generation(1), &roster).unwrap();
-            meter.boundary();
             let outcome = issue_durable_object_roster(
                 &store,
                 &prepared,
@@ -3910,41 +4025,42 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(outcome.as_str(), "applied");
-            meter.boundary();
+            consumer.persist().await;
             assert_eq!(
                 finalize_durable_object_roster(&store, group(0x91), generation(1), &roster)
                     .unwrap(),
                 XfrmObjectRosterDurablePhase::Committed
             );
-            let after = store.advance_writer_epoch().unwrap().get();
-            let roster_boundaries = meter.total();
-            let roster_burns = after - before - 1;
-            // One prepare-class and one finalize-class publication regardless
-            // of how many members the group carries.
-            assert_eq!(
-                class_count(&store, XfrmObjectRosterPublicationClass::Prepare),
-                1
-            );
-            assert_eq!(
-                class_count(&store, XfrmObjectRosterPublicationClass::Finalize),
-                1
-            );
-            assert_eq!(roster_boundaries, 3 * BARRIER_COST);
-            assert_eq!(roster_burns, 1);
+        };
+        assert!(tokio::time::timeout(HARD_BUDGET, roster_lifecycle)
+            .await
+            .is_ok());
+        let after = store.advance_writer_epoch().unwrap().get();
+        // These are code-under-test facts, independent of the delayed
+        // external consumer boundary above.
+        assert_eq!(after - before - 1, 1);
+        assert_eq!(
+            class_count(&store, XfrmObjectRosterPublicationClass::Prepare),
+            1
+        );
+        assert_eq!(
+            class_count(&store, XfrmObjectRosterPublicationClass::Finalize),
+            1
+        );
 
-            // Baseline: the same objects through the serial single-object
-            // durable API, driven for real in the same test.
-            let object_root = TestRoot::new();
-            let object_store = open_object_store(&object_root);
-            let object_backend = MockXfrmBackend::new();
-            let baseline = BarrierMeter::new();
-            let before = object_store.advance_writer_epoch().unwrap().get();
-            for index in 0..arity {
+        // Drive the actual serial single-object API over the same five
+        // objects. Each lifecycle must cross its own two consumer boundaries.
+        let object_root = TestRoot::new();
+        let object_store = open_object_store(&object_root);
+        let object_backend = MockXfrmBackend::new();
+        let before = object_store.advance_writer_epoch().unwrap().get();
+        let serial_lifecycles = async {
+            for index in 0..MEMBER_COUNT {
                 let request = sa_request(index);
                 let operation =
                     XfrmObjectInstallOperationId::from_bytes([octet(index) + 1; 16]).unwrap();
                 let object_generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
-                baseline.boundary();
+                consumer.persist().await;
                 let prepared = prepare_durable_object_install(
                     &object_store,
                     operation,
@@ -3960,7 +4076,6 @@ mod tests {
                 } else {
                     XfrmObjectInstallPreEffectProof::Absent
                 };
-                baseline.boundary();
                 assert_eq!(
                     issue_durable_object_install(
                         &object_store,
@@ -3976,7 +4091,7 @@ mod tests {
                     .as_str(),
                     "acquired"
                 );
-                baseline.boundary();
+                consumer.persist().await;
                 assert_eq!(
                     finalize_durable_object_install(
                         &object_store,
@@ -3988,17 +4103,14 @@ mod tests {
                     XfrmObjectInstallDurablePhase::Committed
                 );
             }
-            let after = object_store.advance_writer_epoch().unwrap().get();
-            let baseline_boundaries = baseline.total();
-            let baseline_burns = after - before - 1;
-
-            assert_eq!(baseline_boundaries, 3 * arity * BARRIER_COST);
-            assert_eq!(baseline_burns, u64::try_from(arity).unwrap());
-            if arity == 5 {
-                assert_eq!(roster_boundaries, 3 * BARRIER_COST);
-                assert_eq!(baseline_boundaries, 15 * BARRIER_COST);
-            }
-        }
+        };
+        let mut serial_lifecycles = Box::pin(serial_lifecycles);
+        assert!(tokio::time::timeout(HARD_BUDGET, &mut serial_lifecycles)
+            .await
+            .is_err());
+        serial_lifecycles.await;
+        let after = object_store.advance_writer_epoch().unwrap().get();
+        assert_eq!(after - before - 1, u64::try_from(MEMBER_COUNT).unwrap());
     }
 
     #[tokio::test]

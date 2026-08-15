@@ -470,7 +470,9 @@ The required ordering after that atomic bind is:
    transient block that succeeds later with that very same authority.
 5. Durably record the consumer decision, then call
    `finalize_durable_object_roster` only after adoption is durable. `Applied`
-   becomes `Committed` with every member slot preserved as acquired.
+   becomes `Committed` with every member slot preserved as acquired. This leaves
+   one terminal idempotence record, not unresolved cleanup authority; the next
+   cooperating prepare or epoch advance deterministically prunes it.
 6. After restart, call `adopt_durable_object_roster` or
    `recover_durable_object_roster` for every retained roster **before any other
    namespace mutation**. An intervening ordinary mutation burns the writer
@@ -482,6 +484,13 @@ one, so a caller times the group rather than the members, and a caller-side
 timeout does not stop the actor: once admitted, the command runs to a durable
 terminal record even if the observing future is dropped. The correct action
 after a caller-side timeout is adoption or recovery, never a replay.
+
+Roster recovery's `Absent`-then-present cleanup rule requires the deployment to
+exclude raw-netlink and independently stored XFRM writers for the namespace.
+The SDK writer epoch orders cooperating actor writes only; it does not fence an
+external writer. If that exclusion is violated, an identical object is
+observationally ambiguous after a crash, and Linux's unconditional delete could
+remove the external writer's object.
 
 ### Ordered apply and reverse compensation
 
