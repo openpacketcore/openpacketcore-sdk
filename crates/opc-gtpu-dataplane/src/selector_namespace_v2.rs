@@ -409,8 +409,13 @@ fn canonical_atom_length(encoded: &[u8]) -> Result<usize, SelectorNamespaceCodec
                 .ok_or_else(SelectorNamespaceCodecError::invalid)?;
         }
         b'P' => {
-            let valid = (length == 6 && payload[0] == 4 && payload[1] == 32)
-                || (length == 10 && payload[0] == 6 && payload[1] == 64);
+            let valid = if length == 6 {
+                payload[0] == 4 && payload[1] == 32 && payload[2..6].iter().any(|byte| *byte != 0)
+            } else if length == 10 {
+                payload[0] == 6 && payload[1] == 64 && payload[2..10].iter().any(|byte| *byte != 0)
+            } else {
+                false
+            };
             if !valid {
                 return Err(SelectorNamespaceCodecError::invalid());
             }
@@ -1327,6 +1332,13 @@ mod tests {
         wrong_prefix[4] = 64;
         for atom in [noncanonical_teid, zero_mark, partial_mask, wrong_prefix] {
             assert!(AtomSubsetCodecV1::new(vec![atom]).is_err());
+        }
+
+        for zero_paa in [ipv4_paa_atom([0; 4]), ipv6_paa_atom([0; 8])] {
+            assert!(AtomSubsetCodecV1::new(vec![zero_paa.clone()]).is_err());
+            let mut encoded = vec![1, 0, 1];
+            encoded.extend_from_slice(&zero_paa);
+            assert!(AtomSubsetCodecV1::decode(&encoded).is_err());
         }
 
         let maximum = (1..=MAX_PROVENANCE_ATOMS)
