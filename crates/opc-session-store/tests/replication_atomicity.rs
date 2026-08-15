@@ -4,8 +4,8 @@ use bytes::Bytes;
 use futures_util::{stream::BoxStream, StreamExt};
 use opc_session_store::{
     EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, OwnerId, ReplicationEntry,
-    ReplicationOp, SessionKey, SessionKeyType, SessionStoreBackend, SqliteSessionBackend,
-    StateClass, StateType, StoreError, StoredSessionRecord,
+    ReplicationOp, SessionBackend, SessionKey, SessionKeyType, SessionStoreBackend,
+    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
@@ -397,6 +397,110 @@ where
     assert_no_watch_entry(&mut watch).await;
 }
 
+async fn assert_sqlite_oversized_replication_is_rejected_before_mutation(rebuild: bool) {
+    let backend = SqliteSessionBackend::in_memory().expect("SQLite backend");
+    let owner = OwnerId::new("owner-a").expect("owner");
+    let original_key = key(b"payload-bound-original");
+    let candidate_key = key(b"payload-bound-candidate");
+    let original = lease_and_record_entry(
+        1,
+        "payload-bound-original",
+        original_key.clone(),
+        &owner,
+        1,
+        1,
+        timestamp(),
+    );
+    backend
+        .replicate_entry(original.clone())
+        .await
+        .expect("seed original state");
+    let before = replication_snapshot(&backend).await;
+    let original_record = backend
+        .get(&original_key)
+        .await
+        .expect("read original")
+        .expect("original record");
+    let caps = backend.capabilities().await;
+    let candidate_timestamp = timestamp();
+    let mut oversized = lease_and_record_entry(
+        if rebuild { 1 } else { 2 },
+        "payload-bound-oversized",
+        candidate_key.clone(),
+        &owner,
+        2,
+        2,
+        candidate_timestamp,
+    );
+    let ReplicationOp::Batch { ops } = &mut oversized.op else {
+        panic!("fixture is a batch");
+    };
+    let Some(ReplicationOp::CompareAndSet { new_record, .. }) = ops.get_mut(1) else {
+        panic!("fixture contains a CAS");
+    };
+    new_record.payload =
+        EncryptedSessionPayload::new(Bytes::from(vec![0xAB; caps.max_value_bytes + 1]));
+
+    let result = if rebuild {
+        backend.rebuild_replication_state(vec![oversized]).await
+    } else {
+        backend.replicate_entry(oversized).await
+    };
+    assert_eq!(
+        result.expect_err("oversized replicated value must fail closed"),
+        StoreError::PayloadTooLarge {
+            actual: caps.max_value_bytes + 1,
+            max: caps.max_value_bytes,
+        }
+    );
+    assert_eq!(replication_snapshot(&backend).await, before);
+    assert_eq!(
+        backend.get(&original_key).await.expect("read original"),
+        Some(original_record)
+    );
+    assert!(backend
+        .get(&candidate_key)
+        .await
+        .expect("read rejected candidate")
+        .is_none());
+}
+
+async fn assert_sqlite_exact_replication_payload_is_accepted() {
+    let backend = SqliteSessionBackend::in_memory().expect("SQLite backend");
+    let owner = OwnerId::new("owner-a").expect("owner");
+    let candidate_key = key(b"payload-bound-exact");
+    let caps = backend.capabilities().await;
+    let mut exact = lease_and_record_entry(
+        1,
+        "payload-bound-exact",
+        candidate_key.clone(),
+        &owner,
+        1,
+        1,
+        timestamp(),
+    );
+    let ReplicationOp::Batch { ops } = &mut exact.op else {
+        panic!("fixture is a batch");
+    };
+    let Some(ReplicationOp::CompareAndSet { new_record, .. }) = ops.get_mut(1) else {
+        panic!("fixture contains a CAS");
+    };
+    new_record.payload =
+        EncryptedSessionPayload::new(Bytes::from(vec![0xAB; caps.max_value_bytes]));
+
+    backend
+        .replicate_entry(exact)
+        .await
+        .expect("the advertised exact payload limit must replicate");
+    let retained = backend
+        .get(&candidate_key)
+        .await
+        .expect("read exact-limit candidate")
+        .expect("exact-limit candidate");
+    assert_eq!(retained.payload.len(), caps.max_value_bytes);
+    assert_eq!(backend.max_replication_sequence().await.unwrap(), 1);
+}
+
 #[tokio::test]
 async fn fake_failed_compound_append_is_atomic() {
     assert_failed_compound_append_is_atomic(FakeSessionBackend::new()).await;
@@ -445,4 +549,19 @@ async fn sqlite_successful_rebuild_preserves_watch_subscription() {
         SqliteSessionBackend::in_memory().expect("SQLite backend"),
     )
     .await;
+}
+
+#[tokio::test]
+async fn sqlite_oversized_replication_append_is_rejected_before_mutation() {
+    assert_sqlite_oversized_replication_is_rejected_before_mutation(false).await;
+}
+
+#[tokio::test]
+async fn sqlite_oversized_replication_rebuild_is_rejected_before_mutation() {
+    assert_sqlite_oversized_replication_is_rejected_before_mutation(true).await;
+}
+
+#[tokio::test]
+async fn sqlite_exact_replication_payload_is_accepted() {
+    assert_sqlite_exact_replication_payload_is_accepted().await;
 }

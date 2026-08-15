@@ -5,7 +5,7 @@ use opc_session_store::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, EncryptingSessionBackend,
     Generation, LeaseError, OwnerId, SessionBackend, SessionKey, SessionKeyType,
     SessionLeaseManager, SessionOp, SessionOpResult, SqliteSessionBackend, StateClass, StateType,
-    StoreError, StoredSessionRecord,
+    StoreError, StoredSessionRecord, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use std::{sync::Arc, time::Duration};
@@ -108,7 +108,8 @@ async fn test_sqlite_capabilities_are_truthful_for_single_node_backend() {
     assert!(caps.restore_scan);
     assert!(!caps.ordered_replication_log);
     assert!(!caps.watch);
-    assert_eq!(caps.max_value_bytes, 1_048_576);
+    assert_eq!(caps.max_value_bytes, 4 * 1024 * 1024 + 64 * 1024);
+    assert!(caps.max_value_bytes <= RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES);
 }
 
 #[tokio::test]
@@ -255,7 +256,23 @@ async fn test_sqlite_max_payload_bytes_is_enforced() {
         .await
         .unwrap();
 
-    let record = StoredSessionRecord {
+    let exact_record = StoredSessionRecord {
+        payload: EncryptedSessionPayload::new(Bytes::from(vec![0xAB; caps.max_value_bytes])),
+        ..test_record(key.clone(), 1, &lease)
+    };
+    let exact_result = backend
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: exact_record,
+        })
+        .await
+        .unwrap();
+    assert_eq!(exact_result, CompareAndSetResult::Success);
+
+    let oversized_record = StoredSessionRecord {
+        generation: Generation::new(2),
         payload: EncryptedSessionPayload::new(Bytes::from(vec![0xAB; caps.max_value_bytes + 1])),
         ..test_record(key.clone(), 1, &lease)
     };
@@ -264,8 +281,8 @@ async fn test_sqlite_max_payload_bytes_is_enforced() {
         .compare_and_set(CompareAndSet {
             key: key.clone(),
             lease,
-            expected_generation: None,
-            new_record: record,
+            expected_generation: Some(Generation::new(1)),
+            new_record: oversized_record,
         })
         .await
         .unwrap_err();
@@ -277,6 +294,10 @@ async fn test_sqlite_max_payload_bytes_is_enforced() {
             max: caps.max_value_bytes
         }
     );
+
+    let retained = backend.get(&key).await.unwrap().unwrap();
+    assert_eq!(retained.generation, Generation::new(1));
+    assert_eq!(retained.payload.len(), caps.max_value_bytes);
 }
 
 #[tokio::test]
