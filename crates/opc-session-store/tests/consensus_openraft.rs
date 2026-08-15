@@ -1870,7 +1870,13 @@ async fn encryption_wrapper_keeps_plaintext_above_consensus_and_durable_authorit
 
 #[tokio::test]
 async fn writes_leases_and_cas_converge_with_linearizable_reads() {
-    let cluster = TestCluster::start().await;
+    // This proof qualifies cross-node convergence, not a sub-second operation
+    // deadline. Use the production budget so the concurrent snapshot workload
+    // cannot exhaust a healthy linearizable read barrier under the workspace
+    // test harness.
+    let cluster =
+        TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+            .await;
     let key = session_key(b"cross-node-cas");
     let lease = cluster.stores[1]
         .acquire(&key, owner("owner-a"), Duration::from_secs(30))
@@ -2283,7 +2289,13 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
         .acquire()
         .await
         .expect("qualification semaphore remains open");
-    let cluster = TestCluster::start().await;
+    // Snapshot qualification intentionally commits thousands of operations.
+    // Keep each operation on the production budget while parallel workspace
+    // tests contend for the runner; the outer recovery bounds still enforce a
+    // finite end-to-end proof.
+    let cluster =
+        TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+            .await;
     let lagging_before = cluster.stores[0]
         .probe_durable_readiness()
         .await
