@@ -896,6 +896,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fixture, so no message that already round-tripped moves on the wire.
 
 ### Fixed
+- **Bounded stateless-consumer connection establishment — `opc-session-net`
+  (#691):** `StatelessSessionConsumerClient::with_pre_request_connection_timeout`
+  adds an opt-in per-operation deadline for endpoint resolution, TCP, TLS, and
+  the value-free Hello exchange through the application-call write boundary.
+  Expiry before any call bytes are written is retry-safe and reported as
+  unavailable; a partial call write and every post-write failure retain the
+  existing exact-request-ID unknown-outcome contract. Clients that do not opt
+  in retain the existing complete-operation deadline behavior.
 - **Reconnect-time stateless consumer endpoint resolution — `opc-session-net`
   (#688):** `StatelessSessionConsumerClient::new_with_resolver` now resolves a
   stable endpoint before each fresh connection, so ordinary endpoint
