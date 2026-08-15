@@ -4,8 +4,9 @@ use bytes::Bytes;
 use futures_util::{stream::BoxStream, StreamExt};
 use opc_session_store::{
     EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, OwnerId, ReplicationEntry,
-    ReplicationOp, SessionBackend, SessionKey, SessionKeyType, SessionStoreBackend,
-    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
+    ReplicationOp, RestoreScanRequest, RestoreScanScope, SessionBackend, SessionKey,
+    SessionKeyType, SessionStoreBackend, SqliteSessionBackend, StateClass, StateType, StoreError,
+    StoredSessionRecord,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
@@ -175,6 +176,42 @@ where
             .await
             .expect("read lease counters"),
     )
+}
+
+async fn restore_continuation<B>(backend: &B) -> RestoreScanRequest
+where
+    B: SessionStoreBackend,
+{
+    let first = backend
+        .scan_restore_records(RestoreScanRequest::all(1))
+        .await
+        .expect("read first restore page");
+    RestoreScanRequest {
+        scope: RestoreScanScope::all(),
+        cursor: Some(
+            first
+                .next_cursor
+                .expect("two-record fixture yields a continuation"),
+        ),
+        limit: 1,
+    }
+}
+
+async fn assert_restore_continuation_is_current<B>(
+    backend: &B,
+    request: RestoreScanRequest,
+    expected_key: &SessionKey,
+) where
+    B: SessionStoreBackend,
+{
+    let continued = backend
+        .scan_restore_records(request)
+        .await
+        .expect("failed replication leaves the restore revision unchanged");
+    assert_eq!(
+        continued.records.first().map(|record| &record.key),
+        Some(expected_key)
+    );
 }
 
 async fn next_watch_entry(
@@ -365,6 +402,7 @@ async fn assert_sqlite_cross_key_replication_is_rejected_before_mutation(rebuild
     let backend = SqliteSessionBackend::in_memory().expect("SQLite backend");
     let owner = OwnerId::new("owner-a").expect("owner");
     let original_key = key(b"cross-key-original");
+    let sentinel_key = key(b"cross-key-sentinel");
     let op_key = key(b"cross-key-op");
     let record_key = key(b"cross-key-record");
     let original = lease_and_record_entry(
@@ -380,16 +418,29 @@ async fn assert_sqlite_cross_key_replication_is_rejected_before_mutation(rebuild
         .replicate_entry(original.clone())
         .await
         .expect("seed original state");
+    backend
+        .replicate_entry(lease_and_record_entry(
+            2,
+            "cross-key-sentinel",
+            sentinel_key.clone(),
+            &owner,
+            2,
+            2,
+            timestamp(),
+        ))
+        .await
+        .expect("seed restore continuation");
+    let restore_continuation = restore_continuation(&backend).await;
     let before = replication_snapshot(&backend).await;
     let original_record = backend
         .get(&original_key)
         .await
         .expect("read original")
         .expect("original record");
-    let mut watch = backend.watch(2).await.expect("watch cross-key rejection");
+    let mut watch = backend.watch(3).await.expect("watch cross-key rejection");
 
     let rejected = cross_key_lease_and_record_entry(
-        if rebuild { 1 } else { 2 },
+        if rebuild { 1 } else { 3 },
         op_key.clone(),
         record_key.clone(),
         &owner,
@@ -405,8 +456,8 @@ async fn assert_sqlite_cross_key_replication_is_rejected_before_mutation(rebuild
         result.expect_err("cross-key replicated CAS must fail closed"),
         StoreError::InvalidKey("compare-and-set key does not match record key".into())
     );
-    // The snapshot includes the replication head/log and next lease/fence
-    // counters, proving the nested acquire never reached replay.
+    // The snapshots cover replication head/log, next lease/fence counters,
+    // and the opaque restore revision carried by the continuation.
     assert_eq!(replication_snapshot(&backend).await, before);
     assert_eq!(
         backend.get(&original_key).await.expect("read original"),
@@ -422,6 +473,7 @@ async fn assert_sqlite_cross_key_replication_is_rejected_before_mutation(rebuild
         .await
         .expect("read rejected record key")
         .is_none());
+    assert_restore_continuation_is_current(&backend, restore_continuation, &sentinel_key).await;
     assert_no_watch_entry(&mut watch).await;
 }
 
@@ -505,6 +557,7 @@ async fn assert_sqlite_oversized_replication_is_rejected_before_mutation(rebuild
     let backend = SqliteSessionBackend::in_memory().expect("SQLite backend");
     let owner = OwnerId::new("owner-a").expect("owner");
     let original_key = key(b"payload-bound-original");
+    let sentinel_key = key(b"payload-bound-sentinel");
     let candidate_key = key(b"payload-bound-candidate");
     let original = lease_and_record_entry(
         1,
@@ -519,17 +572,30 @@ async fn assert_sqlite_oversized_replication_is_rejected_before_mutation(rebuild
         .replicate_entry(original.clone())
         .await
         .expect("seed original state");
+    backend
+        .replicate_entry(lease_and_record_entry(
+            2,
+            "payload-bound-sentinel",
+            sentinel_key.clone(),
+            &owner,
+            2,
+            2,
+            timestamp(),
+        ))
+        .await
+        .expect("seed restore continuation");
+    let restore_continuation = restore_continuation(&backend).await;
     let before = replication_snapshot(&backend).await;
     let original_record = backend
         .get(&original_key)
         .await
         .expect("read original")
         .expect("original record");
-    let mut watch = backend.watch(2).await.expect("watch oversized rejection");
+    let mut watch = backend.watch(3).await.expect("watch oversized rejection");
     let caps = backend.capabilities().await;
     let candidate_timestamp = timestamp();
     let mut oversized = lease_and_record_entry(
-        if rebuild { 1 } else { 2 },
+        if rebuild { 1 } else { 3 },
         "payload-bound-oversized",
         candidate_key.clone(),
         &owner,
@@ -568,6 +634,7 @@ async fn assert_sqlite_oversized_replication_is_rejected_before_mutation(rebuild
         .await
         .expect("read rejected candidate")
         .is_none());
+    assert_restore_continuation_is_current(&backend, restore_continuation, &sentinel_key).await;
     assert_no_watch_entry(&mut watch).await;
 }
 

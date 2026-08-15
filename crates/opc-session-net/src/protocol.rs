@@ -4055,7 +4055,11 @@ mod tests {
         }
     }
 
-    fn restore_record(stable_id: &'static [u8], payload_len: usize) -> StoredSessionRecord {
+    fn restore_record_with_byte(
+        stable_id: &'static [u8],
+        payload_len: usize,
+        payload_byte: u8,
+    ) -> StoredSessionRecord {
         StoredSessionRecord {
             key: SessionKey {
                 tenant: TenantId::from_static("tenant-a"),
@@ -4071,8 +4075,12 @@ mod tests {
             state_class: StateClass::AuthoritativeSession,
             state_type: StateType::from_static("pdu-session"),
             expires_at: None,
-            payload: EncryptedSessionPayload::new(vec![7; payload_len]),
+            payload: EncryptedSessionPayload::new(vec![payload_byte; payload_len]),
         }
+    }
+
+    fn restore_record(stable_id: &'static [u8], payload_len: usize) -> StoredSessionRecord {
+        restore_record_with_byte(stable_id, payload_len, 7)
     }
 
     #[test]
@@ -4171,6 +4179,15 @@ mod tests {
             cursor_profile: RestoreScanCursorProfile::LegacyCompatibility,
         })
         .is_err());
+
+        let worst_case = restore_record_with_byte(
+            b"exact-wire-frame-cap",
+            RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES,
+            u8::MAX,
+        );
+        let worst_case_page = RestoreScanPage::new(vec![worst_case], 0, None);
+        ensure_restore_scan_success_frame_fits(&worst_case_page, MAX_NEGOTIATED_FRAME_SIZE)
+            .expect("the advertised exact wire payload cap must fit its maximum frame");
     }
 
     #[test]

@@ -9592,6 +9592,172 @@ mod tests {
         crate::EncryptedSessionPayload::try_envelope(encoded).expect("valid envelope")
     }
 
+    fn sealed_record_for_key(
+        record_key: SessionKey,
+        payload_len: usize,
+    ) -> crate::StoredSessionRecord {
+        let mut record = crate::StoredSessionRecord {
+            key: record_key,
+            generation: crate::Generation::new(1),
+            owner: OwnerId::new("consensus-cap-owner").expect("owner"),
+            fence: crate::FenceToken::new(1),
+            state_class: crate::StateClass::AuthoritativeSession,
+            state_type: crate::StateType::from_static("consensus-cap-test"),
+            expires_at: None,
+            payload: crate::EncryptedSessionPayload::new([]),
+        };
+        record.payload = sealed_payload_for_record(&record, payload_len);
+        record
+    }
+
+    fn sealed_replication_cas(
+        operation_key: SessionKey,
+        record_key: SessionKey,
+        payload_len: usize,
+    ) -> ReplicationOp {
+        ReplicationOp::CompareAndSet {
+            key: operation_key,
+            expected_generation: None,
+            credential_id: 1,
+            guard_expires_at: timestamp(1),
+            new_record: sealed_record_for_key(record_key, payload_len),
+        }
+    }
+
+    #[tokio::test]
+    async fn sealed_consensus_state_enforces_the_consensus_payload_cap() {
+        for (payload_len, accepted) in [(1_048_576, true), (1_048_577, false)] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.lock().await;
+            let record = sealed_record_for_key(key(), payload_len);
+            ops::insert_or_replace_record_sync(&conn, &record).expect("persist sealed fixture");
+
+            let validation = validate_sealed_state_sync(&conn);
+            if accepted {
+                validation.expect("the exact consensus cap remains valid");
+            } else {
+                let error = validation.expect_err("one over the consensus cap must reject");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_claim_rejects_a_record_above_the_consensus_cap() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        let record = sealed_record_for_key(key(), 1_048_577);
+        ops::insert_or_replace_record_sync(&conn, &record).expect("persist sealed fixture");
+
+        let error = claim_legacy_checkpoint_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            [0x31; 32],
+            1,
+            [0x32; 32],
+            0,
+            0,
+        )
+        .expect_err("legacy claim must not import an oversized consensus record");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!table_exists(&conn, "consensus_identity").expect("inspect ownership table"));
+    }
+
+    #[test]
+    fn sealed_replication_validation_enforces_the_consensus_payload_cap() {
+        validate_sealed_replication_op(&sealed_replication_cas(key(), key(), 1_048_576))
+            .expect("exact-cap key-bound replication remains valid");
+
+        let oversized =
+            validate_sealed_replication_op(&sealed_replication_cas(key(), key(), 1_048_577))
+                .expect_err("persisted replication must reject one over the consensus cap");
+        assert_eq!(oversized.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn sealed_replication_validation_binds_the_operation_and_record_keys() {
+        let operation_key = key();
+        let mut record_key = operation_key.clone();
+        record_key.stable_id = Bytes::from_static(b"cross-key-persisted-record")
+            .try_into()
+            .expect("valid stable ID");
+        let cross_key = validate_sealed_replication_op(&sealed_replication_cas(
+            operation_key,
+            record_key,
+            64 * 1024,
+        ))
+        .expect_err("persisted replication must bind the operation and record keys");
+        assert_eq!(cross_key.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_rejects_an_oversized_record_without_target_mutation() {
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.lock().await;
+        let identity = identity();
+        let members = expected_members();
+        initialize_schema(&source_conn, identity, &members).expect("source consensus schema");
+        apply_entries_sync(
+            &source_conn,
+            identity,
+            &source.consensus_capabilities(),
+            vec![membership_entry()],
+        )
+        .expect("apply source membership");
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("oversized.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity, &snapshot_path)
+                .expect("build source snapshot");
+        drop(source_conn);
+
+        let incoming = Connection::open(&snapshot_path).expect("open incoming snapshot");
+        let oversized = sealed_record_for_key(key(), 1_048_577);
+        ops::insert_or_replace_record_sync(&incoming, &oversized)
+            .expect("inject valid oversized envelope");
+        drop(incoming);
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.lock().await;
+        initialize_schema(&target_conn, identity, &members).expect("target consensus schema");
+        let before_restore =
+            ops::read_restore_scan_state_sync(&target_conn).expect("target restore state");
+        let before_applied =
+            read_applied_sync(&target_conn, identity).expect("target applied state");
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "oversized-record-rejected".to_string(),
+        };
+
+        let error = install_snapshot_database_sync(
+            &target_conn,
+            identity,
+            &snapshot_path,
+            &meta,
+            "oversized.opc",
+            [0x41; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("incoming metadata")
+                .len(),
+        )
+        .expect_err("snapshot install must reject an oversized consensus record");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            before_restore,
+            ops::read_restore_scan_state_sync(&target_conn).expect("unchanged restore state")
+        );
+        assert_eq!(
+            before_applied,
+            read_applied_sync(&target_conn, identity).expect("unchanged applied state")
+        );
+        let target_records: i64 = target_conn
+            .query_row("SELECT COUNT(*) FROM session_records", [], |row| row.get(0))
+            .expect("count target records");
+        assert_eq!(target_records, 0);
+    }
+
     fn capped_cas_entry(
         index: u64,
         request_id: [u8; 16],
