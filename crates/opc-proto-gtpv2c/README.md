@@ -601,6 +601,40 @@ let response = S2bCreateSessionAcceptedResponse {
 };
 ```
 
+Create Session Response receive decoding remains strict by default: the PGW
+control role accepts only interface type 32 and the PGW user-plane role only
+type 33. A caller that has already made its own interworking decision can use
+the one-shot `decode_create_session_response_summary_with_receive_policy`
+helper with `S2bCreateSessionResponseReceivePolicy` to independently add the
+standardized S5/S8 control type 7, user-plane type 5, or both. The policy has no
+arbitrary interface-type constructor, is copied for one decode, and is applied
+to the same first retained singleton used by the returned typed summary. It
+does not affect `S2bMessage::decode`, the no-policy summary helpers, any other
+GTPv2-C procedure, or canonical builders; those remain strict S2b.
+
+```rust
+use opc_proto_gtpv2c::{
+    decode_create_session_response_summary_with_receive_policy,
+    S2bCreateSessionResponseReceivePolicy,
+};
+use opc_protocol::{DecodeContext, ValidationLevel};
+
+# let response_bytes: &[u8] = &[];
+let receive_policy = S2bCreateSessionResponseReceivePolicy::STRICT
+    .allow_s5_s8_pgw_control()
+    .allow_s5_s8_pgw_user_plane();
+let receive_context = DecodeContext {
+    validation_level: ValidationLevel::ProcedureAware,
+    ..DecodeContext::default()
+};
+let summary = decode_create_session_response_summary_with_receive_policy(
+    response_bytes,
+    receive_context,
+    receive_policy,
+);
+# let _ = summary;
+```
+
 The former loose Update Bearer shell with a single `bearer_context` has been
 replaced by the strict dedicated-bearer API. Construct
 `S2bUpdateBearerRequest` with mandatory `apn_ambr` and one to fifteen

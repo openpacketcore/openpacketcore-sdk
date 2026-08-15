@@ -291,6 +291,163 @@ fn create_session_accepted_response_builder_rejects_invalid_control_endpoints() 
 }
 
 #[test]
+fn create_session_accepted_response_builder_never_emits_receive_policy_roles() {
+    let mut bearer_context = accepted_bearer_context(6, 0x1122_3344);
+    let user_plane = bearer_context
+        .members
+        .iter_mut()
+        .find(|ie| ie.ie_type() == IE_TYPE_F_TEID)
+        .unwrap_or_else(|| panic!("accepted test Bearer Context needs an F-TEID"));
+    let TypedIeValue::FullyQualifiedTeid(user_plane) = &mut user_plane.value else {
+        panic!("accepted test Bearer Context F-TEID must be typed");
+    };
+    user_plane.interface_type = 5;
+
+    let result = s2b_create_session_accepted_response(S2bCreateSessionAcceptedResponse {
+        sequence_number: 0x010204,
+        response_teid: 0x5566_7788,
+        pgw_control_f_teid: pgw_control_f_teid(0x2030_4050),
+        bearer_context,
+        additional_ies: Vec::new(),
+    });
+    assert!(result.is_err(), "builder accepted an S5/S8 user-plane role");
+
+    let mut bearer_context = accepted_bearer_context(6, 0x1122_3344);
+    bearer_context.members.push(TypedIe {
+        instance: 1,
+        value: TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid {
+            interface_type: 5,
+            teid: 0x3040_5060,
+            ipv4: Some([198, 51, 100, 10]),
+            ipv6: None,
+        }),
+    });
+    let result = s2b_create_session_accepted_response(S2bCreateSessionAcceptedResponse {
+        sequence_number: 0x010204,
+        response_teid: 0x5566_7788,
+        pgw_control_f_teid: pgw_control_f_teid(0x2030_4050),
+        bearer_context,
+        additional_ies: Vec::new(),
+    });
+    assert!(
+        result.is_err(),
+        "builder emitted an extra S5/S8 role beside the strict S2b role"
+    );
+
+    let mut bearer_context = accepted_bearer_context(6, 0x1122_3344);
+    bearer_context.members.push(TypedIe {
+        instance: 1,
+        value: TypedIeValue::BearerContext(BearerContext {
+            members: vec![TypedIe {
+                instance: 0,
+                value: TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid {
+                    interface_type: 5,
+                    teid: 0x3545_5565,
+                    ipv4: Some([198, 51, 100, 11]),
+                    ipv6: None,
+                }),
+            }],
+        }),
+    });
+    let result = s2b_create_session_accepted_response(S2bCreateSessionAcceptedResponse {
+        sequence_number: 0x010204,
+        response_teid: 0x5566_7788,
+        pgw_control_f_teid: pgw_control_f_teid(0x2030_4050),
+        bearer_context,
+        additional_ies: Vec::new(),
+    });
+    assert!(
+        result.is_err(),
+        "builder emitted a receive-only role from a nested Bearer Context"
+    );
+
+    let result = s2b_create_session_accepted_response(S2bCreateSessionAcceptedResponse {
+        sequence_number: 0x010204,
+        response_teid: 0x5566_7788,
+        pgw_control_f_teid: pgw_control_f_teid(0x2030_4050),
+        bearer_context: accepted_bearer_context(6, 0x1122_3344),
+        additional_ies: vec![TypedIe {
+            instance: 0,
+            value: TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid {
+                interface_type: 7,
+                teid: 0x4050_6070,
+                ipv4: Some([192, 0, 2, 3]),
+                ipv6: None,
+            }),
+        }],
+    });
+    assert!(
+        result.is_err(),
+        "builder emitted a receive-only role through additional IEs"
+    );
+
+    let result = s2b_create_session_accepted_response(S2bCreateSessionAcceptedResponse {
+        sequence_number: 0x010204,
+        response_teid: 0x5566_7788,
+        pgw_control_f_teid: FullyQualifiedTeid {
+            interface_type: 7,
+            teid: 0x2030_4050,
+            ipv4: Some([192, 0, 2, 2]),
+            ipv6: None,
+        },
+        bearer_context: accepted_bearer_context(6, 0x1122_3344),
+        additional_ies: Vec::new(),
+    });
+    assert!(result.is_err(), "builder accepted an S5/S8 control role");
+}
+
+#[test]
+fn create_session_rejected_response_builder_never_emits_receive_policy_roles() {
+    let result = s2b_create_session_rejected_response(S2bCreateSessionRejectedResponse {
+        sequence_number: 0x010204,
+        response_teid: 0x5566_7788,
+        cause: CauseValue::MandatoryIeMissing,
+        additional_ies: vec![TypedIe {
+            instance: 1,
+            value: TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid {
+                interface_type: 7,
+                teid: 0x4050_6070,
+                ipv4: Some([192, 0, 2, 3]),
+                ipv6: None,
+            }),
+        }],
+    });
+    assert!(
+        result.is_err(),
+        "rejected builder emitted an S5/S8 control role"
+    );
+
+    let result = s2b_create_session_rejected_response(S2bCreateSessionRejectedResponse {
+        sequence_number: 0x010204,
+        response_teid: 0x5566_7788,
+        cause: CauseValue::MandatoryIeMissing,
+        additional_ies: vec![TypedIe {
+            instance: 0,
+            value: TypedIeValue::BearerContext(BearerContext {
+                members: vec![TypedIe {
+                    instance: 1,
+                    value: TypedIeValue::BearerContext(BearerContext {
+                        members: vec![TypedIe {
+                            instance: 0,
+                            value: TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid {
+                                interface_type: 5,
+                                teid: 0x5060_7080,
+                                ipv4: Some([198, 51, 100, 12]),
+                                ipv6: None,
+                            }),
+                        }],
+                    }),
+                }],
+            }),
+        }],
+    });
+    assert!(
+        result.is_err(),
+        "rejected builder emitted an S5/S8 user-plane role from a nested Bearer Context"
+    );
+}
+
+#[test]
 fn create_session_request_builder_rejects_duplicate_profile_singletons() {
     let mut request = create_session_request_input();
     request.additional_ies.push(TypedIe {
