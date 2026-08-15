@@ -52,6 +52,8 @@ const RECORD_MAGIC: [u8; 8] = *b"OPCXOBJ1";
 const RECORD_VERSION: u16 = 2;
 const RECORD_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-record-v1\0";
 const INSTALL_REQUEST_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-install-request-v1\0";
+const DELETION_IDENTITY_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-deletion-identity-v1\0";
+const NAMESPACE_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-namespace-v1\0";
 const CONTROL_BYTES: usize = 128;
 const CONTROL_BODY_BYTES: usize = CONTROL_BYTES - AUTH_TAG_BYTES;
 const CONTROL_MAGIC: [u8; 8] = *b"OPCXCTL1";
@@ -69,9 +71,9 @@ const FILE_MODE: u32 = 0o600;
 const DIRECTORY_MODE: u32 = 0o700;
 const CREATE_ATTEMPTS: usize = 8;
 
-type HmacSha256 = ZeroizingHmacSha256;
+pub(crate) type HmacSha256 = ZeroizingHmacSha256;
 
-struct ZeroizingHmacSha256 {
+pub(crate) struct ZeroizingHmacSha256 {
     inner: Sha256,
     outer_pad: Zeroizing<[u8; 64]>,
 }
@@ -93,11 +95,11 @@ impl ZeroizingHmacSha256 {
         Self { inner, outer_pad }
     }
 
-    fn update(&mut self, bytes: &[u8]) {
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
         self.inner.update(bytes);
     }
 
-    fn finalize(self) -> Zeroizing<[u8; AUTH_TAG_BYTES]> {
+    pub(crate) fn finalize(self) -> Zeroizing<[u8; AUTH_TAG_BYTES]> {
         let mut inner_digest = self.inner.finalize();
         let mut outer = Sha256::new();
         outer.update(self.outer_pad.as_slice());
@@ -109,6 +111,54 @@ impl ZeroizingHmacSha256 {
         digest.as_mut_slice().zeroize();
         output
     }
+}
+
+/// Borrow-scoped view of one durable family's secret proof-key bytes.
+///
+/// Every durable record family owns a distinct zeroizing proof-key newtype.
+/// The canonical encoders below are shared across those families, so they take
+/// this borrow instead of a concrete key type. The borrow is the point: the
+/// secret is never copied out of its owning newtype, so each family keeps its
+/// own `Drop`-time zeroization discipline.
+#[derive(Clone, Copy)]
+pub(crate) struct CanonicalMacKey<'a>(&'a [u8; AUTH_TAG_BYTES]);
+
+impl<'a> CanonicalMacKey<'a> {
+    /// Borrow a proof-key newtype's secret bytes for canonical encoding.
+    ///
+    /// Call this only from a proof-key newtype's own accessor so the borrow
+    /// cannot outlive the key it observes.
+    pub(crate) const fn new(bytes: &'a [u8; AUTH_TAG_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    /// Start a keyed MAC already bound to one family-specific domain.
+    ///
+    /// The domain separator is unconditionally absorbed first, so no caller can
+    /// produce a domain-free tag by forgetting it.
+    pub(crate) fn begin(self, domain: &[u8]) -> HmacSha256 {
+        let mut mac = HmacSha256::new(self.0);
+        mac.update(domain);
+        mac
+    }
+}
+
+impl fmt::Debug for CanonicalMacKey<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CanonicalMacKey(<redacted>)")
+    }
+}
+
+/// Value-free failure of a shared canonical encoder.
+///
+/// Each durable family maps this into its own public error enum so no family
+/// leaks another family's diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalEncodeError {
+    /// A variable-length field exceeds the bounded canonical encoding.
+    CapacityExceeded,
+    /// The request cannot produce an exact canonical identity.
+    Malformed,
 }
 
 /// Secret proof key used to authenticate staged-object recovery state.
@@ -130,8 +180,9 @@ impl XfrmObjectRecoveryProofKey {
         Ok(Self(bytes))
     }
 
-    fn bytes(&self) -> &[u8; AUTH_TAG_BYTES] {
-        &self.0
+    /// Borrow this key for the shared canonical encoders.
+    pub(crate) const fn canonical_mac_key(&self) -> CanonicalMacKey<'_> {
+        CanonicalMacKey::new(&self.0)
     }
 }
 
@@ -534,7 +585,7 @@ impl DurableObjectRecord {
         encoded[104..112].copy_from_slice(&self.writer_epoch.get().to_be_bytes());
         encoded[112..144].copy_from_slice(&self.deletion_identity_fingerprint);
         encoded[144..176].copy_from_slice(&self.install_request_fingerprint);
-        let tag = authenticate(key, &encoded[..RECORD_BODY_BYTES])?;
+        let tag = authenticate(key, &encoded[..RECORD_BODY_BYTES]);
         encoded[RECORD_BODY_BYTES..].copy_from_slice(&tag);
         Ok(encoded)
     }
@@ -646,22 +697,19 @@ fn record_matches_fingerprints(
     )
 }
 
-fn authenticate(
-    key: &XfrmObjectRecoveryProofKey,
-    body: &[u8],
-) -> Result<[u8; AUTH_TAG_BYTES], XfrmObjectInstallDurableError> {
-    authenticate_domain(key, RECORD_AUTH_DOMAIN, body)
+fn authenticate(key: &XfrmObjectRecoveryProofKey, body: &[u8]) -> [u8; AUTH_TAG_BYTES] {
+    authenticate_domain(key.canonical_mac_key(), RECORD_AUTH_DOMAIN, body)
 }
 
-fn authenticate_domain(
-    key: &XfrmObjectRecoveryProofKey,
+/// Compute the domain-separated keyed tag over one canonical body.
+pub(crate) fn authenticate_domain(
+    key: CanonicalMacKey<'_>,
     domain: &[u8],
     body: &[u8],
-) -> Result<[u8; AUTH_TAG_BYTES], XfrmObjectInstallDurableError> {
-    let mut mac = HmacSha256::new(key.bytes());
-    mac.update(domain);
+) -> [u8; AUTH_TAG_BYTES] {
+    let mut mac = key.begin(domain);
     mac.update(body);
-    Ok(*mac.finalize())
+    *mac.finalize()
 }
 
 fn verify_authentication(
@@ -669,23 +717,27 @@ fn verify_authentication(
     body: &[u8],
     tag: &[u8],
 ) -> Result<(), XfrmObjectInstallDurableError> {
-    verify_authentication_domain(key, RECORD_AUTH_DOMAIN, body, tag)
-}
-
-fn verify_authentication_domain(
-    key: &XfrmObjectRecoveryProofKey,
-    domain: &[u8],
-    body: &[u8],
-    tag: &[u8],
-) -> Result<(), XfrmObjectInstallDurableError> {
-    let mut mac = HmacSha256::new(key.bytes());
-    mac.update(domain);
-    mac.update(body);
-    if bool::from(mac.finalize().as_slice().ct_eq(tag)) {
+    if verify_authentication_domain(key.canonical_mac_key(), RECORD_AUTH_DOMAIN, body, tag) {
         Ok(())
     } else {
         Err(XfrmObjectInstallDurableError::AuthenticationFailed)
     }
+}
+
+/// Report whether a tag matches the domain-separated keyed tag of one body.
+///
+/// The comparison is constant time. Callers map `false` into their own family's
+/// authentication failure so no family leaks another family's diagnostics.
+#[must_use]
+pub(crate) fn verify_authentication_domain(
+    key: CanonicalMacKey<'_>,
+    domain: &[u8],
+    body: &[u8],
+    tag: &[u8],
+) -> bool {
+    let mut mac = key.begin(domain);
+    mac.update(body);
+    bool::from(mac.finalize().as_slice().ct_eq(tag))
 }
 
 fn array_at<const N: usize>(bytes: &[u8], start: usize) -> [u8; N] {
@@ -769,7 +821,11 @@ impl ControlRecord {
         encoded[64..80].copy_from_slice(&self.actor_incarnation);
         encoded[80..88].copy_from_slice(&self.root_device.to_be_bytes());
         encoded[88..96].copy_from_slice(&self.root_inode.to_be_bytes());
-        let tag = authenticate_domain(key, CONTROL_AUTH_DOMAIN, &encoded[..CONTROL_BODY_BYTES])?;
+        let tag = authenticate_domain(
+            key.canonical_mac_key(),
+            CONTROL_AUTH_DOMAIN,
+            &encoded[..CONTROL_BODY_BYTES],
+        );
         encoded[CONTROL_BODY_BYTES..].copy_from_slice(&tag);
         Ok(encoded)
     }
@@ -784,12 +840,14 @@ impl ControlRecord {
         {
             return Err(XfrmObjectInstallDurableError::Malformed);
         }
-        verify_authentication_domain(
-            key,
+        if !verify_authentication_domain(
+            key.canonical_mac_key(),
             CONTROL_AUTH_DOMAIN,
             &encoded[..CONTROL_BODY_BYTES],
             &encoded[CONTROL_BODY_BYTES..],
-        )?;
+        ) {
+            return Err(XfrmObjectInstallDurableError::AuthenticationFailed);
+        }
         let control = Self {
             store_incarnation: array_at(encoded, 16),
             namespace_seal: array_at(encoded, 32),
@@ -825,7 +883,11 @@ impl EpochRecord {
         encoded[8..10].copy_from_slice(&RECORD_VERSION.to_be_bytes());
         encoded[16..32].copy_from_slice(&self.store_incarnation);
         encoded[32..40].copy_from_slice(&self.epoch.get().to_be_bytes());
-        let tag = authenticate_domain(key, EPOCH_AUTH_DOMAIN, &encoded[..EPOCH_BODY_BYTES])?;
+        let tag = authenticate_domain(
+            key.canonical_mac_key(),
+            EPOCH_AUTH_DOMAIN,
+            &encoded[..EPOCH_BODY_BYTES],
+        );
         encoded[EPOCH_BODY_BYTES..].copy_from_slice(&tag);
         Ok(encoded)
     }
@@ -841,12 +903,14 @@ impl EpochRecord {
         {
             return Err(XfrmObjectInstallDurableError::Malformed);
         }
-        verify_authentication_domain(
-            key,
+        if !verify_authentication_domain(
+            key.canonical_mac_key(),
             EPOCH_AUTH_DOMAIN,
             &encoded[..EPOCH_BODY_BYTES],
             &encoded[EPOCH_BODY_BYTES..],
-        )?;
+        ) {
+            return Err(XfrmObjectInstallDurableError::AuthenticationFailed);
+        }
         let store_incarnation = array_at(encoded, 16);
         let epoch =
             NonZeroU64::new(u64_at(encoded, 32)).ok_or(XfrmObjectInstallDurableError::Malformed)?;
@@ -946,7 +1010,7 @@ impl XfrmObjectInstallRecoveryStore {
         // prior process died after mkdir but before its parent fsync.
         sync_store_root_parent(path, &descriptor)?;
 
-        let namespace_seal = namespace_seal(&proof_key, namespace_binding)?;
+        let namespace_seal = namespace_seal(&proof_key, namespace_binding);
         let owner_process_id = std::process::id();
         let mut inner = StoreInner {
             visible_path: path.to_path_buf(),
@@ -1044,14 +1108,17 @@ impl XfrmObjectInstallRecoveryStore {
         validate_exact_lookup_mark(removal.lookup_mark(), "durable_object.install.mark")
             .map_err(|_| XfrmObjectInstallDurableError::NonExactRemovalIdentity)?;
         let lease = self.lease()?;
-        let mut canonical = Zeroizing::new([0_u8; 64]);
-        let length = encode_deletion_identity(&removal, request.policy_if_id(), &mut canonical)?;
-        let deletion_identity = authenticate_domain(
-            &lease.store.proof_key,
-            b"opc-xfrm-object-deletion-identity-v1\0",
-            &canonical[..length],
-        )?;
-        let install_request = authenticate_install_request(&lease.store.proof_key, request)?;
+        let key = lease.store.proof_key.canonical_mac_key();
+        let deletion_identity = authenticate_deletion_identity(
+            key,
+            DELETION_IDENTITY_AUTH_DOMAIN,
+            &removal,
+            request.policy_if_id(),
+        )
+        .map_err(map_canonical_encode_error)?;
+        let install_request =
+            authenticate_install_request(key, INSTALL_REQUEST_AUTH_DOMAIN, request)
+                .map_err(map_canonical_encode_error)?;
         Ok(DurableObjectFingerprints {
             deletion_identity,
             install_request,
@@ -1067,13 +1134,13 @@ impl XfrmObjectInstallRecoveryStore {
         validate_exact_lookup_mark(removal.lookup_mark(), "durable_object.install.mark")
             .map_err(|_| XfrmObjectInstallDurableError::NonExactRemovalIdentity)?;
         let lease = self.lease()?;
-        let mut canonical = Zeroizing::new([0_u8; 64]);
-        let length = encode_deletion_identity(removal, policy_if_id, &mut canonical)?;
-        authenticate_domain(
-            &lease.store.proof_key,
-            b"opc-xfrm-object-deletion-identity-v1\0",
-            &canonical[..length],
+        authenticate_deletion_identity(
+            lease.store.proof_key.canonical_mac_key(),
+            DELETION_IDENTITY_AUTH_DOMAIN,
+            removal,
+            policy_if_id,
         )
+        .map_err(map_canonical_encode_error)
     }
 
     /// Inspect the authenticated current phase for a retained handle.
@@ -2162,19 +2229,35 @@ fn parse_epoch_name(name: &str) -> Option<NonZeroU64> {
     NonZeroU64::new(u64::from_str_radix(encoded, 16).ok()?)
 }
 
-fn namespace_seal(
-    key: &XfrmObjectRecoveryProofKey,
-    binding: [u8; 40],
-) -> Result<[u8; 32], XfrmObjectInstallDurableError> {
-    authenticate_domain(key, b"opc-xfrm-object-namespace-v1\0", &binding)
+fn namespace_seal(key: &XfrmObjectRecoveryProofKey, binding: [u8; 40]) -> [u8; 32] {
+    authenticate_domain(key.canonical_mac_key(), NAMESPACE_AUTH_DOMAIN, &binding)
 }
 
-fn authenticate_install_request(
-    key: &XfrmObjectRecoveryProofKey,
+fn map_canonical_encode_error(error: CanonicalEncodeError) -> XfrmObjectInstallDurableError {
+    match error {
+        CanonicalEncodeError::CapacityExceeded => XfrmObjectInstallDurableError::CapacityExceeded,
+        CanonicalEncodeError::Malformed => XfrmObjectInstallDurableError::Malformed,
+    }
+}
+
+/// Compute the domain-separated keyed fingerprint of one complete install
+/// request.
+///
+/// The encoding is length-prefixed and covers every field the backend would
+/// send, so two requests that differ anywhere produce different fingerprints.
+/// The `domain` argument keeps sibling record families separate even when a
+/// deployment configures the same key bytes for both.
+///
+/// # Errors
+///
+/// Returns [`CanonicalEncodeError::CapacityExceeded`] when a variable-length
+/// field exceeds the bounded canonical encoding.
+pub(crate) fn authenticate_install_request(
+    key: CanonicalMacKey<'_>,
+    domain: &[u8],
     request: &XfrmObjectInstallRequest,
-) -> Result<[u8; AUTH_TAG_BYTES], XfrmObjectInstallDurableError> {
-    let mut mac = HmacSha256::new(key.bytes());
-    mac.update(INSTALL_REQUEST_AUTH_DOMAIN);
+) -> Result<[u8; AUTH_TAG_BYTES], CanonicalEncodeError> {
+    let mut mac = key.begin(domain);
     match request {
         XfrmObjectInstallRequest::Sa(request) => {
             mac_u8(&mut mac, 1);
@@ -2235,7 +2318,7 @@ fn authenticate_install_request(
             mac_u64(
                 &mut mac,
                 u64::try_from(parameters.templates.len())
-                    .map_err(|_| XfrmObjectInstallDurableError::CapacityExceeded)?,
+                    .map_err(|_| CanonicalEncodeError::CapacityExceeded)?,
             );
             for template in &parameters.templates {
                 mac_template(&mut mac, *template);
@@ -2247,32 +2330,43 @@ fn authenticate_install_request(
     Ok(*mac.finalize())
 }
 
-fn mac_bytes(mac: &mut HmacSha256, bytes: &[u8]) -> Result<(), XfrmObjectInstallDurableError> {
+/// Absorb one length-prefixed byte string.
+///
+/// # Errors
+///
+/// Returns [`CanonicalEncodeError::CapacityExceeded`] when the length cannot be
+/// represented in the fixed-width prefix.
+pub(crate) fn mac_bytes(mac: &mut HmacSha256, bytes: &[u8]) -> Result<(), CanonicalEncodeError> {
     mac_u64(
         mac,
-        u64::try_from(bytes.len()).map_err(|_| XfrmObjectInstallDurableError::CapacityExceeded)?,
+        u64::try_from(bytes.len()).map_err(|_| CanonicalEncodeError::CapacityExceeded)?,
     );
     mac.update(bytes);
     Ok(())
 }
 
-fn mac_u8(mac: &mut HmacSha256, value: u8) {
+/// Absorb one unsigned byte.
+pub(crate) fn mac_u8(mac: &mut HmacSha256, value: u8) {
     mac.update(&[value]);
 }
 
-fn mac_u16(mac: &mut HmacSha256, value: u16) {
+/// Absorb one big-endian 16-bit value.
+pub(crate) fn mac_u16(mac: &mut HmacSha256, value: u16) {
     mac.update(&value.to_be_bytes());
 }
 
-fn mac_u32(mac: &mut HmacSha256, value: u32) {
+/// Absorb one big-endian 32-bit value.
+pub(crate) fn mac_u32(mac: &mut HmacSha256, value: u32) {
     mac.update(&value.to_be_bytes());
 }
 
-fn mac_u64(mac: &mut HmacSha256, value: u64) {
+/// Absorb one big-endian 64-bit value.
+pub(crate) fn mac_u64(mac: &mut HmacSha256, value: u64) {
     mac.update(&value.to_be_bytes());
 }
 
-fn mac_ip_address(mac: &mut HmacSha256, address: IpAddress) {
+/// Absorb one address with its family discriminant.
+pub(crate) fn mac_ip_address(mac: &mut HmacSha256, address: IpAddress) {
     match address {
         IpAddress::Ipv4(octets) => {
             mac_u8(mac, 4);
@@ -2285,7 +2379,8 @@ fn mac_ip_address(mac: &mut HmacSha256, address: IpAddress) {
     }
 }
 
-fn mac_selector(mac: &mut HmacSha256, selector: &XfrmSelector) {
+/// Absorb one traffic selector.
+pub(crate) fn mac_selector(mac: &mut HmacSha256, selector: &XfrmSelector) {
     mac_ip_address(mac, selector.source);
     mac_ip_address(mac, selector.destination);
     mac_u16(mac, selector.source_port);
@@ -2295,17 +2390,20 @@ fn mac_selector(mac: &mut HmacSha256, selector: &XfrmSelector) {
     mac_u8(mac, selector.destination_prefix_len);
 }
 
-fn mac_id(mac: &mut HmacSha256, id: XfrmId) {
+/// Absorb one exact XFRM identity triple.
+pub(crate) fn mac_id(mac: &mut HmacSha256, id: XfrmId) {
     mac_ip_address(mac, id.destination);
     mac_u32(mac, id.spi);
     mac_u8(mac, id.protocol);
 }
 
-fn mac_request_id(mac: &mut HmacSha256, request_id: Option<XfrmRequestId>) {
+/// Absorb one optional request identifier.
+pub(crate) fn mac_request_id(mac: &mut HmacSha256, request_id: Option<XfrmRequestId>) {
     mac_optional_u32(mac, request_id.map(XfrmRequestId::get));
 }
 
-fn mac_optional_u32(mac: &mut HmacSha256, value: Option<u32>) {
+/// Absorb one optional 32-bit value with its presence discriminant.
+pub(crate) fn mac_optional_u32(mac: &mut HmacSha256, value: Option<u32>) {
     match value {
         Some(value) => {
             mac_u8(mac, 1);
@@ -2315,7 +2413,8 @@ fn mac_optional_u32(mac: &mut HmacSha256, value: Option<u32>) {
     }
 }
 
-fn mac_mode(mac: &mut HmacSha256, mode: XfrmMode) {
+/// Absorb one transform mode.
+pub(crate) fn mac_mode(mac: &mut HmacSha256, mode: XfrmMode) {
     mac_u8(
         mac,
         match mode {
@@ -2326,7 +2425,8 @@ fn mac_mode(mac: &mut HmacSha256, mode: XfrmMode) {
     );
 }
 
-fn mac_direction(mac: &mut HmacSha256, direction: XfrmDirection) {
+/// Absorb one policy direction.
+pub(crate) fn mac_direction(mac: &mut HmacSha256, direction: XfrmDirection) {
     mac_u8(
         mac,
         match direction {
@@ -2337,7 +2437,8 @@ fn mac_direction(mac: &mut HmacSha256, direction: XfrmDirection) {
     );
 }
 
-fn mac_action(mac: &mut HmacSha256, action: XfrmAction) {
+/// Absorb one policy action.
+pub(crate) fn mac_action(mac: &mut HmacSha256, action: XfrmAction) {
     mac_u8(
         mac,
         match action {
@@ -2347,7 +2448,8 @@ fn mac_action(mac: &mut HmacSha256, action: XfrmAction) {
     );
 }
 
-fn mac_lifetime(mac: &mut HmacSha256, lifetime: LifetimeConfig) {
+/// Absorb one complete lifetime configuration.
+pub(crate) fn mac_lifetime(mac: &mut HmacSha256, lifetime: LifetimeConfig) {
     mac_u64(mac, lifetime.soft_byte_limit);
     mac_u64(mac, lifetime.hard_byte_limit);
     mac_u64(mac, lifetime.soft_packet_limit);
@@ -2356,10 +2458,16 @@ fn mac_lifetime(mac: &mut HmacSha256, lifetime: LifetimeConfig) {
     mac_u64(mac, lifetime.hard_add_expires_seconds);
 }
 
-fn mac_replay_state(
+/// Absorb one optional replay state including its bitmap.
+///
+/// # Errors
+///
+/// Returns [`CanonicalEncodeError::CapacityExceeded`] when the bitmap length
+/// cannot be represented in the fixed-width prefix.
+pub(crate) fn mac_replay_state(
     mac: &mut HmacSha256,
     state: Option<&SaReplayState>,
-) -> Result<(), XfrmObjectInstallDurableError> {
+) -> Result<(), CanonicalEncodeError> {
     let Some(state) = state else {
         mac_u8(mac, 0);
         return Ok(());
@@ -2373,8 +2481,7 @@ fn mac_replay_state(
     mac_u32(mac, state.replay_window);
     mac_u64(
         mac,
-        u64::try_from(state.bitmap.len())
-            .map_err(|_| XfrmObjectInstallDurableError::CapacityExceeded)?,
+        u64::try_from(state.bitmap.len()).map_err(|_| CanonicalEncodeError::CapacityExceeded)?,
     );
     for word in &state.bitmap {
         mac_u32(mac, *word);
@@ -2382,7 +2489,8 @@ fn mac_replay_state(
     Ok(())
 }
 
-fn mac_encap(mac: &mut HmacSha256, encap: Option<UdpEncap>) {
+/// Absorb one optional UDP encapsulation descriptor.
+pub(crate) fn mac_encap(mac: &mut HmacSha256, encap: Option<UdpEncap>) {
     match encap {
         Some(encap) => {
             mac_u8(mac, 1);
@@ -2394,7 +2502,8 @@ fn mac_encap(mac: &mut HmacSha256, encap: Option<UdpEncap>) {
     }
 }
 
-fn mac_lookup_mark(mac: &mut HmacSha256, mark: Option<XfrmLookupMark>) {
+/// Absorb one optional lookup mark.
+pub(crate) fn mac_lookup_mark(mac: &mut HmacSha256, mark: Option<XfrmLookupMark>) {
     match mark {
         Some(mark) => {
             mac_u8(mac, 1);
@@ -2405,7 +2514,8 @@ fn mac_lookup_mark(mac: &mut HmacSha256, mark: Option<XfrmLookupMark>) {
     }
 }
 
-fn mac_output_mark(mac: &mut HmacSha256, mark: Option<XfrmMark>) {
+/// Absorb one optional post-transform output mark.
+pub(crate) fn mac_output_mark(mac: &mut HmacSha256, mark: Option<XfrmMark>) {
     match mark {
         Some(mark) => {
             mac_u8(mac, 1);
@@ -2416,23 +2526,46 @@ fn mac_output_mark(mac: &mut HmacSha256, mark: Option<XfrmMark>) {
     }
 }
 
-fn mac_template(mac: &mut HmacSha256, template: XfrmTemplate) {
+/// Absorb one policy template.
+pub(crate) fn mac_template(mac: &mut HmacSha256, template: XfrmTemplate) {
     mac_id(mac, template.id);
     mac_ip_address(mac, template.source_address);
     mac_request_id(mac, template.request_id);
     mac_mode(mac, template.mode);
 }
 
+/// Compute the domain-separated keyed fingerprint of one exact kernel deletion
+/// identity.
+///
+/// The canonical plaintext exists only in a zeroizing buffer for the duration
+/// of the call; the caller receives the tag alone. `policy_if_id` must already
+/// be canonicalized, so an encoded zero arrives as `None`.
+///
+/// # Errors
+///
+/// Returns [`CanonicalEncodeError::Malformed`] when the removal request cannot
+/// produce an exact canonical identity.
+pub(crate) fn authenticate_deletion_identity(
+    key: CanonicalMacKey<'_>,
+    domain: &[u8],
+    removal: &XfrmObjectRemovalRequest,
+    policy_if_id: Option<u32>,
+) -> Result<[u8; AUTH_TAG_BYTES], CanonicalEncodeError> {
+    let mut canonical = Zeroizing::new([0_u8; 64]);
+    let length = encode_deletion_identity(removal, policy_if_id, &mut canonical)?;
+    Ok(authenticate_domain(key, domain, &canonical[..length]))
+}
+
 fn encode_deletion_identity(
     removal: &XfrmObjectRemovalRequest,
     policy_if_id: Option<u32>,
     output: &mut [u8; 64],
-) -> Result<usize, XfrmObjectInstallDurableError> {
+) -> Result<usize, CanonicalEncodeError> {
     let mut cursor = 0_usize;
     match removal {
         XfrmObjectRemovalRequest::Sa(request) => {
             if policy_if_id.is_some() {
-                return Err(XfrmObjectInstallDurableError::Malformed);
+                return Err(CanonicalEncodeError::Malformed);
             }
             output[cursor] = 1;
             cursor += 1;
@@ -2460,7 +2593,7 @@ fn encode_policy_identity(
     if_id: Option<u32>,
     output: &mut [u8; 64],
     cursor: &mut usize,
-) -> Result<(), XfrmObjectInstallDurableError> {
+) -> Result<(), CanonicalEncodeError> {
     encode_selector(&request.selector, output, cursor);
     output[*cursor] = match request.direction {
         XfrmDirection::In => 1,
@@ -2475,7 +2608,7 @@ fn encode_policy_identity(
             *cursor += 1;
             push_bytes(output, cursor, &value.to_be_bytes());
         }
-        Some(_) => return Err(XfrmObjectInstallDurableError::Malformed),
+        Some(_) => return Err(CanonicalEncodeError::Malformed),
         None => {
             output[*cursor] = 0;
             *cursor += 1;
@@ -2734,6 +2867,159 @@ mod tests {
                 assert_eq!(handle.to_bytes(), encoded);
             }
         }
+    }
+
+    /// Fixed SA install request for the object family's golden vectors.
+    fn golden_sa_request() -> XfrmObjectInstallRequest {
+        XfrmObjectInstallRequest::Sa(crate::InstallSaRequest {
+            parameters: crate::SaParameters {
+                selector: XfrmSelector::new(
+                    IpAddress::Ipv4([10, 0, 0, 1]),
+                    IpAddress::Ipv4([10, 0, 0, 2]),
+                    50,
+                ),
+                id: XfrmId {
+                    destination: IpAddress::Ipv4([10, 0, 0, 2]),
+                    spi: 0x1234_5678,
+                    protocol: 50,
+                },
+                source_address: IpAddress::Ipv4([10, 0, 0, 1]),
+                request_id: None,
+                auth: Some((
+                    crate::AuthAlgorithm::hmac_sha256(96),
+                    crate::KeyMaterial::new(vec![0xab; 32]),
+                )),
+                crypt: Some((
+                    crate::Algorithm::cbc_aes(),
+                    crate::KeyMaterial::new(vec![0xcd; 32]),
+                )),
+                aead: None,
+                mode: XfrmMode::Tunnel,
+                lifetime: LifetimeConfig::default(),
+                replay_window: 32,
+                replay_state: None,
+                encap: None,
+                mark: None,
+                output_mark: None,
+                if_id: None,
+                egress_dscp: None,
+            },
+        })
+    }
+
+    /// Fixed interface-scoped policy install request for the golden vectors.
+    fn golden_policy_request() -> XfrmObjectInstallRequest {
+        XfrmObjectInstallRequest::Policy(crate::InstallPolicyRequest {
+            parameters: crate::PolicyParameters {
+                selector: XfrmSelector::new(
+                    IpAddress::Ipv4([10, 0, 0, 1]),
+                    IpAddress::Ipv4([10, 0, 0, 2]),
+                    50,
+                ),
+                direction: XfrmDirection::Out,
+                action: XfrmAction::Allow,
+                priority: 616,
+                templates: vec![XfrmTemplate {
+                    id: XfrmId {
+                        destination: IpAddress::Ipv4([10, 0, 0, 2]),
+                        spi: 0x1234_5678,
+                        protocol: 50,
+                    },
+                    source_address: IpAddress::Ipv4([10, 0, 0, 1]),
+                    request_id: None,
+                    mode: XfrmMode::Tunnel,
+                }],
+                mark: None,
+                if_id: Some(600),
+            },
+        })
+    }
+
+    /// Byte-pinned canonical encodings for the object family.
+    ///
+    /// The three encoders are now shared with the roster family and take their
+    /// domain separator as a parameter, so nothing in a round-trip test can
+    /// notice if the object family's domain is changed: both sides of every
+    /// comparison would move together. These vectors are the only thing that
+    /// does notice. A domain change silently invalidates every persisted
+    /// `DurableObjectRecord`, which turns `recover_durable_object_install`
+    /// into a permanent `WrongBinding` and leaves the writer gate closed
+    /// forever, so this must fail loudly rather than pass quietly.
+    #[test]
+    fn golden_vectors_pin_the_object_install_request_and_deletion_identity_encoding() {
+        let proof_key = key(9);
+        let borrowed = proof_key.canonical_mac_key();
+        let sa = golden_sa_request();
+        let policy = golden_policy_request();
+
+        assert_eq!(
+            authenticate_install_request(borrowed, INSTALL_REQUEST_AUTH_DOMAIN, &sa).unwrap(),
+            [
+                0x25, 0x45, 0x12, 0x78, 0x88, 0x1a, 0xe4, 0xa7, 0x0c, 0x35, 0x75, 0xb6, 0xc5, 0x4c,
+                0xbc, 0x46, 0xbc, 0x33, 0xe0, 0xc2, 0x6c, 0xc2, 0x77, 0xa4, 0xfb, 0x48, 0x3b, 0x64,
+                0xb6, 0x9d, 0x02, 0x54,
+            ],
+            "object SA install-request fingerprint encoding changed"
+        );
+        assert_eq!(
+            authenticate_install_request(borrowed, INSTALL_REQUEST_AUTH_DOMAIN, &policy).unwrap(),
+            [
+                0xc5, 0xc9, 0xb4, 0x1f, 0x1b, 0x7e, 0x3c, 0x34, 0x15, 0x62, 0x28, 0x7b, 0x00, 0xb7,
+                0xa2, 0x4a, 0xa6, 0x88, 0x71, 0xda, 0x6c, 0x42, 0x94, 0x1e, 0x8d, 0x66, 0x2b, 0x53,
+                0xf2, 0xa5, 0x6c, 0x2a,
+            ],
+            "object policy install-request fingerprint encoding changed"
+        );
+        assert_eq!(
+            authenticate_deletion_identity(
+                borrowed,
+                DELETION_IDENTITY_AUTH_DOMAIN,
+                &sa.removal(),
+                sa.policy_if_id(),
+            )
+            .unwrap(),
+            [
+                0x02, 0x4d, 0x3a, 0x78, 0xe3, 0x53, 0xf9, 0x5b, 0x32, 0x63, 0x89, 0x19, 0xca, 0x2c,
+                0x68, 0xdb, 0xb1, 0x85, 0xe6, 0x02, 0xc1, 0x2c, 0xe4, 0x2d, 0x3a, 0xfe, 0x72, 0x20,
+                0xbd, 0xe6, 0xf5, 0x36,
+            ],
+            "object SA deletion-identity fingerprint encoding changed"
+        );
+        assert_eq!(
+            authenticate_deletion_identity(
+                borrowed,
+                DELETION_IDENTITY_AUTH_DOMAIN,
+                &policy.removal(),
+                policy.policy_if_id(),
+            )
+            .unwrap(),
+            [
+                0x98, 0x42, 0xce, 0x31, 0xc7, 0xaa, 0x69, 0x82, 0x51, 0x08, 0x22, 0x72, 0x25, 0x14,
+                0x36, 0x04, 0x86, 0xac, 0x14, 0x04, 0x0e, 0x3f, 0x57, 0xef, 0x2d, 0x33, 0xe2, 0x2e,
+                0xcb, 0xc2, 0x9e, 0x44,
+            ],
+            "object scoped-policy deletion-identity fingerprint encoding changed"
+        );
+        assert_eq!(
+            namespace_seal(&proof_key, [0x42; 40]),
+            [
+                0x26, 0xa8, 0x2e, 0x11, 0x15, 0xb3, 0x48, 0x52, 0x82, 0x39, 0x7c, 0x6c, 0x24, 0x54,
+                0xd0, 0x5d, 0x64, 0x91, 0x54, 0x58, 0xf2, 0x97, 0x24, 0x16, 0x5b, 0xda, 0xc9, 0xf9,
+                0x50, 0x44, 0x66, 0x31,
+            ],
+            "object namespace seal encoding changed"
+        );
+        assert_eq!(
+            record(XfrmObjectInstallDurablePhase::Acquired)
+                .encode(&proof_key)
+                .unwrap()[RECORD_BODY_BYTES..],
+            [
+                0xb4, 0x48, 0x2b, 0xf7, 0xdc, 0x72, 0xad, 0x30, 0x56, 0xeb, 0x26, 0x45, 0x5f, 0xae,
+                0xe6, 0x13, 0xc0, 0x91, 0x77, 0x6c, 0x9d, 0x04, 0x69, 0xf6, 0x87, 0x96, 0x07, 0x44,
+                0x98, 0x5a, 0x14, 0x04,
+            ],
+            "object record tag encoding changed"
+        );
     }
 
     #[test]
