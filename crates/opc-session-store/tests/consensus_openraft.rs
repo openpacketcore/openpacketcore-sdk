@@ -51,6 +51,7 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_millis(
 );
 const CLUSTER_START_TIMEOUT: Duration = RECOVERY_TIMEOUT;
 const SNAPSHOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const SNAPSHOT_COMMAND_BATCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SNAPSHOT_CATCH_UP_COMMANDS: usize = 4_300;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_CAPTURED_CONSENSUS_PAYLOADS: usize = 4_096;
@@ -58,9 +59,9 @@ const MAX_CAPTURED_CONSENSUS_PAYLOADS: usize = 4_096;
 // expensive snapshot-compaction qualification under the parallel test harness.
 static ELECTION_AND_SNAPSHOT_TEST_PERMIT: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(1);
-// Cluster formation uses the short qualification timeout below. Serialize only
-// that setup phase so concurrent libtest fixtures cannot consume one another's
-// formation budget; test bodies remain concurrent.
+// Cluster formation uses each fixture's selected operation budget. Serialize
+// only that setup phase so concurrent libtest fixtures cannot consume one
+// another's formation budget; test bodies remain concurrent.
 static CLUSTER_FORMATION_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 const ENCRYPTION_NAMESPACE: &str = "consensus-boundary-qualification";
 const PLAINTEXT_CANARY_BEFORE_ROTATION: &[u8] =
@@ -2291,8 +2292,8 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
         .expect("qualification semaphore remains open");
     // Snapshot qualification intentionally commits thousands of operations.
     // Keep each operation on the production budget while parallel workspace
-    // tests contend for the runner; the outer recovery bounds still enforce a
-    // finite end-to-end proof.
+    // tests contend for the runner. The aggregate command and recovery bounds
+    // keep the complete qualification finite.
     let cluster =
         TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
             .await;
@@ -2343,12 +2344,16 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
             .expect("majority commits record while follower is isolated")
     );
 
-    for _ in 0..SNAPSHOT_CATCH_UP_COMMANDS {
-        cluster.stores[1]
-            .max_replication_sequence()
-            .await
-            .expect("advance committed logical time toward snapshot compaction");
-    }
+    tokio::time::timeout(SNAPSHOT_COMMAND_BATCH_TIMEOUT, async {
+        for _ in 0..SNAPSHOT_CATCH_UP_COMMANDS {
+            cluster.stores[1]
+                .max_replication_sequence()
+                .await
+                .expect("advance committed logical time toward snapshot compaction");
+        }
+    })
+    .await
+    .expect("snapshot command batch completes within its aggregate bound");
 
     let compacted = tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
         loop {
