@@ -245,6 +245,13 @@ fn connection_failure_reason(error: &ProtocolError) -> &'static str {
 }
 
 fn record_server_connection_failure(error: &ProtocolError) {
+    #[cfg(test)]
+    if matches!(
+        error,
+        ProtocolError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut
+    ) {
+        crate::test_support::record_connection_timeout_failure();
+    }
     match error {
         ProtocolError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
             &METRICS.session_net_connection_failure_timeout
@@ -263,6 +270,8 @@ fn record_server_connection_outcome(result: &Result<(), ProtocolError>) {
             METRICS
                 .session_net_connection_successes
                 .fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            crate::test_support::record_connection_success();
         }
         Err(error) => record_server_connection_failure(error),
     }
@@ -3927,42 +3936,15 @@ mod tests {
         bytes
     }
 
-    #[derive(Clone, Copy)]
-    struct ConnectionOutcomeMetricSnapshot {
-        idle_retirements: u64,
-        timeout_failures: u64,
-        successes: u64,
-        drain_started: u64,
-        drain_completed: u64,
-    }
-
-    fn connection_outcome_metrics() -> ConnectionOutcomeMetricSnapshot {
-        ConnectionOutcomeMetricSnapshot {
-            idle_retirements: METRICS
-                .session_net_lifecycle_retirement_idle_timeout
-                .load(Ordering::Relaxed),
-            timeout_failures: METRICS
-                .session_net_connection_failure_timeout
-                .load(Ordering::Relaxed),
-            successes: METRICS
-                .session_net_connection_successes
-                .load(Ordering::Relaxed),
-            drain_started: METRICS
-                .session_net_lifecycle_drain_started
-                .load(Ordering::Relaxed),
-            drain_completed: METRICS
-                .session_net_lifecycle_drain_completed
-                .load(Ordering::Relaxed),
-        }
+    fn connection_outcome_metrics() -> crate::test_support::ConnectionOutcomeMetricSnapshot {
+        crate::test_support::CONNECTION_OUTCOME_TEST_ACCOUNTING
+            .try_with(|accounting| accounting.snapshot())
+            .expect("connection outcome accounting scope")
     }
 
     async fn wait_for_drain_completion(minimum: u64) {
         tokio::time::timeout(Duration::from_secs(1), async {
-            while METRICS
-                .session_net_lifecycle_drain_completed
-                .load(Ordering::Relaxed)
-                < minimum
-            {
+            while connection_outcome_metrics().drain_completed < minimum {
                 tokio::task::yield_now().await;
             }
         })
@@ -3998,12 +3980,7 @@ mod tests {
         (result, writer)
     }
 
-    #[tokio::test]
-    async fn generic_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
-
+    async fn assert_generic_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
         let before_idle = connection_outcome_metrics();
         let (idle_result, acknowledgement) = dispatch_after_authentication(&[]).await;
         record_server_connection_outcome(&idle_result);
@@ -4070,6 +4047,17 @@ mod tests {
             before_handshake.idle_retirements
         );
         assert!(after_handshake.timeout_failures > before_handshake.timeout_failures);
+    }
+
+    #[tokio::test]
+    async fn generic_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
+        let accounting = Arc::new(crate::test_support::ConnectionOutcomeTestAccounting::default());
+        crate::test_support::CONNECTION_OUTCOME_TEST_ACCOUNTING
+            .scope(
+                accounting,
+                assert_generic_server_distinguishes_authenticated_idle_from_active_frame_timeout(),
+            )
+            .await;
     }
 
     #[tokio::test]

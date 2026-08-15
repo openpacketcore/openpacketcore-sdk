@@ -659,6 +659,9 @@ const UNRECORDED_RETIREMENT_REASON: u8 = u8::MAX;
 struct LifecycleConnectionMetrics {
     state: AtomicU8,
     hard_overrun_recorded: AtomicBool,
+    // Retain test attribution when lifecycle ownership moves between tasks.
+    #[cfg(test)]
+    test_accounting: Option<Arc<crate::test_support::ConnectionOutcomeTestAccounting>>,
 }
 
 impl LifecycleConnectionMetrics {
@@ -669,6 +672,8 @@ impl LifecycleConnectionMetrics {
         Self {
             state: AtomicU8::new(LIFECYCLE_METRIC_ACTIVE),
             hard_overrun_recorded: AtomicBool::new(false),
+            #[cfg(test)]
+            test_accounting: crate::test_support::current_connection_outcome_test_accounting(),
         }
     }
 
@@ -692,6 +697,10 @@ impl LifecycleConnectionMetrics {
         METRICS
             .session_net_lifecycle_drain_started
             .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(accounting) = &self.test_accounting {
+            accounting.record_drain_started();
+        }
     }
 
     fn record_hard_overrun(&self) {
@@ -712,6 +721,10 @@ impl Drop for LifecycleConnectionMetrics {
                 METRICS
                     .session_net_lifecycle_drain_completed
                     .fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                if let Some(accounting) = &self.test_accounting {
+                    accounting.record_drain_completed();
+                }
             }
             _ => decrement_gauge(&METRICS.session_net_lifecycle_active_connections),
         }
@@ -1017,6 +1030,10 @@ impl ConnectionLifecycle {
             .store(reason as u8, Ordering::Release);
         self.metrics.begin_draining();
         reason.retirement_counter().fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(accounting) = &self.metrics.test_accounting {
+            accounting.record_retirement(reason);
+        }
         tracing::debug!(reason = reason.as_str(), "session connection retired");
     }
 
