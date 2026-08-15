@@ -66,7 +66,6 @@ use crate::readiness::{
     FixedQuorumReadinessReport, FixedQuorumTrafficAuthority, PlacementResiliencePolicy,
     PlacementResilienceReport, ReplicaReadinessObservation, ReplicaReadinessOutcome,
 };
-use crate::record::SessionPayloadEncoding;
 use crate::record::StoredSessionRecord;
 use crate::restore::{RestoreScanPage, RestoreScanRequest};
 use crate::sqlite::SqliteSessionBackend;
@@ -2206,6 +2205,13 @@ impl ConsensusSessionStore {
         deadline: tokio::time::Instant,
         allow_operator_recovery: bool,
     ) -> ForwardMutationReply {
+        if let Err(error) =
+            validate_consensus_intent_with_recovery(&request.intent, allow_operator_recovery)
+        {
+            return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
+                error,
+            )));
+        }
         // Membership changes take the exclusive side of this gate. Holding a
         // shared guard through the definitive proposal result lets the
         // transition driver drain every already-admitted application write
@@ -2236,13 +2242,6 @@ impl ConsensusSessionStore {
         {
             return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
                 StoreError::TopologyAuthorityRevoked,
-            )));
-        }
-        if let Err(error) =
-            validate_consensus_intent_with_recovery(&request.intent, allow_operator_recovery)
-        {
-            return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
-                error,
             )));
         }
         let proposal_permit = match tokio::time::timeout_at(
@@ -3295,6 +3294,7 @@ fn validate_consensus_command_preproposal(
     };
     if let SessionMutationIntent::CompareAndSet(op) = intent {
         validate_stored_record_expiry_at(&op.new_record, command.logical_time)?;
+        validate_sealed_payload(op)?;
     }
     Ok(())
 }
@@ -3341,14 +3341,7 @@ fn validate_consensus_batch(ops: &[SessionOp]) -> Result<(), StoreError> {
 }
 
 fn validate_sealed_payload(op: &CompareAndSet) -> Result<(), StoreError> {
-    if op.new_record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
-        return Err(StoreError::Crypto(
-            "session consensus requires a sealed payload".into(),
-        ));
-    }
-    op.new_record
-        .payload
-        .validate_envelope_for_record(&op.new_record)
+    crate::sqlite::validate_consensus_record(&op.new_record)
 }
 
 #[derive(Clone)]
@@ -4367,6 +4360,11 @@ mod membership_tests {
     use opc_consensus::{
         derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
     };
+    use opc_crypto::CryptoEnvelopeV1;
+    use opc_key::{
+        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
+        AES_256_GCM_SIV_NONCE_LEN,
+    };
 
     use super::*;
     use crate::backend::ReplicationOp;
@@ -4831,6 +4829,94 @@ mod membership_tests {
         ));
     }
 
+    #[test]
+    fn preproposal_rejects_a_consensus_record_above_the_retained_cap() {
+        let logical_time = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let key = SessionKey {
+            tenant: TenantId::new("preproposal-cap").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"preproposal-cap")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let owner = OwnerId::new("preproposal-cap-owner").expect("owner");
+        let lease = LeaseGuard::new(
+            key.clone(),
+            owner.clone(),
+            FenceToken::new(1),
+            logical_time,
+            checked_session_deadline(logical_time, Duration::from_secs(60))
+                .expect("lease deadline"),
+            1,
+        );
+        let mut new_record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(1),
+            owner: owner.clone(),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("preproposal-cap"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([]),
+        };
+        let key_id = KeyId::new("preproposal-cap-key").expect("key ID");
+        let aad = EnvelopeAad::session(
+            new_record.key.tenant.clone(),
+            1,
+            SessionAad::new(
+                new_record.key.nf_kind.as_str(),
+                "preproposal-cap-keyed-session-digest",
+                new_record.state_type.as_str(),
+                new_record.generation.get(),
+                new_record.fence.get(),
+                "preproposal-cap-backend",
+            )
+            .expect("session AAD"),
+        );
+        let envelope = |opaque_len| CryptoEnvelopeV1 {
+            algorithm: AeadAlgorithm::Aes256GcmSiv,
+            key_id: key_id.clone(),
+            nonce: vec![0x42; AES_256_GCM_SIV_NONCE_LEN],
+            aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+            ciphertext_and_tag: {
+                let mut ciphertext_and_tag = vec![0x5a; opaque_len];
+                ciphertext_and_tag.extend_from_slice(&[0xa5; AEAD_TAG_LEN]);
+                ciphertext_and_tag
+            },
+        };
+        let payload_len = crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 1;
+        let envelope_overhead = envelope(0).encode().expect("empty envelope").len();
+        let encoded = envelope(payload_len - envelope_overhead)
+            .encode()
+            .expect("oversized envelope");
+        assert_eq!(encoded.len(), payload_len);
+        new_record.payload = EncryptedSessionPayload::try_envelope(encoded)
+            .expect("bounded oversized envelope fixture");
+        let command = crate::consensus::SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: singleton_topology()
+                .consensus_identity()
+                .expect("consensus topology identity"),
+            request_id: SessionConsensusRequestId::new(),
+            logical_time,
+            intent: SessionMutationIntent::CompareAndSet(Box::new(CompareAndSet {
+                key: key.clone(),
+                lease,
+                expected_generation: None,
+                new_record,
+            })),
+        };
+
+        assert_eq!(
+            validate_consensus_command_preproposal(&command),
+            Err(StoreError::PayloadTooLarge {
+                actual: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 1,
+                max: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+            })
+        );
+    }
+
     #[tokio::test]
     async fn store_and_forwarded_services_fail_closed_before_exact_admission() {
         let directory = tempfile::tempdir().expect("membership admission directory");
@@ -4877,6 +4963,28 @@ mod membership_tests {
             )
             .await;
         assert_eq!(forwarded, ForwardMutationReply::Unavailable);
+        let invalid_internal_authority = store
+            .apply_on_local_leader(
+                ForwardMutationRequest {
+                    request_id: SessionConsensusRequestId::new(),
+                    intent: SessionMutationIntent::Authorized {
+                        origin: store.inner.local_node_id,
+                        authority_identity: singleton_topology()
+                            .consensus_identity()
+                            .expect("singleton authority identity"),
+                        mutation: Box::new(SessionMutationIntent::AdvanceLogicalTime),
+                    },
+                    required_consumer_scope: ForwardConsumerScope::Internal,
+                },
+                store.inner.local_node_id,
+                deadline,
+            )
+            .await;
+        assert!(matches!(
+            invalid_internal_authority,
+            ForwardMutationReply::Applied(response)
+                if matches!(response.result, Err(StoreError::CapabilityNotSupported(_)))
+        ));
         assert_eq!(
             store.local_read_barrier(deadline).await,
             ReadBarrierReply::Unavailable

@@ -38,6 +38,8 @@ use crate::error::{LeaseError, StoreError};
 use crate::readiness::PlacementResiliencePolicy;
 use crate::record::SessionPayloadEncoding;
 
+#[cfg(test)]
+use super::RestoreScanValidationProfile;
 use super::{lease, ops, SqliteSessionBackend};
 
 const CONSENSUS_LOG_ENTRY_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -1617,6 +1619,10 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     }
     validate_persisted_membership_sync(&tx, storage_identity)
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    // Reopen is an admission boundary too: a pre-cap, recovered, or externally
+    // modified database must not expose state that live consensus proposals
+    // could not create under the retained profile.
+    validate_sealed_state_sync(&tx).map_err(|_| SessionConsensusStorageError::CorruptState)?;
     if authority_profile == ConsensusAuthorityProfile::FixedImmutable
         && !fixed_quorum_authority_is_exact_sync(
             &tx,
@@ -4703,6 +4709,31 @@ pub(crate) fn observed_credential_high_water_sync(conn: &Connection) -> io::Resu
     Ok(high)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static LEGACY_CLAIM_AFTER_VALIDATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn install_legacy_claim_after_validation_hook(hook: impl FnOnce() + 'static) {
+    LEGACY_CLAIM_AFTER_VALIDATION_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "legacy claim test hook already installed"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_legacy_claim_after_validation_hook() {
+    let hook = LEGACY_CLAIM_AFTER_VALIDATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn claim_legacy_checkpoint_sync(
     conn: &Connection,
@@ -4715,13 +4746,20 @@ pub(crate) fn claim_legacy_checkpoint_sync(
     watch_cursor_invalidation_floor: u64,
 ) -> io::Result<()> {
     validate_member_set(expected_members, false)?;
-    if table_exists(conn, "consensus_identity").map_err(db_error)? {
+    // Acquire write authority before inspecting the legacy checkpoint. Keeping
+    // validation and ownership installation in one transaction prevents a
+    // concurrent legacy writer from changing the admitted state between the
+    // sealed-state preflight and the consensus fence.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+    if table_exists(&tx, "consensus_identity").map_err(db_error)? {
         return Err(invalid_data(
             "session recovery checkpoint is already consensus-owned",
         ));
     }
-    validate_sealed_state_sync(conn)?;
-    let logical_time: Option<String> = conn
+    validate_sealed_state_sync(&tx)?;
+    #[cfg(test)]
+    run_legacy_claim_after_validation_hook();
+    let logical_time: Option<String> = tx
         .query_row(
             "SELECT timestamp FROM session_replication_log ORDER BY sequence DESC LIMIT 1",
             [],
@@ -4734,7 +4772,6 @@ pub(crate) fn claim_legacy_checkpoint_sync(
             .map_err(|_| invalid_data("legacy checkpoint logical time is invalid"))?;
     }
 
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
     tx.execute_batch(CONSENSUS_SCHEMA).map_err(db_error)?;
     let epoch = epoch_i64(identity)?;
     tx.execute(
@@ -7572,15 +7609,17 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
             encoding,
         )
         .map_err(|_| invalid_data("session consensus snapshot record is invalid"))?;
-        if record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
-            return Err(invalid_data(
-                "session consensus snapshot contains an unsealed record payload",
-            ));
-        }
-        record
-            .payload
-            .validate_envelope_for_record(&record)
-            .map_err(|_| invalid_data("session consensus snapshot envelope is invalid"))?;
+        super::validate_consensus_record(&record).map_err(|error| match error {
+            StoreError::PayloadTooLarge { .. } => invalid_data(
+                "session consensus snapshot record exceeds the consensus payload limit",
+            ),
+            StoreError::Crypto(_)
+                if record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 =>
+            {
+                invalid_data("session consensus snapshot contains an unsealed record payload")
+            }
+            _ => invalid_data("session consensus snapshot envelope is invalid"),
+        })?;
     }
 
     let mut stmt = conn
@@ -7661,6 +7700,11 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
 }
 
 pub(crate) fn validate_sealed_replication_op(root: &ReplicationOp) -> io::Result<()> {
+    super::replication::validate_replication_payloads(
+        root,
+        super::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+    )
+    .map_err(|_| invalid_data("session replication log violates consensus admission"))?;
     let mut pending = vec![root];
     let mut visited = 0_usize;
     while let Some(op) = pending.pop() {
@@ -7672,17 +7716,9 @@ pub(crate) fn validate_sealed_replication_op(root: &ReplicationOp) -> io::Result
         }
         match op {
             ReplicationOp::CompareAndSet { new_record, .. } => {
-                if new_record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
-                    return Err(invalid_data(
-                        "session replication log contains an unsealed record payload",
-                    ));
-                }
-                new_record
-                    .payload
-                    .validate_envelope_for_record(new_record)
-                    .map_err(|_| {
-                        invalid_data("session replication log contains an invalid envelope")
-                    })?;
+                super::validate_consensus_record(new_record).map_err(|_| {
+                    invalid_data("session replication log contains an invalid envelope")
+                })?;
             }
             ReplicationOp::Batch { ops } => pending.extend(ops),
             _ => {}
@@ -7697,9 +7733,12 @@ pub(crate) fn build_snapshot_database_sync(
     identity: SessionConsensusIdentity,
     path: &std::path::Path,
 ) -> io::Result<ConsensusAppliedMembership> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
+    validate_sealed_state_sync(&tx)?;
     let destination = create_pinned_snapshot_database(path)?;
-    build_snapshot_database_from_pinned_sync(conn, identity, destination)
-        .map(|(snapshot, _)| snapshot)
+    let (snapshot, _) = build_snapshot_database_from_pinned_sync(&tx, identity, destination)?;
+    tx.commit().map_err(db_error)?;
+    Ok(snapshot)
 }
 
 pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
@@ -7723,6 +7762,7 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
         expected_bindings,
         fixed_placement_policy,
     )?;
+    validate_sealed_state_sync(&tx)?;
     // Do not create even an empty snapshot artifact until the durable fixed
     // authority check has succeeded under the source read transaction.
     let destination = create_pinned_snapshot_database(path)?;
@@ -9643,6 +9683,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_consensus_get_revalidates_persisted_payload_authority() {
+        let exact = SqliteSessionBackend::in_memory().expect("exact-cap backend");
+        {
+            let conn = exact.conn.lock().await;
+            let record = sealed_record_for_key(key(), 1_048_576);
+            ops::insert_or_replace_record_sync(&conn, &record).expect("persist exact-cap record");
+        }
+        assert!(exact
+            .consensus_get_at(&key(), timestamp(1))
+            .await
+            .expect("exact-cap consensus read")
+            .is_some());
+
+        let oversized = SqliteSessionBackend::in_memory().expect("oversized backend");
+        {
+            let conn = oversized.conn.lock().await;
+            let record = sealed_record_for_key(key(), 1_048_577);
+            ops::insert_or_replace_record_sync(&conn, &record)
+                .expect("inject oversized persisted record");
+        }
+        assert_eq!(
+            oversized
+                .consensus_get_at(&key(), timestamp(1))
+                .await
+                .expect_err("live consensus read must reject one over its retained cap"),
+            StoreError::PayloadTooLarge {
+                actual: 1_048_577,
+                max: 1_048_576,
+            }
+        );
+
+        let unsealed = SqliteSessionBackend::in_memory().expect("unsealed backend");
+        {
+            let conn = unsealed.conn.lock().await;
+            let mut record = sealed_record_for_key(key(), 64 * 1024);
+            record.payload = crate::EncryptedSessionPayload::new(b"unsealed");
+            ops::insert_or_replace_record_sync(&conn, &record)
+                .expect("inject unsealed persisted record");
+        }
+        assert!(matches!(
+            unsealed.consensus_get_at(&key(), timestamp(1)).await,
+            Err(StoreError::Crypto(_))
+        ));
+
+        let mismatched = SqliteSessionBackend::in_memory().expect("AAD-mismatch backend");
+        {
+            let conn = mismatched.conn.lock().await;
+            let mut record = sealed_record_for_key(key(), 64 * 1024);
+            record.generation = crate::Generation::new(2);
+            ops::insert_or_replace_record_sync(&conn, &record)
+                .expect("inject AAD-mismatched persisted record");
+        }
+        assert!(matches!(
+            mismatched.consensus_get_at(&key(), timestamp(1)).await,
+            Err(StoreError::Crypto(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn live_consensus_restore_scan_revalidates_persisted_payload_authority() {
+        let exact = SqliteSessionBackend::in_memory().expect("exact-cap backend");
+        {
+            let conn = exact.conn.lock().await;
+            let record = sealed_record_for_key(key(), 1_048_576);
+            ops::insert_or_replace_record_sync(&conn, &record).expect("persist exact-cap record");
+        }
+        let exact_page = exact
+            .consensus_scan_restore_records_at(
+                RestoreScanRequest::all(1),
+                timestamp(1),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect("exact-cap consensus restore page");
+        assert_eq!(exact_page.records.len(), 1);
+
+        let oversized = SqliteSessionBackend::in_memory().expect("oversized backend");
+        {
+            let conn = oversized.conn.lock().await;
+            let record = sealed_record_for_key(key(), 1_048_577);
+            ops::insert_or_replace_record_sync(&conn, &record)
+                .expect("inject oversized persisted record");
+        }
+        assert_eq!(
+            oversized
+                .consensus_scan_restore_records_at(
+                    RestoreScanRequest::all(1),
+                    timestamp(1),
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                )
+                .await
+                .expect_err("consensus restore must reject one over its retained cap"),
+            StoreError::PayloadTooLarge {
+                actual: 1_048_577,
+                max: 1_048_576,
+            }
+        );
+
+        let invalid_aad = SqliteSessionBackend::in_memory().expect("AAD-mismatch backend");
+        {
+            let conn = invalid_aad.conn.lock().await;
+            let mut record = sealed_record_for_key(key(), 64 * 1024);
+            record.fence = crate::FenceToken::new(2);
+            ops::insert_or_replace_record_sync(&conn, &record)
+                .expect("inject AAD-mismatched persisted record");
+        }
+        assert!(matches!(
+            invalid_aad
+                .consensus_scan_restore_records_at(
+                    RestoreScanRequest::all(1),
+                    timestamp(1),
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                )
+                .await,
+            Err(StoreError::Crypto(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_build_rejects_invalid_source_before_creating_an_artifact() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        let identity = identity();
+        let members = expected_members();
+        initialize_schema(&conn, identity, &members).expect("consensus schema");
+        apply_entries_sync(
+            &conn,
+            identity,
+            &backend.consensus_capabilities(),
+            vec![membership_entry()],
+        )
+        .expect("apply membership");
+        let oversized = sealed_record_for_key(key(), 1_048_577);
+        ops::insert_or_replace_record_sync(&conn, &oversized)
+            .expect("inject oversized persisted record");
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("must-not-exist.sqlite");
+
+        let error = build_snapshot_database_sync(&conn, identity, &snapshot_path)
+            .expect_err("invalid source must reject snapshot capture");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            !snapshot_path.exists(),
+            "invalid source must not leave a snapshot artifact"
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_claim_rejects_a_record_above_the_consensus_cap() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.lock().await;
@@ -9662,6 +9850,46 @@ mod tests {
         .expect_err("legacy claim must not import an oversized consensus record");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(!table_exists(&conn, "consensus_identity").expect("inspect ownership table"));
+    }
+
+    #[test]
+    fn legacy_claim_validation_and_ownership_fence_are_one_transaction() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let database = directory.path().join("legacy-claim.sqlite");
+        drop(SqliteSessionBackend::open(&database).expect("legacy backend"));
+        let conn = Connection::open(&database).expect("claim connection");
+        let concurrent_record = sealed_record_for_key(key(), 1_048_577);
+        let concurrent_database = database.clone();
+        install_legacy_claim_after_validation_hook(move || {
+            let concurrent =
+                Connection::open(&concurrent_database).expect("concurrent legacy writer");
+            concurrent
+                .busy_timeout(Duration::ZERO)
+                .expect("disable concurrent writer wait");
+            ops::insert_or_replace_record_sync(&concurrent, &concurrent_record)
+                .expect_err("the claim transaction must already fence a concurrent legacy writer");
+        });
+
+        claim_legacy_checkpoint_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            [0x41; 32],
+            1,
+            [0x42; 32],
+            0,
+            0,
+        )
+        .expect("claim valid legacy checkpoint");
+
+        let record_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_records", [], |row| row.get(0))
+            .expect("count claimed records");
+        assert_eq!(
+            record_count, 0,
+            "the fenced writer must not mutate the claim"
+        );
+        validate_sealed_state_sync(&conn).expect("claimed state remains valid");
     }
 
     #[test]
@@ -9689,6 +9917,91 @@ mod tests {
         ))
         .expect_err("persisted replication must bind the operation and record keys");
         assert_eq!(cross_key.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn consensus_replication_read_revalidates_persisted_cas_authority() {
+        let mut unsealed_record = sealed_record_for_key(key(), 64 * 1024);
+        unsealed_record.payload = crate::EncryptedSessionPayload::new(b"unsealed".as_slice());
+        for op in [
+            sealed_replication_cas(key(), key(), 1_048_577),
+            ReplicationOp::CompareAndSet {
+                key: unsealed_record.key.clone(),
+                expected_generation: None,
+                credential_id: 1,
+                guard_expires_at: timestamp(1),
+                new_record: unsealed_record,
+            },
+            {
+                let operation_key = key();
+                let mut record_key = operation_key.clone();
+                record_key.stable_id = Bytes::from_static(b"cross-key-consumer-record")
+                    .try_into()
+                    .expect("valid stable ID");
+                sealed_replication_cas(operation_key, record_key, 64 * 1024)
+            },
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            {
+                let conn = backend.conn.lock().await;
+                initialize_schema(&conn, identity(), &expected_members())
+                    .expect("consensus schema");
+                let entry = ReplicationEntry {
+                    sequence: 1,
+                    tx_id: "persisted-read"
+                        .to_string()
+                        .try_into()
+                        .expect("transaction ID"),
+                    op,
+                    timestamp: timestamp(1),
+                };
+                conn.execute(
+                    "INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp) VALUES (1, ?1, ?2, ?3)",
+                    params![
+                        entry.tx_id.as_str(),
+                        serde_json::to_string(&entry).expect("entry JSON"),
+                        entry.timestamp.to_string(),
+                    ],
+                )
+                .expect("inject persisted entry");
+            }
+
+            assert!(matches!(
+                backend.consensus_get_replication_log(1, 1).await,
+                Err(StoreError::BackendUnavailable(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn consensus_reopen_rejects_persisted_state_above_its_retained_cap() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let members = expected_members();
+        let bindings = test_member_bindings(&members);
+        {
+            let conn = backend.conn.lock().await;
+            initialize_schema(&conn, identity(), &members).expect("consensus schema");
+            let oversized = sealed_record_for_key(key(), 1_048_577);
+            ops::insert_or_replace_record_sync(&conn, &oversized)
+                .expect("inject valid oversized envelope");
+        }
+        let snapshots = tempfile::tempdir().expect("snapshot directory");
+
+        let error = match SqliteConsensusCore::initialize(
+            &backend,
+            snapshots.path().join("snapshots"),
+            identity(),
+            members,
+            bindings,
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("reopen must reject state above the retained consensus cap"),
+            Err(error) => error,
+        };
+        assert_eq!(error, SessionConsensusStorageError::CorruptState);
     }
 
     #[tokio::test]
@@ -11824,7 +12137,7 @@ mod tests {
             timestamp(1),
             Arc::new(AtomicBool::new(false)),
             std::time::Instant::now() + Duration::from_secs(5),
-            false,
+            RestoreScanValidationProfile::Consensus,
         )
         .expect_err("snapshot install creates a new cursor incarnation");
         assert_eq!(stale, StoreError::RestoreScanCursorStale);
@@ -11838,7 +12151,7 @@ mod tests {
             timestamp(1),
             Arc::new(AtomicBool::new(false)),
             std::time::Instant::now() + Duration::from_secs(5),
-            false,
+            RestoreScanValidationProfile::Consensus,
         )
         .expect("restart from first page");
         assert!(first_page.complete);
@@ -11886,7 +12199,7 @@ mod tests {
             timestamp(1),
             Arc::new(AtomicBool::new(false)),
             std::time::Instant::now() + Duration::from_secs(5),
-            false,
+            RestoreScanValidationProfile::Consensus,
         )
         .expect_err("same snapshot still yields node-local cursor incarnations");
         assert_eq!(cross_node, StoreError::RestoreScanCursorStale);
@@ -12872,6 +13185,58 @@ mod tests {
         assert!(
             !path.exists(),
             "rejected snapshot build must not write an image"
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_snapshot_build_rejects_invalid_source_before_creating_an_artifact() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        let identity = identity();
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        initialize_schema_with_profile(
+            &conn,
+            identity,
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed authority");
+        apply_entries_with_authority_sync(
+            &conn,
+            identity,
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            vec![membership_entry_at(
+                0,
+                vec![members.clone()],
+                members.clone(),
+            )],
+        )
+        .expect("form fixed quorum");
+        let oversized = sealed_record_for_key(key(), 1_048_577);
+        ops::insert_or_replace_record_sync(&conn, &oversized)
+            .expect("inject oversized persisted record");
+
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let path = directory.path().join("invalid-fixed-source.sqlite");
+        let error = build_snapshot_database_with_authority_sync(
+            &conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &path,
+        )
+        .expect_err("fixed snapshot build must reject invalid source state");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(
+            !path.exists(),
+            "invalid fixed source must not leave a snapshot artifact"
         );
     }
 

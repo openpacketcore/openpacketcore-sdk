@@ -842,7 +842,8 @@ after the Openraft barrier and local apply. One absolute deadline MUST begin at
 the public restore entry and cover the barrier/apply path, blocking-worker and
 asynchronous connection admission, SQLite progress, and blocking-task join.
 Each page MUST examine no more than 4,096 live candidates plus one non-decoded
-lookahead, return no more than 1,024 records, 4 MiB of payload, or 8 MiB of
+lookahead, return no more than 1,024 records, an aggregate local 4 MiB + 64 KiB
+of stored-envelope payload, or 8 MiB of
 retained record/key/metadata/payload/cursor bytes, examine no more than 8 MiB
 of key/filter metadata, and obey the SQLite VM-step, wall-time, and cancellation
 budgets. Candidate/lookahead SQL MUST NOT select payload blobs; admitted
@@ -1052,8 +1053,9 @@ Serde boundary MUST delegate to private fixed-width v5 DTOs. `Hello` and
 `HelloAck` add an optional `contract_profile`; `HelloAck` also carries the
 server's optional `cas_idempotency_epoch`, and direct CAS carries an optional
 `idempotency_epoch`. Exhaustive Rust construction and matching MUST account for
-the new fields. The profile pins wire-schema revision 6 and error-set revision
-8; owner, custom-key, and state-type
+the new fields. The profile pins wire-schema revision 7 and error-set revision
+9; `max_restore_scan_page_payload_bytes = 2096128`; owner, custom-key, and
+state-type
 bounds of 128 UTF-8 bytes; `min_frame_size = 8192`;
 `max_frame_size = 16777216`;
 `stable_id_max_bytes = 64`; `replication_tx_id_max_bytes = 128`;
@@ -1192,9 +1194,10 @@ fit maximum-profile metadata/envelopes but does not promise a non-zero
 application payload. Capability evidence remains descriptive and MUST NOT
 authorize quorum or traffic readiness.
 The 1 MiB default yields 130,048 payload bytes and the 16 MiB ceiling yields
-2,096,128. Advertising SQLite's full 1 MiB value limit requires at least
-8,396,800 frame bytes; 16 MiB is the recommended configured frame size for that
-profile. This is a per-frame limit, not aggregate admission: at the server's
+2,096,128. The wire ceiling is intentionally below standalone SQLite's local
+4 MiB + 64 KiB stored-envelope restore capacity, which is not a session-net
+wire capability. This is a per-frame limit, not aggregate admission: at the
+server's
 default 128 connection slots, simultaneous ceiling-sized encoded stores can
 retain about 2 GiB before chunk metadata, TLS, and runtime overhead. The
 aggregate scales with the configured connection limit. #143 owns aggregate
@@ -1307,7 +1310,7 @@ or traffic admission. A cache MUST be keyed by the exact profile and negotiated
 directional limits and cleared when a successful reconnect changes either
 limit. Callers MUST use fresh bounded quorum evidence.
 
-The transition to v5 wire-schema revision 6 and error-set revision 9 is a
+The transition to v5 wire-schema revision 7 and error-set revision 9 is a
 coordinated stop/upgrade/start boundary, not a rolling deployment. Operators
 MUST drain traffic and writers; run the #135 identity
 audit; inventory every retained record, replication log, snapshot, restore
@@ -1345,7 +1348,7 @@ across the independent `OPCH`/#135 boundary retains its checkpoint/reverse-
 migration requirement.
 
 That compatibility cutover is distinct from credential rotation. Only after
-every participant is admitted on the same revision-6 profile MAY operators use
+every participant is admitted on the same revision-7 profile MAY operators use
 material-epoch or explicit reauthentication to recycle connections without
 draining application traffic. The lifecycle MUST NOT be used to mix protocol
 profiles, negotiate a downgrade, or turn a binary rollback into a rolling
@@ -1559,7 +1562,8 @@ from checked `last_delivered_sequence + 1`. Cursor overflow, compaction or
 another permanent backend error, cancellation, and bounded slow-consumer
 failure MUST terminate explicitly rather than reconnect forever.
 
-This bootstrap behavior admits the already-frozen direct revision-6 variant and
+This bootstrap behavior was introduced for the then-frozen direct revision-6
+variant and is retained by the current revision-7 profile, alongside the
 existing consensus error value in their restricted bootstrap contexts. It
 changes no public API, direct or consensus profile revision, persisted
 SQLite/journal/snapshot format, Openraft commit authority, payload envelope,

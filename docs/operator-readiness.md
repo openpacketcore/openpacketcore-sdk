@@ -459,10 +459,11 @@ on any `invalid_record_expiry_fields`, invalid nested replication entry, or
 incomplete result. Follow the complete backup, re-authoring, OpenRaft recovery,
 verification, and fleet-wide rollback procedure in
 [`session-store-record-expiry-migration.md`](session-store-record-expiry-migration.md).
-The compatibility profile moves to `opc-session-net/5`, wire revision 6,
-error revision 8; consensus moves to `opc-session-consensus/2`, transport/wire
-revision 2, error revision 4. Both are coordinated drained upgrades, not
-rolling changes.
+The original bounded-authority preflight transition moved the compatibility
+profile to `opc-session-net/5`, wire revision 6, error revision 8; consensus
+moved to `opc-session-consensus/2`, transport/wire revision 2, error revision 4. That
+transition was a coordinated drained upgrade, not a rolling change. The current
+v5 direct profile is wire-schema revision 7 and error-set revision 9.
 
 ### Nested replication payload admission and upgrade
 
@@ -1069,21 +1070,24 @@ implemented under #163. #164/#143 fleet evidence still applies before this
 compatibility surface could be admitted to a production migration.
 `MAX_SESSION_TTL` controls session/lease state only; it does not define
 certificate expiry, trust-bundle validity, or authentication age. The direct
-wire-schema revision-6 upgrade remains a coordinated drained
+wire-schema revision-7 upgrade remains a coordinated drained
 stop/upgrade/start; only subsequent credential rotations within a uniform
-revision-6 fleet use seamless lifecycle recycling.
+revision-7 fleet use seamless lifecycle recycling.
 
-A successful restore page may be shorter than requested to respect the backend
-4 MiB payload, 8 MiB retained-page, 8 MiB examined key/filter metadata, or
-4,096 examined-candidate budget; a narrow scope may yield an empty page with
-an advancing cursor. Follow the confidential authenticated `next_cursor` until
-the issuer reports `complete`. Compatibility peer validation checks bounds,
-order, scope, cursor shape, and claimed progress; it cannot prove that an
-authenticated server did not omit a record or falsely report completion.
+A session-net server first narrows the dispatched record limit from the
+negotiated 2,096,128-byte wire-payload bound. The backend may return fewer
+records than that narrowed request to respect its retained-page, aggregate
+payload, examined key/filter metadata, or 4,096 examined-candidate budget; a
+narrow scope may yield an empty page with an advancing cursor. Follow the
+confidential authenticated `next_cursor` until the issuer reports `complete`.
+Compatibility peer validation checks bounds, order, scope, cursor shape, and
+claimed progress; it cannot prove that an authenticated server did not omit a
+record or falsely report completion.
 Production completeness comes only from scanning the barrier-confirmed local
-Openraft-applied state. A page that
-cannot fit the effective wire frame returns `RestoreScanResponseTooLarge` and
-is retried from the same cursor with a smaller record limit.
+Openraft-applied state. The transport does not trim a returned page by payload
+size: a serialized page that still cannot fit the effective wire frame returns
+`RestoreScanResponseTooLarge` and is retried from the same cursor with a
+smaller record limit.
 
 Wire-schema revision 3 retains revision 2's negotiated response budget and
 adds the AES-256-GCM-SIV snapshot-bound cursor, explicit durable-page profile,
@@ -1138,9 +1142,10 @@ prove a value at exactly the advertised maximum can be written and read across
 unequal limits. At the exact 8 KiB minimum the conservative payload maximum is
 zero; use a larger configured frame for payload-bearing traffic. Raw frame size
 is not an acceptable payload-capability value. The 1 MiB default advertises
-130,048 bytes and the 16 MiB ceiling advertises 2,096,128. SQLite's full 1 MiB
-limit needs at least 8,396,800 frame bytes, so configure 16 MiB for that
-profile. This is a per-frame limit: at the server's default 128 connection
+130,048 bytes and the 16 MiB ceiling advertises 2,096,128. The wire ceiling is
+intentionally below standalone SQLite's local 4 MiB + 64 KiB stored-envelope
+restore capacity, which is not a session-net wire capability. This is a
+per-frame limit: at the server's default 128 connection
 slots, simultaneous ceiling-sized encodes can retain about 2 GiB before
 metadata/TLS/runtime overhead. The aggregate scales with
 `with_max_connections`; #143 owns aggregate byte permits and distributed
@@ -1168,12 +1173,12 @@ client restore response budget; a confidential authenticated restore cursor;
 excluded counts, `max_value_bytes`, and size-bearing store errors; and checked
 conversion before dispatch/exposure. Restore `loaded_count` and `complete` are
 recomputed rather than trusted from the peer. Independent limits are 256 batch
-operations, 1,024 restore records, 4 MiB of restore payload and 4,096 examined
-live candidates per page, 65,536 log entries, and 65,536 rebuild entries; the
+operations, 1,024 restore records, 2,096,128 bytes of restore wire payload and
+4,096 examined live candidates per page, 65,536 log entries, and 65,536 rebuild entries; the
 configured frame bound remains
 separate. #159 now enforces that negotiated bound and one
 absolute write deadline across every ordinary response/watch item. The profile
-pins wire-schema revision 6, error-set revision 9,
+pins wire-schema revision 7, error-set revision 9,
 `max_restore_scan_examined_rows = 4096`,
 `min_frame_size = 8192`, `max_frame_size = 16777216`, 128-byte
 owner/custom-key/state-type bounds,
@@ -1450,7 +1455,13 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
   admission evidence only. Require the Openraft readiness barrier plus
   continuous traffic gating; do not derive authority from `capabilities()` or
   the availability of a restore-scan method.
-- **Payload Bound**: The backend enforces a 1 MiB payload limit through `BackendCapabilities::max_value_bytes`; state types that need larger values require an explicit profile decision.
+- **Payload Bound**: Standalone SQLite permits a local 4 MiB + 64 KiB stored
+  envelope. Its consensus adapter retains a 1 MiB command/value ceiling until
+  #683 raises every command, RPC, and consumer-response bound together.
+  Session-net separately clamps advertised `BackendCapabilities::max_value_bytes`
+  to the negotiated frame budget and limits a restore wire page to 2,096,128
+  payload bytes. State types that need larger values require an explicit
+  profile decision.
 - **Storage Fault-Injection**: Reusable `FaultInjectingStore` and `FaultType` adapters under `opc-persist` allow injecting disk-full, fsync/write failure, corrupt database/WAL, failed rollback target load, failed rollback point creation, audit-chain corruption, and startup recovery fencing. These hooks are compiled only with the `dangerous-test-hooks` feature and must not be enabled in production profiles. They cover all RFC 001 §14.3 failures, asserting fail-closed config publication/notifications, redacting SQL internals/raw paths/secrets from client-visible errors, raising alarms, and updating metrics.
 
 ## Machine-Readable Compatibility Policy Contract

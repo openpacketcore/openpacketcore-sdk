@@ -357,7 +357,7 @@ fn inspect_current(
     }
     consensus::read_membership_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    validate_sealed_records(conn, budget)?;
+    validate_consensus_sealed_records(conn, budget)?;
     let committed = consensus::read_committed_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let applied = consensus::read_applied_sync(conn, storage_identity)
@@ -726,7 +726,7 @@ fn inspect_legacy(
     budget: &mut InspectionBudget,
 ) -> Result<RecoveryReplicaEvidence, RecoveryError> {
     validate_legacy_schema(conn)?;
-    validate_sealed_records(conn, budget)?;
+    validate_consensus_sealed_records(conn, budget)?;
     validate_replication_sequence_domain(conn, budget, 0)?;
     let branch_digest = hash_legacy_state(conn, budget)?;
     let fence_high_water = consensus::observed_fence_high_water_sync(conn)
@@ -1155,7 +1155,10 @@ fn hash_logical_state(
     Ok(RecoveryDigest::from_bytes(hasher.finalize().into()))
 }
 
-fn validate_sealed_records(
+// Both current replicas and the legacy checkpoints admitted by this offline
+// quorum-recovery workflow are consensus inputs. The retained 1 MiB consensus
+// cap is therefore intentional here; this is not standalone-store inspection.
+fn validate_consensus_sealed_records(
     conn: &Connection,
     budget: &mut InspectionBudget,
 ) -> Result<(), RecoveryError> {
@@ -1240,12 +1243,7 @@ fn validate_sealed_records(
             row.get(11).map_err(|_| RecoveryError::CorruptReplica)?,
         )
         .map_err(|_| RecoveryError::CorruptReplica)?;
-        if record.payload.encoding() != crate::SessionPayloadEncoding::EnvelopeV1 {
-            return Err(RecoveryError::CorruptReplica);
-        }
-        record
-            .payload
-            .validate_envelope_for_record(&record)
+        crate::sqlite::validate_consensus_record(&record)
             .map_err(|_| RecoveryError::CorruptReplica)?;
     }
     Ok(())
@@ -2542,7 +2540,7 @@ fn convert_legacy_checkpoint(
     let mut source_budget = InspectionBudget::new(limits);
     validate_database_snapshot(&source_conn, &source_budget)?;
     validate_legacy_schema(&source_conn)?;
-    validate_sealed_records(&source_conn, &mut source_budget)?;
+    validate_consensus_sealed_records(&source_conn, &mut source_budget)?;
     validate_replication_sequence_domain(&source_conn, &mut source_budget, 0)?;
     let before = hash_legacy_state(&source_conn, &mut source_budget)?;
 

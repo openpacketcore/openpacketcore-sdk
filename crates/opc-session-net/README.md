@@ -313,12 +313,14 @@ mutation or rebuild authority beside Openraft.
   scope, cursor shape, and the server's claimed progress; it cannot prove that
   an authenticated server did not omit records or falsely report completion.
   Production completeness is the local Openraft-applied scan after a
-  linearizable barrier, not this compatibility RPC. Backends may return fewer records than requested
-  (including an empty advancing sparse page) to stay within the fixed 4 MiB
-  **wire** payload, 8 MiB retained-page, 8 MiB examined-metadata, and 4,096
-  examined-candidate budgets; callers continue from the
-  confidential authenticated `next_cursor` until `complete`. A server does not
-  rewrite a backend cursor to fit a smaller wire frame: it returns
+  linearizable barrier, not this compatibility RPC. The server first narrows
+  the dispatched record limit from the fixed 2,096,128-byte **wire** payload
+  bound. Backends may return fewer records than that narrowed request
+  (including an empty advancing sparse page) to stay within their retained-page,
+  aggregate-payload, examined-metadata, and 4,096 examined-candidate budgets;
+  callers continue from the confidential authenticated `next_cursor` until
+  `complete`. A server does not trim a returned page by payload size or rewrite
+  its backend cursor to fit a smaller wire frame: it returns
   `RestoreScanResponseTooLarge`, allowing the caller to retry from the same
   cursor with a smaller record limit. The wire omits redundant `loaded_count`
   and `complete` values and recomputes both from records and cursor.
@@ -337,7 +339,7 @@ mutation or rebuild authority beside Openraft.
   `MAX_REPLICATION_OPERATIONS_PER_ENTRY` (256). The root is depth 1 and every
   operation node, including `Batch`, counts toward the per-entry total.
 - Independent protocol work limits admit at most 256 batch operations, 1,024
-  restore records and 4 MiB of restore payload, 65,536 replication-log
+  restore records and 2,096,128 bytes of restore payload, 65,536 replication-log
   entries, and 65,536 rebuild entries.
   These limits apply in addition to the configured encoded-frame bound.
 - Every post-bootstrap server response and watch item is fully bounded-encoded
@@ -397,13 +399,14 @@ build.
 
 ### Outbound response contract
 
-Protocol v5 contract-profile wire-schema revision 6 retains revision 5's
-confidential authenticated snapshot-bound
-restore cursor, explicit durable-page profile, fixed 4 MiB restore payload and
-8 MiB retained-page, 8 MiB examined-metadata, and 4,096 examined-candidate
-budgets and exact configuration/process epoch binding for direct CAS. Revision
-5 adds the bounded, payload-free `RecordExpiryPreflight` authority exchange.
-Revision 6 adds the fixed `ConnectionRetiring` no-dispatch proof used for safe
+Protocol v5 contract-profile wire-schema revision 7 retains revision 6's
+confidential authenticated snapshot-bound restore cursor, explicit
+durable-page profile, 8 MiB retained-page, 8 MiB examined-metadata, and 4,096
+examined-candidate budgets and exact configuration/process epoch binding for
+direct CAS. Revision 7 corrects the restore payload fence from a nominal 4 MiB
+that worst-case JSON could not carry to the frame-safe 2,096,128-byte budget.
+Revision 5 adds the bounded, payload-free `RecordExpiryPreflight` authority
+exchange. Revision 6 adds the fixed `ConnectionRetiring` no-dispatch proof used for safe
 reconnection during authentication-material rotation. When lifecycle
 retirement is observed after mutual TLS and before any `HelloAck` bytes are
 written, the server returns the same complete control as
@@ -419,7 +422,7 @@ handshake. `requested_response_frame_size`,
 `Option<u32>` bootstrap fields so an older decoder can classify an otherwise
 decodable legacy minimal bootstrap. This is not bidirectional mismatch
 negotiation: an older decoder may reject unknown fields by simply closing.
-Exact revision-6 v5 admission requires each to be `Some`, at least
+Exact revision-7 v5 admission requires each to be `Some`, at least
 `MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or 8,192 bytes), and at most
 `MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or 16,777,216 bytes). The profile pins
 both as `min_frame_size = 8192` and `max_frame_size = 16777216`.
@@ -431,12 +434,13 @@ supports unequal client/server settings without assuming either configured
 limit applies in both directions. A revision-4/error-revision-7 or older peer
 is incompatible; the ALPN is `opc-session-net/5`.
 
-The 4 MiB restore payload is a v5 wire-only contract value. It does not derive
-from a local backend capability or local scan budget: standalone SQLite may
-restore one 4 MiB + 64 KiB stored envelope locally. Server serialization and
-client response decoding both reject a page one byte over the fixed wire cap,
-without emitting or accepting a partial page, while the wire schema and
-contract-profile revision remain v5/revision 6.
+The 2,096,128-byte restore payload is a v5 wire-only contract value. It does
+not derive from a local backend capability or local scan budget: standalone
+SQLite may restore one 4 MiB + 64 KiB stored envelope locally. The fixed value
+reserves worst-case JSON expansion and metadata headroom below the 16 MiB
+frame. Server serialization and client response decoding both reject a page
+one byte over the fixed wire cap without emitting or accepting a partial page;
+the exact contract profile is v5/revision 7.
 
 Error-set revision 4 adds typed replication-log range overflow, page-limit,
 and compacted-cursor outcomes. A log request normalizes `start = 0` to one;
@@ -777,8 +781,8 @@ Retirement has these invariants:
   explicitly.
 
 This is credential continuity, not protocol negotiation. The move to direct
-wire-schema revision 6 is still a coordinated drained stop/upgrade/start of
-every participant. After the fleet is uniformly on revision 6, leaf and trust
+wire-schema revision 7 is still a coordinated drained stop/upgrade/start of
+every participant. After the fleet is uniformly on revision 7, leaf and trust
 rotation uses the lifecycle above without a protocol downgrade or plaintext
 fallback. The bootstrap retirement control does not advance the direct or
 consensus profile revision and does not change the public API, but an older
@@ -905,8 +909,8 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   adds public `ContractProfile::max_frame_size`, so external profile struct
   literals and exhaustive destructuring must be updated in the same
   coordinated change.
-- The v5 profile pins wire-schema revision 6 and error-set revision 9;
-  `max_restore_scan_page_payload_bytes = 4194304`;
+- The v5 profile pins wire-schema revision 7 and error-set revision 9;
+  `max_restore_scan_page_payload_bytes = 2096128`;
   `max_restore_scan_examined_rows = 4096`;
   `min_frame_size = 8192`; `max_frame_size = 16777216`; the 128-byte
   owner/custom-key/state-type rules;
@@ -928,7 +932,7 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   pre-v4 peer built before #135 can still send an empty or oversized value
   that a new peer rejects before dispatch, so unchanged valid JSON shape is not
   a rolling-compatibility claim.
-- Treat every v5 exact-profile migration through wire-schema revision 6 and
+- Treat every v5 exact-profile migration through wire-schema revision 7 and
   error-set revision 9 as a
   coordinated stop/upgrade/start boundary. Drain
   traffic and writers, audit every persisted SQLite replica with the count-only

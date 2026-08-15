@@ -12,7 +12,11 @@ use opc_config_model::{
 };
 use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
 use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
-use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
+use opc_crypto::CryptoEnvelopeV1;
+use opc_key::{
+    serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, KeyPurpose, MemoryKeyProvider,
+    SessionAad, Zeroizing, AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN,
+};
 use opc_mgmt_audit::{AuditError, AuditEvent, AuditOutcome, AuditSink};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use rusqlite::{params, types::Value, Connection};
@@ -310,6 +314,62 @@ fn create_legacy_replica(root: &Path, id: ReplicaId, fence: u64) -> RecoveryRepl
     let backing = ReplicaBackingIdentity::new(format!("recovery-backing-{}", id.as_str()))
         .expect("recovery backing identity");
     RecoveryReplica::new_bound(id, backing, identity(), database, snapshots)
+}
+
+fn sealed_recovery_record(payload_len: usize) -> StoredSessionRecord {
+    let mut record = StoredSessionRecord {
+        key: SessionKey {
+            tenant: TenantId::from_static("recovery-cap-tenant"),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"recovery-cap-session")
+                .try_into()
+                .expect("valid stable ID"),
+        },
+        generation: Generation::new(1),
+        owner: OwnerId::new("recovery-cap-owner").expect("owner"),
+        fence: crate::FenceToken::new(1),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("recovery-cap-state"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([]),
+    };
+    let key_id = KeyId::new("recovery-cap-test-key").expect("key ID");
+    let aad = EnvelopeAad::session(
+        record.key.tenant.clone(),
+        1,
+        SessionAad::new(
+            record.key.nf_kind.as_str(),
+            "recovery-cap-keyed-session-digest",
+            record.state_type.as_str(),
+            record.generation.get(),
+            record.fence.get(),
+            "recovery-cap-test-backend",
+        )
+        .expect("session AAD"),
+    );
+    let envelope = |opaque_len| CryptoEnvelopeV1 {
+        algorithm: AeadAlgorithm::Aes256GcmSiv,
+        key_id: key_id.clone(),
+        nonce: vec![0x42; AES_256_GCM_SIV_NONCE_LEN],
+        aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+        ciphertext_and_tag: {
+            let mut ciphertext_and_tag = vec![0xA5; opaque_len];
+            ciphertext_and_tag.extend_from_slice(&[0x5A; AEAD_TAG_LEN]);
+            ciphertext_and_tag
+        },
+    };
+    let envelope_overhead = envelope(0).encode().expect("empty envelope").len();
+    let encoded = envelope(
+        payload_len
+            .checked_sub(envelope_overhead)
+            .expect("payload length exceeds envelope overhead"),
+    )
+    .encode()
+    .expect("sized envelope");
+    assert_eq!(encoded.len(), payload_len);
+    record.payload = EncryptedSessionPayload::try_envelope(encoded).expect("valid envelope");
+    record
 }
 
 fn private_tempdir() -> tempfile::TempDir {
@@ -1229,6 +1289,43 @@ fn inspection_enforces_database_value_row_and_deadline_budgets() {
             Err(RecoveryError::WorkLimitExceeded)
         );
     }
+}
+
+#[test]
+fn current_recovery_inspection_enforces_the_consensus_payload_cap() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let ids = [
+        replica_id("current-cap-replica-a"),
+        replica_id("current-cap-replica-b"),
+        replica_id("current-cap-replica-c"),
+    ];
+    let replica = create_legacy_replica(temp.path(), ids[0].clone(), 3);
+    let members = node_set(&ids);
+    claim_current_replica(
+        &replica,
+        &members,
+        LogId::new(
+            CommittedLeaderId::new(1, *members.iter().next().expect("member")),
+            0,
+        ),
+    );
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    crate::sqlite::ops::insert_or_replace_record_sync(&conn, &sealed_recovery_record(1_048_577))
+        .expect("inject valid sealed record above the consensus cap");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint current replica");
+    drop(conn);
+
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        }),
+        Err(RecoveryError::CorruptReplica)
+    );
 }
 
 fn claim_current_replica(

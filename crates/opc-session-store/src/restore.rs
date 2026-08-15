@@ -31,14 +31,14 @@ pub const RESTORE_SCAN_DEFAULT_PAGE_SIZE: usize = 256;
 pub const RESTORE_SCAN_MAX_PAGE_SIZE: usize = 1024;
 
 /// Hard maximum combined stored-payload bytes returned by one local restore
-/// page.
+/// page. Session-net applies its own smaller frame-safe wire budget.
 ///
 /// This is deliberately larger than the session-net v5 wire-page payload
 /// budget. Standalone SQLite advertises this same stored-record limit, and a
 /// local restore scan must be able to return one record at that exact limit,
 /// including a local-AEAD or remote-seal envelope. Network adapters apply
-/// their independent 4 MiB wire budget before serializing or accepting a
-/// page.
+/// their independent frame-safe wire budget before serializing or accepting
+/// a page.
 pub const RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
 
 /// Compatibility name for the local restore-page stored-payload budget.

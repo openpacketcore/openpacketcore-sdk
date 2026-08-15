@@ -244,8 +244,9 @@ backend dispatch or caller exposure. It omits restore `loaded_count` and
 `complete` and recomputes them after decode. Independent limits admit 256 batch
 operations, 1,024 restore records, 65,536 replication-log entries, and 65,536
 rebuild entries, in addition to the configured frame-size bound. The exact
-profile pins wire-schema revision 6, error-set revision 9, a 4 MiB restore
-payload bound, 8 MiB retained-page and examined key/filter-metadata bounds,
+profile pins wire-schema revision 7, error-set revision 9, a 2,096,128-byte
+restore wire-payload bound, 8 MiB retained-page and examined key/filter-metadata
+bounds,
 `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, depth-16/256-node replication trees, and the
 31,536,000-second TTL maximum. Revision 2 additionally pins
@@ -286,7 +287,7 @@ independent request-frame size. Each is a checked `u32` between
 `MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases that same minimum.
 This makes unequal client/server limits explicit. The directional fields were
 introduced by wire-schema revision 2 and are retained by the current
-wire-schema revision 6/error-set revision 9 profile. Older exact profiles,
+wire-schema revision 7/error-set revision 9 profile. Older exact profiles,
 including error revision 8 or older, are incompatible; the
 current ALPN is `opc-session-net/5`.
 
@@ -328,8 +329,9 @@ limits. It is zero at the exact 8 KiB minimum; that minimum fits bounded
 metadata/envelopes, not a non-zero application payload. It remains
 static/descriptive evidence, not quorum readiness.
 The 1 MiB default advertises 130,048 bytes and the 16 MiB ceiling advertises
-2,096,128. SQLite's full 1 MiB value limit requires at least 8,396,800 frame
-bytes, so 16 MiB is the recommended setting for that profile. This remains a
+2,096,128. The wire ceiling is intentionally below standalone SQLite's local
+4 MiB + 64 KiB stored-envelope restore capacity, which is not a session-net
+wire capability. This remains a
 per-frame limit: at the default 128 connection slots, simultaneous
 ceiling-sized encodes can retain about 2 GiB before metadata/TLS/runtime
 overhead. The aggregate scales with `with_max_connections`; aggregate byte

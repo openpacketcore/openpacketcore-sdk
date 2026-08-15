@@ -240,9 +240,10 @@ independent HA placement.
   Exact response sizing returns typed `RestoreScanResponseTooLarge` without a
   partial frame unless peers negotiated a sufficient frame (up to 16 MiB).
   The local stored-page ceiling is intentionally independent of session-net
-  v5's fixed 4 MiB wire payload ceiling: local SQLite restore can recover its
-  advertised 4 MiB + 64 KiB stored record limit, including sealing-envelope
-  overhead, but an oversized local page is never transportable as a v5 page.
+  v5's fixed 2,096,128-byte frame-safe wire payload ceiling: local SQLite
+  restore can recover its advertised 4 MiB + 64 KiB stored record limit,
+  including sealing-envelope overhead, but an oversized local page is never
+  transportable as a v5 page.
 - `opc-session-net` protocol v5 can transport only the durable opaque restore
   page profile. Compatibility offset cursors from `FakeSessionBackend` are
   local test evidence and are rejected by both remote client and server; this
@@ -256,7 +257,7 @@ independent HA placement.
   `max_value_bytes`, and
   size-bearing store errors; checked conversion at both domain boundaries; and
   independent 256-batch, 1,024-restore, 65,536-log, and 65,536-rebuild limits.
-  Its profile pins wire-schema revision 6, error-set revision 9,
+  Its profile pins wire-schema revision 7, error-set revision 9,
   `max_restore_scan_examined_rows = 4096`,
   `max_restore_scan_page_retained_bytes = 8388608`,
   `max_restore_scan_examined_metadata_bytes = 8388608`, `min_frame_size = 8192`,
@@ -268,8 +269,9 @@ independent HA placement.
   request IDs, when present, use the canonical lowercase hyphenated 36-byte UUID encoding.
   Revision 2 added exact directional frame negotiation. Revision 3 replaces
   revision 2's inspectable cursor fields with the confidential authenticated
-  token, adds the page cursor profile, and pins the 4 MiB payload plus 4,096
-  examined-candidate bounds. Error-set revision 3 carries typed restore
+  token, adds the page cursor profile, and originally pins the restore payload
+  plus 4,096 examined-candidate bounds. Wire-schema revision 7 corrects that
+  payload fence to a worst-case-JSON-safe 2,096,128 bytes. Error-set revision 3 carries typed restore
   stale-cursor, work-budget, and direct-CAS idempotency outcomes; revision 4
   adds the replication-log range, page-limit, and compacted-cursor outcomes;
   revision 5 adds the non-CAS backend and lease ambiguity outcomes; revision 6

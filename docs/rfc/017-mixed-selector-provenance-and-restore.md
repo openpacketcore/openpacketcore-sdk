@@ -1317,11 +1317,12 @@ This is a stored-envelope admission requirement: `max_value_bytes` measures
 the bytes accepted by the protected store after local-AEAD or remote sealing,
 not an equal plaintext promise made by a sealing wrapper. A local restore scan
 must therefore retain and recover one exact 4 MiB + 64 KiB stored record. That
-local recovery budget is distinct from the existing `opc-session-net` v5
-restore-page wire budget, which remains exactly 4 MiB. The wire contract
-rejects an oversized complete page during both server serialization and client
-decode; it neither splits a record nor changes the v5 wire schema/profile
-revision to carry the local envelope headroom.
+local recovery budget is distinct from the `opc-session-net` v5 revision-7
+restore-page wire budget of 2,096,128 bytes. That conservative budget reserves
+worst-case JSON expansion and bounded record metadata below the fixed 16 MiB
+frame. The wire contract rejects an oversized complete page during both server
+serialization and client decode; it neither splits a record nor claims the
+local envelope headroom is remotely transportable.
 
 Those count limits are independent ceilings, not permission to combine every
 ceiling in one record. Every v2 state also satisfies a coupled **restore

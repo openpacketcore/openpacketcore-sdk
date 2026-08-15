@@ -435,8 +435,9 @@ visible unless a separate approved storage layer protects them.
 The opt-in `opc-session-net` protocol v5 carries validated restore-scan
 requests and pages to individual remote replicas. It admits only the
 `DurableOpaqueV1` page profile; offset cursors from the local fake are rejected
-and can never become remote restore evidence. Backend pages are capped at
-1,024 records, 4 MiB of payload, and 4,096 examined live candidates plus one
+and can never become remote restore evidence. Backend pages sent over
+session-net are capped at 1,024 records, 2,096,128 bytes of wire payload, and
+4,096 examined live candidates plus one
 lookahead. Narrow scopes may therefore return an empty advancing page. The
 cursor is an AES-256-GCM-SIV ciphertext that confidentially and
 authentically binds the composite seek key, backend epoch, record revision,
@@ -499,8 +500,8 @@ response budget, a confidential authenticated strictly bounded restore cursor, a
 `complete` are omitted and recomputed after decode. Independent work limits
 admit 256 batch operations, 1,024 restore records, 65,536 log entries, and
 65,536 rebuild entries; the configured frame bound remains separate. The exact
-profile pins wire-schema revision 6, error-set revision 9, a 4 MiB restore
-payload bound, `max_restore_scan_examined_rows = 4096`, 128-byte
+profile pins wire-schema revision 7, error-set revision 9, a 2,096,128-byte
+restore wire-payload bound, `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, the
 31,536,000-second TTL maximum, and
 depth-16/256-node replication trees. Revision 2 also pins
@@ -553,8 +554,9 @@ byte-array expansion, and equal escaping/metadata headroom. The advertised
 maximum can perform a real write/read round trip under unequal limits. It
 is zero at the exact 8 KiB minimum; payload-bearing traffic requires a larger
 frame. The 1 MiB default advertises 130,048 bytes; the 16 MiB ceiling advertises
-2,096,128, and SQLite's full 1 MiB limit requires at least 8,396,800 frame
-bytes. A 16 MiB setting is recommended for that profile. This is per frame: at
+2,096,128. The wire ceiling is intentionally below standalone SQLite's local
+4 MiB + 64 KiB stored-envelope restore capacity, which is not a session-net
+wire capability. This is per frame: at
 the default 128 connection slots, concurrent ceiling-sized encodes can retain
 about 2 GiB before metadata/TLS/runtime overhead. The aggregate scales with
 `with_max_connections`, so aggregate limiting and resource/soak evidence remain
