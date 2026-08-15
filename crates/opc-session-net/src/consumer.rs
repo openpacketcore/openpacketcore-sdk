@@ -111,14 +111,48 @@ impl SessionConsumerCallError {
     }
 }
 
-fn classify_call_write_error(error: FrameWriteError) -> SessionConsumerCallError {
+fn classify_call_write_error(
+    error: FrameWriteError,
+    pre_request_budget_active: bool,
+) -> SessionConsumerCallError {
     match error {
-        FrameWriteError::BeforeWrite(error) => {
-            SessionConsumerCallError::BeforeCallWrite(error.into())
-        }
+        FrameWriteError::BeforeWrite(error) => SessionConsumerCallError::BeforeCallWrite(
+            pre_request_error(error.into(), pre_request_budget_active),
+        ),
         FrameWriteError::MayHaveWritten(error) => {
             SessionConsumerCallError::MayHaveSent(error.into())
         }
+    }
+}
+
+const fn pre_request_timeout_error(pre_request_budget_active: bool) -> SessionConsumerClientError {
+    if pre_request_budget_active {
+        SessionConsumerClientError::Unavailable
+    } else {
+        SessionConsumerClientError::Deadline
+    }
+}
+
+const fn pre_request_error(
+    error: SessionConsumerClientError,
+    pre_request_budget_active: bool,
+) -> SessionConsumerClientError {
+    match error {
+        SessionConsumerClientError::Deadline => {
+            pre_request_timeout_error(pre_request_budget_active)
+        }
+        _ => error,
+    }
+}
+
+fn ensure_pre_request_budget_remaining(
+    deadline: tokio::time::Instant,
+    pre_request_budget_active: bool,
+) -> Result<(), SessionConsumerClientError> {
+    if pre_request_budget_active && tokio::time::Instant::now() >= deadline {
+        Err(SessionConsumerClientError::Unavailable)
+    } else {
+        Ok(())
     }
 }
 
@@ -577,6 +611,7 @@ pub struct StatelessSessionConsumerClient {
     tls_config: opc_tls::AuthenticatedClientConfig,
     idle_timeout: Duration,
     operation_timeout: Duration,
+    pre_request_connection_timeout: Option<Duration>,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
 }
@@ -588,6 +623,10 @@ impl fmt::Debug for StatelessSessionConsumerClient {
             .field("redacted", &true)
             .field("idle_timeout", &self.idle_timeout)
             .field("operation_timeout", &self.operation_timeout)
+            .field(
+                "pre_request_connection_timeout",
+                &self.pre_request_connection_timeout,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -634,6 +673,7 @@ impl StatelessSessionConsumerClient {
             tls_config,
             idle_timeout: DEFAULT_CONSUMER_IDLE_TIMEOUT,
             operation_timeout: DEFAULT_CONSUMER_OPERATION_TIMEOUT,
+            pre_request_connection_timeout: None,
             lifecycle_policy: ConnectionLifecyclePolicy::default(),
             reauthentication: SessionReauthenticationControl::new(),
         }
@@ -651,6 +691,21 @@ impl StatelessSessionConsumerClient {
     #[must_use]
     pub fn with_operation_timeout(mut self, timeout: Duration) -> Self {
         self.operation_timeout = timeout;
+        self
+    }
+
+    /// Set an opt-in bound for endpoint resolution, TCP, TLS, and the
+    /// value-free Hello/HelloAck exchange before an application call is sent.
+    ///
+    /// The budget begins with each operation and is clipped to the complete
+    /// operation deadline. If it expires before an application call frame is
+    /// written, the operation is reported as unavailable and is safe to try at
+    /// another admitted endpoint. It does not shorten the post-call response
+    /// window, which remains governed by [`Self::with_operation_timeout`] and
+    /// preserves the typed unknown-outcome rule.
+    #[must_use]
+    pub fn with_pre_request_connection_timeout(mut self, timeout: Duration) -> Self {
+        self.pre_request_connection_timeout = Some(timeout);
         self
     }
 
@@ -687,9 +742,24 @@ impl StatelessSessionConsumerClient {
         self.reauthentication.request_reauthentication()
     }
 
+    fn pre_request_deadline(
+        &self,
+        started_at: tokio::time::Instant,
+        operation_deadline: tokio::time::Instant,
+    ) -> (tokio::time::Instant, bool) {
+        match self
+            .pre_request_connection_timeout
+            .and_then(|timeout| started_at.checked_add(timeout))
+        {
+            Some(deadline) if deadline < operation_deadline => (deadline, true),
+            Some(_) | None => (operation_deadline, false),
+        }
+    }
+
     async fn connect(
         &self,
-        deadline: tokio::time::Instant,
+        pre_request_deadline: tokio::time::Instant,
+        pre_request_budget_active: bool,
     ) -> Result<ConsumerConnection, SessionConsumerClientError> {
         if self.idle_timeout.is_zero()
             || self.operation_timeout.is_zero()
@@ -700,7 +770,7 @@ impl StatelessSessionConsumerClient {
         {
             return Err(SessionConsumerClientError::Protocol);
         }
-        let address = tokio::time::timeout_at(deadline, (self.resolve)())
+        let address = tokio::time::timeout_at(pre_request_deadline, (self.resolve)())
             .await
             .map_err(|_| SessionConsumerClientError::Unavailable)?
             .map_err(|_| SessionConsumerClientError::Unavailable)?;
@@ -709,17 +779,20 @@ impl StatelessSessionConsumerClient {
             .tls_config
             .begin_handshake()
             .map_err(|_| SessionConsumerClientError::Authentication)?;
-        let tcp = tokio::time::timeout_at(deadline, TcpStream::connect(address))
+        let tcp = tokio::time::timeout_at(pre_request_deadline, TcpStream::connect(address))
             .await
-            .map_err(|_| SessionConsumerClientError::Deadline)?
+            .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
             .map_err(|_| SessionConsumerClientError::Unavailable)?;
         let connector =
             tokio_rustls::TlsConnector::from(consumer_client_tls_config(handshake.rustls_config()));
-        let tls =
-            tokio::time::timeout_at(deadline, connector.connect(self.server_name.clone(), tcp))
-                .await
-                .map_err(|_| SessionConsumerClientError::Deadline)?
-                .map_err(|error| SessionConsumerClientError::from(classify_tls_io_error(error)))?;
+        let tls = tokio::time::timeout_at(
+            pre_request_deadline,
+            connector.connect(self.server_name.clone(), tcp),
+        )
+        .await
+        .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
+        .map_err(|error| SessionConsumerClientError::from(classify_tls_io_error(error)))
+        .map_err(|error| pre_request_error(error, pre_request_budget_active))?;
         let established_at = tokio::time::Instant::now();
         if tls.get_ref().1.alpn_protocol() != Some(SESSION_QUORUM_CONSUMER_ALPN) {
             return Err(SessionConsumerClientError::Protocol);
@@ -734,16 +807,23 @@ impl StatelessSessionConsumerClient {
             transport_revision: SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
             scope: self.scope,
         });
-        write_frame_bounded_until(&mut writer, &hello, MAX_NEGOTIATED_FRAME_SIZE, deadline)
-            .await
-            .map_err(SessionConsumerClientError::from)?;
+        write_frame_bounded_until(
+            &mut writer,
+            &hello,
+            MAX_NEGOTIATED_FRAME_SIZE,
+            pre_request_deadline,
+        )
+        .await
+        .map_err(SessionConsumerClientError::from)
+        .map_err(|error| pre_request_error(error, pre_request_budget_active))?;
         let ack = tokio::time::timeout_at(
-            deadline,
+            pre_request_deadline,
             read_consumer_frame::<_, ConsumerWireResponse>(&mut reader, MAX_NEGOTIATED_FRAME_SIZE),
         )
         .await
-        .map_err(|_| SessionConsumerClientError::Deadline)?
-        .map_err(SessionConsumerClientError::from)?;
+        .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
+        .map_err(SessionConsumerClientError::from)
+        .map_err(|error| pre_request_error(error, pre_request_budget_active))?;
         match ack {
             ConsumerWireResponse::HelloAck(ack)
                 if ack.transport_revision == SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION
@@ -834,24 +914,27 @@ impl StatelessSessionConsumerClient {
                 SessionConsumerClientError::Protocol,
             ));
         }
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.operation_timeout)
-            .ok_or(SessionConsumerCallError::BeforeCallWrite(
-                SessionConsumerClientError::Deadline,
-            ))?;
+        let started_at = tokio::time::Instant::now();
+        let deadline = started_at.checked_add(self.operation_timeout).ok_or(
+            SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Deadline),
+        )?;
+        let (pre_request_deadline, pre_request_budget_active) =
+            self.pre_request_deadline(started_at, deadline);
         let mut connection = self
-            .connect(deadline)
+            .connect(pre_request_deadline, pre_request_budget_active)
             .await
+            .map_err(SessionConsumerCallError::BeforeCallWrite)?;
+        ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
             .map_err(SessionConsumerCallError::BeforeCallWrite)?;
         let outbound = ConsumerWireRequest::Call(Box::new(request));
         write_frame_bounded_until_classified(
             &mut connection.writer,
             &outbound,
             MAX_NEGOTIATED_FRAME_SIZE,
-            deadline,
+            pre_request_deadline,
         )
         .await
-        .map_err(classify_call_write_error)?;
+        .map_err(|error| classify_call_write_error(error, pre_request_budget_active))?;
         if !connection.current(&self.tls_config, &self.reauthentication) {
             return Err(SessionConsumerCallError::MayHaveSent(
                 SessionConsumerClientError::Deadline,
@@ -1116,12 +1199,17 @@ impl StatelessSessionConsumerClient {
         &self,
         start_sequence: u64,
     ) -> Result<BoxStream<'static, Result<SessionConsumerChange, StoreError>>, StoreError> {
-        let deadline = tokio::time::Instant::now()
+        let started_at = tokio::time::Instant::now();
+        let deadline = started_at
             .checked_add(self.operation_timeout)
             .ok_or_else(|| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
+        let (pre_request_deadline, pre_request_budget_active) =
+            self.pre_request_deadline(started_at, deadline);
         let mut connection = self
-            .connect(deadline)
+            .connect(pre_request_deadline, pre_request_budget_active)
             .await
+            .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
+        ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
             .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
         let request = self.request(
             SessionConsumerRequestId::new(),
@@ -1131,7 +1219,7 @@ impl StatelessSessionConsumerClient {
             &mut connection.writer,
             &ConsumerWireRequest::Call(Box::new(request)),
             MAX_NEGOTIATED_FRAME_SIZE,
-            deadline,
+            pre_request_deadline,
         )
         .await
         .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
@@ -1931,9 +2019,10 @@ where
 mod tests {
     use super::{
         classify_call_write_error, consumer_response_fits, decode_consumer_frame_payload,
-        lease_response, mutation_response, ConsumerWireResponse, SessionConsumerAuthorizationError,
-        SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerClientError,
-        SessionConsumerLeaseMutationError, SessionConsumerMutationError,
+        ensure_pre_request_budget_remaining, lease_response, mutation_response,
+        ConsumerWireResponse, SessionConsumerAuthorizationError, SessionConsumerAuthorizer,
+        SessionConsumerCallError, SessionConsumerClientError, SessionConsumerLeaseMutationError,
+        SessionConsumerMutationError,
     };
     use bytes::Bytes;
     use opc_session_store::{
@@ -2100,20 +2189,49 @@ mod tests {
         ));
 
         assert!(matches!(
-            classify_call_write_error(crate::protocol::FrameWriteError::BeforeWrite(
-                crate::ProtocolError::FrameTooLarge(1),
-            )),
+            classify_call_write_error(
+                crate::protocol::FrameWriteError::BeforeWrite(crate::ProtocolError::FrameTooLarge(
+                    1
+                ),),
+                false,
+            ),
             SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol)
         ));
         assert!(matches!(
-            classify_call_write_error(crate::protocol::FrameWriteError::MayHaveWritten(
-                crate::ProtocolError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "redacted test failure",
+            classify_call_write_error(
+                crate::protocol::FrameWriteError::MayHaveWritten(crate::ProtocolError::Io(
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "redacted test failure",),
                 )),
-            )),
+                false,
+            ),
             SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Deadline)
         ));
+        assert!(matches!(
+            classify_call_write_error(
+                crate::protocol::FrameWriteError::BeforeWrite(crate::ProtocolError::Io(
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "redacted test failure",),
+                )),
+                true,
+            ),
+            SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Unavailable)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restrictive_pre_request_budget_is_checked_at_the_call_boundary() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert_eq!(ensure_pre_request_budget_remaining(deadline, true), Ok(()));
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert_eq!(
+            ensure_pre_request_budget_remaining(deadline, true),
+            Err(SessionConsumerClientError::Unavailable)
+        );
+        assert_eq!(
+            ensure_pre_request_budget_remaining(deadline, false),
+            Ok(()),
+            "the default operation deadline retains its existing write classification"
+        );
     }
 
     #[test]

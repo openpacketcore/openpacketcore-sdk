@@ -28,6 +28,7 @@ use opc_session_store::{
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 struct TestPki {
     ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
@@ -414,6 +415,180 @@ async fn consumer_resolver_reconnects_the_same_client_after_endpoint_replacement
         "each new consumer connection must invoke the resolver"
     );
     second_handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn pre_request_connection_budget_expires_during_a_stalled_tls_handshake() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("pre-request-stalled-server");
+    let client_spiffe = spiffe("pre-request-stalled-client");
+    let (_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled TLS listener");
+    let address = listener.local_addr().expect("stalled listener address");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let stalled_tls = {
+        let accepted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept TLS client");
+            accepted.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        })
+    };
+    let client = StatelessSessionConsumerClient::new_with_resolver(
+        Arc::new(move || Box::pin(async move { Ok(address) })),
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    )
+    .with_pre_request_connection_timeout(Duration::from_millis(100))
+    .with_operation_timeout(Duration::from_secs(1));
+
+    let started_at = tokio::time::Instant::now();
+    let outcome = client
+        .delete_fenced_with_id(SessionConsumerRequestId::new(), test_lease().await)
+        .await;
+    let elapsed = started_at.elapsed();
+    assert!(matches!(
+        outcome,
+        Err(SessionConsumerMutationError::NotTransmitted {
+            cause: SessionConsumerClientError::Unavailable
+        })
+    ));
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the pre-request budget must expire before the complete operation deadline"
+    );
+    stalled_tls.abort();
+}
+
+#[tokio::test]
+async fn pre_request_connection_budget_leaves_time_for_a_healthy_later_roster_endpoint() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("pre-request-roster-server");
+    let client_spiffe = spiffe("pre-request-roster-client");
+    let (_first_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let stalled_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled TLS listener");
+    let stalled_address = stalled_listener
+        .local_addr()
+        .expect("stalled listener address");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let stalled_tls = {
+        let accepted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let (_stream, _) = stalled_listener
+                .accept()
+                .await
+                .expect("accept stalled TLS client");
+            accepted.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        })
+    };
+    let healthy_service = Arc::new(CountingConsumer::default());
+    let (healthy_authorizer, healthy_scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    assert_eq!(scope, healthy_scope, "fixed roster retains one scope");
+    let (healthy_handle, healthy_address) = SessionQuorumConsumerServer::new(
+        healthy_service.clone(),
+        pki.server_config(&server_spiffe),
+        healthy_authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start healthy consumer listener");
+
+    let resolver_attempts = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolver_attempts = Arc::clone(&resolver_attempts);
+        Arc::new(move || {
+            let address = if resolver_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                stalled_address
+            } else {
+                healthy_address
+            };
+            Box::pin(async move { Ok(address) })
+        })
+    };
+    let client = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(stalled_address.ip().into()),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    )
+    .with_pre_request_connection_timeout(Duration::from_millis(100))
+    .with_operation_timeout(Duration::from_secs(1));
+
+    let lease = test_lease().await;
+    let started_at = tokio::time::Instant::now();
+    let stalled = client
+        .delete_fenced_with_id(SessionConsumerRequestId::new(), lease)
+        .await;
+    assert!(matches!(
+        stalled,
+        Err(SessionConsumerMutationError::NotTransmitted {
+            cause: SessionConsumerClientError::Unavailable
+        })
+    ));
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        client.capabilities().await,
+        Ok(BackendCapabilities::all_enabled()),
+        "a later admitted endpoint must remain reachable within the caller window"
+    );
+    assert_eq!(healthy_service.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        started_at.elapsed() < Duration::from_millis(500),
+        "the stalled endpoint must not consume the fixed-roster renewal window"
+    );
+    stalled_tls.abort();
+    healthy_handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn pre_request_connection_budget_does_not_shorten_post_call_outcome_deadline() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("pre-request-post-call-server");
+    let client_spiffe = spiffe("pre-request-post-call-client");
+    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let hanging = Arc::new(HangingConsumer::default());
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        hanging.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start hanging consumer listener");
+    let request_id = SessionConsumerRequestId::new();
+    let client = StatelessSessionConsumerClient::new_with_resolver(
+        Arc::new(move || Box::pin(async move { Ok(address) })),
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    )
+    .with_pre_request_connection_timeout(Duration::from_millis(500))
+    .with_operation_timeout(Duration::from_secs(1));
+
+    let lease = test_lease().await;
+    let started_at = tokio::time::Instant::now();
+    let outcome = client.delete_fenced_with_id(request_id, lease).await;
+    assert!(matches!(
+        outcome,
+        Err(SessionConsumerMutationError::OutcomeUnknown { request_id: retry_id })
+            if retry_id == request_id
+    ));
+    assert_eq!(hanging.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        started_at.elapsed() >= Duration::from_millis(800),
+        "the post-call response wait must retain the full operation deadline"
+    );
+    handle.abort_and_wait().await;
 }
 
 #[tokio::test]
