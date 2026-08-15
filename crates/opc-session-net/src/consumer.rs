@@ -33,6 +33,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
+use crate::consensus::RemoteAddrResolver;
 use crate::error::{classify_tls_io_error, ProtocolError};
 use crate::lifecycle::{
     CertificateExpiryEvidence, ConnectionLifecycle, ConnectionLifecyclePolicy,
@@ -127,7 +128,7 @@ fn classify_call_write_error(error: FrameWriteError) -> SessionConsumerCallError
 /// the transport effect boundary without a response, only an exact replay of
 /// the *same request body* under the retained [`SessionConsumerRequestId`] is
 /// permitted to recover the durable result. A new ID would be a new mutation.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SessionConsumerMutationError {
     /// The application call frame was never written, so no mutation effect is
@@ -149,6 +150,20 @@ pub enum SessionConsumerMutationError {
     Store(#[from] StoreError),
 }
 
+impl fmt::Debug for SessionConsumerMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::NotTransmitted { .. } => "not_transmitted",
+            Self::OutcomeUnknown { .. } => "outcome_unknown",
+            Self::Store(_) => "store",
+        };
+        formatter
+            .debug_struct("SessionConsumerMutationError")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SessionConsumerMutationError {
     /// Return the sole request identity permitted for exact recovery.
     pub const fn exact_retry_id(&self) -> Option<SessionConsumerRequestId> {
@@ -165,7 +180,7 @@ impl SessionConsumerMutationError {
 /// writes. The caller may use only the retained ID to recover the exact
 /// durable acquisition/renewal/release result; it must not write with the old
 /// guard while that recovery is pending.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SessionConsumerLeaseMutationError {
     /// The application call frame was never written, so the lease state is
@@ -184,6 +199,20 @@ pub enum SessionConsumerLeaseMutationError {
     /// A confirmed consumer lease failure.
     #[error(transparent)]
     Lease(#[from] LeaseError),
+}
+
+impl fmt::Debug for SessionConsumerLeaseMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::NotTransmitted { .. } => "not_transmitted",
+            Self::OutcomeUnknown { .. } => "outcome_unknown",
+            Self::Lease(_) => "lease",
+        };
+        formatter
+            .debug_struct("SessionConsumerLeaseMutationError")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SessionConsumerLeaseMutationError {
@@ -530,6 +559,10 @@ fn server_connection_current(
         && admitted_material_epoch == current_material_epoch
 }
 
+fn constant_address_resolver(address: SocketAddr) -> RemoteAddrResolver {
+    Arc::new(move || Box::pin(async move { Ok(address) }))
+}
+
 /// Stateless mTLS client for the typed session-quorum consumer contract.
 ///
 /// The type holds only an endpoint, expected service identity, mTLS material,
@@ -537,7 +570,7 @@ fn server_connection_current(
 /// member identity, voter/learner state, or consensus peer.
 #[derive(Clone)]
 pub struct StatelessSessionConsumerClient {
-    address: SocketAddr,
+    resolve: RemoteAddrResolver,
     server_name: rustls_pki_types::ServerName<'static>,
     expected_server_identity: SpiffeId,
     scope: SessionConsumerScope,
@@ -552,10 +585,7 @@ impl fmt::Debug for StatelessSessionConsumerClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("StatelessSessionConsumerClient")
-            .field("address", &"<redacted>")
-            .field("server_name", &"<redacted>")
-            .field("expected_server_identity", &"<redacted>")
-            .field("scope", &self.scope)
+            .field("redacted", &true)
             .field("idle_timeout", &self.idle_timeout)
             .field("operation_timeout", &self.operation_timeout)
             .finish_non_exhaustive()
@@ -571,8 +601,33 @@ impl StatelessSessionConsumerClient {
         scope: SessionConsumerScope,
         tls_config: opc_tls::AuthenticatedClientConfig,
     ) -> Self {
+        Self::new_with_resolver(
+            constant_address_resolver(address),
+            server_name,
+            expected_server_identity,
+            scope,
+            tls_config,
+        )
+    }
+
+    /// Construct a production mTLS client that resolves its endpoint for
+    /// every new connection.
+    ///
+    /// A resolver failure is reported as [`SessionConsumerClientError::Unavailable`]
+    /// before the application request is written. Each normal operation opens
+    /// a fresh connection, so callers may update a stable DNS or service
+    /// endpoint between calls without reconstructing the client. The TLS
+    /// server name and expected SPIFFE identity remain fixed by this client
+    /// and are never derived from the resolved address.
+    pub fn new_with_resolver(
+        resolve: RemoteAddrResolver,
+        server_name: rustls_pki_types::ServerName<'static>,
+        expected_server_identity: SpiffeId,
+        scope: SessionConsumerScope,
+        tls_config: opc_tls::AuthenticatedClientConfig,
+    ) -> Self {
         Self {
-            address,
+            resolve,
             server_name,
             expected_server_identity,
             scope,
@@ -591,8 +646,8 @@ impl StatelessSessionConsumerClient {
         self
     }
 
-    /// Set the complete operation deadline including DNS-free TCP, TLS,
-    /// profile bootstrap, request, and response.
+    /// Set the complete operation deadline including endpoint resolution,
+    /// TCP, TLS, profile bootstrap, request, and response.
     #[must_use]
     pub fn with_operation_timeout(mut self, timeout: Duration) -> Self {
         self.operation_timeout = timeout;
@@ -645,12 +700,16 @@ impl StatelessSessionConsumerClient {
         {
             return Err(SessionConsumerClientError::Protocol);
         }
+        let address = tokio::time::timeout_at(deadline, (self.resolve)())
+            .await
+            .map_err(|_| SessionConsumerClientError::Unavailable)?
+            .map_err(|_| SessionConsumerClientError::Unavailable)?;
         let generation = self.reauthentication.generation();
         let handshake = self
             .tls_config
             .begin_handshake()
             .map_err(|_| SessionConsumerClientError::Authentication)?;
-        let tcp = tokio::time::timeout_at(deadline, TcpStream::connect(self.address))
+        let tcp = tokio::time::timeout_at(deadline, TcpStream::connect(address))
             .await
             .map_err(|_| SessionConsumerClientError::Deadline)?
             .map_err(|_| SessionConsumerClientError::Unavailable)?;
