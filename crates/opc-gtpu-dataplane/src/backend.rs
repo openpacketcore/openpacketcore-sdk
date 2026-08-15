@@ -717,6 +717,85 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Qualify one complete retired selector source for RFC 017 reuse.
+    ///
+    /// This is deliberately distinct from [`Self::authorize_selector_reuse`]:
+    /// it accepts no v1 reuse request, proof, or receipt. A qualified backend
+    /// must bind its drain result to the opaque namespace, group, selector-set,
+    /// desired-graph, generation, nonce, and epoch coordinate. Until the RFC
+    /// 017 coordinator and adapter codec are complete, all implementations
+    /// inherit this fail-closed result.
+    ///
+    /// ```compile_fail
+    /// use opc_gtpu_dataplane::GtpuSessionSelectorRetiredDrainRequest;
+    ///
+    /// fn cannot_clone(
+    ///     request: GtpuSessionSelectorRetiredDrainRequest,
+    /// ) -> GtpuSessionSelectorRetiredDrainRequest {
+    ///     request.clone()
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use std::fmt::Debug;
+    /// use opc_gtpu_dataplane::GtpuSessionSelectorRetiredDrainRequest;
+    ///
+    /// fn cannot_format(request: GtpuSessionSelectorRetiredDrainRequest) {
+    ///     let _ = format!("{request:?}");
+    /// }
+    /// ```
+    async fn qualify_retired_selector_drain(
+        &self,
+        _request: crate::GtpuSessionSelectorRetiredDrainRequest,
+    ) -> Result<crate::GtpuSessionSelectorRetiredDrainReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_retired_drain_qualification",
+        })
+    }
+
+    /// Inspect one selector namespace for qualified complete mutable loss.
+    ///
+    /// A missing map, an empty readback, retained exact state, or traffic
+    /// observation cannot satisfy this port. The returned opaque observation
+    /// is for the matching SDK supervisor alone and cannot create restore
+    /// authority through a public API. Existing implementations fail closed.
+    async fn inspect_selector_namespace_loss(
+        &self,
+        _request: crate::GtpuSessionSelectorNamespaceLossInspectionRequest,
+    ) -> Result<crate::GtpuSessionSelectorNamespaceLossObservation, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_namespace_loss_inspection",
+        })
+    }
+
+    /// Restore one complete selector namespace after separately qualified loss.
+    ///
+    /// The opaque request is not a generic reconcile request and does not
+    /// accept any v1 selector-reuse surface. A backend must reject altered,
+    /// stale, cross-namespace, cross-generation, cross-nonce, or cross-epoch
+    /// coordinates before mutation. Existing implementations fail closed.
+    async fn restore_selector_namespace(
+        &self,
+        _request: crate::GtpuSessionSelectorNamespaceRestoreRequest,
+    ) -> Result<crate::GtpuSessionSelectorNamespaceRestoreReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_namespace_restore",
+        })
+    }
+
+    /// Read back one completed selector-namespace restore exactly.
+    ///
+    /// This remains a separate operation so a successful restore effect can
+    /// never stand in for exact readback. Existing implementations fail closed.
+    async fn readback_selector_namespace_restore(
+        &self,
+        _request: crate::GtpuSessionSelectorNamespaceRestoreReadbackRequest,
+    ) -> Result<crate::GtpuSessionSelectorNamespaceRestoreReadbackReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_namespace_restore_readback",
+        })
+    }
+
     /// Acquire one opaque selector namespace binding lease. This is the
     /// backend-neutral authority port used by production selector workers;
     /// implementations must not fall back to a raw semantic lookup.
@@ -1133,6 +1212,45 @@ mod tests {
             backend.recover_orphaned_current_ebpf_graph(request).await,
             Err(GtpuError::UnsupportedFeature {
                 feature: "current_ebpf_graph_recovery"
+            })
+        ));
+
+        let retired_drain_request =
+            crate::selector_namespace_v2::GtpuSessionSelectorRetiredDrainRequest::for_test();
+        assert!(matches!(
+            backend
+                .qualify_retired_selector_drain(retired_drain_request)
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "gtpu_selector_retired_drain_qualification"
+            })
+        ));
+        let loss_inspection_request =
+            crate::selector_namespace_v2::GtpuSessionSelectorNamespaceLossInspectionRequest::for_test();
+        assert!(matches!(
+            backend
+                .inspect_selector_namespace_loss(loss_inspection_request)
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "gtpu_selector_namespace_loss_inspection"
+            })
+        ));
+        let restore_request =
+            crate::selector_namespace_v2::GtpuSessionSelectorNamespaceRestoreRequest::for_test();
+        assert!(matches!(
+            backend.restore_selector_namespace(restore_request).await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "gtpu_selector_namespace_restore"
+            })
+        ));
+        let restore_readback_request =
+            crate::selector_namespace_v2::GtpuSessionSelectorNamespaceRestoreReadbackRequest::for_test();
+        assert!(matches!(
+            backend
+                .readback_selector_namespace_restore(restore_readback_request)
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "gtpu_selector_namespace_restore_readback"
             })
         ));
     }

@@ -61,6 +61,7 @@ pub mod mock;
 pub mod model;
 pub mod reassembly;
 pub mod selector_namespace;
+mod selector_namespace_v2;
 pub mod tft_classifier;
 pub mod traffic_observation;
 pub mod unsupported;
@@ -142,6 +143,13 @@ pub use selector_namespace::{
 #[cfg(test)]
 pub(crate) use selector_namespace::{
     InMemoryGtpuSessionSelectorNamespace, InMemoryGtpuSessionSelectorNamespaceStore,
+};
+pub use selector_namespace_v2::{
+    GtpuSessionSelectorNamespaceLossInspectionRequest, GtpuSessionSelectorNamespaceLossObservation,
+    GtpuSessionSelectorNamespaceRestoreReadbackReceipt,
+    GtpuSessionSelectorNamespaceRestoreReadbackRequest, GtpuSessionSelectorNamespaceRestoreReceipt,
+    GtpuSessionSelectorNamespaceRestoreRequest, GtpuSessionSelectorRetiredDrainReceipt,
+    GtpuSessionSelectorRetiredDrainRequest,
 };
 pub use tft_classifier::{
     TftUplinkBearer, TftUplinkClassification, TftUplinkClassifier, TftUplinkClassifierReadback,
