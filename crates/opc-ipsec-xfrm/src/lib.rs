@@ -112,6 +112,58 @@
 //! bridge, or unconditional-delete escape hatch; their diagnostics remain
 //! value-free like the install boundary.
 //!
+//! A dependency-ordered group of XFRM objects receives that same durable
+//! boundary as one transaction through a third self-contained store family.
+//! `LinuxXfrmBackend::bind_current_network_namespace_with_object_roster_recovery`
+//! is the recommended constructor;
+//! `bind_current_network_namespace_with_object_sa_relocation_and_roster_recovery`
+//! binds all three families while a deployment still migrates. Either
+//! authenticates and permanently leases one `XfrmObjectRosterRecoveryStore` on
+//! the namespace actor before any mutation-capable handle is returned.
+//! `NamespaceBoundLinuxXfrmBackend::prepare_durable_object_roster` binds the
+//! complete ordered roster into one authenticated `Prepared` record before any
+//! effect: the group identity, every member's durable identity and generation,
+//! every exact install request, and one ordered keyed digest over all of them.
+//! It returns an affine [`XfrmObjectRosterAdmissionAuthority`], and
+//! `NamespaceBoundLinuxXfrmBackend::run_durable_object_roster` consumes that
+//! authority in a single actor command that applies the members in the
+//! caller-declared order, publishing each member's exact absence proof before
+//! that member's own effect and burning the roster's one writer epoch at
+//! `Prepared` to `Issuing`. The group is all-or-nothing: a pre-existing object
+//! at any member identity is authoritative no-mutation with zero effects, and a
+//! divergence after at least one acquisition reverse-compensates exactly the
+//! acquired prefix and terminates as `RolledBack`. Roster records retain only
+//! opaque group and member correlation, phases, proof codes, incarnations, the
+//! epoch, and independent proof-keyed fingerprints of each member's exact
+//! deletion identity and complete install request; no request identity value or
+//! key material is persisted or rendered. After process loss the consumer calls
+//! exactly one of
+//! `NamespaceBoundLinuxXfrmBackend::adopt_durable_object_roster`, which commits
+//! a converged `Applied` roster additively without deleting anything, or
+//! `NamespaceBoundLinuxXfrmBackend::recover_durable_object_roster`, which
+//! retires it as owned residue. That call must come before any other namespace
+//! mutation: an intervening ordinary mutation burns the writer epoch every
+//! absence proof depends on and leaves the record retained for product repair.
+//! Every unresolved roster phase gates all later cooperating mutations in the
+//! namespace and both other durable families, and an unresolved install or
+//! relocation record gates rosters. Every one of those gates is screened before
+//! the run consumes anything, so a blocked run returns its exact affine
+//! authority through `XfrmObjectRosterRunError::into_retry_authority` and
+//! succeeds later unchanged. Missing, malformed, duplicated, reordered,
+//! substituted, stale-epoch, wrong-namespace, and wrong-incarnation roster
+//! state fails closed, and handles, outcomes, errors, and diagnostics stay
+//! value-free. The leased root carries the same trusted, non-rollback storage
+//! obligation as the install boundary; because records hold fingerprints rather
+//! than values, adopting or recovering a roster requires the consumer to have
+//! durably retained every member request, including its key material. A
+//! finalized roster retains one terminal idempotence record but no unresolved
+//! cleanup authority; the next cooperating prepare or epoch advance prunes it
+//! deterministically. Automatic roster recovery of an `Absent` witness followed
+//! by a present object is valid only while the deployment excludes raw or
+//! independently stored XFRM writers from the namespace. The SDK epoch orders
+//! cooperating actor writes only, not that external fence: otherwise identical
+//! ownership is observationally ambiguous and Linux deletion is unconditional.
+//!
 //! Same-SPI successor activation uses
 //! [`NamespaceBoundLinuxXfrmBackend::apply_and_read_back_outbound_esp_counter`].
 //! The sealed actor validates the opaque outbound binding, reads the kernel's
@@ -161,6 +213,10 @@ mod durable_object;
 mod durable_relocation;
 #[cfg(unix)]
 mod durable_relocation_flow;
+#[cfg(unix)]
+mod durable_roster;
+#[cfg(unix)]
+mod durable_roster_flow;
 pub mod error;
 #[cfg(feature = "ikev2")]
 pub mod ikev2;
@@ -210,6 +266,20 @@ pub use durable_relocation::{
 };
 #[cfg(unix)]
 pub use durable_relocation_flow::{XfrmSaRelocationDurableOutcome, XfrmSaRelocationRestartOutcome};
+#[cfg(unix)]
+pub use durable_roster::{
+    XfrmObjectRosterAdjacentProof, XfrmObjectRosterDurableError, XfrmObjectRosterDurablePhase,
+    XfrmObjectRosterGroupId, XfrmObjectRosterMemberPhase, XfrmObjectRosterOperationGeneration,
+    XfrmObjectRosterRecoveryHandle, XfrmObjectRosterRecoveryProofKey,
+    XfrmObjectRosterRecoveryStore, XfrmObjectRosterSweepProof, XFRM_OBJECT_ROSTER_MAX_MEMBERS,
+    XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES,
+};
+#[cfg(unix)]
+pub use durable_roster_flow::{
+    XfrmObjectRosterDurableOutcome, XfrmObjectRosterMemberDisposition,
+    XfrmObjectRosterMemberDispositions, XfrmObjectRosterMemberRequest, XfrmObjectRosterRequest,
+    XfrmObjectRosterRequestError, XfrmObjectRosterRestartOutcome,
+};
 pub use error::XfrmError;
 #[cfg(feature = "ikev2")]
 pub use ikev2::{
@@ -237,6 +307,7 @@ pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_C
 #[cfg(unix)]
 pub use namespace::{
     XfrmObjectInstallAdmissionAuthority, XfrmObjectInstallRunError, XfrmObjectRecoveryBindError,
+    XfrmObjectRosterAdmissionAuthority, XfrmObjectRosterRunError,
     XfrmSaRelocationAdmissionAuthority, XfrmSaRelocationRunError,
 };
 pub use observation::{

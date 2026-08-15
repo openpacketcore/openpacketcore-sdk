@@ -8,6 +8,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Durable grouped XFRM object roster transaction — `opc-ipsec-xfrm`:**
+  `LinuxXfrmBackend::bind_current_network_namespace_with_object_roster_recovery`
+  and the opt-in migration constructor
+  `bind_current_network_namespace_with_object_sa_relocation_and_roster_recovery`
+  authenticate and permanently lease a self-contained
+  `XfrmObjectRosterRecoveryStore` (own `XfrmObjectRosterRecoveryProofKey`,
+  `XfrmObjectRosterRecoveryHandle`, `XfrmObjectRosterGroupId`,
+  `XfrmObjectRosterOperationGeneration`, and `XfrmObjectRosterDurablePhase`) on
+  the namespace actor before returning a mutation-capable backend. A
+  dependency-ordered group of XFRM objects now applies as one durable
+  transaction rather than one durable lifecycle per object.
+  `XfrmObjectRosterRequest::new` validates up to
+  `XFRM_OBJECT_ROSTER_MAX_MEMBERS` `XfrmObjectRosterMemberRequest` values in
+  caller-declared apply order, rejecting non-exact removal identities,
+  duplicate deletion identities, duplicate caller-supplied member identities,
+  and members the kernel's own coarse selection relation cannot tell apart,
+  through `XfrmObjectRosterRequestError`.
+  `prepare_durable_object_roster` publishes one authenticated `Prepared` record
+  binding the group identity, every member identity and generation, every exact
+  install request, and one ordered keyed digest, then returns a non-cloneable
+  `XfrmObjectRosterAdmissionAuthority`; `run_durable_object_roster` consumes it
+  in one actor command holding one queue permit, burns one writer epoch at
+  `Prepared -> Issuing`, and publishes each member's adjacent absence proof
+  before that member's effect; `finalize_durable_object_roster` commits
+  `Applied` to `Committed` with every member slot preserved. The group is
+  all-or-nothing: a conflict proved before any effect is authoritative
+  no-mutation with zero backend calls, a divergence after at least one
+  acquisition reverse-compensates exactly the acquired prefix in strict reverse
+  order, and a member `AlreadyExists` under an absence proof fails the roster
+  instead of succeeding (RFC 7296 §1.3/§2.8, RFC 4301 §4.4) while never
+  deleting the foreign object. After process loss `adopt_durable_object_roster`
+  commits a converged applied roster additively without any deletion or leaves
+  it untouched as adoption-refused, and `recover_durable_object_roster` retires
+  it as owned residue; one of them must run before any other namespace
+  mutation, or the burned writer epoch forces a repair-required verdict with
+  the record retained. Both classify every unresolved member from its own
+  adjacent proof plus a fresh exact readback and report
+  `XfrmObjectRosterRestartOutcome`: no-mutation, rolled-back,
+  owned-residue-retired, adopted, adoption-refused, indeterminate, committed,
+  retired, removal-pending, foreign-untouched, or repair-required. The
+  indeterminate and removal-pending verdicts both carry the redaction-safe
+  backend failure the recovering process observed. Adoption screens a phase it
+  will refuse outright before it fences the other durable families, so using it
+  as a probe is free across families.
+  `XfrmObjectRosterDurableOutcome`, `XfrmObjectRosterRestartOutcome`, and the
+  authenticated re-read `XfrmObjectRosterRecoveryStore::inspect_dispositions`
+  all carry value-free `XfrmObjectRosterMemberDispositions` /
+  `XfrmObjectRosterMemberDisposition` descriptors, whose member state is
+  exposed as the closed enums `XfrmObjectRosterMemberPhase`,
+  `XfrmObjectRosterSweepProof`, and `XfrmObjectRosterAdjacentProof` (through
+  `member_phase`, `sweep_proof_kind`, and `adjacent_proof_kind`, with the
+  `&'static str` label accessors kept as conveniences), while
+  `XfrmObjectRosterRunError::into_retry_authority` returns the exact affine
+  authority for the three proved pre-effect rejections — a closed
+  cooperating-writer gate (`xfrm_object_roster_gated`, screened before anything
+  is consumed, covering an unresolved install, relocation, or sibling roster),
+  a still-closed deferred DSCP activation, and an untrusted pre-effect sweep
+  readback — and `XfrmObjectRosterDurableError` names every fail-closed durable
+  rejection.
+  Behavior change: an unresolved roster now fences single-object durable
+  installs and durable SA relocations, and an unresolved install or relocation
+  fences rosters. Fixed-size records of
+  `XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES` retain only opaque group and
+  member correlation, group and member phases, sweep and adjacent proof codes,
+  incarnations, publication sequence, writer epoch, and independent
+  proof-keyed fingerprints of each member's deletion identity and complete
+  install request; no request identity value and no key material is persisted
+  or rendered, so consumers must durably retain every complete member request.
 - **Generation-fenced live GTP-U traffic-continuity proof —
   `opc-dataplane-observation`, `opc-gtpu-dataplane`,
   `opc-gtpu-dataplane-ebpf`:** adds a backend-neutral, non-authoritative
