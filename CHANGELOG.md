@@ -22,8 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `XfrmObjectRosterRequest::new` validates up to
   `XFRM_OBJECT_ROSTER_MAX_MEMBERS` `XfrmObjectRosterMemberRequest` values in
   caller-declared apply order, rejecting non-exact removal identities,
-  duplicate deletion identities, and members the kernel's own coarse selection
-  relation cannot tell apart, through `XfrmObjectRosterRequestError`.
+  duplicate deletion identities, duplicate caller-supplied member identities,
+  and members the kernel's own coarse selection relation cannot tell apart,
+  through `XfrmObjectRosterRequestError`.
   `prepare_durable_object_roster` publishes one authenticated `Prepared` record
   binding the group identity, every member identity and generation, every exact
   install request, and one ordered keyed digest, then returns a non-cloneable
@@ -46,14 +47,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adjacent proof plus a fresh exact readback and report
   `XfrmObjectRosterRestartOutcome`: no-mutation, rolled-back,
   owned-residue-retired, adopted, adoption-refused, indeterminate, committed,
-  retired, removal-pending, foreign-untouched, or repair-required.
+  retired, removal-pending, foreign-untouched, or repair-required. The
+  indeterminate and removal-pending verdicts both carry the redaction-safe
+  backend failure the recovering process observed. Adoption screens a phase it
+  will refuse outright before it fences the other durable families, so using it
+  as a probe is free across families.
   `XfrmObjectRosterDurableOutcome`, `XfrmObjectRosterRestartOutcome`, and the
   authenticated re-read `XfrmObjectRosterRecoveryStore::inspect_dispositions`
   all carry value-free `XfrmObjectRosterMemberDispositions` /
-  `XfrmObjectRosterMemberDisposition` descriptors, while
+  `XfrmObjectRosterMemberDisposition` descriptors, whose member state is
+  exposed as the closed enums `XfrmObjectRosterMemberPhase`,
+  `XfrmObjectRosterSweepProof`, and `XfrmObjectRosterAdjacentProof` (through
+  `member_phase`, `sweep_proof_kind`, and `adjacent_proof_kind`, with the
+  `&'static str` label accessors kept as conveniences), while
   `XfrmObjectRosterRunError::into_retry_authority` returns the exact affine
-  authority for the two proved pre-effect rejections and
-  `XfrmObjectRosterDurableError` names every fail-closed durable rejection.
+  authority for the three proved pre-effect rejections — a closed
+  cooperating-writer gate (`xfrm_object_roster_gated`, screened before anything
+  is consumed, covering an unresolved install, relocation, or sibling roster),
+  a still-closed deferred DSCP activation, and an untrusted pre-effect sweep
+  readback — and `XfrmObjectRosterDurableError` names every fail-closed durable
+  rejection.
   Behavior change: an unresolved roster now fences single-object durable
   installs and durable SA relocations, and an unresolved install or relocation
   fences rosters. Fixed-size records of

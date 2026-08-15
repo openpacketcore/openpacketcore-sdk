@@ -441,8 +441,10 @@ The required ordering after that atomic bind is:
 1. Validate the group with `XfrmObjectRosterRequest::new`, passing up to
    `XFRM_OBJECT_ROSTER_MAX_MEMBERS` (8) `XfrmObjectRosterMemberRequest` values
    in the caller-declared apply order. Construction is the only place member
-   admissibility is decided; it returns a value-free
-   `XfrmObjectRosterRequestError` and contacts no backend.
+   admissibility is decided — exact removal identity, no shared deletion
+   identity, no shared caller-supplied durable member identity, and no
+   collision in the kernel's own coarse selection relation; it returns a
+   value-free `XfrmObjectRosterRequestError` and contacts no backend.
 2. Call `prepare_durable_object_roster` with the retained
    `XfrmObjectRosterGroupId`, a nonzero `XfrmObjectRosterOperationGeneration`,
    and that roster. It publishes one authenticated `Prepared` record binding
@@ -456,11 +458,16 @@ The required ordering after that atomic bind is:
    the deferred-DSCP preflight for every SA member, sweeps every member's exact
    identity read-only, burns the roster's single writer epoch on
    `Prepared -> Issuing`, and then applies members in order, publishing each
-   member's adjacent absence proof *before* that member's effect. Two proved
+   member's adjacent absence proof *before* that member's effect. Three proved
    pre-effect rejections return the exact authority through
-   `XfrmObjectRosterRunError::into_retry_authority`: a still-closed deferred
-   DSCP gate (`xfrm_object_roster_dscp_activation_required`) and an untrusted
-   sweep readback (`xfrm_object_roster_pre_effect_readback_failed`).
+   `XfrmObjectRosterRunError::into_retry_authority`: a closed
+   cooperating-writer gate (`xfrm_object_roster_gated` — an unresolved
+   single-object install, an unresolved SA relocation, or an unresolved sibling
+   roster in the same store), a still-closed deferred DSCP gate
+   (`xfrm_object_roster_dscp_activation_required`), and an untrusted sweep
+   readback (`xfrm_object_roster_pre_effect_readback_failed`). The gated
+   rejection is screened before anything at all is consumed, so it is a
+   transient block that succeeds later with that very same authority.
 5. Durably record the consumer decision, then call
    `finalize_durable_object_roster` only after adoption is durable. `Applied`
    becomes `Committed` with every member slot preserved as acquired.
@@ -489,17 +496,26 @@ Ordinal zero is applied first and compensated last. For a five-member roster:
 | 4 | outbound policy | 5th | 1st |
 
 Any member result other than a clean acquisition diverts the whole group. The
-observed backend call log is exactly the applied prefix followed by its exact
-reverse:
+observed mutating call log is the applied prefix — up to and including the
+install that diverted the group — followed by the exact reverse of whatever was
+actually acquired. The read-only sweep and adjacent readbacks are omitted from
+the table below; the sweep alone is one `query_*` per member.
 
-| Divergence | Backend calls | Terminal phase | Outcome |
+| Divergence | Mutating backend calls | Terminal phase | Outcome |
 | --- | --- | --- | --- |
 | sweep proves a conflict at any ordinal | none | `NoMutation` | `no_mutation`, dispositions name the conflicting ordinals |
 | ordinal 0 witnesses an adjacent conflict | none | `NoMutation` | `no_mutation` |
-| ordinal 3 fails after 0-2 acquired | install 0, 1, 2, then remove 2, 1, 0 | `RolledBack` | `rolled_back`, `failed_member` 3 |
-| ordinal 4 returns `AlreadyExists` | install 0-3, then remove 3, 2, 1, 0 | `RolledBack` | `rolled_back`, `failed_member` 4 |
+| ordinal 0 fails, or returns `AlreadyExists` | install 0 | `RolledBack` | `rolled_back`, `failed_member` 0, zero acquisitions and zero removals |
+| ordinal 3 fails after 0-2 acquired | install 0, 1, 2, 3, then remove 2, 1, 0 | `RolledBack` | `rolled_back`, `failed_member` 3 |
+| ordinal 4 returns `AlreadyExists` | install 0-4, then remove 3, 2, 1, 0 | `RolledBack` | `rolled_back`, `failed_member` 4 |
 | a compensation removal fails | applied prefix, partial reverse | stays `Compensating` | `indeterminate`, record retained and gating |
 | every member acknowledged | install 0-4 | `Applied` | `applied`, awaiting finalize |
+
+The failing member's own install IS issued in the two failure rows: on a real
+kernel that is a `XFRM_MSG_NEWSA`/`NEWPOLICY` message the kernel rejects, not a
+call that never happened. `rolled_back` therefore does not imply that any
+kernel object was created and then removed — at ordinal 0 the compensated
+prefix is empty.
 
 `AlreadyExists` from a member install under an `Absent` adjacent proof records
 that member as no-mutation and **fails** the roster, deliberately diverging
@@ -513,8 +529,12 @@ for a member additionally requires its own `Absent` adjacent proof, an
 epoch-current record, and exact binding re-validation.
 
 Every outcome and every restart verdict carries
-`XfrmObjectRosterMemberDispositions`: a value-free per-member ordinal, phase
-label, sweep-proof label, and adjacent-proof label.
+`XfrmObjectRosterMemberDispositions`: a value-free per-member ordinal plus the
+member's durable state as closed enums — `XfrmObjectRosterMemberPhase`,
+`XfrmObjectRosterSweepProof`, and `XfrmObjectRosterAdjacentProof` — so a
+consumer branching on member state gets compiler-checked exhaustiveness. The
+`&'static str` label accessors remain as logging conveniences over the same
+values.
 `XfrmObjectRosterRecoveryStore::inspect_dispositions` re-authenticates a
 retained `XfrmObjectRosterRecoveryHandle` against this exact lease, group
 identity, generation, and member set before yielding the same descriptor; it
@@ -535,7 +555,12 @@ incarnations, member digest, and epoch currency, reads every member back
 exactly, and publishes `Applied -> Committed` only when every acquired member
 is present. Otherwise it publishes nothing, leaves the record `Applied` with
 the writer gate closed, and reports `adoption_refused` so the consumer can
-still choose recovery. Recovery classifies each unresolved member from its own
+still choose recovery. A refusal decided by an unresolved `Issuing` or
+`Compensating` phase costs nothing across families: the namespace actor screens
+those phases before it fences the other two durable stores, so using adoption
+as a probe cannot burn their writer epochs or invalidate a prepared
+single-object install or SA relocation authority. Only an `Applied` record,
+which adoption can actually commit, carries recovery's full fencing cost. Recovery classifies each unresolved member from its own
 adjacent proof plus a fresh exact readback — there is no conflict shortcut, a
 member that never entered its effect window is never deleted, and a member that
 witnessed a foreign object is left exactly as found (`foreign_untouched`) —
@@ -559,6 +584,15 @@ never both interleaved for the same flow. A half-migrated consumer is
 serialized by the gates rather than corrupted, but each family then waits for
 the other's resolution; consumers that have finished migrating should move back
 to the roster-only constructor.
+
+Because each family's recovery is itself gated on the other bound families, a
+namespace that starts up already holding an unresolved record in *two* families
+cannot recover either one while all three stores are bound. Running operations
+never produce that state, but changing the bound store set across restarts can.
+The escape is to bind only the family being recovered, run its recovery to a
+terminal verdict, drop that backend, repeat for the next family, and only then
+rebind the full set. That deletes, reorders, and replays nothing: it only lifts
+the mutual gate while each recovery re-authenticates its own record and epoch.
 
 ### Kernel-proven notes
 

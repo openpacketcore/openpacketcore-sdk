@@ -230,6 +230,11 @@ impl XfrmObjectRosterOperationGeneration {
     pub const fn get(self) -> u64 {
         self.0.get()
     }
+
+    /// Borrow the nonzero value the newtype already guarantees.
+    pub(crate) const fn nonzero(self) -> NonZeroU64 {
+        self.0
+    }
 }
 
 impl fmt::Debug for XfrmObjectRosterOperationGeneration {
@@ -324,6 +329,14 @@ impl XfrmObjectRosterDurablePhase {
     /// The relation is a strict DAG apart from the two intra-phase progress
     /// self-edges. Ordering inside a phase is carried by the record's
     /// publication sequence, never by the phase alone.
+    ///
+    /// `Committed -> Retired` has no writer today: `finalize` reports a
+    /// committed roster idempotently and terminal pruning unlinks its record
+    /// outright. The edge is kept because retiring a committed roster is the
+    /// one direction that can never lose authority — it surrenders cleanup
+    /// rights that were already surrendered — so admitting it costs nothing
+    /// and refusing it would make a future explicit retire an unpublishable
+    /// state rather than a no-op.
     pub(crate) const fn permits(self, next: Self) -> bool {
         matches!(
             (self, next),
@@ -359,8 +372,14 @@ impl XfrmObjectRosterDurablePhase {
 }
 
 /// Durable state of one member slot inside a roster record.
+///
+/// This is the per-member half of a roster verdict: the group phase says what
+/// the transaction did, and this says what each declared member ended up
+/// owning. It is value-free — no address, selector, SPI, mark, or interface
+/// identifier is representable here.
+#[non_exhaustive]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum XfrmObjectRosterMemberPhase {
+pub enum XfrmObjectRosterMemberPhase {
     /// The member has not been issued.
     Pending,
     /// Linux acknowledged that this roster acquired the member's object.
@@ -377,7 +396,8 @@ pub(crate) enum XfrmObjectRosterMemberPhase {
 
 impl XfrmObjectRosterMemberPhase {
     /// Stable, value-free member phase label.
-    pub(crate) const fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Acquired => "acquired",
@@ -448,8 +468,9 @@ impl fmt::Debug for XfrmObjectRosterMemberPhase {
 /// The sweep runs across all members before the group leaves `Prepared`. Its
 /// only job is the all-or-nothing conflict gate. It never authorizes a
 /// deletion on its own.
+#[non_exhaustive]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum XfrmObjectRosterSweepProof {
+pub enum XfrmObjectRosterSweepProof {
     /// The member's exact deletion identity was absent during the sweep.
     Absent,
     /// The member's exact deletion identity was already present, so the whole
@@ -459,7 +480,8 @@ pub(crate) enum XfrmObjectRosterSweepProof {
 
 impl XfrmObjectRosterSweepProof {
     /// Stable, value-free proof label.
-    pub(crate) const fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Absent => "absent",
             Self::Conflict => "conflict",
@@ -496,8 +518,9 @@ impl fmt::Debug for XfrmObjectRosterSweepProof {
 /// This is the only proof that can authorize deleting a member: it is
 /// published before the member's install is issued, so a fresh readback that
 /// finds the object present proves the object is this roster's residue.
+#[non_exhaustive]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum XfrmObjectRosterAdjacentProof {
+pub enum XfrmObjectRosterAdjacentProof {
     /// The member's exact deletion identity was absent immediately before its
     /// effect window opened.
     Absent,
@@ -511,7 +534,8 @@ pub(crate) enum XfrmObjectRosterAdjacentProof {
 
 impl XfrmObjectRosterAdjacentProof {
     /// Stable, value-free proof label.
-    pub(crate) const fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Absent => "absent",
             Self::Conflict => "conflict",
@@ -2958,10 +2982,15 @@ fn read_fixed_file<const N: usize>(
     store: &StoreInner,
     name: &str,
 ) -> Result<[u8; N], XfrmObjectRosterDurableError> {
+    // `O_NONBLOCK` so that a FIFO planted in the leased root under a
+    // well-formed entry name cannot park the whole namespace actor inside
+    // `open`. `validate_file_metadata` below still rejects everything that is
+    // not a regular file, but it only runs once the open returns, and every
+    // actor command is serialized behind this scan.
     let descriptor = openat(
         store.descriptor.as_fd(),
         name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|_| XfrmObjectRosterDurableError::Malformed)?;
@@ -5421,12 +5450,26 @@ mod tests {
                 XfrmObjectRosterAdjacentProof::AbsentThenAlreadyExists
             ),
         ] {
-            assert!(!rendered.contains("abab"), "leaked identity: {rendered}");
-            assert!(!rendered.contains("feed"), "leaked generation: {rendered}");
-            assert!(
-                !rendered.contains("1111"),
-                "leaked member identity: {rendered}"
-            );
+            // Both renderings of every fixture are forbidden. Rust's derived
+            // `Debug` prints `[u8; N]` in DECIMAL and a `u64` generation in
+            // decimal too, so a hex-only predicate would let a `#[derive(Debug)]`
+            // regression on any of these types pass silently.
+            for forbidden in [
+                // group id / member id / fingerprint bytes, hex and decimal
+                "abab",
+                "171, 171", // second fingerprint byte, hex and decimal
+                "acac",
+                "172, 172", // generation 0xfeed_beef, hex and decimal
+                "feed",
+                "4276993775", // member identity fill, hex and decimal
+                "1111",
+                "17, 17",
+            ] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "leaked {forbidden}: {rendered}"
+                );
+            }
         }
         for error in [
             XfrmObjectRosterDurableError::InvalidProofKey,

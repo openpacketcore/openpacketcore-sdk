@@ -2869,6 +2869,159 @@ mod tests {
         }
     }
 
+    /// Fixed SA install request for the object family's golden vectors.
+    fn golden_sa_request() -> XfrmObjectInstallRequest {
+        XfrmObjectInstallRequest::Sa(crate::InstallSaRequest {
+            parameters: crate::SaParameters {
+                selector: XfrmSelector::new(
+                    IpAddress::Ipv4([10, 0, 0, 1]),
+                    IpAddress::Ipv4([10, 0, 0, 2]),
+                    50,
+                ),
+                id: XfrmId {
+                    destination: IpAddress::Ipv4([10, 0, 0, 2]),
+                    spi: 0x1234_5678,
+                    protocol: 50,
+                },
+                source_address: IpAddress::Ipv4([10, 0, 0, 1]),
+                request_id: None,
+                auth: Some((
+                    crate::AuthAlgorithm::hmac_sha256(96),
+                    crate::KeyMaterial::new(vec![0xab; 32]),
+                )),
+                crypt: Some((
+                    crate::Algorithm::cbc_aes(),
+                    crate::KeyMaterial::new(vec![0xcd; 32]),
+                )),
+                aead: None,
+                mode: XfrmMode::Tunnel,
+                lifetime: LifetimeConfig::default(),
+                replay_window: 32,
+                replay_state: None,
+                encap: None,
+                mark: None,
+                output_mark: None,
+                if_id: None,
+                egress_dscp: None,
+            },
+        })
+    }
+
+    /// Fixed interface-scoped policy install request for the golden vectors.
+    fn golden_policy_request() -> XfrmObjectInstallRequest {
+        XfrmObjectInstallRequest::Policy(crate::InstallPolicyRequest {
+            parameters: crate::PolicyParameters {
+                selector: XfrmSelector::new(
+                    IpAddress::Ipv4([10, 0, 0, 1]),
+                    IpAddress::Ipv4([10, 0, 0, 2]),
+                    50,
+                ),
+                direction: XfrmDirection::Out,
+                action: XfrmAction::Allow,
+                priority: 616,
+                templates: vec![XfrmTemplate {
+                    id: XfrmId {
+                        destination: IpAddress::Ipv4([10, 0, 0, 2]),
+                        spi: 0x1234_5678,
+                        protocol: 50,
+                    },
+                    source_address: IpAddress::Ipv4([10, 0, 0, 1]),
+                    request_id: None,
+                    mode: XfrmMode::Tunnel,
+                }],
+                mark: None,
+                if_id: Some(600),
+            },
+        })
+    }
+
+    /// Byte-pinned canonical encodings for the object family.
+    ///
+    /// The three encoders are now shared with the roster family and take their
+    /// domain separator as a parameter, so nothing in a round-trip test can
+    /// notice if the object family's domain is changed: both sides of every
+    /// comparison would move together. These vectors are the only thing that
+    /// does notice. A domain change silently invalidates every persisted
+    /// `DurableObjectRecord`, which turns `recover_durable_object_install`
+    /// into a permanent `WrongBinding` and leaves the writer gate closed
+    /// forever, so this must fail loudly rather than pass quietly.
+    #[test]
+    fn golden_vectors_pin_the_object_install_request_and_deletion_identity_encoding() {
+        let proof_key = key(9);
+        let borrowed = proof_key.canonical_mac_key();
+        let sa = golden_sa_request();
+        let policy = golden_policy_request();
+
+        assert_eq!(
+            authenticate_install_request(borrowed, INSTALL_REQUEST_AUTH_DOMAIN, &sa).unwrap(),
+            [
+                0x25, 0x45, 0x12, 0x78, 0x88, 0x1a, 0xe4, 0xa7, 0x0c, 0x35, 0x75, 0xb6, 0xc5, 0x4c,
+                0xbc, 0x46, 0xbc, 0x33, 0xe0, 0xc2, 0x6c, 0xc2, 0x77, 0xa4, 0xfb, 0x48, 0x3b, 0x64,
+                0xb6, 0x9d, 0x02, 0x54,
+            ],
+            "object SA install-request fingerprint encoding changed"
+        );
+        assert_eq!(
+            authenticate_install_request(borrowed, INSTALL_REQUEST_AUTH_DOMAIN, &policy).unwrap(),
+            [
+                0xc5, 0xc9, 0xb4, 0x1f, 0x1b, 0x7e, 0x3c, 0x34, 0x15, 0x62, 0x28, 0x7b, 0x00, 0xb7,
+                0xa2, 0x4a, 0xa6, 0x88, 0x71, 0xda, 0x6c, 0x42, 0x94, 0x1e, 0x8d, 0x66, 0x2b, 0x53,
+                0xf2, 0xa5, 0x6c, 0x2a,
+            ],
+            "object policy install-request fingerprint encoding changed"
+        );
+        assert_eq!(
+            authenticate_deletion_identity(
+                borrowed,
+                DELETION_IDENTITY_AUTH_DOMAIN,
+                &sa.removal(),
+                sa.policy_if_id(),
+            )
+            .unwrap(),
+            [
+                0x02, 0x4d, 0x3a, 0x78, 0xe3, 0x53, 0xf9, 0x5b, 0x32, 0x63, 0x89, 0x19, 0xca, 0x2c,
+                0x68, 0xdb, 0xb1, 0x85, 0xe6, 0x02, 0xc1, 0x2c, 0xe4, 0x2d, 0x3a, 0xfe, 0x72, 0x20,
+                0xbd, 0xe6, 0xf5, 0x36,
+            ],
+            "object SA deletion-identity fingerprint encoding changed"
+        );
+        assert_eq!(
+            authenticate_deletion_identity(
+                borrowed,
+                DELETION_IDENTITY_AUTH_DOMAIN,
+                &policy.removal(),
+                policy.policy_if_id(),
+            )
+            .unwrap(),
+            [
+                0x98, 0x42, 0xce, 0x31, 0xc7, 0xaa, 0x69, 0x82, 0x51, 0x08, 0x22, 0x72, 0x25, 0x14,
+                0x36, 0x04, 0x86, 0xac, 0x14, 0x04, 0x0e, 0x3f, 0x57, 0xef, 0x2d, 0x33, 0xe2, 0x2e,
+                0xcb, 0xc2, 0x9e, 0x44,
+            ],
+            "object scoped-policy deletion-identity fingerprint encoding changed"
+        );
+        assert_eq!(
+            namespace_seal(&proof_key, [0x42; 40]),
+            [
+                0x26, 0xa8, 0x2e, 0x11, 0x15, 0xb3, 0x48, 0x52, 0x82, 0x39, 0x7c, 0x6c, 0x24, 0x54,
+                0xd0, 0x5d, 0x64, 0x91, 0x54, 0x58, 0xf2, 0x97, 0x24, 0x16, 0x5b, 0xda, 0xc9, 0xf9,
+                0x50, 0x44, 0x66, 0x31,
+            ],
+            "object namespace seal encoding changed"
+        );
+        assert_eq!(
+            record(XfrmObjectInstallDurablePhase::Acquired)
+                .encode(&proof_key)
+                .unwrap()[RECORD_BODY_BYTES..],
+            [
+                0xb4, 0x48, 0x2b, 0xf7, 0xdc, 0x72, 0xad, 0x30, 0x56, 0xeb, 0x26, 0x45, 0x5f, 0xae,
+                0xe6, 0x13, 0xc0, 0x91, 0x77, 0x6c, 0x9d, 0x04, 0x69, 0xf6, 0x87, 0x96, 0x07, 0x44,
+                0x98, 0x5a, 0x14, 0x04,
+            ],
+            "object record tag encoding changed"
+        );
+    }
+
     #[test]
     fn zeroizing_hmac_matches_independent_sha256_vector() {
         let mut key = [0_u8; 32];

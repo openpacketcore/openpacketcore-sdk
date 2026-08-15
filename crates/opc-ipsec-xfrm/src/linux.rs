@@ -541,6 +541,21 @@ impl LinuxXfrmBackend {
     /// never both interleaved for the same Child SA. A half-migrated consumer
     /// is serialized by the gates rather than corrupted, but each family then
     /// waits for the other's resolution.
+    ///
+    /// Each family's recovery is itself gated on the other bound families, so
+    /// a namespace that starts up already holding an unresolved record in TWO
+    /// families cannot recover either one while all three stores are bound:
+    /// each recovery is refused by the other's closed gate, and this is not
+    /// the repair-required path. Running operations never produce that state —
+    /// the run-path gates make it unreachable — but changing the BOUND STORE
+    /// SET across restarts can, for example by leaving an `Applied` roster
+    /// behind while an older single-object `Acquired` record still exists in a
+    /// root this process had stopped binding. The escape is to bind only the
+    /// family being recovered, run its recovery to a terminal verdict, drop
+    /// that backend, then repeat for the next family, and only then rebind the
+    /// full set. No record is deleted, reordered, or replayed by that
+    /// procedure: it only lifts the mutual gate while each recovery runs, and
+    /// every recovery still re-authenticates its own record and epoch.
     #[cfg(unix)]
     pub fn bind_current_network_namespace_with_object_sa_relocation_and_roster_recovery(
         self,

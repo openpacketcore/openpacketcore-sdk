@@ -1790,6 +1790,18 @@ fn issuing_cut_at_middle_member_without_effect_compensates_only_the_prefix() -> 
     issuing_cut_detector(2, false)
 }
 
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn issuing_cut_at_first_member_without_effect_compensates_only_the_prefix() -> TestResult {
+    issuing_cut_detector(0, false)
+}
+
+#[test]
+#[ignore = "requires root, CAP_SYS_ADMIN/CAP_NET_ADMIN, iproute2, and named netns support"]
+fn issuing_cut_at_last_member_without_effect_compensates_only_the_prefix() -> TestResult {
+    issuing_cut_detector(4, false)
+}
+
 // ---------------------------------------------------------------------------
 // Role 5: applied-unfinalized then RECOVER
 // ---------------------------------------------------------------------------

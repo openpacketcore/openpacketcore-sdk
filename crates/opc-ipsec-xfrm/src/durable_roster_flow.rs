@@ -15,12 +15,20 @@
 //!
 //! **A member slot in `NoMutation` is never an argument to any delete, at any
 //! phase, regardless of proof codes.** Deletion authority for a member
-//! additionally requires that member's ADJACENT proof to be `Absent`: the
-//! group-wide sweep proof alone never authorizes a deletion, because it is
-//! witnessed before the group's epoch burn and therefore cannot order an
-//! observation against this roster's own effect window.
+//! additionally requires that member's ADJACENT proof to be `Absent`.
+//!
+//! The group-wide sweep proof alone never authorizes a deletion. The reason is
+//! adjacency, not epoch ordering: both proofs are witnessed by the same
+//! serialized writer (the namespace actor runs one command at a time), and
+//! member zero's adjacent witness is in fact taken on the same side of the
+//! epoch burn as the sweep. What makes the adjacent proof load-bearing is that
+//! it is the LAST observation before THAT member's own install is issued, with
+//! no other backend call in between. The sweep is separated from member k's
+//! install by every earlier member's effect, so "absent during the sweep" does
+//! not imply "absent when this member's effect window opened", and an object
+//! found afterwards could be foreign rather than this roster's residue.
 
-use std::{error::Error, fmt, num::NonZeroU64};
+use std::{error::Error, fmt};
 
 use crate::durable_install::{install, readback_object_present, remove};
 use crate::durable_roster::{
@@ -115,6 +123,13 @@ pub enum XfrmObjectRosterRequestError {
     AmbiguousKernelSelection,
     /// A member supplied the reserved all-zero durable identity.
     MalformedMemberIdentity,
+    /// Two members supplied the same durable member identity, which the
+    /// durable record refuses because it would make per-member recovery
+    /// ambiguous.
+    ///
+    /// Only caller-supplied identities can collide: the SDK-derived identity
+    /// is separated by ordinal.
+    DuplicateMemberIdentity,
 }
 
 impl XfrmObjectRosterRequestError {
@@ -134,6 +149,7 @@ impl XfrmObjectRosterRequestError {
                 "xfrm_object_roster_request_ambiguous_kernel_selection"
             }
             Self::MalformedMemberIdentity => "xfrm_object_roster_request_malformed_member_identity",
+            Self::DuplicateMemberIdentity => "xfrm_object_roster_request_duplicate_member_identity",
         }
     }
 }
@@ -194,8 +210,9 @@ impl XfrmObjectRosterRequest {
     ///
     /// Ordinal zero is applied first and compensated last. Every member must
     /// select exactly one kernel object for removal, no two members may share
-    /// an exact deletion identity, and no two members may collide in the
-    /// kernel's coarse selection relation.
+    /// an exact deletion identity or a caller-supplied durable member
+    /// identity, and no two members may collide in the kernel's coarse
+    /// selection relation.
     ///
     /// # Errors
     ///
@@ -222,6 +239,22 @@ impl XfrmObjectRosterRequest {
             let removal = member.request.removal();
             validate_exact_lookup_mark(removal.lookup_mark(), "durable_roster.member.mark")
                 .map_err(|_| XfrmObjectRosterRequestError::NonExactRemovalIdentity)?;
+        }
+        // Only supplied identities can collide. `derive_member_identity` mixes
+        // the ordinal into the keyed derivation, so the SDK-derived identities
+        // of one group are distinct by construction, and a supplied identity
+        // cannot be predicted onto a derived one without the proof key.
+        let supplied_identities = members
+            .iter()
+            .filter_map(|member| member.identity.map(|(id, _)| id))
+            .collect::<Vec<_>>();
+        for (index, left) in supplied_identities.iter().enumerate() {
+            if supplied_identities[index + 1..]
+                .iter()
+                .any(|right| right == left)
+            {
+                return Err(XfrmObjectRosterRequestError::DuplicateMemberIdentity);
+            }
         }
         let deletion_identities = members
             .iter()
@@ -287,12 +320,16 @@ impl fmt::Debug for XfrmObjectRosterRequest {
 }
 
 /// Value-free durable disposition of one roster member slot.
+///
+/// Every field is an ordinal or a closed enum, so a consumer can branch on
+/// member state with compiler-checked exhaustiveness. The `&'static str`
+/// accessors remain as logging conveniences over the same values.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct XfrmObjectRosterMemberDisposition {
     ordinal: usize,
-    phase: &'static str,
-    sweep_proof: Option<&'static str>,
-    adjacent_proof: Option<&'static str>,
+    phase: XfrmObjectRosterMemberPhase,
+    sweep_proof: Option<XfrmObjectRosterSweepProof>,
+    adjacent_proof: Option<XfrmObjectRosterAdjacentProof>,
 }
 
 impl XfrmObjectRosterMemberDisposition {
@@ -302,16 +339,38 @@ impl XfrmObjectRosterMemberDisposition {
         self.ordinal
     }
 
+    /// Durable phase of this member slot.
+    #[must_use]
+    pub const fn member_phase(self) -> XfrmObjectRosterMemberPhase {
+        self.phase
+    }
+
+    /// Group-wide pre-effect sweep proof witnessed for this member, when one
+    /// was witnessed.
+    #[must_use]
+    pub const fn sweep_proof_kind(self) -> Option<XfrmObjectRosterSweepProof> {
+        self.sweep_proof
+    }
+
+    /// Adjacent proof witnessed immediately before this member's own effect
+    /// window, when one was witnessed.
+    ///
+    /// This is the only proof that can authorize deleting this member.
+    #[must_use]
+    pub const fn adjacent_proof_kind(self) -> Option<XfrmObjectRosterAdjacentProof> {
+        self.adjacent_proof
+    }
+
     /// Stable, value-free durable phase label of this member slot.
     #[must_use]
     pub const fn phase(self) -> &'static str {
-        self.phase
+        self.phase.as_str()
     }
 
     /// Stable label of the group-wide pre-effect sweep proof, when witnessed.
     #[must_use]
-    pub const fn sweep_proof(self) -> Option<&'static str> {
-        self.sweep_proof
+    pub fn sweep_proof(self) -> Option<&'static str> {
+        self.sweep_proof.map(XfrmObjectRosterSweepProof::as_str)
     }
 
     /// Stable label of the adjacent proof witnessed immediately before this
@@ -319,21 +378,22 @@ impl XfrmObjectRosterMemberDisposition {
     ///
     /// This is the only proof that can authorize deleting this member.
     #[must_use]
-    pub const fn adjacent_proof(self) -> Option<&'static str> {
+    pub fn adjacent_proof(self) -> Option<&'static str> {
         self.adjacent_proof
+            .map(XfrmObjectRosterAdjacentProof::as_str)
     }
 
     /// Whether this member witnessed a conflicting object it must never
     /// delete.
     #[must_use]
-    pub fn is_conflicting(self) -> bool {
-        self.sweep_proof == Some(XfrmObjectRosterSweepProof::Conflict.as_str())
+    pub const fn is_conflicting(self) -> bool {
+        matches!(self.sweep_proof, Some(XfrmObjectRosterSweepProof::Conflict))
             || matches!(
                 self.adjacent_proof,
-                Some(label)
-                    if label == XfrmObjectRosterAdjacentProof::Conflict.as_str()
-                        || label
-                            == XfrmObjectRosterAdjacentProof::AbsentThenAlreadyExists.as_str()
+                Some(
+                    XfrmObjectRosterAdjacentProof::Conflict
+                        | XfrmObjectRosterAdjacentProof::AbsentThenAlreadyExists
+                )
             )
     }
 }
@@ -343,9 +403,9 @@ impl fmt::Debug for XfrmObjectRosterMemberDisposition {
         formatter
             .debug_struct("XfrmObjectRosterMemberDisposition")
             .field("ordinal", &self.ordinal)
-            .field("phase", &self.phase)
-            .field("sweep_proof", &self.sweep_proof)
-            .field("adjacent_proof", &self.adjacent_proof)
+            .field("phase", &self.phase())
+            .field("sweep_proof", &self.sweep_proof())
+            .field("adjacent_proof", &self.adjacent_proof())
             .finish()
     }
 }
@@ -426,9 +486,13 @@ pub enum XfrmObjectRosterDurableOutcome {
         /// Per-member durable disposition.
         members: XfrmObjectRosterMemberDispositions,
     },
-    /// A member failed or conflicted after at least one member was acquired.
-    /// The acquired prefix was reverse-compensated and the group left no
-    /// acquired member behind.
+    /// A member failed or conflicted, so the group made no net acquisition:
+    /// whatever prefix had been acquired was reverse-compensated in exact
+    /// reverse order and no acquired member was left behind.
+    ///
+    /// `failed_member` names the diverting ordinal. A failure at ordinal zero
+    /// leaves that prefix empty, so this verdict does NOT imply that any kernel
+    /// object was created and then removed.
     RolledBack {
         /// Authenticated correlation handle for the terminal record.
         handle: XfrmObjectRosterRecoveryHandle,
@@ -524,8 +588,11 @@ impl fmt::Debug for XfrmObjectRosterDurableOutcome {
 /// record they are the exact state the operator must repair or retry against.
 #[non_exhaustive]
 pub enum XfrmObjectRosterRestartOutcome {
-    /// A prepared or explicit no-mutation roster was retired without any
-    /// backend removal.
+    /// A prepared roster was retired without any backend removal.
+    ///
+    /// A terminal no-mutation record always names the conflicting object it
+    /// refused to touch, so recovering one reports
+    /// [`Self::ForeignUntouched`] rather than this verdict.
     NoMutation {
         /// Per-member durable disposition.
         members: XfrmObjectRosterMemberDispositions,
@@ -559,6 +626,12 @@ pub enum XfrmObjectRosterRestartOutcome {
     Indeterminate {
         /// Per-member durable disposition.
         members: XfrmObjectRosterMemberDispositions,
+        /// Redaction-safe backend failure observed by the recovering process.
+        ///
+        /// Unlike the single-object family, this verdict is always produced by
+        /// a readback the current process just issued, so the error is live
+        /// evidence rather than a value the record would have had to persist.
+        source: XfrmError,
     },
     /// Product ownership was already committed; cleanup is forbidden.
     Committed {
@@ -623,7 +696,7 @@ impl XfrmObjectRosterRestartOutcome {
             | Self::OwnedResidueRetired { members }
             | Self::Adopted { members }
             | Self::AdoptionRefused { members }
-            | Self::Indeterminate { members }
+            | Self::Indeterminate { members, .. }
             | Self::Committed { members }
             | Self::Retired { members }
             | Self::RemovalPending { members, .. }
@@ -632,11 +705,13 @@ impl XfrmObjectRosterRestartOutcome {
         }
     }
 
-    /// Redaction-safe backend removal failure, when retry remains required.
+    /// Redaction-safe backend failure, when retry remains required.
     #[must_use]
     pub const fn source(&self) -> Option<&XfrmError> {
         match self {
-            Self::RemovalPending { source, .. } => Some(source),
+            Self::RemovalPending { source, .. } | Self::Indeterminate { source, .. } => {
+                Some(source)
+            }
             _ => None,
         }
     }
@@ -747,13 +822,13 @@ fn roster_member_material(
     for (ordinal, member) in roster.members().iter().enumerate() {
         let fingerprints = store.fingerprints_for_request(member.request())?;
         let (member_id, member_generation) = match member.identity {
-            Some((bytes, generation)) => (
+            Some((bytes, member_generation)) => (
                 XfrmObjectRosterMemberId::from_bytes(bytes)?,
-                NonZeroU64::new(generation.get()).ok_or(XfrmObjectRosterDurableError::Malformed)?,
+                member_generation.nonzero(),
             ),
             None => (
                 store.derive_member_identity(group_id, generation, ordinal)?,
-                NonZeroU64::new(generation.get()).ok_or(XfrmObjectRosterDurableError::Malformed)?,
+                generation.nonzero(),
             ),
         };
         material.push(XfrmObjectRosterMemberMaterial {
@@ -785,11 +860,9 @@ fn dispositions_for(record: &DurableRosterRecord) -> XfrmObjectRosterMemberDispo
         };
         *entry = Some(XfrmObjectRosterMemberDisposition {
             ordinal,
-            phase: slot.phase.as_str(),
-            sweep_proof: slot.sweep_proof.map(XfrmObjectRosterSweepProof::as_str),
-            adjacent_proof: slot
-                .adjacent_proof
-                .map(XfrmObjectRosterAdjacentProof::as_str),
+            phase: slot.phase,
+            sweep_proof: slot.sweep_proof,
+            adjacent_proof: slot.adjacent_proof,
         });
     }
     dispositions
@@ -1174,10 +1247,18 @@ where
                 // Step 8: the identical reconcile recovery uses. Never descend
                 // past a member whose own residue is still unproved.
                 match reconcile_unresolved_member(store, record, ordinal, roster, backend).await? {
+                    // `Foreign` cannot occur at THIS call site: the publish
+                    // just above leaves the slot `Indeterminate`, which the
+                    // decode validator forces to carry an `Absent` adjacent
+                    // proof, and the `Absent` row never yields `Foreign`. The
+                    // arm exists because the reconcile is shared verbatim with
+                    // recovery, where the conflict rows are live; folding both
+                    // into one arm is what keeps the live and post-crash
+                    // classifications identical by construction.
                     MemberReconcile::Resolved(next) | MemberReconcile::Foreign(next) => {
                         record = next;
                     }
-                    MemberReconcile::Unreadable(next)
+                    MemberReconcile::Unreadable { record: next, .. }
                     | MemberReconcile::RepairRequired(next)
                     | MemberReconcile::RemovalPending { record: next, .. } => {
                         return Ok(Issued::Terminal(
@@ -1215,6 +1296,11 @@ where
                 source: Some(source),
             },
         )),
+        // `Compensation::Cut` is unreachable defence in depth on this path:
+        // the compensation call above passes `cut: None`, so the loop has no
+        // cut ordinal to honour. It is folded in with the repair verdict
+        // because both mean the same thing to a caller — the record is
+        // retained, nothing further was deleted, and recovery owns it next.
         Compensation::RepairRequired(record) | Compensation::Cut(record) => Ok(Issued::Terminal(
             XfrmObjectRosterDurableOutcome::Indeterminate {
                 handle: store.handle_for_record(&record)?,
@@ -1261,13 +1347,24 @@ enum MemberReconcile {
     /// slot is resolved and the foreign state was left untouched.
     Foreign(DurableRosterRecord),
     /// The member's exact readback could not be trusted; nothing was published.
-    Unreadable(DurableRosterRecord),
+    Unreadable {
+        record: DurableRosterRecord,
+        source: XfrmError,
+    },
     /// The exact removal failed after `RemovalAdmitted` was made durable.
     RemovalPending {
         record: DurableRosterRecord,
         source: XfrmError,
     },
     /// The record cannot be safely repaired at this boundary.
+    ///
+    /// Both callers re-check epoch currency before reaching the reconcile — the
+    /// live run has just burned the epoch itself, and recovery rejects a stale
+    /// epoch at its entry — so in a single-writer namespace this is defence in
+    /// depth against a storage rollback rather than a routine verdict. It stays
+    /// because the epoch check here is the LAST one before a delete could be
+    /// admitted, and losing it would make the ordering guarantee the `Absent`
+    /// proof depends on unenforced at the only point that matters.
     RepairRequired(DurableRosterRecord),
 }
 
@@ -1278,8 +1375,14 @@ enum MemberReconcile {
 /// recovery, so the live and post-crash verdicts for the same durable state
 /// cannot drift apart. The classification is:
 ///
-/// - no adjacent proof recorded: the member never entered its effect window,
-///   so it provably made no mutation and nothing is deleted.
+/// - no adjacent proof recorded + absent: the member never entered its effect
+///   window and nothing is there; it provably made no mutation.
+/// - no adjacent proof recorded + present: no effect was ever admitted for this
+///   member, so whatever occupies its identity is foreign. The slot resolves as
+///   no-mutation carrying a `Conflict` adjacent proof and is never deleted.
+///   This is the same verdict the live run publishes when member zero's own
+///   adjacent witness finds the object present, which is what keeps the live
+///   and post-crash verdicts identical for that window.
 /// - `Absent` + absent: the effect provably never landed; no deletion.
 /// - `Absent` + present: the object appeared inside this member's own effect
 ///   window under the group's burned epoch, so it can only be this roster's
@@ -1315,11 +1418,39 @@ where
     };
 
     match slot.adjacent_proof {
-        None => Ok(MemberReconcile::Resolved(resolve(
-            store,
-            &record,
-            XfrmObjectRosterMemberPhase::NoMutation,
-        )?)),
+        None => {
+            // The member never entered an effect window, so no effect of ours
+            // can be there. A fresh exact readback is still required: an object
+            // sitting at this identity is provably foreign, and losing that
+            // signal here is what would let the post-crash verdict drift away
+            // from the live one for the same durable state. Either way this
+            // branch never produces a delete argument.
+            let present = match readback_object_present(backend, roster.request(ordinal)?).await {
+                Ok(present) => present,
+                Err(source) => return Ok(MemberReconcile::Unreadable { record, source }),
+            };
+            if !present {
+                return Ok(MemberReconcile::Resolved(resolve(
+                    store,
+                    &record,
+                    XfrmObjectRosterMemberPhase::NoMutation,
+                )?));
+            }
+            let conflicted = publish(
+                store,
+                &record,
+                XfrmObjectRosterTransition::new(XfrmObjectRosterDurablePhase::Compensating, cursor)
+                    .with_member(
+                        ordinal,
+                        XfrmObjectRosterMemberTransition {
+                            phase: XfrmObjectRosterMemberPhase::NoMutation,
+                            sweep_proof: slot.sweep_proof,
+                            adjacent_proof: Some(XfrmObjectRosterAdjacentProof::Conflict),
+                        },
+                    ),
+            )?;
+            Ok(MemberReconcile::Foreign(conflicted))
+        }
         Some(XfrmObjectRosterAdjacentProof::Conflict)
         | Some(XfrmObjectRosterAdjacentProof::AbsentThenAlreadyExists) => {
             if slot.phase == XfrmObjectRosterMemberPhase::NoMutation {
@@ -1347,7 +1478,7 @@ where
             }
             let present = match readback_object_present(backend, roster.request(ordinal)?).await {
                 Ok(present) => present,
-                Err(_) => return Ok(MemberReconcile::Unreadable(record)),
+                Err(source) => return Ok(MemberReconcile::Unreadable { record, source }),
             };
             if !present {
                 return Ok(MemberReconcile::Resolved(resolve(
@@ -1393,7 +1524,16 @@ enum Compensation {
         record: DurableRosterRecord,
         source: XfrmError,
     },
+    /// The record's writer epoch is no longer current, so nothing may be
+    /// deleted under it.
+    ///
+    /// Defence in depth: both callers already checked epoch currency before
+    /// reaching this loop. It stays because this is the last check standing
+    /// between a stale record and a real `remove`, and a storage rollback is
+    /// the one thing the durable boundary explicitly does not assume away.
     RepairRequired(DurableRosterRecord),
+    /// The caller's crash-detector cut ordinal was reached. Only the detector
+    /// seam passes a cut; every production path passes `None`.
     Cut(DurableRosterRecord),
 }
 
@@ -1552,6 +1692,12 @@ pub(crate) fn finalize_durable_object_roster(
 /// deadline expired, recover destroys it. Use adopt when the consumer's
 /// bookkeeping can still accept the group; use recover when it cannot.
 ///
+/// A refusal decided by an unresolved `Issuing` or `Compensating` phase costs
+/// nothing across families: the namespace actor screens those phases before it
+/// fences the other durable families, so an "adopt first, recover if refused"
+/// probe cannot invalidate a prepared single-object install or SA relocation
+/// authority or burn their writer epochs.
+///
 /// # Errors
 ///
 /// Returns any authentication, binding, or storage failure from the store.
@@ -1664,6 +1810,13 @@ where
                 // conflicting object, and that object was never touched.
                 Ok(XfrmObjectRosterRestartOutcome::ForeignUntouched { members })
             } else {
+                // Unreachable defence in depth: `no_mutation_body_is_legal`
+                // admits a terminal no-mutation record only when a sweep proof
+                // or member zero's adjacent proof is `Conflict`, and both make
+                // `has_conflict()` true. The branch stays so that a future
+                // zero-effect verdict with no conflicting witness degrades to
+                // the weaker, still-correct label instead of claiming a foreign
+                // object was observed.
                 Ok(XfrmObjectRosterRestartOutcome::NoMutation { members })
             }
         }
@@ -1751,9 +1904,13 @@ where
                 record = next;
                 foreign = true;
             }
-            MemberReconcile::Unreadable(next) => {
+            MemberReconcile::Unreadable {
+                record: next,
+                source,
+            } => {
                 return Ok(XfrmObjectRosterRestartOutcome::Indeterminate {
                     members: dispositions_for(&next),
+                    source,
                 })
             }
             MemberReconcile::RepairRequired(next) => {
@@ -1800,7 +1957,14 @@ where
                 members: dispositions_for(&record),
             })
         }
-        Compensation::Cut(record) => Ok(XfrmObjectRosterRestartOutcome::Indeterminate {
+        // Unreachable defence in depth: recovery always passes `cut: None`, so
+        // `compensate_acquired_slots` has no cut ordinal to honour and cannot
+        // return this variant. It stays because the compensation loop is shared
+        // verbatim with the crash-detector seam, and a record that somehow
+        // reached this arm is inconsistent in a way this boundary cannot
+        // classify, which is exactly the repair verdict: record retained,
+        // nothing deleted, cooperating writers still fenced.
+        Compensation::Cut(record) => Ok(XfrmObjectRosterRestartOutcome::RepairRequired {
             members: dispositions_for(&record),
         }),
     }
@@ -1911,9 +2075,13 @@ where
 ///
 /// # Errors
 ///
-/// Returns any authentication, binding, or storage failure, and
-/// [`XfrmObjectRosterDurableError::InvalidTransition`] when compensation never
-/// reaches `ordinal`.
+/// Returns [`XfrmObjectRosterDurableError::Malformed`] for an ordinal outside
+/// the roster's arity, and
+/// [`XfrmObjectRosterDurableError::InvalidTransition`] when the record's phase
+/// is not compensable or when `ordinal` is not a member compensation would
+/// ever visit. Both are decided BEFORE any compensation runs, so a cut that
+/// can never be honoured never issues a deletion. Any authentication, binding,
+/// or storage failure is returned unchanged.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cut_durable_object_roster_at_compensating_member<B>(
     store: &XfrmObjectRosterRecoveryStore,
@@ -1933,6 +2101,23 @@ where
         record.phase,
         XfrmObjectRosterDurablePhase::Applied | XfrmObjectRosterDurablePhase::Compensating
     ) {
+        return Err(XfrmObjectRosterDurableError::InvalidTransition);
+    }
+    // Fail closed on an unreachable cut before compensating anything. The loop
+    // below only honours a cut for a slot it actually visits, so an ordinal
+    // outside the arity or a slot compensation would never target would
+    // otherwise let the whole group be reverse-compensated for real and only
+    // then be reported as "the cut never happened".
+    if ordinal >= roster.arity() {
+        return Err(XfrmObjectRosterDurableError::Malformed);
+    }
+    let compensable = record.member(ordinal).is_some_and(|slot| {
+        matches!(
+            slot.phase,
+            XfrmObjectRosterMemberPhase::Acquired | XfrmObjectRosterMemberPhase::RemovalAdmitted
+        )
+    });
+    if !compensable {
         return Err(XfrmObjectRosterDurableError::InvalidTransition);
     }
     match compensate_acquired_slots(
@@ -2604,6 +2789,44 @@ mod tests {
             XfrmObjectRosterRequestError::MalformedMemberIdentity
         );
 
+        // Two members that are otherwise perfectly admissible — distinct
+        // deletion identities, distinct kernel selection keys — but that share
+        // one caller-supplied durable identity. The durable record refuses this
+        // on encode, so without a named constructor rejection the consumer only
+        // learns about it as an opaque store `Malformed` from `prepare`.
+        assert_eq!(
+            XfrmObjectRosterRequest::new(vec![
+                XfrmObjectRosterMemberRequest::new(sa_request(0))
+                    .with_identity([0x7a; 16], generation(1)),
+                XfrmObjectRosterMemberRequest::new(sa_request(1))
+                    .with_identity([0x7a; 16], generation(1)),
+            ])
+            .unwrap_err(),
+            XfrmObjectRosterRequestError::DuplicateMemberIdentity
+        );
+        // A supplied identity that only collides across generations is still a
+        // collision: the record's uniqueness rule is on the identity alone.
+        assert_eq!(
+            XfrmObjectRosterRequest::new(vec![
+                XfrmObjectRosterMemberRequest::new(sa_request(0))
+                    .with_identity([0x7b; 16], generation(1)),
+                XfrmObjectRosterMemberRequest::new(sa_request(1))
+                    .with_identity([0x7b; 16], generation(2)),
+            ])
+            .unwrap_err(),
+            XfrmObjectRosterRequestError::DuplicateMemberIdentity
+        );
+        // Distinct supplied identities, and a mix of supplied and derived, are
+        // both admissible: only the override path can collide.
+        assert!(XfrmObjectRosterRequest::new(vec![
+            XfrmObjectRosterMemberRequest::new(sa_request(0))
+                .with_identity([0x7c; 16], generation(1)),
+            XfrmObjectRosterMemberRequest::new(sa_request(1))
+                .with_identity([0x7d; 16], generation(1)),
+            XfrmObjectRosterMemberRequest::new(sa_request(2)),
+        ])
+        .is_ok());
+
         assert_eq!(roster_of(&[Kind::Sa]).arity(), 1);
         assert_eq!(
             roster_of(&[Kind::Sa; XFRM_OBJECT_ROSTER_MAX_MEMBERS]).arity(),
@@ -2993,6 +3216,80 @@ mod tests {
         }
     }
 
+    /// A member set that is reordered, partially substituted, or truncated is
+    /// a DIFFERENT roster, and every authority-bearing surface must say so
+    /// before it can be turned into a deletion.
+    ///
+    /// The digest binds each member's ordinal, object kind, durable identity,
+    /// generation, and both keyed fingerprints, so all three mutations change
+    /// it. Truncation additionally changes the member count the digest covers.
+    #[tokio::test]
+    async fn reordered_or_substituted_member_sets_fail_closed_without_deleting() {
+        let root = TestRoot::new();
+        let declared = roster_of(&[Kind::Sa, Kind::Policy, Kind::Sa]);
+        let backend = ScriptedBackend::for_roster(&declared);
+        let store = open_store(&root);
+        let outcome = run_roster(&store, group(0x77), generation(1), &declared, &backend)
+            .await
+            .unwrap();
+        assert_eq!(outcome.as_str(), "applied");
+        backend.clear_log();
+
+        let reordered = XfrmObjectRosterRequest::new(vec![
+            XfrmObjectRosterMemberRequest::new(request_for(Kind::Sa, 2)),
+            XfrmObjectRosterMemberRequest::new(request_for(Kind::Policy, 1)),
+            XfrmObjectRosterMemberRequest::new(request_for(Kind::Sa, 0)),
+        ])
+        .unwrap();
+        let substituted = XfrmObjectRosterRequest::new(vec![
+            XfrmObjectRosterMemberRequest::new(request_for(Kind::Sa, 0)),
+            XfrmObjectRosterMemberRequest::new(request_for(Kind::Policy, 5)),
+            XfrmObjectRosterMemberRequest::new(request_for(Kind::Sa, 2)),
+        ])
+        .unwrap();
+        let truncated = roster_of(&[Kind::Sa, Kind::Policy]);
+
+        for (label, other) in [
+            ("reordered", reordered),
+            ("substituted", substituted),
+            ("truncated", truncated),
+        ] {
+            assert_eq!(
+                store.inspect_dispositions(outcome.handle(), group(0x77), generation(1), &other),
+                Err(XfrmObjectRosterDurableError::WrongBinding),
+                "{label}"
+            );
+            assert_eq!(
+                recover_durable_object_roster(
+                    &store,
+                    group(0x77),
+                    generation(1),
+                    &other,
+                    &backend,
+                )
+                .await
+                .err(),
+                Some(XfrmObjectRosterDurableError::WrongBinding),
+                "{label}"
+            );
+            assert_eq!(
+                finalize_durable_object_roster(&store, group(0x77), generation(1), &other),
+                Err(XfrmObjectRosterDurableError::WrongBinding),
+                "{label}"
+            );
+        }
+        // Not one rejection reached the backend with any mutation at all.
+        assert!(backend.ordinals(OpKind::Remove).is_empty());
+        assert_eq!(backend.effects(), 0);
+        // The declared member set still authenticates and still owns the group.
+        assert_eq!(
+            store
+                .inspect_dispositions(outcome.handle(), group(0x77), generation(1), &declared)
+                .unwrap(),
+            *outcome.members()
+        );
+    }
+
     #[tokio::test]
     async fn restart_verdict_matrix_for_issuing_cuts() {
         // Section 8 Issuing row x member index x object kind, with the member's
@@ -3072,6 +3369,135 @@ mod tests {
                     assert!(reopened.advance_writer_epoch().is_ok());
                 }
             }
+        }
+    }
+
+    /// The one `Issuing` cut the detector seam cannot reach: member zero's
+    /// adjacent witness found a conflict, and the process died after the
+    /// `Prepared -> Issuing` publication that opened its effect window but
+    /// before the terminal no-mutation publication.
+    ///
+    /// The live run reports `no_mutation` and names ordinal zero as
+    /// conflicting. Recovery must reach the same verdict class from the same
+    /// durable bytes, must never delete the foreign object, and must not
+    /// silently downgrade to a plain rollback that erases the conflict signal.
+    #[tokio::test]
+    async fn issuing_cut_before_member_zeros_conflict_publication_recovers_foreign_untouched() {
+        for kinds in [
+            [Kind::Sa; 3],
+            [Kind::Policy; 3],
+            [Kind::Sa, Kind::Policy, Kind::Sa],
+        ] {
+            // Reference verdict: the same conflict, observed live.
+            let live_root = TestRoot::new();
+            let roster = roster_of(&kinds);
+            let live_backend = ScriptedBackend::for_roster(&roster);
+            let live_store = open_store(&live_root);
+            live_backend
+                .plant(roster.member(0).unwrap().request())
+                .await;
+            live_backend.clear_log();
+            let live = run_roster(
+                &live_store,
+                group(0x4a),
+                generation(1),
+                &roster,
+                &live_backend,
+            )
+            .await
+            .unwrap();
+            assert_eq!(live.as_str(), "no_mutation");
+            assert!(live.members().has_conflict());
+            assert!(live_backend.ordinals(OpKind::Remove).is_empty());
+
+            // The crash window itself: an `Issuing` record whose sweep proofs
+            // are all `Absent` and whose member zero never recorded an adjacent
+            // proof, exactly what step 5 publishes when the fresh member-zero
+            // readback taken just before it found the object present.
+            let root = TestRoot::new();
+            let backend = ScriptedBackend::for_roster(&roster);
+            let store = open_store(&root);
+            let prepared =
+                prepare_object_roster(&store, group(0x4b), generation(1), &roster).unwrap();
+            let mut issuing =
+                XfrmObjectRosterTransition::new(XfrmObjectRosterDurablePhase::Issuing, 0);
+            for ordinal in 0..kinds.len() {
+                issuing = issuing.with_member(
+                    ordinal,
+                    XfrmObjectRosterMemberTransition {
+                        phase: XfrmObjectRosterMemberPhase::Pending,
+                        sweep_proof: Some(XfrmObjectRosterSweepProof::Absent),
+                        adjacent_proof: None,
+                    },
+                );
+            }
+            store
+                .transition(&prepared, XfrmObjectRosterDurablePhase::Prepared, issuing)
+                .unwrap();
+            // The conflicting object is there when recovery looks.
+            backend.plant(roster.member(0).unwrap().request()).await;
+            backend.clear_log();
+            drop(store);
+
+            let reopened = open_store(&root);
+            let recovered = recover_durable_object_roster(
+                &reopened,
+                group(0x4b),
+                generation(1),
+                &roster,
+                &backend,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("kinds {kinds:?}: {error:?}"));
+            // The restart enum spells the live `no_mutation` verdict class
+            // `foreign_untouched` when a conflicting object is named, which is
+            // exactly what the live `NoMutation { members }` above carries.
+            assert_eq!(recovered.as_str(), "foreign_untouched", "kinds {kinds:?}");
+            assert!(recovered.members().has_conflict(), "kinds {kinds:?}");
+            assert_eq!(
+                recovered.members().member(0).unwrap().adjacent_proof(),
+                Some("conflict"),
+                "kinds {kinds:?}"
+            );
+            assert_eq!(
+                recovered.members().member(0).unwrap().member_phase(),
+                XfrmObjectRosterMemberPhase::NoMutation,
+                "kinds {kinds:?}"
+            );
+            // The foreign object survives untouched and nothing was deleted.
+            assert!(
+                backend.ordinals(OpKind::Remove).is_empty(),
+                "kinds {kinds:?}"
+            );
+            assert!(
+                backend
+                    .is_present(roster.member(0).unwrap().request())
+                    .await,
+                "kinds {kinds:?}"
+            );
+            for ordinal in 1..kinds.len() {
+                assert!(
+                    !backend
+                        .is_present(roster.member(ordinal).unwrap().request())
+                        .await
+                );
+            }
+            // Recovery is idempotent and the writer gate reopens.
+            assert_eq!(
+                recover_durable_object_roster(
+                    &reopened,
+                    group(0x4b),
+                    generation(1),
+                    &roster,
+                    &backend,
+                )
+                .await
+                .unwrap()
+                .as_str(),
+                "retired"
+            );
+            assert!(reopened.advance_writer_epoch().is_ok());
+            backend.retire(roster.member(0).unwrap().request()).await;
         }
     }
 
@@ -3422,6 +3848,17 @@ mod tests {
     }
 
     /// Synthetic barrier charged once per consumer-visible durable boundary.
+    ///
+    /// This pins CALL SHAPE, not time. The counter is driven by the test
+    /// body's own `boundary()` calls around each API lifecycle call, so it can
+    /// only ever restate how many lifecycle calls the test made; it measures
+    /// nothing about the code under test and no latency claim rests on it. The
+    /// load-bearing evidence in
+    /// [`one_roster_lifecycle_replaces_the_serial_single_object_baseline`] is
+    /// measured from the code under test instead: the writer-epoch burn count
+    /// (1 for a roster of any arity against N for the serial baseline) and the
+    /// publication-ledger class counts (one prepare-class and one
+    /// finalize-class publication regardless of arity).
     struct BarrierMeter {
         charged: Cell<usize>,
     }
@@ -3625,6 +4062,7 @@ mod tests {
             XfrmObjectRosterRequestError::DuplicateDeletionIdentity,
             XfrmObjectRosterRequestError::AmbiguousKernelSelection,
             XfrmObjectRosterRequestError::MalformedMemberIdentity,
+            XfrmObjectRosterRequestError::DuplicateMemberIdentity,
         ] {
             rendered.push(format!("{error:?}"));
             rendered.push(format!("{error}"));
@@ -3632,13 +4070,18 @@ mod tests {
         }
 
         for text in rendered {
+            // Every fixture value is forbidden in BOTH its decimal and its
+            // hexadecimal rendering, because a `#[derive(Debug)]` regression on
+            // a value-bearing type would print the decimal form.
             for forbidden in [
                 "198",
                 "10.67",
                 "6160",
                 "1633058817",
+                "0x6160",
                 "600",
                 "616",
+                "0x268",
                 "Ipv4",
                 "Tunnel",
                 "selector",

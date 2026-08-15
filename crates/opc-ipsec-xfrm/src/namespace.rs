@@ -760,9 +760,11 @@ impl Error for XfrmSaRelocationRunError {
 /// invalidates all prepared authorities before its backend effect, while
 /// process loss discards their live seals.
 ///
-/// The affine, move-only receiver is the executable one-run invariant:
+/// The affine, move-only receiver is the executable one-run invariant. The
+/// error code is pinned so a later signature change cannot degrade this into
+/// "fails to compile for some unrelated reason":
 ///
-/// ```compile_fail
+/// ```compile_fail,E0382
 /// # use opc_ipsec_xfrm::{NamespaceBoundLinuxXfrmBackend, XfrmObjectRosterAdmissionAuthority};
 /// # fn authority() -> XfrmObjectRosterAdmissionAuthority { unimplemented!() }
 /// # async fn cannot_run_twice(backend: NamespaceBoundLinuxXfrmBackend) {
@@ -797,13 +799,14 @@ impl fmt::Debug for XfrmObjectRosterAdmissionAuthority {
 
 /// Value-free failure while admitting one prepared durable object roster.
 ///
-/// A roster whose SA members need a still-closed deferred DSCP activation, and
-/// a pre-effect sweep readback that could not be trusted, both return the
-/// original affine authority through [`Self::into_retry_authority`]. In either
-/// case no durable roster phase or roster writer epoch has changed and no
-/// member effect was admitted, so the caller may retry that exact authority.
-/// Every other failure consumes the authority under the durable protocol's
-/// existing fail-closed recovery contract.
+/// Three rejections return the original affine authority through
+/// [`Self::into_retry_authority`]: a closed cooperating-writer gate, a roster
+/// whose SA members need a still-closed deferred DSCP activation, and a
+/// pre-effect sweep readback that could not be trusted. In all three cases no
+/// durable roster phase or roster writer epoch has changed and no member
+/// effect was admitted, so the caller may retry that exact authority. Every
+/// other failure consumes the authority under the durable protocol's existing
+/// fail-closed recovery contract.
 #[cfg(unix)]
 pub struct XfrmObjectRosterRunError {
     kind: XfrmObjectRosterRunErrorKind,
@@ -812,6 +815,10 @@ pub struct XfrmObjectRosterRunError {
 #[cfg(unix)]
 enum XfrmObjectRosterRunErrorKind {
     Durable(XfrmObjectRosterDurableError),
+    Gated {
+        authority: Box<XfrmObjectRosterAdmissionAuthority>,
+        source: XfrmObjectRosterDurableError,
+    },
     DscpActivationRequired(Box<XfrmObjectRosterAdmissionAuthority>),
     PreEffectReadbackFailed {
         authority: Box<XfrmObjectRosterAdmissionAuthority>,
@@ -821,9 +828,19 @@ enum XfrmObjectRosterRunErrorKind {
 
 #[cfg(unix)]
 impl XfrmObjectRosterRunError {
+    const GATED: &'static str = "xfrm_object_roster_gated";
     const DSCP_ACTIVATION_REQUIRED: &'static str = "xfrm_object_roster_dscp_activation_required";
     const PRE_EFFECT_READBACK_FAILED: &'static str =
         "xfrm_object_roster_pre_effect_readback_failed";
+
+    fn gated(
+        authority: Box<XfrmObjectRosterAdmissionAuthority>,
+        source: XfrmObjectRosterDurableError,
+    ) -> Self {
+        Self {
+            kind: XfrmObjectRosterRunErrorKind::Gated { authority, source },
+        }
+    }
 
     fn dscp_activation_required(authority: Box<XfrmObjectRosterAdmissionAuthority>) -> Self {
         Self {
@@ -845,6 +862,7 @@ impl XfrmObjectRosterRunError {
     pub const fn as_str(&self) -> &'static str {
         match &self.kind {
             XfrmObjectRosterRunErrorKind::Durable(error) => error.as_str(),
+            XfrmObjectRosterRunErrorKind::Gated { .. } => Self::GATED,
             XfrmObjectRosterRunErrorKind::DscpActivationRequired(_) => {
                 Self::DSCP_ACTIVATION_REQUIRED
             }
@@ -854,12 +872,17 @@ impl XfrmObjectRosterRunError {
         }
     }
 
-    /// Return the underlying durable-protocol error, when this was not a
-    /// clean deferred-activation or pre-effect readback rejection.
+    /// Return the underlying durable-protocol error, when one was observed.
+    ///
+    /// A gated rejection reports the rejection its closed cooperating-writer
+    /// gate produced AND returns the authority, because the gate was screened
+    /// before anything was consumed. Compare [`Self::as_str`] to tell the two
+    /// apart: only `xfrm_object_roster_gated` is retryable.
     #[must_use]
     pub const fn durable_error(&self) -> Option<XfrmObjectRosterDurableError> {
         match &self.kind {
-            XfrmObjectRosterRunErrorKind::Durable(error) => Some(*error),
+            XfrmObjectRosterRunErrorKind::Durable(error)
+            | XfrmObjectRosterRunErrorKind::Gated { source: error, .. } => Some(*error),
             XfrmObjectRosterRunErrorKind::DscpActivationRequired(_)
             | XfrmObjectRosterRunErrorKind::PreEffectReadbackFailed { .. } => None,
         }
@@ -882,8 +905,9 @@ impl XfrmObjectRosterRunError {
     #[must_use]
     pub fn into_retry_authority(self) -> Option<XfrmObjectRosterAdmissionAuthority> {
         match self.kind {
-            XfrmObjectRosterRunErrorKind::DscpActivationRequired(authority) => Some(*authority),
-            XfrmObjectRosterRunErrorKind::PreEffectReadbackFailed { authority, .. } => {
+            XfrmObjectRosterRunErrorKind::Gated { authority, .. }
+            | XfrmObjectRosterRunErrorKind::DscpActivationRequired(authority)
+            | XfrmObjectRosterRunErrorKind::PreEffectReadbackFailed { authority, .. } => {
                 Some(*authority)
             }
             XfrmObjectRosterRunErrorKind::Durable(_) => None,
@@ -928,7 +952,8 @@ impl fmt::Display for XfrmObjectRosterRunError {
 impl Error for XfrmObjectRosterRunError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.kind {
-            XfrmObjectRosterRunErrorKind::Durable(error) => Some(error),
+            XfrmObjectRosterRunErrorKind::Durable(error)
+            | XfrmObjectRosterRunErrorKind::Gated { source: error, .. } => Some(error),
             XfrmObjectRosterRunErrorKind::DscpActivationRequired(_) => None,
             XfrmObjectRosterRunErrorKind::PreEffectReadbackFailed { source, .. } => Some(source),
         }
@@ -1925,6 +1950,30 @@ impl NamespaceActorState {
         Ok(())
     }
 
+    /// Same-family cooperating-writer gate: a grouped roster is rejected while
+    /// a SIBLING roster in the same store is still `Issuing`, `Applied`, or
+    /// `Compensating`.
+    ///
+    /// The store enforces this too, inside `Prepared -> Issuing`, but it does
+    /// so after admission has already been consumed and after the other two
+    /// families were fenced. Screening it here keeps a sibling block what it
+    /// is — a transient rejection that consumes nothing and can succeed later.
+    /// It cannot false-positive on the roster being run: that roster is
+    /// `Prepared`, and `Prepared` is never an unresolved writer authority, so
+    /// a true answer always names some other roster.
+    #[cfg(unix)]
+    fn require_roster_gate_open_for_roster(&self) -> Result<(), XfrmObjectRosterDurableError> {
+        if let Some(store) = &self.roster_recovery_store {
+            let unresolved = store
+                .has_unresolved_writer_authority()
+                .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+            if unresolved {
+                return Err(XfrmObjectRosterDurableError::InvalidTransition);
+            }
+        }
+        Ok(())
+    }
+
     fn admit_xfrm_mutation(&mut self) -> Result<(), XfrmError> {
         // Three-part invariant for an ordinary, independently admitted
         // namespace mutation across every bound durable family:
@@ -2495,17 +2544,27 @@ impl NamespaceBoundLinuxXfrmBackend {
     ///
     /// # Proved-clean rejections
     ///
-    /// Two rejections prove that no member effect was admitted and no roster
-    /// phase or roster writer epoch changed: a still-closed deferred DSCP
-    /// activation gate, and a pre-effect sweep readback that could not be
-    /// trusted. Both return the exact affine authority through
-    /// [`XfrmObjectRosterRunError::into_retry_authority`], and the actor
-    /// re-registers its admission seal before returning it, so the same
-    /// authority can be retried without reminting. The sweep runs inside the
-    /// admitted command rather than ahead of admission consumption, so a sweep
-    /// rejection has already fenced the other durable families; that fencing is
-    /// monotone and only ever invalidates, and the roster's own durable state
-    /// is untouched. Every other failure consumes the authority under the
+    /// Three rejections prove that no member effect was admitted and no roster
+    /// phase or roster writer epoch changed: a closed cooperating-writer gate
+    /// (`xfrm_object_roster_gated`), a still-closed deferred DSCP activation
+    /// gate, and a pre-effect sweep readback that could not be trusted. All
+    /// three return the exact affine authority through
+    /// [`XfrmObjectRosterRunError::into_retry_authority`], so the same
+    /// authority can be retried without reminting.
+    ///
+    /// A gated rejection is screened before anything at all is consumed: the
+    /// admission seal is never removed and no sibling family is fenced, which
+    /// is what makes "run me again once the blocking writer resolves" true
+    /// rather than aspirational. It covers an unresolved single-object install,
+    /// an unresolved SA relocation, AND an unresolved sibling roster in this
+    /// same store.
+    ///
+    /// The DSCP and sweep rejections happen later. The sweep in particular runs
+    /// inside the admitted command rather than ahead of admission consumption,
+    /// so a sweep rejection has already fenced the other durable families and
+    /// the actor re-registers the admission seal before returning; that fencing
+    /// is monotone and only ever invalidates, and the roster's own durable
+    /// state is untouched. Every other failure consumes the authority under the
     /// durable protocol's existing fail-closed recovery contract.
     ///
     /// # Deadlines
@@ -2611,6 +2670,18 @@ impl NamespaceBoundLinuxXfrmBackend {
     /// every acquired member is present. Otherwise it publishes nothing, leaves
     /// the record `Applied` with the writer gate closed, and reports adoption
     /// refused so the consumer can still choose recovery.
+    ///
+    /// # Cost of a refused probe
+    ///
+    /// A refusal decided by an unresolved `Issuing` or `Compensating` phase
+    /// costs nothing across families: no writer epoch is burned and no prepared
+    /// single-object install or SA relocation authority is invalidated, so
+    /// "adopt first, recover if refused" is safe to use as a probe. Only an
+    /// `Applied` record — the one adoption can actually commit — carries the
+    /// same cross-family fencing obligation as recovery, because committing it
+    /// surrenders cleanup authority for real kernel objects. A refusal decided
+    /// later, by a member that no longer reads back present, has therefore
+    /// already fenced.
     ///
     /// # Errors
     ///
@@ -3364,35 +3435,74 @@ fn roster_requires_dscp_activation(
     })
 }
 
-/// The run path's four-layer validation chain, shared verbatim with the
+/// How a pre-admission rejection must be reported back to the caller.
+///
+/// Both arms consume nothing, but only one of them proves that the run can
+/// succeed later with this exact authority.
+#[cfg(unix)]
+enum RosterRunAdmissionRejection {
+    /// A cooperating-writer gate is closed. The rejection is transient: the
+    /// authority is still registered and still valid, so it is handed back for
+    /// an exact retry once the blocking writer resolves.
+    Gated(XfrmObjectRosterDurableError),
+    /// The admission itself is not usable, so the caller must follow the
+    /// durable recovery contract.
+    Rejected(XfrmObjectRosterDurableError),
+}
+
+/// The run path's validation chain, shared verbatim with the
 /// authority-consuming crash-detector seams.
 ///
-/// Store instance, live admission seal, both cross-family gates, then the
+/// Store instance, live admission seal, all three cooperating-writer gates
+/// (both other families AND a sibling roster in this same store), then the
 /// authenticated `Prepared` record and roster digest. A failure here consumes
 /// nothing: no epoch is burned and the admission stays registered.
+///
+/// The roster's own gate is screened HERE rather than being left to the
+/// store's `Prepared -> Issuing` check, because by then admission has been
+/// consumed and both sibling families have been fenced — turning a transient
+/// sibling block into a permanently stranded `Prepared` record.
 #[cfg(unix)]
 fn validate_object_roster_run_admission(
     state: &NamespaceActorState,
     authority: &XfrmObjectRosterAdmissionAuthority,
-) -> Result<(), XfrmObjectRosterDurableError> {
+) -> Result<(), RosterRunAdmissionRejection> {
     state
         .require_object_roster_store(&authority.operation.store)
         .and_then(|()| state.require_object_roster_admission(authority))
-        .and_then(|()| state.require_install_gate_open_for_roster())
+        .map_err(RosterRunAdmissionRejection::Rejected)?;
+    state
+        .require_install_gate_open_for_roster()
         .and_then(|()| state.require_relocation_gate_open_for_roster())
-        .and_then(|()| {
-            validate_object_roster_admission(
-                &authority.operation.store,
-                &authority.prepared,
-                authority.operation.group_id,
-                authority.operation.generation,
-                &authority.operation.roster,
-            )
-        })
+        .and_then(|()| state.require_roster_gate_open_for_roster())
+        .map_err(RosterRunAdmissionRejection::Gated)?;
+    validate_object_roster_admission(
+        &authority.operation.store,
+        &authority.prepared,
+        authority.operation.group_id,
+        authority.operation.generation,
+        &authority.operation.roster,
+    )
+    .map_err(RosterRunAdmissionRejection::Rejected)
 }
 
-/// The recovery path's admission chain, shared by adopt, recover, and the
-/// compensating crash-detector seam.
+/// Turn a pre-admission rejection into the actor's reply, returning the exact
+/// affine authority whenever the rejection was a transient gate block.
+#[cfg(unix)]
+fn reject_roster_run(
+    authority: Box<XfrmObjectRosterAdmissionAuthority>,
+    rejection: RosterRunAdmissionRejection,
+) -> XfrmObjectRosterRunError {
+    match rejection {
+        RosterRunAdmissionRejection::Gated(error) => {
+            XfrmObjectRosterRunError::gated(authority, error)
+        }
+        RosterRunAdmissionRejection::Rejected(error) => error.into(),
+    }
+}
+
+/// The recovery path's admission chain, shared by recover and the compensating
+/// crash-detector seam.
 ///
 /// Store instance, then the authenticated current group phase, then the
 /// live-authority reconcile gate, then the cross-family fencing obligation the
@@ -3410,6 +3520,44 @@ fn admit_object_roster_recovery(
         &operation.roster,
     )?;
     state.reconcile_object_roster_admission(operation.group_id, operation.generation)?;
+    state.admit_durable_object_roster_recovery(phase)
+}
+
+/// Adoption's admission chain: every check recovery runs, except that a phase
+/// adoption will refuse outright is screened BEFORE any cross-family fencing.
+///
+/// Adoption is purely additive and can only ever publish from `Applied`, so a
+/// diagnostic "adopt first, recover if refused" probe against an `Issuing` or
+/// `Compensating` record must not pay recovery's fencing cost: it would burn
+/// the object and relocation writer epochs and destroy any legitimately
+/// prepared install or relocation authority for a call that then publishes
+/// nothing. The store-instance check, the authenticated phase read, and the
+/// live-authority reconcile gate all still run first, so a refusal is never
+/// less validated than a recovery. Recovery keeps its fencing unchanged: it
+/// really can issue per-member cleanup.
+#[cfg(unix)]
+fn admit_object_roster_adoption(
+    state: &mut NamespaceActorState,
+    operation: &DurableObjectRosterOperation,
+) -> Result<(), XfrmObjectRosterDurableError> {
+    state.require_object_roster_store(&operation.store)?;
+    let phase = durable_object_roster_phase(
+        &operation.store,
+        operation.group_id,
+        operation.generation,
+        &operation.roster,
+    )?;
+    state.reconcile_object_roster_admission(operation.group_id, operation.generation)?;
+    if matches!(
+        phase,
+        XfrmObjectRosterDurablePhase::Issuing | XfrmObjectRosterDurablePhase::Compensating
+    ) {
+        // The two unresolved phases adoption always refuses. Nothing durable
+        // is read past this point and nothing is published, so no sibling
+        // family is fenced.
+        state.invalidate_counter_receipts();
+        return Ok(());
+    }
     state.admit_durable_object_roster_recovery(phase)
 }
 
@@ -3982,8 +4130,8 @@ impl NamespaceCommand {
             }
             #[cfg(unix)]
             Self::RunDurableObjectRoster(authority, reply) => {
-                if let Err(error) = validate_object_roster_run_admission(state, &authority) {
-                    let _ = reply.send(Err(error.into()));
+                if let Err(rejection) = validate_object_roster_run_admission(state, &authority) {
+                    let _ = reply.send(Err(reject_roster_run(authority, rejection)));
                     return;
                 }
                 // All-or-nothing deferred DSCP preflight over every SA member,
@@ -4026,8 +4174,8 @@ impl NamespaceCommand {
                 // Crash-detector seams share the run path's validation chain,
                 // DSCP preflight, sweep, and admission consumption. They stop
                 // at the selected unresolved phase before recovery.
-                if let Err(error) = validate_object_roster_run_admission(state, &authority) {
-                    let _ = reply.send(Err(error.into()));
+                if let Err(rejection) = validate_object_roster_run_admission(state, &authority) {
+                    let _ = reply.send(Err(reject_roster_run(authority, rejection)));
                     return;
                 }
                 if roster_requires_dscp_activation(backend, &authority.operation.roster) {
@@ -4086,7 +4234,7 @@ impl NamespaceCommand {
             }
             #[cfg(unix)]
             Self::AdoptDurableObjectRoster(operation, reply) => {
-                let result = match admit_object_roster_recovery(state, &operation) {
+                let result = match admit_object_roster_adoption(state, &operation) {
                     Ok(()) => {
                         adopt_object_roster(
                             &operation.store,
@@ -9514,6 +9662,16 @@ mod tests {
             .unwrap()
     }
 
+    /// Synthesize a second handle on one live admission seal.
+    ///
+    /// This exists ONLY to build the forged, substituted, and tampered
+    /// admissions the negative tests feed to the actor, and to supply a
+    /// payload to the `XfrmObjectRunError` constructors in the accessor and
+    /// diagnostic unit tests. The public API cannot produce two live handles on
+    /// one seal, so this must never be used to claim that the actor gave an
+    /// authority back: the tests that assert retryability drive
+    /// [`XfrmObjectRosterRunError::into_retry_authority`] on an error the actor
+    /// actually returned.
     #[cfg(unix)]
     fn duplicate_roster_admission(
         authority: &XfrmObjectRosterAdmissionAuthority,
@@ -10220,16 +10378,21 @@ mod tests {
                 .unwrap_err(),
             XfrmObjectRosterDurableError::InvalidTransition
         );
-        // The sibling roster authority survives the gate: the rejection is a
-        // transient cross-family block, not a stale seal.
+        // The roster authority survives the gate through the PUBLIC error: a
+        // transient cross-family block returns the exact affine authority the
+        // caller passed in, so no second live seal is needed to retry it.
         let gated = backend
-            .run_durable_object_roster(duplicate_roster_admission(&authority))
+            .run_durable_object_roster(authority)
             .await
             .unwrap_err();
+        assert_eq!(gated.as_str(), "xfrm_object_roster_gated");
         assert_eq!(
             gated.durable_error(),
             Some(XfrmObjectRosterDurableError::InvalidTransition)
         );
+        let authority = gated
+            .into_retry_authority()
+            .expect("a gate-rejected run must return the exact affine authority");
         assert!(transport.operations().is_empty());
 
         // Retiring the relocation reopens the roster gate and the SAME
@@ -10315,6 +10478,94 @@ mod tests {
             )
             .await
             .is_ok());
+    }
+
+    /// A run blocked by a SIBLING roster in the same store must consume
+    /// nothing and must succeed later with the very same authority.
+    ///
+    /// `Prepared` deliberately does not gate, so two rosters can legally be
+    /// prepared before either runs. If the sibling block were only caught by
+    /// the store's own `Prepared -> Issuing` check, admission would already be
+    /// gone, both other durable families would already be fenced, and the
+    /// second roster's `Prepared` record would be stranded: its authority is
+    /// affine and was moved by value, and re-preparing the same members under
+    /// a fresh group and generation is refused as a duplicate deletion
+    /// identity while that record stays non-terminal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sibling_blocked_roster_run_consumes_nothing_and_succeeds_after_the_sibling_resolves()
+    {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0x93);
+        let generation = roster_generation(1);
+        let first_group = roster_group(0x2a);
+        let second_group = roster_group(0x2b);
+        let first = sa_roster(2);
+        let second = policy_roster(2);
+
+        let first_authority = backend
+            .prepare_durable_object_roster(&store, first_group, generation, first.clone())
+            .await
+            .unwrap();
+        let second_authority = backend
+            .prepare_durable_object_roster(&store, second_group, generation, second.clone())
+            .await
+            .unwrap();
+
+        // Drive the first roster into an unresolved `Issuing` window.
+        backend
+            .detector_cut_roster_issuing_at_member(first_authority, 1, false)
+            .await
+            .unwrap();
+        assert!(store.has_unresolved_writer_authority().unwrap());
+        let after_cut = transport.operations();
+
+        // The second run is refused BEFORE anything is consumed, and the
+        // rejection hands the exact affine authority back.
+        let gated = backend
+            .run_durable_object_roster(second_authority)
+            .await
+            .unwrap_err();
+        assert_eq!(gated.as_str(), "xfrm_object_roster_gated");
+        assert_eq!(
+            gated.durable_error(),
+            Some(XfrmObjectRosterDurableError::InvalidTransition)
+        );
+        let second_authority = gated
+            .into_retry_authority()
+            .expect("a sibling-blocked run must return the exact affine authority");
+        // The blocked run touched neither the kernel nor the second record.
+        assert_eq!(transport.operations(), after_cut);
+        assert_eq!(
+            store.inspect(&second_authority.prepared),
+            Ok(XfrmObjectRosterDurablePhase::Prepared)
+        );
+
+        // Resolving the sibling reopens the gate and the SAME authority runs.
+        assert_eq!(
+            backend
+                .recover_durable_object_roster(&store, first_group, generation, &first)
+                .await
+                .unwrap()
+                .as_str(),
+            "rolled_back"
+        );
+        assert_eq!(
+            backend
+                .run_durable_object_roster(second_authority)
+                .await
+                .unwrap()
+                .as_str(),
+            "applied"
+        );
+        assert_eq!(
+            backend
+                .finalize_durable_object_roster(&store, second_group, generation, &second)
+                .await
+                .unwrap(),
+            XfrmObjectRosterDurablePhase::Committed
+        );
     }
 
     #[cfg(unix)]
@@ -10416,14 +10667,21 @@ mod tests {
         ));
         assert!(transport.operations().is_empty());
         let gated = backend
-            .run_durable_object_roster(duplicate_roster_admission(&authority))
+            .run_durable_object_roster(authority)
             .await
             .unwrap_err();
         assert_eq!(
-            gated.durable_error(),
-            Some(XfrmObjectRosterDurableError::InvalidTransition),
+            gated.as_str(),
+            "xfrm_object_roster_gated",
             "a gate-rejected mutation must not turn the surviving authority stale"
         );
+        assert_eq!(
+            gated.durable_error(),
+            Some(XfrmObjectRosterDurableError::InvalidTransition)
+        );
+        let authority = gated
+            .into_retry_authority()
+            .expect("a gate-rejected run must return the exact affine authority");
 
         assert!(matches!(
             backend
@@ -10770,29 +11028,64 @@ mod tests {
             .await
             .unwrap();
 
-        // Both proved-clean rejections hand back a usable authority.
+        // An untrustworthy pre-effect sweep readback, driven through the real
+        // actor: the admission is already consumed by the time the sweep runs,
+        // so this exercises the seal re-registration path end to end.
+        let untrusted_root = DurableTestRoot::new();
+        let untrusted_transport = UntrustedReadbackTransport::default();
+        let (untrusted_backend, untrusted_store) =
+            bind_with_roster_recovery(untrusted_transport.clone(), &untrusted_root, 0x9c);
+        let untrusted_group = roster_group(0x2c);
+        let untrusted_roster = sa_roster(2);
+        let untrusted_authority = untrusted_backend
+            .prepare_durable_object_roster(
+                &untrusted_store,
+                untrusted_group,
+                generation,
+                untrusted_roster.clone(),
+            )
+            .await
+            .unwrap();
+        let readback = untrusted_backend
+            .run_durable_object_roster(untrusted_authority)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            readback.as_str(),
+            "xfrm_object_roster_pre_effect_readback_failed"
+        );
+        assert!(readback.durable_error().is_none());
+        assert!(readback.readback_source().is_some());
+        let recovered = readback.into_retry_authority().expect("retry authority");
+        // Durable state is untouched, and the returned authority is still the
+        // registered live admission: an unregistered seal would make the retry
+        // stale rather than reproduce the same proved-clean rejection.
+        assert_eq!(
+            untrusted_store.inspect(&recovered.prepared),
+            Ok(XfrmObjectRosterDurablePhase::Prepared)
+        );
+        let repeated = untrusted_backend
+            .run_durable_object_roster(recovered)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            repeated.as_str(),
+            "xfrm_object_roster_pre_effect_readback_failed"
+        );
+        drop(repeated);
+
+        // The other proved-clean rejection is driven end to end by
+        // `deferred_dscp_gate_rejects_the_whole_roster_before_any_durable_step`;
+        // here only the accessor shape is pinned.
         let dscp = XfrmObjectRosterRunError::dscp_activation_required(Box::new(
             duplicate_roster_admission(&authority),
         ));
         assert!(dscp.durable_error().is_none());
         assert!(dscp.into_retry_authority().is_some());
-        let readback = XfrmObjectRosterRunError::pre_effect_readback_failed(
-            Box::new(duplicate_roster_admission(&authority)),
-            XfrmError::StateIndeterminate {
-                operation: "query_sa",
-            },
-        );
-        assert!(matches!(
-            readback.readback_source(),
-            Some(XfrmError::StateIndeterminate {
-                operation: "query_sa"
-            })
-        ));
-        let recovered = readback.into_retry_authority().expect("retry authority");
-        // The recovered authority is still the exact registered admission.
+        let replayed = duplicate_roster_admission(&authority);
         assert_eq!(
             backend
-                .run_durable_object_roster(recovered)
+                .run_durable_object_roster(authority)
                 .await
                 .unwrap()
                 .as_str(),
@@ -10814,7 +11107,7 @@ mod tests {
         // The consumed authority is not replayable either.
         assert_eq!(
             backend
-                .run_durable_object_roster(authority)
+                .run_durable_object_roster(replayed)
                 .await
                 .unwrap_err(),
             XfrmObjectRosterDurableError::Stale
@@ -11205,6 +11498,13 @@ mod tests {
             (
                 XfrmObjectRosterRunError::from(XfrmObjectRosterDurableError::WrongBinding),
                 "xfrm_object_roster_recovery_wrong_binding",
+            ),
+            (
+                XfrmObjectRosterRunError::gated(
+                    Box::new(duplicate_roster_admission(&authority)),
+                    XfrmObjectRosterDurableError::InvalidTransition,
+                ),
+                "xfrm_object_roster_gated",
             ),
             (
                 XfrmObjectRosterRunError::dscp_activation_required(Box::new(

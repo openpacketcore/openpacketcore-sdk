@@ -146,7 +146,10 @@
 //! absence proof depends on and leaves the record retained for product repair.
 //! Every unresolved roster phase gates all later cooperating mutations in the
 //! namespace and both other durable families, and an unresolved install or
-//! relocation record gates rosters. Missing, malformed, duplicated, reordered,
+//! relocation record gates rosters. Every one of those gates is screened before
+//! the run consumes anything, so a blocked run returns its exact affine
+//! authority through `XfrmObjectRosterRunError::into_retry_authority` and
+//! succeeds later unchanged. Missing, malformed, duplicated, reordered,
 //! substituted, stale-epoch, wrong-namespace, and wrong-incarnation roster
 //! state fails closed, and handles, outcomes, errors, and diagnostics stay
 //! value-free. The leased root carries the same trusted, non-rollback storage
@@ -258,10 +261,11 @@ pub use durable_relocation::{
 pub use durable_relocation_flow::{XfrmSaRelocationDurableOutcome, XfrmSaRelocationRestartOutcome};
 #[cfg(unix)]
 pub use durable_roster::{
-    XfrmObjectRosterDurableError, XfrmObjectRosterDurablePhase, XfrmObjectRosterGroupId,
-    XfrmObjectRosterOperationGeneration, XfrmObjectRosterRecoveryHandle,
-    XfrmObjectRosterRecoveryProofKey, XfrmObjectRosterRecoveryStore,
-    XFRM_OBJECT_ROSTER_MAX_MEMBERS, XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES,
+    XfrmObjectRosterAdjacentProof, XfrmObjectRosterDurableError, XfrmObjectRosterDurablePhase,
+    XfrmObjectRosterGroupId, XfrmObjectRosterMemberPhase, XfrmObjectRosterOperationGeneration,
+    XfrmObjectRosterRecoveryHandle, XfrmObjectRosterRecoveryProofKey,
+    XfrmObjectRosterRecoveryStore, XfrmObjectRosterSweepProof, XFRM_OBJECT_ROSTER_MAX_MEMBERS,
+    XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES,
 };
 #[cfg(unix)]
 pub use durable_roster_flow::{
