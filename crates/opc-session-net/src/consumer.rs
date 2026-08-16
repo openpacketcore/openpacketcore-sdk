@@ -932,6 +932,7 @@ impl StatelessSessionConsumerClient {
             &outbound,
             MAX_NEGOTIATED_FRAME_SIZE,
             pre_request_deadline,
+            None,
         )
         .await
         .map_err(|error| classify_call_write_error(error, pre_request_budget_active))?;

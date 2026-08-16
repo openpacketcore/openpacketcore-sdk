@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use hmac::Mac;
 use opc_consensus::engine::LogId;
+use opc_types::Timestamp;
 use rusqlite::backup::Backup;
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -34,14 +35,16 @@ const PLAN_MAC_DOMAIN: &[u8] = b"openpacketcore/session-recovery/plan-seal/v1\0"
 const WORKFLOW_MAC_DOMAIN: &[u8] = b"openpacketcore/session-recovery/workflow/v1\0";
 const BACKUP_MAC_DOMAIN: &[u8] = b"openpacketcore/session-recovery/backup/v1\0";
 const CURRENT_BRANCH_DOMAIN: &[u8] = b"openpacketcore/session-recovery/current-branch/v1\0";
+const IMMEDIATE_PREDECESSOR_BRANCH_DOMAIN: &[u8] =
+    b"openpacketcore/session-recovery/immediate-predecessor-branch/v1\0";
 const LEGACY_BRANCH_DOMAIN: &[u8] = b"openpacketcore/session-recovery/legacy-branch/v1\0";
 const PATH_BINDING_DOMAIN: &[u8] = b"openpacketcore/session-recovery/path-binding/v1\0";
 const FILE_IDENTITY_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file-identity/v1\0";
 const LOGICAL_STATE_DOMAIN: &[u8] = b"openpacketcore/session-recovery/logical-state/v1\0";
 const FILE_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file/v1\0";
 const WORKFLOW_VERSION: u16 = 2;
-// Six base SQLite objects plus fifteen bounded consensus/recovery objects.
-const MAX_CURRENT_SCHEMA_OBJECTS: usize = 21;
+// Six base SQLite objects plus sixteen bounded consensus/recovery objects.
+const MAX_CURRENT_SCHEMA_OBJECTS: usize = 22;
 const MAX_SCHEMA_SQL_BYTES: usize = 16_384;
 
 pub(super) struct InspectionInput<'a> {
@@ -308,6 +311,16 @@ pub(super) fn inspect_replica(
     conn.progress_handler(1_000, Some(move || started.elapsed() >= max_duration));
     validate_database_snapshot(&conn, &budget)?;
     if table_exists(&conn, "consensus_identity")? {
+        if is_exact_immediate_predecessor_schema(&conn)? {
+            return inspect_immediate_predecessor(
+                input,
+                &conn,
+                paths,
+                path_binding,
+                file_identity,
+                &mut budget,
+            );
+        }
         inspect_current(
             input,
             &conn,
@@ -383,7 +396,19 @@ fn inspect_current(
     }
     consensus::read_membership_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    validate_consensus_sealed_records(conn, budget)?;
+    budget.check()?;
+    if consensus::validate_recovery_receipts_and_admission_sync(conn, storage_identity).is_err() {
+        return if budget.check().is_err() {
+            Err(RecoveryError::WorkLimitExceeded)
+        } else {
+            Err(RecoveryError::CorruptReplica)
+        };
+    }
+    budget.check()?;
+    let (application_sequence, _, _, logical_time, watch_sequence) =
+        consensus::read_machine_sync(conn, storage_identity)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+    validate_consensus_sealed_records(conn, budget, logical_time)?;
     validate_legacy_lease_state(conn, budget)?;
     let committed = consensus::read_committed_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
@@ -401,22 +426,11 @@ fn inspect_current(
     )?;
     let recovery = consensus::read_operator_recovery_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    let replication_head = validate_replication_sequence_domain(
+    let (replication_head, _) = validate_replication_sequence_domain(
         conn,
         budget,
         recovery.watch_cursor_invalidation_floor,
     )?;
-    let (application_sequence, watch_sequence): (i64, i64) = conn
-        .query_row(
-            "SELECT application_sequence, watch_sequence FROM consensus_machine WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|_| RecoveryError::CorruptReplica)?;
-    let application_sequence =
-        u64::try_from(application_sequence).map_err(|_| RecoveryError::CorruptReplica)?;
-    let watch_sequence =
-        u64::try_from(watch_sequence).map_err(|_| RecoveryError::CorruptReplica)?;
     if watch_sequence != replication_head {
         return Err(RecoveryError::CorruptReplica);
     }
@@ -429,6 +443,8 @@ fn inspect_current(
         recovery.recovery_epoch,
         recovery.pending_epoch,
         recovery.pending_plan_digest,
+        recovery.pending_fence_high_water,
+        recovery.pending_credential_high_water,
         recovery.watch_cursor_invalidation_floor,
     )?;
     let fence_high_water = consensus::observed_fence_high_water_sync(conn)
@@ -451,6 +467,145 @@ fn inspect_current(
         recovery_epoch: recovery.recovery_epoch,
         pending_recovery_epoch: recovery.pending_epoch,
         pending_plan_digest: recovery.pending_plan_digest.map(RecoveryDigest::from_bytes),
+        pending_fence_high_water: recovery.pending_fence_high_water,
+        pending_credential_high_water: recovery.pending_credential_high_water,
+        watch_cursor_invalidation_floor: recovery.watch_cursor_invalidation_floor,
+        application_sequence,
+        watch_sequence,
+        committed_index: committed.as_ref().map(|log_id| log_id.index),
+        applied_index: applied.as_ref().map(|log_id| log_id.index),
+        local_head_index: last_log.as_ref().map(|log_id| log_id.index),
+        branch_digest,
+        fence_high_water,
+        credential_high_water,
+        logical_state_digest,
+    })
+}
+
+/// The operator-recovery path accepts exactly one historical Openraft schema,
+/// never a best-effort collection of similarly named tables.  The manifest is
+/// derived from production DDL and includes the standalone state tables too,
+/// so a partial or hand-assembled predecessor image cannot become a recovery
+/// authority.
+fn is_exact_immediate_predecessor_schema(conn: &Connection) -> Result<bool, RecoveryError> {
+    let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    consensus::install_immediate_predecessor_recovery_validation_schema_sync(&canonical)
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    Ok(recovery_schema_manifest(conn)? == recovery_schema_manifest(&canonical)?)
+}
+
+fn inspect_immediate_predecessor(
+    input: InspectionInput<'_>,
+    conn: &Connection,
+    paths: CanonicalReplicaPaths,
+    path_binding: RecoveryDigest,
+    file_identity: RecoveryDigest,
+    budget: &mut InspectionBudget,
+) -> Result<RecoveryReplicaEvidence, RecoveryError> {
+    budget.check()?;
+    preflight_immediate_predecessor_tables(conn, budget)?;
+    let (schema_version, cluster, configuration, epoch): (i64, Vec<u8>, Vec<u8>, i64) = conn
+        .query_row(
+            "SELECT schema_version, cluster_id, configuration_id, configuration_epoch FROM consensus_identity WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if schema_version != i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    let cluster: [u8; 32] = cluster
+        .try_into()
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let configuration: [u8; 32] = configuration
+        .try_into()
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let epoch = u64::try_from(epoch)
+        .ok()
+        .and_then(|value| SessionConsensusConfigurationEpoch::new(value).ok())
+        .ok_or(RecoveryError::CorruptReplica)?;
+    let storage_identity = SessionConsensusIdentity::new(
+        crate::consensus::SessionConsensusClusterId::from_bytes(cluster),
+        SessionConsensusConfigurationId::from_bytes(configuration),
+        epoch,
+    );
+    if storage_identity.cluster_id() != input.identity.cluster_id() {
+        return Err(RecoveryError::WrongCluster);
+    }
+    let membership_scope = consensus::read_membership_scope_sync(conn, storage_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if membership_scope.current_identity != input.identity
+        || membership_scope.current_members != *input.expected_members
+    {
+        return Err(RecoveryError::WrongCluster);
+    }
+    consensus::read_membership_sync(conn, storage_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let (application_sequence, _, logical_time, watch_sequence) =
+        consensus::read_immediate_predecessor_machine_sync(conn, storage_identity)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+    validate_consensus_sealed_records(conn, budget, logical_time)?;
+    validate_legacy_lease_state(conn, budget)?;
+    let committed = consensus::read_committed_sync(conn, storage_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let applied = consensus::read_applied_sync(conn, storage_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let purged = consensus::read_purged_sync(conn, storage_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let last_log = consensus::last_log_sync(conn, storage_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    validate_log_floors(
+        committed.as_ref(),
+        applied.as_ref(),
+        purged.as_ref(),
+        last_log.as_ref(),
+    )?;
+    let recovery = consensus::read_operator_recovery_sync(conn, storage_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let (replication_head, _) = validate_replication_sequence_domain(
+        conn,
+        budget,
+        recovery.watch_cursor_invalidation_floor,
+    )?;
+    if watch_sequence != replication_head {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    let branch_digest = immediate_predecessor_branch_digest(
+        conn,
+        storage_identity,
+        committed.as_ref(),
+        &paths.snapshots,
+        budget,
+        recovery.recovery_epoch,
+        recovery.pending_epoch,
+        recovery.pending_plan_digest,
+        recovery.pending_fence_high_water,
+        recovery.pending_credential_high_water,
+        recovery.watch_cursor_invalidation_floor,
+    )?;
+    let fence_high_water = consensus::observed_fence_high_water_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let credential_high_water = consensus::observed_credential_high_water_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let logical_state_digest = hash_logical_state(conn, budget)?;
+    budget.check()?;
+    Ok(RecoveryReplicaEvidence {
+        replica_token: super::replica_token(input.key, &input.replica.replica_id)?,
+        backing_identity: RecoveryDigest::from_bytes(input.replica.backing_identity.fingerprint()),
+        path_binding,
+        file_identity,
+        format: RecoveryReplicaFormat::ImmediatePredecessor,
+        cluster_digest: Some(RecoveryDigest::from_bytes(cluster)),
+        configuration_digest: Some(RecoveryDigest::from_bytes(
+            *input.identity.configuration_id().as_bytes(),
+        )),
+        configuration_epoch: Some(input.identity.configuration_epoch().get()),
+        recovery_epoch: recovery.recovery_epoch,
+        pending_recovery_epoch: recovery.pending_epoch,
+        pending_plan_digest: recovery.pending_plan_digest.map(RecoveryDigest::from_bytes),
+        pending_fence_high_water: recovery.pending_fence_high_water,
+        pending_credential_high_water: recovery.pending_credential_high_water,
         watch_cursor_invalidation_floor: recovery.watch_cursor_invalidation_floor,
         application_sequence,
         watch_sequence,
@@ -468,22 +623,46 @@ fn preflight_current_tables(
     conn: &Connection,
     budget: &InspectionBudget,
 ) -> Result<(), RecoveryError> {
+    preflight_consensus_tables(
+        conn,
+        budget,
+        "SELECT COUNT(*), COALESCE(MAX(MAX(length(CAST(request_id AS BLOB)), length(CAST(payload_digest AS BLOB)), length(CAST(command_json AS BLOB)), length(CAST(predecessor_digest AS BLOB)), COALESCE(length(CAST(predecessor_logical_time AS BLOB)), 0), length(CAST(predecessor_receipt_digest AS BLOB)), length(CAST(response_json AS BLOB)), length(CAST(receipt_digest AS BLOB)))), 0), COALESCE(SUM(length(CAST(request_id AS BLOB)) + length(CAST(payload_digest AS BLOB)) + length(CAST(command_json AS BLOB)) + length(CAST(predecessor_digest AS BLOB)) + COALESCE(length(CAST(predecessor_logical_time AS BLOB)), 0) + length(CAST(predecessor_receipt_digest AS BLOB)) + length(CAST(response_json AS BLOB)) + length(CAST(receipt_digest AS BLOB))), 0) FROM consensus_request_outcomes",
+        true,
+    )
+}
+
+fn preflight_immediate_predecessor_tables(
+    conn: &Connection,
+    budget: &InspectionBudget,
+) -> Result<(), RecoveryError> {
+    preflight_consensus_tables(
+        conn,
+        budget,
+        "SELECT COUNT(*), COALESCE(MAX(MAX(length(CAST(request_id AS BLOB)), length(CAST(payload_digest AS BLOB)), length(CAST(response_json AS BLOB)))), 0), COALESCE(SUM(length(CAST(request_id AS BLOB)) + length(CAST(payload_digest AS BLOB)) + length(CAST(response_json AS BLOB))), 0) FROM consensus_request_outcomes",
+        false,
+    )
+}
+
+fn preflight_consensus_tables(
+    conn: &Connection,
+    budget: &InspectionBudget,
+    outcomes_query: &str,
+    has_command_admission: bool,
+) -> Result<(), RecoveryError> {
     let mut total_bytes = 0_u64;
     for query in [
-        "SELECT COUNT(*), COALESCE(MAX(MAX(length(cluster_id), length(configuration_id))), 0), COALESCE(SUM(length(cluster_id) + length(configuration_id)), 0) FROM consensus_identity",
-        "SELECT COUNT(*), COALESCE(MAX(length(membership_json)), 0), COALESCE(SUM(length(membership_json)), 0) FROM consensus_membership",
-        "SELECT COUNT(*), COALESCE(MAX(length(vote_json)), 0), COALESCE(SUM(length(vote_json)), 0) FROM consensus_vote",
-        "SELECT COUNT(*), COALESCE(MAX(length(log_id_json)), 0), COALESCE(SUM(length(log_id_json)), 0) FROM consensus_committed",
-        "SELECT COUNT(*), COALESCE(MAX(length(log_id_json)), 0), COALESCE(SUM(length(log_id_json)), 0) FROM consensus_purged",
-        "SELECT COUNT(*), COALESCE(MAX(length(entry_json)), 0), COALESCE(SUM(length(entry_json)), 0) FROM consensus_log",
-        "SELECT COUNT(*), COALESCE(MAX(length(log_id_json)), 0), COALESCE(SUM(length(log_id_json)), 0) FROM consensus_applied",
-        "SELECT COUNT(*), COALESCE(MAX(MAX(length(meta_json), length(file_name), length(checksum))), 0), COALESCE(SUM(length(meta_json) + length(file_name) + length(checksum)), 0) FROM consensus_snapshot",
-        "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(payload_digest), length(response_json))), 0), COALESCE(SUM(length(request_id) + length(payload_digest) + length(response_json)), 0) FROM consensus_request_outcomes",
+        "SELECT COUNT(*), COALESCE(MAX(MAX(length(CAST(cluster_id AS BLOB)), length(CAST(configuration_id AS BLOB)))), 0), COALESCE(SUM(length(CAST(cluster_id AS BLOB)) + length(CAST(configuration_id AS BLOB))), 0) FROM consensus_identity",
+        "SELECT COUNT(*), COALESCE(MAX(length(CAST(membership_json AS BLOB))), 0), COALESCE(SUM(length(CAST(membership_json AS BLOB))), 0) FROM consensus_membership",
+        "SELECT COUNT(*), COALESCE(MAX(length(CAST(vote_json AS BLOB))), 0), COALESCE(SUM(length(CAST(vote_json AS BLOB))), 0) FROM consensus_vote",
+        "SELECT COUNT(*), COALESCE(MAX(length(CAST(log_id_json AS BLOB))), 0), COALESCE(SUM(length(CAST(log_id_json AS BLOB))), 0) FROM consensus_committed",
+        "SELECT COUNT(*), COALESCE(MAX(length(CAST(log_id_json AS BLOB))), 0), COALESCE(SUM(length(CAST(log_id_json AS BLOB))), 0) FROM consensus_purged",
+        "SELECT COUNT(*), COALESCE(MAX(length(CAST(entry_json AS BLOB))), 0), COALESCE(SUM(length(CAST(entry_json AS BLOB))), 0) FROM consensus_log",
+        "SELECT COUNT(*), COALESCE(MAX(length(CAST(log_id_json AS BLOB))), 0), COALESCE(SUM(length(CAST(log_id_json AS BLOB))), 0) FROM consensus_applied",
+        "SELECT COUNT(*), COALESCE(MAX(MAX(length(CAST(meta_json AS BLOB)), length(CAST(file_name AS BLOB)), length(CAST(checksum AS BLOB)))), 0), COALESCE(SUM(length(CAST(meta_json AS BLOB)) + length(CAST(file_name AS BLOB)) + length(CAST(checksum AS BLOB))), 0) FROM consensus_snapshot",
+        outcomes_query,
     ] {
         let (count, maximum, total): (i64, i64, i64) = conn
-            .query_row(query, [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
+            .query_row(query, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .map_err(|error| inspection_sql_error(error, budget))?;
         let count = u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
         let maximum = u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?;
@@ -498,10 +677,23 @@ fn preflight_current_tables(
             return Err(RecoveryError::WorkLimitExceeded);
         }
     }
+    if has_command_admission {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_command_admission",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| inspection_sql_error(error, budget))?;
+        let count = u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
+        if count > budget.limits.max_rows() {
+            return Err(RecoveryError::WorkLimitExceeded);
+        }
+    }
     if table_exists(conn, "consensus_operator_recovery")? {
         let (count, maximum, total): (i64, i64, i64) = conn
             .query_row(
-                "SELECT COUNT(*), COALESCE(MAX(MAX(length(last_plan_digest), COALESCE(length(pending_plan_digest), 0))), 0), COALESCE(SUM(length(last_plan_digest) + COALESCE(length(pending_plan_digest), 0)), 0) FROM consensus_operator_recovery",
+                "SELECT COUNT(*), COALESCE(MAX(MAX(length(CAST(last_plan_digest AS BLOB)), COALESCE(length(CAST(pending_plan_digest AS BLOB)), 0))), 0), COALESCE(SUM(length(CAST(last_plan_digest AS BLOB)) + COALESCE(length(CAST(pending_plan_digest AS BLOB)), 0)), 0) FROM consensus_operator_recovery",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -522,7 +714,7 @@ fn preflight_current_tables(
     if table_exists(conn, "consensus_membership_scope")? {
         let (count, maximum, total): (i64, i64, i64) = conn
             .query_row(
-                "SELECT COUNT(*), COALESCE(MAX(MAX(length(current_members_json), length(application_authority_members_json), COALESCE(length(predecessor_members_json), 0), COALESCE(length(desired_members_json), 0))), 0), COALESCE(SUM(length(current_members_json) + length(application_authority_members_json) + COALESCE(length(predecessor_members_json), 0) + COALESCE(length(desired_members_json), 0)), 0) FROM consensus_membership_scope",
+                "SELECT COUNT(*), COALESCE(MAX(MAX(length(CAST(current_members_json AS BLOB)), length(CAST(application_authority_members_json AS BLOB)), COALESCE(length(CAST(predecessor_members_json AS BLOB)), 0), COALESCE(length(CAST(desired_members_json AS BLOB)), 0))), 0), COALESCE(SUM(length(CAST(current_members_json AS BLOB)) + length(CAST(application_authority_members_json AS BLOB)) + COALESCE(length(CAST(predecessor_members_json AS BLOB)), 0) + COALESCE(length(CAST(desired_members_json AS BLOB)), 0)), 0) FROM consensus_membership_scope",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -543,7 +735,7 @@ fn preflight_current_tables(
     if table_exists(conn, "consensus_membership_history")? {
         let (count, maximum, total): (i64, i64, i64) = conn
             .query_row(
-                "SELECT COUNT(*), COALESCE(MAX(length(members_json)), 0), COALESCE(SUM(length(members_json)), 0) FROM consensus_membership_history",
+                "SELECT COUNT(*), COALESCE(MAX(length(CAST(members_json AS BLOB))), 0), COALESCE(SUM(length(CAST(members_json AS BLOB))), 0) FROM consensus_membership_history",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -564,7 +756,7 @@ fn preflight_current_tables(
     if table_exists(conn, "consensus_membership_terminal_history")? {
         let (count, maximum, total): (i64, i64, i64) = conn
             .query_row(
-                "SELECT COUNT(*), COALESCE(MAX(length(transition_id) + length(transition_digest)), 0), COALESCE(SUM(length(transition_id) + length(transition_digest)), 0) FROM consensus_membership_terminal_history",
+                "SELECT COUNT(*), COALESCE(MAX(length(CAST(transition_id AS BLOB)) + length(CAST(transition_digest AS BLOB))), 0), COALESCE(SUM(length(CAST(transition_id AS BLOB)) + length(CAST(transition_digest AS BLOB))), 0) FROM consensus_membership_terminal_history",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -624,6 +816,8 @@ fn committed_branch_digest(
     recovery_epoch: u64,
     pending_epoch: Option<u64>,
     pending_plan_digest: Option<[u8; 32]>,
+    pending_fence_high_water: Option<u64>,
+    pending_credential_high_water: Option<u64>,
     watch_cursor_invalidation_floor: u64,
 ) -> Result<RecoveryDigest, RecoveryError> {
     let mut hasher = Sha256::new();
@@ -633,13 +827,20 @@ fn committed_branch_digest(
     hasher.update(identity.configuration_epoch().get().to_be_bytes());
     hasher.update(recovery_epoch.to_be_bytes());
     hasher.update(watch_cursor_invalidation_floor.to_be_bytes());
-    match (pending_epoch, pending_plan_digest) {
-        (Some(epoch), Some(digest)) => {
+    match (
+        pending_epoch,
+        pending_plan_digest,
+        pending_fence_high_water,
+        pending_credential_high_water,
+    ) {
+        (Some(epoch), Some(digest), Some(fence), Some(credential)) => {
             hasher.update([1]);
             hasher.update(epoch.to_be_bytes());
             hasher.update(digest);
+            hasher.update(fence.to_be_bytes());
+            hasher.update(credential.to_be_bytes());
         }
-        (None, None) => hasher.update([0]),
+        (None, None, None, None) => hasher.update([0]),
         _ => return Err(RecoveryError::CorruptReplica),
     }
     let Some(committed) = committed else {
@@ -688,6 +889,86 @@ fn committed_branch_digest(
     Ok(RecoveryDigest::from_bytes(hasher.finalize().into()))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn immediate_predecessor_branch_digest(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    committed: Option<&LogId<SessionConsensusNodeId>>,
+    snapshot_dir: &Path,
+    budget: &mut InspectionBudget,
+    recovery_epoch: u64,
+    pending_epoch: Option<u64>,
+    pending_plan_digest: Option<[u8; 32]>,
+    pending_fence_high_water: Option<u64>,
+    pending_credential_high_water: Option<u64>,
+    watch_cursor_invalidation_floor: u64,
+) -> Result<RecoveryDigest, RecoveryError> {
+    let mut hasher = Sha256::new();
+    hasher.update(IMMEDIATE_PREDECESSOR_BRANCH_DOMAIN);
+    hasher.update(identity.cluster_id().as_bytes());
+    hasher.update(identity.configuration_id().as_bytes());
+    hasher.update(identity.configuration_epoch().get().to_be_bytes());
+    hasher.update(recovery_epoch.to_be_bytes());
+    hasher.update(watch_cursor_invalidation_floor.to_be_bytes());
+    match (
+        pending_epoch,
+        pending_plan_digest,
+        pending_fence_high_water,
+        pending_credential_high_water,
+    ) {
+        (Some(epoch), Some(digest), Some(fence), Some(credential)) => {
+            hasher.update([1]);
+            hasher.update(epoch.to_be_bytes());
+            hasher.update(digest);
+            hasher.update(fence.to_be_bytes());
+            hasher.update(credential.to_be_bytes());
+        }
+        (None, None, None, None) => hasher.update([0]),
+        _ => return Err(RecoveryError::CorruptReplica),
+    }
+    if let Some(committed) = committed {
+        hasher.update([1]);
+        feed_json(&mut hasher, committed)?;
+        let end = committed
+            .index
+            .checked_add(1)
+            .ok_or(RecoveryError::CorruptReplica)?;
+        let entries =
+            consensus::read_log_range_sync(conn, identity, committed.index, Some(end), Some(1))
+                .map_err(|_| RecoveryError::CorruptReplica)?;
+        if let Some(entry) = entries.first() {
+            if entry.log_id != *committed {
+                return Err(RecoveryError::CorruptReplica);
+            }
+            hasher.update([1]);
+            feed_json(&mut hasher, entry)?;
+        } else {
+            let snapshot = consensus::read_current_snapshot_sync(conn, identity)
+                .map_err(|_| RecoveryError::CorruptReplica)?
+                .ok_or(RecoveryError::CorruptReplica)?;
+            if snapshot.0.last_log_id.as_ref() != Some(committed) {
+                return Err(RecoveryError::CorruptReplica);
+            }
+            let observed = verify_snapshot_file(
+                &snapshot_dir.join(&snapshot.1),
+                budget.limits.max_snapshot_bytes(),
+                Some(budget),
+            )?;
+            if observed.0 != snapshot.2 || observed.1 != snapshot.3 {
+                return Err(RecoveryError::CorruptReplica);
+            }
+            hasher.update([2]);
+            hasher.update(snapshot.2);
+            hasher.update(snapshot.3.to_be_bytes());
+            feed_json(&mut hasher, &snapshot.0)?;
+        }
+    } else {
+        hasher.update([0]);
+    }
+    hash_immediate_predecessor_checkpoint(conn, budget, &mut hasher)?;
+    Ok(RecoveryDigest::from_bytes(hasher.finalize().into()))
+}
+
 fn hash_current_checkpoint(
     conn: &Connection,
     budget: &mut InspectionBudget,
@@ -703,6 +984,7 @@ fn hash_current_checkpoint(
         "SELECT * FROM consensus_membership ORDER BY singleton",
         "SELECT * FROM consensus_applied ORDER BY singleton",
         "SELECT * FROM consensus_request_outcomes ORDER BY request_id",
+        "SELECT * FROM consensus_command_admission ORDER BY singleton",
     ] {
         hasher.update(
             u64::try_from(query.len())
@@ -745,6 +1027,44 @@ fn hash_current_checkpoint(
     Ok(())
 }
 
+fn hash_immediate_predecessor_checkpoint(
+    conn: &Connection,
+    budget: &mut InspectionBudget,
+    hasher: &mut Sha256,
+) -> Result<(), RecoveryError> {
+    for query in [
+        "SELECT * FROM session_records ORDER BY tenant, nf_kind, key_type, stable_id",
+        "SELECT * FROM leases ORDER BY tenant, nf_kind, key_type, stable_id",
+        "SELECT * FROM key_fences ORDER BY tenant, nf_kind, key_type, stable_id",
+        "SELECT * FROM lease_globals ORDER BY key",
+        "SELECT * FROM session_replication_log ORDER BY sequence",
+        "SELECT * FROM consensus_identity ORDER BY singleton",
+        "SELECT * FROM consensus_membership_scope ORDER BY singleton",
+        "SELECT * FROM consensus_membership_history ORDER BY configuration_epoch",
+        "SELECT * FROM consensus_membership_terminal_history ORDER BY transition_start_index, transition_id",
+        "SELECT * FROM consensus_candidate_bootstrap ORDER BY singleton",
+        "SELECT * FROM consensus_vote ORDER BY singleton",
+        "SELECT * FROM consensus_committed ORDER BY singleton",
+        "SELECT * FROM consensus_purged ORDER BY singleton",
+        "SELECT * FROM consensus_log ORDER BY log_index",
+        "SELECT * FROM consensus_applied ORDER BY singleton",
+        "SELECT * FROM consensus_membership ORDER BY singleton",
+        "SELECT * FROM consensus_machine ORDER BY singleton",
+        "SELECT * FROM consensus_request_outcomes ORDER BY request_id",
+        "SELECT * FROM consensus_snapshot ORDER BY singleton",
+        "SELECT * FROM consensus_operator_recovery ORDER BY singleton",
+    ] {
+        hasher.update(
+            u64::try_from(query.len())
+                .map_err(|_| RecoveryError::WorkLimitExceeded)?
+                .to_be_bytes(),
+        );
+        hasher.update(query.as_bytes());
+        hash_query_rows(conn, query, budget, hasher)?;
+    }
+    Ok(())
+}
+
 fn inspect_legacy(
     input: InspectionInput<'_>,
     conn: &Connection,
@@ -753,9 +1073,9 @@ fn inspect_legacy(
     budget: &mut InspectionBudget,
 ) -> Result<RecoveryReplicaEvidence, RecoveryError> {
     validate_legacy_schema(conn)?;
-    validate_consensus_sealed_records(conn, budget)?;
+    let (_, replication_time) = validate_replication_sequence_domain(conn, budget, 0)?;
+    validate_consensus_sealed_records(conn, budget, replication_time)?;
     validate_legacy_lease_state(conn, budget)?;
-    validate_replication_sequence_domain(conn, budget, 0)?;
     let branch_digest = hash_legacy_state(conn, budget)?;
     let fence_high_water = consensus::observed_fence_high_water_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
@@ -774,7 +1094,19 @@ fn inspect_legacy(
         .map(u64::try_from)
         .transpose()
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    let sequence_high_water = local_head_index.unwrap_or(0);
+    // Standalone writes can persist sealed session state without producing a
+    // replication notification.  Such a record proves that this checkpoint
+    // has application history, but cannot prove an exact command count. Keep
+    // that one-step floor as plan evidence only: explicit legacy recovery
+    // deliberately resets the receipt-backed machine sequence to zero.
+    let has_sealed_application_state: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM session_records)", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let sequence_high_water = local_head_index
+        .unwrap_or(0)
+        .max(u64::from(has_sealed_application_state));
     Ok(RecoveryReplicaEvidence {
         replica_token: super::replica_token(input.key, &input.replica.replica_id)?,
         backing_identity: RecoveryDigest::from_bytes(input.replica.backing_identity.fingerprint()),
@@ -787,6 +1119,8 @@ fn inspect_legacy(
         recovery_epoch: 0,
         pending_recovery_epoch: None,
         pending_plan_digest: None,
+        pending_fence_high_water: None,
+        pending_credential_high_water: None,
         watch_cursor_invalidation_floor: 0,
         application_sequence: sequence_high_water,
         watch_sequence: sequence_high_water,
@@ -869,7 +1203,7 @@ fn validate_legacy_schema(conn: &Connection) -> Result<(), RecoveryError> {
     }
     let mut statement = conn
         .prepare(
-            "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+            "SELECT type, name FROM sqlite_master WHERE substr(name, 1, 7) != 'sqlite_' COLLATE NOCASE ORDER BY type, name",
         )
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let objects = statement
@@ -1042,6 +1376,20 @@ fn validate_exact_recovery_schema(
         .map_err(|_| RecoveryError::DatabaseUnavailable)?;
     let migrated_operator = schema_object_sql(&canonical, "consensus_operator_recovery")?
         .ok_or(RecoveryError::DatabaseUnavailable)?;
+    canonical
+        .execute_batch("DROP TABLE consensus_operator_recovery")
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    consensus::install_cursor_migrated_operator_recovery_validation_schema_sync(&canonical)
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    let cursor_migrated_operator = schema_object_sql(&canonical, "consensus_operator_recovery")?
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
+    canonical
+        .execute_batch("DROP TABLE consensus_operator_recovery")
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    consensus::install_pre_high_water_operator_recovery_validation_schema_sync(&canonical)
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    let pre_high_water_operator = schema_object_sql(&canonical, "consensus_operator_recovery")?
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
 
     let mut observed = recovery_schema_manifest(conn)?;
     match observed.remove("restore_scan_state") {
@@ -1052,7 +1400,11 @@ fn validate_exact_recovery_schema(
     }
     match observed.remove("consensus_operator_recovery") {
         Some(sql)
-            if sql == canonical_operator || sql == add_on_operator || sql == migrated_operator => {}
+            if sql == canonical_operator
+                || sql == add_on_operator
+                || sql == migrated_operator
+                || sql == cursor_migrated_operator
+                || sql == pre_high_water_operator => {}
         Some(_) => return Err(RecoveryError::CorruptReplica),
         None if require_recovery_table => return Err(RecoveryError::CorruptReplica),
         None => {}
@@ -1093,7 +1445,7 @@ fn validate_exact_recovery_schema(
 fn recovery_schema_manifest(conn: &Connection) -> Result<BTreeMap<String, String>, RecoveryError> {
     let mut statement = conn
         .prepare(
-            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+            "SELECT type, name, sql FROM sqlite_master WHERE substr(name, 1, 7) != 'sqlite_' COLLATE NOCASE ORDER BY type, name",
         )
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let mut rows = statement
@@ -1189,17 +1541,18 @@ fn hash_logical_state(
 fn validate_consensus_sealed_records(
     conn: &Connection,
     budget: &mut InspectionBudget,
+    expiry_reference: Option<Timestamp>,
 ) -> Result<(), RecoveryError> {
     let (count, max_value, total_value): (i64, i64, i64) = conn
         .query_row(
             r#"
             SELECT COUNT(*),
-                   COALESCE(MAX(MAX(length(stable_id), length(payload))), 0),
+                   COALESCE(MAX(MAX(length(CAST(stable_id AS BLOB)), length(CAST(payload AS BLOB)))), 0),
                    COALESCE(SUM(
-                       length(tenant) + length(nf_kind) + length(key_type) +
-                       length(stable_id) + length(owner) + length(state_class) +
-                       length(state_type) + COALESCE(length(expires_at), 0) +
-                       length(payload)
+                       length(CAST(tenant AS BLOB)) + length(CAST(nf_kind AS BLOB)) + length(CAST(key_type AS BLOB)) +
+                       length(CAST(stable_id AS BLOB)) + length(CAST(owner AS BLOB)) + length(CAST(state_class AS BLOB)) +
+                       length(CAST(state_type AS BLOB)) + COALESCE(length(CAST(expires_at AS BLOB)), 0) +
+                       length(CAST(payload AS BLOB))
                    ), 0)
             FROM session_records
             "#,
@@ -1273,6 +1626,18 @@ fn validate_consensus_sealed_records(
         .map_err(|_| RecoveryError::CorruptReplica)?;
         crate::sqlite::validate_consensus_record(&record)
             .map_err(|_| RecoveryError::CorruptReplica)?;
+        // The semantic profile does not need a clock and must be checked even
+        // when an old checkpoint has no finite expiry authority.  A finite
+        // deadline, however, is accepted only against a persisted authority:
+        // never the recovery host's wall clock.
+        crate::ttl::validate_stored_record_expiry_profile(&record)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        match expiry_reference {
+            Some(reference) => crate::ttl::validate_stored_record_expiry_at(&record, reference)
+                .map_err(|_| RecoveryError::CorruptReplica)?,
+            None if record.expires_at.is_some() => return Err(RecoveryError::CorruptReplica),
+            None => {}
+        }
     }
     Ok(())
 }
@@ -1285,21 +1650,18 @@ fn validate_legacy_lease_state(
     let mut maximum_value_bytes = 0_u64;
     let mut total_value_bytes = 0_u64;
     for query in [
-        "SELECT COUNT(*), COALESCE(MAX(MAX(length(tenant), length(nf_kind), length(key_type), length(stable_id), length(owner), length(guard_expires_at))), 0), COALESCE(SUM(length(tenant) + length(nf_kind) + length(key_type) + length(stable_id) + length(owner) + length(guard_expires_at)), 0) FROM leases",
-        "SELECT COUNT(*), COALESCE(MAX(MAX(length(tenant), length(nf_kind), length(key_type), length(stable_id))), 0), COALESCE(SUM(length(tenant) + length(nf_kind) + length(key_type) + length(stable_id)), 0) FROM key_fences",
-        "SELECT COUNT(*), COALESCE(MAX(length(key)), 0), COALESCE(SUM(length(key)), 0) FROM lease_globals",
+        "SELECT COUNT(*), COALESCE(MAX(MAX(length(CAST(tenant AS BLOB)), length(CAST(nf_kind AS BLOB)), length(CAST(key_type AS BLOB)), length(CAST(stable_id AS BLOB)), length(CAST(owner AS BLOB)), length(CAST(guard_expires_at AS BLOB)))), 0), COALESCE(SUM(length(CAST(tenant AS BLOB)) + length(CAST(nf_kind AS BLOB)) + length(CAST(key_type AS BLOB)) + length(CAST(stable_id AS BLOB)) + length(CAST(owner AS BLOB)) + length(CAST(guard_expires_at AS BLOB))), 0) FROM leases",
+        "SELECT COUNT(*), COALESCE(MAX(MAX(length(CAST(tenant AS BLOB)), length(CAST(nf_kind AS BLOB)), length(CAST(key_type AS BLOB)), length(CAST(stable_id AS BLOB)))), 0), COALESCE(SUM(length(CAST(tenant AS BLOB)) + length(CAST(nf_kind AS BLOB)) + length(CAST(key_type AS BLOB)) + length(CAST(stable_id AS BLOB))), 0) FROM key_fences",
+        "SELECT COUNT(*), COALESCE(MAX(length(CAST(key AS BLOB))), 0), COALESCE(SUM(length(CAST(key AS BLOB))), 0) FROM lease_globals",
     ] {
         let (count, maximum, total): (i64, i64, i64) = conn
-            .query_row(query, [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
+            .query_row(query, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .map_err(|error| inspection_sql_error(error, budget))?;
         row_count = row_count
             .checked_add(u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?)
             .ok_or(RecoveryError::WorkLimitExceeded)?;
-        maximum_value_bytes = maximum_value_bytes.max(
-            u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?,
-        );
+        maximum_value_bytes = maximum_value_bytes
+            .max(u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?);
         total_value_bytes = total_value_bytes
             .checked_add(u64::try_from(total).map_err(|_| RecoveryError::CorruptReplica)?)
             .ok_or(RecoveryError::WorkLimitExceeded)?;
@@ -1319,7 +1681,7 @@ fn validate_replication_sequence_domain(
     conn: &Connection,
     budget: &mut InspectionBudget,
     invalidation_floor: u64,
-) -> Result<u64, RecoveryError> {
+) -> Result<(u64, Option<Timestamp>), RecoveryError> {
     let (minimum, maximum, count, max_value, total_value): (
         Option<i64>,
         Option<i64>,
@@ -1330,8 +1692,8 @@ fn validate_replication_sequence_domain(
         .query_row(
             r#"
             SELECT MIN(sequence), MAX(sequence), COUNT(*),
-                   COALESCE(MAX(MAX(length(tx_id), length(entry_json), length(timestamp))), 0),
-                   COALESCE(SUM(length(tx_id) + length(entry_json) + length(timestamp)), 0)
+                   COALESCE(MAX(MAX(length(CAST(tx_id AS BLOB)), length(CAST(entry_json AS BLOB)), length(CAST(timestamp AS BLOB)))), 0),
+                   COALESCE(SUM(length(CAST(tx_id AS BLOB)) + length(CAST(entry_json AS BLOB)) + length(CAST(timestamp AS BLOB))), 0)
             FROM session_replication_log
             "#,
             [],
@@ -1359,7 +1721,7 @@ fn validate_replication_sequence_domain(
         if minimum.is_some() || maximum.is_some() {
             return Err(RecoveryError::CorruptReplica);
         }
-        return Ok(invalidation_floor);
+        return Ok((invalidation_floor, None));
     }
     let minimum = minimum
         .and_then(|value| u64::try_from(value).ok())
@@ -1386,6 +1748,7 @@ fn validate_replication_sequence_domain(
         .query([])
         .map_err(|error| inspection_sql_error(error, budget))?;
     let mut expected = expected_minimum;
+    let mut final_timestamp = None;
     while let Some(row) = rows
         .next()
         .map_err(|error| inspection_sql_error(error, budget))?
@@ -1434,6 +1797,7 @@ fn validate_replication_sequence_domain(
         {
             return Err(RecoveryError::CorruptReplica);
         }
+        final_timestamp = Some(entry.timestamp);
         expected = expected
             .checked_add(1)
             .ok_or(RecoveryError::CorruptReplica)?;
@@ -1441,7 +1805,125 @@ fn validate_replication_sequence_domain(
     if expected.checked_sub(1) != Some(expected_maximum) {
         return Err(RecoveryError::CorruptReplica);
     }
-    Ok(expected_maximum)
+    Ok((expected_maximum, final_timestamp))
+}
+
+#[cfg(test)]
+mod byte_budget_tests {
+    use super::*;
+
+    fn budget(max_value_bytes: u64) -> InspectionBudget {
+        InspectionBudget::new(
+            RecoveryLimits::try_new_with_work_budget(
+                1_024,
+                1_024,
+                128,
+                max_value_bytes,
+                1_024,
+                Duration::from_secs(1),
+            )
+            .expect("test limits"),
+        )
+    }
+
+    #[test]
+    fn current_table_preflight_counts_utf8_bytes_not_text_characters() {
+        let conn = Connection::open_in_memory().expect("open in-memory SQLite");
+        conn.execute_batch(
+            "
+            CREATE TABLE consensus_identity (cluster_id, configuration_id);
+            CREATE TABLE consensus_membership (membership_json);
+            CREATE TABLE consensus_vote (vote_json);
+            CREATE TABLE consensus_committed (log_id_json);
+            CREATE TABLE consensus_purged (log_id_json);
+            CREATE TABLE consensus_log (entry_json);
+            CREATE TABLE consensus_applied (log_id_json);
+            CREATE TABLE consensus_snapshot (meta_json, file_name, checksum);
+            CREATE TABLE consensus_request_outcomes (request_id, payload_digest, command_json, predecessor_sequence, predecessor_digest, predecessor_logical_time, predecessor_receipt_digest, raft_log_index, response_json, receipt_version, receipt_digest);
+            CREATE TABLE consensus_command_admission (singleton);
+            INSERT INTO consensus_membership VALUES ('éé');
+            ",
+        )
+        .expect("create current-table canary");
+        assert_eq!(preflight_current_tables(&conn, &budget(4)), Ok(()));
+        assert_eq!(
+            preflight_current_tables(&conn, &budget(3)),
+            Err(RecoveryError::WorkLimitExceeded),
+            "a character-count preflight would proceed to later recovery phases"
+        );
+    }
+
+    #[test]
+    fn sealed_record_preflight_rejects_multibyte_dynamic_text_before_record_decode() {
+        let conn = Connection::open_in_memory().expect("open in-memory SQLite");
+        conn.execute_batch(
+            "
+            CREATE TABLE session_records (
+                tenant, nf_kind, key_type, stable_id, generation, owner, fence,
+                state_class, state_type, expires_at, payload, encoding
+            );
+            INSERT INTO session_records VALUES
+                ('éé', '', '', X'01', 1, '', 1, '', '', NULL, X'01', '');
+            ",
+        )
+        .expect("create sealed-record canary");
+        assert_ne!(
+            validate_consensus_sealed_records(&conn, &mut budget(4), None),
+            Err(RecoveryError::WorkLimitExceeded),
+            "the exact byte budget reaches the record decoder canary"
+        );
+        assert_eq!(
+            validate_consensus_sealed_records(&conn, &mut budget(3), None),
+            Err(RecoveryError::WorkLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn legacy_lease_preflight_rejects_multibyte_dynamic_text_before_lease_validation() {
+        let conn = Connection::open_in_memory().expect("open in-memory SQLite");
+        conn.execute_batch(
+            "
+            CREATE TABLE leases (
+                tenant, nf_kind, key_type, stable_id, active, credential_id, owner,
+                fence, expires_at_unix_ms, guard_expires_at
+            );
+            CREATE TABLE key_fences (tenant, nf_kind, key_type, stable_id, fence);
+            CREATE TABLE lease_globals (key, val);
+            INSERT INTO leases VALUES ('éé', '', '', X'01', 1, X'01', '', 1, 0, '');
+            ",
+        )
+        .expect("create lease canary");
+        assert_ne!(
+            validate_legacy_lease_state(&conn, &mut budget(4)),
+            Err(RecoveryError::WorkLimitExceeded),
+            "the exact byte budget reaches the lease-state canary"
+        );
+        assert_eq!(
+            validate_legacy_lease_state(&conn, &mut budget(3)),
+            Err(RecoveryError::WorkLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn replication_preflight_rejects_multibyte_dynamic_text_before_sequence_validation() {
+        let conn = Connection::open_in_memory().expect("open in-memory SQLite");
+        conn.execute_batch(
+            "
+            CREATE TABLE session_replication_log (sequence, tx_id, entry_json, timestamp);
+            INSERT INTO session_replication_log VALUES (1, 'éé', X'01', '');
+            ",
+        )
+        .expect("create replication canary");
+        assert_ne!(
+            validate_replication_sequence_domain(&conn, &mut budget(4), 0),
+            Err(RecoveryError::WorkLimitExceeded),
+            "the exact byte budget reaches the sequence-domain canary"
+        );
+        assert_eq!(
+            validate_replication_sequence_domain(&conn, &mut budget(3), 0),
+            Err(RecoveryError::WorkLimitExceeded)
+        );
+    }
 }
 
 fn hash_query_rows(
@@ -2465,36 +2947,66 @@ fn stage_source(
     limits: RecoveryLimits,
 ) -> Result<Option<String>, RecoveryError> {
     let paths = canonical_replica_paths(source, false)?;
-    match plan.body.basis {
-        RecoveryDecisionBasis::VerifiedCommittedMajority => {
-            sqlite_backup(&paths.database, staged, limits.max_database_bytes())?;
-        }
-        RecoveryDecisionBasis::ExplicitLegacyCheckpoint => {
-            convert_legacy_checkpoint(&paths.database, staged, limits)?;
-        }
-    }
-    let staged_replica = RecoveryReplica::new_bound(
-        source.replica_id.clone(),
-        source.backing_identity.clone(),
-        source.admitted_identity,
-        staged.to_path_buf(),
-        paths.snapshots.clone(),
-    );
-    let staged_evidence = inspect_replica(InspectionInput {
-        key,
-        replica: &staged_replica,
-        identity: plan.body.identity,
-        expected_members: &plan.body.expected_members,
-        limits,
-    })?;
     let planned_source = plan
         .body
         .evidence
         .iter()
         .find(|item| item.replica_token == plan.body.source_token)
         .ok_or(RecoveryError::StalePlan)?;
-    if !same_checkpoint(&staged_evidence, planned_source) {
+    // The checkpoint is a private, sealed copy, but still re-inspect it before
+    // it crosses the reset boundary. This makes an interrupted workflow fail
+    // closed if its sealed source has been substituted or corrupted.
+    let checkpoint_evidence = inspect_replica(InspectionInput {
+        key,
+        replica: source,
+        identity: plan.body.identity,
+        expected_members: &plan.body.expected_members,
+        limits,
+    })?;
+    if !same_checkpoint(&checkpoint_evidence, planned_source) {
         return Err(RecoveryError::SourceChanged);
+    }
+    let recovery_root_time = match plan.body.basis {
+        RecoveryDecisionBasis::VerifiedCommittedMajority => {
+            sqlite_backup(&paths.database, staged, limits.max_database_bytes())?;
+            None
+        }
+        RecoveryDecisionBasis::ExplicitLegacyCheckpoint => match planned_source.format {
+            RecoveryReplicaFormat::LegacyUnproven => {
+                convert_legacy_checkpoint(&paths.database, staged, limits)?;
+                None
+            }
+            RecoveryReplicaFormat::ImmediatePredecessor => {
+                convert_immediate_predecessor_checkpoint(
+                    &paths.database,
+                    staged,
+                    plan.body.identity,
+                    &plan.body.expected_members,
+                    planned_source.watch_cursor_invalidation_floor,
+                    limits,
+                )?
+            }
+            RecoveryReplicaFormat::Openraft => return Err(RecoveryError::StalePlan),
+        },
+    };
+    if planned_source.format != RecoveryReplicaFormat::ImmediatePredecessor {
+        let staged_replica = RecoveryReplica::new_bound(
+            source.replica_id.clone(),
+            source.backing_identity.clone(),
+            source.admitted_identity,
+            staged.to_path_buf(),
+            paths.snapshots.clone(),
+        );
+        let staged_evidence = inspect_replica(InspectionInput {
+            key,
+            replica: &staged_replica,
+            identity: plan.body.identity,
+            expected_members: &plan.body.expected_members,
+            limits,
+        })?;
+        if !same_checkpoint(&staged_evidence, planned_source) {
+            return Err(RecoveryError::SourceChanged);
+        }
     }
     let mut conn = open_read_write(staged)?;
     ensure_restore_scan_metadata(&conn)?;
@@ -2533,6 +3045,8 @@ fn stage_source(
                 storage_identity,
                 plan.body.next_recovery_epoch,
                 plan.plan_digest.as_bytes(),
+                plan.body.fence_high_water,
+                plan.body.credential_high_water,
             )
             .map_err(|_| RecoveryError::CorruptReplica)?;
             tx.execute("DELETE FROM session_replication_log", [])
@@ -2560,11 +3074,14 @@ fn stage_source(
                 &conn,
                 plan.body.identity,
                 &plan.body.expected_members,
-                plan.body.source_branch_digest.as_bytes(),
+                plan.plan_digest.as_bytes(),
                 plan.body.next_recovery_epoch,
                 plan.plan_digest.as_bytes(),
+                plan.body.fence_high_water,
+                plan.body.credential_high_water,
                 plan.body.application_sequence_high_water,
                 plan.body.watch_cursor_invalidation_floor,
+                recovery_root_time,
             )
             .map_err(|_| RecoveryError::CorruptReplica)?;
             validate_exact_recovery_schema(&conn, true)?;
@@ -2606,16 +3123,17 @@ fn convert_legacy_checkpoint(
     let mut source_budget = InspectionBudget::new(limits);
     validate_database_snapshot(&source_conn, &source_budget)?;
     validate_legacy_schema(&source_conn)?;
-    validate_consensus_sealed_records(&source_conn, &mut source_budget)?;
+    let (_, source_replication_time) =
+        validate_replication_sequence_domain(&source_conn, &mut source_budget, 0)?;
+    validate_consensus_sealed_records(&source_conn, &mut source_budget, source_replication_time)?;
     validate_legacy_lease_state(&source_conn, &mut source_budget)?;
-    validate_replication_sequence_domain(&source_conn, &mut source_budget, 0)?;
     let before = hash_legacy_state(&source_conn, &mut source_budget)?;
 
-    drop(private_create_new(destination)?);
     drop(
         crate::sqlite::SqliteSessionBackend::open(destination)
             .map_err(|_| RecoveryError::FileOperationFailed)?,
     );
+    set_private_file_permissions(destination)?;
     let mut destination_conn = open_read_write(destination)?;
     let tx = destination_conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2665,9 +3183,14 @@ fn convert_legacy_checkpoint(
     let destination_conn = open_read_only(destination)?;
     validate_legacy_schema(&destination_conn)?;
     let mut destination_budget = InspectionBudget::new(limits);
-    validate_consensus_sealed_records(&destination_conn, &mut destination_budget)?;
+    let (_, destination_replication_time) =
+        validate_replication_sequence_domain(&destination_conn, &mut destination_budget, 0)?;
+    validate_consensus_sealed_records(
+        &destination_conn,
+        &mut destination_budget,
+        destination_replication_time,
+    )?;
     validate_legacy_lease_state(&destination_conn, &mut destination_budget)?;
-    validate_replication_sequence_domain(&destination_conn, &mut destination_budget, 0)?;
     let after = hash_legacy_state(&destination_conn, &mut destination_budget)?;
     if before != after {
         return Err(RecoveryError::SourceChanged);
@@ -2675,6 +3198,149 @@ fn convert_legacy_checkpoint(
     open_regular_read(destination)
         .and_then(|file| file.sync_all())
         .map_err(|_| RecoveryError::FileOperationFailed)
+}
+
+/// Convert the reviewed predecessor into a fresh local-state database before
+/// claiming it.  This intentionally copies no consensus object: old
+/// `consensus_request_outcomes` have command-only provenance and cannot be
+/// promoted into v2 command/result receipts.  The destination's subsequent
+/// plan-bound root is therefore the first authority for its new receipt chain.
+fn convert_immediate_predecessor_checkpoint(
+    source: &Path,
+    destination: &Path,
+    identity: SessionConsensusIdentity,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    replication_invalidation_floor: u64,
+    limits: RecoveryLimits,
+) -> Result<Option<Timestamp>, RecoveryError> {
+    let source_conn = open_read_only(source)?;
+    let mut source_budget = InspectionBudget::new(limits);
+    validate_database_snapshot(&source_conn, &source_budget)?;
+    if !is_exact_immediate_predecessor_schema(&source_conn)? {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    preflight_immediate_predecessor_tables(&source_conn, &source_budget)?;
+    let source_identity = consensus::read_storage_identity_sync(&source_conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if source_identity != identity {
+        return Err(RecoveryError::WrongCluster);
+    }
+    let membership_scope = consensus::read_membership_scope_sync(&source_conn, source_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if membership_scope.current_identity != identity
+        || membership_scope.current_members != *expected_members
+    {
+        return Err(RecoveryError::WrongCluster);
+    }
+    consensus::read_membership_sync(&source_conn, source_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let (_, _, source_logical_time, source_watch_sequence) =
+        consensus::read_immediate_predecessor_machine_sync(&source_conn, source_identity)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+    validate_consensus_sealed_records(&source_conn, &mut source_budget, source_logical_time)?;
+    validate_legacy_lease_state(&source_conn, &mut source_budget)?;
+    let committed = consensus::read_committed_sync(&source_conn, source_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let applied = consensus::read_applied_sync(&source_conn, source_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let purged = consensus::read_purged_sync(&source_conn, source_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let last_log = consensus::last_log_sync(&source_conn, source_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    validate_log_floors(
+        committed.as_ref(),
+        applied.as_ref(),
+        purged.as_ref(),
+        last_log.as_ref(),
+    )?;
+    let recovery = consensus::read_operator_recovery_sync(&source_conn, source_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if recovery.watch_cursor_invalidation_floor != replication_invalidation_floor {
+        return Err(RecoveryError::SourceChanged);
+    }
+    let (replication_head, _) = validate_replication_sequence_domain(
+        &source_conn,
+        &mut source_budget,
+        replication_invalidation_floor,
+    )?;
+    if source_watch_sequence != replication_head {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    let before = hash_legacy_state(&source_conn, &mut source_budget)?;
+
+    drop(
+        crate::sqlite::SqliteSessionBackend::open(destination)
+            .map_err(|_| RecoveryError::FileOperationFailed)?,
+    );
+    set_private_file_permissions(destination)?;
+    let mut destination_conn = open_read_write(destination)?;
+    let tx = destination_conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| RecoveryError::FileOperationFailed)?;
+    for table in [
+        "session_records",
+        "leases",
+        "key_fences",
+        "lease_globals",
+        "session_replication_log",
+    ] {
+        tx.execute(&format!("DELETE FROM {table}"), [])
+            .map_err(|_| RecoveryError::FileOperationFailed)?;
+    }
+    for (table, columns, column_count) in [
+        (
+            "session_records",
+            "tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding",
+            12,
+        ),
+        (
+            "leases",
+            "tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at",
+            10,
+        ),
+        (
+            "key_fences",
+            "tenant, nf_kind, key_type, stable_id, fence",
+            5,
+        ),
+        ("lease_globals", "key, val", 2),
+        (
+            "session_replication_log",
+            "sequence, tx_id, entry_json, timestamp",
+            4,
+        ),
+    ] {
+        copy_exact_table(&source_conn, &tx, table, columns, column_count)?;
+    }
+    tx.commit()
+        .map_err(|_| RecoveryError::FileOperationFailed)?;
+    destination_conn
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE;")
+        .map_err(|_| RecoveryError::FileOperationFailed)?;
+    drop(destination_conn);
+
+    let destination_conn = open_read_only(destination)?;
+    validate_legacy_schema(&destination_conn)?;
+    let mut destination_budget = InspectionBudget::new(limits);
+    validate_consensus_sealed_records(
+        &destination_conn,
+        &mut destination_budget,
+        source_logical_time,
+    )?;
+    validate_legacy_lease_state(&destination_conn, &mut destination_budget)?;
+    validate_replication_sequence_domain(
+        &destination_conn,
+        &mut destination_budget,
+        replication_invalidation_floor,
+    )?;
+    let after = hash_legacy_state(&destination_conn, &mut destination_budget)?;
+    if before != after {
+        return Err(RecoveryError::SourceChanged);
+    }
+    open_regular_read(destination)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| RecoveryError::FileOperationFailed)?;
+    Ok(source_logical_time)
 }
 
 fn copy_exact_table(
@@ -2739,7 +3405,9 @@ fn verify_staged_source(
         .ok_or(RecoveryError::StalePlan)?;
     if evidence.pending_recovery_epoch != Some(plan.body.next_recovery_epoch)
         || evidence.pending_plan_digest != Some(plan.plan_digest)
-        || evidence.application_sequence != plan.body.application_sequence_high_water
+        || evidence.pending_fence_high_water != Some(plan.body.fence_high_water)
+        || evidence.pending_credential_high_water != Some(plan.body.credential_high_water)
+        || evidence.application_sequence != staged_application_sequence(plan)
         || evidence.watch_sequence != plan.body.watch_cursor_invalidation_floor
         || evidence.watch_cursor_invalidation_floor != plan.body.watch_cursor_invalidation_floor
         || evidence.fence_high_water > plan.body.fence_high_water
@@ -2774,6 +3442,18 @@ fn verify_staged_source(
     Ok(())
 }
 
+/// An explicit legacy checkpoint deliberately starts a fresh receipt chain at
+/// the sealed plan root. Its old application counter is evidence-only and
+/// must not be represented as if old command/result receipts survived.
+fn staged_application_sequence(plan: &RecoveryPlan) -> u64 {
+    match plan.body.basis {
+        RecoveryDecisionBasis::VerifiedCommittedMajority => {
+            plan.body.application_sequence_high_water
+        }
+        RecoveryDecisionBasis::ExplicitLegacyCheckpoint => 0,
+    }
+}
+
 fn same_checkpoint(observed: &RecoveryReplicaEvidence, planned: &RecoveryReplicaEvidence) -> bool {
     observed.replica_token == planned.replica_token
         && observed.backing_identity == planned.backing_identity
@@ -2784,6 +3464,8 @@ fn same_checkpoint(observed: &RecoveryReplicaEvidence, planned: &RecoveryReplica
         && observed.recovery_epoch == planned.recovery_epoch
         && observed.pending_recovery_epoch == planned.pending_recovery_epoch
         && observed.pending_plan_digest == planned.pending_plan_digest
+        && observed.pending_fence_high_water == planned.pending_fence_high_water
+        && observed.pending_credential_high_water == planned.pending_credential_high_water
         && observed.watch_cursor_invalidation_floor == planned.watch_cursor_invalidation_floor
         && observed.application_sequence == planned.application_sequence
         && observed.watch_sequence == planned.watch_sequence
@@ -2895,7 +3577,9 @@ fn verify_target_installed(
         .ok_or(RecoveryError::StalePlan)?;
     if evidence.pending_recovery_epoch != Some(plan.body.next_recovery_epoch)
         || evidence.pending_plan_digest != Some(plan.plan_digest)
-        || evidence.application_sequence != plan.body.application_sequence_high_water
+        || evidence.pending_fence_high_water != Some(plan.body.fence_high_water)
+        || evidence.pending_credential_high_water != Some(plan.body.credential_high_water)
+        || evidence.application_sequence != staged_application_sequence(plan)
         || evidence.watch_sequence != plan.body.watch_cursor_invalidation_floor
         || evidence.watch_cursor_invalidation_floor != plan.body.watch_cursor_invalidation_floor
         || evidence.logical_state_digest != planned_source.logical_state_digest
@@ -2921,7 +3605,9 @@ fn verify_target_finalized(
     if evidence.recovery_epoch != plan.body.next_recovery_epoch
         || evidence.pending_recovery_epoch.is_some()
         || evidence.pending_plan_digest.is_some()
-        || evidence.application_sequence < plan.body.application_sequence_high_water
+        || evidence.pending_fence_high_water.is_some()
+        || evidence.pending_credential_high_water.is_some()
+        || evidence.application_sequence < staged_application_sequence(plan)
         || evidence.watch_sequence < plan.body.watch_cursor_invalidation_floor
         || evidence.watch_cursor_invalidation_floor < plan.body.watch_cursor_invalidation_floor
         || evidence.fence_high_water < plan.body.fence_high_water
@@ -3303,6 +3989,16 @@ fn set_private_directory_permissions(path: &Path) -> Result<(), RecoveryError> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|_| RecoveryError::FileOperationFailed)?;
+    }
+    Ok(())
+}
+
+fn set_private_file_permissions(path: &Path) -> Result<(), RecoveryError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .map_err(|_| RecoveryError::FileOperationFailed)?;
     }
     Ok(())

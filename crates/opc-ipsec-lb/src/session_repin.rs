@@ -7692,8 +7692,9 @@ mod tests {
         let directory = TestDirectory::new("encrypted-retirement-restart");
         let database_path = directory.path().join("session-store.sqlite");
         let provider = encryption_provider();
+        let sqlite = Arc::new(SqliteSessionBackend::open(&database_path).unwrap());
         let encrypted = EncryptingSessionBackend::new(
-            Arc::new(SqliteSessionBackend::open(&database_path).unwrap()),
+            Arc::clone(&sqlite),
             Arc::clone(&provider),
             "session-repin-retirement-sqlite",
         );
@@ -7705,6 +7706,14 @@ mod tests {
             .await
             .unwrap();
         drop(journal);
+        // Every detached lease cleanup is itself bounded by
+        // `SESSION_REPIN_RELEASE_TIMEOUT`. Waiting for its retained adapter
+        // reference gives this restart fixture a deterministic lifecycle
+        // boundary without weakening SQLite admission.
+        while Arc::strong_count(&sqlite) > 1 {
+            tokio::task::yield_now().await;
+        }
+        drop(sqlite);
 
         let restarted = SessionStoreRePinJournal::new(
             EncryptingSessionBackend::new(

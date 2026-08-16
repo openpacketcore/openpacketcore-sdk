@@ -1,16 +1,18 @@
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use opc_session_store::{
-    EncryptedSessionPayload, Generation, LeaseError, OwnerId, ReplicationEntry, ReplicationOp,
-    RestoreScanRequest, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager,
-    SessionPayloadEncoding, SqliteSessionBackend, StateClass, StateType, StoreError,
-    StoredSessionRecord, OWNER_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES,
+    EncryptedSessionPayload, Generation, OwnerId, ReplicationEntry, ReplicationOp, SessionBackend,
+    SessionKey, SessionKeyType, SessionLeaseManager, SqliteSessionBackend, StateClass, StateType,
+    StoreError, StoredSessionRecord, OWNER_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use rusqlite::{params, types::Value, Connection};
 use serde_json::Value as JsonValue;
-use tempfile::NamedTempFile;
+use tempfile::TempDir;
 
 const TENANT: &str = "tenant-persistence-test";
 const NF_KIND: &str = "smf";
@@ -28,11 +30,26 @@ struct DatabaseSnapshot {
     replication_log: Vec<Vec<Value>>,
 }
 
-fn initialized_database() -> NamedTempFile {
-    let file = NamedTempFile::new().expect("temporary SQLite file");
-    let backend = SqliteSessionBackend::open(file.path()).expect("initialize SQLite schema");
+struct InitializedDatabase {
+    _directory: TempDir,
+    path: PathBuf,
+}
+
+impl InitializedDatabase {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn initialized_database() -> InitializedDatabase {
+    let directory = tempfile::tempdir().expect("temporary SQLite directory");
+    let path = directory.path().join("session.sqlite");
+    let backend = SqliteSessionBackend::open(&path).expect("initialize SQLite schema");
     drop(backend);
-    file
+    InitializedDatabase {
+        _directory: directory,
+        path,
+    }
 }
 
 fn query_values(connection: &Connection, sql: &str) -> Vec<Vec<Value>> {
@@ -154,7 +171,7 @@ fn insert_raw_active_lease(connection: &Connection, session_key: &SessionKey, ow
         .execute(
             "INSERT INTO leases (\
                  tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, \
-                 expires_at_unix_ms, guard_expires_at\
+                    expires_at_unix_ms, guard_expires_at\
              ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9)",
             params![
                 session_key.tenant.as_str(),
@@ -279,7 +296,7 @@ fn assert_redacted_serialization_error(
         panic!("expected serialization error, got {error:?}");
     };
     assert!(
-        message.starts_with(fixed_message),
+        message == fixed_message,
         "unexpected serialization error: {message}"
     );
     assert!(
@@ -288,8 +305,25 @@ fn assert_redacted_serialization_error(
     );
 }
 
+fn reopen_rejects_invalid_persisted_state(path: &Path) -> StoreError {
+    match SqliteSessionBackend::open(path) {
+        Ok(_) => panic!("invalid persisted state must reject during construction"),
+        Err(error) => error,
+    }
+}
+
+fn assert_reopen_rejects_invalid_lease_authority(path: &Path) {
+    let Err(error) = SqliteSessionBackend::open(path) else {
+        panic!("invalid persisted authority must reject at reopen");
+    };
+    assert_eq!(
+        error,
+        StoreError::Serialization("persisted session lease authority is invalid".to_string())
+    );
+}
+
 #[tokio::test]
-async fn valid_raw_legacy_record_and_log_hydrate_without_rewrite() {
+async fn incomplete_raw_legacy_record_and_log_reject_without_rewrite() {
     let file = initialized_database();
     let session_key = legacy_key(b"valid-legacy-row");
     let owner = OwnerId::new(VALID_OWNER).expect("valid owner");
@@ -313,33 +347,10 @@ async fn valid_raw_legacy_record_and_log_hydrate_without_rewrite() {
     }
     let before = snapshot(file.path());
 
-    let backend = SqliteSessionBackend::open(file.path()).expect("open SQLite backend");
-    let record = backend
-        .get(&session_key)
-        .await
-        .expect("read legacy record")
-        .expect("legacy record exists");
-    assert_eq!(record.key.key_type, session_key.key_type);
-    assert_eq!(record.owner, owner);
     assert_eq!(
-        record.payload.encoding(),
-        SessionPayloadEncoding::LegacyPlaintext
+        reopen_rejects_invalid_persisted_state(file.path()),
+        StoreError::Serialization("persisted standalone session state is invalid".to_string())
     );
-    assert_eq!(record.payload.as_bytes(), b"legacy-payload");
-
-    let page = backend
-        .scan_restore_records(RestoreScanRequest::all(10))
-        .await
-        .expect("scan legacy record");
-    assert_eq!(page.records, vec![record]);
-    assert_eq!(
-        backend
-            .get_replication_log(1, 10)
-            .await
-            .expect("read legacy replication log"),
-        vec![entry]
-    );
-    drop(backend);
 
     assert_eq!(snapshot(file.path()), before);
 }
@@ -361,18 +372,11 @@ async fn invalid_persisted_record_owner_is_redacted_and_read_only() {
     }
     let before = snapshot(file.path());
 
-    let backend = SqliteSessionBackend::open(file.path()).expect("open SQLite backend");
-    let error = backend
-        .get(&session_key)
-        .await
-        .expect_err("reject invalid owner");
-    drop(backend);
-
-    assert_eq!(
-        error,
-        StoreError::Serialization("persisted session owner is invalid".to_string())
+    assert_redacted_serialization_error(
+        reopen_rejects_invalid_persisted_state(file.path()),
+        "persisted standalone session state is invalid",
+        &hostile_owner,
     );
-    assert!(!error.to_string().contains(&hostile_owner));
     assert_eq!(snapshot(file.path()), before);
 }
 
@@ -392,23 +396,16 @@ async fn invalid_persisted_record_key_type_is_redacted_and_read_only() {
     }
     let before = snapshot(file.path());
 
-    let backend = SqliteSessionBackend::open(file.path()).expect("open SQLite backend");
-    let error = backend
-        .scan_restore_records(RestoreScanRequest::all(10))
-        .await
-        .expect_err("reject invalid key type");
-    drop(backend);
-
-    assert_eq!(
-        error,
-        StoreError::Serialization("custom session key type must be at most 128 bytes".to_string())
+    assert_redacted_serialization_error(
+        reopen_rejects_invalid_persisted_state(file.path()),
+        "persisted standalone session state is invalid",
+        &hostile_key_type,
     );
-    assert!(!error.to_string().contains(&hostile_key_type));
     assert_eq!(snapshot(file.path()), before);
 }
 
 #[tokio::test]
-async fn invalid_active_lease_owner_blocks_acquire_without_mutation() {
+async fn invalid_active_lease_owner_rejects_reopen_without_mutation() {
     let file = initialized_database();
     let session_key = legacy_key(b"invalid-acquire-owner");
     let hostile_owner = invalid_owner();
@@ -418,31 +415,16 @@ async fn invalid_active_lease_owner_blocks_acquire_without_mutation() {
     }
     let before = snapshot(file.path());
 
-    let backend = SqliteSessionBackend::open(file.path()).expect("open SQLite backend");
-    let error = backend
-        .acquire(
-            &session_key,
-            OwnerId::new("acquire-challenger").expect("valid challenger"),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect_err("reject invalid active lease owner");
-    drop(backend);
-
-    assert_eq!(
-        error,
-        LeaseError::Backend("persisted session owner is invalid".to_string())
-    );
-    assert!(!error.to_string().contains(&hostile_owner));
+    assert_reopen_rejects_invalid_lease_authority(file.path());
     assert_eq!(snapshot(file.path()), before);
 }
 
 #[tokio::test]
-async fn invalid_active_lease_owner_blocks_renew_without_mutation() {
+async fn invalid_active_lease_owner_rejects_renew_reopen_without_mutation() {
     let file = initialized_database();
     let session_key = legacy_key(b"invalid-renew-owner");
     let backend = SqliteSessionBackend::open(file.path()).expect("open SQLite backend");
-    let lease = backend
+    let _lease = backend
         .acquire(
             &session_key,
             OwnerId::new("renew-owner").expect("valid owner"),
@@ -472,23 +454,12 @@ async fn invalid_active_lease_owner_blocks_renew_without_mutation() {
     }
     let before = snapshot(file.path());
 
-    let backend = SqliteSessionBackend::open(file.path()).expect("reopen SQLite backend");
-    let error = backend
-        .renew(&lease, Duration::from_secs(60))
-        .await
-        .expect_err("reject invalid active lease owner");
-    drop(backend);
-
-    assert_eq!(
-        error,
-        LeaseError::Backend("persisted session owner is invalid".to_string())
-    );
-    assert!(!error.to_string().contains(&hostile_owner));
+    assert_reopen_rejects_invalid_lease_authority(file.path());
     assert_eq!(snapshot(file.path()), before);
 }
 
 #[tokio::test]
-async fn invalid_active_lease_owner_blocks_fenced_mutation_without_mutation() {
+async fn invalid_active_lease_owner_rejects_fenced_mutation_reopen_without_mutation() {
     let file = initialized_database();
     let session_key = legacy_key(b"invalid-mutation-owner");
     let owner = OwnerId::new("mutation-owner").expect("valid owner");
@@ -529,23 +500,12 @@ async fn invalid_active_lease_owner_blocks_fenced_mutation_without_mutation() {
     }
     let before = snapshot(file.path());
 
-    let backend = SqliteSessionBackend::open(file.path()).expect("reopen SQLite backend");
-    let error = backend
-        .delete_fenced(&lease)
-        .await
-        .expect_err("reject mutation with invalid persisted owner");
-    drop(backend);
-
-    assert_eq!(
-        error,
-        StoreError::Serialization("persisted session owner is invalid".to_string())
-    );
-    assert!(!error.to_string().contains(&hostile_owner));
+    assert_reopen_rejects_invalid_lease_authority(file.path());
     assert_eq!(snapshot(file.path()), before);
 }
 
 #[tokio::test]
-async fn invalid_key_fence_identity_cannot_alias_a_valid_max_length_identity() {
+async fn invalid_key_fence_identity_rejects_reopen_without_mutation() {
     let file = initialized_database();
     let valid_key_type = "k".repeat(SESSION_KEY_TYPE_MAX_BYTES);
     let hostile_key_type = format!("{valid_key_type}k");
@@ -571,41 +531,9 @@ async fn invalid_key_fence_identity_cannot_alias_a_valid_max_length_identity() {
         SessionKeyType::other(hostile_key_type.clone()),
         Err("custom session key type must be at most 128 bytes".to_string())
     );
-    let valid_key = key(
-        SessionKeyType::other(valid_key_type.clone()).expect("valid maximum-length key type"),
-        stable_id,
-    );
-    let backend = SqliteSessionBackend::open(file.path()).expect("open SQLite backend");
-    let lease = backend
-        .acquire(
-            &valid_key,
-            OwnerId::new("valid-key-fence-owner").expect("valid owner"),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("acquire distinct valid key identity");
-    drop(backend);
-
-    let connection = Connection::open(file.path()).expect("open raw SQLite connection");
-    let hostile_fence: i64 = connection
-        .query_row(
-            "SELECT fence FROM key_fences \
-             WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4",
-            params![TENANT, NF_KIND, hostile_key_type, stable_id.as_slice()],
-            |row| row.get(0),
-        )
-        .expect("invalid identity remains present");
-    let valid_fence: i64 = connection
-        .query_row(
-            "SELECT fence FROM key_fences \
-             WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4",
-            params![TENANT, NF_KIND, valid_key_type, stable_id.as_slice()],
-            |row| row.get(0),
-        )
-        .expect("valid identity has an independent fence");
-    assert_eq!(hostile_fence, 777);
-    assert_eq!(valid_fence as u64, lease.fence().get());
-    assert_ne!(valid_fence, hostile_fence);
+    let before = snapshot(file.path());
+    assert_reopen_rejects_invalid_lease_authority(file.path());
+    assert_eq!(snapshot(file.path()), before);
 }
 
 #[tokio::test]
@@ -630,16 +558,9 @@ async fn invalid_nested_replication_log_owner_is_redacted_and_read_only() {
     }
     let before = snapshot(file.path());
 
-    let backend = SqliteSessionBackend::open(file.path()).expect("open SQLite backend");
-    let error = backend
-        .get_replication_log(1, 10)
-        .await
-        .expect_err("reject invalid nested owner");
-    drop(backend);
-
     assert_redacted_serialization_error(
-        error,
-        "owner id must be at most 128 bytes",
+        reopen_rejects_invalid_persisted_state(file.path()),
+        "persisted standalone session state is invalid",
         &hostile_owner,
     );
     assert_eq!(snapshot(file.path()), before);
@@ -670,16 +591,9 @@ async fn invalid_nested_replication_log_key_type_is_redacted_and_read_only() {
     }
     let before = snapshot(file.path());
 
-    let backend = SqliteSessionBackend::open(file.path()).expect("open SQLite backend");
-    let error = backend
-        .get_replication_log(1, 10)
-        .await
-        .expect_err("reject invalid nested key type");
-    drop(backend);
-
     assert_redacted_serialization_error(
-        error,
-        "custom session key type must be at most 128 bytes",
+        reopen_rejects_invalid_persisted_state(file.path()),
+        "persisted standalone session state is invalid",
         &hostile_key_type,
     );
     assert_eq!(snapshot(file.path()), before);
@@ -712,16 +626,9 @@ async fn invalid_nested_replication_log_stable_id_is_redacted_and_read_only() {
     }
     let before = snapshot(file.path());
 
-    let backend = SqliteSessionBackend::open(file.path()).expect("open SQLite backend");
-    let error = backend
-        .get_replication_log(1, 10)
-        .await
-        .expect_err("reject invalid nested stable ID");
-    drop(backend);
-
     assert_redacted_serialization_error(
-        error,
-        "stable session identifier must contain 1 to 64 bytes",
+        reopen_rejects_invalid_persisted_state(file.path()),
+        "persisted standalone session state is invalid",
         "[90,90,90",
     );
     assert_eq!(snapshot(file.path()), before);

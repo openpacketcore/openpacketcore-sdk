@@ -1541,13 +1541,12 @@ async fn consensus_claim_fences_retained_and_reopened_raw_sqlite_handles() {
         .expect("journal entry");
     assert_raw_consensus_guard(raw.replicate_entry(entry).await);
 
-    let reopened = SqliteSessionBackend::open(cluster._directory.path().join("node-0.sqlite"))
-        .expect("reopen consensus-owned SQLite file");
-    assert_raw_consensus_guard(reopened.get(&key).await);
-    assert_raw_consensus_lease_guard(
-        reopened
-            .acquire(&key, owner("reopened-owner"), Duration::from_secs(30))
-            .await,
+    assert!(
+        matches!(
+            SqliteSessionBackend::open(cluster._directory.path().join("node-0.sqlite")),
+            Err(StoreError::BackendUnavailable(_))
+        ),
+        "a live consensus owner must exclude a second raw admission"
     );
 
     let committed = store

@@ -14,15 +14,18 @@ use zeroize::Zeroizing;
 
 use super::{
     admitted_key_custody, install_key_custody_module, install_key_custody_module_with_report,
-    key_custody_required_capabilities, seal_with_slot, unseal_with_slot, KeyCustodyInstallError,
-    MAX_KEY_CUSTODY_BOUND_AAD_BYTES,
+    key_custody_required_capabilities, seal_with_key_id_with_slot, seal_with_slot,
+    unseal_with_slot, KeyCustodyInstallError, MAX_KEY_CUSTODY_BOUND_AAD_BYTES,
 };
 use crate::{
     key_id_from_bound_aad, serialize_bound_aad, EncryptedPayload, EnvelopeAad, KeyCustodyModule,
-    KeyCustodyOperationError, KeyError, KeyId, RemoteSealProvider, SessionAad,
+    KeyCustodyOperationError, KeyError, KeyId, RemoteSealCapabilities, RemoteSealProvider,
+    SessionAad,
 };
 
 const KEY_MATERIAL_CANARY: &str = "provider-owned-key-material-canary";
+const PROVIDER_PLAINTEXT: &[u8] = b"plaintext";
+const PROVIDER_UNSEAL_CIPHERTEXT_LEN: usize = PROVIDER_PLAINTEXT.len() + 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderMode {
@@ -31,6 +34,8 @@ enum ProviderMode {
     MalformedAad,
     NonCanonicalAad,
     MismatchedAad,
+    MalformedSealLength,
+    MalformedUnsealLength,
     NotFound,
     Unavailable,
     SensitiveError,
@@ -45,6 +50,7 @@ struct CountingCustodyModule {
     self_test_unavailable: Mutex<bool>,
     mode: Mutex<ProviderMode>,
     key_id: KeyId,
+    max_key_id_bytes: AtomicUsize,
     _provider_owned_key: Zeroizing<Vec<u8>>,
     self_test_calls: AtomicUsize,
     seal_calls: AtomicUsize,
@@ -79,6 +85,7 @@ impl CountingCustodyModule {
             self_test_unavailable: Mutex::new(false),
             mode: Mutex::new(ProviderMode::Valid),
             key_id: KeyId::new("provider-owned-session-key").expect("key id"),
+            max_key_id_bytes: AtomicUsize::new(512),
             _provider_owned_key: Zeroizing::new(KEY_MATERIAL_CANARY.as_bytes().to_vec()),
             self_test_calls: AtomicUsize::new(0),
             seal_calls: AtomicUsize::new(0),
@@ -121,10 +128,15 @@ impl CountingCustodyModule {
         *self.mode.lock().expect("provider mode lock") = mode;
     }
 
-    fn valid_payload(&self, aad: &EnvelopeAad) -> EncryptedPayload {
+    fn set_max_key_id_bytes(&self, max_key_id_bytes: usize) {
+        self.max_key_id_bytes
+            .store(max_key_id_bytes, Ordering::SeqCst);
+    }
+
+    fn valid_payload(&self, aad: &EnvelopeAad, plaintext: &[u8]) -> EncryptedPayload {
         EncryptedPayload {
             aad: serialize_bound_aad(aad, &self.key_id).expect("test AAD"),
-            ciphertext_and_tag: b"provider-ciphertext".to_vec(),
+            ciphertext_and_tag: vec![0xA5; plaintext.len() + 16],
         }
     }
 }
@@ -168,24 +180,34 @@ impl CryptoModule for CountingCustodyModule {
 
 #[async_trait]
 impl RemoteSealProvider for CountingCustodyModule {
+    fn capabilities(&self) -> RemoteSealCapabilities {
+        RemoteSealCapabilities {
+            max_seal_plaintext_bytes: 1024,
+            max_unseal_output_bytes: 1024,
+            max_round_trip_plaintext_bytes: 1024,
+            max_ciphertext_expansion_bytes: 16,
+            max_key_id_bytes: self.max_key_id_bytes.load(Ordering::SeqCst),
+        }
+    }
+
     async fn seal(
         &self,
         aad: &EnvelopeAad,
-        _plaintext: &[u8],
+        plaintext: &[u8],
     ) -> Result<EncryptedPayload, KeyError> {
         self.seal_calls.fetch_add(1, Ordering::SeqCst);
         match *self.mode.lock().expect("provider mode lock") {
-            ProviderMode::Valid => Ok(self.valid_payload(aad)),
+            ProviderMode::Valid => Ok(self.valid_payload(aad, plaintext)),
             ProviderMode::OversizedAad => Ok(EncryptedPayload {
                 aad: vec![b'x'; MAX_KEY_CUSTODY_BOUND_AAD_BYTES + 1],
-                ciphertext_and_tag: b"provider-ciphertext".to_vec(),
+                ciphertext_and_tag: vec![0xA5; plaintext.len() + 16],
             }),
             ProviderMode::MalformedAad => Ok(EncryptedPayload {
                 aad: b"{malformed".to_vec(),
-                ciphertext_and_tag: b"provider-ciphertext".to_vec(),
+                ciphertext_and_tag: vec![0xA5; plaintext.len() + 16],
             }),
             ProviderMode::NonCanonicalAad => {
-                let mut payload = self.valid_payload(aad);
+                let mut payload = self.valid_payload(aad, plaintext);
                 payload.aad.insert(0, b' ');
                 Ok(payload)
             }
@@ -196,8 +218,13 @@ impl RemoteSealProvider for CountingCustodyModule {
                     SessionAad::new("smf", "other-session", "state", 1, 1, "store")
                         .expect("other AAD"),
                 );
-                Ok(self.valid_payload(&other_aad))
+                Ok(self.valid_payload(&other_aad, plaintext))
             }
+            ProviderMode::MalformedSealLength => Ok(EncryptedPayload {
+                aad: serialize_bound_aad(aad, &self.key_id).expect("test AAD"),
+                ciphertext_and_tag: vec![0xA5; plaintext.len() + 15],
+            }),
+            ProviderMode::MalformedUnsealLength => Ok(self.valid_payload(aad, plaintext)),
             ProviderMode::NotFound => Err(KeyError::NotFound),
             ProviderMode::Unavailable => Err(KeyError::Unavailable),
             ProviderMode::SensitiveError => Err(KeyError::InvalidMetadata {
@@ -225,8 +252,19 @@ impl RemoteSealProvider for CountingCustodyModule {
             | ProviderMode::OversizedAad
             | ProviderMode::MalformedAad
             | ProviderMode::NonCanonicalAad
-            | ProviderMode::MismatchedAad => Ok(Zeroizing::new(b"provider-plaintext".to_vec())),
+            | ProviderMode::MismatchedAad
+            | ProviderMode::MalformedSealLength => Ok(Zeroizing::new(PROVIDER_PLAINTEXT.to_vec())),
+            ProviderMode::MalformedUnsealLength => Ok(Zeroizing::new(vec![0x5A; 1])),
         }
+    }
+
+    async fn seal_with_key_id(
+        &self,
+        _key_id: &KeyId,
+        aad: &EnvelopeAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedPayload, KeyError> {
+        self.seal(aad, plaintext).await
     }
 }
 
@@ -412,7 +450,8 @@ async fn live_checks_cover_the_complete_granted_set_before_dispatch() {
         module.key_id
     );
     assert_eq!(
-        valid.ciphertext_and_tag, b"provider-ciphertext",
+        valid.ciphertext_and_tag,
+        vec![0xA5; b"plaintext".len() + 16],
         "the admitted object must supply the exact provider result"
     );
     assert_eq!(module.seal_calls.load(Ordering::SeqCst), 1);
@@ -421,7 +460,7 @@ async fn live_checks_cover_the_complete_granted_set_before_dispatch() {
             .await
             .expect("admitted unseal")
             .as_slice(),
-        b"provider-plaintext"
+        PROVIDER_PLAINTEXT
     );
     assert_eq!(module.unseal_calls.load(Ordering::SeqCst), 1);
 
@@ -511,6 +550,73 @@ async fn provider_outputs_are_bounded_canonical_and_context_exact() {
 }
 
 #[tokio::test]
+async fn provider_output_length_contract_violations_are_invalid_provider_output() {
+    let required = key_custody_required_capabilities();
+    let module = Arc::new(CountingCustodyModule::new(required));
+    let slot = OnceLock::new();
+    let _admitted_report = install_key_custody_module_with_report(
+        &slot,
+        as_module(&module),
+        required_policy(),
+        report(&module).await,
+    )
+    .expect("install");
+    let aad = session_aad();
+
+    module.set_mode(ProviderMode::MalformedSealLength);
+    assert_custody_error(
+        seal_with_slot(&slot, &aad, PROVIDER_PLAINTEXT)
+            .await
+            .expect_err("successful malformed seal output must fail closed"),
+        KeyCustodyOperationError::InvalidProviderOutput,
+    );
+
+    module.set_mode(ProviderMode::MalformedUnsealLength);
+    assert_custody_error(
+        unseal_with_slot(
+            &slot,
+            &module.key_id,
+            &aad,
+            &[0xA5; PROVIDER_UNSEAL_CIPHERTEXT_LEN],
+        )
+        .await
+        .expect_err("successful malformed unseal output must fail closed"),
+        KeyCustodyOperationError::InvalidProviderOutput,
+    );
+}
+
+#[tokio::test]
+async fn provider_seal_with_key_id_requires_exact_and_bounded_returned_key_id() {
+    let required = key_custody_required_capabilities();
+    let module = Arc::new(CountingCustodyModule::new(required));
+    let slot = OnceLock::new();
+    let _admitted_report = install_key_custody_module_with_report(
+        &slot,
+        as_module(&module),
+        required_policy(),
+        report(&module).await,
+    )
+    .expect("install");
+    let aad = session_aad();
+    let requested = KeyId::new("requested-exact-key-generation").expect("requested key id");
+
+    assert_custody_error(
+        seal_with_key_id_with_slot(&slot, &requested, &aad, PROVIDER_PLAINTEXT)
+            .await
+            .expect_err("provider must not substitute another key generation"),
+        KeyCustodyOperationError::InvalidProviderOutput,
+    );
+
+    module.set_max_key_id_bytes(module.key_id.as_str().len() - 1);
+    assert_custody_error(
+        seal_with_key_id_with_slot(&slot, &module.key_id, &aad, PROVIDER_PLAINTEXT)
+            .await
+            .expect_err("returned key ID must fit the provider-declared bound"),
+        KeyCustodyOperationError::InvalidProviderOutput,
+    );
+}
+
+#[tokio::test]
 async fn provider_errors_preserve_only_safe_public_classifications() {
     let required = key_custody_required_capabilities();
     let module = Arc::new(CountingCustodyModule::new(required));
@@ -526,33 +632,53 @@ async fn provider_errors_preserve_only_safe_public_classifications() {
 
     module.set_mode(ProviderMode::NotFound);
     assert_eq!(
-        unseal_with_slot(&slot, &module.key_id, &aad, b"ciphertext")
-            .await
-            .expect_err("not found"),
+        unseal_with_slot(
+            &slot,
+            &module.key_id,
+            &aad,
+            &[0xA5; PROVIDER_UNSEAL_CIPHERTEXT_LEN],
+        )
+        .await
+        .expect_err("not found"),
         KeyError::NotFound
     );
 
     module.set_mode(ProviderMode::Unavailable);
     assert_eq!(
-        unseal_with_slot(&slot, &module.key_id, &aad, b"ciphertext")
-            .await
-            .expect_err("unavailable"),
+        unseal_with_slot(
+            &slot,
+            &module.key_id,
+            &aad,
+            &[0xA5; PROVIDER_UNSEAL_CIPHERTEXT_LEN],
+        )
+        .await
+        .expect_err("unavailable"),
         KeyError::Unavailable
     );
 
     module.set_mode(ProviderMode::SensitiveError);
-    let error = unseal_with_slot(&slot, &module.key_id, &aad, b"ciphertext")
-        .await
-        .expect_err("contextual provider errors must collapse");
+    let error = unseal_with_slot(
+        &slot,
+        &module.key_id,
+        &aad,
+        &[0xA5; PROVIDER_UNSEAL_CIPHERTEXT_LEN],
+    )
+    .await
+    .expect_err("contextual provider errors must collapse");
     assert_custody_error(error, KeyCustodyOperationError::ProviderOperationFailed);
 
     module.set_mode(ProviderMode::Valid);
     assert_eq!(
-        unseal_with_slot(&slot, &module.key_id, &aad, b"ciphertext")
-            .await
-            .expect("valid unseal")
-            .as_slice(),
-        b"provider-plaintext"
+        unseal_with_slot(
+            &slot,
+            &module.key_id,
+            &aad,
+            &[0xA5; PROVIDER_UNSEAL_CIPHERTEXT_LEN],
+        )
+        .await
+        .expect("valid unseal")
+        .as_slice(),
+        PROVIDER_PLAINTEXT
     );
     assert_eq!(
         module.self_test_calls.load(Ordering::SeqCst),
@@ -585,14 +711,17 @@ async fn process_install_returns_evidence_and_exposes_only_the_opaque_handle() {
         .seal(&aad, b"plaintext")
         .await
         .expect("process-routed seal");
-    assert_eq!(payload.ciphertext_and_tag, b"provider-ciphertext");
+    assert_eq!(
+        payload.ciphertext_and_tag,
+        vec![0xA5; b"plaintext".len() + 16]
+    );
     assert_eq!(
         handle
             .unseal(&module.key_id, &aad, payload.ciphertext_and_tag.as_slice())
             .await
             .expect("process-routed unseal")
             .as_slice(),
-        b"provider-plaintext"
+        PROVIDER_PLAINTEXT
     );
     assert_eq!(module.seal_calls.load(Ordering::SeqCst), 1);
     assert_eq!(module.unseal_calls.load(Ordering::SeqCst), 1);

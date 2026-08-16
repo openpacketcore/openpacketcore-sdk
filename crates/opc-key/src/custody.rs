@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 use crate::{
     decode_bound_aad,
     errors::{KeyCustodyOperationError, KeyError},
-    remote::RemoteSealProvider,
+    remote::{RemoteSealActiveKeyedDigest, RemoteSealCapabilities, RemoteSealProvider},
     scope::{serialize_bound_aad, EnvelopeAad, KeyId},
     EncryptedPayload,
 };
@@ -302,12 +302,37 @@ async fn seal_with_slot(
     plaintext: &[u8],
 ) -> Result<EncryptedPayload, KeyError> {
     let installed = select_module(slot).map_err(KeyError::from)?;
+    let capabilities = installed.module.capabilities();
+    capabilities.validate_seal_plaintext(plaintext.len())?;
     let payload = installed
         .module
         .seal(aad, plaintext)
         .await
         .map_err(map_provider_error)?;
-    validate_provider_payload(aad, payload)
+    validate_provider_output(
+        capabilities.validate_seal_output(plaintext.len(), payload.ciphertext_and_tag.len()),
+    )?;
+    validate_provider_payload(aad, capabilities, None, payload)
+}
+
+async fn seal_with_key_id_with_slot(
+    slot: &OnceLock<AdmittedKeyCustodyModule>,
+    key_id: &KeyId,
+    aad: &EnvelopeAad,
+    plaintext: &[u8],
+) -> Result<EncryptedPayload, KeyError> {
+    let installed = select_module(slot).map_err(KeyError::from)?;
+    let capabilities = installed.module.capabilities();
+    capabilities.validate_seal_plaintext(plaintext.len())?;
+    let payload = installed
+        .module
+        .seal_with_key_id(key_id, aad, plaintext)
+        .await
+        .map_err(map_provider_error)?;
+    validate_provider_output(
+        capabilities.validate_seal_output(plaintext.len(), payload.ciphertext_and_tag.len()),
+    )?;
+    validate_provider_payload(aad, capabilities, Some(key_id), payload)
 }
 
 async fn unseal_with_slot(
@@ -317,11 +342,21 @@ async fn unseal_with_slot(
     ciphertext_and_tag: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
     let installed = select_module(slot).map_err(KeyError::from)?;
-    installed
+    let capabilities = installed.module.capabilities();
+    capabilities.validate_unseal_input(ciphertext_and_tag.len())?;
+    let plaintext = installed
         .module
         .unseal(key_id, aad, ciphertext_and_tag)
         .await
-        .map_err(map_provider_error)
+        .map_err(map_provider_error)?;
+    validate_provider_output(
+        capabilities.validate_unseal_output(ciphertext_and_tag.len(), plaintext.len()),
+    )?;
+    Ok(plaintext)
+}
+
+fn validate_provider_output(result: Result<(), KeyError>) -> Result<(), KeyError> {
+    result.map_err(|_| KeyCustodyOperationError::InvalidProviderOutput.into())
 }
 
 fn map_provider_error(error: KeyError) -> KeyError {
@@ -334,6 +369,8 @@ fn map_provider_error(error: KeyError) -> KeyError {
 
 fn validate_provider_payload(
     expected_aad: &EnvelopeAad,
+    capabilities: RemoteSealCapabilities,
+    expected_key_id: Option<&KeyId>,
     payload: EncryptedPayload,
 ) -> Result<EncryptedPayload, KeyError> {
     if payload.aad.len() > MAX_KEY_CUSTODY_BOUND_AAD_BYTES {
@@ -343,6 +380,11 @@ fn validate_provider_payload(
     let (decoded_aad, returned_key_id) = decode_bound_aad(&payload.aad)
         .map_err(|_| KeyError::from(KeyCustodyOperationError::InvalidProviderOutput))?;
     if &decoded_aad != expected_aad {
+        return Err(KeyCustodyOperationError::InvalidProviderOutput.into());
+    }
+    if returned_key_id.as_str().len() > capabilities.max_key_id_bytes
+        || expected_key_id.is_some_and(|expected| expected != &returned_key_id)
+    {
         return Err(KeyCustodyOperationError::InvalidProviderOutput.into());
     }
 
@@ -356,6 +398,47 @@ fn validate_provider_payload(
 
 #[async_trait]
 impl RemoteSealProvider for AdmittedKeyCustody {
+    fn capabilities(&self) -> RemoteSealCapabilities {
+        KEY_CUSTODY_MODULE
+            .get()
+            .map(|installed| installed.module.capabilities())
+            .unwrap_or_else(RemoteSealCapabilities::unavailable)
+    }
+
+    async fn active_keyed_digest(
+        &self,
+        domain: &[u8],
+        input: &[u8],
+    ) -> Result<RemoteSealActiveKeyedDigest, KeyError> {
+        select_module(&KEY_CUSTODY_MODULE)?
+            .module
+            .active_keyed_digest(domain, input)
+            .await
+            .map_err(map_provider_error)
+    }
+
+    async fn keyed_digest(
+        &self,
+        key_id: &KeyId,
+        domain: &[u8],
+        input: &[u8],
+    ) -> Result<[u8; 32], KeyError> {
+        select_module(&KEY_CUSTODY_MODULE)?
+            .module
+            .keyed_digest(key_id, domain, input)
+            .await
+            .map_err(map_provider_error)
+    }
+
+    async fn seal_with_key_id(
+        &self,
+        key_id: &KeyId,
+        aad: &EnvelopeAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedPayload, KeyError> {
+        seal_with_key_id_with_slot(&KEY_CUSTODY_MODULE, key_id, aad, plaintext).await
+    }
+
     async fn seal(
         &self,
         aad: &EnvelopeAad,

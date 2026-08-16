@@ -23,6 +23,9 @@ pub use store::{
     SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
     SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };
+pub(crate) use types::{
+    DurableSessionConsensusCommand, SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID,
+};
 
 pub use types::{
     SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
@@ -36,7 +39,7 @@ pub use types::{
 opc_consensus::engine::declare_raft_types!(
     /// Internal Openraft type configuration for the session state machine.
     pub(crate) SessionRaftTypeConfig:
-        D = SessionConsensusCommand,
+        D = DurableSessionConsensusCommand,
         R = SessionConsensusResponse,
         NodeId = SessionConsensusNodeId,
         Node = opc_consensus::engine::EmptyNode,

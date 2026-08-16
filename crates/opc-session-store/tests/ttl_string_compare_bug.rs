@@ -91,11 +91,11 @@ async fn test_sqlite_string_comparison_subsecond_bug_not_pruning_expired() {
         time: clock_state.clone(),
     });
 
-    // Use NamedTempFile to inspect raw database rows
-    let tmp_file = tempfile::NamedTempFile::new().unwrap();
-    let db_path = tmp_file.path();
+    // Retain the parent directory while the backend initializes this new path.
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("sessions.sqlite");
 
-    let backend = SqliteSessionBackend::open(db_path)
+    let backend = SqliteSessionBackend::open(&db_path)
         .unwrap()
         .with_clock(clock.clone());
 
@@ -148,7 +148,7 @@ async fn test_sqlite_string_comparison_subsecond_bug_not_pruning_expired() {
     let _got = backend.get(&key).await.unwrap();
 
     // Open connection directly to verify if row was deleted
-    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM session_records", [], |r| r.get(0))
         .unwrap();
@@ -167,9 +167,9 @@ async fn test_sqlite_lease_premature_millisecond_prune() {
         time: clock_state.clone(),
     });
 
-    let tmp_file = tempfile::NamedTempFile::new().unwrap();
-    let db_path = tmp_file.path();
-    let backend = SqliteSessionBackend::open(db_path)
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("sessions.sqlite");
+    let backend = SqliteSessionBackend::open(&db_path)
         .unwrap()
         .with_clock(clock.clone());
 

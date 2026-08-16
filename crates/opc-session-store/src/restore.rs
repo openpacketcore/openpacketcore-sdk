@@ -445,7 +445,7 @@ impl RestoreScanCursor {
                     ..=RESTORE_SCAN_CURSOR_MAX_DURABLE_BYTES)
                     .contains(&decoded_len) => {}
             0 | RESTORE_SCAN_CURSOR_VERSION => {
-                return Err("restore scan cursor has an invalid length")
+                return Err("restore scan cursor has an invalid length");
             }
             _ => return Err("restore scan cursor version is unsupported"),
         }

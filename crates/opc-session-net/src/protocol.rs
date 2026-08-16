@@ -82,10 +82,10 @@ pub const SESSION_NET_ALPN: &[u8] = b"opc-session-net/5";
 pub const SESSION_CONSENSUS_ALPN: &[u8] = b"opc-session-consensus/2";
 /// Fixed revision of the consensus-only bootstrap and operation DTOs.
 ///
-/// Revision 4 makes every forwarded consumer operation carry an explicit
-/// internal-or-consumer scope marker. It therefore rejects revision-3 peers
-/// before they can omit that authorization boundary.
-pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 4;
+/// Revision 5 binds every forwarded mutation reply to the exact request ID,
+/// semantic intent, authority identity, and consumer scope. It therefore
+/// rejects revision-4 peers before an unbound reply can be accepted.
+pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 5;
 
 /// Exact resource and semantic profile for consensus-only connections.
 ///
@@ -3456,7 +3456,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     T: Serialize,
 {
-    write_frame_bounded_until_classified(writer, frame, max_frame_size, deadline)
+    write_frame_bounded_until_classified(writer, frame, max_frame_size, deadline, None)
         .await
         .map_err(FrameWriteError::into_protocol_error)
 }
@@ -3469,6 +3469,7 @@ pub(crate) async fn write_frame_bounded_until_classified<W, T>(
     frame: &T,
     max_frame_size: usize,
     deadline: tokio::time::Instant,
+    transmission_started: Option<&AtomicBool>,
 ) -> Result<(), FrameWriteError>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -3480,6 +3481,7 @@ where
         max_frame_size,
         deadline,
         &NEVER_CANCELLED,
+        transmission_started,
     )
     .await
 }
@@ -3507,6 +3509,7 @@ where
         max_frame_size,
         deadline,
         cancellation,
+        None,
     )
     .await
     .map_err(FrameWriteError::into_protocol_error)
@@ -3518,6 +3521,7 @@ async fn write_frame_bounded_until_cancellable_classified<W, T>(
     max_frame_size: usize,
     deadline: tokio::time::Instant,
     cancellation: &AtomicBool,
+    transmission_started: Option<&AtomicBool>,
 ) -> Result<(), FrameWriteError>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -3536,7 +3540,14 @@ where
     let len = u32::try_from(json.encoded_len)
         .map_err(|_| ProtocolError::FrameTooLarge(json.encoded_len))
         .map_err(FrameWriteError::BeforeWrite)?;
+    let mut write_entered = false;
     let write = async {
+        // This is the transport effect boundary: no await or fallible work
+        // separates the marker from the first prefix write attempt.
+        write_entered = true;
+        if let Some(transmission_started) = transmission_started {
+            transmission_started.store(true, Ordering::Release);
+        }
         writer
             .write_all(&len.to_be_bytes())
             .await
@@ -3551,7 +3562,10 @@ where
     };
     match tokio::time::timeout_at(deadline, write).await {
         Ok(result) => result.map_err(FrameWriteError::MayHaveWritten),
-        Err(_elapsed) => Err(FrameWriteError::MayHaveWritten(write_timeout_error())),
+        Err(_elapsed) if write_entered => {
+            Err(FrameWriteError::MayHaveWritten(write_timeout_error()))
+        }
+        Err(_elapsed) => Err(FrameWriteError::BeforeWrite(write_timeout_error())),
     }
 }
 
@@ -4283,7 +4297,7 @@ mod tests {
             6
         );
         assert_eq!(SESSION_CONSENSUS_ALPN, b"opc-session-consensus/2");
-        assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 4);
+        assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 5);
         let mut previous_error_set = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
         previous_error_set.error_set_revision = 1;
         assert!(!previous_error_set.is_current());
@@ -5612,11 +5626,13 @@ mod tests {
     #[tokio::test]
     async fn expired_bounded_write_deadline_emits_nothing() {
         let mut writer = Vec::new();
+        let transmission_started = AtomicBool::new(false);
         let classified = write_frame_bounded_until_classified(
             &mut writer,
             &Response::WatchStream,
             MIN_NEGOTIATED_FRAME_SIZE,
             tokio::time::Instant::now(),
+            Some(&transmission_started),
         )
         .await
         .expect_err("expired deadline must remain before the write boundary");
@@ -5626,6 +5642,53 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::TimedOut
         ));
         assert!(writer.is_empty());
+        assert!(!transmission_started.load(Ordering::Acquire));
+
+        struct FirstPollFails;
+        impl tokio::io::AsyncWrite for FirstPollFails {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "first prefix write failed",
+                )))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut first_poll_fails = FirstPollFails;
+        let transmission_started = AtomicBool::new(false);
+        let classified = write_frame_bounded_until_classified(
+            &mut first_poll_fails,
+            &Response::WatchStream,
+            MIN_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Some(&transmission_started),
+        )
+        .await
+        .expect_err("a failed first write has crossed the transport effect boundary");
+        assert!(matches!(
+            classified,
+            FrameWriteError::MayHaveWritten(ProtocolError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+        ));
+        assert!(transmission_started.load(Ordering::Acquire));
 
         let error = write_frame_bounded_until(
             &mut writer,

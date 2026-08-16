@@ -316,6 +316,67 @@ impl SessionConsumerOperation {
     }
 }
 
+/// Validate relationships and bounded, time-independent inputs for a complete
+/// consumer operation without reading state or claiming clock authority.
+///
+/// This is deliberately whole-operation validation: a malformed late batch
+/// slot must be rejected before a caller-owned request ID is durably bound or
+/// an earlier slot can run.
+pub(crate) fn validate_consumer_operation_profile(
+    operation: &SessionConsumerOperation,
+) -> Result<(), StoreError> {
+    match operation {
+        SessionConsumerOperation::CompareAndSet { op } => validate_compare_and_set_profile(op),
+        SessionConsumerOperation::DeleteFenced { lease }
+        | SessionConsumerOperation::ReleaseLease { lease } => {
+            crate::lease::validate_lease_guard_profile(lease)
+        }
+        SessionConsumerOperation::RefreshTtl { lease, ttl }
+        | SessionConsumerOperation::RenewLease { lease, ttl } => {
+            crate::lease::validate_lease_guard_profile(lease)?;
+            crate::validate_session_ttl(*ttl)
+        }
+        SessionConsumerOperation::AcquireLease { ttl, .. } => crate::validate_session_ttl(*ttl),
+        SessionConsumerOperation::Batch { ops } => {
+            for op in ops {
+                match op {
+                    SessionOp::CompareAndSet(op) => validate_compare_and_set_profile(op)?,
+                    SessionOp::DeleteFenced { lease } => {
+                        crate::lease::validate_lease_guard_profile(lease)?;
+                    }
+                    SessionOp::RefreshTtl { lease, ttl } => {
+                        crate::lease::validate_lease_guard_profile(lease)?;
+                        crate::validate_session_ttl(*ttl)?;
+                    }
+                    SessionOp::Get { .. } => {}
+                }
+            }
+            Ok(())
+        }
+        SessionConsumerOperation::Capabilities
+        | SessionConsumerOperation::Get { .. }
+        | SessionConsumerOperation::PreflightRecordExpiry { .. }
+        | SessionConsumerOperation::ScanRestoreRecords { .. }
+        | SessionConsumerOperation::Watch { .. } => Ok(()),
+    }
+}
+
+/// Validate one CAS's self-contained key, owner, fence, and expiry profile.
+pub(crate) fn validate_compare_and_set_profile(op: &CompareAndSet) -> Result<(), StoreError> {
+    crate::lease::validate_lease_guard_profile(&op.lease)?;
+    if op.key != op.new_record.key
+        || op.key != *op.lease.key()
+        || op.new_record.owner != *op.lease.owner()
+        || op.new_record.fence != op.lease.fence()
+        || i64::try_from(op.new_record.generation.get()).is_err()
+    {
+        return Err(StoreError::InvalidKey(
+            "consumer compare-and-set relationships are invalid".into(),
+        ));
+    }
+    crate::validate_stored_record_expiry_profile(&op.new_record)
+}
+
 /// One scope-bound consumer request.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

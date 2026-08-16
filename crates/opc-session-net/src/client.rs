@@ -41,13 +41,14 @@ use crate::lifecycle::{
 };
 use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
-    compare_and_set_result_matches_key, conservative_payload_budget, get_result_matches_key,
-    read_frame, read_response_frame, session_op_results_match_expectations,
+    compare_and_set_result_matches_key, conservative_payload_budget, ensure_frame_fits_until,
+    get_result_matches_key, read_frame, read_response_frame, session_op_results_match_expectations,
     validate_request_payload_limit, validate_request_profile,
-    validate_restore_scan_wire_payload_bytes, write_frame_bounded_until, BootstrapHello,
-    BootstrapRequest, BootstrapResponse, ContractProfile, Request, Response,
-    RestoreScanWireRequest, CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, DEFAULT_MAX_FRAME_SIZE,
-    MAX_HANDSHAKE_FRAME_SIZE, MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES,
+    validate_restore_scan_wire_payload_bytes, write_frame_bounded_until,
+    write_frame_bounded_until_classified, BootstrapHello, BootstrapRequest, BootstrapResponse,
+    ContractProfile, FrameWriteError, Request, Response, RestoreScanWireRequest, CONTRACT_VERSION,
+    CURRENT_CONTRACT_PROFILE, DEFAULT_MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE,
+    MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES,
     MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE, SESSION_NET_ALPN,
 };
 
@@ -248,6 +249,7 @@ struct RemoteRequestAttemptFailure {
     failure: RemoteRequestFailure,
     request_may_have_reached_server: bool,
     invalidates_contract: bool,
+    connection_reusable: bool,
 }
 
 impl RemoteRequestAttemptFailure {
@@ -265,6 +267,7 @@ impl RemoteRequestAttemptFailure {
             failure: RemoteRequestFailure::from_protocol_error(error),
             request_may_have_reached_server: false,
             invalidates_contract: invalidates_negotiated_contract(error),
+            connection_reusable: false,
         }
     }
 
@@ -276,6 +279,7 @@ impl RemoteRequestAttemptFailure {
             // mutation transport failure is conservatively ambiguous.
             request_may_have_reached_server: true,
             invalidates_contract: invalidates_negotiated_contract(error),
+            connection_reusable: false,
         }
     }
 
@@ -284,6 +288,7 @@ impl RemoteRequestAttemptFailure {
             failure: RemoteRequestFailure::from_store_preflight(error),
             request_may_have_reached_server: false,
             invalidates_contract: false,
+            connection_reusable: false,
         }
     }
 
@@ -292,6 +297,7 @@ impl RemoteRequestAttemptFailure {
             failure,
             request_may_have_reached_server: true,
             invalidates_contract: true,
+            connection_reusable: false,
         }
     }
 
@@ -302,6 +308,16 @@ impl RemoteRequestAttemptFailure {
             // server correlated this request but did not dispatch it.
             request_may_have_reached_server: false,
             invalidates_contract: false,
+            connection_reusable: false,
+        }
+    }
+
+    fn before_write_on_clean_connection(error: &ProtocolError) -> Self {
+        Self {
+            failure: RemoteRequestFailure::from_protocol_error(error),
+            request_may_have_reached_server: false,
+            invalidates_contract: false,
+            connection_reusable: true,
         }
     }
 }
@@ -1512,6 +1528,7 @@ impl RemoteSessionBackend {
                 },
                 request_may_have_reached_server: transmission_started.load(Ordering::Acquire),
                 invalidates_contract: false,
+                connection_reusable: false,
             }),
         }
     }
@@ -1567,6 +1584,7 @@ impl RemoteSessionBackend {
                         .unwrap_or(RemoteRequestFailure::Timeout),
                     request_may_have_reached_server: false,
                     invalidates_contract: false,
+                    connection_reusable: false,
                 });
             }
             let from_pool = candidate.is_some();
@@ -1685,6 +1703,18 @@ impl RemoteSessionBackend {
             *guard = Some(conn);
             return Err(RemoteRequestAttemptFailure::from_store_preflight(error));
         }
+        if let Err(error) = ensure_frame_fits_until(
+            &request,
+            conn.frame_limits.request_frame_size,
+            operation_deadline,
+            &AtomicBool::new(false),
+        ) {
+            // The exact JSON representation has not offered even a length
+            // prefix to the writer. Keep this authenticated connection: a
+            // later request may fit the same negotiated frame.
+            *guard = Some(conn);
+            return Err(RemoteRequestAttemptFailure::before_transmission(&error));
+        }
 
         let mut lifecycle = conn.lifecycle.clone();
         let mut reauthentication_rx = self.reauthentication.subscribe();
@@ -1734,6 +1764,7 @@ impl RemoteSessionBackend {
                             request_may_have_reached_server: transmission_started
                                 .is_none_or(|started| started.load(Ordering::Acquire)),
                             invalidates_contract: false,
+                            connection_reusable: false,
                         });
                     }
                     result = &mut exchange => break result,
@@ -1784,6 +1815,9 @@ impl RemoteSessionBackend {
             Err(attempt) => {
                 if attempt.invalidates_contract {
                     self.clear_cached_capabilities();
+                }
+                if attempt.connection_reusable {
+                    *guard = Some(conn);
                 }
                 Err(attempt)
             }
@@ -1923,17 +1957,24 @@ impl RemoteSessionBackend {
                 &ProtocolError::ContractMismatch,
             ));
         }
-        if let Some(transmission_started) = transmission_started {
-            transmission_started.store(true, Ordering::Release);
-        }
-        let write_result = write_frame_bounded_until(
+        let write_result = write_frame_bounded_until_classified(
             &mut conn.writer,
             req,
             conn.frame_limits.request_frame_size,
             operation_deadline,
+            transmission_started,
         )
         .await;
-        if let Err(write_error) = write_result {
+        let write_error = match write_result {
+            Ok(()) => None,
+            Err(FrameWriteError::BeforeWrite(write_error)) => {
+                return Err(
+                    RemoteRequestAttemptFailure::before_write_on_clean_connection(&write_error),
+                );
+            }
+            Err(FrameWriteError::MayHaveWritten(write_error)) => Some(write_error),
+        };
+        if let Some(write_error) = write_error {
             // A server can win the retirement/request race and return the
             // authenticated no-dispatch proof while this half observes a
             // write failure. Only a fully decoded fixed control changes the
@@ -3246,6 +3287,10 @@ mod tests {
     }
 
     async fn valid_compare_and_set(payload_len: usize) -> CompareAndSet {
+        valid_compare_and_set_with_byte(payload_len, 7).await
+    }
+
+    async fn valid_compare_and_set_with_byte(payload_len: usize, byte: u8) -> CompareAndSet {
         let backend = FakeSessionBackend::new();
         let key = match valid_deadline_entry().op {
             ReplicationOp::RefreshTtl { key, .. } => key,
@@ -3264,7 +3309,7 @@ mod tests {
             state_class: StateClass::AuthoritativeSession,
             state_type: StateType::new("client-preflight").expect("state type"),
             expires_at: None,
-            payload: EncryptedSessionPayload::new(vec![7; payload_len]),
+            payload: EncryptedSessionPayload::new(vec![byte; payload_len]),
         };
         CompareAndSet {
             key,
@@ -5644,6 +5689,122 @@ mod tests {
             unavailable_capabilities(),
             "a later failed probe must not reuse capabilities negotiated on the violating connection"
         );
+    }
+
+    #[tokio::test]
+    async fn aggregate_batch_frame_overflow_is_before_write_and_reuses_connection() {
+        let operation = valid_compare_and_set_with_byte(1_024, u8::MAX).await;
+        let mut selected = None;
+        for operation_count in 2..=MAX_SESSION_NET_BATCH_OPERATIONS {
+            let operations = vec![SessionOp::CompareAndSet(operation.clone()); operation_count];
+            let request = Request::Batch {
+                ops: operations.clone(),
+            };
+            let encoded_len = serde_json::to_vec(&request)
+                .expect("valid aggregate request")
+                .len();
+            let one_over_limit = encoded_len.saturating_sub(1);
+            if (crate::MIN_NEGOTIATED_FRAME_SIZE..=DEFAULT_MAX_FRAME_SIZE).contains(&one_over_limit)
+                && operation.new_record.payload.len() <= conservative_payload_budget(one_over_limit)
+            {
+                selected = Some((operations, request, encoded_len));
+                break;
+            }
+        }
+        let (operations, request, encoded_len) =
+            selected.expect("aggregate worst-byte request has a valid per-record budget");
+        crate::protocol::ensure_frame_fits(&request, encoded_len)
+            .expect("exact aggregate JSON length must fit");
+        assert!(matches!(
+            crate::protocol::ensure_frame_fits(&request, encoded_len - 1),
+            Err(ProtocolError::FrameTooLarge(_))
+        ));
+        let negotiated_frame_size =
+            u32::try_from(encoded_len - 1).expect("bounded negotiated frame size");
+        let first_key = operation.key.clone();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind overflow server");
+        let addr = listener.local_addr().expect("overflow server address");
+        let (silence_proven_tx, silence_proven_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            write_frame(
+                &mut stream,
+                &hello_ack_with_limits(&hello, negotiated_frame_size, negotiated_frame_size),
+            )
+            .await
+            .expect("write bounded hello acknowledgement");
+
+            let capabilities: Request = read_frame(
+                &mut stream,
+                usize::try_from(negotiated_frame_size).expect("bounded negotiated frame size"),
+            )
+            .await
+            .expect("read capabilities request");
+            assert!(matches!(capabilities, Request::Capabilities));
+            write_frame(
+                &mut stream,
+                &Response::Capabilities(BackendCapabilities::all_enabled()),
+            )
+            .await
+            .expect("write capabilities response");
+
+            let mut prefix = [0_u8; 1];
+            match tokio::time::timeout(Duration::from_millis(100), stream.peek(&mut prefix)).await {
+                Err(_) => silence_proven_tx.send(()).expect("publish no-prefix proof"),
+                Ok(Ok(0)) => panic!("the clean connection closed before the follow-up"),
+                Ok(Ok(_)) => {
+                    let unexpected: Request = read_frame(
+                        &mut stream,
+                        usize::try_from(negotiated_frame_size)
+                            .expect("bounded negotiated frame size"),
+                    )
+                    .await
+                    .expect("decode unexpected over-limit frame");
+                    panic!("the over-limit aggregate offered a length-prefix byte: {unexpected:?}");
+                }
+                Ok(Err(error)) => panic!("inspect clean connection: {error}"),
+            }
+
+            let follow_up: Request = read_frame(
+                &mut stream,
+                usize::try_from(negotiated_frame_size).expect("bounded negotiated frame size"),
+            )
+            .await
+            .expect("read retained-connection follow-up");
+            assert!(matches!(follow_up, Request::Get { .. }));
+            write_frame(&mut stream, &Response::Get(Ok(None)))
+                .await
+                .expect("write follow-up response");
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        assert!(backend.capabilities().await.batch_write);
+        let error = backend
+            .batch(operations)
+            .await
+            .expect_err("aggregate one-over request must fail before write");
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable(
+                "remote session mutation failed before transmission".to_string()
+            )
+        );
+        assert!(
+            backend.conn.lock().await.is_some(),
+            "clean connection is retained"
+        );
+        silence_proven_rx
+            .await
+            .expect("server proves the no-prefix interval");
+        assert_eq!(
+            backend.get(&first_key).await.expect("retained follow-up"),
+            None
+        );
+        server.await.expect("overflow server task");
     }
 
     #[tokio::test]

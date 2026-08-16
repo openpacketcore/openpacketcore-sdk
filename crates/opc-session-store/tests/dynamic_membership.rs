@@ -533,11 +533,11 @@ impl DynamicFleet {
             .expect("retained restart placeholder");
         let placeholder = self.stores[placeholder_index].clone();
         let retired = std::mem::replace(&mut self.stores[index], placeholder);
+        retired
+            .shutdown()
+            .await
+            .expect("shut down retained consensus member");
         drop(retired);
-        // The topology supervisor only holds weak store references. Give the
-        // retired incarnation a scheduling turn to observe its final drop
-        // before opening the same durable Raft state.
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let successor = tokio::time::timeout(TEST_DEADLINE, async {
             loop {
@@ -561,9 +561,15 @@ impl DynamicFleet {
                 .expect("restart predecessor identity"),
             0..INITIAL_MEMBER_COUNT,
         );
+        self._backends[index] =
+            SqliteSessionBackend::in_memory().expect("temporary stopped-backend placeholder");
+        let backend =
+            SqliteSessionBackend::open(self._directory.path().join(format!("node-{index}.sqlite")))
+                .expect("reopen retained SQLite backend");
+        self._backends[index] = backend.clone();
         let reopened = ConsensusSessionStore::open_with_operation_timeout(
             topology,
-            self._backends[index].clone(),
+            backend,
             self._directory.path().join(format!("snapshots-{index}")),
             peers,
             STORE_OPERATION_TIMEOUT,
@@ -602,8 +608,11 @@ impl DynamicFleet {
             .expect("restart placeholder");
         let placeholder = self.stores[placeholder_index].clone();
         let retired = std::mem::replace(&mut self.stores[index], placeholder);
+        retired
+            .shutdown()
+            .await
+            .expect("shut down member in incomplete terminal scope");
         drop(retired);
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let topology = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
             replica_id(index),
@@ -617,9 +626,15 @@ impl DynamicFleet {
         let peers = self
             .network
             .peers_for_indices(index, identity, active_indices.iter().copied());
+        self._backends[index] =
+            SqliteSessionBackend::in_memory().expect("temporary stopped-backend placeholder");
+        let backend =
+            SqliteSessionBackend::open(self._directory.path().join(format!("node-{index}.sqlite")))
+                .expect("reopen SQLite backend from incomplete terminal state");
+        self._backends[index] = backend.clone();
         let reopened = ConsensusSessionStore::open_with_operation_timeout(
             topology,
-            self._backends[index].clone(),
+            backend,
             self._directory.path().join(format!("snapshots-{index}")),
             peers,
             STORE_OPERATION_TIMEOUT,

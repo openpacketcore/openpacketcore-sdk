@@ -45,8 +45,9 @@ pub use provider::{
     AES_256_GCM_SIV_NONCE_LEN,
 };
 pub use remote::{
-    MemoryRemoteSealProvider, RemoteSealMaterialController, RemoteSealMaterialEpoch,
-    RemoteSealProvider,
+    MemoryRemoteSealProvider, RemoteSealActiveKeyedDigest, RemoteSealCapabilities,
+    RemoteSealMaterialController, RemoteSealMaterialEpoch, RemoteSealProvider,
+    REMOTE_SEAL_MAX_KEY_ID_BYTES,
 };
 pub use scope::{
     decode_bound_aad, key_id_from_bound_aad, serialize_bound_aad, AeadAlgorithm, ConfigAad,

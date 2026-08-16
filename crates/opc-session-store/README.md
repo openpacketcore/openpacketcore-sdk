@@ -130,10 +130,25 @@ open its file-backed SQLite store as follows. The `identity` must be the
 fixed-profile- and policy-bound result of
 `derive_fixed_durable_quorum_consensus_identity`; the ordinary descriptor-only
 consensus identity remains for dynamic profiles. This constructor is supported
-only on Linux because fixed quorum recovery uses descriptor-pinned SQLite
-snapshots; on other platforms it returns
+only on Linux; on other platforms it returns
 `ConsensusSessionStoreOpenError::FixedQuorumUnsupportedPlatform` before
 initializing durable Raft state.
+
+Dynamic consensus also installs SQLite snapshots and therefore requires Linux
+descriptor-pinned snapshot staging; on another platform it returns
+`ConsensusSessionStoreOpenError::DynamicConsensusUnsupportedPlatform` before
+creating a consensus schema or snapshot directory. The Linux `/proc/self/fd`
+pinning is limited to SDK-controlled dynamic-consensus snapshot staging with
+journaling disabled; it is never a general/live-WAL standalone SQLite binding.
+Standalone `SqliteSessionBackend` remains portable because it does not install
+consensus snapshots. Its file-backed form requires its immediate parent
+database namespace to be a real, non-symlink/non-reparse, service-owned or
+otherwise trusted namespace controlled by the service identity. The constructor
+rejects leaf symlink/reparse and nonregular shapes, and Unix hardlink ambiguity
+where safely representable, but does not claim universal cross-platform inode
+binding. An actor able to rename in that namespace can replace the `db-wal`,
+`db-shm`, or `db-journal` family, so hostile or same-UID same-directory
+replacement is outside this constructor guarantee.
 
 ```rust
 let members = vec![
@@ -586,11 +601,12 @@ cluster, configuration digest, epoch, peer role, and fresh challenge must all
 agree before an Openraft RPC is dispatched. Resolver or DNS aliases change
 only the dial address; a bare self ID such as `epdg-app-0` can correctly name
 the member whose route is an FQDN because the SDK never compares those strings.
-The exact consensus contract uses transport/wire-schema revision 4 and
-error-set revision 6. Revision 4 makes the forwarded consumer scope explicit,
-so a peer cannot silently downgrade a consumer-scoped operation to an internal
-call; error revision 6 binds that semantic boundary into the exact profile.
-Revision 3/error revision 5 or older fails before dispatch. Drain traffic and
+The exact consensus contract uses transport/wire-schema revision 5 and
+error-set revision 6. Revision 5 binds every forwarded mutation reply to its
+exact request ID, semantic intent, authority identity, and consumer scope, so a
+peer cannot replay a valid reply for another operation; error revision 6 binds
+that semantic boundary into the exact profile. Revision 4/error revision 5 or
+older fails before dispatch. Drain traffic and
 writers, then stop and upgrade every consensus member together; mixed-profile
 rolling operation is unsupported.
 
@@ -891,6 +907,15 @@ they cannot bypass Openraft for reads, leases, mutation, rebuild, pruning, or
 journal access, and their capability declaration collapses to the minimal
 non-authoritative profile. The owning consensus adapter reports its own exact
 capabilities separately.
+
+Protection-wrapper caller capacity is distinct from the inner backend's stored
+envelope capacity. A remote provider must publish enforced plaintext,
+round-trip, output, key-ID, and exact AEAD-expansion limits; the wrapper clamps
+to the smallest executable value after reserving worst-case canonical envelope
+overhead. In particular, the SDK KMS provider's 65,536-byte hex-JSON response
+body limit, excluding its four-byte length prefix, guarantees only 32,663
+plaintext bytes for a seal/get/restore round trip, so it never advertises the
+local backend's 4,259,840-byte stored-value cap.
 
 This is payload-envelope encryption, not whole-database encryption. Session
 payload bytes are sealed; SQLite/Raft metadata such as membership, log indexes,
@@ -1323,9 +1348,21 @@ by issue #143.
   authenticated restore cursor and explicit durable page profile. Error-set
   revision 2 carries typed stale-cursor and work-budget failures. Revision-3
   and revision-2 exact profiles require a
-  coordinated stop/upgrade/start and fail closed when mixed. Existing SQLite
-  stores receive only an O(1) `restore_scan_state.cursor_key` metadata
-  migration; no session-record backfill or second authority is created. A
+  coordinated stop/upgrade/start and fail closed when mixed. An existing
+  standalone SQLite store receives the O(1)
+  `restore_scan_state.cursor_key` metadata migration only when its complete
+  six-table manifest is the frozen predecessor whose sole layout difference is
+  the legacy three-column restore table. Existing-file admission performs
+  exactly one complete persisted-state validation pass, costing O(records +
+  replication-log entries), before mutation; partial, mixed, missing, extra,
+  and malformed images fail closed without repair. The exact predecessor is
+  migrated in one transaction, then reclassified as the exact current schema
+  and checked only for the migrated restore row/key, rather than rescanning
+  unchanged session, replication-log, or lease authority; schema and row
+  changes roll back together on error. SQLite's reviewed nullable
+  `ALTER TABLE` form is accepted on restart only with one valid populated
+  nonzero 32-byte key. No session-record backfill or second authority is
+  created. A
   pre-revision-3 consensus snapshot lacks that key and must not be installed
   into a revision-3 fleet; take a coherent post-upgrade snapshot before
   declaring rollback/repair coverage. This

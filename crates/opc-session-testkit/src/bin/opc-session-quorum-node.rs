@@ -1212,9 +1212,13 @@ impl QualificationNode {
                 }
             }
         };
+        let consumer_service = self.store.consumer_service_with_key_provider(
+            Arc::clone(self.protected.provider()),
+            self.protected.backend_namespace(),
+        );
         let listener = SessionQuorumConsumerServer::new(
             Arc::new(QualificationConsumerOutcomeUnknownService {
-                inner: Arc::new(self.store.consumer_service()),
+                inner: Arc::new(consumer_service),
                 armed: Arc::clone(&self.consumer_outcome_unknown),
             }),
             transport.server_config.clone(),

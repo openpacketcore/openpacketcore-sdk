@@ -389,11 +389,12 @@ authoritative, and a recovered watcher must still reconcile the bounded durable
 journal before subscribing at `head + 1`.
 
 `qualification/v6/session-ha-profile.json` is the current experimental
-foundation inventory. It binds consensus transport and wire-schema revision 4
+foundation inventory. It binds consensus transport and wire-schema revision 5
 and deterministic error-set revision 6. All earlier v1 through v5 profile and
-evidence artifacts remain byte-for-byte frozen; new runtime contract revisions
-receive a new profile namespace instead of rewriting retained qualification
-evidence.
+evidence artifacts remain byte-for-byte frozen. The unqualified v6 foundation
+tracks the current candidate contract while `qualification_complete` remains
+false; after that contract is frozen, a later runtime-contract revision receives
+a new profile namespace instead of rewriting retained qualification evidence.
 
 Schedule v6 also binds `terminal-stage-elapsed-millis/v1`. If an accepted
 recovery operation finishes after its fixed deadline, the campaign remains

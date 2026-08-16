@@ -8,6 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 
 use opc_consensus::engine::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
 use opc_consensus::engine::{
@@ -59,6 +63,10 @@ pub enum SessionConsensusStorageError {
     /// SQLite or snapshot storage could not be initialized.
     #[error("session consensus storage is unavailable")]
     BackendUnavailable,
+    /// Dynamic consensus requires descriptor-pinned snapshot installation,
+    /// which is currently implemented only on Linux.
+    #[error("dynamic session consensus is unsupported on this platform")]
+    DynamicConsensusUnsupportedPlatform,
 }
 
 /// Immutable authority model bound to one durable consensus database.
@@ -85,6 +93,17 @@ pub(crate) struct SqliteConsensusLogStore {
 pub(crate) struct SqliteConsensusStateMachine {
     core: SqliteConsensusCore,
     membership_admission: Option<SessionRaftPeerDirectory>,
+    #[cfg(test)]
+    snapshot_test_faults: Arc<SnapshotTestFaults>,
+}
+
+/// Instance-local one-shot snapshot faults used only to exercise the
+/// post-commit reconciliation contract.
+#[cfg(test)]
+#[derive(Default)]
+struct SnapshotTestFaults {
+    force_detach_failure: AtomicBool,
+    force_membership_observation_failure: AtomicBool,
 }
 
 impl SqliteConsensusStateMachine {
@@ -103,6 +122,16 @@ impl SqliteConsensusStateMachine {
             return Ok(());
         };
         admission.observe_applied_membership(membership)
+    }
+
+    #[cfg(test)]
+    fn force_next_snapshot_postcommit_failures_for_test(&self) {
+        self.snapshot_test_faults
+            .force_detach_failure
+            .store(true, Ordering::Release);
+        self.snapshot_test_faults
+            .force_membership_observation_failure
+            .store(true, Ordering::Release);
     }
 
     /// Read the durable application chain head for storage qualification.
@@ -127,6 +156,200 @@ impl SqliteConsensusStateMachine {
 /// serialization of the session database.
 pub(crate) struct SqliteConsensusSnapshotBuilder {
     core: SqliteConsensusCore,
+}
+
+/// Deletes SDK-created staging files on every pre-commit exit. The final
+/// published path is explicitly disarmed only after SQLite metadata commits.
+struct SnapshotArtifacts {
+    paths: Vec<PathBuf>,
+}
+
+impl SnapshotArtifacts {
+    fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        let mut artifacts = Vec::new();
+        for path in paths {
+            artifacts.push(path.clone());
+            for suffix in ["-journal", "-wal", "-shm"] {
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                artifacts.push(PathBuf::from(sidecar));
+            }
+        }
+        Self { paths: artifacts }
+    }
+
+    fn disarm(&mut self, path: &Path) {
+        self.paths.retain(|candidate| {
+            if candidate == path {
+                return false;
+            }
+            !["-journal", "-wal", "-shm"].iter().any(|suffix| {
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                candidate == Path::new(&sidecar)
+            })
+        });
+    }
+
+    fn arm(&mut self, path: PathBuf) {
+        self.paths.push(path.clone());
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            self.paths.push(PathBuf::from(sidecar));
+        }
+    }
+
+    fn take_paths(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.paths)
+    }
+}
+
+impl Drop for SnapshotArtifacts {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+/// Reclaim committed-path garbage away from the Openraft response path. A
+/// crash before this task runs is safe: startup directory validation scavenges
+/// all unreferenced staging files. The final published snapshot is disarmed
+/// before this function can receive the artifact list.
+fn defer_snapshot_cleanup(paths: Vec<PathBuf>) {
+    let _ = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let completion_hook = snapshot_deferred_cleanup_completion_hook(&paths);
+        let mut changed_directories = BTreeSet::new();
+        for path in paths {
+            #[cfg(test)]
+            let cleanup_hook = snapshot_cleanup_scavenge_test_hook(&path, None);
+            #[cfg(test)]
+            if let Some(hook) = &cleanup_hook {
+                hook.cleanup_started.wait();
+                hook.cleanup_release.wait();
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    if let Some(parent) = path.parent() {
+                        changed_directories.insert(parent.to_path_buf());
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
+            #[cfg(test)]
+            if let Some(hook) = cleanup_hook {
+                hook.cleanup_removed.notify_one();
+            }
+        }
+        for directory in changed_directories {
+            let _ = sync_directory(&directory);
+        }
+        #[cfg(test)]
+        if let Some(hook) = completion_hook {
+            if hook.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                hook.completed.notify_one();
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct SnapshotDeferredCleanupCompletionHook {
+    snapshot_dir: PathBuf,
+    remaining: Arc<AtomicUsize>,
+    completed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static SNAPSHOT_DEFERRED_CLEANUP_COMPLETION_HOOK: OnceLock<
+    Mutex<Option<SnapshotDeferredCleanupCompletionHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn snapshot_deferred_cleanup_completion_hook(
+    paths: &[PathBuf],
+) -> Option<SnapshotDeferredCleanupCompletionHook> {
+    let hook = SNAPSHOT_DEFERRED_CLEANUP_COMPLETION_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()?
+        .clone()?;
+    paths
+        .iter()
+        .any(|path| path.parent() == Some(hook.snapshot_dir.as_path()))
+        .then_some(hook)
+}
+
+#[cfg(test)]
+fn set_snapshot_deferred_cleanup_completion_hook(
+    hook: Option<SnapshotDeferredCleanupCompletionHook>,
+) {
+    *SNAPSHOT_DEFERRED_CLEANUP_COMPLETION_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("snapshot deferred cleanup completion hook lock") = hook;
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct SnapshotCleanupScavengeTestHook {
+    candidate: PathBuf,
+    snapshot_dir: PathBuf,
+    cleanup_started: Arc<Barrier>,
+    cleanup_release: Arc<Barrier>,
+    cleanup_removed: Arc<tokio::sync::Notify>,
+    scavenge_enumerated: Arc<tokio::sync::Notify>,
+    scavenge_release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static SNAPSHOT_CLEANUP_SCAVENGE_TEST_HOOK: OnceLock<
+    Mutex<Option<SnapshotCleanupScavengeTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn snapshot_cleanup_scavenge_test_hook(
+    candidate: &Path,
+    snapshot_dir: Option<&Path>,
+) -> Option<SnapshotCleanupScavengeTestHook> {
+    let hook = SNAPSHOT_CLEANUP_SCAVENGE_TEST_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()?
+        .clone()?;
+    (hook.candidate == candidate
+        && snapshot_dir.is_none_or(|directory| hook.snapshot_dir == directory))
+    .then_some(hook)
+}
+
+#[cfg(test)]
+fn set_snapshot_cleanup_scavenge_test_hook(hook: Option<SnapshotCleanupScavengeTestHook>) {
+    *SNAPSHOT_CLEANUP_SCAVENGE_TEST_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("snapshot cleanup test hook lock") = hook;
+}
+
+fn defer_old_snapshot_cleanup(
+    snapshot_dir: PathBuf,
+    previous: Option<consensus::CurrentSnapshot>,
+    current_file_name: String,
+) {
+    let Some((_, file_name, _, _)) = previous else {
+        return;
+    };
+    if file_name == current_file_name {
+        return;
+    }
+    defer_snapshot_cleanup(vec![snapshot_dir.join(file_name)]);
 }
 
 pub(crate) async fn open_with_member_bindings(
@@ -225,6 +448,8 @@ async fn open_with_member_bindings_for_profile(
         SqliteConsensusStateMachine {
             core,
             membership_admission: Some(membership_admission),
+            #[cfg(test)]
+            snapshot_test_faults: Arc::new(SnapshotTestFaults::default()),
         },
         storage_identity,
     ))
@@ -271,6 +496,7 @@ async fn open(
         SqliteConsensusStateMachine {
             core,
             membership_admission: None,
+            snapshot_test_faults: Arc::new(SnapshotTestFaults::default()),
         },
     ))
 }
@@ -330,6 +556,8 @@ pub(crate) async fn open_with_pending_membership(
         SqliteConsensusStateMachine {
             core,
             membership_admission: Some(membership_admission),
+            #[cfg(test)]
+            snapshot_test_faults: Arc::new(SnapshotTestFaults::default()),
         },
         storage_identity,
     ))
@@ -398,17 +626,31 @@ async fn validate_and_clean_snapshot_directory(
         if !staging && !orphan_snapshot {
             continue;
         }
-        let file_type = entry
-            .file_type()
-            .await
-            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        #[cfg(test)]
+        if let Some(hook) =
+            snapshot_cleanup_scavenge_test_hook(&entry.path(), Some(core.snapshot_dir.as_ref()))
+        {
+            hook.scavenge_enumerated.notify_one();
+            hook.scavenge_release.notified().await;
+        }
+        let file_type = match entry.file_type().await {
+            Ok(file_type) => file_type,
+            // Deferred committed-path cleanup can unlink a candidate after
+            // `read_dir` yielded it. That is already the desired terminal
+            // state, not a failed reopen.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(SessionConsensusStorageError::BackendUnavailable),
+        };
         if !file_type.is_file() && !file_type.is_symlink() {
             return Err(SessionConsensusStorageError::CorruptState);
         }
-        tokio::fs::remove_file(entry.path())
-            .await
-            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-        removed = true;
+        match tokio::fs::remove_file(entry.path()).await {
+            Ok(()) => removed = true,
+            // The same benign race is possible between `file_type` and
+            // removal. Treat it as successful scavenging.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(SessionConsensusStorageError::BackendUnavailable),
+        }
     }
     if removed {
         sync_directory(core.snapshot_dir.as_ref())
@@ -824,7 +1066,14 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 error,
             )
         })?;
-        let incoming_path = snapshot.path().to_path_buf();
+        let raw_path = self
+            .core
+            .snapshot_dir
+            .join(format!("install-{}.sqlite", uuid::Uuid::new_v4()));
+        // Own the extraction target before envelope validation or extraction
+        // can create it. The receiving handle independently owns its path
+        // until this install either commits or is dropped.
+        let mut artifacts = SnapshotArtifacts::new([raw_path.clone()]);
         let (payload_length, checksum, total_length) =
             verify_snapshot_envelope_reader(&mut snapshot)
                 .await
@@ -835,10 +1084,6 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                         error,
                     )
                 })?;
-        let raw_path = self
-            .core
-            .snapshot_dir
-            .join(format!("install-{}.sqlite", uuid::Uuid::new_v4()));
         let raw_snapshot =
             extract_snapshot_database_from_reader(&mut snapshot, &raw_path, payload_length)
                 .await
@@ -856,11 +1101,14 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             .core
             .snapshot_dir
             .join(format!("promote-{}.part", uuid::Uuid::new_v4()));
+        // Arm every path before creating or promoting it. This also covers a
+        // malformed receive that fails before the SQLite installer is called.
+        artifacts.arm(promoted_path.clone());
+        artifacts.arm(final_path.clone());
         if let Err(error) =
             copy_and_promote_from_reader(&mut snapshot, &promoted_path, &final_path, total_length)
                 .await
         {
-            let _ = tokio::fs::remove_file(&raw_path).await;
             return Err(storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
                 ErrorVerb::Write,
@@ -889,30 +1137,24 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                     )
                 })?;
         if promoted_checksum != checksum || promoted_length != total_length {
-            let _ = tokio::fs::remove_file(&final_path).await;
-            let _ = tokio::fs::remove_file(&raw_path).await;
             return Err(storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
                 ErrorVerb::Read,
                 consensus::invalid_data("session consensus promoted snapshot is inconsistent"),
             ));
         }
-        let promoted_pin =
-            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-                Some(
-                    snapshot_handle_pin(&promoted_snapshot, &final_path)
-                        .await
-                        .map_err(|error| {
-                            storage_error(
-                                ErrorSubject::Snapshot(Some(meta.signature())),
-                                ErrorVerb::Read,
-                                error,
-                            )
-                        })?,
+        // Dynamic and fixed authority both publish this path before the
+        // metadata transaction. Pin its identity for the hand-off so a
+        // same-name replacement cannot become the durable snapshot.
+        let promoted_pin = snapshot_handle_pin(&promoted_snapshot, &final_path)
+            .await
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
                 )
-            } else {
-                None
-            };
+            })?;
 
         let installs_uniform_cutover =
             self.membership_admission.as_ref().is_some_and(|admission| {
@@ -933,27 +1175,60 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                         error,
                     )
                 })?;
-            if let Some(promoted_pin) = &promoted_pin {
-                if !promoted_pin
-                    .path_matches_identity(&final_path)
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?
-                {
-                    return Err(storage_error(
+            if !promoted_pin
+                .path_matches_identity(&final_path)
+                .map_err(|error| {
+                    storage_error(
                         ErrorSubject::Snapshot(Some(meta.signature())),
                         ErrorVerb::Read,
-                        consensus::invalid_data(
-                            "session consensus published snapshot was replaced",
-                        ),
-                    ));
-                }
+                        error,
+                    )
+                })?
+            {
+                return Err(storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    consensus::invalid_data("session consensus published snapshot was replaced"),
+                ));
             }
-            match consensus::install_snapshot_database_from_pinned_with_authority_sync(
+            #[cfg(test)]
+            let installed = if self
+                .snapshot_test_faults
+                .force_detach_failure
+                .swap(false, Ordering::AcqRel)
+            {
+                consensus::install_snapshot_database_from_pinned_with_forced_detach_failure_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    Some(&self.core.expected_members),
+                    Some(&self.core.expected_bindings),
+                    self.core.fixed_placement_policy,
+                    raw_snapshot,
+                    Some((&promoted_pin, final_path.as_path())),
+                    meta,
+                    &file_name,
+                    checksum,
+                    total_length,
+                )
+            } else {
+                consensus::install_snapshot_database_from_pinned_with_authority_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    Some(&self.core.expected_members),
+                    Some(&self.core.expected_bindings),
+                    self.core.fixed_placement_policy,
+                    raw_snapshot,
+                    Some((&promoted_pin, final_path.as_path())),
+                    meta,
+                    &file_name,
+                    checksum,
+                    total_length,
+                )
+            };
+            #[cfg(not(test))]
+            let installed = consensus::install_snapshot_database_from_pinned_with_authority_sync(
                 &conn,
                 self.core.storage_identity,
                 self.core.authority_profile,
@@ -961,36 +1236,64 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 Some(&self.core.expected_bindings),
                 self.core.fixed_placement_policy,
                 raw_snapshot,
-                promoted_pin.as_ref().map(|pin| (pin, final_path.as_path())),
+                Some((&promoted_pin, final_path.as_path())),
                 meta,
                 &file_name,
                 checksum,
                 total_length,
-            ) {
+            );
+            match installed {
                 Err(error) => Err(storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Write,
                     error,
                 )),
-                Ok(()) => {
-                    self.observe_applied_membership(&meta.last_membership)
-                        .map_err(membership_admission_storage_error)?;
-                    Ok(previous)
+                // A successful SQLite install is the durable ownership
+                // transfer for `final_path`. Membership observation is local
+                // reconciliation and must not turn that committed outcome
+                // into a rollback-looking error.
+                Ok(consensus::SnapshotInstallOutcome::Committed {
+                    incoming_detached: _,
+                }) => {
+                    // Keep the membership writer through route reconciliation:
+                    // once the durable image reaches an exact uniform
+                    // successor, no newly admitted predecessor RPC may slip
+                    // between the SQLite cutover and route promotion.
+                    #[cfg(test)]
+                    let observed_membership = !self
+                        .snapshot_test_faults
+                        .force_membership_observation_failure
+                        .swap(false, Ordering::AcqRel)
+                        && self
+                            .observe_applied_membership(&meta.last_membership)
+                            .is_ok();
+                    #[cfg(not(test))]
+                    let observed_membership = self
+                        .observe_applied_membership(&meta.last_membership)
+                        .is_ok();
+                    Ok((previous, observed_membership))
                 }
             }
         };
-        let previous = match install_result {
-            Ok(previous) => previous,
-            Err(error) => {
-                let _ = tokio::fs::remove_file(&final_path).await;
-                let _ = tokio::fs::remove_file(&raw_path).await;
-                return Err(error);
-            }
+        let (previous, observed_membership) = match install_result {
+            Ok(result) => result,
+            Err(error) => return Err(error),
         };
+        artifacts.disarm(&final_path);
         self.core.applied_progress.send_replace(meta.last_log_id);
-        let _ = tokio::fs::remove_file(&raw_path).await;
-        let _ = tokio::fs::remove_file(&incoming_path).await;
-        remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name).await;
+        // SQLite has committed final-path ownership. From here to the
+        // state-machine response there must be no await or blocking cleanup:
+        // a crash leaves only SDK staging garbage, which startup scavenges.
+        // If observation is uncertain, retain the old file as well as the
+        // newly referenced one. A later durable read/retry can reconcile it.
+        if observed_membership {
+            defer_old_snapshot_cleanup(
+                self.core.snapshot_dir.as_ref().to_path_buf(),
+                previous,
+                file_name.clone(),
+            );
+        }
+        defer_snapshot_cleanup(artifacts.take_paths());
         Ok(())
     }
 
@@ -1119,6 +1422,11 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             .core
             .snapshot_dir
             .join(format!("seal-{}.part", uuid::Uuid::new_v4()));
+        // Every path is armed before any synchronous SQLite backup or async
+        // sealing step can create it. Only the final path becomes durable
+        // ownership once the metadata transaction succeeds below.
+        let mut artifacts =
+            SnapshotArtifacts::new([raw_path.clone(), temporary_path.clone(), final_path.clone()]);
         let ((last_log_id, last_membership), (mut snapshot, checksum, byte_length)) =
             if self.core.authority_profile == ConsensusAuthorityProfile::Dynamic {
                 let membership = {
@@ -1166,11 +1474,9 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                     })?;
                 (membership, sealed)
             };
-        tokio::fs::rename(&temporary_path, &final_path)
-            .await
-            .map_err(|error| {
-                storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-            })?;
+        std::fs::rename(&temporary_path, &final_path).map_err(|error| {
+            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+        })?;
         sync_directory(&self.core.snapshot_dir).map_err(|error| {
             storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
         })?;
@@ -1180,75 +1486,19 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             last_membership,
             snapshot_id,
         };
-        let published_pin =
-            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-                Some(
-                    snapshot_handle_pin(&snapshot, &final_path)
-                        .await
-                        .map_err(|error| {
-                            storage_error(
-                                ErrorSubject::Snapshot(Some(meta.signature())),
-                                ErrorVerb::Read,
-                                error,
-                            )
-                        })?,
-                )
-            } else {
-                None
-            };
-        let previous = {
-            let conn = self.core.conn.lock().await;
-            let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-            if let Some(published_pin) = &published_pin {
-                if !published_pin
-                    .path_matches_identity(&final_path)
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?
-                {
-                    return Err(storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        consensus::invalid_data(
-                            "session consensus published snapshot was replaced",
-                        ),
-                    ));
-                }
-            }
-            consensus::save_current_snapshot_with_authority_sync(
-                &conn,
-                self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                &meta,
-                &file_name,
-                checksum,
-                byte_length,
-            )
+        // Dynamic snapshots receive the same publication identity fence as
+        // fixed authority: the path is not trusted after promotion.
+        let published_pin = snapshot_handle_pin(&snapshot, &final_path)
+            .await
             .map_err(|error| {
                 storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Write,
+                    ErrorVerb::Read,
                     error,
                 )
             })?;
-            previous
-        };
-        let _ = tokio::fs::remove_file(&raw_path).await;
-        remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name).await;
+        // Verify and rewind before publishing metadata. Once metadata commits,
+        // this builder must return without awaiting verification or cleanup.
         let (_, observed_checksum, observed_length) =
             verify_snapshot_envelope_reader(&mut snapshot)
                 .await
@@ -1273,6 +1523,63 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 error,
             )
         })?;
+        let previous = {
+            let conn = self.core.conn.lock().await;
+            let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
+            if !published_pin
+                .path_matches_identity(&final_path)
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?
+            {
+                return Err(storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    consensus::invalid_data("session consensus published snapshot was replaced"),
+                ));
+            }
+            consensus::save_current_snapshot_from_pinned_with_authority_sync(
+                &conn,
+                self.core.storage_identity,
+                self.core.authority_profile,
+                &self.core.expected_members,
+                &self.core.expected_bindings,
+                self.core.fixed_placement_policy,
+                (&published_pin, &final_path),
+                &meta,
+                &file_name,
+                checksum,
+                byte_length,
+            )
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Write,
+                    error,
+                )
+            })?;
+            previous
+        };
+        artifacts.disarm(&final_path);
+        // Metadata now owns `final_path`. Defer all remaining garbage work so
+        // the committed snapshot response has no await/cancellation point.
+        defer_old_snapshot_cleanup(
+            self.core.snapshot_dir.as_ref().to_path_buf(),
+            previous,
+            file_name.clone(),
+        );
+        defer_snapshot_cleanup(artifacts.take_paths());
         Ok(Snapshot {
             meta,
             snapshot: Box::new(snapshot),
@@ -1309,16 +1616,21 @@ async fn notify_watchers(core: &SqliteConsensusCore, notifications: &[Replicatio
     }
 }
 
-fn secure_snapshot_create_options(read: bool) -> tokio::fs::OpenOptions {
-    let mut options = tokio::fs::OpenOptions::new();
+fn secure_snapshot_create(path: &Path, read: bool) -> io::Result<tokio::fs::File> {
+    // Creation is synchronous so the caller's already-armed artifact owner
+    // cannot be cancelled after the OS materializes a path but before a Tokio
+    // open future delivers its handle.
+    let mut options = std::fs::OpenOptions::new();
     options.create_new(true).read(read).write(true);
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
         options
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    options
+    options.open(path).map(tokio::fs::File::from_std)
 }
 
 async fn snapshot_handle_pin(
@@ -1326,7 +1638,7 @@ async fn snapshot_handle_pin(
     path: &Path,
 ) -> io::Result<PinnedSqliteFile> {
     let cloned = snapshot.try_clone().await?;
-    PinnedSqliteFile::from_file(cloned.into_std().await, path.to_path_buf())
+    PinnedSqliteFile::from_file(cloned.into_std().await?, path.to_path_buf())
 }
 
 async fn seal_snapshot_database(
@@ -1342,9 +1654,7 @@ async fn seal_snapshot_database(
         ));
     }
     let mut source = tokio::fs::File::from_std(raw_snapshot.into_file());
-    let mut output = secure_snapshot_create_options(true)
-        .open(output_path)
-        .await?;
+    let mut output = secure_snapshot_create(output_path, true)?;
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -1404,9 +1714,7 @@ async fn seal_snapshot_database_from_path(
         ));
     }
     let mut source = tokio::fs::File::open(raw_path).await?;
-    let mut output = secure_snapshot_create_options(true)
-        .open(output_path)
-        .await?;
+    let mut output = secure_snapshot_create(output_path, true)?;
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -1521,9 +1829,7 @@ where
     source.seek(io::SeekFrom::Start(0)).await?;
     let mut source = source.take(length);
     let destination_path = destination.to_path_buf();
-    let mut destination = secure_snapshot_create_options(false)
-        .open(destination)
-        .await?;
+    let mut destination = secure_snapshot_create(destination, false)?;
     let copied = tokio::io::copy(&mut source, &mut destination).await?;
     if copied != length {
         return Err(consensus::invalid_data(
@@ -1532,7 +1838,7 @@ where
     }
     destination.flush().await?;
     destination.sync_all().await?;
-    PinnedSqliteFile::from_file(destination.into_std().await, destination_path)
+    PinnedSqliteFile::seal_extracted_source(destination.into_std().await, destination_path)
 }
 
 async fn copy_and_promote_from_reader<R>(
@@ -1545,9 +1851,7 @@ where
     R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
 {
     source.seek(io::SeekFrom::Start(0)).await?;
-    let mut output = secure_snapshot_create_options(false)
-        .open(temporary)
-        .await?;
+    let mut output = secure_snapshot_create(temporary, false)?;
     let copied = tokio::io::copy(source, &mut output).await?;
     if copied != expected_length {
         return Err(consensus::invalid_data(
@@ -1557,7 +1861,10 @@ where
     output.flush().await?;
     output.sync_all().await?;
     drop(output);
-    tokio::fs::rename(temporary, final_path).await?;
+    // Promotion is likewise synchronous: once the caller's artifact owner is
+    // armed, there is no cancellation point between rename and ownership
+    // transfer to the surrounding durable metadata path.
+    std::fs::rename(temporary, final_path)?;
     let parent = final_path
         .parent()
         .ok_or_else(|| consensus::invalid_data("session consensus snapshot has no parent"))?;
@@ -1566,18 +1873,6 @@ where
 
 fn sync_directory(path: &Path) -> io::Result<()> {
     std::fs::File::open(path)?.sync_all()
-}
-
-async fn remove_old_snapshot(
-    snapshot_dir: &Path,
-    previous: Option<consensus::CurrentSnapshot>,
-    current_file_name: &str,
-) {
-    if let Some((_, file_name, _, _)) = previous {
-        if file_name != current_file_name {
-            let _ = tokio::fs::remove_file(snapshot_dir.join(file_name)).await;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1590,8 +1885,8 @@ mod tests {
     use opc_consensus::engine::{CommittedLeaderId, EntryPayload, RaftSnapshotBuilder};
     use opc_crypto::CryptoEnvelopeV1;
     use opc_key::{
-        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
-        AES_256_GCM_SIV_NONCE_LEN,
+        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, KeyPurpose, MemoryKeyProvider,
+        SessionAad, Zeroizing, AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN,
     };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -1599,15 +1894,49 @@ mod tests {
     use super::*;
     use crate::backend::CompareAndSet;
     use crate::consensus::{
-        SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
-        SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusRequestId,
-        SessionMutationIntent, SessionMutationOutcome, SESSION_CONSENSUS_SCHEMA_VERSION,
+        DurableSessionConsensusCommand, SessionConsensusClusterId, SessionConsensusCommand,
+        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+        SessionConsensusEntryDigest, SessionConsensusRequestId, SessionMutationIntent,
+        SessionMutationOutcome, SESSION_CONSENSUS_SCHEMA_VERSION,
     };
+    use crate::error::StoreError;
     use crate::lease::SessionLeaseManager;
     use crate::model::{Generation, OwnerId, SessionKey, SessionKeyType, StateClass, StateType};
     use crate::record::{EncryptedSessionPayload, StoredSessionRecord};
 
     const PLAINTEXT_CANARY: &[u8] = b"never-persist-this-plaintext-canary";
+
+    #[test]
+    fn snapshot_artifacts_bound_repeated_precommit_failures_and_keep_disarmed_final() {
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let final_path = directory.path().join("snapshot-committed.opc");
+        for attempt in 0..3 {
+            let incoming = directory.path().join(format!("incoming-{attempt}.part"));
+            let raw = directory.path().join(format!("install-{attempt}.sqlite"));
+            let promote = directory.path().join(format!("promote-{attempt}.part"));
+            let artifacts =
+                SnapshotArtifacts::new([incoming.clone(), raw.clone(), promote.clone()]);
+            for path in [incoming, raw, promote] {
+                std::fs::write(&path, b"precommit artifact").expect("write staged artifact");
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push("-wal");
+                std::fs::write(PathBuf::from(sidecar), b"sidecar").expect("write WAL artifact");
+            }
+            drop(artifacts);
+        }
+        std::fs::write(&final_path, b"durably referenced final").expect("write final snapshot");
+        let mut committed = SnapshotArtifacts::new([final_path.clone()]);
+        committed.disarm(&final_path);
+        drop(committed);
+        let names = std::fs::read_dir(directory.path())
+            .expect("read snapshot directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vec![final_path.file_name().expect("final name").to_os_string()],
+            names
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
@@ -1713,6 +2042,7 @@ mod tests {
             SqliteConsensusStateMachine {
                 core,
                 membership_admission: None,
+                snapshot_test_faults: Arc::new(SnapshotTestFaults::default()),
             },
             database,
         )
@@ -1810,7 +2140,17 @@ mod tests {
     ) -> Entry<SessionRaftTypeConfig> {
         Entry {
             log_id: log_id_with_term(term, index),
-            payload: EntryPayload::Normal(command),
+            payload: EntryPayload::Normal(DurableSessionConsensusCommand::legacy(command)),
+        }
+    }
+
+    fn current_normal_entry(
+        index: u64,
+        command: SessionConsensusCommand,
+    ) -> Entry<SessionRaftTypeConfig> {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(DurableSessionConsensusCommand::current(command)),
         }
     }
 
@@ -1848,6 +2188,86 @@ mod tests {
         assert_eq!(sealed.len(), payload_bytes);
         record.payload =
             EncryptedSessionPayload::try_envelope(sealed).expect("structurally valid envelope");
+        current_normal_entry(
+            index,
+            SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(1),
+                request_id: SessionConsensusRequestId::from_bytes([request_byte; 16]),
+                logical_time: timestamp(request_byte),
+                intent: SessionMutationIntent::CompareAndSet(Box::new(CompareAndSet {
+                    key,
+                    lease,
+                    expected_generation: None,
+                    new_record: record,
+                })),
+            },
+        )
+    }
+
+    async fn authenticated_legacy_cas_entry(
+        index: u64,
+        request_byte: u8,
+        payload_bytes: usize,
+    ) -> Entry<SessionRaftTypeConfig> {
+        const NAMESPACE: &str = "historical-consensus-cap-test";
+        let key = key();
+        let owner = OwnerId::new("replica-a").expect("owner");
+        let fence = crate::model::FenceToken::new(1);
+        let lease = crate::lease::LeaseGuard::new(
+            key.clone(),
+            owner.clone(),
+            fence,
+            timestamp(1),
+            timestamp(59),
+            1,
+        );
+        let mut record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(index),
+            owner,
+            fence,
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new("historical-cap-boundary").expect("state type"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([]),
+        };
+        let provider = MemoryKeyProvider::new();
+        provider
+            .insert_active_key(
+                KeyId::new("historical-consensus-cap-key").expect("key ID"),
+                KeyPurpose::Session,
+                record.key.tenant.clone(),
+                Zeroizing::new([0x6d; AES_256_GCM_SIV_KEY_LEN]),
+            )
+            .expect("install historical test key");
+        let empty = EncryptedSessionPayload::encrypt(&provider, &record, NAMESPACE)
+            .await
+            .expect("seal empty historical fixture");
+        let plaintext_bytes = payload_bytes
+            .checked_sub(empty.len())
+            .expect("payload cap exceeds authenticated envelope overhead");
+        record.payload = EncryptedSessionPayload::new(vec![request_byte; plaintext_bytes]);
+        let sealed = EncryptedSessionPayload::encrypt(&provider, &record, NAMESPACE)
+            .await
+            .expect("seal historical fixture");
+        assert_eq!(sealed.len(), payload_bytes);
+        assert_eq!(
+            sealed
+                .decrypt(
+                    &provider,
+                    &record.key,
+                    &record.state_type,
+                    record.generation,
+                    record.fence,
+                    NAMESPACE,
+                )
+                .await
+                .expect("authenticate historical fixture")
+                .len(),
+            plaintext_bytes
+        );
+        record.payload = sealed;
         normal_entry(
             index,
             SessionConsensusCommand {
@@ -1865,6 +2285,21 @@ mod tests {
         )
     }
 
+    fn command_admission_cutover_entry(index: u64) -> Entry<SessionRaftTypeConfig> {
+        current_normal_entry(
+            index,
+            SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(1),
+                request_id: SessionConsensusRequestId::from_bytes(
+                    crate::consensus::SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID,
+                ),
+                logical_time: crate::consensus::types::command_admission_cutover_logical_time(),
+                intent: SessionMutationIntent::AdvanceLogicalTime,
+            },
+        )
+    }
+
     fn advance_time_command(
         identity: SessionConsensusIdentity,
         request_byte: u8,
@@ -1877,6 +2312,26 @@ mod tests {
             logical_time: timestamp(second),
             intent: SessionMutationIntent::AdvanceLogicalTime,
         }
+    }
+
+    fn with_current_admission_entry(
+        mut entry: Entry<SessionRaftTypeConfig>,
+    ) -> Entry<SessionRaftTypeConfig> {
+        let EntryPayload::Normal(command) = &mut entry.payload else {
+            panic!("current-admission fixture must be a normal entry");
+        };
+        *command = DurableSessionConsensusCommand::current((**command).clone());
+        entry
+    }
+
+    fn with_legacy_admission_entry(
+        mut entry: Entry<SessionRaftTypeConfig>,
+    ) -> Entry<SessionRaftTypeConfig> {
+        let EntryPayload::Normal(command) = &mut entry.payload else {
+            panic!("legacy-admission fixture must be a normal entry");
+        };
+        *command = DurableSessionConsensusCommand::legacy((**command).clone());
+        entry
     }
 
     fn initial_membership_entry() -> Entry<SessionRaftTypeConfig> {
@@ -1904,9 +2359,13 @@ mod tests {
         .expect("consensus storage");
         let entries = [
             initial_membership_entry(),
-            sealed_cas_entry(1, 11, 600 * 1024),
-            sealed_cas_entry(2, 12, 600 * 1024),
-            sealed_cas_entry(3, 13, crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES),
+            with_legacy_admission_entry(sealed_cas_entry(1, 11, 600 * 1024)),
+            with_legacy_admission_entry(sealed_cas_entry(2, 12, 600 * 1024)),
+            with_legacy_admission_entry(sealed_cas_entry(
+                3,
+                13,
+                crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+            )),
         ];
         {
             let conn = log_store.core.conn.lock().await;
@@ -1940,6 +2399,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_legacy_one_over_log_survives_cutover_reopen_reads_and_follower_catchup()
+    {
+        let directory = tempfile::tempdir().expect("historical log directory");
+        let leader_database = directory.path().join("leader.sqlite");
+        let leader_snapshots = directory.path().join("leader-snapshots");
+        let entries = vec![
+            initial_membership_entry(),
+            authenticated_legacy_cas_entry(
+                1,
+                11,
+                crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 1,
+            )
+            .await,
+            command_admission_cutover_entry(2),
+            // The store deliberately retries the fixed marker because a
+            // previous leader reply may have been lost.  Its receipt makes
+            // this a no-op and the original activation boundary must remain
+            // pinned at index 3.
+            command_admission_cutover_entry(3),
+            current_normal_entry(4, advance_time_command(identity(1), 13, 13)),
+        ];
+
+        let leader_backend = SqliteSessionBackend::open(&leader_database).expect("leader backend");
+        let (leader_log, mut leader_machine) = open(
+            &leader_backend,
+            &leader_snapshots,
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("leader consensus storage");
+        {
+            let conn = leader_log.core.conn.lock().await;
+            conn.execute(
+                "UPDATE consensus_command_admission SET strict_activation_index = 0, cutover_committed = 0 WHERE singleton = 1",
+                [],
+            )
+            .expect("model a base-version database before replicated cutover");
+            consensus::append_logs_sync(&conn, identity(1), &entries)
+                .expect("append retained base history and cutover");
+        }
+        let applied = leader_machine
+            .apply(entries.clone())
+            .await
+            .expect("deterministically apply retained history and cutover");
+        assert!(matches!(
+            &applied[1].result,
+            Err(StoreError::PayloadTooLarge {
+                actual,
+                max: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+            }) if *actual == crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 1
+        ));
+        drop(leader_log);
+        drop(leader_machine);
+        drop(leader_backend);
+
+        let reopened_backend =
+            SqliteSessionBackend::open(&leader_database).expect("reopen leader backend");
+        let (mut reopened_log, _) = open(
+            &reopened_backend,
+            &leader_snapshots,
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("reopen retained consensus history");
+        let full = reopened_log
+            .try_get_log_entries(0..5)
+            .await
+            .expect("read full retained history after cutover");
+        assert_eq!(
+            full.iter()
+                .map(|entry| entry.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        let limited = reopened_log
+            .limited_get_log_entries(1, 5)
+            .await
+            .expect("read nonempty limited historical page after cutover");
+        assert_eq!(
+            limited
+                .iter()
+                .map(|entry| entry.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let follower_backend = SqliteSessionBackend::open(directory.path().join("follower.sqlite"))
+            .expect("follower backend");
+        let (follower_log, mut follower_machine) = open(
+            &follower_backend,
+            directory.path().join("follower-snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("fresh follower consensus storage");
+        {
+            let conn = follower_log.core.conn.lock().await;
+            conn.execute(
+                "UPDATE consensus_command_admission SET strict_activation_index = 0, cutover_committed = 0 WHERE singleton = 1",
+                [],
+            )
+            .expect("fresh follower starts before replicated cutover");
+            consensus::append_logs_sync(&conn, identity(1), &entries)
+                .expect("follower admits retained history only through replicated cutover");
+        }
+        let follower_applied = follower_machine
+            .apply(entries)
+            .await
+            .expect("follower applies retained history deterministically");
+        assert_eq!(applied[1], follower_applied[1]);
+
+        let exact = with_current_admission_entry(sealed_cas_entry(
+            5,
+            21,
+            crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+        ));
+        let one_over = with_current_admission_entry(sealed_cas_entry(
+            6,
+            22,
+            crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 1,
+        ));
+        let conn = follower_log.core.conn.lock().await;
+        consensus::append_logs_sync(&conn, identity(1), &[exact])
+            .expect("current follower admission accepts exact cap");
+        assert!(
+            consensus::append_logs_sync(&conn, identity(1), &[one_over]).is_err(),
+            "current follower admission rejects one byte over the cap"
+        );
+    }
+
+    #[tokio::test]
     async fn fixed_raw_reads_reject_persisted_profile_policy_and_scope_drift() {
         for drift in [
             "UPDATE consensus_identity SET authority_profile = 1 WHERE singleton = 1",
@@ -1950,7 +2543,9 @@ mod tests {
             let (mut log_store, mut state_machine, database) =
                 open_fixed_raw_read_store(&directory).await;
             let connection = rusqlite::Connection::open(database).expect("open fixed raw-read db");
-            connection.execute(drift, []).expect("persist fixed raw-read drift");
+            connection
+                .execute(drift, [])
+                .expect("persist fixed raw-read drift");
             drop(connection);
 
             assert_fixed_raw_reads_fail_closed(&mut log_store, &mut state_machine).await;
@@ -1987,9 +2582,10 @@ mod tests {
         let snapshots = temp.path().join("snapshots");
         let backend = SqliteSessionBackend::open(&database).expect("backend");
 
-        let _ = open(&backend, &snapshots, identity(1), expected_members())
-            .await
-            .expect("first initialization");
+        let (first_log_store, first_state_machine) =
+            open(&backend, &snapshots, identity(1), expected_members())
+                .await
+                .expect("first initialization");
         let cancelled_receive = snapshots.join("incoming-cancelled.part");
         let interrupted_build = snapshots.join("build-interrupted.sqlite");
         let interrupted_install_wal = snapshots.join("install-interrupted.sqlite-wal");
@@ -2006,14 +2602,37 @@ mod tests {
         tokio::fs::write(&orphan_promoted, b"promoted before metadata commit")
             .await
             .expect("write orphan promoted artifact");
-        let _ = open(&backend, &snapshots, identity(1), expected_members())
-            .await
-            .expect("idempotent initialization cleans interrupted staging");
+        drop(first_log_store);
+        drop(first_state_machine);
+        drop(backend);
+
+        let reopened_backend = SqliteSessionBackend::open(&database).expect("reopen backend");
+        let (reopened_log_store, reopened_state_machine) = open(
+            &reopened_backend,
+            &snapshots,
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("idempotent initialization cleans interrupted staging");
         assert!(!cancelled_receive.exists());
         assert!(!interrupted_build.exists());
         assert!(!interrupted_install_wal.exists());
         assert!(!orphan_promoted.exists());
-        let error = match open(&backend, &snapshots, identity(2), expected_members()).await {
+        drop(reopened_log_store);
+        drop(reopened_state_machine);
+        drop(reopened_backend);
+
+        let mismatch_backend =
+            SqliteSessionBackend::open(&database).expect("reopen mismatch backend");
+        let error = match open(
+            &mismatch_backend,
+            &snapshots,
+            identity(2),
+            expected_members(),
+        )
+        .await
+        {
             Ok(_) => panic!("different configuration must fail"),
             Err(error) => error,
         };
@@ -2211,8 +2830,14 @@ mod tests {
         let SessionMutationOutcome::Lease(guard) = response.result.expect("lease outcome") else {
             panic!("expected lease outcome");
         };
-        let first_digest = acquire
-            .calculate_applied_digest(1, SessionConsensusEntryDigest::GENESIS, timestamp(1))
+        let first_digest = DurableSessionConsensusCommand::legacy(acquire.clone())
+            .calculate_applied_result_digest(
+                1,
+                SessionConsensusEntryDigest::GENESIS,
+                timestamp(1),
+                1,
+                &Ok(SessionMutationOutcome::Lease(guard.clone())),
+            )
             .expect("digest");
         assert_eq!(
             (1, first_digest, Some(timestamp(1))),
@@ -2304,21 +2929,23 @@ mod tests {
     #[tokio::test]
     async fn divergent_uncommitted_tails_are_replaceable_but_committed_prefix_is_immutable() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let backend =
-            SqliteSessionBackend::open(temp.path().join("sessions.sqlite")).expect("backend");
-        let (_, mut state_machine) = open(
-            &backend,
-            temp.path().join("snapshots"),
-            identity(1),
-            expected_members(),
-        )
-        .await
-        .expect("consensus storage");
+        let database = temp.path().join("sessions.sqlite");
+        let snapshots = temp.path().join("snapshots");
+        let backend = SqliteSessionBackend::open(&database).expect("backend");
+        let (_, mut state_machine) = open(&backend, &snapshots, identity(1), expected_members())
+            .await
+            .expect("consensus storage");
 
         let membership = initial_membership_entry();
         let committed_command = advance_time_command(identity(1), 11, 1);
-        let committed_digest = committed_command
-            .calculate_applied_digest(1, SessionConsensusEntryDigest::GENESIS, timestamp(1))
+        let committed_digest = DurableSessionConsensusCommand::legacy(committed_command.clone())
+            .calculate_applied_result_digest(
+                1,
+                SessionConsensusEntryDigest::GENESIS,
+                timestamp(1),
+                1,
+                &Ok(SessionMutationOutcome::Unit),
+            )
             .expect("committed digest");
         let committed = normal_entry(1, committed_command);
         let first_tail = normal_entry(2, advance_time_command(identity(1), 12, 2));
@@ -2385,10 +3012,12 @@ mod tests {
                 .expect("state-machine head")
         );
         drop(state_machine);
+        drop(backend);
 
+        let reopened_backend = SqliteSessionBackend::open(&database).expect("reopen backend");
         let (_, reopened_state_machine) = open(
-            &backend,
-            temp.path().join("snapshots"),
+            &reopened_backend,
+            &snapshots,
             identity(1),
             expected_members(),
         )
@@ -2450,11 +3079,17 @@ mod tests {
         assert_eq!(responses[2].sequence, 2);
         assert_eq!(responses[2].logical_time, Some(timestamp(5)));
 
-        let first_digest = first
-            .calculate_applied_digest(1, SessionConsensusEntryDigest::GENESIS, timestamp(5))
+        let first_digest = DurableSessionConsensusCommand::legacy(first.clone())
+            .calculate_applied_result_digest(
+                1,
+                SessionConsensusEntryDigest::GENESIS,
+                timestamp(5),
+                1,
+                &responses[1].result,
+            )
             .expect("first digest");
-        let second_digest = second
-            .calculate_applied_digest(2, first_digest, timestamp(5))
+        let second_digest = DurableSessionConsensusCommand::legacy(second.clone())
+            .calculate_applied_result_digest(2, first_digest, timestamp(5), 2, &responses[2].result)
             .expect("second digest");
         assert_eq!(
             (2, second_digest, Some(timestamp(5))),
@@ -2525,6 +3160,27 @@ mod tests {
             source_sm.proposal_state().await.expect("source state"),
             target_sm.proposal_state().await.expect("target state")
         );
+        let source_receipt = {
+            let conn = source_sm.core.conn.lock().await;
+            conn.query_row(
+                "SELECT receipt_version, receipt_digest FROM consensus_request_outcomes",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .expect("read canonical source receipt")
+        };
+        let target_receipt = {
+            let conn = target_sm.core.conn.lock().await;
+            conn.query_row(
+                "SELECT receipt_version, receipt_digest FROM consensus_request_outcomes",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .expect("read fresh destination receipt")
+        };
+        assert_eq!(source_receipt, target_receipt);
+        assert_eq!(2, source_receipt.0);
+        assert_eq!(32, source_receipt.1.len());
         {
             let conn = target_sm.core.conn.lock().await;
             assert_eq!(
@@ -2550,8 +3206,8 @@ mod tests {
         assert_eq!(snapshot.meta, current.meta);
 
         let advanced = advance_time_command(identity(1), 15, 2);
-        let advanced_digest = advanced
-            .calculate_applied_digest(
+        let advanced_digest = DurableSessionConsensusCommand::legacy(advanced.clone())
+            .calculate_applied_result_digest(
                 2,
                 source_sm
                     .proposal_state()
@@ -2559,6 +3215,8 @@ mod tests {
                     .expect("source proposal state")
                     .1,
                 timestamp(2),
+                2,
+                &Ok(SessionMutationOutcome::Unit),
             )
             .expect("advanced digest");
         target_sm
@@ -2647,24 +3305,34 @@ mod tests {
         )
         .await
         .expect("corrupt target storage");
-        let mut corrupt_receiving = corrupt_target_sm
-            .begin_receiving_snapshot()
-            .await
-            .expect("corrupt receiving file");
-        let mut corrupted_snapshot = snapshot_bytes.clone();
-        corrupted_snapshot[64] ^= 0xff;
-        corrupt_receiving
-            .write_all(&corrupted_snapshot)
-            .await
-            .expect("write corrupt snapshot");
-        corrupt_receiving
-            .flush()
-            .await
-            .expect("flush corrupt snapshot");
-        assert!(corrupt_target_sm
-            .install_snapshot(&snapshot.meta, corrupt_receiving)
-            .await
-            .is_err());
+        for corruption_offset in [64, 65] {
+            let mut corrupt_receiving = corrupt_target_sm
+                .begin_receiving_snapshot()
+                .await
+                .expect("corrupt receiving file");
+            let mut corrupted_snapshot = snapshot_bytes.clone();
+            corrupted_snapshot[corruption_offset] ^= 0xff;
+            corrupt_receiving
+                .write_all(&corrupted_snapshot)
+                .await
+                .expect("write corrupt snapshot");
+            corrupt_receiving
+                .flush()
+                .await
+                .expect("flush corrupt snapshot");
+            assert!(corrupt_target_sm
+                .install_snapshot(&snapshot.meta, corrupt_receiving)
+                .await
+                .is_err());
+        }
+        let staged = std::fs::read_dir(corrupt_dir.path().join("snapshots"))
+            .expect("read corrupt snapshot directory")
+            .map(|entry| entry.expect("snapshot entry").file_name())
+            .collect::<Vec<_>>();
+        assert!(
+            staged.is_empty(),
+            "repeated failed receives leave no artifacts"
+        );
         assert_eq!(
             (0, SessionConsensusEntryDigest::GENESIS, None),
             corrupt_target_sm
@@ -2685,8 +3353,14 @@ mod tests {
         file.sync_all().await.expect("sync corruption");
         assert!(target_sm.get_current_snapshot().await.is_err());
         drop(file);
+        drop(target_sm);
+        drop(target_backend);
+
+        let restarted_backend =
+            SqliteSessionBackend::open(target_dir.path().join("sessions.sqlite"))
+                .expect("reopen corrupted target backend");
         let reopen_error = match open(
-            &target_backend,
+            &restarted_backend,
             target_dir.path().join("snapshots"),
             identity(1),
             expected_members(),
@@ -2697,5 +3371,200 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(SessionConsensusStorageError::CorruptState, reopen_error);
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_postcommit_detach_and_membership_failures_remain_committed() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source_backend =
+            SqliteSessionBackend::open(source_dir.path().join("sessions.sqlite")).expect("backend");
+        let (_, mut source) = open(
+            &source_backend,
+            source_dir.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("source storage");
+        source
+            .apply([
+                initial_membership_entry(),
+                normal_entry(
+                    1,
+                    acquire_command(identity(1), SessionConsensusRequestId::from_bytes([17; 16])),
+                ),
+            ])
+            .await
+            .expect("apply source state");
+        let mut builder = source.get_snapshot_builder().await;
+        let mut snapshot = builder
+            .build_snapshot()
+            .await
+            .expect("build source snapshot");
+
+        let target_dir = tempfile::tempdir().expect("target tempdir");
+        let target_database = target_dir.path().join("sessions.sqlite");
+        let target_backend = SqliteSessionBackend::open(&target_database).expect("target backend");
+        let snapshot_dir = target_dir.path().join("snapshots");
+        let (_, mut target) = open(
+            &target_backend,
+            snapshot_dir.clone(),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("target storage");
+        let mut receiving = target
+            .begin_receiving_snapshot()
+            .await
+            .expect("receiving snapshot");
+        snapshot
+            .snapshot
+            .seek(io::SeekFrom::Start(0))
+            .await
+            .expect("rewind source snapshot");
+        tokio::io::copy(&mut snapshot.snapshot, &mut receiving)
+            .await
+            .expect("stream source snapshot");
+        let initial_cleanup = SnapshotDeferredCleanupCompletionHook {
+            snapshot_dir: target_dir.path().join("snapshots"),
+            remaining: Arc::new(AtomicUsize::new(1)),
+            completed: Arc::new(tokio::sync::Notify::new()),
+        };
+        set_snapshot_deferred_cleanup_completion_hook(Some(initial_cleanup.clone()));
+        target.force_next_snapshot_postcommit_failures_for_test();
+        target
+            .install_snapshot(&snapshot.meta, receiving)
+            .await
+            .expect("post-commit cleanup failures must report success");
+        initial_cleanup.completed.notified().await;
+        set_snapshot_deferred_cleanup_completion_hook(None);
+        let committed = target
+            .get_current_snapshot()
+            .await
+            .expect("read committed snapshot")
+            .expect("committed snapshot exists");
+        let committed_path = committed.snapshot.path().to_path_buf();
+        drop(committed);
+        assert!(
+            committed_path.exists(),
+            "committed final survives cleanup faults"
+        );
+        drop(target);
+        drop(target_backend);
+
+        let restarted_backend =
+            SqliteSessionBackend::open(&target_database).expect("reopen target backend");
+        let (_, mut restarted) = open(
+            &restarted_backend,
+            snapshot_dir,
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("restart after post-commit cleanup failure");
+        assert!(
+            committed_path.exists(),
+            "startup cleanup retains the durably referenced final"
+        );
+        let mut retry = restarted
+            .begin_receiving_snapshot()
+            .await
+            .expect("retry receiving snapshot");
+        snapshot
+            .snapshot
+            .seek(io::SeekFrom::Start(0))
+            .await
+            .expect("rewind source snapshot for retry");
+        tokio::io::copy(&mut snapshot.snapshot, &mut retry)
+            .await
+            .expect("stream retry snapshot");
+        let retry_cleanup = SnapshotDeferredCleanupCompletionHook {
+            snapshot_dir: target_dir.path().join("snapshots"),
+            remaining: Arc::new(AtomicUsize::new(2)),
+            completed: Arc::new(tokio::sync::Notify::new()),
+        };
+        set_snapshot_deferred_cleanup_completion_hook(Some(retry_cleanup.clone()));
+        restarted
+            .install_snapshot(&snapshot.meta, retry)
+            .await
+            .expect("retry after post-commit cleanup failure");
+        retry_cleanup.completed.notified().await;
+        set_snapshot_deferred_cleanup_completion_hook(None);
+        assert!(
+            restarted
+                .get_current_snapshot()
+                .await
+                .expect("read retry snapshot")
+                .is_some(),
+            "retry leaves a durably referenced final"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_scavenging_tolerates_a_held_deferred_cleanup_race() {
+        let directory = tempfile::tempdir().expect("snapshot cleanup race directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let backend = SqliteSessionBackend::open(&database).expect("initial cleanup race backend");
+        let (_, state_machine) = open(
+            &backend,
+            snapshot_dir.clone(),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("initialize snapshot directory");
+        drop(state_machine);
+        drop(backend);
+
+        let candidate = snapshot_dir.join("incoming-deferred-race.part");
+        std::fs::write(&candidate, b"stale deferred cleanup candidate")
+            .expect("write deferred cleanup candidate");
+        let hook = SnapshotCleanupScavengeTestHook {
+            candidate: candidate.clone(),
+            snapshot_dir: snapshot_dir.clone(),
+            cleanup_started: Arc::new(Barrier::new(2)),
+            cleanup_release: Arc::new(Barrier::new(2)),
+            cleanup_removed: Arc::new(tokio::sync::Notify::new()),
+            scavenge_enumerated: Arc::new(tokio::sync::Notify::new()),
+            scavenge_release: Arc::new(tokio::sync::Notify::new()),
+        };
+        set_snapshot_cleanup_scavenge_test_hook(Some(hook.clone()));
+        defer_snapshot_cleanup(vec![candidate.clone()]);
+        let cleanup_started = Arc::clone(&hook.cleanup_started);
+        tokio::task::spawn_blocking(move || cleanup_started.wait())
+            .await
+            .expect("deferred cleanup reaches hold point");
+
+        let reopen_backend = SqliteSessionBackend::open(&database).expect("reopen cleanup backend");
+        let reopening = open(
+            &reopen_backend,
+            snapshot_dir,
+            identity(1),
+            expected_members(),
+        );
+        tokio::pin!(reopening);
+        tokio::select! {
+            () = hook.scavenge_enumerated.notified() => {}
+            result = &mut reopening => {
+                let _ = result;
+                panic!("reopen finished before race hook");
+            }
+        }
+        let cleanup_release = Arc::clone(&hook.cleanup_release);
+        tokio::task::spawn_blocking(move || cleanup_release.wait())
+            .await
+            .expect("release deferred cleanup");
+        hook.cleanup_removed.notified().await;
+        hook.scavenge_release.notify_one();
+        reopening
+            .await
+            .expect("candidate removal during enumeration is benign");
+        set_snapshot_cleanup_scavenge_test_hook(None);
+        assert!(
+            !candidate.exists(),
+            "deferred cleanup removed its candidate"
+        );
     }
 }

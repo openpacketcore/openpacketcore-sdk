@@ -2,13 +2,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::backend::{CompareAndSet, CompareAndSetResult};
+use crate::consumer::validate_compare_and_set_profile;
 use crate::error::StoreError;
-use crate::lease::LeaseGuard;
+use crate::lease::{validate_lease_guard_profile, LeaseGuard};
 use crate::model::{OwnerId, SessionKey};
 use crate::record::StoredSessionRecord;
 
@@ -25,11 +27,46 @@ pub use opc_consensus::{
 /// Current durable command and consensus-RPC schema.
 pub const SESSION_CONSENSUS_SCHEMA_VERSION: u16 = opc_consensus::CONSENSUS_SCHEMA_VERSION;
 
+/// Admission revision decoded for commands written before strict payload
+/// admission was introduced. It is never emitted by current leaders.
+pub(crate) const SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_LEGACY: u8 = 0;
+
+/// Admission revision emitted by current leaders and required for every new
+/// command. Legacy revision zero is accepted only below the separately
+/// durable historical activation watermark.
+pub(crate) const SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_CURRENT: u8 = 1;
+
+/// Fixed idempotency key for the replicated admission-cutover marker. Keeping
+/// it SDK-internal and constant prevents an arbitrary marker-shaped command
+/// from moving or colliding with the durable boundary.
+pub(crate) const SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID: [u8; 16] = [0x43; 16];
+
+/// Canonical logical time for the fixed admission-cutover command.
+///
+/// The marker is retried with one fixed request ID across leaders. Its full
+/// command digest must therefore be byte-identical regardless of wall-clock
+/// time or the logical clock observed by the proposing node.
+pub(crate) fn command_admission_cutover_logical_time() -> opc_types::Timestamp {
+    opc_types::Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH)
+}
+
+/// Identify the public command shape reserved for the strict-admission
+/// cutover before its canonical logical time and private durable revision are
+/// attached by the local leader.
+pub(crate) fn is_command_admission_cutover_request(
+    request_id: SessionConsensusRequestId,
+    intent: &SessionMutationIntent,
+) -> bool {
+    request_id.as_bytes() == &SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID
+        && matches!(intent, SessionMutationIntent::AdvanceLogicalTime)
+}
+
 /// Maximum accepted byte length of a caller-supplied cluster name.
 pub const SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES: usize =
     opc_consensus::CONSENSUS_CLUSTER_ID_MAX_BYTES;
 
 const COMMAND_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/command/v1\0";
+const COMMAND_RESULT_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/command-result/v2\0";
 
 /// Redacted fixed-width binding of one topology member's admitted identities.
 ///
@@ -218,6 +255,57 @@ pub enum SessionMutationIntent {
     },
 }
 
+/// Validate one unwrapped mutation's time-independent semantic profile.
+///
+/// This is shared by leader preproposal and follower log admission. It never
+/// reads lease state, so fence freshness, credential ownership, and record
+/// conflicts remain deterministic state-machine checks.
+pub(crate) fn validate_mutation_intent_profile(
+    intent: &SessionMutationIntent,
+) -> Result<(), StoreError> {
+    match intent {
+        SessionMutationIntent::CompareAndSet(op) => validate_compare_and_set_profile(op),
+        SessionMutationIntent::DeleteFenced(lease) | SessionMutationIntent::ReleaseLease(lease) => {
+            validate_lease_guard_profile(lease)
+        }
+        SessionMutationIntent::RefreshTtl { lease, ttl }
+        | SessionMutationIntent::RenewLease { lease, ttl } => {
+            validate_lease_guard_profile(lease)?;
+            crate::validate_session_ttl(*ttl)
+        }
+        SessionMutationIntent::AcquireLease { ttl, .. } => crate::validate_session_ttl(*ttl),
+        SessionMutationIntent::PrepareTopologyTransition {
+            desired_identity,
+            desired_members,
+            desired_bindings,
+            ..
+        } => {
+            if i64::try_from(desired_identity.configuration_epoch().get()).is_err()
+                || desired_members
+                    .iter()
+                    .any(|node| i64::try_from(node.get()).is_err())
+                || desired_bindings
+                    .keys()
+                    .any(|node| i64::try_from(node.get()).is_err())
+            {
+                return Err(StoreError::InvalidKey(
+                    "topology transition exceeds consensus storage bounds".into(),
+                ));
+            }
+            Ok(())
+        }
+        SessionMutationIntent::AdvanceLogicalTime
+        | SessionMutationIntent::BindConsumerRequest { .. }
+        | SessionMutationIntent::ReadConsumerRecord { .. }
+        | SessionMutationIntent::FinalizeOperatorRecovery { .. }
+        | SessionMutationIntent::MarkTopologyLearnersReady { .. }
+        | SessionMutationIntent::FenceTopologyAuthority { .. }
+        | SessionMutationIntent::AbortTopologyTransition { .. }
+        | SessionMutationIntent::FinalizeTopologyTransition { .. }
+        | SessionMutationIntent::Authorized { .. } => Ok(()),
+    }
+}
+
 /// Application command carried by one normal Openraft log entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionConsensusCommand {
@@ -256,6 +344,186 @@ impl SessionConsensusCommand {
             hasher.finalize().into(),
         ))
     }
+
+    /// Calculate the application-chain digest for a command written by the
+    /// current SDK, including the exact deterministic result and committed
+    /// log position.
+    ///
+    /// This models the SDK's private current admission revision, so public
+    /// callers can reproduce a current [`SessionConsensusResponse::digest`]
+    /// without exposing that internal representation. To verify a retained
+    /// pre-cutover command, use [`Self::calculate_applied_digest`], whose
+    /// command-only input remains byte-for-byte compatible with that history.
+    pub fn calculate_applied_result_digest(
+        &self,
+        sequence: u64,
+        previous_digest: SessionConsensusEntryDigest,
+        effective_logical_time: opc_types::Timestamp,
+        raft_log_index: u64,
+        result: &Result<SessionMutationOutcome, StoreError>,
+    ) -> Result<SessionConsensusEntryDigest, StoreError> {
+        DurableSessionConsensusCommand::current(self.clone()).calculate_applied_result_digest(
+            sequence,
+            previous_digest,
+            effective_logical_time,
+            raft_log_index,
+            result,
+        )
+    }
+}
+
+/// Crate-private Openraft payload that records the payload-admission revision
+/// without changing `SessionConsensusCommand`'s stable public Rust shape.
+///
+/// The command is flattened first to keep historical log JSON decodable. A
+/// missing trailing revision is the frozen legacy representation; current
+/// leaders always emit the current revision. This wrapper is deliberately not
+/// re-exported: applications construct and serialize the public command shape
+/// they used before strict admission was introduced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DurableSessionConsensusCommand {
+    command: SessionConsensusCommand,
+    admission_revision: u8,
+}
+
+/// JSON compatibility view for the private durable command wrapper.
+///
+/// `serde(flatten)` is intentionally confined to human-readable formats:
+/// postcard cannot size a flattened map, while existing log and receipt JSON
+/// must retain its historical flattened representation.
+#[derive(Serialize)]
+struct HumanReadableDurableSessionConsensusCommandRef<'a> {
+    #[serde(flatten)]
+    command: &'a SessionConsensusCommand,
+    admission_revision: u8,
+}
+
+/// Owned JSON compatibility view for the private durable command wrapper.
+#[derive(Deserialize)]
+struct HumanReadableDurableSessionConsensusCommand {
+    #[serde(flatten)]
+    command: SessionConsensusCommand,
+    #[serde(default)]
+    admission_revision: u8,
+}
+
+impl Serialize for DurableSessionConsensusCommand {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            return HumanReadableDurableSessionConsensusCommandRef {
+                command: &self.command,
+                admission_revision: self.admission_revision,
+            }
+            .serialize(serializer);
+        }
+
+        // Postcard requires a statically known sequence length. A tuple keeps
+        // the private binary Openraft payload fixed-length while the command
+        // itself retains its existing derived binary representation.
+        (&self.command, self.admission_revision).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DurableSessionConsensusCommand {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let HumanReadableDurableSessionConsensusCommand {
+                command,
+                admission_revision,
+            } = HumanReadableDurableSessionConsensusCommand::deserialize(deserializer)?;
+            return Ok(Self {
+                command,
+                admission_revision,
+            });
+        }
+
+        let (command, admission_revision) =
+            <(SessionConsensusCommand, u8)>::deserialize(deserializer)?;
+        Ok(Self {
+            command,
+            admission_revision,
+        })
+    }
+}
+
+impl DurableSessionConsensusCommand {
+    pub(crate) fn legacy(command: SessionConsensusCommand) -> Self {
+        Self {
+            command,
+            admission_revision: SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_LEGACY,
+        }
+    }
+
+    pub(crate) fn current(command: SessionConsensusCommand) -> Self {
+        Self {
+            command,
+            admission_revision: SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_CURRENT,
+        }
+    }
+
+    pub(crate) const fn admission_revision(&self) -> u8 {
+        self.admission_revision
+    }
+
+    pub(crate) fn is_command_admission_cutover(&self) -> bool {
+        self.admission_revision == SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_CURRENT
+            && is_command_admission_cutover_request(self.command.request_id, &self.command.intent)
+            && self.command.logical_time == command_admission_cutover_logical_time()
+    }
+
+    pub(crate) fn calculate_applied_result_digest(
+        &self,
+        sequence: u64,
+        previous_digest: SessionConsensusEntryDigest,
+        effective_logical_time: opc_types::Timestamp,
+        raft_log_index: u64,
+        result: &Result<SessionMutationOutcome, StoreError>,
+    ) -> Result<SessionConsensusEntryDigest, StoreError> {
+        if self.admission_revision == SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_LEGACY {
+            return self.command.calculate_applied_digest(
+                sequence,
+                previous_digest,
+                effective_logical_time,
+            );
+        }
+        let encoded = serde_json::to_vec(&(
+            sequence,
+            previous_digest,
+            effective_logical_time,
+            raft_log_index,
+            self,
+            result,
+        ))
+        .map_err(|_| {
+            StoreError::Serialization("session consensus command result encoding failed".into())
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(COMMAND_RESULT_DIGEST_DOMAIN);
+        hasher.update(encoded);
+        Ok(SessionConsensusEntryDigest::from_bytes(
+            hasher.finalize().into(),
+        ))
+    }
+}
+
+impl Deref for DurableSessionConsensusCommand {
+    type Target = SessionConsensusCommand;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl DerefMut for DurableSessionConsensusCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
 }
 
 /// Successful state-machine result returned after durable quorum commit and
@@ -281,7 +549,12 @@ pub struct SessionConsensusResponse {
     pub result: Result<SessionMutationOutcome, StoreError>,
     /// Committed application sequence when admitted, or zero for a rejection.
     pub sequence: u64,
-    /// Digest of the admitted application command.
+    /// Digest binding the admitted application outcome.
+    ///
+    /// Current commands bind the predecessor chain position, effective
+    /// logical time, Raft log index, private durable command representation,
+    /// and deterministic result. Retained pre-cutover commands preserve their
+    /// historical command-only digest.
     pub digest: Option<SessionConsensusEntryDigest>,
     /// Persisted logical time at which the original request was applied.
     /// Exact retries recover this value even after leader failover.
@@ -339,7 +612,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use opc_types::{NetworkFunctionKind, TenantId};
+    use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
     use super::*;
     use crate::{OwnerId, SessionKeyType, StableId, STABLE_ID_MAX_BYTES};
@@ -373,6 +646,119 @@ mod tests {
             if let Err(error) = decoded {
                 assert!(!error.to_string().contains("165"));
             }
+        }
+    }
+
+    #[test]
+    fn public_command_shape_and_digest_contract_remain_compatible() {
+        let identity = SessionConsensusIdentity::new(
+            SessionConsensusClusterId::new("public-command-compat").expect("cluster ID"),
+            SessionConsensusConfigurationId::from_bytes([0x71; 32]),
+            SessionConsensusConfigurationEpoch::new(1).expect("configuration epoch"),
+        );
+        let command = SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity,
+            request_id: SessionConsensusRequestId::from_bytes([0x72; 16]),
+            logical_time: Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH),
+            intent: SessionMutationIntent::AdvanceLogicalTime,
+        };
+        let frozen_public_json = serde_json::to_vec(&command).expect("encode public command");
+        let decoded_legacy: DurableSessionConsensusCommand =
+            serde_json::from_slice(&frozen_public_json).expect("decode frozen public command");
+        assert_eq!(
+            SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_LEGACY,
+            decoded_legacy.admission_revision(),
+            "a missing internal revision remains legacy history"
+        );
+        assert_eq!(command, *decoded_legacy);
+        let current = DurableSessionConsensusCommand::current(command.clone());
+        let mut expected_current_json = frozen_public_json.clone();
+        assert_eq!(Some(b'}'), expected_current_json.pop());
+        expected_current_json.extend_from_slice(b",\"admission_revision\":1}");
+        assert_eq!(
+            expected_current_json,
+            serde_json::to_vec(&current).expect("encode current durable command"),
+            "current JSON retains the flattened command representation"
+        );
+        let decoded_current_json: DurableSessionConsensusCommand =
+            serde_json::from_slice(&expected_current_json)
+                .expect("decode current durable command JSON");
+        assert_eq!(current, decoded_current_json);
+        let encoded_current =
+            opc_consensus::encode_bounded(&current).expect("encode current durable command");
+        let decoded_current: DurableSessionConsensusCommand =
+            opc_consensus::decode_bounded(&encoded_current)
+                .expect("decode current durable command");
+        assert_eq!(
+            current, decoded_current,
+            "postcard round-trips current commands"
+        );
+        let legacy_encoded = serde_json::to_vec(&(
+            1_u64,
+            SessionConsensusEntryDigest::GENESIS,
+            command.logical_time,
+            &command,
+        ))
+        .expect("encode frozen public command");
+        let mut legacy_hasher = Sha256::new();
+        legacy_hasher.update(COMMAND_DIGEST_DOMAIN);
+        legacy_hasher.update(legacy_encoded);
+        assert_eq!(
+            SessionConsensusEntryDigest::from_bytes(legacy_hasher.finalize().into()),
+            command
+                .calculate_applied_digest(
+                    1,
+                    SessionConsensusEntryDigest::GENESIS,
+                    command.logical_time,
+                )
+                .expect("calculate frozen public digest"),
+            "the legacy public command JSON is the command-only digest input"
+        );
+
+        let result = Ok(SessionMutationOutcome::Unit);
+        assert_eq!(
+            current
+                .calculate_applied_result_digest(
+                    1,
+                    SessionConsensusEntryDigest::GENESIS,
+                    command.logical_time,
+                    7,
+                    &result,
+                )
+                .expect("calculate durable current digest"),
+            command
+                .calculate_applied_result_digest(
+                    1,
+                    SessionConsensusEntryDigest::GENESIS,
+                    command.logical_time,
+                    7,
+                    &result,
+                )
+                .expect("calculate public current digest"),
+            "public callers can reproduce a current response digest"
+        );
+
+        // This deliberately exhaustive match is a compile-time regression
+        // test: adding another public variant or a hidden cutover variant
+        // breaks callers that exhaustively match this stable enum.
+        match command.intent {
+            SessionMutationIntent::AdvanceLogicalTime
+            | SessionMutationIntent::CompareAndSet(_)
+            | SessionMutationIntent::DeleteFenced(_)
+            | SessionMutationIntent::RefreshTtl { .. }
+            | SessionMutationIntent::AcquireLease { .. }
+            | SessionMutationIntent::RenewLease { .. }
+            | SessionMutationIntent::ReleaseLease(_)
+            | SessionMutationIntent::BindConsumerRequest { .. }
+            | SessionMutationIntent::ReadConsumerRecord { .. }
+            | SessionMutationIntent::FinalizeOperatorRecovery { .. }
+            | SessionMutationIntent::PrepareTopologyTransition { .. }
+            | SessionMutationIntent::MarkTopologyLearnersReady { .. }
+            | SessionMutationIntent::FenceTopologyAuthority { .. }
+            | SessionMutationIntent::AbortTopologyTransition { .. }
+            | SessionMutationIntent::FinalizeTopologyTransition { .. }
+            | SessionMutationIntent::Authorized { .. } => {}
         }
     }
 }

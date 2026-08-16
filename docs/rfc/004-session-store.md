@@ -877,9 +877,24 @@ the same descriptor set MUST also derive different scopes. Mixed-policy or
 mixed-profile peers MUST fail authenticated admission before Openraft or durable
 Raft initialization. Dynamic-profile identities remain descriptor- and
 epoch-derived and do not include the fixed-profile or placement-policy binding.
-`ConsensusSessionStore::open_fixed_durable_quorum` is supported only on Linux,
-where descriptor-pinned SQLite snapshots are available; other platforms MUST
-return `FixedQuorumUnsupportedPlatform` before durable initialization.
+`ConsensusSessionStore::open_fixed_durable_quorum` is supported only on Linux;
+other platforms MUST return `FixedQuorumUnsupportedPlatform` before durable
+initialization. Dynamic consensus constructors require Linux
+descriptor-pinned snapshot staging and MUST return
+`DynamicConsensusUnsupportedPlatform` before creating consensus schema or
+snapshot-directory state on another platform. Linux `/proc/self/fd` descriptor
+pinning applies only to SDK-controlled dynamic-consensus snapshot staging with
+journaling disabled, never to general/live-WAL standalone SQLite. Standalone
+SQLite remains portable because it does not install consensus snapshots.
+
+Portable file-backed standalone SQLite requires its immediate parent database
+namespace to be a real, non-symlink/non-reparse, service-owned or otherwise
+trusted namespace controlled by the service identity. Leaf symlink/reparse and
+nonregular shapes MUST be rejected, as MUST Unix hardlink ambiguity where
+safely representable; this does not claim universal cross-platform inode
+binding. Actors able to rename within that namespace can replace the `db-wal`,
+`db-shm`, and `db-journal` family, so hostile or same-UID same-directory
+replacement is outside the constructor guarantee.
 Fixed membership does not authorize dynamic membership transitions, a second
 consensus engine, a controller feed, or a new packet-core protocol path.
 `try_from_fixed_durable_quorum_with_authenticated_placement` may additionally
@@ -987,12 +1002,15 @@ performs provider work. Errors and diagnostics MUST be redaction-safe, and a
 subsequent independent request MUST use a usable freshly authenticated
 connection.
 
-`ReplicationWatchCatchUpRequired` advances the quarantined protocol-v4 error
-set from revision 5 to revision 6. The wire schema remains revision 4. All
-legacy compatibility peers MUST be drained and upgraded together; this is not
-a rolling mixed-profile transition. The Openraft consensus profile, persisted
-SQLite/journal/snapshot format, payload envelopes, AAD, and HKMS/provider
-placement are unchanged.
+`ReplicationWatchCatchUpRequired` advanced the quarantined protocol-v4 error
+set from revision 5 to revision 6 without changing that direct wire schema.
+The current direct protocol profile is wire-schema revision 7 and error-set
+revision 9; it retains the bounded-watch outcome and adds the later
+direct-contract changes described in §12.3. All legacy compatibility peers
+MUST be drained and upgraded together; this is not a rolling mixed-profile
+transition.
+The Openraft consensus profile, persisted SQLite/journal/snapshot format,
+payload envelopes, AAD, and HKMS/provider placement are otherwise unchanged.
 
 Replicas MUST apply events only if `generation` and `fence` are newer according
 to the state class rules.
@@ -1340,7 +1358,18 @@ then restore traffic. Once an
 drained checkpoint restore or reviewed reverse migration of every live and
 replayable record, log, snapshot, and restore source.
 Revision 3 adds only an O(1) per-store cursor key to local restore metadata; it
-does not rewrite session records or create another authority. A pre-revision-3
+does not rewrite session records or create another authority. Standalone
+startup migrates only the exact complete six-table predecessor whose sole
+layout difference is the legacy three-column `restore_scan_state`. Existing-
+file admission performs exactly one complete persisted-state validation pass,
+costing O(records + replication-log entries), and rejects every partial/mixed/
+missing/extra/malformed image without repair. It transactionally adds and
+populates the nonzero 32-byte key, then reclassifies the exact current schema
+and validates only the migrated restore row/key rather than rescanning
+unchanged session, replication-log, or lease authority. Any failure rolls the
+schema and row change back together. The exact nullable DDL emitted by SQLite
+`ALTER TABLE` is a reviewed current form only
+when its single row carries a valid key, so restart does not migrate again. A pre-revision-3
 consensus snapshot lacks that metadata and MUST NOT be installed after upgrade;
 operators MUST take and validate a coherent post-upgrade snapshot before
 claiming repair or rollback coverage. In-profile
@@ -1422,12 +1451,12 @@ replication append, or rebuild request. The consensus ALPN and legacy
 `opc-session-net/5` ALPN MUST NOT be multiplexed as equivalent authority on one
 production listener.
 
-The exact consensus contract profile MUST use transport/wire-schema revision 4
-and error-set revision 6. Revision 4 makes the forwarded consumer scope
-explicit, so a peer cannot silently downgrade a consumer-scoped operation to
-an internal call; error revision 6 binds that semantic boundary into the
-exact profile. Revision 3/error revision 5 or older MUST fail before engine
-dispatch.
+The exact consensus contract profile MUST use transport/wire-schema revision 5
+and error-set revision 6. Revision 5 binds every forwarded mutation reply to
+its exact request ID, semantic intent, authority identity, and consumer scope,
+so a peer cannot replay a valid reply for another operation; error revision 6
+binds that semantic boundary into the exact profile. Revision 4/error revision
+5 or older MUST fail before engine dispatch.
 Operators MUST drain traffic and writers, stop every consensus member, upgrade
 the full membership together, verify exact-profile handshakes, and only then
 restore traffic. Mixed-profile rolling operation is unsupported.
@@ -1715,6 +1744,17 @@ readable while KMS retains each envelope's exact key. Missing, revoked,
 malformed, cross-tenant, and wrong-AAD inputs fail with coarse, redacted crypto
 errors. Provider, endpoint, tenant, key ID, and payload text MUST NOT be
 included in those errors.
+
+Every remote provider MUST publish enforced seal-input, unseal-output,
+round-trip-plaintext, key-ID, and exact ciphertext-expansion capabilities. An
+undeclared capability is unusable. Remote AES-256-GCM-SIV seal output MUST be
+exactly plaintext length plus the 16-byte authentication tag, and unseal output
+MUST be exactly ciphertext length minus that tag. The KMS remote-seal profile
+MUST also implement `derive_keyed_digest` under the exact selected key, with
+separate domain and input fields and a canonical 32-byte result. Its 65,536-byte
+hex-JSON response limit provides an exact 32,663-byte guaranteed round-trip
+plaintext capacity; implementations MUST NOT advertise the local
+4,259,840-byte stored-envelope cap through that KMS profile.
 
 KMS/HKMS owns remote historical-key retention and retirement. The SDK keeps no
 local historical material or authorization cache and exposes no retirement API

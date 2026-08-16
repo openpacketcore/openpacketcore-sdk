@@ -2255,20 +2255,56 @@ impl ConsensusSessionStore {
         request: &SessionTopologyTransitionRequest,
         kind: TransitionControlKind,
         intent: SessionMutationIntent,
+        mut operation_guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(tokio::sync::OwnedRwLockWriteGuard<()>, u64), SessionTopologyTransitionError> {
+        if self.inner.raft.current_leader().await != Some(self.inner.local_node_id) {
+            return Err(SessionTopologyTransitionError::NotLeader);
+        }
+        if !self
+            .inner
+            .backend
+            .consensus_command_admission_cutover_committed(self.inner.storage_identity)
+            .await
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?
+        {
+            let marker = DurableSessionConsensusCommand::current(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: self.inner.storage_identity,
+                request_id: SessionConsensusRequestId::from_bytes(
+                    SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID,
+                ),
+                logical_time: super::command_admission_cutover_logical_time(),
+                intent: SessionMutationIntent::AdvanceLogicalTime,
+            });
+            encode_bounded(&marker).map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            (operation_guard, _) = self
+                .propose_transition_command_with_guard(marker, operation_guard, deadline)
+                .await?;
+        }
+        let command = DurableSessionConsensusCommand::current(SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: self.inner.storage_identity,
+            request_id: transition_request_id(request, kind),
+            logical_time: Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH),
+            intent,
+        });
+        encode_bounded(&command).map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        self.propose_transition_command_with_guard(command, operation_guard, deadline)
+            .await
+    }
+
+    /// Submit an SDK-internal transition command while retaining the exclusive
+    /// topology fence until Openraft returns the definitive result.
+    async fn propose_transition_command_with_guard(
+        &self,
+        command: DurableSessionConsensusCommand,
         operation_guard: tokio::sync::OwnedRwLockWriteGuard<()>,
         deadline: tokio::time::Instant,
     ) -> Result<(tokio::sync::OwnedRwLockWriteGuard<()>, u64), SessionTopologyTransitionError> {
         if self.inner.raft.current_leader().await != Some(self.inner.local_node_id) {
             return Err(SessionTopologyTransitionError::NotLeader);
         }
-        let command = SessionConsensusCommand {
-            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
-            identity: self.inner.storage_identity,
-            request_id: transition_request_id(request, kind),
-            logical_time: Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH),
-            intent,
-        };
-        encode_bounded(&command).map_err(|_| SessionTopologyTransitionError::Unavailable)?;
         let raft = self.inner.raft.clone();
         let attempt_deadline = transition_engine_attempt_deadline(deadline);
         let mut supervisor = tokio::spawn(async move {
@@ -2506,7 +2542,7 @@ impl ConsensusSessionStore {
                         SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
                     )) => continue,
                     Ok(Err(_)) => {
-                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                     }
                     Ok(Ok(response)) => response,
                 };
@@ -2518,7 +2554,7 @@ impl ConsensusSessionStore {
                         SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
                     ) => continue,
                     Err(_) => {
-                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                     }
                     Ok(payload) => payload,
                 };
@@ -2620,7 +2656,7 @@ impl ConsensusSessionStore {
                         SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
                     )) => continue,
                     Ok(Err(_)) => {
-                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                     }
                     Ok(Ok(response)) => response,
                 };
@@ -2632,7 +2668,7 @@ impl ConsensusSessionStore {
                         SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
                     ) => continue,
                     Err(_) => {
-                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                     }
                     Ok(payload) => payload,
                 };
@@ -2739,7 +2775,7 @@ impl ConsensusSessionStore {
                         SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
                     )) => continue,
                     Ok(Err(_)) => {
-                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                     }
                     Ok(Ok(response)) => response,
                 };
@@ -2751,7 +2787,7 @@ impl ConsensusSessionStore {
                         SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout,
                     ) => continue,
                     Err(_) => {
-                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings)
+                        return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                     }
                     Ok(payload) => payload,
                 };

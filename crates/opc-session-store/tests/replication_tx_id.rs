@@ -74,9 +74,10 @@ fn coordinator_mint_is_fixed_lowercase_hex_without_legacy_normalization() {
 
 #[test]
 fn new_sqlite_schema_enforces_text_and_exact_width_bounds() {
-    let file = tempfile::NamedTempFile::new().expect("temporary database");
-    drop(SqliteSessionBackend::open(file.path()).expect("initialize schema"));
-    let conn = Connection::open(file.path()).expect("open database");
+    let directory = tempfile::tempdir().expect("temporary database directory");
+    let path = directory.path().join("sessions.sqlite");
+    drop(SqliteSessionBackend::open(&path).expect("initialize schema"));
+    let conn = Connection::open(&path).expect("open database");
 
     for (sequence, tx_id) in [(1_i64, "x".to_string()), (2, "x".repeat(128))] {
         let encoded = serde_json::to_string(&entry(sequence as u64, &tx_id)).expect("entry JSON");
@@ -115,9 +116,10 @@ fn new_sqlite_schema_enforces_text_and_exact_width_bounds() {
 
 #[tokio::test]
 async fn replay_rebuild_restart_and_fork_identity_preserve_exact_legacy_bytes() {
-    let file = tempfile::NamedTempFile::new().expect("temporary database");
+    let directory = tempfile::tempdir().expect("temporary database directory");
+    let path = directory.path().join("sessions.sqlite");
     let original = entry(1, "Legacy-TX");
-    let backend = SqliteSessionBackend::open(file.path()).expect("open backend");
+    let backend = SqliteSessionBackend::open(&path).expect("open backend");
     backend
         .replicate_entry(original.clone())
         .await
@@ -143,7 +145,7 @@ async fn replay_rebuild_restart_and_fork_identity_preserve_exact_legacy_bytes() 
     );
     drop(backend);
 
-    let restarted = SqliteSessionBackend::open(file.path()).expect("restart backend");
+    let restarted = SqliteSessionBackend::open(&path).expect("restart backend");
     assert_eq!(
         restarted
             .get_replication_log(1, 10)
@@ -153,8 +155,9 @@ async fn replay_rebuild_restart_and_fork_identity_preserve_exact_legacy_bytes() 
     );
     drop(restarted);
 
-    let rebuilt_file = tempfile::NamedTempFile::new().expect("rebuild database");
-    let rebuilt = SqliteSessionBackend::open(rebuilt_file.path()).expect("open rebuild backend");
+    let rebuilt_directory = tempfile::tempdir().expect("rebuild database directory");
+    let rebuilt_path = rebuilt_directory.path().join("sessions.sqlite");
+    let rebuilt = SqliteSessionBackend::open(&rebuilt_path).expect("open rebuild backend");
     rebuilt
         .rebuild_replication_state(vec![original.clone()])
         .await
@@ -180,11 +183,12 @@ async fn hostile_or_inconsistent_persisted_ids_fail_closed_without_rewrite() {
             "persisted replication transaction ID is invalid",
         ),
     ] {
-        let file = tempfile::NamedTempFile::new().expect("temporary database");
-        drop(SqliteSessionBackend::open(file.path()).expect("initialize schema"));
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let path = directory.path().join("sessions.sqlite");
+        drop(SqliteSessionBackend::open(&path).expect("initialize schema"));
         let expected = entry(1, "expected");
         let encoded = serde_json::to_string(&expected).expect("entry JSON");
-        let conn = Connection::open(file.path()).expect("open raw database");
+        let conn = Connection::open(&path).expect("open raw database");
         conn.execute_batch("PRAGMA ignore_check_constraints = ON")
             .expect("allow legacy-invalid fixture");
         conn.execute(
@@ -195,15 +199,18 @@ async fn hostile_or_inconsistent_persisted_ids_fail_closed_without_rewrite() {
         .expect("insert hostile fixture");
         drop(conn);
 
-        let backend = SqliteSessionBackend::open(file.path()).expect("open backend");
         for _ in 0..64 {
+            let error = match SqliteSessionBackend::open(&path) {
+                Ok(_) => panic!("hostile transaction ID must reject during construction"),
+                Err(error) => error,
+            };
             assert_eq!(
-                backend.get_replication_log(1, 1).await,
-                Err(StoreError::Serialization(expected_message.into()))
+                error,
+                StoreError::Serialization("persisted standalone session state is invalid".into())
             );
+            assert!(!error.to_string().contains(&stored_tx_id));
         }
-        drop(backend);
-        let conn = Connection::open(file.path()).expect("reopen raw database");
+        let conn = Connection::open(&path).expect("reopen raw database");
         assert_eq!(
             conn.query_row(
                 "SELECT length(CAST(tx_id AS BLOB)) FROM session_replication_log",

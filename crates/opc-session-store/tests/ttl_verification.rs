@@ -7,7 +7,6 @@ use opc_session_store::{
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::NamedTempFile;
 
 fn tenant() -> TenantId {
     TenantId::new("tenant-a").expect("tenant")
@@ -64,12 +63,12 @@ async fn test_virtual_time_lease_takeover_success() {
 // Verification 2: Non-leakage of expired records and leases in SQLite database (pruning).
 #[tokio::test]
 async fn test_database_row_pruning() {
-    // Create a temporary database file
-    let tmp_file = NamedTempFile::new().unwrap();
-    let db_path = tmp_file.path();
+    // Retain the parent directory while the backend initializes this new path.
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("sessions.sqlite");
 
     {
-        let backend = SqliteSessionBackend::open(db_path).unwrap();
+        let backend = SqliteSessionBackend::open(&db_path).unwrap();
         let key = test_key(b"leak-test-key");
 
         // Acquire lease with a TTL of 500 ms
@@ -115,7 +114,7 @@ async fn test_database_row_pruning() {
     }
 
     // Now open the database file directly via rusqlite Connection to inspect row counts.
-    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
 
     // 1. Verify session_records table contains 0 records (expired record pruned).
     let record_count: i64 = conn

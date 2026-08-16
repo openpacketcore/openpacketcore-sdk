@@ -203,12 +203,12 @@ attestor supplies that provenance; the CNF chooses and configures the
 Kubernetes/cloud/CSI/TPM/SPIFFE adapter and must still map each logical voter
 to exactly one durable backing volume.
 
-The exact consensus contract is transport/wire-schema revision 4 and error-set
-revision 6. Revision 4 makes the forwarded consumer scope explicit, so a
-peer cannot silently downgrade a consumer-scoped operation to an internal
-call; error revision 6 binds that semantic boundary into the exact profile.
-Older exact profiles fail before engine dispatch and require a drained
-full-membership upgrade.
+The exact consensus contract is transport/wire-schema revision 5 and error-set
+revision 6. Revision 5 binds every forwarded mutation reply to its exact
+request ID, semantic intent, authority identity, and consumer scope, so a peer
+cannot replay a valid reply for another operation; error revision 6 binds that
+semantic boundary into the exact profile. Older exact profiles fail before
+engine dispatch and require a drained full-membership upgrade.
 
 ### Structural identity and legacy persistence admission
 
@@ -445,8 +445,8 @@ authentically binds the composite seek key, backend epoch, record revision,
 logical time, scope, and progress. A modified, stale, or cross-scope cursor
 fails typed and restarts from page one. A server never fabricates a replacement
 cursor while fitting a wire frame; an encoded page that cannot fit returns
-`RestoreScanResponseTooLarge` so the caller can retry the same cursor with a
-smaller record limit.
+`RestoreScanResponseTooLarge`; the SDK does not retry it, so the caller can
+retry the same cursor with a smaller record limit.
 
 Every production participant is created with an opaque authenticated TLS
 config and a binding derived from one immutable `SessionReplicationManifest`.

@@ -112,8 +112,8 @@
   },
   "protocol": {
     "consensus_alpn": "opc-session-consensus/2",
-    "transport_revision": 4,
-    "wire_schema_revision": 4,
+    "transport_revision": 5,
+    "wire_schema_revision": 5,
     "error_set_revision": 6,
     "consensus_schema_version": 1,
     "min_frame_bytes": 9437184,
@@ -173,7 +173,9 @@
     "max_restore_page_records": 1024,
     "max_restore_page_payload_bytes": 2096128,
     "max_restore_examined_rows": 4096,
-    "max_restore_sqlite_work_millis": 1000
+    "max_restore_sqlite_work_millis": 1000,
+    "local_stored_value_cap_bytes": 4259840,
+    "consensus_stored_value_cap_bytes": 1048576
   },
   "provisional_test_thresholds": {
     "acknowledged_write_loss": 0,

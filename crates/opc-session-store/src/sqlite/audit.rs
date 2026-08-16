@@ -193,7 +193,8 @@ impl SqliteIdentityAuditViolationCounts {
     }
 
     /// Relational record rows whose absolute expiry violates the bounded
-    /// profile at the audit reference time.
+    /// profile at the audit reference time, or lease rows whose paired
+    /// canonical deadline representations disagree.
     pub const fn invalid_record_expiry_fields(self) -> u64 {
         self.invalid_record_expiry_fields
     }
@@ -547,11 +548,20 @@ fn schema_is_supported(conn: &Connection) -> Result<bool, ()> {
                 "expires_at",
             ][..],
         ),
-        ("leases", &["owner", "key_type", "stable_id"][..]),
+        (
+            "leases",
+            &[
+                "owner",
+                "key_type",
+                "stable_id",
+                "guard_expires_at",
+                "expires_at_unix_ms",
+            ][..],
+        ),
         ("key_fences", &["key_type", "stable_id"][..]),
         (
             "session_replication_log",
-            &["sequence", "tx_id", "entry_json"][..],
+            &["sequence", "tx_id", "entry_json", "timestamp"][..],
         ),
     ] {
         for column in columns {
@@ -657,7 +667,10 @@ const LEASES_FIRST_PAGE: &str = r#"
            CASE WHEN typeof(key_type) = 'text'
                   AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END,
            typeof(stable_id), length(stable_id),
-           NULL, NULL, NULL, NULL
+           typeof(guard_expires_at), length(CAST(guard_expires_at AS BLOB)),
+           CASE WHEN typeof(guard_expires_at) = 'text'
+                  AND length(CAST(guard_expires_at AS BLOB)) <= 64 THEN guard_expires_at END,
+           typeof(expires_at_unix_ms), expires_at_unix_ms
     FROM leases
     ORDER BY rowid
     LIMIT ?3
@@ -672,7 +685,10 @@ const LEASES_NEXT_PAGE: &str = r#"
            CASE WHEN typeof(key_type) = 'text'
                   AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END,
            typeof(stable_id), length(stable_id),
-           NULL, NULL, NULL, NULL
+           typeof(guard_expires_at), length(CAST(guard_expires_at AS BLOB)),
+           CASE WHEN typeof(guard_expires_at) = 'text'
+                  AND length(CAST(guard_expires_at AS BLOB)) <= 64 THEN guard_expires_at END,
+           typeof(expires_at_unix_ms), expires_at_unix_ms
     FROM leases
     WHERE rowid > ?3
     ORDER BY rowid
@@ -688,6 +704,7 @@ fn scan_session_records(conn: &Connection, state: &mut AuditState) -> Result<Sca
         "SELECT 1 FROM session_records WHERE rowid > ?1 LIMIT 1",
         ScannedTable::SessionRecords,
         true,
+        false,
         state,
     )
 }
@@ -701,6 +718,7 @@ fn scan_leases(conn: &Connection, state: &mut AuditState) -> Result<ScanControl,
         "SELECT 1 FROM leases WHERE rowid > ?1 LIMIT 1",
         ScannedTable::Leases,
         false,
+        true,
         state,
     )
 }
@@ -714,6 +732,7 @@ fn scan_owner_and_key_type_table(
     next_exists_sql: &str,
     table: ScannedTable,
     validate_expiry: bool,
+    validate_lease_deadline: bool,
     state: &mut AuditState,
 ) -> Result<ScanControl, ()> {
     let mut cursor = None;
@@ -780,6 +799,12 @@ fn scan_owner_and_key_type_table(
             {
                 return Ok(ScanControl::Stop);
             }
+            if validate_lease_deadline
+                && !lease_deadline_fields_are_valid(row, 9, 10, 11, 12, 13)?
+                && !state.increment_invalid_record_expiry()
+            {
+                return Ok(ScanControl::Stop);
+            }
             cursor = Some(rowid);
             rows_in_page = rows_in_page.checked_add(1).ok_or(())?;
         }
@@ -787,6 +812,37 @@ fn scan_owner_and_key_type_table(
             return Ok(ScanControl::Continue);
         }
     }
+}
+
+fn lease_deadline_fields_are_valid(
+    row: &Row<'_>,
+    guard_type_index: usize,
+    guard_length_index: usize,
+    guard_value_index: usize,
+    unix_ms_type_index: usize,
+    unix_ms_value_index: usize,
+) -> Result<bool, ()> {
+    let guard_type: String = row.get(guard_type_index).map_err(|_| ())?;
+    let guard_length: Option<i64> = row.get(guard_length_index).map_err(|_| ())?;
+    if guard_type != "text"
+        || !guard_length.is_some_and(|guard_length| (1..=64).contains(&guard_length))
+    {
+        return Ok(false);
+    }
+    let guard: Option<String> = row.get(guard_value_index).map_err(|_| ())?;
+    let Some(guard) = guard else {
+        return Ok(false);
+    };
+    let timestamp = match super::ops::parse_persisted_rfc3339_normalized(&guard) {
+        Ok(timestamp) => timestamp,
+        Err(_) => return Ok(false),
+    };
+    let unix_ms_type: String = row.get(unix_ms_type_index).map_err(|_| ())?;
+    if unix_ms_type != "integer" {
+        return Ok(false);
+    }
+    let unix_ms: i64 = row.get(unix_ms_value_index).map_err(|_| ())?;
+    Ok(super::ops::timestamp_unix_millis(timestamp).is_ok_and(|expected| expected == unix_ms))
 }
 
 fn record_expiry_fields_are_valid(
@@ -815,10 +871,12 @@ fn record_expiry_fields_are_valid(
             let Some(value) = value else {
                 return Ok(false);
             };
-            Some(match Timestamp::from_str(&value) {
-                Ok(value) => value,
-                Err(_) => return Ok(false),
-            })
+            Some(
+                match super::ops::parse_persisted_rfc3339_normalized(&value) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(false),
+                },
+            )
         }
         _ => return Ok(false),
     };
@@ -979,7 +1037,10 @@ const REPLICATION_LOG_FIRST_PAGE: &str = r#"
                   AND length(CAST(tx_id AS BLOB)) <= ?1 THEN tx_id END,
            typeof(entry_json), length(CAST(entry_json AS BLOB)),
            CASE WHEN typeof(entry_json) = 'text'
-                  AND length(CAST(entry_json AS BLOB)) <= ?2 THEN entry_json END
+                  AND length(CAST(entry_json AS BLOB)) <= ?2 THEN entry_json END,
+           typeof(timestamp), length(CAST(timestamp AS BLOB)),
+           CASE WHEN typeof(timestamp) = 'text'
+                  AND length(CAST(timestamp AS BLOB)) <= 64 THEN timestamp END
     FROM session_replication_log
     ORDER BY sequence
     LIMIT ?3
@@ -992,7 +1053,10 @@ const REPLICATION_LOG_NEXT_PAGE: &str = r#"
                   AND length(CAST(tx_id AS BLOB)) <= ?1 THEN tx_id END,
            typeof(entry_json), length(CAST(entry_json AS BLOB)),
            CASE WHEN typeof(entry_json) = 'text'
-                  AND length(CAST(entry_json AS BLOB)) <= ?2 THEN entry_json END
+                  AND length(CAST(entry_json AS BLOB)) <= ?2 THEN entry_json END,
+           typeof(timestamp), length(CAST(timestamp AS BLOB)),
+           CASE WHEN typeof(timestamp) = 'text'
+                  AND length(CAST(timestamp AS BLOB)) <= 64 THEN timestamp END
     FROM session_replication_log
     WHERE sequence > ?3
     ORDER BY sequence
@@ -1086,12 +1150,25 @@ fn scan_replication_entries(conn: &Connection, state: &mut AuditState) -> Result
                 let entry = serde_json::from_str::<ReplicationEntry>(&entry_json)
                     .ok()
                     .and_then(|entry| entry.into_validated().ok());
+                let timestamp_type: String = row.get(7).map_err(|_| ())?;
+                let timestamp_length: Option<i64> = row.get(8).map_err(|_| ())?;
+                let timestamp: Option<String> = row.get(9).map_err(|_| ())?;
+                let timestamp = (timestamp_type == "text"
+                    && timestamp_length
+                        .and_then(|value| u64::try_from(value).ok())
+                        .is_some_and(|value| value <= 64))
+                .then_some(timestamp)
+                .flatten()
+                .and_then(|value| super::ops::parse_persisted_rfc3339_normalized(&value).ok());
                 let stored_sequence = u64::try_from(sequence)
                     .ok()
                     .filter(|sequence| *sequence != 0);
                 let valid = stored_sequence
                     .zip(entry.as_ref())
-                    .is_some_and(|(stored_sequence, entry)| entry.sequence == stored_sequence);
+                    .zip(timestamp)
+                    .is_some_and(|((stored_sequence, entry), timestamp)| {
+                        entry.sequence == stored_sequence && entry.timestamp == timestamp
+                    });
                 let tx_id_valid = stored_tx_id
                     .as_ref()
                     .zip(encoded_tx_id.as_ref())
@@ -1131,4 +1208,46 @@ fn page_has_more(
     }
     .map_err(|_| ())?;
     Ok(value.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    #[test]
+    fn audit_rejects_noncanonical_or_mismatched_lease_deadlines() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        conn.execute_batch("CREATE TABLE lease_fixture (guard_expires_at, expires_at_unix_ms);")
+            .expect("fixture schema");
+        let canonical = "2026-07-12T00:00:00.000000000Z";
+        let expected = super::super::ops::timestamp_unix_millis(
+            Timestamp::from_str(canonical).expect("timestamp"),
+        )
+        .expect("SQLite timestamp");
+        for (deadline, unix_ms) in [
+            ("2026-07-12T00:00:00Z", expected),
+            (canonical, expected + 1),
+        ] {
+            conn.execute(
+                "INSERT INTO lease_fixture (guard_expires_at, expires_at_unix_ms) VALUES (?1, ?2)",
+                params![deadline, unix_ms],
+            )
+            .expect("fixture row");
+        }
+        let mut statement = conn
+            .prepare(
+                "SELECT typeof(guard_expires_at), length(CAST(guard_expires_at AS BLOB)), guard_expires_at, typeof(expires_at_unix_ms), expires_at_unix_ms FROM lease_fixture",
+            )
+            .expect("fixture query");
+        let rows = statement
+            .query_map([], |row| {
+                Ok(lease_deadline_fields_are_valid(row, 0, 1, 2, 3, 4).is_ok_and(|valid| valid))
+            })
+            .expect("scan fixture")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect fixture");
+        assert_eq!(rows, vec![false, false]);
+    }
 }

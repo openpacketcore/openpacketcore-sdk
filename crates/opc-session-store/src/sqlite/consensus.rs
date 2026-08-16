@@ -10,7 +10,6 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
@@ -28,10 +27,12 @@ use crate::backend::{
 use crate::capability::BackendCapabilities;
 use crate::consensus::storage::{ConsensusAuthorityProfile, SessionConsensusStorageError};
 use crate::consensus::types::{
-    SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-    SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusNodeId,
-    SessionConsensusRequestId, SessionConsensusResponse, SessionMutationIntent,
-    SessionMutationOutcome, SessionTopologyMemberBinding, SESSION_CONSENSUS_SCHEMA_VERSION,
+    DurableSessionConsensusCommand, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
+    SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusIdentity,
+    SessionConsensusNodeId, SessionConsensusRequestId, SessionConsensusResponse,
+    SessionMutationIntent, SessionMutationOutcome, SessionTopologyMemberBinding,
+    SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_CURRENT,
+    SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_LEGACY, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::consensus::SessionRaftTypeConfig;
 use crate::error::{LeaseError, StoreError};
@@ -40,14 +41,77 @@ use crate::record::SessionPayloadEncoding;
 
 #[cfg(test)]
 use super::RestoreScanValidationProfile;
-use super::{lease, ops, SqliteSessionBackend};
+use super::{lease, ops, SqliteProvisionalProbeAdmission, SqliteSessionBackend};
 
 const CONSENSUS_LOG_ENTRY_MAX_BYTES: usize = 16 * 1024 * 1024;
+// The frozen base release admitted exactly one byte beyond its advertised
+// consensus cap.  This is a retained-history exception, not a moving version
+// of the live capability: keep both sides of the historic rejection explicit.
+const BASE_ADMITTED_LEGACY_PAYLOAD_BYTES: usize = 1_048_577;
+const BASE_ADVERTISED_LEGACY_PAYLOAD_MAX_BYTES: usize = 1_048_576;
 const MEMBERSHIP_SCOPE_MEMBERS_MAX_BYTES: usize = 1_024;
 const MEMBERSHIP_SCOPE_BINDINGS_MAX_BYTES: usize = 32 * 1_024;
 const MEMBERSHIP_HISTORY_MAX_ENTRIES: usize = 4_096;
 const MEMBERSHIP_TRANSITION_ID_BYTES: usize = 16;
 const OUTCOME_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/outcome-payload/v1\0";
+const OUTCOME_RECEIPT_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/outcome-receipt/v2\0";
+const OUTCOME_RECEIPT_VERSION: i64 = 2;
+const OUTCOME_RECEIPT_CHAIN_GENESIS: [u8; 32] = [0; 32];
+const COMMAND_ADMISSION_REVISION: i64 = 1;
+const LEGACY_CONSENSUS_REQUEST_OUTCOMES_SCHEMA: &str = r#"CREATE TABLE consensus_request_outcomes (
+    request_id BLOB PRIMARY KEY CHECK (length(request_id) = 16),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
+    response_json BLOB NOT NULL,
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+)"#;
+// The reviewed immediate predecessor predates the parallel receipt-chain
+// head. Keep this DDL separate from the current machine table: recovery only
+// accepts this exact frozen shape and must never manufacture receipt authority
+// while classifying or converting it.
+const IMMEDIATE_PREDECESSOR_CONSENSUS_MACHINE_SCHEMA: &str = r#"CREATE TABLE consensus_machine (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    application_sequence INTEGER NOT NULL CHECK (application_sequence >= 0),
+    last_digest BLOB NOT NULL CHECK (length(last_digest) = 32),
+    logical_time TEXT,
+    watch_sequence INTEGER NOT NULL CHECK (watch_sequence >= 0),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+)"#;
+// Receipt v2 was not released, but an in-progress authority image can carry
+// this exact pre-receipt-chain manifest.  It is the only v2 shape that may be
+// upgraded in place; accepting a merely similar collection of columns would
+// turn an interrupted or foreign schema into a trusted recovery source.
+const PRE_RECEIPT_CHAIN_CONSENSUS_REQUEST_OUTCOMES_SCHEMA: &str = r#"CREATE TABLE consensus_request_outcomes (
+    request_id BLOB PRIMARY KEY CHECK (length(request_id) = 16),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
+    command_json BLOB NOT NULL CHECK (length(command_json) > 0),
+    predecessor_sequence INTEGER NOT NULL CHECK (predecessor_sequence >= 0),
+    predecessor_digest BLOB NOT NULL CHECK (length(predecessor_digest) = 32),
+    predecessor_logical_time TEXT,
+    raft_log_index INTEGER NOT NULL CHECK (raft_log_index >= 0),
+    response_json BLOB NOT NULL,
+    receipt_version INTEGER NOT NULL CHECK (receipt_version = 2),
+    receipt_digest BLOB NOT NULL CHECK (length(receipt_digest) = 32),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+)"#;
+const RECEIPT_CHAIN_CONSENSUS_REQUEST_OUTCOMES_SCHEMA: &str = r#"CREATE TABLE consensus_request_outcomes (
+    request_id BLOB PRIMARY KEY CHECK (length(request_id) = 16),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
+    command_json BLOB NOT NULL CHECK (length(command_json) > 0),
+    predecessor_sequence INTEGER NOT NULL CHECK (predecessor_sequence >= 0),
+    predecessor_digest BLOB NOT NULL CHECK (length(predecessor_digest) = 32),
+    predecessor_logical_time TEXT,
+    predecessor_receipt_digest BLOB NOT NULL CHECK (length(predecessor_receipt_digest) = 32),
+    raft_log_index INTEGER NOT NULL CHECK (raft_log_index >= 0),
+    response_json BLOB NOT NULL,
+    receipt_version INTEGER NOT NULL CHECK (receipt_version = 2),
+    receipt_digest BLOB NOT NULL CHECK (length(receipt_digest) = 32),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);"#;
 const OPERATOR_RECOVERY_LATCH_MAGIC: &[u8; 8] = b"OPCRL001";
 const OPERATOR_RECOVERY_LATCH_BYTES: usize = 8 + 32 + 32 + 8 + 8 + 32 + 1;
 
@@ -1032,6 +1096,7 @@ CREATE TABLE consensus_machine (
     configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
     application_sequence INTEGER NOT NULL CHECK (application_sequence >= 0),
     last_digest BLOB NOT NULL CHECK (length(last_digest) = 32),
+    last_receipt_digest BLOB NOT NULL CHECK (length(last_receipt_digest) = 32),
     logical_time TEXT,
     watch_sequence INTEGER NOT NULL CHECK (watch_sequence >= 0),
     FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
@@ -1041,7 +1106,24 @@ CREATE TABLE consensus_request_outcomes (
     request_id BLOB PRIMARY KEY CHECK (length(request_id) = 16),
     configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
     payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
+    command_json BLOB NOT NULL CHECK (length(command_json) > 0),
+    predecessor_sequence INTEGER NOT NULL CHECK (predecessor_sequence >= 0),
+    predecessor_digest BLOB NOT NULL CHECK (length(predecessor_digest) = 32),
+    predecessor_logical_time TEXT,
+    predecessor_receipt_digest BLOB NOT NULL CHECK (length(predecessor_receipt_digest) = 32),
+    raft_log_index INTEGER NOT NULL CHECK (raft_log_index >= 0),
     response_json BLOB NOT NULL,
+    receipt_version INTEGER NOT NULL CHECK (receipt_version = 2),
+    receipt_digest BLOB NOT NULL CHECK (length(receipt_digest) = 32),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+
+CREATE TABLE consensus_command_admission (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    admission_revision INTEGER NOT NULL CHECK (admission_revision = 1),
+    strict_activation_index INTEGER NOT NULL CHECK (strict_activation_index >= 0),
+    cutover_committed INTEGER NOT NULL CHECK (cutover_committed IN (0, 1)),
     FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
 );
 
@@ -1064,10 +1146,14 @@ CREATE TABLE consensus_operator_recovery (
     pending_plan_digest BLOB CHECK (
         pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
     ),
+    pending_fence_high_water INTEGER CHECK (pending_fence_high_water >= 0),
+    pending_credential_high_water INTEGER CHECK (pending_credential_high_water >= 0),
     watch_cursor_invalidation_floor INTEGER NOT NULL CHECK (watch_cursor_invalidation_floor >= 0),
     CHECK (
-        (pending_epoch IS NULL AND pending_plan_digest IS NULL)
-        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+        (pending_epoch IS NULL AND pending_plan_digest IS NULL
+            AND pending_fence_high_water IS NULL AND pending_credential_high_water IS NULL)
+        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL
+            AND pending_fence_high_water IS NOT NULL AND pending_credential_high_water IS NOT NULL)
     ),
     FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
 );
@@ -1091,6 +1177,102 @@ pub(crate) fn install_recovery_validation_schema_sync(
     Ok(())
 }
 
+/// Install the one reviewed predecessor manifest used by the recovery-only
+/// upgrade path. It differs from the current schema by the absence of command
+/// admission, the parallel receipt-chain machine head, and the four-column,
+/// pre-receipt outcome table.
+///
+/// Recovery derives this from production DDL instead of carrying a second
+/// hand-maintained table inventory.  Callers use it only on an otherwise
+/// empty canonical schema connection when qualifying a stopped replica.
+pub(crate) fn install_immediate_predecessor_recovery_validation_schema_sync(
+    conn: &Connection,
+) -> io::Result<()> {
+    conn.execute_batch(CONSENSUS_SCHEMA).map_err(db_error)?;
+    conn.execute_batch(
+        "DROP TABLE consensus_command_admission;
+         DROP TABLE consensus_operator_recovery;
+         DROP TABLE consensus_request_outcomes;
+         DROP TABLE consensus_machine;",
+    )
+    .map_err(db_error)?;
+    conn.execute_batch(IMMEDIATE_PREDECESSOR_CONSENSUS_MACHINE_SCHEMA)
+        .map_err(db_error)?;
+    conn.execute_batch(PRE_HIGH_WATER_OPERATOR_RECOVERY_SCHEMA)
+        .map_err(db_error)?;
+    conn.execute_batch(LEGACY_CONSENSUS_REQUEST_OUTCOMES_SCHEMA)
+        .map_err(db_error)
+}
+
+/// Convert a current test fixture into the exact reviewed predecessor layout.
+/// Production recovery never calls this: its manifest oracle above always
+/// starts from an empty canonical connection.
+#[cfg(test)]
+pub(crate) fn downgrade_to_immediate_predecessor_fixture_sync(conn: &Connection) -> io::Result<()> {
+    let machine: (i64, i64, i64, Vec<u8>, Option<String>, i64) = conn
+        .query_row(
+            "SELECT singleton, configuration_epoch, application_sequence, last_digest, logical_time, watch_sequence FROM consensus_machine WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .map_err(db_error)?;
+    let recovery: StoredOperatorRecoveryRow = conn
+        .query_row(
+            "SELECT configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, pending_fence_high_water, pending_credential_high_water, watch_cursor_invalidation_floor FROM consensus_operator_recovery WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .map_err(db_error)?;
+    if recovery.5.is_some() || recovery.6.is_some() {
+        return Err(invalid_data(
+            "a pending current recovery authority cannot model the immediate predecessor",
+        ));
+    }
+    conn.execute_batch(
+        "DROP TABLE consensus_command_admission;
+         DROP TABLE consensus_operator_recovery;
+         DROP TABLE consensus_request_outcomes;
+         DROP TABLE consensus_machine;",
+    )
+    .map_err(db_error)?;
+    conn.execute_batch(IMMEDIATE_PREDECESSOR_CONSENSUS_MACHINE_SCHEMA)
+        .map_err(db_error)?;
+    conn.execute(
+        "INSERT INTO consensus_machine (singleton, configuration_epoch, application_sequence, last_digest, logical_time, watch_sequence) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![machine.0, machine.1, machine.2, machine.3, machine.4, machine.5],
+    )
+    .map_err(db_error)?;
+    conn.execute_batch(PRE_HIGH_WATER_OPERATOR_RECOVERY_SCHEMA)
+        .map_err(db_error)?;
+    conn.execute(
+        "INSERT INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+        params![recovery.0, recovery.1, recovery.2, recovery.3, recovery.4, recovery.7],
+    )
+    .map_err(db_error)?;
+    conn.execute_batch(LEGACY_CONSENSUS_REQUEST_OUTCOMES_SCHEMA)
+        .map_err(db_error)
+}
+
 /// Reproduce the supported pre-cursor operator-recovery schema migration.
 ///
 /// SQLite records `ALTER TABLE ... ADD COLUMN` by appending the column to the
@@ -1103,6 +1285,29 @@ pub(crate) fn install_migrated_operator_recovery_validation_schema_sync(
     conn.execute_batch(PRE_CURSOR_OPERATOR_RECOVERY_SCHEMA)
         .map_err(db_error)?;
     conn.execute_batch(OPERATOR_RECOVERY_CURSOR_MIGRATION)
+        .map_err(db_error)?;
+    conn.execute_batch(OPERATOR_RECOVERY_HIGH_WATER_MIGRATION)
+        .map_err(db_error)
+}
+
+/// Install the exact cursor-era recovery table, before pending high-waters
+/// became part of the sealed operator-recovery authority.
+pub(crate) fn install_cursor_migrated_operator_recovery_validation_schema_sync(
+    conn: &Connection,
+) -> io::Result<()> {
+    conn.execute_batch(PRE_CURSOR_OPERATOR_RECOVERY_SCHEMA)
+        .map_err(db_error)?;
+    conn.execute_batch(OPERATOR_RECOVERY_CURSOR_MIGRATION)
+        .map_err(db_error)
+}
+
+/// Install the exact direct-table layout produced by the immediately
+/// preceding current schema.  It remains a recovery-only manifest oracle;
+/// writable open migrates it at the reviewed high-water binding boundary.
+pub(crate) fn install_pre_high_water_operator_recovery_validation_schema_sync(
+    conn: &Connection,
+) -> io::Result<()> {
+    conn.execute_batch(PRE_HIGH_WATER_OPERATOR_RECOVERY_SCHEMA)
         .map_err(db_error)
 }
 
@@ -1191,6 +1396,9 @@ impl SqliteConsensusCore {
         authority_profile: ConsensusAuthorityProfile,
         fixed_placement_policy: Option<PlacementResiliencePolicy>,
     ) -> Result<Self, SessionConsensusStorageError> {
+        if !cfg!(target_os = "linux") && authority_profile == ConsensusAuthorityProfile::Dynamic {
+            return Err(SessionConsensusStorageError::DynamicConsensusUnsupportedPlatform);
+        }
         validate_member_set(&expected_members, false)
             .map_err(|_| SessionConsensusStorageError::InvalidIdentity)?;
         validate_member_bindings(&expected_members, &expected_bindings)
@@ -1203,8 +1411,16 @@ impl SqliteConsensusCore {
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
 
         let (storage_identity, applied) = {
+            // Raw watch registration takes this registry before acquiring the
+            // SQLite connection. Retain the same order for the complete
+            // admission transition so a captured standalone watch cannot be
+            // registered after consensus takes authority.
+            let mut watchers = backend.watchers.lock().await;
             let conn = backend.conn.lock().await;
-            let storage_identity = initialize_schema_with_storage_anchor_and_pending_and_bindings(
+            let prior_admission = backend
+                .begin_consensus_admission(&conn, &mut watchers)
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+            let initialized = initialize_schema_with_storage_anchor_and_pending_and_bindings(
                 &conn,
                 required_storage_identity,
                 identity,
@@ -1213,9 +1429,19 @@ impl SqliteConsensusCore {
                 pending,
                 authority_profile,
                 fixed_placement_policy,
-            )?;
-            let applied = read_applied_sync(&conn, storage_identity)
-                .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+            );
+            let (storage_identity, applied) = match initialized {
+                Ok(initialized) => initialized,
+                Err(error) => {
+                    backend
+                        .finish_consensus_admission(&conn, prior_admission, false)
+                        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+                    return Err(error);
+                }
+            };
+            backend
+                .finish_consensus_admission(&conn, prior_admission, true)
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
             (storage_identity, applied)
         };
         let (applied_progress, _) = tokio::sync::watch::channel(applied);
@@ -1379,6 +1605,7 @@ fn initialize_schema_with_pending_and_bindings(
         ConsensusAuthorityProfile::Dynamic,
         None,
     )
+    .map(|(storage_identity, _)| storage_identity)
 }
 
 #[cfg(test)]
@@ -1399,6 +1626,7 @@ fn initialize_schema_with_profile(
         (authority_profile == ConsensusAuthorityProfile::FixedImmutable)
             .then_some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
     )
+    .map(|(storage_identity, _)| storage_identity)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1411,7 +1639,13 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     pending: Option<PendingMembershipBootstrap<'_>>,
     authority_profile: ConsensusAuthorityProfile,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
-) -> Result<SessionConsensusIdentity, SessionConsensusStorageError> {
+) -> Result<
+    (
+        SessionConsensusIdentity,
+        Option<LogId<SessionConsensusNodeId>>,
+    ),
+    SessionConsensusStorageError,
+> {
     if matches!(authority_profile, ConsensusAuthorityProfile::FixedImmutable)
         != fixed_placement_policy.is_some()
     {
@@ -1426,16 +1660,30 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
             return Err(SessionConsensusStorageError::InvalidIdentity);
         }
     }
-    // The immediate transaction is the durable authority hand-off fence. A
+    // The exclusive transaction is the durable authority hand-off fence. A
     // standalone operation on another SQLite connection either finishes
     // before this claim (and is included in the legacy-state check) or starts
     // after the consensus identity commits and fails closed.
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
     let identity_table_exists = table_exists(&tx, "consensus_identity")
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
 
-    if !identity_table_exists {
+    let initial_schema = if !identity_table_exists {
+        // A fresh raw backend released its constructor lock before consensus
+        // configuration was known. Reclassify its complete local catalog
+        // under this new EXCLUSIVE transaction so an empty extra object or
+        // altered local DDL cannot cross that bounded continuation gap.
+        super::validate_local_schema_for_fresh_consensus_claim(&tx)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        if consensus_schema_has_footprint(&tx)
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+        {
+            // A database that already contains any consensus object is not a
+            // fresh standalone store.  Never complete that footprint by
+            // creating a new identity or singleton rows.
+            return Err(SessionConsensusStorageError::CorruptState);
+        }
         if legacy_authority_is_nonempty(&tx)
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
         {
@@ -1464,12 +1712,48 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
         )
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
         tx.execute(
-            "INSERT INTO consensus_machine (singleton, configuration_epoch, application_sequence, last_digest, logical_time, watch_sequence) VALUES (1, ?1, 0, ?2, NULL, 0)",
-            params![epoch, SessionConsensusEntryDigest::GENESIS.as_bytes().as_slice()],
+            "INSERT INTO consensus_machine (singleton, configuration_epoch, application_sequence, last_digest, last_receipt_digest, logical_time, watch_sequence) VALUES (1, ?1, 0, ?2, ?3, NULL, 0)",
+            params![
+                epoch,
+                SessionConsensusEntryDigest::GENESIS.as_bytes().as_slice(),
+                OUTCOME_RECEIPT_CHAIN_GENESIS.as_slice(),
+            ],
         )
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-    }
+        ConsensusReopenSchema::Current
+    } else {
+        // Classification reads only SQLite's schema catalog. Persisted
+        // authority is validated once below after reviewed migrations finish.
+        classify_consensus_reopen_schema(&tx)?
+    };
 
+    // Capture these from the classified source before any initializer helper
+    // can create a reviewed migration table.  A missing singleton in an
+    // already-present authority table is corruption, not a reason to seed a
+    // replacement row.  A fresh database has just installed the current DDL,
+    // but its source still had no authority tables and may initialize them.
+    let (
+        source_operator_recovery_table_existed,
+        source_command_admission_table_existed,
+        source_membership_scope_table_existed,
+    ) = if identity_table_exists {
+        (
+            table_exists(&tx, "consensus_operator_recovery")
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?,
+            table_exists(&tx, "consensus_command_admission")
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?,
+            table_exists(&tx, "consensus_membership_scope")
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?,
+        )
+    } else {
+        (false, false, false)
+    };
+
+    // Preserve the pre-mutation manifest classification.  A complete frozen
+    // base image may still add empty receipt provenance, but the sole
+    // nonempty automatic migration is pinned to the exact reviewed immediate
+    // predecessor rather than to any older or partial schema shape.
+    let exact_immediate_predecessor = initial_schema == ConsensusReopenSchema::ImmediatePredecessor;
     let storage_identity = read_storage_identity_sync(&tx)?;
     ensure_consensus_authority_profile_sync(&tx, authority_profile, identity_table_exists)?;
     ensure_fixed_placement_policy_sync(&tx, authority_profile, fixed_placement_policy)?;
@@ -1490,19 +1774,46 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     {
         return Err(SessionConsensusStorageError::IdentityMismatch);
     }
-    ensure_operator_recovery_schema_sync(&tx, storage_identity)
+    ensure_operator_recovery_schema_for_initializer_sync(
+        &tx,
+        storage_identity,
+        !source_operator_recovery_table_existed,
+    )
+    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    ensure_machine_receipt_chain_schema_sync(&tx, storage_identity)
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    ensure_command_admission_schema_sync(
+        &tx,
+        storage_identity,
+        !source_command_admission_table_existed,
+    )
+    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    ensure_outcome_receipt_schema_sync(&tx, storage_identity, exact_immediate_predecessor)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::InvalidData {
+                // Old receipts lack the command/predecessor provenance that
+                // v2 verifies. They require an operator recovery path rather
+                // than being silently accepted or locally reconstructed.
+                SessionConsensusStorageError::RecoveryRequired
+            } else {
+                SessionConsensusStorageError::BackendUnavailable
+            }
+        })?;
     ensure_membership_scope_schema_sync(
         &tx,
         storage_identity,
         requested_identity,
         expected_members,
         expected_bindings,
+        !source_membership_scope_table_existed,
     )
     .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-    if identity_table_exists {
-        validate_existing_schema(&tx, storage_identity)?;
+    let expected_final_schema = initial_schema.expected_schema_after_initialization();
+    let final_schema = classify_consensus_reopen_schema(&tx)?;
+    if final_schema != expected_final_schema {
+        return Err(SessionConsensusStorageError::CorruptState);
     }
+    validate_existing_schema(&tx, storage_identity)?;
 
     let scope = read_membership_scope_sync(&tx, storage_identity)
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
@@ -1617,8 +1928,6 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
             )?;
         }
     }
-    validate_persisted_membership_sync(&tx, storage_identity)
-        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
     // Reopen is an admission boundary too: a pre-cap, recovered, or externally
     // modified database must not expose state that live consensus proposals
     // could not create under the retained profile.
@@ -1641,9 +1950,12 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
             .map_err(|_| SessionConsensusStorageError::CorruptState)?;
     }
 
+    let applied = read_applied_sync(&tx, storage_identity)
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+
     tx.commit()
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-    Ok(storage_identity)
+    Ok((storage_identity, applied))
 }
 
 fn authority_profile_i64(profile: ConsensusAuthorityProfile) -> i64 {
@@ -1891,6 +2203,7 @@ fn initialize_schema_with_storage_anchor_and_pending(
         ConsensusAuthorityProfile::Dynamic,
         None,
     )
+    .map(|(storage_identity, _)| storage_identity)
 }
 
 fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
@@ -2238,6 +2551,7 @@ fn ensure_membership_scope_schema_sync(
     requested_current_identity: SessionConsensusIdentity,
     expected_members: &BTreeSet<SessionConsensusNodeId>,
     expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    allow_missing_singleton_initialization: bool,
 ) -> io::Result<()> {
     validate_member_set(expected_members, false)?;
     if !expected_bindings.is_empty() {
@@ -2257,8 +2571,13 @@ fn ensure_membership_scope_schema_sync(
             "session consensus storage and current identity lineage is invalid",
         ));
     }
-    let existed = table_exists(conn, "consensus_membership_scope").map_err(db_error)?;
-    if !existed {
+    let scope_table_exists = table_exists(conn, "consensus_membership_scope").map_err(db_error)?;
+    if !scope_table_exists {
+        if !allow_missing_singleton_initialization {
+            return Err(invalid_data(
+                "session consensus membership scope table disappeared during initialization",
+            ));
+        }
         // A legacy database may be upgraded only when its old fixed validator
         // proves the caller-supplied set. This prevents migration from blessing
         // a caller-invented topology.
@@ -2273,7 +2592,7 @@ fn ensure_membership_scope_schema_sync(
             // active epoch newer than its immutable storage incarnation. A
             // legacy database without this table never performed a dynamic
             // transition and therefore cannot assert such a lineage.
-            if existed || requested_current_identity != storage_identity {
+            if requested_current_identity != storage_identity {
                 return Err(invalid_data(
                     "legacy session consensus membership scope cannot skip epochs",
                 ));
@@ -2296,6 +2615,11 @@ fn ensure_membership_scope_schema_sync(
         )
         .map_err(db_error)?;
     if rows == 0 {
+        if !allow_missing_singleton_initialization {
+            return Err(invalid_data(
+                "session consensus membership scope singleton is missing",
+            ));
+        }
         let encoded_bindings = if expected_bindings.is_empty() {
             encode_json(&Vec::<(SessionConsensusNodeId, SessionTopologyMemberBinding)>::new())?
         } else {
@@ -3474,7 +3798,31 @@ impl SqliteSessionBackend {
         transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
         transition_digest: [u8; 32],
     ) -> Result<bool, MembershipScopeMutationError> {
+        if self.consensus_provisional_probe_admission().is_none() {
+            return Err(MembershipScopeMutationError::BackendUnavailable);
+        }
         let conn = self.conn.lock().await;
+        match self.consensus_provisional_probe_admission() {
+            Some(SqliteProvisionalProbeAdmission::PristineStandalone) => {
+                // A brand-new membership candidate has no consensus marker to
+                // query yet. Admit that ordering only for an exact standalone
+                // catalog with no local authority or partial consensus
+                // footprint; the initializer repeats the catalog check under
+                // its EXCLUSIVE hand-off transaction before claiming it.
+                super::validate_local_schema_for_fresh_consensus_claim(&conn)
+                    .map_err(|_| MembershipScopeMutationError::CorruptState)?;
+                if consensus_schema_has_footprint(&conn)
+                    .map_err(|_| MembershipScopeMutationError::BackendUnavailable)?
+                    || legacy_authority_is_nonempty(&conn)
+                        .map_err(|_| MembershipScopeMutationError::BackendUnavailable)?
+                {
+                    return Err(MembershipScopeMutationError::CorruptState);
+                }
+                return Ok(false);
+            }
+            Some(SqliteProvisionalProbeAdmission::ConsensusOwned) => {}
+            None => return Err(MembershipScopeMutationError::BackendUnavailable),
+        }
         let marker = read_candidate_bootstrap_marker_sync(&conn, storage_identity)
             .map_err(|_| MembershipScopeMutationError::CorruptState)?;
         Ok(marker.is_some_and(|marker| {
@@ -3492,7 +3840,13 @@ impl SqliteSessionBackend {
         transition_id: [u8; MEMBERSHIP_TRANSITION_ID_BYTES],
         transition_digest: [u8; 32],
     ) -> Result<MembershipScopeMutation, MembershipScopeMutationError> {
+        if !self.consensus_admission_is_ready() {
+            return Err(MembershipScopeMutationError::BackendUnavailable);
+        }
         let conn = self.conn.lock().await;
+        if !self.consensus_admission_is_ready() {
+            return Err(MembershipScopeMutationError::BackendUnavailable);
+        }
         cancel_provisional_candidate_membership_scope_sync(
             &conn,
             storage_identity,
@@ -3512,7 +3866,13 @@ impl SqliteSessionBackend {
         ),
         MembershipScopeMutationError,
     > {
+        if !self.consensus_admission_is_ready() {
+            return Err(MembershipScopeMutationError::BackendUnavailable);
+        }
         let conn = self.conn.lock().await;
+        if !self.consensus_admission_is_ready() {
+            return Err(MembershipScopeMutationError::BackendUnavailable);
+        }
         let scope = read_scope_for_mutation(&conn, storage_identity)?;
         let membership = read_membership_sync(&conn, storage_identity)
             .map_err(|_| MembershipScopeMutationError::CorruptState)?;
@@ -3533,7 +3893,13 @@ impl SqliteSessionBackend {
         ),
         MembershipScopeMutationError,
     > {
+        if !self.consensus_admission_is_ready() {
+            return Err(MembershipScopeMutationError::BackendUnavailable);
+        }
         let conn = self.conn.lock().await;
+        if !self.consensus_admission_is_ready() {
+            return Err(MembershipScopeMutationError::BackendUnavailable);
+        }
         let authority_profile = read_consensus_authority_profile_sync(&conn)
             .map_err(|_| MembershipScopeMutationError::CorruptState)?;
         let placement_policy = read_fixed_placement_policy_sync(&conn)
@@ -3559,7 +3925,13 @@ impl SqliteSessionBackend {
         ),
         MembershipScopeMutationError,
     > {
+        if !self.consensus_admission_is_ready() {
+            return Err(MembershipScopeMutationError::BackendUnavailable);
+        }
         let conn = self.conn.lock().await;
+        if !self.consensus_admission_is_ready() {
+            return Err(MembershipScopeMutationError::BackendUnavailable);
+        }
         let scope = read_scope_for_mutation(&conn, storage_identity)?;
         let evidence = read_membership_transition_evidence_sync(
             &conn,
@@ -4320,6 +4692,308 @@ fn legacy_authority_is_nonempty(conn: &Connection) -> rusqlite::Result<bool> {
     Ok(false)
 }
 
+#[cfg(test)]
+const CONSENSUS_BASE_TABLES: &[&str] = &[
+    "consensus_identity",
+    "consensus_vote",
+    "consensus_committed",
+    "consensus_purged",
+    "consensus_log",
+    "consensus_applied",
+    "consensus_membership",
+    "consensus_machine",
+    "consensus_request_outcomes",
+    "consensus_snapshot",
+];
+
+#[cfg(test)]
+const CONSENSUS_UPGRADE_TABLES: &[&str] = &[
+    "consensus_membership_scope",
+    "consensus_membership_history",
+    "consensus_membership_terminal_history",
+    "consensus_candidate_bootstrap",
+    "consensus_command_admission",
+    "consensus_operator_recovery",
+];
+
+fn consensus_schema_has_footprint(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name GLOB 'consensus_*')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn consensus_schema_manifest(
+    conn: &Connection,
+) -> Result<BTreeMap<String, String>, SessionConsensusStorageError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT type, name, sql FROM sqlite_master WHERE name GLOB 'consensus_*' ORDER BY type, name",
+        )
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    let mut rows = statement
+        .query([])
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    let mut manifest = BTreeMap::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+    {
+        let kind: String = row
+            .get(0)
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        let name: String = row
+            .get(1)
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        let sql: Option<String> = row
+            .get(2)
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        let Some(sql) = sql else {
+            return Err(SessionConsensusStorageError::CorruptState);
+        };
+        if kind != "table" || manifest.insert(name, sql).is_some() {
+            return Err(SessionConsensusStorageError::CorruptState);
+        }
+    }
+    Ok(manifest)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsensusReopenSchema {
+    Current,
+    HistoricalBase,
+    OriginMainFixedMembership,
+    ImmediatePredecessor,
+    PreReceiptChain,
+    OperatorRecoveryAddOn,
+    OperatorRecoveryMigrated,
+    OperatorRecoveryCursorMigrated,
+    OperatorRecoveryPreHighWater,
+    HistoricalBaseMigrated,
+    ImmediatePredecessorMigrated,
+    PreReceiptChainMigrated,
+    OperatorRecoveryPreHighWaterMigrated,
+}
+
+impl ConsensusReopenSchema {
+    /// Return the exact stored-DDL form produced by the reviewed initializer
+    /// migration for this complete source manifest.  In particular, the
+    /// recovery add-on already uses `OPERATOR_RECOVERY_SCHEMA`, so it has the
+    /// pending high-water columns and remains in its add-on DDL form.
+    fn expected_schema_after_initialization(self) -> Self {
+        match self {
+            Self::Current => Self::Current,
+            Self::HistoricalBase => Self::HistoricalBaseMigrated,
+            Self::OriginMainFixedMembership => Self::Current,
+            Self::ImmediatePredecessor => Self::ImmediatePredecessorMigrated,
+            Self::PreReceiptChain => Self::PreReceiptChainMigrated,
+            Self::OperatorRecoveryAddOn => Self::OperatorRecoveryAddOn,
+            Self::OperatorRecoveryMigrated => Self::OperatorRecoveryMigrated,
+            Self::OperatorRecoveryCursorMigrated => Self::OperatorRecoveryMigrated,
+            Self::OperatorRecoveryPreHighWater => Self::OperatorRecoveryPreHighWaterMigrated,
+            Self::HistoricalBaseMigrated
+            | Self::ImmediatePredecessorMigrated
+            | Self::PreReceiptChainMigrated
+            | Self::OperatorRecoveryPreHighWaterMigrated => self,
+        }
+    }
+}
+
+fn canonical_consensus_schema_manifest(
+    install: impl FnOnce(&Connection) -> io::Result<()>,
+) -> Result<BTreeMap<String, String>, SessionConsensusStorageError> {
+    let canonical = SqliteSessionBackend::canonical_schema_connection()
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    install(&canonical).map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    consensus_schema_manifest(&canonical)
+}
+
+fn install_current_consensus_schema(conn: &Connection) -> io::Result<()> {
+    install_recovery_validation_schema_sync(conn, false)
+}
+
+fn replace_operator_recovery_schema(
+    conn: &Connection,
+    install: impl FnOnce(&Connection) -> io::Result<()>,
+) -> io::Result<()> {
+    conn.execute_batch("DROP TABLE consensus_operator_recovery;")
+        .map_err(db_error)?;
+    install(conn)
+}
+
+fn install_machine_receipt_chain_migration_schema(conn: &Connection) -> io::Result<()> {
+    conn.execute_batch("DROP TABLE consensus_machine;")
+        .map_err(db_error)?;
+    conn.execute_batch(IMMEDIATE_PREDECESSOR_CONSENSUS_MACHINE_SCHEMA)
+        .map_err(db_error)?;
+    conn.execute_batch(
+        "ALTER TABLE consensus_machine ADD COLUMN last_receipt_digest BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(last_receipt_digest) = 32);",
+    )
+    .map_err(db_error)
+}
+
+fn install_current_outcome_receipt_schema(conn: &Connection) -> io::Result<()> {
+    conn.execute_batch("DROP TABLE consensus_request_outcomes;")
+        .map_err(db_error)?;
+    conn.execute_batch(RECEIPT_CHAIN_CONSENSUS_REQUEST_OUTCOMES_SCHEMA)
+        .map_err(db_error)
+}
+
+fn install_operator_recovery_high_water_migration_schema(conn: &Connection) -> io::Result<()> {
+    conn.execute_batch(OPERATOR_RECOVERY_HIGH_WATER_MIGRATION)
+        .map_err(db_error)
+}
+
+fn install_consensus_reopen_schema(
+    conn: &Connection,
+    schema: ConsensusReopenSchema,
+) -> io::Result<()> {
+    if schema == ConsensusReopenSchema::ImmediatePredecessor {
+        return install_immediate_predecessor_recovery_validation_schema_sync(conn);
+    }
+    install_current_consensus_schema(conn)?;
+    match schema {
+        ConsensusReopenSchema::Current => Ok(()),
+        ConsensusReopenSchema::HistoricalBase => conn
+            .execute_batch(
+                "DROP TABLE consensus_membership_scope;
+                 DROP TABLE consensus_membership_history;
+                 DROP TABLE consensus_membership_terminal_history;
+                 DROP TABLE consensus_candidate_bootstrap;
+                 DROP TABLE consensus_command_admission;
+                 DROP TABLE consensus_operator_recovery;
+                 ALTER TABLE consensus_identity DROP COLUMN fixed_placement_policy;
+                 ALTER TABLE consensus_identity DROP COLUMN authority_profile;",
+            )
+            .map_err(db_error),
+        ConsensusReopenSchema::OriginMainFixedMembership => conn
+            .execute_batch(
+                "DROP TABLE consensus_candidate_bootstrap;
+                 DROP TABLE consensus_membership_terminal_history;
+                 DROP TABLE consensus_membership_history;
+                 DROP TABLE consensus_membership_scope;",
+            )
+            .map_err(db_error),
+        ConsensusReopenSchema::ImmediatePredecessor => unreachable!(),
+        ConsensusReopenSchema::PreReceiptChain => conn
+            .execute_batch(
+                "DROP TABLE consensus_request_outcomes;
+                 DROP TABLE consensus_machine;",
+            )
+            .map_err(db_error)
+            .and_then(|()| {
+                conn.execute_batch(IMMEDIATE_PREDECESSOR_CONSENSUS_MACHINE_SCHEMA)
+                    .map_err(db_error)
+            })
+            .and_then(|()| {
+                conn.execute_batch(PRE_RECEIPT_CHAIN_CONSENSUS_REQUEST_OUTCOMES_SCHEMA)
+                    .map_err(db_error)
+            }),
+        ConsensusReopenSchema::OperatorRecoveryAddOn => {
+            replace_operator_recovery_schema(conn, |conn| {
+                install_recovery_validation_schema_sync(conn, true)
+            })
+        }
+        ConsensusReopenSchema::OperatorRecoveryMigrated => {
+            replace_operator_recovery_schema(conn, |conn| {
+                install_migrated_operator_recovery_validation_schema_sync(conn)
+            })
+        }
+        ConsensusReopenSchema::OperatorRecoveryCursorMigrated => {
+            replace_operator_recovery_schema(conn, |conn| {
+                install_cursor_migrated_operator_recovery_validation_schema_sync(conn)
+            })
+        }
+        ConsensusReopenSchema::OperatorRecoveryPreHighWater => {
+            replace_operator_recovery_schema(conn, |conn| {
+                install_pre_high_water_operator_recovery_validation_schema_sync(conn)
+            })
+        }
+        ConsensusReopenSchema::HistoricalBaseMigrated => {
+            conn.execute_batch(
+                "ALTER TABLE consensus_identity DROP COLUMN fixed_placement_policy;
+                 ALTER TABLE consensus_identity DROP COLUMN authority_profile;
+                 ALTER TABLE consensus_identity ADD COLUMN authority_profile INTEGER CHECK (authority_profile IN (1, 2));
+                 ALTER TABLE consensus_identity ADD COLUMN fixed_placement_policy INTEGER CHECK (fixed_placement_policy IN (1, 2));",
+            )
+            .map_err(db_error)?;
+            replace_operator_recovery_schema(conn, |conn| {
+                install_recovery_validation_schema_sync(conn, true)
+            })
+        }
+        ConsensusReopenSchema::ImmediatePredecessorMigrated => {
+            install_machine_receipt_chain_migration_schema(conn)?;
+            install_current_outcome_receipt_schema(conn)?;
+            replace_operator_recovery_schema(conn, |conn| {
+                install_pre_high_water_operator_recovery_validation_schema_sync(conn)
+            })?;
+            install_operator_recovery_high_water_migration_schema(conn)
+        }
+        ConsensusReopenSchema::PreReceiptChainMigrated => {
+            install_machine_receipt_chain_migration_schema(conn)?;
+            install_current_outcome_receipt_schema(conn)
+        }
+        ConsensusReopenSchema::OperatorRecoveryPreHighWaterMigrated => {
+            replace_operator_recovery_schema(conn, |conn| {
+                install_pre_high_water_operator_recovery_validation_schema_sync(conn)
+            })?;
+            install_operator_recovery_high_water_migration_schema(conn)
+        }
+    }
+}
+
+fn classify_consensus_reopen_schema(
+    conn: &Connection,
+) -> Result<ConsensusReopenSchema, SessionConsensusStorageError> {
+    let observed = consensus_schema_manifest(conn)?;
+    for schema in [
+        ConsensusReopenSchema::Current,
+        ConsensusReopenSchema::HistoricalBase,
+        ConsensusReopenSchema::OriginMainFixedMembership,
+        ConsensusReopenSchema::ImmediatePredecessor,
+        ConsensusReopenSchema::PreReceiptChain,
+        ConsensusReopenSchema::OperatorRecoveryAddOn,
+        ConsensusReopenSchema::OperatorRecoveryMigrated,
+        ConsensusReopenSchema::OperatorRecoveryCursorMigrated,
+        ConsensusReopenSchema::OperatorRecoveryPreHighWater,
+        ConsensusReopenSchema::HistoricalBaseMigrated,
+        ConsensusReopenSchema::ImmediatePredecessorMigrated,
+        ConsensusReopenSchema::PreReceiptChainMigrated,
+        ConsensusReopenSchema::OperatorRecoveryPreHighWaterMigrated,
+    ] {
+        if observed
+            == canonical_consensus_schema_manifest(|conn| {
+                install_consensus_reopen_schema(conn, schema)
+            })?
+        {
+            return Ok(schema);
+        }
+    }
+    Err(SessionConsensusStorageError::CorruptState)
+}
+
+/// Recognize a complete, exact consensus-owned inventory without reading any
+/// authority rowset. The consensus initializer validates persisted state and
+/// performs only the reviewed migrations while holding the admission fence.
+pub(super) fn validate_consensus_inventory_for_local_open(
+    conn: &Connection,
+) -> Result<bool, SessionConsensusStorageError> {
+    let manifest = consensus_schema_manifest(conn)?;
+    if manifest.is_empty() {
+        return Ok(false);
+    }
+    classify_consensus_reopen_schema(conn)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+fn is_immediate_predecessor_schema(
+    conn: &Connection,
+) -> Result<bool, SessionConsensusStorageError> {
+    Ok(classify_consensus_reopen_schema(conn)? == ConsensusReopenSchema::ImmediatePredecessor)
+}
+
 fn validate_existing_schema(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
@@ -4338,6 +5012,7 @@ fn validate_existing_schema(
         "consensus_membership",
         "consensus_machine",
         "consensus_request_outcomes",
+        "consensus_command_admission",
         "consensus_snapshot",
         "consensus_operator_recovery",
     ] {
@@ -4351,6 +5026,9 @@ fn validate_existing_schema(
     if read_storage_identity_sync(conn)? != storage_identity {
         return Err(SessionConsensusStorageError::IdentityMismatch);
     }
+
+    super::validate_consensus_restore_scan_metadata_row(conn)
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
 
     let machine_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM consensus_machine", [], |row| {
@@ -4367,6 +5045,10 @@ fn validate_existing_schema(
     }
     validate_persisted_membership_sync(conn, storage_identity)
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    read_command_admission_sync(conn, storage_identity)
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    validate_all_outcomes_sync(conn, storage_identity)
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
     Ok(())
 }
 
@@ -4380,7 +5062,30 @@ CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
     pending_plan_digest BLOB CHECK (
         pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
     ),
+    pending_fence_high_water INTEGER CHECK (pending_fence_high_water >= 0),
+    pending_credential_high_water INTEGER CHECK (pending_credential_high_water >= 0),
     watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 0 CHECK (watch_cursor_invalidation_floor >= 0),
+    CHECK (
+        (pending_epoch IS NULL AND pending_plan_digest IS NULL
+            AND pending_fence_high_water IS NULL AND pending_credential_high_water IS NULL)
+        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL
+            AND pending_fence_high_water IS NOT NULL AND pending_credential_high_water IS NOT NULL)
+    ),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+"#;
+
+const PRE_HIGH_WATER_OPERATOR_RECOVERY_SCHEMA: &str = r#"
+CREATE TABLE consensus_operator_recovery (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0),
+    last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32),
+    pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch),
+    pending_plan_digest BLOB CHECK (
+        pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
+    ),
+    watch_cursor_invalidation_floor INTEGER NOT NULL CHECK (watch_cursor_invalidation_floor >= 0),
     CHECK (
         (pending_epoch IS NULL AND pending_plan_digest IS NULL)
         OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
@@ -4407,31 +5112,69 @@ CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
 );
 "#;
 
-const OPERATOR_RECOVERY_CURSOR_MIGRATION: &str =
-    "ALTER TABLE consensus_operator_recovery ADD COLUMN watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 0 CHECK (watch_cursor_invalidation_floor >= 0);";
+const OPERATOR_RECOVERY_CURSOR_MIGRATION: &str = "ALTER TABLE consensus_operator_recovery ADD COLUMN watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 0 CHECK (watch_cursor_invalidation_floor >= 0);";
+const OPERATOR_RECOVERY_HIGH_WATER_MIGRATION: &str = "ALTER TABLE consensus_operator_recovery ADD COLUMN pending_fence_high_water INTEGER CHECK (pending_fence_high_water >= 0); ALTER TABLE consensus_operator_recovery ADD COLUMN pending_credential_high_water INTEGER CHECK (pending_credential_high_water >= 0);";
 
 pub(crate) fn ensure_operator_recovery_schema_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
 ) -> io::Result<()> {
+    ensure_operator_recovery_schema_with_missing_singleton_initialization_sync(conn, identity, true)
+}
+
+fn ensure_operator_recovery_schema_for_initializer_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    allow_missing_singleton_initialization: bool,
+) -> io::Result<()> {
+    ensure_operator_recovery_schema_with_missing_singleton_initialization_sync(
+        conn,
+        identity,
+        allow_missing_singleton_initialization,
+    )
+}
+
+fn ensure_operator_recovery_schema_with_missing_singleton_initialization_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    allow_missing_singleton_initialization: bool,
+) -> io::Result<()> {
     conn.execute_batch(OPERATOR_RECOVERY_SCHEMA)
         .map_err(db_error)?;
-    let has_cursor_floor: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery') WHERE name = 'watch_cursor_invalidation_floor')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(db_error)?;
-    if !has_cursor_floor {
+    if !operator_recovery_cursor_column_exists(conn)? {
         conn.execute_batch(OPERATOR_RECOVERY_CURSOR_MIGRATION)
             .map_err(db_error)?;
     }
-    conn.execute(
-        "INSERT OR IGNORE INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor) VALUES (1, ?1, 0, ?2, NULL, NULL, 0)",
-        params![epoch_i64(identity)?, [0_u8; 32].as_slice()],
-    )
-    .map_err(db_error)?;
+    let (has_pending_fence, has_pending_credential) =
+        operator_recovery_pending_high_water_columns(conn)?;
+    if has_pending_fence != has_pending_credential {
+        return Err(invalid_data(
+            "session consensus operator recovery high-water binding is incomplete",
+        ));
+    }
+    if !has_pending_fence {
+        let pending: bool = conn
+            .query_row(
+                "SELECT pending_epoch IS NOT NULL OR pending_plan_digest IS NOT NULL FROM consensus_operator_recovery WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if pending {
+            return Err(invalid_data(
+                "session consensus pending recovery high-water binding is missing",
+            ));
+        }
+        conn.execute_batch(OPERATOR_RECOVERY_HIGH_WATER_MIGRATION)
+            .map_err(db_error)?;
+    }
+    if allow_missing_singleton_initialization {
+        conn.execute(
+            "INSERT OR IGNORE INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, pending_fence_high_water, pending_credential_high_water, watch_cursor_invalidation_floor) VALUES (1, ?1, 0, ?2, NULL, NULL, NULL, NULL, 0)",
+            params![epoch_i64(identity)?, [0_u8; 32].as_slice()],
+        )
+        .map_err(db_error)?;
+    }
     let (stored_epoch, rows): (i64, i64) = conn
         .query_row(
             "SELECT configuration_epoch, (SELECT COUNT(*) FROM consensus_operator_recovery) FROM consensus_operator_recovery WHERE singleton = 1",
@@ -4448,16 +5191,896 @@ pub(crate) fn ensure_operator_recovery_schema_sync(
     Ok(())
 }
 
+/// Add the versioned receipt columns to pre-receipt databases.
+///
+/// A legacy row binds only the command digest, not the complete result.  The
+/// sole automatic exception is a complete retained revision-zero chain whose
+/// every result is independently re-derived as `PayloadTooLarge`: that
+/// rejection is decided before any mutable lease, record, or fence lookup.
+/// Every successful or state-dependent legacy result remains an
+/// operator-recovery concern; it is never promoted into a v2 receipt.
+fn ensure_machine_receipt_chain_schema_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<()> {
+    let present = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_machine') WHERE name = 'last_receipt_digest')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(db_error)?;
+    if !present {
+        // Receipt v2 was not released. A candidate image may lack this
+        // parallel head, which is initialized only while its receipts are
+        // rebuilt below inside the same opening transaction.
+        conn.execute_batch(
+            "ALTER TABLE consensus_machine ADD COLUMN last_receipt_digest BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(last_receipt_digest) = 32);",
+        )
+        .map_err(db_error)?;
+    }
+    let digest: Vec<u8> = conn
+        .query_row(
+            "SELECT last_receipt_digest FROM consensus_machine WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if digest.len() != OUTCOME_RECEIPT_CHAIN_GENESIS.len() {
+        return Err(invalid_data(
+            "session consensus receipt chain head is invalid",
+        ));
+    }
+    validate_epoch(
+        conn.query_row(
+            "SELECT configuration_epoch FROM consensus_machine WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?,
+        identity,
+    )
+}
+
+fn ensure_outcome_receipt_schema_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    exact_immediate_predecessor: bool,
+) -> io::Result<()> {
+    let columns = [
+        "receipt_version",
+        "receipt_digest",
+        "command_json",
+        "predecessor_sequence",
+        "predecessor_digest",
+        "predecessor_logical_time",
+        "raft_log_index",
+    ];
+    let present = columns
+        .iter()
+        .map(|column| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_request_outcomes') WHERE name = ?1)",
+                [column],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(db_error)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if present.iter().any(|present| *present) && present.iter().any(|present| !*present) {
+        return Err(invalid_data(
+            "session consensus outcome receipt schema is partial",
+        ));
+    }
+    let receipt_chain_present = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_request_outcomes') WHERE name = 'predecessor_receipt_digest')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(db_error)?;
+    if !present[0] {
+        let legacy_schema: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_request_outcomes'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if legacy_schema != LEGACY_CONSENSUS_REQUEST_OUTCOMES_SCHEMA {
+            return Err(invalid_data(
+                "session consensus legacy outcome receipt schema is invalid",
+            ));
+        }
+        conn.execute_batch(&format!(
+            "ALTER TABLE consensus_request_outcomes RENAME TO consensus_request_outcomes_legacy;\n{RECEIPT_CHAIN_CONSENSUS_REQUEST_OUTCOMES_SCHEMA}"
+        ))
+        .map_err(db_error)?;
+        migrate_legacy_outcome_receipts_sync(conn, identity, exact_immediate_predecessor)?;
+        conn.execute_batch("DROP TABLE consensus_request_outcomes_legacy;")
+            .map_err(db_error)?;
+    } else if !receipt_chain_present {
+        migrate_current_outcome_receipt_chain_sync(conn, identity)?;
+    }
+    Ok(())
+}
+
+fn migrate_legacy_outcome_receipts_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    exact_immediate_predecessor: bool,
+) -> io::Result<()> {
+    let mut statement = conn
+        .prepare(
+            "SELECT request_id, configuration_epoch, payload_digest, response_json \
+             FROM consensus_request_outcomes_legacy",
+        )
+        .map_err(db_error)?;
+    let legacy = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })
+        .map_err(db_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error)?;
+    drop(statement);
+
+    let (machine_sequence, machine_digest, _, machine_time, _) = read_machine_sync(conn, identity)?;
+    if legacy.is_empty() {
+        if machine_sequence != 0
+            || machine_digest != SessionConsensusEntryDigest::GENESIS
+            || machine_time.is_some()
+        {
+            return Err(invalid_data(
+                "session consensus empty legacy outcome chain is invalid",
+            ));
+        }
+        return Ok(());
+    }
+
+    if !exact_immediate_predecessor {
+        return Err(invalid_data(
+            "session consensus nonempty legacy outcomes require the exact reviewed predecessor",
+        ));
+    }
+
+    // A migrated legacy chain must begin at the original genesis root.  A
+    // non-pristine operator-recovery epoch has a different authority root and
+    // belongs to the explicit recovery workflow instead.
+    let recovery = read_operator_recovery_sync(conn, identity)?;
+    if recovery.recovery_epoch != 0
+        || recovery.last_plan_digest != [0; 32]
+        || recovery.pending_epoch.is_some()
+        || recovery.pending_plan_digest.is_some()
+    {
+        return Err(invalid_data(
+            "session consensus legacy outcomes require operator recovery",
+        ));
+    }
+    let applied = read_applied_sync(conn, identity)?.ok_or_else(|| {
+        invalid_data("session consensus legacy outcomes are missing an applied log pointer")
+    })?;
+    validate_complete_legacy_log_retention_sync(conn, identity, applied.index)?;
+
+    let mut outcomes = Vec::with_capacity(legacy.len());
+    for (request_id, epoch, payload_digest, response) in legacy {
+        validate_epoch(epoch, identity)?;
+        let request_id: [u8; 16] = request_id
+            .try_into()
+            .map_err(|_| invalid_data("persisted session consensus request ID is invalid"))?;
+        let payload_digest: [u8; 32] = payload_digest.try_into().map_err(|_| {
+            invalid_data("persisted session consensus request digest has invalid length")
+        })?;
+        let response: SessionConsensusResponse = decode_json(&response)?;
+        outcomes.push((
+            SessionConsensusRequestId::from_bytes(request_id),
+            payload_digest,
+            response,
+        ));
+    }
+    outcomes.sort_by_key(|(_, _, response)| response.sequence);
+    if u64::try_from(outcomes.len())
+        .map_err(|_| invalid_data("persisted session consensus outcomes exceed integer range"))?
+        != machine_sequence
+    {
+        return Err(invalid_data(
+            "session consensus legacy outcome chain is incomplete",
+        ));
+    }
+
+    let mut predecessor_sequence = 0_u64;
+    let mut predecessor_digest = SessionConsensusEntryDigest::GENESIS;
+    let mut predecessor_receipt_digest = OUTCOME_RECEIPT_CHAIN_GENESIS;
+    let mut predecessor_time: Option<Timestamp> = None;
+    let mut previous_raft_log_index = None;
+    for (request_id, stored_payload_digest, stored_response) in outcomes {
+        let raft_log_index = stored_response.raft_log_index;
+        if raft_log_index > applied.index
+            || previous_raft_log_index.is_some_and(|previous| raft_log_index <= previous)
+        {
+            return Err(invalid_data(
+                "session consensus legacy outcome chain is invalid",
+            ));
+        }
+        let command = read_exact_retained_legacy_command_sync(conn, identity, raft_log_index)?;
+        if command.admission_revision() != SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_LEGACY
+            || command.request_id != request_id
+            || payload_digest(&command)? != stored_payload_digest
+        {
+            return Err(invalid_data(
+                "session consensus legacy outcome does not match retained command",
+            ));
+        }
+
+        let result = rederive_legacy_payload_too_large_result(&command, identity)?;
+        let sequence = predecessor_sequence
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session consensus sequence exhausted"))?;
+        let logical_time = predecessor_time.map_or(command.logical_time, |previous| {
+            previous.max(command.logical_time)
+        });
+        let digest = command
+            .calculate_applied_result_digest(
+                sequence,
+                predecessor_digest,
+                logical_time,
+                raft_log_index,
+                &result,
+            )
+            .map_err(|_| invalid_data("session consensus legacy command digest failed"))?;
+        let response = SessionConsensusResponse {
+            result,
+            sequence,
+            digest: Some(digest),
+            logical_time: Some(logical_time),
+            raft_log_index,
+        };
+        if stored_response != response {
+            return Err(invalid_data(
+                "session consensus legacy outcome is not independently reproducible",
+            ));
+        }
+        let receipt = outcome_receipt_digest(OutcomeReceiptDigestInput {
+            request_id: &request_id,
+            configuration_epoch: identity.configuration_epoch().get(),
+            semantic_command_digest: &stored_payload_digest,
+            command: &command,
+            predecessor_sequence,
+            predecessor_digest: &predecessor_digest,
+            predecessor_logical_time: predecessor_time,
+            predecessor_receipt_digest: &predecessor_receipt_digest,
+            raft_log_index,
+            response: &response,
+        })?;
+        conn.execute(
+            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, command_json, predecessor_sequence, predecessor_digest, predecessor_logical_time, predecessor_receipt_digest, raft_log_index, response_json, receipt_version, receipt_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                request_id.as_bytes().as_slice(),
+                epoch_i64(identity)?,
+                stored_payload_digest.as_slice(),
+                encode_json(&command)?,
+                checked_i64(predecessor_sequence)?,
+                predecessor_digest.as_bytes().as_slice(),
+                predecessor_time.map(ops::format_rfc3339_normalized),
+                predecessor_receipt_digest.as_slice(),
+                checked_i64(raft_log_index)?,
+                encode_json(&response)?,
+                OUTCOME_RECEIPT_VERSION,
+                receipt.as_slice(),
+            ],
+        )
+        .map_err(db_error)?;
+        predecessor_sequence = sequence;
+        predecessor_digest = digest;
+        predecessor_receipt_digest = receipt;
+        predecessor_time = Some(logical_time);
+        previous_raft_log_index = Some(raft_log_index);
+    }
+    if predecessor_sequence != machine_sequence
+        || predecessor_digest != machine_digest
+        || predecessor_time != machine_time
+    {
+        return Err(invalid_data(
+            "session consensus legacy outcome chain head is invalid",
+        ));
+    }
+    let changed = conn
+        .execute(
+            "UPDATE consensus_machine SET last_receipt_digest = ?1 WHERE singleton = 1 AND configuration_epoch = ?2 AND application_sequence = ?3",
+            params![
+                predecessor_receipt_digest.as_slice(),
+                epoch_i64(identity)?,
+                checked_i64(machine_sequence)?,
+            ],
+        )
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Err(invalid_data(
+            "session consensus legacy machine state is missing",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PreReceiptChainOutcome {
+    request_id: SessionConsensusRequestId,
+    payload_digest: [u8; 32],
+    command: DurableSessionConsensusCommand,
+    predecessor_sequence: u64,
+    predecessor_digest: SessionConsensusEntryDigest,
+    predecessor_logical_time: Option<Timestamp>,
+    raft_log_index: u64,
+    response: SessionConsensusResponse,
+}
+
+/// Upgrade the only unreleased v2 candidate layout into the result-bearing
+/// parallel receipt chain.  The frozen application chain is verified as-is
+/// and deliberately never rewritten: legacy-compatible peers retain its old
+/// digest semantics.  Receipt links become the independently result-bound
+/// authority from this point forward.
+fn migrate_current_outcome_receipt_chain_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<()> {
+    let schema: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_request_outcomes'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if schema != PRE_RECEIPT_CHAIN_CONSENSUS_REQUEST_OUTCOMES_SCHEMA {
+        return Err(invalid_data(
+            "session consensus pre-receipt-chain outcome schema is invalid",
+        ));
+    }
+
+    let admission = read_command_admission_sync(conn, identity)?;
+    let recovery = read_operator_recovery_sync(conn, identity)?;
+    let applied_index = read_applied_sync(conn, identity)?.map(|log_id| log_id.index);
+    let (machine_sequence, machine_digest, machine_receipt_digest, machine_time, _) =
+        read_machine_sync(conn, identity)?;
+    if machine_receipt_digest != OUTCOME_RECEIPT_CHAIN_GENESIS {
+        return Err(invalid_data(
+            "session consensus pre-receipt-chain machine receipt head is invalid",
+        ));
+    }
+
+    let mut statement = conn
+        .prepare(
+            "SELECT request_id, configuration_epoch, payload_digest, command_json, predecessor_sequence, predecessor_digest, predecessor_logical_time, raft_log_index, response_json, receipt_version, receipt_digest FROM consensus_request_outcomes",
+        )
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, Vec<u8>>(10)?,
+            ))
+        })
+        .map_err(db_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error)?;
+    drop(statement);
+
+    let mut outcomes = Vec::with_capacity(rows.len());
+    for (
+        request_id,
+        epoch,
+        payload,
+        command,
+        predecessor_sequence,
+        predecessor_digest,
+        predecessor_time,
+        raft_log_index,
+        response,
+        receipt_version,
+        receipt_digest,
+    ) in rows
+    {
+        validate_epoch(epoch, identity)?;
+        if receipt_version != OUTCOME_RECEIPT_VERSION {
+            return Err(invalid_data(
+                "session consensus pre-receipt-chain receipt version is invalid",
+            ));
+        }
+        let request_id = request_id
+            .try_into()
+            .map(SessionConsensusRequestId::from_bytes)
+            .map_err(|_| invalid_data("persisted session consensus request ID is invalid"))?;
+        let stored_payload_digest: [u8; 32] = payload.try_into().map_err(|_| {
+            invalid_data("persisted session consensus request digest has invalid length")
+        })?;
+        let command: DurableSessionConsensusCommand = decode_json(&command)?;
+        // Legacy application digests are command-only.  A candidate row with
+        // revision zero therefore cannot prove its result and must take the
+        // explicit recovery route instead of being blessed into receipt v2.
+        if command.admission_revision() != SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_CURRENT
+            || command.request_id != request_id
+            || command.identity != identity
+            || payload_digest(&command)? != stored_payload_digest
+        {
+            return Err(invalid_data(
+                "session consensus pre-receipt-chain command is invalid",
+            ));
+        }
+        let predecessor_sequence = checked_u64(predecessor_sequence)?;
+        let predecessor_digest = SessionConsensusEntryDigest::from_bytes(
+            predecessor_digest.try_into().map_err(|_| {
+                invalid_data("persisted session consensus predecessor digest has invalid length")
+            })?,
+        );
+        let predecessor_logical_time = predecessor_time
+            .map(|value| {
+                ops::parse_persisted_rfc3339_normalized(&value).map_err(|_| {
+                    invalid_data("persisted session consensus predecessor logical time is invalid")
+                })
+            })
+            .transpose()?;
+        let raft_log_index = checked_u64(raft_log_index)?;
+        let response: SessionConsensusResponse = decode_json(&response)?;
+        validate_outcome_against_retained_log_sync(conn, identity, raft_log_index, &command)?;
+        validate_persisted_command_admission(&command, identity, raft_log_index, admission)?;
+        let effective_time = predecessor_logical_time.map_or(command.logical_time, |previous| {
+            previous.max(command.logical_time)
+        });
+        if response.sequence
+            != predecessor_sequence
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("persisted session consensus sequence exhausted"))?
+            || response.logical_time != Some(effective_time)
+            || response.raft_log_index != raft_log_index
+            || response.digest
+                != Some(
+                    command
+                        .calculate_applied_result_digest(
+                            response.sequence,
+                            predecessor_digest,
+                            effective_time,
+                            raft_log_index,
+                            &response.result,
+                        )
+                        .map_err(|_| {
+                            invalid_data("persisted session consensus outcome digest is invalid")
+                        })?,
+                )
+        {
+            return Err(invalid_data(
+                "session consensus pre-receipt-chain outcome metadata is invalid",
+            ));
+        }
+        validate_response_for_command(&command, &response)?;
+        if let Ok(outcome) = &response.result {
+            validate_consensus_outcome_records(outcome).map_err(|_| {
+                invalid_data("persisted session consensus outcome record is invalid")
+            })?;
+        }
+        let receipt_digest: [u8; 32] = receipt_digest.try_into().map_err(|_| {
+            invalid_data("persisted session consensus outcome receipt has invalid length")
+        })?;
+        if receipt_digest
+            != outcome_receipt_digest_without_receipt_chain(
+                OutcomeReceiptDigestWithoutChainInput {
+                    request_id: &request_id,
+                    configuration_epoch: identity.configuration_epoch().get(),
+                    semantic_command_digest: &stored_payload_digest,
+                    command: &command,
+                    predecessor_sequence,
+                    predecessor_digest: &predecessor_digest,
+                    predecessor_logical_time,
+                    raft_log_index,
+                    response: &response,
+                },
+            )?
+        {
+            return Err(invalid_data(
+                "session consensus pre-receipt-chain outcome receipt is invalid",
+            ));
+        }
+        outcomes.push(PreReceiptChainOutcome {
+            request_id,
+            payload_digest: stored_payload_digest,
+            command,
+            predecessor_sequence,
+            predecessor_digest,
+            predecessor_logical_time,
+            raft_log_index,
+            response,
+        });
+    }
+
+    outcomes.sort_by_key(|outcome| outcome.response.sequence);
+    let recovery_root = outcome_chain_recovery_root(recovery);
+    let (root_digest, root_time) = match outcomes.first() {
+        Some(outcome)
+            if outcome.predecessor_sequence == 0
+                && outcome.predecessor_digest == SessionConsensusEntryDigest::GENESIS
+                && outcome.predecessor_logical_time.is_none() =>
+        {
+            (SessionConsensusEntryDigest::GENESIS, None)
+        }
+        Some(outcome)
+            if outcome.predecessor_sequence == 0
+                && recovery_root == Some(*outcome.predecessor_digest.as_bytes()) =>
+        {
+            (outcome.predecessor_digest, outcome.predecessor_logical_time)
+        }
+        Some(_) => {
+            return Err(invalid_data(
+                "session consensus pre-receipt-chain outcome root is invalid",
+            ));
+        }
+        None if machine_sequence == 0
+            && machine_digest == SessionConsensusEntryDigest::GENESIS
+            && machine_time.is_none() =>
+        {
+            (SessionConsensusEntryDigest::GENESIS, None)
+        }
+        None if machine_sequence == 0 && recovery_root == Some(*machine_digest.as_bytes()) => {
+            (machine_digest, machine_time)
+        }
+        None => {
+            return Err(invalid_data(
+                "session consensus pre-receipt-chain empty outcome head is invalid",
+            ));
+        }
+    };
+    if u64::try_from(outcomes.len())
+        .map_err(|_| invalid_data("persisted session consensus outcomes exceed integer range"))?
+        != machine_sequence
+    {
+        return Err(invalid_data(
+            "session consensus pre-receipt-chain outcome chain is incomplete",
+        ));
+    }
+    let mut previous_raft_log_index = None;
+    let mut found_cutover_receipt = false;
+    for (position, outcome) in outcomes.iter().enumerate() {
+        let expected_sequence = u64::try_from(position)
+            .map_err(|_| invalid_data("persisted session consensus outcomes exceed integer range"))?
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("persisted session consensus sequence exhausted"))?;
+        let (expected_digest, expected_time) = if position == 0 {
+            (root_digest, root_time)
+        } else {
+            let previous = &outcomes[position - 1].response;
+            (
+                previous.digest.ok_or_else(|| {
+                    invalid_data("persisted session consensus outcome metadata is invalid")
+                })?,
+                previous.logical_time,
+            )
+        };
+        if outcome.response.sequence != expected_sequence
+            || outcome.predecessor_sequence != expected_sequence - 1
+            || outcome.predecessor_digest != expected_digest
+            || outcome.predecessor_logical_time != expected_time
+            || previous_raft_log_index.is_some_and(|previous| outcome.raft_log_index <= previous)
+            || applied_index.is_none_or(|applied| outcome.raft_log_index > applied)
+        {
+            return Err(invalid_data(
+                "session consensus pre-receipt-chain outcome chain is invalid",
+            ));
+        }
+        previous_raft_log_index = Some(outcome.raft_log_index);
+        if admission.cutover_committed
+            && outcome.request_id.as_bytes()
+                == &crate::consensus::SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID
+            && outcome.raft_log_index.checked_add(1) == Some(admission.strict_activation_index)
+            && matches!(outcome.response.result, Ok(SessionMutationOutcome::Unit))
+        {
+            found_cutover_receipt = true;
+        }
+    }
+    if let Some(last) = outcomes.last() {
+        if last.response.digest != Some(machine_digest)
+            || last.response.logical_time != machine_time
+        {
+            return Err(invalid_data(
+                "session consensus pre-receipt-chain outcome head is invalid",
+            ));
+        }
+    } else if machine_sequence != 0 || machine_digest != root_digest || machine_time != root_time {
+        return Err(invalid_data(
+            "session consensus pre-receipt-chain empty outcome head is invalid",
+        ));
+    }
+    if admission.cutover_committed && !found_cutover_receipt {
+        return Err(invalid_data(
+            "session consensus pre-receipt-chain admission cutover receipt is missing",
+        ));
+    }
+
+    conn.execute_batch(&format!(
+        "ALTER TABLE consensus_request_outcomes RENAME TO consensus_request_outcomes_pre_receipt_chain;\n{RECEIPT_CHAIN_CONSENSUS_REQUEST_OUTCOMES_SCHEMA}"
+    ))
+    .map_err(db_error)?;
+    let mut predecessor_receipt_digest = OUTCOME_RECEIPT_CHAIN_GENESIS;
+    for outcome in outcomes {
+        let receipt_digest = outcome_receipt_digest(OutcomeReceiptDigestInput {
+            request_id: &outcome.request_id,
+            configuration_epoch: identity.configuration_epoch().get(),
+            semantic_command_digest: &outcome.payload_digest,
+            command: &outcome.command,
+            predecessor_sequence: outcome.predecessor_sequence,
+            predecessor_digest: &outcome.predecessor_digest,
+            predecessor_logical_time: outcome.predecessor_logical_time,
+            predecessor_receipt_digest: &predecessor_receipt_digest,
+            raft_log_index: outcome.raft_log_index,
+            response: &outcome.response,
+        })?;
+        conn.execute(
+            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, command_json, predecessor_sequence, predecessor_digest, predecessor_logical_time, predecessor_receipt_digest, raft_log_index, response_json, receipt_version, receipt_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                outcome.request_id.as_bytes().as_slice(),
+                epoch_i64(identity)?,
+                outcome.payload_digest.as_slice(),
+                encode_json(&outcome.command)?,
+                checked_i64(outcome.predecessor_sequence)?,
+                outcome.predecessor_digest.as_bytes().as_slice(),
+                outcome.predecessor_logical_time.map(ops::format_rfc3339_normalized),
+                predecessor_receipt_digest.as_slice(),
+                checked_i64(outcome.raft_log_index)?,
+                encode_json(&outcome.response)?,
+                OUTCOME_RECEIPT_VERSION,
+                receipt_digest.as_slice(),
+            ],
+        )
+        .map_err(db_error)?;
+        predecessor_receipt_digest = receipt_digest;
+    }
+    let changed = conn
+        .execute(
+            "UPDATE consensus_machine SET last_receipt_digest = ?1 WHERE singleton = 1 AND configuration_epoch = ?2 AND application_sequence = ?3",
+            params![
+                predecessor_receipt_digest.as_slice(),
+                epoch_i64(identity)?,
+                checked_i64(machine_sequence)?,
+            ],
+        )
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Err(invalid_data(
+            "session consensus pre-receipt-chain machine state is missing",
+        ));
+    }
+    conn.execute_batch("DROP TABLE consensus_request_outcomes_pre_receipt_chain;")
+        .map_err(db_error)?;
+    Ok(())
+}
+
+/// Complete retained history is required to qualify the one automatic legacy
+/// upgrade path.  A compacted log leaves the old command-only cache unable to
+/// prove what happened, even for a syntactically plausible rejection.
+fn validate_complete_legacy_log_retention_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    applied_index: u64,
+) -> io::Result<()> {
+    if read_purged_sync(conn, identity)?.is_some() {
+        return Err(invalid_data(
+            "session consensus legacy outcomes require retained logs",
+        ));
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT configuration_epoch, term, log_index, entry_json \
+             FROM consensus_log WHERE log_index <= ?1 ORDER BY log_index ASC",
+        )
+        .map_err(db_error)?;
+    let mut rows = statement
+        .query([checked_i64(applied_index)?])
+        .map_err(db_error)?;
+    let mut expected_index = 0_u64;
+    let mut saw_applied = false;
+    while let Some(row) = rows.next().map_err(db_error)? {
+        let epoch: i64 = row.get(0).map_err(db_error)?;
+        let term: i64 = row.get(1).map_err(db_error)?;
+        let index: i64 = row.get(2).map_err(db_error)?;
+        let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
+        validate_epoch(epoch, identity)?;
+        let index = checked_u64(index)?;
+        let entry: Entry<SessionRaftTypeConfig> = decode_json(&encoded)?;
+        if index != expected_index
+            || entry.log_id.index != index
+            || checked_u64(term)? != entry.log_id.leader_id.term
+        {
+            return Err(invalid_data(
+                "persisted session consensus legacy log is not complete",
+            ));
+        }
+        if index == applied_index {
+            saw_applied = true;
+            break;
+        }
+        expected_index = expected_index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session consensus log index exhausted"))?;
+    }
+    if !saw_applied {
+        return Err(invalid_data(
+            "persisted session consensus legacy log is not complete",
+        ));
+    }
+    Ok(())
+}
+
+/// Read the exact command at a retained legacy outcome index.  Unlike current
+/// receipt validation, absence is not tolerated here because this function is
+/// constructing the first result-bound receipt for the command.
+fn read_exact_retained_legacy_command_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    raft_log_index: u64,
+) -> io::Result<DurableSessionConsensusCommand> {
+    let (epoch, term, index, encoded): (i64, i64, i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index = ?1",
+            [checked_i64(raft_log_index)?],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(db_error)?;
+    validate_epoch(epoch, identity)?;
+    let entry: Entry<SessionRaftTypeConfig> = decode_json(&encoded)?;
+    if checked_u64(index)? != raft_log_index
+        || entry.log_id.index != raft_log_index
+        || checked_u64(term)? != entry.log_id.leader_id.term
+    {
+        return Err(invalid_data(
+            "persisted session consensus legacy retained log row is invalid",
+        ));
+    }
+    match entry.payload {
+        // A missing `admission_revision` in the frozen JSON decodes to this
+        // revision-zero command by design; serializing the v2 receipt writes
+        // its explicit canonical value without changing the old chain digest.
+        EntryPayload::Normal(command) => Ok(command),
+        _ => Err(invalid_data(
+            "persisted session consensus legacy outcome is not a normal log command",
+        )),
+    }
+}
+
+/// Independently derive the sole non-stateful legacy result that can be
+/// migrated.  The ordinary command validator checks the frozen command shape
+/// and envelope under legacy admission; the central record validator then
+/// produces the exact current payload limit.  Structural CAS checks are all
+/// earlier than the stateful lease/fence lookups in `compare_and_set_sync`.
+fn rederive_legacy_payload_too_large_result(
+    command: &DurableSessionConsensusCommand,
+    identity: SessionConsensusIdentity,
+) -> io::Result<Result<SessionMutationOutcome, StoreError>> {
+    validate_command_for_log_with_cap(command, identity, false)?;
+    let SessionMutationIntent::CompareAndSet(operation) = &command.intent else {
+        return Err(invalid_data(
+            "session consensus legacy outcome is not a payload rejection command",
+        ));
+    };
+    if operation.lease.key() != &operation.key
+        || operation.new_record.key != operation.key
+        || operation.new_record.owner != *operation.lease.owner()
+        || operation.new_record.fence != operation.lease.fence()
+    {
+        return Err(invalid_data(
+            "session consensus legacy payload rejection command is invalid",
+        ));
+    }
+    match super::validate_consensus_record(&operation.new_record) {
+        Err(error) if is_base_admitted_legacy_payload_too_large(&error) => Ok(Err(error)),
+        _ => Err(invalid_data(
+            "session consensus legacy outcome is not an independently reproducible payload rejection",
+        )),
+    }
+}
+
+/// Ensure the durable admission state exists. Strict admission begins only
+/// once the replicated cutover marker commits; that marker is the portable
+/// proof followers and snapshots use to distinguish the retained legacy
+/// prefix from current traffic.
+fn install_command_admission_schema_sync(conn: &Connection) -> io::Result<()> {
+    if table_exists(conn, "consensus_command_admission").map_err(db_error)? {
+        return Ok(());
+    }
+    let canonical = SqliteSessionBackend::canonical_schema_connection()
+        .map_err(|_| io::Error::other("session consensus canonical schema is unavailable"))?;
+    install_recovery_validation_schema_sync(&canonical, false)?;
+    let ddl: String = canonical
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_command_admission'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    conn.execute_batch(&ddl).map_err(db_error)
+}
+
+fn ensure_command_admission_schema_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    allow_missing_singleton_initialization: bool,
+) -> io::Result<()> {
+    let exists = table_exists(conn, "consensus_command_admission").map_err(db_error)?;
+    if !exists {
+        install_command_admission_schema_sync(conn)?;
+    }
+    if allow_missing_singleton_initialization {
+        // Seed only a fresh database or an exact supported source manifest
+        // whose complete inventory lacked this table. An existing authority
+        // table with a deleted singleton must fail closed below.
+        conn.execute(
+            "INSERT INTO consensus_command_admission (singleton, configuration_epoch, admission_revision, strict_activation_index, cutover_committed) VALUES (1, ?1, ?2, ?3, 0)",
+            params![
+                epoch_i64(identity)?,
+                COMMAND_ADMISSION_REVISION,
+                0_i64,
+            ],
+        )
+        .map_err(db_error)?;
+    }
+    read_command_admission_sync(conn, identity).map(|_| ())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OperatorRecoveryState {
     pub(crate) recovery_epoch: u64,
     pub(crate) last_plan_digest: [u8; 32],
     pub(crate) pending_epoch: Option<u64>,
     pub(crate) pending_plan_digest: Option<[u8; 32]>,
+    pub(crate) pending_fence_high_water: Option<u64>,
+    pub(crate) pending_credential_high_water: Option<u64>,
     pub(crate) watch_cursor_invalidation_floor: u64,
 }
 
-type StoredOperatorRecoveryRow = (i64, i64, Vec<u8>, Option<i64>, Option<Vec<u8>>, i64);
+/// Return the sole plan digest that can root a receipt chain at sequence zero.
+///
+/// A first explicit legacy claim has no finalized recovery epoch, so its
+/// pending plan is the fresh chain root. Once a recovery epoch is finalized,
+/// a later verified-majority repair preserves that chain and its pending plan
+/// only fences the repair; accepting that newer digest would permit a receipt
+/// root rewrite without a command/result receipt.
+fn outcome_chain_recovery_root(recovery: OperatorRecoveryState) -> Option<[u8; 32]> {
+    if recovery.recovery_epoch > 0 {
+        Some(recovery.last_plan_digest)
+    } else {
+        recovery.pending_plan_digest
+    }
+}
+
+type StoredOperatorRecoveryRow = (
+    i64,
+    i64,
+    Vec<u8>,
+    Option<i64>,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<i64>,
+    i64,
+);
+
+type LegacyOperatorRecoveryWithCursorRow = (i64, i64, Vec<u8>, Option<i64>, Option<Vec<u8>>, i64);
+
+type MachineState = (
+    u64,
+    SessionConsensusEntryDigest,
+    [u8; 32],
+    Option<Timestamp>,
+    u64,
+);
 
 pub(crate) fn read_operator_recovery_sync(
     conn: &Connection,
@@ -4469,28 +6092,61 @@ pub(crate) fn read_operator_recovery_sync(
             last_plan_digest: [0; 32],
             pending_epoch: None,
             pending_plan_digest: None,
+            pending_fence_high_water: None,
+            pending_credential_high_water: None,
             watch_cursor_invalidation_floor: 0,
         });
     }
-    let row: StoredOperatorRecoveryRow = if operator_recovery_cursor_column_exists(conn)? {
+    let row: StoredOperatorRecoveryRow = if operator_recovery_pending_high_water_columns(conn)?
+        == (true, true)
+    {
         conn.query_row(
-            "SELECT configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor FROM consensus_operator_recovery WHERE singleton = 1",
+            "SELECT configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, pending_fence_high_water, pending_credential_high_water, watch_cursor_invalidation_floor FROM consensus_operator_recovery WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
         )
         .map_err(db_error)?
     } else {
-        let legacy: (i64, i64, Vec<u8>, Option<i64>, Option<Vec<u8>>) = conn
-            .query_row(
-                "SELECT configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest FROM consensus_operator_recovery WHERE singleton = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        let (has_fence, has_credential) = operator_recovery_pending_high_water_columns(conn)?;
+        if has_fence || has_credential {
+            return Err(invalid_data(
+                "session consensus operator recovery high-water binding is incomplete",
+            ));
+        }
+        if operator_recovery_cursor_column_exists(conn)? {
+            let legacy: LegacyOperatorRecoveryWithCursorRow = conn
+                .query_row(
+                    "SELECT configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor FROM consensus_operator_recovery WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                )
+                .map_err(db_error)?;
+            (
+                legacy.0, legacy.1, legacy.2, legacy.3, legacy.4, None, None, legacy.5,
             )
-            .map_err(db_error)?;
-        (legacy.0, legacy.1, legacy.2, legacy.3, legacy.4, 0)
+        } else {
+            let legacy: (i64, i64, Vec<u8>, Option<i64>, Option<Vec<u8>>) = conn
+                .query_row(
+                    "SELECT configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest FROM consensus_operator_recovery WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .map_err(db_error)?;
+            (
+                legacy.0, legacy.1, legacy.2, legacy.3, legacy.4, None, None, 0,
+            )
+        }
     };
-    let (stored_epoch, recovery_epoch, last_digest, pending_epoch, pending_digest, cursor_floor) =
-        row;
+    let (
+        stored_epoch,
+        recovery_epoch,
+        last_digest,
+        pending_epoch,
+        pending_digest,
+        pending_fence,
+        pending_credential,
+        cursor_floor,
+    ) = row;
     validate_epoch(stored_epoch, identity)?;
     let recovery_epoch = checked_u64(recovery_epoch)?;
     let last_plan_digest = last_digest
@@ -4504,7 +6160,17 @@ pub(crate) fn read_operator_recovery_sync(
             })
         })
         .transpose()?;
-    if pending_epoch.is_some() != pending_plan_digest.is_some()
+    let pending_fence_high_water = pending_fence.map(checked_u64).transpose()?;
+    let pending_credential_high_water = pending_credential.map(checked_u64).transpose()?;
+    if (recovery_epoch == 0) != (last_plan_digest == [0; 32]) {
+        return Err(invalid_data(
+            "session consensus recovery authority state is invalid",
+        ));
+    }
+    if pending_plan_digest.is_some_and(|digest| digest == [0; 32])
+        || pending_epoch.is_some() != pending_plan_digest.is_some()
+        || pending_epoch.is_some() != pending_fence_high_water.is_some()
+        || pending_epoch.is_some() != pending_credential_high_water.is_some()
         || pending_epoch.is_some_and(|pending| pending <= recovery_epoch)
     {
         return Err(invalid_data(
@@ -4516,6 +6182,8 @@ pub(crate) fn read_operator_recovery_sync(
         last_plan_digest,
         pending_epoch,
         pending_plan_digest,
+        pending_fence_high_water,
+        pending_credential_high_water,
         watch_cursor_invalidation_floor: checked_u64(cursor_floor)?,
     })
 }
@@ -4545,24 +6213,60 @@ fn operator_recovery_cursor_column_exists(conn: &Connection) -> io::Result<bool>
     .map_err(db_error)
 }
 
+fn operator_recovery_pending_high_water_columns(conn: &Connection) -> io::Result<(bool, bool)> {
+    let (fence, credential): (bool, bool) = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery') WHERE name = 'pending_fence_high_water'), EXISTS(SELECT 1 FROM pragma_table_info('consensus_operator_recovery') WHERE name = 'pending_credential_high_water')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(db_error)?;
+    Ok((fence, credential))
+}
+
+fn validate_nonzero_operator_recovery_plan_digest(plan_digest: [u8; 32]) -> io::Result<()> {
+    if plan_digest == [0; 32] {
+        return Err(invalid_data(
+            "session consensus recovery plan digest must be nonzero",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn mark_operator_recovery_pending_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     pending_epoch: u64,
     plan_digest: [u8; 32],
+    fence_high_water: u64,
+    credential_high_water: u64,
 ) -> io::Result<()> {
+    validate_nonzero_operator_recovery_plan_digest(plan_digest)?;
+    validate_operator_recovery_high_water(fence_high_water)?;
+    validate_operator_recovery_high_water(credential_high_water)?;
+    checked_positive_i64(pending_epoch)?;
     ensure_operator_recovery_schema_sync(conn, identity)?;
     let current = read_operator_recovery_sync(conn, identity)?;
-    match (current.pending_epoch, current.pending_plan_digest) {
-        (Some(epoch), Some(digest)) if epoch == pending_epoch && digest == plan_digest => {
+    match (
+        current.pending_epoch,
+        current.pending_plan_digest,
+        current.pending_fence_high_water,
+        current.pending_credential_high_water,
+    ) {
+        (Some(epoch), Some(digest), Some(fence), Some(credential))
+            if epoch == pending_epoch
+                && digest == plan_digest
+                && fence == fence_high_water
+                && credential == credential_high_water =>
+        {
             return Ok(());
         }
-        (Some(_), Some(_)) => {
+        (Some(_), Some(_), Some(_), Some(_)) => {
             return Err(invalid_data(
                 "a different session operator recovery workflow is already pending",
             ));
         }
-        (None, None) => {}
+        (None, None, None, None) => {}
         _ => {
             return Err(invalid_data(
                 "session operator recovery pending state is incomplete",
@@ -4575,10 +6279,12 @@ pub(crate) fn mark_operator_recovery_pending_sync(
         ));
     }
     conn.execute(
-        "UPDATE consensus_operator_recovery SET pending_epoch = ?1, pending_plan_digest = ?2 WHERE singleton = 1 AND configuration_epoch = ?3",
+        "UPDATE consensus_operator_recovery SET pending_epoch = ?1, pending_plan_digest = ?2, pending_fence_high_water = ?3, pending_credential_high_water = ?4 WHERE singleton = 1 AND configuration_epoch = ?5",
         params![
             checked_positive_i64(pending_epoch)?,
             plan_digest.as_slice(),
+            checked_i64(fence_high_water)?,
+            checked_i64(credential_high_water)?,
             epoch_i64(identity)?,
         ],
     )
@@ -4601,12 +6307,44 @@ pub(crate) fn finalize_operator_recovery_sync(
     fence_high_water: u64,
     credential_high_water: u64,
 ) -> io::Result<OperatorRecoveryApply> {
+    validate_nonzero_operator_recovery_plan_digest(plan_digest)?;
+    validate_operator_recovery_high_water(fence_high_water)?;
+    validate_operator_recovery_high_water(credential_high_water)?;
+    checked_positive_i64(recovery_epoch)?;
     ensure_operator_recovery_schema_sync(conn, identity)?;
     let current = read_operator_recovery_sync(conn, identity)?;
-    if let (Some(pending_epoch), Some(pending_digest)) =
-        (current.pending_epoch, current.pending_plan_digest)
-    {
-        if pending_epoch != recovery_epoch || pending_digest != plan_digest {
+    match (
+        current.pending_epoch,
+        current.pending_plan_digest,
+        current.pending_fence_high_water,
+        current.pending_credential_high_water,
+    ) {
+        (
+            Some(pending_epoch),
+            Some(pending_digest),
+            Some(pending_fence),
+            Some(pending_credential),
+        ) => {
+            if pending_epoch != recovery_epoch
+                || pending_digest != plan_digest
+                || pending_fence != fence_high_water
+                || pending_credential != credential_high_water
+            {
+                return Ok(OperatorRecoveryApply::Rejected);
+            }
+        }
+        (None, None, None, None) => {
+            return Ok(
+                if current.recovery_epoch == recovery_epoch
+                    && current.last_plan_digest == plan_digest
+                {
+                    OperatorRecoveryApply::Idempotent
+                } else {
+                    OperatorRecoveryApply::Rejected
+                },
+            );
+        }
+        _ => {
             return Ok(OperatorRecoveryApply::Rejected);
         }
     }
@@ -4647,7 +6385,7 @@ pub(crate) fn finalize_operator_recovery_sync(
     .map_err(db_error)?;
     let changed = conn
         .execute(
-            "UPDATE consensus_operator_recovery SET recovery_epoch = ?1, last_plan_digest = ?2, pending_epoch = NULL, pending_plan_digest = NULL WHERE singleton = 1 AND configuration_epoch = ?3",
+            "UPDATE consensus_operator_recovery SET recovery_epoch = ?1, last_plan_digest = ?2, pending_epoch = NULL, pending_plan_digest = NULL, pending_fence_high_water = NULL, pending_credential_high_water = NULL WHERE singleton = 1 AND configuration_epoch = ?3",
             params![
                 checked_positive_i64(recovery_epoch)?,
                 plan_digest.as_slice(),
@@ -4661,6 +6399,19 @@ pub(crate) fn finalize_operator_recovery_sync(
         ));
     }
     Ok(OperatorRecoveryApply::Applied)
+}
+
+/// A recovery high-water must leave one SQLite-positive allocator value for
+/// the next lease or credential.  Checking this before Raft admission keeps a
+/// malformed authenticated follower command from becoming a deterministic
+/// state-machine fault later.
+fn validate_operator_recovery_high_water(value: u64) -> io::Result<()> {
+    if value >= i64::MAX as u64 {
+        return Err(invalid_data(
+            "session recovery high-water exhausts the SQLite allocator",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn observed_fence_high_water_sync(conn: &Connection) -> io::Result<u64> {
@@ -4739,13 +6490,30 @@ pub(crate) fn claim_legacy_checkpoint_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     expected_members: &BTreeSet<SessionConsensusNodeId>,
-    checkpoint_digest: [u8; 32],
+    recovery_root_digest: [u8; 32],
     pending_recovery_epoch: u64,
     plan_digest: [u8; 32],
+    fence_high_water: u64,
+    credential_high_water: u64,
     application_sequence_high_water: u64,
     watch_cursor_invalidation_floor: u64,
+    recovery_root_time: Option<Timestamp>,
 ) -> io::Result<()> {
     validate_member_set(expected_members, false)?;
+    validate_nonzero_operator_recovery_plan_digest(plan_digest)?;
+    validate_operator_recovery_high_water(fence_high_water)?;
+    validate_operator_recovery_high_water(credential_high_water)?;
+    checked_positive_i64(pending_recovery_epoch)?;
+    if recovery_root_digest == [0; 32] || recovery_root_digest != plan_digest {
+        return Err(invalid_data(
+            "session recovery receipt root is not bound to the operator plan",
+        ));
+    }
+    // The caller already preflights this high-water with every other plan
+    // value.  Keep the range check here too: a direct caller must not use a
+    // narrowing conversion to turn an exhausted historical chain into a
+    // plausible reset checkpoint.
+    checked_i64(application_sequence_high_water)?;
     // Acquire write authority before inspecting the legacy checkpoint. Keeping
     // validation and ownership installation in one transaction prevents a
     // concurrent legacy writer from changing the admitted state between the
@@ -4759,17 +6527,42 @@ pub(crate) fn claim_legacy_checkpoint_sync(
     validate_sealed_state_sync(&tx)?;
     #[cfg(test)]
     run_legacy_claim_after_validation_hook();
-    let logical_time: Option<String> = tx
-        .query_row(
-            "SELECT timestamp FROM session_replication_log ORDER BY sequence DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(db_error)?;
-    if let Some(value) = &logical_time {
-        Timestamp::from_str(value)
-            .map_err(|_| invalid_data("legacy checkpoint logical time is invalid"))?;
+    // A reviewed immediate predecessor already has a sealed machine clock.
+    // Preserve that authoritative clock when the recovery coordinator supplied
+    // it; a standalone legacy source has no such field, so it falls back to
+    // the final validated replication event. The old replay cache is never
+    // used as a time source.
+    let logical_time = match recovery_root_time {
+        Some(value) => Some(value),
+        None => tx
+            .query_row(
+                "SELECT timestamp FROM session_replication_log ORDER BY sequence DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_error)?
+            .map(|value| {
+                ops::parse_persisted_rfc3339_normalized(&value)
+                    .map_err(|_| invalid_data("legacy checkpoint logical time is invalid"))
+            })
+            .transpose()?,
+    };
+    if let Some(reference) = logical_time {
+        validate_record_expiry_bounds_at_sync(&tx, reference)?;
+    } else {
+        let finite_records: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_records WHERE expires_at IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if finite_records {
+            return Err(invalid_data(
+                "legacy checkpoint finite record expiry has no replication time authority",
+            ));
+        }
     }
 
     tx.execute_batch(CONSENSUS_SCHEMA).map_err(db_error)?;
@@ -4794,23 +6587,31 @@ pub(crate) fn claim_legacy_checkpoint_sync(
     )
     .map_err(db_error)?;
     tx.execute(
-        "INSERT INTO consensus_machine (singleton, configuration_epoch, application_sequence, last_digest, logical_time, watch_sequence) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO consensus_command_admission (singleton, configuration_epoch, admission_revision, strict_activation_index, cutover_committed) VALUES (1, ?1, ?2, 0, 0)",
+        params![epoch, COMMAND_ADMISSION_REVISION],
+    )
+    .map_err(db_error)?;
+    tx.execute(
+        "INSERT INTO consensus_machine (singleton, configuration_epoch, application_sequence, last_digest, last_receipt_digest, logical_time, watch_sequence) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             epoch,
-            checked_i64(application_sequence_high_water)?,
-            checkpoint_digest.as_slice(),
-            logical_time,
+            0_i64,
+            recovery_root_digest.as_slice(),
+            OUTCOME_RECEIPT_CHAIN_GENESIS.as_slice(),
+            logical_time.map(ops::format_rfc3339_normalized),
             checked_i64(watch_cursor_invalidation_floor)?,
         ],
     )
     .map_err(db_error)?;
     tx.execute(
-        "INSERT INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor) VALUES (1, ?1, 0, ?2, ?3, ?4, ?5)",
+        "INSERT INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, pending_fence_high_water, pending_credential_high_water, watch_cursor_invalidation_floor) VALUES (1, ?1, 0, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             epoch,
             [0_u8; 32].as_slice(),
             checked_positive_i64(pending_recovery_epoch)?,
             plan_digest.as_slice(),
+            checked_i64(fence_high_water)?,
+            checked_i64(credential_high_water)?,
             checked_i64(watch_cursor_invalidation_floor)?,
         ],
     )
@@ -4821,6 +6622,7 @@ pub(crate) fn claim_legacy_checkpoint_sync(
         identity,
         expected_members,
         &BTreeMap::new(),
+        true,
     )?;
     tx.execute("DELETE FROM session_replication_log", [])
         .map_err(db_error)?;
@@ -4885,15 +6687,178 @@ fn validate_log_id(log_id: &LogId<SessionConsensusNodeId>) -> io::Result<(i64, i
     Ok((term, index))
 }
 
-pub(crate) fn validate_command_for_log(
-    command: &SessionConsensusCommand,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommandAdmission {
+    strict_activation_index: u64,
+    cutover_committed: bool,
+}
+
+fn read_command_admission_sync(
+    conn: &Connection,
     identity: SessionConsensusIdentity,
+) -> io::Result<CommandAdmission> {
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM consensus_command_admission",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if rows != 1 {
+        return Err(invalid_data(
+            "session consensus command admission state is invalid",
+        ));
+    }
+    let (epoch, revision, activation, cutover_committed): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT configuration_epoch, admission_revision, strict_activation_index, cutover_committed FROM consensus_command_admission WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(db_error)?;
+    validate_epoch(epoch, identity)?;
+    if revision != COMMAND_ADMISSION_REVISION {
+        return Err(invalid_data(
+            "session consensus command admission revision is invalid",
+        ));
+    }
+    let strict_activation_index = checked_u64(activation)?;
+    let cutover_committed = match cutover_committed {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(invalid_data(
+                "session consensus command admission state is invalid",
+            ));
+        }
+    };
+    if (!cutover_committed && strict_activation_index != 0)
+        || (cutover_committed && strict_activation_index == 0)
+    {
+        return Err(invalid_data(
+            "session consensus command admission boundary is invalid",
+        ));
+    }
+    Ok(CommandAdmission {
+        strict_activation_index,
+        cutover_committed,
+    })
+}
+
+pub(crate) fn command_admission_cutover_committed_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<bool> {
+    read_command_admission_sync(conn, identity).map(|admission| admission.cutover_committed)
+}
+
+fn validate_command_for_entry(
+    command: &DurableSessionConsensusCommand,
+    identity: SessionConsensusIdentity,
+    log_index: u64,
+    admission: CommandAdmission,
 ) -> io::Result<()> {
-    validate_command_for_log_with_cap(command, identity, true)
+    let is_cutover = command.is_command_admission_cutover();
+    if is_cutover {
+        // The fixed SDK-internal request ID makes retries of the marker
+        // idempotent.  The first marker establishes the boundary; later
+        // strict-revision retries are ordinary duplicate commands and must
+        // not move it.  This matters because callers cannot safely infer from
+        // volatile routing state whether an earlier attempt committed.
+        let boundary_matches = if admission.cutover_committed {
+            log_index
+                .checked_add(1)
+                .is_some_and(|next| next >= admission.strict_activation_index)
+        } else {
+            admission.strict_activation_index == 0
+        };
+        if command.admission_revision() != SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_CURRENT
+            || !boundary_matches
+        {
+            return Err(invalid_data(
+                "session consensus command admission cutover is invalid",
+            ));
+        }
+        return validate_command_for_log_with_cap(command, identity, true);
+    }
+    if !admission.cutover_committed {
+        if command.admission_revision() != SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_LEGACY {
+            return Err(invalid_data(
+                "session consensus command admission cutover is required",
+            ));
+        }
+        return validate_command_for_log_with_cap(command, identity, false);
+    }
+    let marker_index = admission
+        .strict_activation_index
+        .checked_sub(1)
+        .ok_or_else(|| invalid_data("session consensus command admission boundary is invalid"))?;
+    match command.admission_revision() {
+        SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_LEGACY if log_index < marker_index => {
+            validate_command_for_log_with_cap(command, identity, false)
+        }
+        SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_CURRENT
+            if log_index >= admission.strict_activation_index =>
+        {
+            validate_command_for_log_with_cap(command, identity, true)
+        }
+        _ => Err(invalid_data(
+            "session consensus command admission revision is unsupported",
+        )),
+    }
+}
+
+/// Validate a retained outcome's serialized command against the durable
+/// cutover proof. Unlike live admission, a closed cutover still permits a
+/// legacy command only when its original Raft position proves it belongs to
+/// the legacy prefix.
+fn validate_persisted_command_admission(
+    command: &DurableSessionConsensusCommand,
+    identity: SessionConsensusIdentity,
+    raft_log_index: u64,
+    admission: CommandAdmission,
+) -> io::Result<()> {
+    let is_cutover = command.is_command_admission_cutover();
+    if is_cutover {
+        if !admission.cutover_committed
+            || command.admission_revision() != SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_CURRENT
+            || raft_log_index.checked_add(1) != Some(admission.strict_activation_index)
+        {
+            return Err(invalid_data(
+                "persisted session consensus admission cutover is invalid",
+            ));
+        }
+        return validate_command_for_log_with_cap(command, identity, true);
+    }
+    if !admission.cutover_committed {
+        if command.admission_revision() != SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_LEGACY {
+            return Err(invalid_data(
+                "persisted session consensus admission cutover is required",
+            ));
+        }
+        return validate_command_for_log_with_cap(command, identity, false);
+    }
+    let marker_index = admission
+        .strict_activation_index
+        .checked_sub(1)
+        .ok_or_else(|| invalid_data("session consensus command admission boundary is invalid"))?;
+    match command.admission_revision() {
+        SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_LEGACY if raft_log_index < marker_index => {
+            validate_command_for_log_with_cap(command, identity, false)
+        }
+        SESSION_CONSENSUS_COMMAND_ADMISSION_REVISION_CURRENT
+            if raft_log_index >= admission.strict_activation_index =>
+        {
+            validate_command_for_log_with_cap(command, identity, true)
+        }
+        _ => Err(invalid_data(
+            "persisted session consensus command admission is invalid",
+        )),
+    }
 }
 
 fn validate_command_for_log_with_cap(
-    command: &SessionConsensusCommand,
+    command: &DurableSessionConsensusCommand,
     identity: SessionConsensusIdentity,
     enforce_payload_cap: bool,
 ) -> io::Result<()> {
@@ -4903,6 +6868,20 @@ fn validate_command_for_log_with_cap(
     if command.identity != identity {
         return Err(invalid_data("session consensus command identity mismatch"));
     }
+    let is_cutover = command.is_command_admission_cutover();
+    let uses_cutover_request_id = command.request_id.as_bytes()
+        == &crate::consensus::SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID;
+    if is_cutover {
+        if !uses_cutover_request_id {
+            return Err(invalid_data(
+                "session consensus command admission cutover is not canonical",
+            ));
+        }
+    } else if uses_cutover_request_id {
+        return Err(invalid_data(
+            "session consensus command admission cutover request ID is reserved",
+        ));
+    }
     if let SessionMutationIntent::FinalizeOperatorRecovery {
         recovery_epoch,
         plan_digest,
@@ -4911,9 +6890,10 @@ fn validate_command_for_log_with_cap(
     } = &command.intent
     {
         if *recovery_epoch == 0
+            || *recovery_epoch > i64::MAX as u64
             || plan_digest.iter().all(|byte| *byte == 0)
-            || *fence_high_water == u64::MAX
-            || *credential_high_water == u64::MAX
+            || *fence_high_water >= i64::MAX as u64
+            || *credential_high_water >= i64::MAX as u64
         {
             return Err(invalid_data(
                 "session consensus operator recovery command is invalid",
@@ -4921,7 +6901,22 @@ fn validate_command_for_log_with_cap(
         }
     }
     let semantic_intent = match &command.intent {
-        SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
+        SessionMutationIntent::Authorized { mutation, .. } => {
+            if matches!(
+                mutation.as_ref(),
+                SessionMutationIntent::FinalizeOperatorRecovery { .. }
+                    | SessionMutationIntent::PrepareTopologyTransition { .. }
+                    | SessionMutationIntent::MarkTopologyLearnersReady { .. }
+                    | SessionMutationIntent::FenceTopologyAuthority { .. }
+                    | SessionMutationIntent::AbortTopologyTransition { .. }
+                    | SessionMutationIntent::FinalizeTopologyTransition { .. }
+            ) {
+                return Err(invalid_data(
+                    "session consensus authorized control intent is invalid",
+                ));
+            }
+            mutation.as_ref()
+        }
         intent => intent,
     };
     if matches!(semantic_intent, SessionMutationIntent::Authorized { .. }) {
@@ -4929,12 +6924,16 @@ fn validate_command_for_log_with_cap(
             "session consensus authorized intent nesting is invalid",
         ));
     }
+    crate::consensus::types::validate_mutation_intent_profile(semantic_intent)
+        .map_err(|_| invalid_data("session consensus mutation profile is invalid"))?;
     if let SessionMutationIntent::CompareAndSet(op) = semantic_intent {
         crate::ttl::validate_stored_record_expiry_at(&op.new_record, command.logical_time)
             .map_err(|_| invalid_data("session consensus record expiry is invalid"))?;
         match super::validate_consensus_record(&op.new_record) {
             Ok(()) => {}
-            Err(StoreError::PayloadTooLarge { .. }) if !enforce_payload_cap => {
+            Err(error)
+                if !enforce_payload_cap && is_base_admitted_legacy_payload_too_large(&error) =>
+            {
                 if op.new_record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
                     return Err(invalid_data(
                         "session consensus requires a sealed record payload",
@@ -4963,13 +6962,28 @@ fn validate_command_for_log_with_cap(
     Ok(())
 }
 
+/// Whether a current cap rejection is the sole rejection that the frozen base
+/// release could have committed.  Retained revision-zero log validation and
+/// legacy receipt migration must make this same exact decision.
+fn is_base_admitted_legacy_payload_too_large(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::PayloadTooLarge { actual, max }
+            if *actual == BASE_ADMITTED_LEGACY_PAYLOAD_BYTES
+                && *max == BASE_ADVERTISED_LEGACY_PAYLOAD_MAX_BYTES
+    )
+}
+
 fn validate_entry_for_membership_scope(
     entry: &Entry<SessionRaftTypeConfig>,
     storage_identity: SessionConsensusIdentity,
     scope: &MembershipValidationScope,
+    admission: CommandAdmission,
 ) -> io::Result<()> {
     match &entry.payload {
-        EntryPayload::Normal(command) => validate_command_for_log(command, storage_identity),
+        EntryPayload::Normal(command) => {
+            validate_command_for_entry(command, storage_identity, entry.log_id.index, admission)
+        }
         EntryPayload::Membership(membership) => validate_membership_for_log(
             &StoredMembership::new(Some(entry.log_id), membership.clone()),
             scope,
@@ -4983,10 +6997,11 @@ fn validate_entry_for_apply(
     entry: &Entry<SessionRaftTypeConfig>,
     storage_identity: SessionConsensusIdentity,
     scope: &MembershipValidationScope,
+    admission: CommandAdmission,
 ) -> io::Result<()> {
     match &entry.payload {
         EntryPayload::Normal(command) => {
-            validate_command_for_log_with_cap(command, storage_identity, false)
+            validate_command_for_entry(command, storage_identity, entry.log_id.index, admission)
         }
         EntryPayload::Membership(membership) => validate_membership_for_log(
             &StoredMembership::new(Some(entry.log_id), membership.clone()),
@@ -4999,17 +7014,40 @@ fn validate_entry_for_apply(
 
 struct MembershipLogProjection {
     scope: MembershipValidationScope,
+    admission: CommandAdmission,
     membership: StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
     projected_requests: BTreeMap<[u8; 16], [u8; 32]>,
+    outcome_chain_validated: bool,
 }
 
 impl MembershipLogProjection {
     fn load(conn: &Connection, storage_identity: SessionConsensusIdentity) -> io::Result<Self> {
         Ok(Self {
             scope: read_membership_scope_sync(conn, storage_identity)?,
+            admission: read_command_admission_sync(conn, storage_identity)?,
             membership: read_membership_sync(conn, storage_identity)?,
             projected_requests: BTreeMap::new(),
+            outcome_chain_validated: false,
         })
+    }
+
+    fn read_validated_outcome(
+        &mut self,
+        conn: &Connection,
+        storage_identity: SessionConsensusIdentity,
+        request_id: SessionConsensusRequestId,
+    ) -> io::Result<Option<([u8; 32], SessionConsensusResponse)>> {
+        let outcome = read_outcome_sync(conn, storage_identity, request_id)?;
+        if outcome.is_some() && !self.outcome_chain_validated {
+            // A persisted row is about to influence follower projection.
+            // Validate the complete result-bearing chain once in this append
+            // transaction before allowing that row to suppress or bind the
+            // command. Unique requests never consult persisted authority and
+            // therefore avoid a quadratic full-history rescan.
+            validate_all_outcomes_sync(conn, storage_identity)?;
+            self.outcome_chain_validated = true;
+        }
+        Ok(outcome)
     }
 
     fn project(
@@ -5018,7 +7056,7 @@ impl MembershipLogProjection {
         entry: &Entry<SessionRaftTypeConfig>,
         storage_identity: SessionConsensusIdentity,
     ) -> io::Result<()> {
-        validate_entry_for_membership_scope(entry, storage_identity, &self.scope)?;
+        validate_entry_for_membership_scope(entry, storage_identity, &self.scope, self.admission)?;
         match &entry.payload {
             EntryPayload::Blank => Ok(()),
             EntryPayload::Membership(membership) => {
@@ -5080,6 +7118,39 @@ impl MembershipLogProjection {
                 Ok(())
             }
             EntryPayload::Normal(command) => {
+                if command.is_command_admission_cutover() {
+                    let digest = payload_digest(command)?;
+                    let request_id = *command.request_id.as_bytes();
+                    if !self.admission.cutover_committed {
+                        self.admission.strict_activation_index =
+                            entry.log_id.index.checked_add(1).ok_or_else(|| {
+                                invalid_data(
+                                    "session consensus admission activation index exhausted",
+                                )
+                            })?;
+                        self.admission.cutover_committed = true;
+                        self.projected_requests.insert(request_id, digest);
+                    } else if self.projected_requests.get(&request_id) == Some(&digest) {
+                        // A repeated marker in the same unapplied follower
+                        // batch is bound to the first projected marker.
+                    } else if let Some((persisted, response)) =
+                        self.read_validated_outcome(conn, storage_identity, command.request_id)?
+                    {
+                        if persisted != digest
+                            || !matches!(response.result, Ok(SessionMutationOutcome::Unit))
+                        {
+                            return Err(invalid_data(
+                                "projected session consensus admission cutover receipt conflicts",
+                            ));
+                        }
+                        self.projected_requests.insert(request_id, digest);
+                    } else {
+                        return Err(invalid_data(
+                            "projected session consensus admission cutover receipt is missing",
+                        ));
+                    }
+                    return Ok(());
+                }
                 let digest = payload_digest(command)?;
                 let request_id = *command.request_id.as_bytes();
                 if self.projected_requests.contains_key(&request_id) {
@@ -5091,7 +7162,7 @@ impl MembershipLogProjection {
                     return Ok(());
                 }
                 if let Some((persisted, _)) =
-                    read_outcome_sync(conn, storage_identity, command.request_id)?
+                    self.read_validated_outcome(conn, storage_identity, command.request_id)?
                 {
                     if persisted != digest {
                         return Ok(());
@@ -5514,7 +7585,7 @@ pub(crate) fn read_vote_sync(
         _ => {
             return Err(invalid_data(
                 "persisted session consensus vote node mismatch",
-            ))
+            ));
         }
     }
     Ok(Some(vote))
@@ -5803,10 +7874,18 @@ fn read_log_range_with_batch_sync(
         replay_unapplied_log_prefix_sync(conn, identity, start_u64, &mut projection)?;
     let mut entries = Vec::new();
     let sql = match (end, limit) {
-        (Some(_), Some(_)) => "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 AND log_index < ?2 ORDER BY log_index ASC LIMIT ?3",
-        (Some(_), None) => "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 AND log_index < ?2 ORDER BY log_index ASC",
-        (None, Some(_)) => "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 ORDER BY log_index ASC LIMIT ?3",
-        (None, None) => "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 ORDER BY log_index ASC",
+        (Some(_), Some(_)) => {
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 AND log_index < ?2 ORDER BY log_index ASC LIMIT ?3"
+        }
+        (Some(_), None) => {
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 AND log_index < ?2 ORDER BY log_index ASC"
+        }
+        (None, Some(_)) => {
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 ORDER BY log_index ASC LIMIT ?3"
+        }
+        (None, None) => {
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index >= ?1 ORDER BY log_index ASC"
+        }
     };
     let mut stmt = conn.prepare(sql).map_err(db_error)?;
     let mut rows = match (end, limit) {
@@ -5832,7 +7911,12 @@ fn read_log_range_with_batch_sync(
         if applied_index.is_none_or(|applied| entry.log_id.index > applied) {
             projection.project(conn, &entry, identity)?;
         } else {
-            validate_entry_for_membership_scope(&entry, identity, &projection.scope)?;
+            validate_entry_for_membership_scope(
+                &entry,
+                identity,
+                &projection.scope,
+                projection.admission,
+            )?;
         }
         let decision = batch
             .as_mut()
@@ -6424,7 +8508,7 @@ pub(crate) fn read_membership_sync(
     Ok(membership)
 }
 
-fn payload_digest(command: &SessionConsensusCommand) -> io::Result<[u8; 32]> {
+fn payload_digest(command: &DurableSessionConsensusCommand) -> io::Result<[u8; 32]> {
     // Idempotency binds caller-owned semantics, not leader-owned sequence,
     // predecessor, or logical-time metadata. A retry after a committed
     // response is lost will be proposed by a new leader with new metadata but
@@ -6447,6 +8531,101 @@ fn payload_digest(command: &SessionConsensusCommand) -> io::Result<[u8; 32]> {
     };
     let mut hasher = Sha256::new();
     hasher.update(OUTCOME_DIGEST_DOMAIN);
+    hasher.update(encoded);
+    Ok(hasher.finalize().into())
+}
+
+/// Bind a durable idempotency receipt to the semantic command commitment and
+/// the complete deterministic response, including all response metadata.
+/// Caller-origin and proposal-time remain outside `payload_digest`, preserving
+/// the established retry contract while preventing response swizzles.
+struct OutcomeReceiptDigestInput<'a> {
+    request_id: &'a SessionConsensusRequestId,
+    configuration_epoch: u64,
+    semantic_command_digest: &'a [u8; 32],
+    command: &'a DurableSessionConsensusCommand,
+    predecessor_sequence: u64,
+    predecessor_digest: &'a SessionConsensusEntryDigest,
+    predecessor_logical_time: Option<Timestamp>,
+    predecessor_receipt_digest: &'a [u8; 32],
+    raft_log_index: u64,
+    response: &'a SessionConsensusResponse,
+}
+
+macro_rules! outcome_receipt_digest_input {
+    (
+        $request_id:expr, $configuration_epoch:expr, $semantic_command_digest:expr,
+        $command:expr, $predecessor_sequence:expr, $predecessor_digest:expr,
+        $predecessor_logical_time:expr, $predecessor_receipt_digest:expr,
+        $raft_log_index:expr, $response:expr $(,)?
+    ) => {
+        outcome_receipt_digest(OutcomeReceiptDigestInput {
+            request_id: &$request_id,
+            configuration_epoch: $configuration_epoch,
+            semantic_command_digest: &$semantic_command_digest,
+            command: $command,
+            predecessor_sequence: $predecessor_sequence,
+            predecessor_digest: &$predecessor_digest,
+            predecessor_logical_time: $predecessor_logical_time,
+            predecessor_receipt_digest: &$predecessor_receipt_digest,
+            raft_log_index: $raft_log_index,
+            response: $response,
+        })
+    };
+}
+
+fn outcome_receipt_digest(input: OutcomeReceiptDigestInput<'_>) -> io::Result<[u8; 32]> {
+    let encoded = encode_json(&(
+        OUTCOME_RECEIPT_VERSION,
+        input.request_id,
+        input.configuration_epoch,
+        input.semantic_command_digest,
+        input.command,
+        input.predecessor_sequence,
+        input.predecessor_digest,
+        input.predecessor_logical_time,
+        input.predecessor_receipt_digest,
+        input.raft_log_index,
+        input.response,
+    ))?;
+    let mut hasher = Sha256::new();
+    hasher.update(OUTCOME_RECEIPT_DIGEST_DOMAIN);
+    hasher.update(encoded);
+    Ok(hasher.finalize().into())
+}
+
+/// Digest used only to verify the exact unpublished pre-chain candidate
+/// manifest before rebuilding it.  New rows must always use
+/// `outcome_receipt_digest`, which links the preceding result-bearing receipt.
+struct OutcomeReceiptDigestWithoutChainInput<'a> {
+    request_id: &'a SessionConsensusRequestId,
+    configuration_epoch: u64,
+    semantic_command_digest: &'a [u8; 32],
+    command: &'a DurableSessionConsensusCommand,
+    predecessor_sequence: u64,
+    predecessor_digest: &'a SessionConsensusEntryDigest,
+    predecessor_logical_time: Option<Timestamp>,
+    raft_log_index: u64,
+    response: &'a SessionConsensusResponse,
+}
+
+fn outcome_receipt_digest_without_receipt_chain(
+    input: OutcomeReceiptDigestWithoutChainInput<'_>,
+) -> io::Result<[u8; 32]> {
+    let encoded = encode_json(&(
+        OUTCOME_RECEIPT_VERSION,
+        input.request_id,
+        input.configuration_epoch,
+        input.semantic_command_digest,
+        input.command,
+        input.predecessor_sequence,
+        input.predecessor_digest,
+        input.predecessor_logical_time,
+        input.raft_log_index,
+        input.response,
+    ))?;
+    let mut hasher = Sha256::new();
+    hasher.update(OUTCOME_RECEIPT_DIGEST_DOMAIN);
     hasher.update(encoded);
     Ok(hasher.finalize().into())
 }
@@ -6518,7 +8697,59 @@ pub(crate) struct AppliedBatch {
     pub(crate) notifications: Vec<ReplicationEntry>,
 }
 
-fn read_machine_sync(
+pub(crate) fn read_machine_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<MachineState> {
+    let (epoch, sequence, digest, receipt_digest, logical_time, watch_sequence): (
+        i64,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Option<String>,
+        i64,
+    ) = conn
+        .query_row(
+            "SELECT configuration_epoch, application_sequence, last_digest, last_receipt_digest, logical_time, watch_sequence FROM consensus_machine WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .map_err(db_error)?;
+    validate_epoch(epoch, identity)?;
+    let digest: [u8; 32] = digest
+        .try_into()
+        .map_err(|_| invalid_data("persisted session consensus digest has invalid length"))?;
+    let logical_time = logical_time
+        .map(|value| {
+            ops::parse_persisted_rfc3339_normalized(&value)
+                .map_err(|_| invalid_data("persisted session consensus logical time is invalid"))
+        })
+        .transpose()?;
+    Ok((
+        checked_u64(sequence)?,
+        SessionConsensusEntryDigest::from_bytes(digest),
+        receipt_digest.try_into().map_err(|_| {
+            invalid_data("persisted session consensus receipt chain head is invalid")
+        })?,
+        logical_time,
+        checked_u64(watch_sequence)?,
+    ))
+}
+
+/// Read the frozen immediate-predecessor machine head without projecting a
+/// receipt-chain head that this layout never persisted. Callers may use its
+/// application and clock state only while converting the predecessor through
+/// the explicit recovery boundary.
+pub(crate) fn read_immediate_predecessor_machine_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
 ) -> io::Result<(u64, SessionConsensusEntryDigest, Option<Timestamp>, u64)> {
@@ -6532,17 +8763,26 @@ fn read_machine_sync(
         .query_row(
             "SELECT configuration_epoch, application_sequence, last_digest, logical_time, watch_sequence FROM consensus_machine WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .map_err(db_error)?;
     validate_epoch(epoch, identity)?;
     let digest: [u8; 32] = digest
         .try_into()
-        .map_err(|_| invalid_data("persisted session consensus digest has invalid length"))?;
+        .map_err(|_| invalid_data("persisted predecessor consensus digest has invalid length"))?;
     let logical_time = logical_time
         .map(|value| {
-            Timestamp::from_str(&value)
-                .map_err(|_| invalid_data("persisted session consensus logical time is invalid"))
+            ops::parse_persisted_rfc3339_normalized(&value).map_err(|_| {
+                invalid_data("persisted predecessor consensus logical time is invalid")
+            })
         })
         .transpose()?;
     Ok((
@@ -6558,7 +8798,7 @@ pub(crate) fn proposal_state_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
 ) -> io::Result<(u64, SessionConsensusEntryDigest, Option<Timestamp>)> {
-    let (sequence, digest, logical_time, _) = read_machine_sync(conn, identity)?;
+    let (sequence, digest, _, logical_time, _) = read_machine_sync(conn, identity)?;
     Ok((sequence, digest, logical_time))
 }
 
@@ -6566,7 +8806,7 @@ pub(crate) fn logical_time_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
 ) -> io::Result<Option<Timestamp>> {
-    read_machine_sync(conn, identity).map(|(_, _, logical_time, _)| logical_time)
+    read_machine_sync(conn, identity).map(|(_, _, _, logical_time, _)| logical_time)
 }
 
 pub(crate) fn validate_consensus_outcome_records(
@@ -6584,6 +8824,214 @@ pub(crate) fn validate_consensus_outcome_records(
     }
 }
 
+/// Reject response families that are syntactically valid but cannot have been
+/// produced by the retained command. This runs before idempotency replay and
+/// while validating reopened or incoming snapshot state.
+fn validate_response_for_command(
+    command: &DurableSessionConsensusCommand,
+    response: &SessionConsensusResponse,
+) -> io::Result<()> {
+    if response.sequence == 0 || response.digest.is_none() {
+        return Err(invalid_data(
+            "persisted session consensus outcome metadata is invalid",
+        ));
+    }
+    let logical_time = response
+        .logical_time
+        .ok_or_else(|| invalid_data("persisted session consensus outcome metadata is invalid"))?;
+    let authorized = matches!(&command.intent, SessionMutationIntent::Authorized { .. });
+    let intent = match &command.intent {
+        SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
+        intent => intent,
+    };
+    match &response.result {
+        Err(StoreError::TopologyAuthorityRevoked) if authorized => Ok(()),
+        Err(error)
+            if is_deterministic_intent_rejection(error)
+                && response_error_matches_command(intent, error) =>
+        {
+            Ok(())
+        }
+        Err(_) => Err(invalid_data(
+            "persisted session consensus outcome error is invalid",
+        )),
+        Ok(outcome) => {
+            let matches = match (intent, outcome) {
+                (
+                    SessionMutationIntent::AdvanceLogicalTime
+                    | SessionMutationIntent::BindConsumerRequest { .. }
+                    | SessionMutationIntent::DeleteFenced(_)
+                    | SessionMutationIntent::RefreshTtl { .. }
+                    | SessionMutationIntent::ReleaseLease(_)
+                    | SessionMutationIntent::FinalizeOperatorRecovery { .. }
+                    | SessionMutationIntent::PrepareTopologyTransition { .. }
+                    | SessionMutationIntent::MarkTopologyLearnersReady { .. }
+                    | SessionMutationIntent::FenceTopologyAuthority { .. }
+                    | SessionMutationIntent::AbortTopologyTransition { .. }
+                    | SessionMutationIntent::FinalizeTopologyTransition { .. },
+                    SessionMutationOutcome::Unit,
+                ) => true,
+                (
+                    SessionMutationIntent::CompareAndSet(_),
+                    SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Success),
+                ) => true,
+                (
+                    SessionMutationIntent::CompareAndSet(command),
+                    SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Conflict {
+                        current,
+                    }),
+                ) => current
+                    .as_ref()
+                    .is_none_or(|record| record.key == command.key),
+                (
+                    SessionMutationIntent::AcquireLease { key, owner, ttl },
+                    SessionMutationOutcome::Lease(lease),
+                ) => {
+                    lease.key() == key
+                        && lease.owner() == owner
+                        && lease.fence().get() > 0
+                        && lease.credential_id() > 0
+                        && lease.acquired_at() == logical_time
+                        && crate::ttl::checked_session_deadline(logical_time, *ttl).ok()
+                            == Some(lease.expires_at())
+                }
+                (
+                    SessionMutationIntent::RenewLease {
+                        lease: expected,
+                        ttl,
+                    },
+                    SessionMutationOutcome::Lease(lease),
+                ) => {
+                    lease.key() == expected.key()
+                        && lease.owner() == expected.owner()
+                        && lease.fence() == expected.fence()
+                        && lease.credential_id() == expected.credential_id()
+                        && lease.acquired_at() == expected.acquired_at()
+                        && crate::ttl::checked_session_deadline(logical_time, *ttl).ok()
+                            == Some(lease.expires_at())
+                }
+                (
+                    SessionMutationIntent::ReadConsumerRecord { key },
+                    SessionMutationOutcome::ConsumerRecord(record),
+                ) => record.as_ref().is_none_or(|record| &record.key == key),
+                _ => false,
+            };
+            matches.then_some(()).ok_or_else(|| {
+                invalid_data("persisted session consensus outcome does not match command")
+            })
+        }
+    }
+}
+
+/// Constrain deterministic error outcomes to intent families. This prevents a
+/// syntactically valid error from another command family from suppressing
+/// execution during duplicate replay, while retaining historical outcomes
+/// whose exact cause depends on predecessor state.
+fn response_error_matches_command(intent: &SessionMutationIntent, error: &StoreError) -> bool {
+    match intent {
+        SessionMutationIntent::AdvanceLogicalTime
+        | SessionMutationIntent::BindConsumerRequest { .. } => false,
+        SessionMutationIntent::ReadConsumerRecord { .. } => {
+            matches!(error, StoreError::PayloadTooLarge { .. })
+        }
+        SessionMutationIntent::CompareAndSet(_) => matches!(
+            error,
+            StoreError::StaleFence
+                | StoreError::LeaseExpired
+                | StoreError::InvalidKey(_)
+                | StoreError::InvalidRecordExpiry
+                | StoreError::PayloadTooLarge { .. }
+        ),
+        SessionMutationIntent::DeleteFenced(_) => {
+            matches!(error, StoreError::StaleFence | StoreError::LeaseExpired)
+        }
+        SessionMutationIntent::RefreshTtl { .. } => matches!(
+            error,
+            StoreError::StaleFence
+                | StoreError::LeaseExpired
+                | StoreError::NotFound
+                | StoreError::InvalidSessionTtl
+        ),
+        SessionMutationIntent::AcquireLease { .. } => {
+            matches!(error, StoreError::LeaseHeld | StoreError::InvalidSessionTtl)
+        }
+        SessionMutationIntent::RenewLease { .. } => matches!(
+            error,
+            StoreError::LeaseHeld
+                | StoreError::LeaseExpired
+                | StoreError::StaleFence
+                | StoreError::NotFound
+                | StoreError::InvalidSessionTtl
+        ),
+        SessionMutationIntent::ReleaseLease(_) => matches!(
+            error,
+            StoreError::LeaseHeld
+                | StoreError::LeaseExpired
+                | StoreError::StaleFence
+                | StoreError::NotFound
+        ),
+        SessionMutationIntent::FinalizeOperatorRecovery { .. } => matches!(
+            error,
+            StoreError::InvalidKey(reason) if reason == "operator_recovery_epoch_rejected"
+        ),
+        SessionMutationIntent::PrepareTopologyTransition { .. }
+        | SessionMutationIntent::MarkTopologyLearnersReady { .. }
+        | SessionMutationIntent::FenceTopologyAuthority { .. }
+        | SessionMutationIntent::AbortTopologyTransition { .. }
+        | SessionMutationIntent::FinalizeTopologyTransition { .. } => matches!(
+            error,
+            StoreError::InvalidKey(reason) if reason == "topology_transition_rejected"
+        ),
+        SessionMutationIntent::Authorized { .. } => false,
+    }
+}
+
+/// A self-consistent receipt is not allowed to contradict the immutable Raft
+/// command while that command is still retained. Compacted snapshots may no
+/// longer carry the corresponding log row, so absence alone is not evidence
+/// that can reconstruct or reject the receipt.
+fn validate_outcome_against_retained_log_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    raft_log_index: u64,
+    command: &DurableSessionConsensusCommand,
+) -> io::Result<()> {
+    let row = conn
+        .query_row(
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index = ?1",
+            [checked_i64(raft_log_index)?],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((epoch, term, index, encoded)) = row else {
+        return Ok(());
+    };
+    validate_epoch(epoch, identity)?;
+    let entry: Entry<SessionRaftTypeConfig> = decode_json(&encoded)?;
+    if checked_u64(term)? != entry.log_id.leader_id.term
+        || checked_u64(index)? != entry.log_id.index
+        || entry.log_id.index != raft_log_index
+    {
+        return Err(invalid_data(
+            "persisted session consensus outcome retained log row is invalid",
+        ));
+    }
+    match entry.payload {
+        EntryPayload::Normal(retained) if retained == *command => Ok(()),
+        _ => Err(invalid_data(
+            "persisted session consensus outcome contradicts retained command",
+        )),
+    }
+}
+
 fn read_outcome_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -6591,31 +9039,362 @@ fn read_outcome_sync(
 ) -> io::Result<Option<([u8; 32], SessionConsensusResponse)>> {
     let row = conn
         .query_row(
-            "SELECT configuration_epoch, payload_digest, response_json FROM consensus_request_outcomes WHERE request_id = ?1",
+            "SELECT configuration_epoch, payload_digest, command_json, predecessor_sequence, predecessor_digest, predecessor_logical_time, predecessor_receipt_digest, raft_log_index, response_json, receipt_version, receipt_digest FROM consensus_request_outcomes WHERE request_id = ?1",
             [request_id.as_bytes().as_slice()],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Vec<u8>>(10)?,
                 ))
             },
         )
         .optional()
         .map_err(db_error)?;
-    let Some((epoch, digest, response)) = row else {
+    let Some((
+        epoch,
+        digest,
+        command,
+        predecessor_sequence,
+        predecessor_digest,
+        predecessor_logical_time,
+        predecessor_receipt_digest,
+        raft_log_index,
+        response,
+        receipt_version,
+        receipt_digest,
+    )) = row
+    else {
         return Ok(None);
     };
     validate_epoch(epoch, identity)?;
+    if receipt_version != OUTCOME_RECEIPT_VERSION {
+        return Err(invalid_data(
+            "persisted session consensus outcome receipt version is invalid",
+        ));
+    }
     let digest = digest.try_into().map_err(|_| {
         invalid_data("persisted session consensus request digest has invalid length")
     })?;
+    let command: DurableSessionConsensusCommand = decode_json(&command)?;
+    if command.request_id != request_id
+        || command.identity != identity
+        || payload_digest(&command)? != digest
+    {
+        return Err(invalid_data(
+            "persisted session consensus outcome command is invalid",
+        ));
+    }
     let response: SessionConsensusResponse = decode_json(&response)?;
+    let predecessor_sequence = checked_u64(predecessor_sequence)?;
+    let predecessor_digest =
+        SessionConsensusEntryDigest::from_bytes(predecessor_digest.try_into().map_err(|_| {
+            invalid_data("persisted session consensus predecessor digest has invalid length")
+        })?);
+    let predecessor_logical_time = predecessor_logical_time
+        .map(|value| {
+            ops::parse_persisted_rfc3339_normalized(&value).map_err(|_| {
+                invalid_data("persisted session consensus predecessor logical time is invalid")
+            })
+        })
+        .transpose()?;
+    let predecessor_receipt_digest: [u8; 32] =
+        predecessor_receipt_digest.try_into().map_err(|_| {
+            invalid_data(
+                "persisted session consensus predecessor receipt digest has invalid length",
+            )
+        })?;
+    let raft_log_index = checked_u64(raft_log_index)?;
+    validate_outcome_against_retained_log_sync(conn, identity, raft_log_index, &command)?;
+    validate_persisted_command_admission(
+        &command,
+        identity,
+        raft_log_index,
+        read_command_admission_sync(conn, identity)?,
+    )?;
+    let effective_time = predecessor_logical_time.map_or(command.logical_time, |previous| {
+        previous.max(command.logical_time)
+    });
+    if response.sequence
+        != predecessor_sequence
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("persisted session consensus sequence exhausted"))?
+        || response.logical_time != Some(effective_time)
+        || response.raft_log_index != raft_log_index
+        || response.digest
+            != Some(
+                command
+                    .calculate_applied_result_digest(
+                        response.sequence,
+                        predecessor_digest,
+                        effective_time,
+                        raft_log_index,
+                        &response.result,
+                    )
+                    .map_err(|_| {
+                        invalid_data("persisted session consensus outcome digest is invalid")
+                    })?,
+            )
+    {
+        return Err(invalid_data(
+            "persisted session consensus outcome metadata is invalid",
+        ));
+    }
+    validate_response_for_command(&command, &response)?;
     if let Ok(outcome) = &response.result {
         validate_consensus_outcome_records(outcome)
             .map_err(|_| invalid_data("persisted session consensus outcome record is invalid"))?;
     }
+    let receipt_digest: [u8; 32] = receipt_digest.try_into().map_err(|_| {
+        invalid_data("persisted session consensus outcome receipt digest has invalid length")
+    })?;
+    if receipt_digest
+        != outcome_receipt_digest_input!(
+            request_id,
+            checked_positive_u64(epoch)?,
+            digest,
+            &command,
+            predecessor_sequence,
+            predecessor_digest,
+            predecessor_logical_time,
+            predecessor_receipt_digest,
+            raft_log_index,
+            &response,
+        )?
+    {
+        return Err(invalid_data(
+            "persisted session consensus outcome receipt is invalid",
+        ));
+    }
     Ok(Some((digest, response)))
+}
+
+fn validate_all_outcomes_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<()> {
+    let admission = read_command_admission_sync(conn, identity)?;
+    let recovery = read_operator_recovery_sync(conn, identity)?;
+    let applied_index = read_applied_sync(conn, identity)?.map(|log_id| log_id.index);
+    let mut statement = conn
+        .prepare("SELECT request_id FROM consensus_request_outcomes")
+        .map_err(db_error)?;
+    let request_ids = statement
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(db_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error)?;
+    drop(statement);
+    let mut responses = Vec::with_capacity(request_ids.len());
+    for request_id in request_ids {
+        let request_id = request_id
+            .try_into()
+            .map(SessionConsensusRequestId::from_bytes)
+            .map_err(|_| invalid_data("persisted session consensus request ID is invalid"))?;
+        if let Some((_, response)) = read_outcome_sync(conn, identity, request_id)? {
+            let (
+                predecessor_sequence,
+                predecessor_digest,
+                predecessor_logical_time,
+                predecessor_receipt_digest,
+                receipt_digest,
+            ): (i64, Vec<u8>, Option<String>, Vec<u8>, Vec<u8>) = conn
+                .query_row(
+                    "SELECT predecessor_sequence, predecessor_digest, predecessor_logical_time, predecessor_receipt_digest, receipt_digest FROM consensus_request_outcomes WHERE request_id = ?1",
+                    [request_id.as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .map_err(db_error)?;
+            let predecessor_digest = SessionConsensusEntryDigest::from_bytes(
+                predecessor_digest.try_into().map_err(|_| {
+                    invalid_data(
+                        "persisted session consensus predecessor digest has invalid length",
+                    )
+                })?,
+            );
+            let predecessor_logical_time = predecessor_logical_time
+                .map(|value| {
+                    ops::parse_persisted_rfc3339_normalized(&value).map_err(|_| {
+                        invalid_data(
+                            "persisted session consensus predecessor logical time is invalid",
+                        )
+                    })
+                })
+                .transpose()?;
+            let predecessor_receipt_digest: [u8; 32] =
+                predecessor_receipt_digest.try_into().map_err(|_| {
+                    invalid_data(
+                        "persisted session consensus predecessor receipt digest has invalid length",
+                    )
+                })?;
+            let receipt_digest = receipt_digest.try_into().map_err(|_| {
+                invalid_data(
+                    "persisted session consensus outcome receipt digest has invalid length",
+                )
+            })?;
+            responses.push((
+                request_id,
+                response,
+                checked_u64(predecessor_sequence)?,
+                predecessor_digest,
+                predecessor_logical_time,
+                predecessor_receipt_digest,
+                receipt_digest,
+            ));
+        }
+    }
+    responses.sort_by_key(|(_, response, ..)| response.sequence);
+    let (machine_sequence, machine_digest, machine_receipt_digest, machine_time, _) =
+        read_machine_sync(conn, identity)?;
+    // An explicitly operator-authorized legacy reset does not synthesize a
+    // command/result receipt for the discarded replay cache.  Its fresh
+    // chain instead starts at sequence zero from the sealed recovery plan
+    // digest. A later verified-majority repair leaves the existing receipt
+    // root in the finalized plan; its pending plan is a recovery fence, not
+    // a replacement receipt root. Every normal v2 chain starts at GENESIS.
+    let recovery_root = outcome_chain_recovery_root(recovery);
+    let (root_digest, root_time) = match responses.first() {
+        Some((_, _, predecessor_sequence, predecessor_digest, predecessor_time, _, _))
+            if *predecessor_sequence == 0
+                && *predecessor_digest == SessionConsensusEntryDigest::GENESIS
+                && predecessor_time.is_none() =>
+        {
+            (SessionConsensusEntryDigest::GENESIS, None)
+        }
+        Some((_, _, predecessor_sequence, predecessor_digest, predecessor_time, _, _))
+            if *predecessor_sequence == 0
+                && recovery_root == Some(*predecessor_digest.as_bytes()) =>
+        {
+            (*predecessor_digest, *predecessor_time)
+        }
+        Some(_) => {
+            return Err(invalid_data(
+                "persisted session consensus outcome root is invalid",
+            ));
+        }
+        None if machine_sequence == 0
+            && machine_digest == SessionConsensusEntryDigest::GENESIS
+            && machine_time.is_none() =>
+        {
+            (SessionConsensusEntryDigest::GENESIS, None)
+        }
+        None if machine_sequence == 0 && recovery_root == Some(*machine_digest.as_bytes()) => {
+            (machine_digest, machine_time)
+        }
+        None => {
+            return Err(invalid_data(
+                "persisted session consensus empty outcome chain head is invalid",
+            ));
+        }
+    };
+    if u64::try_from(responses.len())
+        .map_err(|_| invalid_data("persisted session consensus outcomes exceed integer range"))?
+        != machine_sequence
+    {
+        return Err(invalid_data(
+            "persisted session consensus outcome chain is incomplete",
+        ));
+    }
+    let mut previous_raft_log_index = None;
+    let mut found_cutover_receipt = false;
+    for (
+        position,
+        (
+            request_id,
+            response,
+            predecessor_sequence,
+            predecessor_digest,
+            predecessor_time,
+            predecessor_receipt_digest,
+            _,
+        ),
+    ) in responses.iter().enumerate()
+    {
+        let expected_sequence = u64::try_from(position)
+            .map_err(|_| invalid_data("persisted session consensus outcomes exceed integer range"))?
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("persisted session consensus sequence exhausted"))?;
+        let (expected_predecessor_digest, expected_predecessor_time, expected_receipt_digest) =
+            if position == 0 {
+                (root_digest, root_time, OUTCOME_RECEIPT_CHAIN_GENESIS)
+            } else {
+                let previous = &responses[position - 1].1;
+                (
+                    previous.digest.ok_or_else(|| {
+                        invalid_data("persisted session consensus outcome metadata is invalid")
+                    })?,
+                    previous.logical_time,
+                    responses[position - 1].6,
+                )
+            };
+        if response.sequence != expected_sequence
+            || *predecessor_sequence != expected_sequence - 1
+            || *predecessor_digest != expected_predecessor_digest
+            || *predecessor_time != expected_predecessor_time
+            || *predecessor_receipt_digest != expected_receipt_digest
+            || previous_raft_log_index.is_some_and(|previous| response.raft_log_index <= previous)
+            || applied_index.is_none_or(|applied| response.raft_log_index > applied)
+        {
+            return Err(invalid_data(
+                "persisted session consensus outcome chain is invalid",
+            ));
+        }
+        previous_raft_log_index = Some(response.raft_log_index);
+        if admission.cutover_committed
+            && request_id.as_bytes()
+                == &crate::consensus::SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID
+            && response.raft_log_index.checked_add(1) == Some(admission.strict_activation_index)
+            && matches!(response.result, Ok(SessionMutationOutcome::Unit))
+        {
+            found_cutover_receipt = true;
+        }
+    }
+    if let Some((_, last, _, _, _, _, last_receipt_digest)) = responses.last() {
+        if last.digest != Some(machine_digest) || last.logical_time != machine_time {
+            return Err(invalid_data(
+                "persisted session consensus outcome chain head is invalid",
+            ));
+        }
+        if *last_receipt_digest != machine_receipt_digest {
+            return Err(invalid_data(
+                "persisted session consensus receipt chain head is invalid",
+            ));
+        }
+    } else if machine_sequence != 0
+        || machine_digest != root_digest
+        || machine_receipt_digest != OUTCOME_RECEIPT_CHAIN_GENESIS
+        || machine_time != root_time
+    {
+        return Err(invalid_data(
+            "persisted session consensus empty outcome chain head is invalid",
+        ));
+    }
+    if admission.cutover_committed && !found_cutover_receipt {
+        return Err(invalid_data(
+            "persisted session consensus admission cutover receipt is missing",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the admission boundary and the complete command/outcome receipt
+/// chain without mutating the database. Operator-recovery inspection uses the
+/// same semantic authority as reopen and snapshot admission; hashing a
+/// self-consistent but forged row is not sufficient evidence.
+pub(crate) fn validate_recovery_receipts_and_admission_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<()> {
+    read_command_admission_sync(conn, identity)?;
+    validate_all_outcomes_sync(conn, identity)
 }
 
 fn validate_membership_ids(
@@ -7083,6 +9862,7 @@ pub(crate) fn apply_entries_with_authority_sync(
     let mut machine = read_machine_sync(&tx, identity)?;
     let mut responses = Vec::with_capacity(entries.len());
     let mut notifications = Vec::new();
+    let mut outcome_chain_validated = false;
 
     for entry in entries {
         if authority_profile == ConsensusAuthorityProfile::FixedImmutable
@@ -7096,7 +9876,8 @@ pub(crate) fn apply_entries_with_authority_sync(
         // have staged, fenced, or aborted a transition. Validate each entry
         // against the scope visible at its exact apply position.
         let scope = read_membership_scope_sync(&tx, identity)?;
-        validate_entry_for_apply(&entry, identity, &scope)?;
+        let admission = read_command_admission_sync(&tx, identity)?;
+        validate_entry_for_apply(&entry, identity, &scope, admission)?;
         let expected_index = last_applied
             .as_ref()
             .map(|log_id| {
@@ -7134,10 +9915,19 @@ pub(crate) fn apply_entries_with_authority_sync(
                 }
             }
             EntryPayload::Normal(command) => {
+                let admission_cutover = command.is_command_admission_cutover();
                 let digest = payload_digest(&command)?;
-                if let Some((persisted_digest, persisted_response)) =
-                    read_outcome_sync(&tx, identity, command.request_id)?
-                {
+                let persisted_outcome = read_outcome_sync(&tx, identity, command.request_id)?;
+                if persisted_outcome.is_some() && !outcome_chain_validated {
+                    // This receipt is about to suppress a committed command.
+                    // Validate the complete chain once in this apply
+                    // transaction before trusting it. New request IDs do not
+                    // consume persisted outcome authority and must not rescan
+                    // the entire growing history on every application.
+                    validate_all_outcomes_sync(&tx, identity)?;
+                    outcome_chain_validated = true;
+                }
+                if let Some((persisted_digest, persisted_response)) = persisted_outcome {
                     if persisted_digest != digest {
                         // A caller can reuse an opaque durable request ID with
                         // another payload. That must be a closed domain
@@ -7152,7 +9942,7 @@ pub(crate) fn apply_entries_with_authority_sync(
                             // preproposal rejection.
                             sequence: machine.0,
                             digest: Some(machine.1),
-                            logical_time: machine.2,
+                            logical_time: machine.3,
                             raft_log_index: entry.log_id.index,
                         }
                     } else {
@@ -7162,13 +9952,9 @@ pub(crate) fn apply_entries_with_authority_sync(
                     let sequence = machine.0.checked_add(1).ok_or_else(|| {
                         invalid_data("session consensus application sequence exhausted")
                     })?;
-                    let logical_time = machine.2.map_or(command.logical_time, |last_time| {
+                    let logical_time = machine.3.map_or(command.logical_time, |last_time| {
                         last_time.max(command.logical_time)
                     });
-                    let command_digest = command
-                        .calculate_applied_digest(sequence, machine.1, logical_time)
-                        .map_err(|_| invalid_data("session consensus command digest failed"))?;
-
                     let (result, replication) = {
                         let mut savepoint = tx.savepoint().map_err(db_error)?;
                         match execute_intent_sync(
@@ -7194,6 +9980,16 @@ pub(crate) fn apply_entries_with_authority_sync(
                         }
                     };
 
+                    let command_digest = command
+                        .calculate_applied_result_digest(
+                            sequence,
+                            machine.1,
+                            logical_time,
+                            entry.log_id.index,
+                            &result,
+                        )
+                        .map_err(|_| invalid_data("session consensus command digest failed"))?;
+
                     let response = SessionConsensusResponse {
                         result,
                         sequence,
@@ -7201,22 +9997,60 @@ pub(crate) fn apply_entries_with_authority_sync(
                         logical_time: Some(logical_time),
                         raft_log_index: entry.log_id.index,
                     };
+                    let receipt = outcome_receipt_digest_input!(
+                        command.request_id,
+                        identity.configuration_epoch().get(),
+                        digest,
+                        &command,
+                        machine.0,
+                        machine.1,
+                        machine.3,
+                        machine.2,
+                        entry.log_id.index,
+                        &response,
+                    )?;
                     tx.execute(
-                        "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, response_json) VALUES (?1, ?2, ?3, ?4)",
+                        "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, command_json, predecessor_sequence, predecessor_digest, predecessor_logical_time, predecessor_receipt_digest, raft_log_index, response_json, receipt_version, receipt_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                         params![
                             command.request_id.as_bytes().as_slice(),
                             epoch_i64(identity)?,
                             digest.as_slice(),
+                            encode_json(&command)?,
+                            checked_i64(machine.0)?,
+                            machine.1.as_bytes().as_slice(),
+                            machine.3.map(ops::format_rfc3339_normalized),
+                            machine.2.as_slice(),
+                            checked_i64(entry.log_id.index)?,
                             encode_json(&response)?,
+                            OUTCOME_RECEIPT_VERSION,
+                            receipt.as_slice(),
                         ],
                     )
                     .map_err(db_error)?;
+                    if admission_cutover {
+                        let changed = tx
+                            .execute(
+                                "UPDATE consensus_command_admission SET strict_activation_index = ?1, cutover_committed = 1 WHERE singleton = 1 AND configuration_epoch = ?2 AND admission_revision = ?3 AND cutover_committed = 0",
+                                params![
+                                    checked_i64(entry.log_id.index.checked_add(1).ok_or_else(|| invalid_data("session consensus admission activation index exhausted"))?)?,
+                                    epoch_i64(identity)?,
+                                    COMMAND_ADMISSION_REVISION,
+                                ],
+                            )
+                            .map_err(db_error)?;
+                        if changed != 1 {
+                            return Err(invalid_data(
+                                "session consensus command admission cutover is invalid",
+                            ));
+                        }
+                    }
                     let changed = tx
                         .execute(
-                            "UPDATE consensus_machine SET application_sequence = ?1, last_digest = ?2, logical_time = ?3 WHERE singleton = 1 AND configuration_epoch = ?4",
+                            "UPDATE consensus_machine SET application_sequence = ?1, last_digest = ?2, last_receipt_digest = ?3, logical_time = ?4 WHERE singleton = 1 AND configuration_epoch = ?5",
                             params![
                                 checked_positive_i64(sequence)?,
                                 command_digest.as_bytes().as_slice(),
+                                receipt.as_slice(),
                                 ops::format_rfc3339_normalized(logical_time),
                                 epoch_i64(identity)?,
                             ],
@@ -7227,15 +10061,16 @@ pub(crate) fn apply_entries_with_authority_sync(
                     }
                     machine.0 = sequence;
                     machine.1 = command_digest;
-                    machine.2 = Some(logical_time);
+                    machine.2 = receipt;
+                    machine.3 = Some(logical_time);
                     if let Some(replication) = replication {
-                        machine.3 = machine.3.checked_add(1).ok_or_else(|| {
+                        machine.4 = machine.4.checked_add(1).ok_or_else(|| {
                             invalid_data("session consensus watch sequence exhausted")
                         })?;
                         notifications.push(store_replication_notification_sync(
                             &tx,
                             identity,
-                            machine.3,
+                            machine.4,
                             command.request_id,
                             replication,
                             logical_time,
@@ -7604,7 +10439,67 @@ fn fixed_uniform_membership_matches(
         && nodes == *expected_members
 }
 
+fn validate_record_expiry_bounds_at_sync(
+    conn: &Connection,
+    reference: Timestamp,
+) -> io::Result<()> {
+    let mut statement = conn
+        .prepare("SELECT state_class, expires_at FROM session_records")
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(db_error)?;
+    for row in rows {
+        let (state_class, expires_at) = row.map_err(db_error)?;
+        let state_class = match state_class.as_str() {
+            "authoritative-session" => crate::model::StateClass::AuthoritativeSession,
+            "dataplane-lookup" => crate::model::StateClass::DataplaneLookup,
+            "replicated-dr" => crate::model::StateClass::ReplicatedDr,
+            "telemetry-derived" => crate::model::StateClass::TelemetryDerived,
+            "ephemeral-procedure" => crate::model::StateClass::EphemeralProcedure,
+            _ => {
+                return Err(invalid_data(
+                    "session consensus snapshot state class is invalid",
+                ));
+            }
+        };
+        let expires_at = expires_at
+            .map(|value| ops::parse_persisted_rfc3339_normalized(&value))
+            .transpose()
+            .map_err(|_| invalid_data("session consensus snapshot record expiry is invalid"))?;
+        crate::ttl::validate_record_expiry_at(expires_at, state_class, reference)
+            .map_err(|_| invalid_data("session consensus snapshot record expiry is invalid"))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
+    // A consensus-owned state machine carries its immutable time authority in
+    // the machine row.  Do not substitute a reopen-time clock here: doing so
+    // would make identical durable state admit differently on different
+    // nodes.  Legacy claim performs its corresponding validation against the
+    // final persisted replication timestamp before installing this row.
+    let consensus_machine_present = table_exists(conn, "consensus_machine").map_err(db_error)?;
+    let expiry_reference = if consensus_machine_present {
+        let logical_time: Option<String> = conn
+            .query_row(
+                "SELECT logical_time FROM consensus_machine WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        logical_time
+            .map(|value| {
+                ops::parse_persisted_rfc3339_normalized(&value).map_err(|_| {
+                    invalid_data("persisted session consensus logical time is invalid")
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let invalid_stable_id = conn
         .query_row(
             r#"
@@ -7692,6 +10587,16 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
             }
             _ => invalid_data("session consensus snapshot envelope is invalid"),
         })?;
+        crate::ttl::validate_stored_record_expiry_profile(&record)
+            .map_err(|_| invalid_data("session consensus snapshot record expiry is invalid"))?;
+        if let Some(reference) = expiry_reference {
+            crate::ttl::validate_stored_record_expiry_at(&record, reference)
+                .map_err(|_| invalid_data("session consensus snapshot record expiry is invalid"))?;
+        } else if consensus_machine_present && record.expires_at.is_some() {
+            return Err(invalid_data(
+                "session consensus finite record expiry has no logical time authority",
+            ));
+        }
     }
 
     validate_lease_state_sync(conn)?;
@@ -7705,7 +10610,8 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
                         AND length(CAST(tx_id AS BLOB)) BETWEEN ?1 AND ?2
                        THEN tx_id
                    END,
-                   entry_json
+                   entry_json,
+                   timestamp
             FROM session_replication_log
             ORDER BY sequence ASC
             "#,
@@ -7719,6 +10625,7 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
                     row.get::<_, i64>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
@@ -7727,7 +10634,7 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
         .checked_add(1)
         .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
     for row in rows {
-        let (stored_sequence, stored_tx_id, encoded) = row.map_err(db_error)?;
+        let (stored_sequence, stored_tx_id, encoded, stored_timestamp) = row.map_err(db_error)?;
         let stored_sequence = checked_u64(stored_sequence)?;
         let stored_tx_id: ReplicationTxId = stored_tx_id
             .ok_or_else(|| invalid_data("persisted session replication transaction ID is invalid"))?
@@ -7743,6 +10650,13 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
         if entry.tx_id != stored_tx_id {
             return Err(invalid_data(
                 "persisted session replication transaction ID is inconsistent",
+            ));
+        }
+        let timestamp = ops::parse_persisted_rfc3339_normalized(&stored_timestamp)
+            .map_err(|_| invalid_data("persisted session replication timestamp is invalid"))?;
+        if entry.timestamp != timestamp {
+            return Err(invalid_data(
+                "persisted session replication timestamp is inconsistent",
             ));
         }
         entry
@@ -7824,8 +10738,8 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
         let credential = checked_positive_u64(credential).map_err(|_| invalid_lease_state())?;
         let fence = checked_positive_u64(fence).map_err(|_| invalid_lease_state())?;
         ops::persisted_owner_id(owner).map_err(|_| invalid_lease_state())?;
-        let guard_expires_at =
-            Timestamp::from_str(&guard_expires_at).map_err(|_| invalid_lease_state())?;
+        let guard_expires_at = ops::parse_persisted_rfc3339_normalized(&guard_expires_at)
+            .map_err(|_| invalid_lease_state())?;
         let guard_expires_at_unix_ms =
             ops::timestamp_unix_millis(guard_expires_at).map_err(|_| invalid_lease_state())?;
         if (active == 1 && expires_at_unix_ms != guard_expires_at_unix_ms)
@@ -7871,6 +10785,16 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
                  AND fence.key_type = record.key_type
                  AND fence.stable_id = record.stable_id
                 WHERE fence.fence IS NULL OR fence.fence < record.fence
+                UNION ALL
+                SELECT 1
+                FROM session_records AS record
+                JOIN leases AS lease
+                  ON lease.tenant = record.tenant
+                 AND lease.nf_kind = record.nf_kind
+                 AND lease.key_type = record.key_type
+                 AND lease.stable_id = record.stable_id
+                WHERE record.fence = lease.fence
+                  AND record.owner != lease.owner
                 UNION ALL
                 SELECT 1
                 FROM leases AS lease
@@ -7948,6 +10872,18 @@ pub(crate) fn validate_sealed_replication_op(root: &ReplicationOp) -> io::Result
     Ok(())
 }
 
+/// Validate every durable source authority before copying a snapshot. In
+/// particular, retained Raft entries are still available at this point to
+/// bind each replay receipt to its immutable command; after compaction their
+/// absence is intentionally not treated as reconstructible evidence.
+fn validate_snapshot_source_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<()> {
+    validate_sealed_state_sync(conn)?;
+    validate_recovery_receipts_and_admission_sync(conn, identity)
+}
+
 #[allow(dead_code)]
 pub(crate) fn build_snapshot_database_sync(
     conn: &Connection,
@@ -7955,7 +10891,7 @@ pub(crate) fn build_snapshot_database_sync(
     path: &std::path::Path,
 ) -> io::Result<ConsensusAppliedMembership> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
-    validate_sealed_state_sync(&tx)?;
+    validate_snapshot_source_sync(&tx, identity)?;
     let destination = create_pinned_snapshot_database(path)?;
     let (snapshot, _) = build_snapshot_database_from_pinned_sync(&tx, identity, destination)?;
     tx.commit().map_err(db_error)?;
@@ -7983,12 +10919,13 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
         expected_bindings,
         fixed_placement_policy,
     )?;
-    validate_sealed_state_sync(&tx)?;
+    validate_snapshot_source_sync(&tx, identity)?;
     // Do not create even an empty snapshot artifact until the durable fixed
-    // authority check has succeeded under the source read transaction.
+    // authority and retained-log receipt checks have succeeded under the
+    // source read transaction.
     let destination = create_pinned_snapshot_database(path)?;
     let (snapshot, destination) =
-        capture_and_finalize_snapshot_database_sync(&tx, identity, destination)?;
+        capture_and_finalize_validated_snapshot_database_sync(&tx, identity, destination)?;
     tx.commit().map_err(db_error)?;
     Ok((snapshot, destination))
 }
@@ -8026,7 +10963,7 @@ fn build_snapshot_database_from_pinned_sync(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
 )> {
-    capture_and_finalize_snapshot_database_sync(conn, identity, destination)
+    capture_and_finalize_validated_snapshot_database_sync(conn, identity, destination)
 }
 
 #[allow(dead_code)]
@@ -8186,10 +11123,10 @@ fn verify_pinned_snapshot_descriptor(
     ))
 }
 
-/// Capture the source image while the caller holds the SQLite transaction that
-/// admitted it. The fixed-authority validation and backup therefore observe
-/// the same pinned source snapshot.
-fn capture_and_finalize_snapshot_database_sync(
+/// Capture an already-validated source image while the caller holds the SQLite
+/// transaction that admitted it. Validation and backup therefore observe the
+/// same pinned source snapshot without repeating the complete source scan.
+fn capture_and_finalize_validated_snapshot_database_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
@@ -8197,7 +11134,6 @@ fn capture_and_finalize_snapshot_database_sync(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
 )> {
-    validate_sealed_state_sync(conn)?;
     let applied = read_applied_sync(conn, identity)?;
     let membership = read_membership_sync(conn, identity)?;
     validate_membership_ids(&membership)?;
@@ -8231,6 +11167,11 @@ fn capture_and_finalize_snapshot_database_sync(
         .map_err(|_| invalid_data("built session consensus snapshot restore metadata failed"))?;
     validate_existing_schema(&destination, identity)
         .map_err(|_| invalid_data("built session consensus snapshot failed validation"))?;
+    // The source was validated while its retained log still existed. Recheck
+    // the self-contained receipt/admission chain after compaction so the
+    // copied snapshot cannot retain a damaged head or receipt link.
+    validate_recovery_receipts_and_admission_sync(&destination, identity)
+        .map_err(|_| invalid_data("built session consensus snapshot receipt validation failed"))?;
     validate_sealed_state_sync(&destination)?;
     pinned = refresh_pinned_snapshot_database(pinned)?;
     verify_pinned_snapshot_descriptor(&pinned, &descriptor_fds)?;
@@ -8645,10 +11586,210 @@ const ATTACHED_SNAPSHOT_VALIDATION_TABLES: &[&str] = &[
     "consensus_membership",
     "consensus_machine",
     "consensus_request_outcomes",
+    "consensus_command_admission",
     "consensus_snapshot",
     "consensus_operator_recovery",
     "restore_scan_state",
 ];
+
+/// The only historical physical layouts admitted for Dynamic consensus.
+///
+/// The first is the released image from before authority-profile fields were
+/// introduced. The second is that exact image after the two reviewed
+/// `ALTER TABLE` migrations have run during a Dynamic reopen. Neither layout
+/// can represent fixed authority, and no other DDL variation is accepted.
+#[derive(Clone, Copy)]
+enum SnapshotSchemaLayout {
+    Current,
+    LegacyDynamicWithoutProfile,
+    LegacyDynamicMigratedProfile,
+}
+
+fn canonical_snapshot_schema_inventory_sync(
+    layout: SnapshotSchemaLayout,
+) -> io::Result<BTreeMap<String, String>> {
+    // Build the manifest through the production schema constructors rather
+    // than maintaining a second handwritten copy of the large table DDL.
+    // `sqlite_schema.sql` preserves the CREATE/ALTER text, so this compares
+    // the complete constraints and physical column layout, not just names.
+    let canonical = SqliteSessionBackend::canonical_schema_connection()
+        .map_err(|_| invalid_data("session consensus canonical snapshot schema is unavailable"))?;
+    install_recovery_validation_schema_sync(&canonical, false)?;
+    match layout {
+        SnapshotSchemaLayout::Current => {}
+        SnapshotSchemaLayout::LegacyDynamicWithoutProfile => canonical
+            .execute_batch(
+                "ALTER TABLE consensus_identity DROP COLUMN authority_profile;\
+                 ALTER TABLE consensus_identity DROP COLUMN fixed_placement_policy;",
+            )
+            .map_err(db_error)?,
+        SnapshotSchemaLayout::LegacyDynamicMigratedProfile => canonical
+            .execute_batch(
+                "ALTER TABLE consensus_identity DROP COLUMN authority_profile;\
+                 ALTER TABLE consensus_identity DROP COLUMN fixed_placement_policy;\
+                 ALTER TABLE consensus_identity ADD COLUMN authority_profile INTEGER CHECK (authority_profile IN (1, 2));\
+                 ALTER TABLE consensus_identity ADD COLUMN fixed_placement_policy INTEGER CHECK (fixed_placement_policy IN (1, 2));",
+            )
+            .map_err(db_error)?,
+    }
+
+    let mut inventory = BTreeMap::new();
+    for table in ATTACHED_SNAPSHOT_VALIDATION_TABLES {
+        let ddl: String = canonical
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if inventory.insert((*table).to_owned(), ddl).is_some() {
+            return Err(invalid_data(
+                "session consensus canonical snapshot schema is duplicated",
+            ));
+        }
+    }
+    Ok(inventory)
+}
+
+/// The incoming image is an authority-bearing database, not a general SQLite
+/// document. Admit only the exact allowlisted ordinary-table schema. In
+/// particular, a same-column view is not a table: allowing one here would
+/// make validation observe a query while the later copy could see different
+/// results.
+fn validate_snapshot_schema_inventory_sync(
+    conn: &Connection,
+    schema: &str,
+    authority_profile: ConsensusAuthorityProfile,
+) -> io::Result<()> {
+    let sql = format!(
+        "SELECT type, name, sql FROM {schema}.sqlite_schema \
+         WHERE substr(name, 1, 7) != 'sqlite_' COLLATE NOCASE ORDER BY type, name"
+    );
+    let mut statement = conn.prepare(&sql).map_err(db_error)?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(db_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error)?;
+    let mut expected_layouts = vec![canonical_snapshot_schema_inventory_sync(
+        SnapshotSchemaLayout::Current,
+    )?];
+    if authority_profile == ConsensusAuthorityProfile::Dynamic {
+        expected_layouts.push(canonical_snapshot_schema_inventory_sync(
+            SnapshotSchemaLayout::LegacyDynamicWithoutProfile,
+        )?);
+        expected_layouts.push(canonical_snapshot_schema_inventory_sync(
+            SnapshotSchemaLayout::LegacyDynamicMigratedProfile,
+        )?);
+    }
+    let schema_is_exact = expected_layouts.iter().any(|expected| {
+        objects.len() == expected.len()
+            && objects.iter().all(|(kind, name, ddl)| {
+                kind == "table"
+                    && ddl
+                        .as_ref()
+                        .is_some_and(|ddl| expected.get(name) == Some(ddl))
+            })
+    });
+    if !schema_is_exact {
+        return Err(invalid_data(
+            "session consensus snapshot schema inventory is invalid",
+        ));
+    }
+    Ok(())
+}
+
+/// Ordered source/destination manifests for every replicated snapshot table.
+///
+/// Keep these expressions identical for the copy and equality checks. SQLite
+/// `SELECT *` is positional, so it would silently compare different logical
+/// values if a compatible migration ever changed physical column order.
+const SNAPSHOT_COPY_TABLE_MANIFESTS: &[(&str, &str)] = &[
+    (
+        "session_records",
+        "tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding",
+    ),
+    (
+        "leases",
+        "tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at",
+    ),
+    ("key_fences", "tenant, nf_kind, key_type, stable_id, fence"),
+    ("lease_globals", "key, val"),
+    (
+        "session_replication_log",
+        "sequence, tx_id, entry_json, timestamp",
+    ),
+    (
+        "consensus_request_outcomes",
+        "request_id, configuration_epoch, payload_digest, command_json, predecessor_sequence, predecessor_digest, predecessor_logical_time, predecessor_receipt_digest, raft_log_index, response_json, receipt_version, receipt_digest",
+    ),
+    (
+        "consensus_command_admission",
+        "singleton, configuration_epoch, admission_revision, strict_activation_index, cutover_committed",
+    ),
+    (
+        "consensus_machine",
+        "singleton, configuration_epoch, application_sequence, last_digest, last_receipt_digest, logical_time, watch_sequence",
+    ),
+    (
+        "consensus_membership",
+        "singleton, configuration_epoch, membership_json",
+    ),
+    (
+        "consensus_membership_scope",
+        "singleton, storage_configuration_epoch, current_configuration_id, current_configuration_epoch, current_members_json, current_bindings_json, application_authority_epoch, application_authority_members_json, predecessor_configuration_id, predecessor_transition_id, predecessor_transition_digest, predecessor_configuration_epoch, predecessor_members_json, predecessor_transition_start_index, predecessor_cutover_index, pending_transition_id, pending_transition_digest, desired_configuration_id, desired_configuration_epoch, desired_members_json, desired_bindings_json, pending_transition_start_index, pending_learners_ready_index, pending_joint_membership_index, pending_uniform_membership_index, terminal_transition_id, terminal_transition_digest, terminal_transition_outcome, terminal_transition_start_index, terminal_learners_ready_index, terminal_joint_membership_index, terminal_uniform_membership_index, terminal_cutover_index, terminal_finalization_index, terminal_desired_configuration_id, terminal_desired_configuration_epoch, terminal_desired_members_json, terminal_desired_bindings_json, terminal_abort_learners_json, terminal_abort_decision_index, terminal_abort_cleanup_membership_index",
+    ),
+    (
+        "consensus_membership_history",
+        "configuration_epoch, storage_configuration_epoch, configuration_id, members_json, transition_id, transition_digest, transition_start_index, cutover_index",
+    ),
+    (
+        "consensus_membership_terminal_history",
+        "transition_id, storage_configuration_epoch, transition_digest, outcome, expected_member_count, transition_start_index, learners_ready_index, joint_membership_index, uniform_membership_index, cutover_index, finalization_index, abort_decision_index, abort_cleanup_membership_index",
+    ),
+    (
+        "consensus_applied",
+        "singleton, configuration_epoch, term, log_index, log_id_json",
+    ),
+    (
+        "consensus_operator_recovery",
+        "singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, pending_fence_high_water, pending_credential_high_water, watch_cursor_invalidation_floor",
+    ),
+    (
+        "restore_scan_state",
+        "singleton, epoch, revision, cursor_key",
+    ),
+];
+
+fn validate_copied_snapshot_tables_match_sync(conn: &Connection) -> io::Result<()> {
+    // This comparison happens after every copy but before local-only restore
+    // metadata is rotated. `EXCEPT` gives set equality; the authoritative
+    // tables all have primary keys, so it is also row equality.
+    for (table, columns) in SNAPSHOT_COPY_TABLE_MANIFESTS {
+        let sql = format!(
+            "SELECT EXISTS(\
+                SELECT 1 FROM (SELECT {columns} FROM main.{table} EXCEPT SELECT {columns} FROM consensus_incoming.{table}) \
+                UNION ALL \
+                SELECT 1 FROM (SELECT {columns} FROM consensus_incoming.{table} EXCEPT SELECT {columns} FROM main.{table})\
+             )"
+        );
+        let differs: bool = conn
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(db_error)?;
+        if differs {
+            return Err(invalid_data(
+                "session consensus copied snapshot tables do not match source",
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn create_attached_snapshot_validation_views(conn: &Connection) -> io::Result<()> {
     for table in ATTACHED_SNAPSHOT_VALIDATION_TABLES {
@@ -8676,12 +11817,12 @@ fn drop_attached_snapshot_validation_views(conn: &Connection) -> io::Result<()> 
 /// Snapshots emitted before authority profiles were added have no column.
 /// They are unambiguously legacy Dynamic snapshots; Fixed authority did not
 /// exist in that durable format and must never infer its identity from it.
-fn read_attached_snapshot_authority_profile_sync(
+fn read_snapshot_authority_profile_sync(
     conn: &Connection,
 ) -> io::Result<Option<ConsensusAuthorityProfile>> {
     let has_column: bool = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM consensus_incoming.pragma_table_info('consensus_identity') WHERE name = 'authority_profile')",
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_identity') WHERE name = 'authority_profile')",
             [],
             |row| row.get(0),
         )
@@ -8691,7 +11832,7 @@ fn read_attached_snapshot_authority_profile_sync(
     }
     let stored: Option<i64> = conn
         .query_row(
-            "SELECT authority_profile FROM consensus_incoming.consensus_identity WHERE singleton = 1",
+            "SELECT authority_profile FROM consensus_identity WHERE singleton = 1",
             [],
             |row| row.get(0),
         )
@@ -8713,9 +11854,22 @@ fn read_attached_snapshot_authority_profile_sync(
         .map(Some)
 }
 
+/// Whether validation is assessing the attached snapshot source or the
+/// destination after its replicated state tables were copied.
+///
+/// The destination intentionally retains its Raft log-store authority; those
+/// tables are deliberately absent from `SNAPSHOT_COPY_TABLE_MANIFESTS`. An
+/// incoming snapshot, in contrast, must contain none of that authority.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotDatabaseValidationTarget {
+    IncomingSource,
+    InstalledDestination,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn validate_attached_snapshot_database_sync(
+fn validate_snapshot_database_sync(
     conn: &Connection,
+    validated_schema: &str,
     identity: SessionConsensusIdentity,
     authority_profile: ConsensusAuthorityProfile,
     expected_scope: &MembershipValidationScope,
@@ -8729,11 +11883,15 @@ fn validate_attached_snapshot_database_sync(
         SessionConsensusNodeId,
         opc_consensus::engine::EmptyNode,
     >,
+    target: SnapshotDatabaseValidationTarget,
 ) -> io::Result<()> {
+    let integrity_pragma = match validated_schema {
+        "consensus_incoming" => "PRAGMA consensus_incoming.integrity_check",
+        "main" => "PRAGMA main.integrity_check",
+        _ => return Err(invalid_data("session consensus snapshot schema is invalid")),
+    };
     let integrity: String = conn
-        .query_row("PRAGMA consensus_incoming.integrity_check", [], |row| {
-            row.get(0)
-        })
+        .query_row(integrity_pragma, [], |row| row.get(0))
         .map_err(db_error)?;
     if integrity != "ok" {
         return Err(invalid_data(
@@ -8742,7 +11900,7 @@ fn validate_attached_snapshot_database_sync(
     }
     validate_existing_schema(conn, identity)
         .map_err(|_| invalid_data("session consensus snapshot identity is invalid"))?;
-    match read_attached_snapshot_authority_profile_sync(conn)? {
+    match read_snapshot_authority_profile_sync(conn)? {
         Some(incoming_profile) if incoming_profile == authority_profile => {}
         None if authority_profile == ConsensusAuthorityProfile::Dynamic => {}
         Some(_) | None => {
@@ -8815,24 +11973,72 @@ fn validate_attached_snapshot_database_sync(
     if applied != meta.last_log_id || membership != meta.last_membership {
         return Err(invalid_data("session consensus snapshot metadata mismatch"));
     }
-    for table in [
-        "consensus_vote",
-        "consensus_committed",
-        "consensus_purged",
-        "consensus_log",
-        "consensus_snapshot",
-    ] {
-        let sql = format!("SELECT COUNT(*) FROM {table}");
-        let count: i64 = conn
-            .query_row(&sql, [], |row| row.get(0))
-            .map_err(db_error)?;
-        if count != 0 {
-            return Err(invalid_data(
-                "session consensus snapshot contains log-store authority",
-            ));
+    if target == SnapshotDatabaseValidationTarget::IncomingSource {
+        for table in [
+            "consensus_vote",
+            "consensus_committed",
+            "consensus_purged",
+            "consensus_log",
+            "consensus_snapshot",
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            let count: i64 = conn
+                .query_row(&sql, [], |row| row.get(0))
+                .map_err(db_error)?;
+            if count != 0 {
+                return Err(invalid_data(
+                    "session consensus snapshot contains log-store authority",
+                ));
+            }
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotInstallOutcome {
+    /// The replacement transaction committed and final-file ownership is now
+    /// durable. Attachment cleanup is post-commit reconciliation only.
+    Committed { incoming_detached: bool },
+}
+
+struct AttachedIncomingSnapshot<'a> {
+    conn: &'a Connection,
+    attached: bool,
+}
+
+impl<'a> AttachedIncomingSnapshot<'a> {
+    fn new(conn: &'a Connection) -> Self {
+        Self {
+            conn,
+            attached: true,
+        }
+    }
+
+    fn detach(&mut self) -> io::Result<()> {
+        self.conn
+            .execute("DETACH DATABASE consensus_incoming", [])
+            .map_err(db_error)?;
+        self.attached = false;
+        Ok(())
+    }
+
+    fn detach_after_commit(&mut self, force_failure: bool) -> io::Result<()> {
+        if force_failure {
+            return Err(io::Error::other(
+                "forced session consensus incoming snapshot detach failure",
+            ));
+        }
+        self.detach()
+    }
+}
+
+impl Drop for AttachedIncomingSnapshot<'_> {
+    fn drop(&mut self) {
+        if self.attached {
+            let _ = self.conn.execute("DETACH DATABASE consensus_incoming", []);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8926,6 +12132,7 @@ pub(crate) fn install_snapshot_database_with_authority_sync(
         checksum,
         byte_length,
     )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8945,7 +12152,82 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
     final_file_name: &str,
     checksum: [u8; 32],
     byte_length: u64,
-) -> io::Result<()> {
+) -> io::Result<SnapshotInstallOutcome> {
+    install_snapshot_database_from_pinned_with_authority_inner_sync(
+        conn,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+        pinned,
+        published_snapshot,
+        meta,
+        final_file_name,
+        checksum,
+        byte_length,
+        false,
+    )
+}
+
+/// Test-only post-commit cleanup fault. This is an explicit argument rather
+/// than process-global state so concurrent store instances cannot affect one
+/// another and production calls always use the normal path above.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_snapshot_database_from_pinned_with_forced_detach_failure_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: Option<&BTreeSet<SessionConsensusNodeId>>,
+    expected_bindings: Option<&BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    published_snapshot: Option<(&crate::consensus::snapshot::PinnedSqliteFile, &Path)>,
+    meta: &opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    final_file_name: &str,
+    checksum: [u8; 32],
+    byte_length: u64,
+) -> io::Result<SnapshotInstallOutcome> {
+    install_snapshot_database_from_pinned_with_authority_inner_sync(
+        conn,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+        pinned,
+        published_snapshot,
+        meta,
+        final_file_name,
+        checksum,
+        byte_length,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_snapshot_database_from_pinned_with_authority_inner_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: Option<&BTreeSet<SessionConsensusNodeId>>,
+    expected_bindings: Option<&BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    published_snapshot: Option<(&crate::consensus::snapshot::PinnedSqliteFile, &Path)>,
+    meta: &opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    final_file_name: &str,
+    checksum: [u8; 32],
+    byte_length: u64,
+    force_detach_failure: bool,
+) -> io::Result<SnapshotInstallOutcome> {
     let incoming_last_log_id = meta.last_log_id.as_ref();
     validate_snapshot_floor(conn, identity, incoming_last_log_id)?;
     let expected_scope = read_membership_scope_sync(conn, identity)?;
@@ -8959,10 +12241,24 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
         return Err(invalid_data("invalid session consensus snapshot file name"));
     }
     let byte_length = checked_positive_i64(byte_length)?;
+    let stale_incoming: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_database_list WHERE name = 'consensus_incoming')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if stale_incoming {
+        // A prior post-commit detach is non-authoritative. Clear it before a
+        // new pre-commit attachment so the shared connection remains retryable.
+        conn.execute("DETACH DATABASE consensus_incoming", [])
+            .map_err(db_error)?;
+    }
     let before = matching_pinned_snapshot_descriptors(&pinned)?;
     let snapshot_uri = pinned_snapshot_uri(&pinned, true);
     conn.execute("ATTACH DATABASE ?1 AS consensus_incoming", [snapshot_uri])
         .map_err(db_error)?;
+    let mut attachment = AttachedIncomingSnapshot::new(conn);
     conn.query_row(
         "SELECT 1 FROM consensus_incoming.sqlite_schema LIMIT 1",
         [],
@@ -8972,11 +12268,15 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
     let after = matching_pinned_snapshot_descriptors(&pinned)?;
     let retained_descriptors = after.difference(&before).copied().collect::<BTreeSet<_>>();
     if retained_descriptors.len() != 1 {
-        let _ = conn.execute("DETACH DATABASE consensus_incoming", []);
         return Err(invalid_data(
             "SQLite did not retain exactly one pinned incoming snapshot descriptor",
         ));
     }
+    // The extracted source was sealed with no SDK-held writer. SQLite has now
+    // retained an FD opened from the pinned source, so remove its only private
+    // staging name before inspecting or copying any incoming bytes.
+    pinned.remove_private_staging_path_after_attach()?;
+    validate_snapshot_schema_inventory_sync(conn, "consensus_incoming", authority_profile)?;
 
     let result = (|| {
         let tx =
@@ -9009,8 +12309,9 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
         // source under the transaction that will copy it. A pathname swap or
         // later writer therefore cannot substitute bytes after validation.
         create_attached_snapshot_validation_views(&tx)?;
-        let validation = validate_attached_snapshot_database_sync(
+        let validation = validate_snapshot_database_sync(
             &tx,
+            "consensus_incoming",
             identity,
             authority_profile,
             &expected_scope,
@@ -9019,65 +12320,15 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             fixed_placement_policy,
             local_candidate_marker,
             meta,
+            SnapshotDatabaseValidationTarget::IncomingSource,
         );
         let drop_views = drop_attached_snapshot_validation_views(&tx);
-        validation?;
+        if let Err(error) = validation {
+            let _ = drop_views;
+            return Err(error);
+        }
         drop_views?;
-        for (table, columns) in [
-            (
-                "session_records",
-                "tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding",
-            ),
-            (
-                "leases",
-                "tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at",
-            ),
-            (
-                "key_fences",
-                "tenant, nf_kind, key_type, stable_id, fence",
-            ),
-            ("lease_globals", "key, val"),
-            (
-                "session_replication_log",
-                "sequence, tx_id, entry_json, timestamp",
-            ),
-            (
-                "consensus_request_outcomes",
-                "request_id, configuration_epoch, payload_digest, response_json",
-            ),
-            (
-                "consensus_machine",
-                "singleton, configuration_epoch, application_sequence, last_digest, logical_time, watch_sequence",
-            ),
-            (
-                "consensus_membership",
-                "singleton, configuration_epoch, membership_json",
-            ),
-            (
-                "consensus_membership_scope",
-                "singleton, storage_configuration_epoch, current_configuration_id, current_configuration_epoch, current_members_json, current_bindings_json, application_authority_epoch, application_authority_members_json, predecessor_configuration_id, predecessor_transition_id, predecessor_transition_digest, predecessor_configuration_epoch, predecessor_members_json, predecessor_transition_start_index, predecessor_cutover_index, pending_transition_id, pending_transition_digest, desired_configuration_id, desired_configuration_epoch, desired_members_json, desired_bindings_json, pending_transition_start_index, pending_learners_ready_index, pending_joint_membership_index, pending_uniform_membership_index, terminal_transition_id, terminal_transition_digest, terminal_transition_outcome, terminal_transition_start_index, terminal_learners_ready_index, terminal_joint_membership_index, terminal_uniform_membership_index, terminal_cutover_index, terminal_finalization_index, terminal_desired_configuration_id, terminal_desired_configuration_epoch, terminal_desired_members_json, terminal_desired_bindings_json, terminal_abort_learners_json, terminal_abort_decision_index, terminal_abort_cleanup_membership_index",
-            ),
-            (
-                "consensus_membership_history",
-                "configuration_epoch, storage_configuration_epoch, configuration_id, members_json, transition_id, transition_digest, transition_start_index, cutover_index",
-            ),
-            (
-                "consensus_membership_terminal_history",
-                "transition_id, storage_configuration_epoch, transition_digest, outcome, expected_member_count, transition_start_index, learners_ready_index, joint_membership_index, uniform_membership_index, cutover_index, finalization_index, abort_decision_index, abort_cleanup_membership_index",
-            ),
-            (
-                "consensus_applied",
-                "singleton, configuration_epoch, term, log_index, log_id_json",
-            ),
-            (
-                "consensus_operator_recovery",
-                "singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor",
-            ),
-            (
-                "restore_scan_state",
-                "singleton, epoch, revision, cursor_key",
-            ),
-        ] {
+        for (table, columns) in SNAPSHOT_COPY_TABLE_MANIFESTS {
             tx.execute(&format!("DELETE FROM {table}"), [])
                 .map_err(db_error)?;
             tx.execute(
@@ -9088,6 +12339,7 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             )
             .map_err(db_error)?;
         }
+        validate_copied_snapshot_tables_match_sync(&tx)?;
         // Restore cursors are local evidence, not replicated state-machine
         // authority. Every snapshot destination gets a fresh incarnation so
         // two nodes installing the same coherent snapshot cannot consume one
@@ -9105,6 +12357,35 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             ],
         )
         .map_err(db_error)?;
+        validate_snapshot_schema_inventory_sync(&tx, "main", authority_profile)?;
+        validate_snapshot_database_sync(
+            &tx,
+            "main",
+            identity,
+            authority_profile,
+            &expected_scope,
+            expected_members,
+            expected_bindings,
+            fixed_placement_policy,
+            local_candidate_marker,
+            meta,
+            SnapshotDatabaseValidationTarget::InstalledDestination,
+        )?;
+        let installed = read_current_snapshot_sync(&tx, identity)?.ok_or_else(|| {
+            invalid_data("installed session consensus snapshot metadata is missing")
+        })?;
+        if installed.0 != *meta
+            || installed.1 != final_file_name
+            || installed.2 != checksum
+            || installed.3
+                != u64::try_from(byte_length).map_err(|_| {
+                    invalid_data("installed session consensus snapshot length is invalid")
+                })?
+        {
+            return Err(invalid_data(
+                "installed session consensus snapshot metadata is inconsistent",
+            ));
+        }
         verify_pinned_snapshot_descriptor(&pinned, &retained_descriptors)?;
         if let Some((published_snapshot, published_path)) = published_snapshot {
             if !published_snapshot.path_matches_identity(published_path)? {
@@ -9116,10 +12397,12 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
         tx.commit().map_err(db_error)
     })();
 
-    let detach = conn
-        .execute("DETACH DATABASE consensus_incoming", [])
-        .map_err(db_error);
-    result.and(detach.map(|_| ()))
+    result?;
+    // Commit transfers ownership of the final snapshot file. A failed detach
+    // is cleanup reconciliation, never proof that the durable transaction
+    // rolled back; Drop attempts it once more on scope exit.
+    let incoming_detached = attachment.detach_after_commit(force_detach_failure).is_ok();
+    Ok(SnapshotInstallOutcome::Committed { incoming_detached })
 }
 
 fn validate_snapshot_floor(
@@ -9148,6 +12431,7 @@ fn validate_snapshot_floor(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn save_current_snapshot_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -9162,6 +12446,7 @@ pub(crate) fn save_current_snapshot_sync(
     save_current_snapshot_in_tx(conn, identity, meta, file_name, checksum, byte_length)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn save_current_snapshot_with_authority_sync(
     conn: &Connection,
@@ -9202,6 +12487,61 @@ pub(crate) fn save_current_snapshot_with_authority_sync(
         )?;
     }
     save_current_snapshot_in_tx(&tx, identity, meta, file_name, checksum, byte_length)?;
+    tx.commit().map_err(db_error)
+}
+
+/// Persist one published snapshot only while its final pathname still names
+/// the descriptor that was sealed and verified by the caller.
+///
+/// Dynamic consensus uses this Linux descriptor fence too: profile choice
+/// changes quorum authority, not the snapshot-file publication contract.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn save_current_snapshot_from_pinned_with_authority_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    published_snapshot: (&crate::consensus::snapshot::PinnedSqliteFile, &Path),
+    meta: &opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    file_name: &str,
+    checksum: [u8; 32],
+    byte_length: u64,
+) -> io::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+    if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+        validate_durable_authority_for_raw_access(
+            &tx,
+            identity,
+            authority_profile,
+            expected_members,
+            expected_bindings,
+            fixed_placement_policy,
+        )?;
+        validate_fixed_snapshot_metadata(meta, expected_members)?;
+        if let Some(snapshot_log_id) = meta.last_log_id.as_ref() {
+            let applied = read_applied_sync(&tx, identity)?.ok_or_else(|| {
+                invalid_data("session consensus fixed snapshot is beyond applied state")
+            })?;
+            ensure_log_id_not_after(
+                snapshot_log_id,
+                &applied,
+                "session consensus fixed snapshot is beyond applied state",
+            )?;
+        }
+    }
+    save_current_snapshot_in_tx(&tx, identity, meta, file_name, checksum, byte_length)?;
+    let (published_snapshot, published_path) = published_snapshot;
+    published_snapshot.verify_identity()?;
+    if !published_snapshot.path_matches_identity(published_path)? {
+        return Err(invalid_data(
+            "session consensus published snapshot was replaced",
+        ));
+    }
     tx.commit().map_err(db_error)
 }
 
@@ -9311,11 +12651,12 @@ pub(crate) fn read_current_snapshot_sync(
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     use bytes::Bytes;
+    use futures_util::StreamExt;
     use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId};
     use opc_crypto::CryptoEnvelopeV1;
     use opc_key::{
@@ -9325,6 +12666,7 @@ mod tests {
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
     use super::*;
+    use crate::backend::SessionBackend;
     #[cfg(target_os = "linux")]
     use crate::consensus::snapshot::PinnedSqliteFile;
     use crate::model::{OwnerId, SessionKey, SessionKeyType};
@@ -9349,6 +12691,17 @@ mod tests {
 
     fn expected_members() -> BTreeSet<SessionConsensusNodeId> {
         BTreeSet::from([node_id()])
+    }
+
+    /// These focused fixtures exercise the private post-admission read paths
+    /// against deliberately malformed rows that could not pass the full
+    /// initializer. Keep production admission exact while granting only the
+    /// test backend the state a successfully initialized core would publish.
+    fn admit_consensus_reads_for_test(backend: &SqliteSessionBackend) {
+        backend.admission_state.store(
+            super::super::SqliteAdmissionState::ConsensusReady as u8,
+            Ordering::Release,
+        );
     }
 
     fn member(value: u64) -> SessionConsensusNodeId {
@@ -9393,14 +12746,36 @@ mod tests {
     ) -> Entry<SessionRaftTypeConfig> {
         Entry {
             log_id: log_id(index),
-            payload: EntryPayload::Normal(SessionConsensusCommand {
-                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
-                identity: identity(),
-                request_id: SessionConsensusRequestId::from_bytes([request_byte; 16]),
-                logical_time: timestamp(u8::try_from(index).expect("test log index")),
-                intent,
-            }),
+            payload: EntryPayload::Normal(DurableSessionConsensusCommand::legacy(
+                SessionConsensusCommand {
+                    schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                    identity: identity(),
+                    request_id: SessionConsensusRequestId::from_bytes([request_byte; 16]),
+                    logical_time: timestamp(u8::try_from(index).expect("test log index")),
+                    intent,
+                },
+            )),
         }
+    }
+
+    fn with_current_admission_revision(
+        mut entry: Entry<SessionRaftTypeConfig>,
+    ) -> Entry<SessionRaftTypeConfig> {
+        let EntryPayload::Normal(command) = &mut entry.payload else {
+            panic!("current-admission fixture must be a normal entry");
+        };
+        *command = DurableSessionConsensusCommand::current((**command).clone());
+        entry
+    }
+
+    fn with_legacy_admission_revision(
+        mut entry: Entry<SessionRaftTypeConfig>,
+    ) -> Entry<SessionRaftTypeConfig> {
+        let EntryPayload::Normal(command) = &mut entry.payload else {
+            panic!("legacy-admission fixture must be a normal entry");
+        };
+        *command = DurableSessionConsensusCommand::legacy((**command).clone());
+        entry
     }
 
     fn identity_at(epoch: u64, configuration_byte: u8) -> SessionConsensusIdentity {
@@ -9632,17 +13007,21 @@ mod tests {
     ) -> Entry<SessionRaftTypeConfig> {
         Entry {
             log_id: log_id(index),
-            payload: EntryPayload::Normal(SessionConsensusCommand {
-                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
-                identity: identity(),
-                request_id: SessionConsensusRequestId::from_bytes(request_id),
-                logical_time: timestamp(u8::try_from(index).expect("test index fits timestamp")),
-                intent: SessionMutationIntent::AcquireLease {
-                    key: key(),
-                    owner: OwnerId::new(owner).expect("owner"),
-                    ttl: Duration::from_secs(300),
+            payload: EntryPayload::Normal(DurableSessionConsensusCommand::legacy(
+                SessionConsensusCommand {
+                    schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                    identity: identity(),
+                    request_id: SessionConsensusRequestId::from_bytes(request_id),
+                    logical_time: timestamp(
+                        u8::try_from(index).expect("test index fits timestamp"),
+                    ),
+                    intent: SessionMutationIntent::AcquireLease {
+                        key: key(),
+                        owner: OwnerId::new(owner).expect("owner"),
+                        ttl: Duration::from_secs(300),
+                    },
                 },
-            }),
+            )),
         }
     }
 
@@ -9832,6 +13211,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sealed_state_rejects_equal_fence_record_owner_mismatch_but_allows_stale_record() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        let first = lease::acquire_sync(
+            &conn,
+            &key(),
+            OwnerId::new("first-owner").expect("owner"),
+            Duration::from_secs(60),
+            timestamp(1),
+        )
+        .expect("first lease");
+
+        let mut equal_fence = sealed_record_for_key(key(), 64 * 1024);
+        equal_fence.owner = OwnerId::new("different-owner").expect("owner");
+        equal_fence.fence = first.fence();
+        persist_sealed_record_fixture(&conn, &equal_fence);
+        assert_eq!(
+            validate_sealed_state_sync(&conn)
+                .expect_err("equal fence cannot belong to different owners")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // Once ownership advances, the older record remains valid historical
+        // state even though its owner differs from the active lease holder.
+        let second = lease::acquire_sync(
+            &conn,
+            &key(),
+            OwnerId::new("second-owner").expect("owner"),
+            Duration::from_secs(60),
+            Timestamp::from_str("2026-07-12T00:01:02Z").expect("successor lease timestamp"),
+        )
+        .expect("successor lease");
+        assert!(equal_fence.fence < second.fence());
+        validate_sealed_state_sync(&conn).expect("lower-fence historical record is valid");
+    }
+
+    #[tokio::test]
+    async fn sealed_state_rejects_finite_expiry_without_machine_logical_time() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let mut record = sealed_record_for_key(key(), 64 * 1024);
+        record.expires_at = Some(timestamp(30));
+        record.payload = sealed_payload_for_record(&record, 64 * 1024);
+        persist_sealed_record_fixture(&conn, &record);
+
+        let error = validate_sealed_state_sync(&conn)
+            .expect_err("finite record must have canonical machine time authority");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "session consensus finite record expiry has no logical time authority"
+        );
+    }
+
+    #[tokio::test]
     async fn live_consensus_get_revalidates_persisted_payload_authority() {
         let exact = SqliteSessionBackend::in_memory().expect("exact-cap backend");
         {
@@ -9839,6 +13275,7 @@ mod tests {
             let record = sealed_record_for_key(key(), 1_048_576);
             persist_sealed_record_fixture(&conn, &record);
         }
+        admit_consensus_reads_for_test(&exact);
         assert!(exact
             .consensus_get_at(&key(), timestamp(1))
             .await
@@ -9851,6 +13288,7 @@ mod tests {
             let record = sealed_record_for_key(key(), 1_048_577);
             persist_sealed_record_fixture(&conn, &record);
         }
+        admit_consensus_reads_for_test(&oversized);
         assert_eq!(
             oversized
                 .consensus_get_at(&key(), timestamp(1))
@@ -9869,6 +13307,7 @@ mod tests {
             record.payload = crate::EncryptedSessionPayload::new(b"unsealed");
             persist_sealed_record_fixture(&conn, &record);
         }
+        admit_consensus_reads_for_test(&unsealed);
         assert!(matches!(
             unsealed.consensus_get_at(&key(), timestamp(1)).await,
             Err(StoreError::Crypto(_))
@@ -9881,6 +13320,7 @@ mod tests {
             record.generation = crate::Generation::new(2);
             persist_sealed_record_fixture(&conn, &record);
         }
+        admit_consensus_reads_for_test(&mismatched);
         assert!(matches!(
             mismatched.consensus_get_at(&key(), timestamp(1)).await,
             Err(StoreError::Crypto(_))
@@ -9926,7 +13366,7 @@ mod tests {
         let conn = backend.conn.blocking_lock();
         initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
         let request_id = SessionConsensusRequestId::from_bytes([0xD2; 16]);
-        let response = SessionConsensusResponse {
+        let mut response = SessionConsensusResponse {
             result: Ok(SessionMutationOutcome::ConsumerRecord(Some(
                 sealed_record_for_key(key(), 1_048_577),
             ))),
@@ -9935,13 +13375,53 @@ mod tests {
             logical_time: Some(timestamp(1)),
             raft_log_index: 1,
         };
+        let command = DurableSessionConsensusCommand::legacy(SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: identity(),
+            request_id,
+            logical_time: timestamp(1),
+            intent: SessionMutationIntent::ReadConsumerRecord { key: key() },
+        });
+        response.digest = Some(
+            command
+                .calculate_applied_result_digest(
+                    1,
+                    SessionConsensusEntryDigest::GENESIS,
+                    timestamp(1),
+                    1,
+                    &response.result,
+                )
+                .expect("response digest"),
+        );
+        let payload_digest = payload_digest(&command).expect("payload digest");
+        let receipt = outcome_receipt_digest_input!(
+            request_id,
+            identity().configuration_epoch().get(),
+            payload_digest,
+            &command,
+            0,
+            SessionConsensusEntryDigest::GENESIS,
+            None,
+            OUTCOME_RECEIPT_CHAIN_GENESIS,
+            1,
+            &response,
+        )
+        .expect("receipt");
         conn.execute(
-            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, response_json) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, command_json, predecessor_sequence, predecessor_digest, predecessor_logical_time, predecessor_receipt_digest, raft_log_index, response_json, receipt_version, receipt_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 request_id.as_bytes().as_slice(),
                 epoch_i64(identity()).expect("epoch"),
-                [0xB2_u8; 32].as_slice(),
+                payload_digest.as_slice(),
+                encode_json(&command).expect("command encoding"),
+                0_i64,
+                SessionConsensusEntryDigest::GENESIS.as_bytes().as_slice(),
+                Option::<String>::None,
+                OUTCOME_RECEIPT_CHAIN_GENESIS.as_slice(),
+                1_i64,
                 encode_json(&response).expect("response encoding"),
+                OUTCOME_RECEIPT_VERSION,
+                receipt.as_slice(),
             ],
         )
         .expect("seed invalid replay outcome");
@@ -9961,7 +13441,7 @@ mod tests {
         let conn = backend.conn.blocking_lock();
         initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
         let request_id = SessionConsensusRequestId::from_bytes([0xD3; 16]);
-        let response = SessionConsensusResponse {
+        let mut response = SessionConsensusResponse {
             result: Ok(SessionMutationOutcome::CompareAndSet(
                 CompareAndSetResult::Conflict {
                     current: Some(sealed_record_for_key(key(), 1_048_577)),
@@ -9972,13 +13452,67 @@ mod tests {
             logical_time: Some(timestamp(1)),
             raft_log_index: 1,
         };
+        let new_record = sealed_record_for_key(key(), 64 * 1024);
+        let lease = crate::LeaseGuard::new(
+            new_record.key.clone(),
+            new_record.owner.clone(),
+            new_record.fence,
+            timestamp(1),
+            timestamp(2),
+            1,
+        );
+        let command = DurableSessionConsensusCommand::legacy(SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: identity(),
+            request_id,
+            logical_time: timestamp(1),
+            intent: SessionMutationIntent::CompareAndSet(Box::new(crate::CompareAndSet {
+                key: new_record.key.clone(),
+                lease,
+                expected_generation: None,
+                new_record,
+            })),
+        });
+        response.digest = Some(
+            command
+                .calculate_applied_result_digest(
+                    1,
+                    SessionConsensusEntryDigest::GENESIS,
+                    timestamp(1),
+                    1,
+                    &response.result,
+                )
+                .expect("response digest"),
+        );
+        let payload_digest = payload_digest(&command).expect("payload digest");
+        let receipt = outcome_receipt_digest_input!(
+            request_id,
+            identity().configuration_epoch().get(),
+            payload_digest,
+            &command,
+            0,
+            SessionConsensusEntryDigest::GENESIS,
+            None,
+            OUTCOME_RECEIPT_CHAIN_GENESIS,
+            1,
+            &response,
+        )
+        .expect("receipt");
         conn.execute(
-            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, response_json) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, command_json, predecessor_sequence, predecessor_digest, predecessor_logical_time, predecessor_receipt_digest, raft_log_index, response_json, receipt_version, receipt_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 request_id.as_bytes().as_slice(),
                 epoch_i64(identity()).expect("epoch"),
-                [0xB3_u8; 32].as_slice(),
+                payload_digest.as_slice(),
+                encode_json(&command).expect("command encoding"),
+                0_i64,
+                SessionConsensusEntryDigest::GENESIS.as_bytes().as_slice(),
+                Option::<String>::None,
+                OUTCOME_RECEIPT_CHAIN_GENESIS.as_slice(),
+                1_i64,
                 encode_json(&response).expect("response encoding"),
+                OUTCOME_RECEIPT_VERSION,
+                receipt.as_slice(),
             ],
         )
         .expect("seed invalid replay outcome");
@@ -9989,6 +13523,514 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "persisted session consensus outcome record is invalid"
+        );
+    }
+
+    #[test]
+    fn replayed_cas_outcome_rejects_valid_unit_response() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let request_id = SessionConsensusRequestId::from_bytes([0xD4; 16]);
+        let new_record = sealed_record_for_key(key(), 64 * 1024);
+        let lease = crate::LeaseGuard::new(
+            new_record.key.clone(),
+            new_record.owner.clone(),
+            new_record.fence,
+            timestamp(1),
+            timestamp(2),
+            1,
+        );
+        let command = DurableSessionConsensusCommand::legacy(SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: identity(),
+            request_id,
+            logical_time: timestamp(1),
+            intent: SessionMutationIntent::CompareAndSet(Box::new(crate::CompareAndSet {
+                key: new_record.key.clone(),
+                lease,
+                expected_generation: None,
+                new_record,
+            })),
+        });
+        let mut response = SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::Unit),
+            sequence: 1,
+            digest: None,
+            logical_time: Some(timestamp(1)),
+            raft_log_index: 1,
+        };
+        response.digest = Some(
+            command
+                .calculate_applied_result_digest(
+                    1,
+                    SessionConsensusEntryDigest::GENESIS,
+                    timestamp(1),
+                    1,
+                    &response.result,
+                )
+                .expect("response digest"),
+        );
+        let payload_digest = payload_digest(&command).expect("payload digest");
+        let receipt = outcome_receipt_digest_input!(
+            request_id,
+            identity().configuration_epoch().get(),
+            payload_digest,
+            &command,
+            0,
+            SessionConsensusEntryDigest::GENESIS,
+            None,
+            OUTCOME_RECEIPT_CHAIN_GENESIS,
+            1,
+            &response,
+        )
+        .expect("receipt");
+        conn.execute(
+            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, command_json, predecessor_sequence, predecessor_digest, predecessor_logical_time, predecessor_receipt_digest, raft_log_index, response_json, receipt_version, receipt_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                request_id.as_bytes().as_slice(),
+                epoch_i64(identity()).expect("epoch"),
+                payload_digest.as_slice(),
+                encode_json(&command).expect("command encoding"),
+                0_i64,
+                SessionConsensusEntryDigest::GENESIS.as_bytes().as_slice(),
+                Option::<String>::None,
+                OUTCOME_RECEIPT_CHAIN_GENESIS.as_slice(),
+                1_i64,
+                encode_json(&response).expect("response encoding"),
+                OUTCOME_RECEIPT_VERSION,
+                receipt.as_slice(),
+            ],
+        )
+        .expect("seed swizzled replay outcome");
+
+        let error = read_outcome_sync(&conn, identity(), request_id)
+            .expect_err("CAS receipt must reject a valid Unit response");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "persisted session consensus outcome does not match command"
+        );
+    }
+
+    #[test]
+    fn replayed_outcome_rejects_response_metadata_mutation() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let request_id = SessionConsensusRequestId::from_bytes([0xD5; 16]);
+        let command = DurableSessionConsensusCommand::legacy(SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: identity(),
+            request_id,
+            logical_time: timestamp(1),
+            intent: SessionMutationIntent::AdvanceLogicalTime,
+        });
+        let mut response = SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::Unit),
+            sequence: 1,
+            digest: None,
+            logical_time: Some(timestamp(1)),
+            raft_log_index: 1,
+        };
+        response.digest = Some(
+            command
+                .calculate_applied_result_digest(
+                    1,
+                    SessionConsensusEntryDigest::GENESIS,
+                    timestamp(1),
+                    1,
+                    &response.result,
+                )
+                .expect("response digest"),
+        );
+        let payload_digest = payload_digest(&command).expect("payload digest");
+        let receipt = outcome_receipt_digest_input!(
+            request_id,
+            identity().configuration_epoch().get(),
+            payload_digest,
+            &command,
+            0,
+            SessionConsensusEntryDigest::GENESIS,
+            None,
+            OUTCOME_RECEIPT_CHAIN_GENESIS,
+            1,
+            &response,
+        )
+        .expect("receipt");
+        conn.execute(
+            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, command_json, predecessor_sequence, predecessor_digest, predecessor_logical_time, predecessor_receipt_digest, raft_log_index, response_json, receipt_version, receipt_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                request_id.as_bytes().as_slice(),
+                epoch_i64(identity()).expect("epoch"),
+                payload_digest.as_slice(),
+                encode_json(&command).expect("command encoding"),
+                0_i64,
+                SessionConsensusEntryDigest::GENESIS.as_bytes().as_slice(),
+                Option::<String>::None,
+                OUTCOME_RECEIPT_CHAIN_GENESIS.as_slice(),
+                1_i64,
+                encode_json(&response).expect("response encoding"),
+                OUTCOME_RECEIPT_VERSION,
+                receipt.as_slice(),
+            ],
+        )
+        .expect("seed replay outcome");
+
+        response.raft_log_index = 2;
+        conn.execute(
+            "UPDATE consensus_request_outcomes SET response_json = ?1 WHERE request_id = ?2",
+            params![
+                encode_json(&response).expect("mutated response encoding"),
+                request_id.as_bytes().as_slice(),
+            ],
+        )
+        .expect("mutate replay response metadata");
+        let error = read_outcome_sync(&conn, identity(), request_id)
+            .expect_err("metadata mutation must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "persisted session consensus outcome metadata is invalid"
+        );
+    }
+
+    #[test]
+    fn empty_outcome_chain_requires_the_genesis_machine_head() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        conn.execute(
+            "UPDATE consensus_machine SET last_digest = ?1 WHERE singleton = 1",
+            [vec![0xA5_u8; 32]],
+        )
+        .expect("mutate empty-chain digest");
+        let error = validate_all_outcomes_sync(&conn, identity())
+            .expect_err("an empty chain cannot claim a non-genesis digest");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "persisted session consensus empty outcome chain head is invalid"
+        );
+        drop(conn);
+
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        conn.execute(
+            "UPDATE consensus_machine SET logical_time = ?1 WHERE singleton = 1",
+            [ops::format_rfc3339_normalized(timestamp(1))],
+        )
+        .expect("mutate empty-chain logical time");
+        let error = validate_all_outcomes_sync(&conn, identity())
+            .expect_err("an empty chain cannot claim a logical time");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "persisted session consensus empty outcome chain head is invalid"
+        );
+    }
+
+    #[test]
+    fn committed_cutover_without_its_receipt_is_rejected_even_when_pristine() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        conn.execute(
+            "UPDATE consensus_command_admission SET strict_activation_index = 1, cutover_committed = 1 WHERE singleton = 1",
+            [],
+        )
+        .expect("forge receipt-free cutover authority");
+
+        let error = validate_all_outcomes_sync(&conn, identity())
+            .expect_err("receipt-free cutover authority must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "persisted session consensus admission cutover receipt is missing"
+        );
+    }
+
+    #[test]
+    fn operator_recovery_authority_rejects_ambiguous_zero_digests() {
+        for (case, mutation) in [
+            (
+                "pristine-epoch-with-plan",
+                "UPDATE consensus_operator_recovery SET recovery_epoch = 0, last_plan_digest = CAST(X'01' || zeroblob(31) AS BLOB) WHERE singleton = 1",
+            ),
+            (
+                "recovered-epoch-without-plan",
+                "UPDATE consensus_operator_recovery SET recovery_epoch = 1, last_plan_digest = zeroblob(32) WHERE singleton = 1",
+            ),
+            (
+                "pending-workflow-without-plan",
+                "UPDATE consensus_operator_recovery SET pending_epoch = 1, pending_plan_digest = zeroblob(32) WHERE singleton = 1",
+            ),
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+                .expect("allow corrupt recovery fixture");
+            conn.execute(mutation, [])
+                .unwrap_or_else(|error| panic!("inject {case} recovery corruption: {error}"));
+
+            let error = read_operator_recovery_sync(&conn, identity())
+                .expect_err("ambiguous recovery authority must reject");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "case {case}");
+            let error = validate_recovery_receipts_and_admission_sync(&conn, identity())
+                .expect_err("persisted validation must reject ambiguous recovery authority");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "case {case}");
+        }
+    }
+
+    #[test]
+    fn operator_recovery_write_entrypoints_reject_zero_plan_digest_before_schema_writes() {
+        let conn = Connection::open_in_memory().expect("connection");
+        assert!(mark_operator_recovery_pending_sync(&conn, identity(), 1, [0; 32], 0, 0).is_err());
+        assert!(finalize_operator_recovery_sync(&conn, identity(), 1, [0; 32], 0, 0).is_err());
+        assert!(claim_legacy_checkpoint_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            [0x11; 32],
+            1,
+            [0; 32],
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        .is_err());
+        assert!(
+            !table_exists(&conn, "consensus_operator_recovery").expect("inspect schema"),
+            "zero-digest entrypoints must not initialize recovery state"
+        );
+        assert!(
+            !table_exists(&conn, "consensus_identity").expect("inspect schema"),
+            "zero-digest claim must not install consensus ownership"
+        );
+    }
+
+    #[test]
+    fn raw_recovery_finalize_without_pending_authority_is_rejected_without_state_mutation() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                acquire_entry(1, [0xA4; 16], "recovery-guard-owner"),
+            ],
+        )
+        .expect("seed active recovery guard");
+        assert!(matches!(
+            applied.responses.as_slice(),
+            [
+                _,
+                SessionConsensusResponse {
+                    result: Ok(SessionMutationOutcome::Lease(_)),
+                    ..
+                }
+            ]
+        ));
+
+        let recovery_before =
+            read_operator_recovery_sync(&conn, identity()).expect("baseline recovery authority");
+        let globals_before: Vec<(String, i64)> = conn
+            .prepare("SELECT key, val FROM lease_globals ORDER BY key")
+            .expect("prepare baseline allocators")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("scan baseline allocators")
+            .collect::<Result<_, _>>()
+            .expect("collect baseline allocators");
+        let active_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM leases WHERE active = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("baseline active leases");
+
+        let forged = topology_entry_at(
+            2,
+            0xA5,
+            SessionMutationIntent::FinalizeOperatorRecovery {
+                recovery_epoch: 1,
+                plan_digest: [0xA6; 32],
+                fence_high_water: 100,
+                credential_high_water: 100,
+            },
+        );
+        let rejected = apply_entries_sync(&conn, identity(), &backend.caps, vec![forged])
+            .expect("raw recovery command applies as a deterministic rejection");
+        assert!(matches!(
+            rejected.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::InvalidKey(reason)),
+                ..
+            }] if reason == "operator_recovery_epoch_rejected"
+        ));
+        assert_eq!(
+            read_operator_recovery_sync(&conn, identity()).expect("rejected recovery authority"),
+            recovery_before
+        );
+        assert_eq!(
+            conn.prepare("SELECT key, val FROM lease_globals ORDER BY key")
+                .expect("prepare rejected allocators")
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("scan rejected allocators")
+                .collect::<Result<Vec<(String, i64)>, _>>()
+                .expect("collect rejected allocators"),
+            globals_before
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM leases WHERE active = 1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("rejected active leases"),
+            active_before
+        );
+    }
+
+    #[test]
+    fn operator_recovery_finalize_binds_the_pending_high_waters_exactly() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let digest = [0xC4; 32];
+        mark_operator_recovery_pending_sync(&conn, identity(), 1, digest, 7, 9)
+            .expect("stage exact recovery authority");
+        let before = read_operator_recovery_sync(&conn, identity()).expect("pending authority");
+
+        for (fence, credential) in [(6, 9), (8, 9), (7, 10)] {
+            assert_eq!(
+                finalize_operator_recovery_sync(&conn, identity(), 1, digest, fence, credential)
+                    .expect("substituted high-water rejects"),
+                OperatorRecoveryApply::Rejected
+            );
+            assert_eq!(
+                read_operator_recovery_sync(&conn, identity()).expect("rejected authority"),
+                before
+            );
+        }
+        assert_eq!(
+            finalize_operator_recovery_sync(&conn, identity(), 1, digest, 7, 9)
+                .expect("exact high-water applies"),
+            OperatorRecoveryApply::Applied
+        );
+        assert_eq!(
+            finalize_operator_recovery_sync(&conn, identity(), 1, digest, 7, 9)
+                .expect("exact finalized retry is idempotent"),
+            OperatorRecoveryApply::Idempotent
+        );
+    }
+
+    #[test]
+    fn operator_recovery_high_water_boundary_is_rejected_before_log_admission() {
+        let EntryPayload::Normal(command) = topology_entry_at(
+            1,
+            0xC5,
+            SessionMutationIntent::FinalizeOperatorRecovery {
+                recovery_epoch: 1,
+                plan_digest: [0xC6; 32],
+                fence_high_water: i64::MAX as u64,
+                credential_high_water: 0,
+            },
+        )
+        .payload
+        else {
+            unreachable!("test helper emits normal command");
+        };
+        assert!(validate_command_for_log_with_cap(&command, identity(), false).is_err());
+    }
+
+    #[test]
+    fn coherent_receipt_rewrite_cannot_contradict_a_retained_command() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let request_id = SessionConsensusRequestId::from_bytes([0xD6; 16]);
+        let original = DurableSessionConsensusCommand::legacy(SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: identity(),
+            request_id,
+            logical_time: timestamp(1),
+            intent: SessionMutationIntent::AdvanceLogicalTime,
+        });
+        append_logs_sync(
+            &conn,
+            identity(),
+            &[
+                membership_entry(),
+                Entry {
+                    log_id: log_id(1),
+                    payload: EntryPayload::Normal(original.clone()),
+                },
+            ],
+        )
+        .expect("retain original command");
+
+        let mut forged = original.clone();
+        forged.intent = SessionMutationIntent::BindConsumerRequest {
+            request_commitment: [0x3C; 32],
+        };
+        let mut response = SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::Unit),
+            sequence: 1,
+            digest: None,
+            logical_time: Some(timestamp(1)),
+            raft_log_index: 1,
+        };
+        response.digest = Some(
+            forged
+                .calculate_applied_result_digest(
+                    1,
+                    SessionConsensusEntryDigest::GENESIS,
+                    timestamp(1),
+                    1,
+                    &response.result,
+                )
+                .expect("forged result digest"),
+        );
+        let forged_payload_digest = payload_digest(&forged).expect("forged payload digest");
+        let forged_receipt = outcome_receipt_digest_input!(
+            request_id,
+            identity().configuration_epoch().get(),
+            forged_payload_digest,
+            &forged,
+            0,
+            SessionConsensusEntryDigest::GENESIS,
+            None,
+            OUTCOME_RECEIPT_CHAIN_GENESIS,
+            1,
+            &response,
+        )
+        .expect("forged receipt digest");
+        conn.execute(
+            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, command_json, predecessor_sequence, predecessor_digest, predecessor_logical_time, predecessor_receipt_digest, raft_log_index, response_json, receipt_version, receipt_digest) VALUES (?1, ?2, ?3, ?4, 0, ?5, NULL, ?6, 1, ?7, ?8, ?9)",
+            params![
+                request_id.as_bytes().as_slice(),
+                epoch_i64(identity()).expect("epoch"),
+                forged_payload_digest.as_slice(),
+                encode_json(&forged).expect("forged command encoding"),
+                SessionConsensusEntryDigest::GENESIS.as_bytes().as_slice(),
+                OUTCOME_RECEIPT_CHAIN_GENESIS.as_slice(),
+                encode_json(&response).expect("forged response encoding"),
+                OUTCOME_RECEIPT_VERSION,
+                forged_receipt.as_slice(),
+            ],
+        )
+        .expect("seed internally coherent forged receipt");
+
+        let error = read_outcome_sync(&conn, identity(), request_id)
+            .expect_err("retained command must anchor receipt semantics");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "persisted session consensus outcome contradicts retained command"
         );
     }
 
@@ -10017,14 +14059,14 @@ mod tests {
             &conn,
             identity(),
             &backend.caps,
-            vec![capped_cas_entry(
+            vec![with_legacy_admission_revision(capped_cas_entry(
                 2,
                 [0xD5; 16],
                 lease,
                 None,
                 crate::Generation::new(2),
                 64 * 1024,
-            )],
+            ))],
         )
         .expect("historical conflict remains deterministic");
         assert!(matches!(
@@ -10062,28 +14104,645 @@ mod tests {
             EntryPayload::Normal(command) => command,
             _ => panic!("oversized fixture is normal"),
         };
-        let error = validate_command_for_log(&oversized_command, identity())
+        let error = validate_command_for_log_with_cap(&oversized_command, identity(), true)
             .expect_err("one-over sealed record must not enter the log");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
-        let nested = SessionConsensusCommand {
+        let nested = DurableSessionConsensusCommand::current(SessionConsensusCommand {
             intent: SessionMutationIntent::Authorized {
                 origin: member(7),
                 authority_identity: identity(),
                 mutation: Box::new(SessionMutationIntent::Authorized {
                     origin: member(7),
                     authority_identity: identity(),
-                    mutation: Box::new(oversized_command.intent),
+                    mutation: Box::new(oversized_command.intent.clone()),
                 }),
             },
-            ..oversized_command
-        };
-        let error = validate_command_for_log(&nested, identity())
+            ..(*oversized_command).clone()
+        });
+        let error = validate_command_for_log_with_cap(&nested, identity(), true)
             .expect_err("nested authorized intent must not enter the log");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(
             error.to_string(),
             "session consensus authorized intent nesting is invalid"
+        );
+
+        let authorized_control = DurableSessionConsensusCommand::current(SessionConsensusCommand {
+            request_id: SessionConsensusRequestId::from_bytes([0xD2; 16]),
+            intent: SessionMutationIntent::Authorized {
+                origin: member(7),
+                authority_identity: identity(),
+                mutation: Box::new(SessionMutationIntent::FinalizeOperatorRecovery {
+                    recovery_epoch: 1,
+                    plan_digest: [0xD1; 32],
+                    fence_high_water: 1,
+                    credential_high_water: 1,
+                }),
+            },
+            ..(*oversized_command).clone()
+        });
+        let error = validate_command_for_log_with_cap(&authorized_control, identity(), true)
+            .expect_err("authorized operator control must not enter the log");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "session consensus authorized control intent is invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn follower_rejects_noncanonical_cutover_without_mutation_and_accepts_exact_retry() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        initialize_schema_with_storage_anchor_and_pending_and_bindings(
+            &conn,
+            None,
+            identity(),
+            &expected_members(),
+            &test_member_bindings(&expected_members()),
+            None,
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .expect("production-shaped consensus schema");
+        append_logs_sync(&conn, identity(), &[membership_entry()]).expect("membership log");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("membership apply");
+
+        let marker = |index: u64, logical_time: Timestamp| -> Entry<SessionRaftTypeConfig> {
+            Entry {
+                log_id: log_id(index),
+                payload: EntryPayload::Normal(DurableSessionConsensusCommand::current(
+                    SessionConsensusCommand {
+                    schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                    identity: identity(),
+                    request_id: SessionConsensusRequestId::from_bytes(
+                        crate::consensus::SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID,
+                    ),
+                    logical_time,
+                    intent: SessionMutationIntent::AdvanceLogicalTime,
+                },
+                )),
+            }
+        };
+        let canonical_time = crate::consensus::types::command_admission_cutover_logical_time();
+        let EntryPayload::Normal(mut reserved_id) = marker(1, canonical_time).payload else {
+            unreachable!("marker fixture is normal")
+        };
+        reserved_id.logical_time = timestamp(1);
+        assert!(validate_command_for_log_with_cap(&reserved_id, identity(), true).is_err());
+        reserved_id.logical_time = canonical_time;
+        reserved_id.intent = SessionMutationIntent::Authorized {
+            origin: node_id(),
+            authority_identity: identity(),
+            mutation: Box::new(SessionMutationIntent::AdvanceLogicalTime),
+        };
+        assert!(validate_command_for_log_with_cap(&reserved_id, identity(), true).is_err());
+
+        let baseline_machine = read_machine_sync(&conn, identity()).expect("baseline machine");
+        let baseline_admission =
+            read_command_admission_sync(&conn, identity()).expect("baseline admission");
+        let baseline_log_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row.get(0))
+            .expect("baseline log count");
+
+        let noncanonical = marker(1, timestamp(1));
+        assert!(append_logs_sync(&conn, identity(), &[noncanonical]).is_err());
+        assert_eq!(
+            read_machine_sync(&conn, identity()).expect("rejected machine"),
+            baseline_machine
+        );
+        assert_eq!(
+            read_command_admission_sync(&conn, identity()).expect("rejected admission"),
+            baseline_admission
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                .get::<_, i64>(0))
+                .expect("rejected log count"),
+            baseline_log_count
+        );
+
+        let canonical = marker(1, canonical_time);
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&canonical))
+            .expect("canonical marker log");
+        let first = apply_entries_sync(&conn, identity(), &backend.caps, vec![canonical])
+            .expect("canonical marker apply");
+        let retry = marker(2, canonical_time);
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&retry))
+            .expect("canonical marker retry log");
+        let repeated = apply_entries_sync(&conn, identity(), &backend.caps, vec![retry])
+            .expect("canonical marker retry apply");
+        assert_eq!(first.responses, repeated.responses);
+        assert_eq!(
+            read_command_admission_sync(&conn, identity())
+                .expect("committed admission")
+                .strict_activation_index,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn live_outcome_chain_swizzle_blocks_duplicate_projection_and_apply() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        let members = expected_members();
+        initialize_schema_with_storage_anchor_and_pending_and_bindings(
+            &conn,
+            None,
+            identity(),
+            &members,
+            &test_member_bindings(&members),
+            None,
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .expect("production-shaped consensus schema");
+
+        let membership = membership_entry();
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&membership))
+            .expect("membership log");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership])
+            .expect("membership apply");
+
+        let marker = Entry {
+            log_id: log_id(1),
+            payload: EntryPayload::Normal(DurableSessionConsensusCommand::current(
+                SessionConsensusCommand {
+                    schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                    identity: identity(),
+                    request_id: SessionConsensusRequestId::from_bytes(
+                        crate::consensus::SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID,
+                    ),
+                    logical_time: crate::consensus::types::command_admission_cutover_logical_time(),
+                    intent: SessionMutationIntent::AdvanceLogicalTime,
+                },
+            )),
+        };
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&marker))
+            .expect("cutover marker log");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![marker])
+            .expect("cutover marker apply");
+
+        let acquire =
+            with_current_admission_revision(acquire_entry(2, [0xE1; 16], "outcome-chain-owner"));
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&acquire)).expect("lease log");
+        let acquired = apply_entries_sync(&conn, identity(), &backend.caps, vec![acquire])
+            .expect("lease apply");
+        let lease = match acquired.responses.as_slice() {
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::Lease(lease)),
+                ..
+            }] => lease.clone(),
+            _ => panic!("lease fixture must return a lease"),
+        };
+        let predecessor = acquired.responses[0].clone();
+        let predecessor_receipt = read_machine_sync(&conn, identity())
+            .expect("lease receipt head")
+            .2;
+
+        let cas = with_current_admission_revision(capped_cas_entry(
+            3,
+            [0xE2; 16],
+            lease,
+            None,
+            crate::Generation::new(1),
+            64 * 1024,
+        ));
+        let EntryPayload::Normal(command) = &cas.payload else {
+            panic!("CAS fixture is normal")
+        };
+        let command = command.clone();
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&cas)).expect("CAS log");
+        let applied = apply_entries_sync(&conn, identity(), &backend.caps, vec![cas.clone()])
+            .expect("CAS apply");
+        let mut swizzled = match applied.responses.as_slice() {
+            [response @ SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Success)),
+                ..
+            }] => response.clone(),
+            _ => panic!("CAS fixture must succeed"),
+        };
+        swizzled.result = Ok(SessionMutationOutcome::CompareAndSet(
+            CompareAndSetResult::Conflict { current: None },
+        ));
+        let predecessor_digest = predecessor.digest.expect("lease response digest");
+        let predecessor_time = predecessor.logical_time;
+        swizzled.digest = Some(
+            command
+                .calculate_applied_result_digest(
+                    swizzled.sequence,
+                    predecessor_digest,
+                    swizzled.logical_time.expect("CAS response logical time"),
+                    swizzled.raft_log_index,
+                    &swizzled.result,
+                )
+                .expect("swizzled result digest"),
+        );
+        let payload = payload_digest(&command).expect("CAS payload digest");
+        let receipt = outcome_receipt_digest_input!(
+            command.request_id,
+            identity().configuration_epoch().get(),
+            payload,
+            &command,
+            predecessor.sequence,
+            predecessor_digest,
+            predecessor_time,
+            predecessor_receipt,
+            swizzled.raft_log_index,
+            &swizzled,
+        )
+        .expect("swizzled receipt digest");
+        assert_eq!(
+            1,
+            conn.execute(
+                "UPDATE consensus_request_outcomes SET response_json = ?1, receipt_digest = ?2 WHERE request_id = ?3",
+                params![
+                    encode_json(&swizzled).expect("encode swizzled response"),
+                    receipt.as_slice(),
+                    command.request_id.as_bytes().as_slice(),
+                ],
+            )
+            .expect("rewrite only the CAS receipt"),
+        );
+
+        // A row-local replay lookup accepts the rewritten receipt: both
+        // result and receipt digests were recomputed, and the retained CAS
+        // command remains unchanged. Only the sealed chain head exposes it.
+        assert_eq!(
+            Some((payload, swizzled.clone())),
+            read_outcome_sync(&conn, identity(), command.request_id)
+                .expect("read locally valid rewritten receipt"),
+        );
+        let error = validate_all_outcomes_sync(&conn, identity())
+            .expect_err("rewritten tail must disagree with the machine head");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let before = (
+            conn.query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("log count"),
+            last_log_sync(&conn, identity()).expect("last log"),
+            read_applied_sync(&conn, identity()).expect("applied pointer"),
+            read_machine_sync(&conn, identity()).expect("machine state"),
+            ops::get_sync(&conn, &key(), timestamp(4)).expect("CAS state"),
+        );
+        let mut duplicate = cas;
+        duplicate.log_id = log_id(4);
+
+        let error = append_logs_sync(&conn, identity(), std::slice::from_ref(&duplicate))
+            .expect_err("follower projection must reject the broken receipt chain");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            before,
+            (
+                conn.query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("unchanged log count"),
+                last_log_sync(&conn, identity()).expect("unchanged last log"),
+                read_applied_sync(&conn, identity()).expect("unchanged applied pointer"),
+                read_machine_sync(&conn, identity()).expect("unchanged machine state"),
+                ops::get_sync(&conn, &key(), timestamp(4)).expect("unchanged CAS state"),
+            )
+        );
+
+        let error = apply_entries_sync(&conn, identity(), &backend.caps, vec![duplicate])
+            .expect_err("duplicate application must reject the broken receipt chain");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            before,
+            (
+                conn.query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("still unchanged log count"),
+                last_log_sync(&conn, identity()).expect("still unchanged last log"),
+                read_applied_sync(&conn, identity()).expect("still unchanged applied pointer"),
+                read_machine_sync(&conn, identity()).expect("still unchanged machine state"),
+                ops::get_sync(&conn, &key(), timestamp(4)).expect("still unchanged CAS state"),
+            )
+        );
+    }
+
+    #[test]
+    fn follower_log_admission_rejects_current_and_legacy_cas_semantic_mismatches() {
+        let lease = crate::LeaseGuard::new(
+            key(),
+            OwnerId::new("consensus-cap-owner").expect("owner"),
+            crate::FenceToken::new(1),
+            timestamp(1),
+            timestamp(1),
+            1,
+        );
+        let base = match capped_cas_entry(
+            1,
+            [0xD7; 16],
+            lease,
+            None,
+            crate::Generation::new(1),
+            64 * 1024,
+        )
+        .payload
+        {
+            EntryPayload::Normal(command) => command,
+            _ => panic!("CAS fixture is normal"),
+        };
+        let mut alternate_key = key();
+        alternate_key.stable_id = Bytes::from_static(b"other-state-machine-fault-session")
+            .try_into()
+            .expect("valid alternate stable ID");
+
+        let mut key_mismatch = base.clone();
+        let SessionMutationIntent::CompareAndSet(op) = &mut key_mismatch.intent else {
+            panic!("CAS fixture intent changed")
+        };
+        op.key = alternate_key;
+
+        let mut owner_mismatch = base.clone();
+        let SessionMutationIntent::CompareAndSet(op) = &mut owner_mismatch.intent else {
+            panic!("CAS fixture intent changed")
+        };
+        op.new_record.owner = OwnerId::new("other-consensus-cap-owner").expect("owner");
+
+        let mut fence_mismatch = base;
+        let SessionMutationIntent::CompareAndSet(op) = &mut fence_mismatch.intent else {
+            panic!("CAS fixture intent changed")
+        };
+        op.new_record.fence = crate::FenceToken::new(2);
+
+        for malformed in [key_mismatch, owner_mismatch, fence_mismatch] {
+            for legacy in [false, true] {
+                let command = if legacy {
+                    DurableSessionConsensusCommand::legacy((*malformed).clone())
+                } else {
+                    DurableSessionConsensusCommand::current((*malformed).clone())
+                };
+                let error = validate_command_for_log_with_cap(&command, identity(), !legacy)
+                    .expect_err("semantic mismatch must not enter a follower log");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(
+                    error.to_string(),
+                    "session consensus mutation profile is invalid"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn follower_log_admission_rejects_sqlite_unrepresentable_cas_before_append() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.lock().await;
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let lease = crate::LeaseGuard::new(
+            key(),
+            OwnerId::new("consensus-cap-owner").expect("owner"),
+            crate::FenceToken::new(1),
+            timestamp(1),
+            timestamp(1),
+            1,
+        );
+        let entry = with_legacy_admission_revision(capped_cas_entry(
+            1,
+            [0xDB; 16],
+            lease,
+            None,
+            crate::Generation::new(u64::MAX),
+            64 * 1024,
+        ));
+        append_logs_sync(&conn, identity(), &[membership_entry()])
+            .expect("append initial follower membership entry");
+        let baseline_log_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row.get(0))
+            .expect("baseline log count");
+
+        let error = append_logs_sync(&conn, identity(), &[entry])
+            .expect_err("unrepresentable generation must not enter a follower log");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "session consensus mutation profile is invalid"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                .get::<_, i64>(0))
+                .expect("rejected log count"),
+            baseline_log_count
+        );
+
+        let desired_members = expected_members();
+        let topology_entry = Entry {
+            log_id: log_id(1),
+            payload: EntryPayload::Normal(DurableSessionConsensusCommand::legacy(
+                SessionConsensusCommand {
+                    schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                    identity: identity(),
+                    request_id: SessionConsensusRequestId::from_bytes([0xDC; 16]),
+                    logical_time: timestamp(1),
+                    intent: SessionMutationIntent::PrepareTopologyTransition {
+                        transition_id: [0xDC; 16],
+                        request_digest: [0xDD; 32],
+                        desired_identity: identity_at(u64::MAX, 0xDE),
+                        desired_bindings: test_member_bindings(&desired_members),
+                        desired_members,
+                    },
+                },
+            )),
+        };
+        let error = append_logs_sync(&conn, identity(), &[topology_entry])
+            .expect_err("unrepresentable successor epoch must not enter a follower log");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                .get::<_, i64>(0))
+                .expect("topology rejection log count"),
+            baseline_log_count
+        );
+    }
+
+    #[test]
+    fn follower_log_admission_rejects_current_and_legacy_out_of_profile_ttls() {
+        let out_of_profile_ttl = Duration::from_secs(crate::ttl::MAX_SESSION_TTL.as_secs() + 1);
+        let lease = crate::LeaseGuard::new(
+            key(),
+            OwnerId::new("consensus-cap-owner").expect("owner"),
+            crate::FenceToken::new(1),
+            timestamp(1),
+            timestamp(1),
+            1,
+        );
+        let intents = [
+            SessionMutationIntent::AcquireLease {
+                key: key(),
+                owner: OwnerId::new("consensus-cap-owner").expect("owner"),
+                ttl: out_of_profile_ttl,
+            },
+            SessionMutationIntent::RefreshTtl {
+                lease: lease.clone(),
+                ttl: out_of_profile_ttl,
+            },
+            SessionMutationIntent::RenewLease {
+                lease,
+                ttl: out_of_profile_ttl,
+            },
+        ];
+
+        for intent in intents {
+            for legacy in [false, true] {
+                let command = if legacy {
+                    DurableSessionConsensusCommand::legacy(SessionConsensusCommand {
+                        schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                        identity: identity(),
+                        request_id: SessionConsensusRequestId::from_bytes([0xD8; 16]),
+                        logical_time: timestamp(1),
+                        intent: intent.clone(),
+                    })
+                } else {
+                    DurableSessionConsensusCommand::current(SessionConsensusCommand {
+                        schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                        identity: identity(),
+                        request_id: SessionConsensusRequestId::from_bytes([0xD8; 16]),
+                        logical_time: timestamp(1),
+                        intent: intent.clone(),
+                    })
+                };
+                let error = validate_command_for_log_with_cap(&command, identity(), !legacy)
+                    .expect_err("out-of-profile TTL must not enter a follower log");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+        }
+    }
+
+    #[test]
+    fn follower_log_admission_rejects_current_and_legacy_forged_guards() {
+        let forged = [
+            SessionMutationIntent::DeleteFenced(crate::LeaseGuard::new(
+                key(),
+                OwnerId::new("consensus-cap-owner").expect("owner"),
+                crate::FenceToken::new(0),
+                timestamp(1),
+                timestamp(1),
+                1,
+            )),
+            SessionMutationIntent::RefreshTtl {
+                lease: crate::LeaseGuard::new(
+                    key(),
+                    OwnerId::new("consensus-cap-owner").expect("owner"),
+                    crate::FenceToken::new(1),
+                    timestamp(2),
+                    timestamp(1),
+                    1,
+                ),
+                ttl: Duration::from_secs(1),
+            },
+            SessionMutationIntent::RenewLease {
+                lease: crate::LeaseGuard::new(
+                    key(),
+                    OwnerId::new("consensus-cap-owner").expect("owner"),
+                    crate::FenceToken::new(1),
+                    timestamp(1),
+                    timestamp(1),
+                    0,
+                ),
+                ttl: Duration::from_secs(1),
+            },
+            SessionMutationIntent::DeleteFenced(crate::LeaseGuard::new(
+                key(),
+                OwnerId::new("consensus-cap-owner").expect("owner"),
+                crate::FenceToken::new(u64::MAX),
+                timestamp(1),
+                timestamp(1),
+                1,
+            )),
+            SessionMutationIntent::ReleaseLease(crate::LeaseGuard::new(
+                key(),
+                OwnerId::new("consensus-cap-owner").expect("owner"),
+                crate::FenceToken::new(1),
+                timestamp(1),
+                timestamp(1),
+                u64::MAX,
+            )),
+            SessionMutationIntent::ReleaseLease(crate::LeaseGuard::new(
+                key(),
+                OwnerId::new("consensus-cap-owner").expect("owner"),
+                crate::FenceToken::new(1),
+                timestamp(1),
+                timestamp(1),
+                0,
+            )),
+        ];
+
+        for intent in forged {
+            for legacy in [false, true] {
+                let command = if legacy {
+                    DurableSessionConsensusCommand::legacy(SessionConsensusCommand {
+                        schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                        identity: identity(),
+                        request_id: SessionConsensusRequestId::from_bytes([0xD9; 16]),
+                        logical_time: timestamp(1),
+                        intent: intent.clone(),
+                    })
+                } else {
+                    DurableSessionConsensusCommand::current(SessionConsensusCommand {
+                        schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                        identity: identity(),
+                        request_id: SessionConsensusRequestId::from_bytes([0xD9; 16]),
+                        logical_time: timestamp(1),
+                        intent: intent.clone(),
+                    })
+                };
+                let error = validate_command_for_log_with_cap(&command, identity(), !legacy)
+                    .expect_err("forged guard must not enter a follower log");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_follower_admission_tolerates_only_an_oversized_valid_record() {
+        let lease = crate::LeaseGuard::new(
+            key(),
+            OwnerId::new("consensus-cap-owner").expect("owner"),
+            crate::FenceToken::new(1),
+            timestamp(1),
+            timestamp(1),
+            1,
+        );
+        let mut command = match capped_cas_entry(
+            1,
+            [0xDA; 16],
+            lease,
+            None,
+            crate::Generation::new(1),
+            1_048_577,
+        )
+        .payload
+        {
+            EntryPayload::Normal(command) => command,
+            _ => panic!("CAS fixture is normal"),
+        };
+        command = DurableSessionConsensusCommand::legacy((*command).clone());
+        validate_command_for_log_with_cap(&command, identity(), false)
+            .expect("the historical exception accepts only the one-over valid payload");
+
+        let SessionMutationIntent::CompareAndSet(op) = &mut command.intent else {
+            panic!("CAS fixture intent changed")
+        };
+        let mut alternate_key = key();
+        alternate_key.stable_id = Bytes::from_static(b"legacy-oversized-malformed-session")
+            .try_into()
+            .expect("valid alternate stable ID");
+        op.key = alternate_key;
+        // This fails only because follower admission invokes the shared
+        // semantic validator before applying the legacy size exception.
+        let error = validate_command_for_log_with_cap(&command, identity(), false)
+            .expect_err("oversized and malformed legacy command must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "session consensus mutation profile is invalid"
         );
     }
 
@@ -10169,6 +14828,7 @@ mod tests {
             let record = sealed_record_for_key(key(), 1_048_576);
             persist_sealed_record_fixture(&conn, &record);
         }
+        admit_consensus_reads_for_test(&exact);
         let exact_page = exact
             .consensus_scan_restore_records_at(
                 RestoreScanRequest::all(1),
@@ -10185,6 +14845,7 @@ mod tests {
             let record = sealed_record_for_key(key(), 1_048_577);
             persist_sealed_record_fixture(&conn, &record);
         }
+        admit_consensus_reads_for_test(&oversized);
         assert_eq!(
             oversized
                 .consensus_scan_restore_records_at(
@@ -10207,6 +14868,7 @@ mod tests {
             record.fence = crate::FenceToken::new(2);
             persist_sealed_record_fixture(&conn, &record);
         }
+        admit_consensus_reads_for_test(&invalid_aad);
         assert!(matches!(
             invalid_aad
                 .consensus_scan_restore_records_at(
@@ -10247,6 +14909,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn snapshot_build_rejects_coherent_receipt_and_machine_head_rewrite_before_compaction() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        let identity = identity();
+        initialize_schema(&conn, identity, &expected_members()).expect("consensus schema");
+        let original = DurableSessionConsensusCommand::legacy(SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity,
+            request_id: SessionConsensusRequestId::from_bytes([0xB6; 16]),
+            logical_time: timestamp(1),
+            intent: SessionMutationIntent::AdvanceLogicalTime,
+        });
+        let entries = vec![
+            membership_entry(),
+            Entry {
+                log_id: log_id(1),
+                payload: EntryPayload::Normal(original),
+            },
+        ];
+        append_logs_sync(&conn, identity, &entries).expect("retain source commands");
+        apply_entries_sync(&conn, identity, &backend.caps, entries).expect("apply source command");
+
+        // Rewrite every mutable receipt/head field coherently, while keeping
+        // the retained entry at index one as the independent authority.
+        let forged = DurableSessionConsensusCommand::legacy(SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity,
+            request_id: SessionConsensusRequestId::from_bytes([0xB6; 16]),
+            logical_time: timestamp(2),
+            intent: SessionMutationIntent::AdvanceLogicalTime,
+        });
+        let result: Result<SessionMutationOutcome, StoreError> = Ok(SessionMutationOutcome::Unit);
+        let forged_digest = forged
+            .calculate_applied_result_digest(
+                1,
+                SessionConsensusEntryDigest::GENESIS,
+                timestamp(2),
+                1,
+                &result,
+            )
+            .expect("calculate forged response digest");
+        let forged_response = SessionConsensusResponse {
+            result,
+            sequence: 1,
+            digest: Some(forged_digest),
+            logical_time: Some(timestamp(2)),
+            raft_log_index: 1,
+        };
+        let forged_payload_digest = payload_digest(&forged).expect("calculate forged payload");
+        let forged_receipt = outcome_receipt_digest_input!(
+            forged.request_id,
+            identity.configuration_epoch().get(),
+            forged_payload_digest,
+            &forged,
+            0,
+            SessionConsensusEntryDigest::GENESIS,
+            None,
+            OUTCOME_RECEIPT_CHAIN_GENESIS,
+            1,
+            &forged_response,
+        )
+        .expect("calculate forged receipt");
+        conn.execute(
+            "UPDATE consensus_request_outcomes SET payload_digest = ?1, command_json = ?2, response_json = ?3, receipt_digest = ?4 WHERE request_id = ?5",
+            params![
+                forged_payload_digest.as_slice(),
+                encode_json(&forged).expect("encode forged command"),
+                encode_json(&forged_response).expect("encode forged response"),
+                forged_receipt.as_slice(),
+                forged.request_id.as_bytes().as_slice(),
+            ],
+        )
+        .expect("rewrite receipt row");
+        conn.execute(
+            "UPDATE consensus_machine SET last_digest = ?1, last_receipt_digest = ?2, logical_time = ?3 WHERE singleton = 1",
+            params![
+                forged_digest.as_bytes().as_slice(),
+                forged_receipt.as_slice(),
+                ops::format_rfc3339_normalized(timestamp(2)),
+            ],
+        )
+        .expect("rewrite machine head");
+
+        let error = validate_all_outcomes_sync(&conn, identity)
+            .expect_err("retained log must reject the coherent forged chain");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("must-not-exist.sqlite");
+        let error = build_snapshot_database_sync(&conn, identity, &snapshot_path)
+            .expect_err("snapshot build must validate retained receipt authority first");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            !snapshot_path.exists(),
+            "a rejected source must not reach snapshot construction or log compaction"
+        );
+    }
+
     #[tokio::test]
     async fn legacy_claim_rejects_a_record_above_the_consensus_cap() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
@@ -10260,9 +15021,12 @@ mod tests {
             &expected_members(),
             [0x31; 32],
             1,
-            [0x32; 32],
+            [0x31; 32],
             0,
             0,
+            0,
+            0,
+            None,
         )
         .expect_err("legacy claim must not import an oversized consensus record");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -10293,9 +15057,12 @@ mod tests {
             &expected_members(),
             [0x35; 32],
             1,
-            [0x36; 32],
+            [0x35; 32],
             0,
             0,
+            0,
+            0,
+            None,
         )
         .expect_err("legacy claim must reject a regressed lease allocator");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -10326,9 +15093,12 @@ mod tests {
             &expected_members(),
             [0x41; 32],
             1,
-            [0x42; 32],
+            [0x41; 32],
             0,
             0,
+            0,
+            0,
+            None,
         )
         .expect("claim valid legacy checkpoint");
 
@@ -10416,10 +15186,186 @@ mod tests {
                 .expect("inject persisted entry");
             }
 
+            admit_consensus_reads_for_test(&backend);
+
             assert!(matches!(
                 backend.consensus_get_replication_log(1, 1).await,
                 Err(StoreError::BackendUnavailable(_))
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_consensus_claim_revalidates_complete_local_schema_under_its_lock() {
+        for (case, mutation, retained_probe) in [
+            (
+                "empty extra table",
+                "CREATE TABLE unreviewed_empty (value INTEGER NOT NULL);",
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'unreviewed_empty'",
+            ),
+            (
+                "altered local DDL",
+                "ALTER TABLE session_records ADD COLUMN unreviewed INTEGER;",
+                "SELECT COUNT(*) FROM pragma_table_info('session_records') WHERE name = 'unreviewed'",
+            ),
+        ] {
+            let directory = tempfile::tempdir().expect("database directory");
+            let database = directory.path().join("session.sqlite");
+            let backend = SqliteSessionBackend::open(&database).expect("fresh backend");
+            let external = Connection::open(&database).expect("cooperating external connection");
+            external
+                .execute_batch(mutation)
+                .unwrap_or_else(|error| panic!("apply {case} mutation: {error}"));
+            drop(external);
+
+            let members = expected_members();
+            let error = match SqliteConsensusCore::initialize(
+                &backend,
+                directory.path().join("snapshots"),
+                identity(),
+                members.clone(),
+                test_member_bindings(&members),
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .await
+            {
+                Ok(_) => panic!("schema drift in the constructor-to-initializer gap must reject"),
+                Err(error) => error,
+            };
+            assert_eq!(SessionConsensusStorageError::CorruptState, error, "{case}");
+
+            let conn = backend.conn.lock().await;
+            let identity_tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'consensus_identity'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("inspect rejected consensus claim");
+            assert_eq!(0, identity_tables, "{case} must not gain consensus authority");
+            let retained: i64 = conn
+                .query_row(retained_probe, [], |row| row.get(0))
+                .unwrap_or_else(|error| panic!("inspect retained {case} mutation: {error}"));
+            assert_eq!(1, retained, "{case} must not be repaired or rewritten");
+        }
+    }
+
+    #[tokio::test]
+    async fn consensus_admission_releases_physical_writer_lock_after_wal_activation() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let database = directory.path().join("session.sqlite");
+        let backend = SqliteSessionBackend::open(&database).expect("fresh backend");
+        let members = expected_members();
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            directory.path().join("snapshots"),
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize consensus backend");
+
+        let writer = Connection::open(&database).expect("open cooperating writer");
+        writer
+            .busy_timeout(Duration::ZERO)
+            .expect("disable competing busy wait");
+        writer
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+            .expect("cooperating writer enters after WAL activation");
+        drop(core);
+    }
+
+    #[tokio::test]
+    async fn consensus_admission_revokes_raw_watchers_without_breaking_consensus_watch() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let mut raw_watch = backend.watch(1).await.expect("standalone raw watch");
+        let members = expected_members();
+        let snapshot_dir = tempfile::tempdir().expect("snapshot directory");
+        let _core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir.path().join("snapshots"),
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize consensus backend");
+
+        assert_eq!(
+            backend.watchers.lock().await.len(),
+            0,
+            "consensus admission must drop every raw standalone watcher"
+        );
+        assert!(
+            raw_watch.next().await.is_none(),
+            "a revoked raw watcher must close before any consensus notification"
+        );
+
+        let consensus_watch = backend
+            .consensus_watch(1)
+            .await
+            .expect("consensus watch remains available after raw revocation");
+        assert_eq!(backend.watchers.lock().await.len(), 1);
+        drop(consensus_watch);
+    }
+
+    #[tokio::test]
+    async fn raw_watch_captured_before_consensus_admission_cannot_escape_registration() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let held_registration = Arc::clone(&backend.watch_registration_gate)
+            .acquire_owned()
+            .await
+            .expect("hold registration gate");
+        let watch_backend = backend.clone();
+        let raw_watch = tokio::spawn(async move { watch_backend.watch(1).await });
+        while !backend.watch_backlog_captured.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        let members = expected_members();
+        let initialize_backend = backend.clone();
+        let snapshot_dir = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = snapshot_dir.path().join("snapshots");
+        let initialize = tokio::spawn(async move {
+            SqliteConsensusCore::initialize(
+                &initialize_backend,
+                snapshot_path,
+                identity(),
+                members.clone(),
+                test_member_bindings(&members),
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .await
+        });
+
+        drop(held_registration);
+        let raw_watch = raw_watch
+            .await
+            .expect("raw watch task must complete before admission finishes");
+        let _core = initialize
+            .await
+            .expect("consensus initializer task")
+            .expect("initialize consensus backend");
+
+        assert_eq!(
+            backend.watchers.lock().await.len(),
+            0,
+            "a captured raw watch must not survive the consensus fence"
+        );
+        match raw_watch {
+            Ok(mut stream) => assert!(
+                stream.next().await.is_none(),
+                "a raw stream registered before the fence must be closed"
+            ),
+            Err(StoreError::CapabilityNotSupported(_)) => {}
+            Err(error) => panic!("raw watch failed unexpectedly: {error}"),
         }
     }
 
@@ -10519,6 +15465,317 @@ mod tests {
         assert_eq!(target_records, 0);
     }
 
+    #[test]
+    fn snapshot_install_rejects_ambiguous_operator_recovery_digests() {
+        for (case, mutation) in [
+            (
+                "pristine-epoch-with-plan",
+                "UPDATE consensus_operator_recovery SET recovery_epoch = 0, last_plan_digest = CAST(X'01' || zeroblob(31) AS BLOB) WHERE singleton = 1",
+            ),
+            (
+                "recovered-epoch-without-plan",
+                "UPDATE consensus_operator_recovery SET recovery_epoch = 1, last_plan_digest = zeroblob(32) WHERE singleton = 1",
+            ),
+            (
+                "pending-workflow-without-plan",
+                "UPDATE consensus_operator_recovery SET pending_epoch = 1, pending_plan_digest = zeroblob(32) WHERE singleton = 1",
+            ),
+        ] {
+            let source = SqliteSessionBackend::in_memory().expect("source backend");
+            let source_conn = source.conn.blocking_lock();
+            let identity = identity();
+            let members = expected_members();
+            initialize_schema(&source_conn, identity, &members).expect("source consensus schema");
+            apply_entries_sync(
+                &source_conn,
+                identity,
+                &source.consensus_capabilities(),
+                vec![membership_entry()],
+            )
+            .expect("apply source membership");
+            let directory = tempfile::tempdir().expect("snapshot directory");
+            let snapshot_path = directory.path().join("ambiguous-recovery.sqlite");
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&source_conn, identity, &snapshot_path)
+                    .expect("build source snapshot");
+            drop(source_conn);
+
+            let incoming = Connection::open(&snapshot_path).expect("open incoming snapshot");
+            incoming
+                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .expect("allow corrupt recovery fixture");
+            incoming
+                .execute(mutation, [])
+                .unwrap_or_else(|error| panic!("inject {case} recovery corruption: {error}"));
+            drop(incoming);
+
+            let target = SqliteSessionBackend::in_memory().expect("target backend");
+            let target_conn = target.conn.blocking_lock();
+            initialize_schema(&target_conn, identity, &members).expect("target consensus schema");
+            let before =
+                read_operator_recovery_sync(&target_conn, identity).expect("target recovery state");
+            let meta = opc_consensus::engine::SnapshotMeta {
+                last_log_id,
+                last_membership,
+                snapshot_id: format!("ambiguous-recovery-{case}"),
+            };
+
+            let error = install_snapshot_database_sync(
+                &target_conn,
+                identity,
+                &snapshot_path,
+                &meta,
+                "ambiguous-recovery.opc",
+                [0x41; 32],
+                std::fs::metadata(&snapshot_path)
+                    .expect("incoming metadata")
+                    .len(),
+            )
+            .expect_err("ambiguous recovery state must reject snapshot installation");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "case {case}");
+            assert_eq!(
+                before,
+                read_operator_recovery_sync(&target_conn, identity)
+                    .expect("target recovery remains unchanged"),
+                "case {case} must not alter target authority"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_install_rejects_required_name_view_and_detaches_before_same_connection_retry() {
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let valid = directory.path().join("valid.sqlite");
+        let malformed = directory.path().join("view.sqlite");
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.blocking_lock();
+        let expected = expected_members();
+        initialize_schema(&source_conn, identity(), &expected).expect("source schema");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &valid).expect("build snapshot");
+        drop(source_conn);
+        std::fs::copy(&valid, &malformed).expect("copy malformed fixture");
+        let malformed_conn = Connection::open(&malformed).expect("open malformed fixture");
+        malformed_conn
+            .execute_batch(
+                "DROP TABLE leases; CREATE VIEW leases AS SELECT * FROM session_records;",
+            )
+            .expect("replace required table with same-column candidate view");
+        drop(malformed_conn);
+
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "view-rejection-retry".into(),
+        };
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.blocking_lock();
+        initialize_schema(&target_conn, identity(), &expected).expect("target schema");
+        let error = install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &malformed,
+            &meta,
+            "rejected-view.opc",
+            [0xA1; 32],
+            std::fs::metadata(&malformed)
+                .expect("malformed metadata")
+                .len(),
+        )
+        .expect_err("required-name view must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let attached: i64 = target_conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'consensus_incoming'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect attachment cleanup");
+        assert_eq!(0, attached);
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &valid,
+            &meta,
+            "accepted-after-view.opc",
+            [0xA2; 32],
+            std::fs::metadata(&valid).expect("valid metadata").len(),
+        )
+        .expect("same connection accepts a later valid snapshot");
+    }
+
+    #[test]
+    fn snapshot_install_rejects_sql_like_wildcard_shaped_incoming_trigger() {
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot = directory.path().join("trigger.sqlite");
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.blocking_lock();
+        let expected = expected_members();
+        initialize_schema(&source_conn, identity(), &expected).expect("source schema");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &snapshot)
+                .expect("build snapshot");
+        drop(source_conn);
+        let incoming = Connection::open(&snapshot).expect("open snapshot");
+        incoming
+            .execute_batch("CREATE TRIGGER sqlitex AFTER INSERT ON leases BEGIN SELECT 1; END;")
+            .expect("add wildcard-shaped incoming trigger");
+        drop(incoming);
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.blocking_lock();
+        initialize_schema(&target_conn, identity(), &expected).expect("target schema");
+        let before = ops::read_restore_scan_state_sync(&target_conn).expect("target restore state");
+        let error = install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot,
+            &opc_consensus::engine::SnapshotMeta {
+                last_log_id,
+                last_membership,
+                snapshot_id: "trigger-rejection".into(),
+            },
+            "rejected-trigger.opc",
+            [0xA3; 32],
+            std::fs::metadata(&snapshot)
+                .expect("snapshot metadata")
+                .len(),
+        )
+        .expect_err("wildcard-shaped incoming trigger must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            before,
+            ops::read_restore_scan_state_sync(&target_conn).expect("target remains unchanged")
+        );
+        let attached: i64 = target_conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'consensus_incoming'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect attachment cleanup");
+        assert_eq!(0, attached);
+    }
+
+    #[test]
+    fn snapshot_install_rejects_destination_trigger_before_commit() {
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot = directory.path().join("destination-trigger.sqlite");
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.blocking_lock();
+        let expected = expected_members();
+        initialize_schema(&source_conn, identity(), &expected).expect("source schema");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &snapshot)
+                .expect("build snapshot");
+        drop(source_conn);
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.blocking_lock();
+        initialize_schema(&target_conn, identity(), &expected).expect("target schema");
+        target_conn
+            .execute_batch(
+                "CREATE TRIGGER destination_install_fault AFTER INSERT ON leases BEGIN SELECT 1; END;",
+            )
+            .expect("add destination trigger");
+        let error = install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot,
+            &opc_consensus::engine::SnapshotMeta {
+                last_log_id,
+                last_membership,
+                snapshot_id: "destination-trigger-rejection".into(),
+            },
+            "destination-trigger.opc",
+            [0xA4; 32],
+            std::fs::metadata(&snapshot)
+                .expect("snapshot metadata")
+                .len(),
+        )
+        .expect_err("destination trigger must reject installation before commit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let snapshots: i64 = target_conn
+            .query_row("SELECT COUNT(*) FROM consensus_snapshot", [], |row| {
+                row.get(0)
+            })
+            .expect("snapshot metadata count");
+        assert_eq!(0, snapshots);
+    }
+
+    #[test]
+    fn snapshot_install_rejects_altered_source_and_destination_table_ddl() {
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let canonical = directory.path().join("canonical.sqlite");
+        let altered = directory.path().join("altered.sqlite");
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.blocking_lock();
+        let expected = expected_members();
+        initialize_schema(&source_conn, identity(), &expected).expect("source schema");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &canonical)
+                .expect("build canonical snapshot");
+        drop(source_conn);
+
+        std::fs::copy(&canonical, &altered).expect("copy altered fixture");
+        let altered_conn = Connection::open(&altered).expect("open altered fixture");
+        altered_conn
+            .execute_batch("ALTER TABLE leases ADD COLUMN untrusted_layout_marker INTEGER;")
+            .expect("alter source table layout");
+        drop(altered_conn);
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "altered-ddl-rejection".into(),
+        };
+
+        let source_target = SqliteSessionBackend::in_memory().expect("source target backend");
+        let source_target_conn = source_target.conn.blocking_lock();
+        initialize_schema(&source_target_conn, identity(), &expected)
+            .expect("source target schema");
+        let source_error = install_snapshot_database_sync(
+            &source_target_conn,
+            identity(),
+            &altered,
+            &meta,
+            "altered-source.opc",
+            [0xA5; 32],
+            std::fs::metadata(&altered)
+                .expect("altered source metadata")
+                .len(),
+        )
+        .expect_err("same-name source table with altered DDL must reject");
+        assert_eq!(io::ErrorKind::InvalidData, source_error.kind());
+
+        let destination_target =
+            SqliteSessionBackend::in_memory().expect("destination target backend");
+        let destination_target_conn = destination_target.conn.blocking_lock();
+        initialize_schema(&destination_target_conn, identity(), &expected)
+            .expect("destination target schema");
+        destination_target_conn
+            .execute_batch("ALTER TABLE leases ADD COLUMN untrusted_layout_marker INTEGER;")
+            .expect("alter destination table layout");
+        let destination_error = install_snapshot_database_sync(
+            &destination_target_conn,
+            identity(),
+            &canonical,
+            &meta,
+            "altered-destination.opc",
+            [0xA6; 32],
+            std::fs::metadata(&canonical)
+                .expect("canonical source metadata")
+                .len(),
+        )
+        .expect_err("same-name destination table with altered DDL must reject");
+        assert_eq!(io::ErrorKind::InvalidData, destination_error.kind());
+        let snapshots: i64 = destination_target_conn
+            .query_row("SELECT COUNT(*) FROM consensus_snapshot", [], |row| {
+                row.get(0)
+            })
+            .expect("read destination snapshot metadata");
+        assert_eq!(0, snapshots, "destination mutation must roll back");
+    }
+
     fn capped_cas_entry(
         index: u64,
         request_id: [u8; 16],
@@ -10541,23 +15798,25 @@ mod tests {
         record.payload = sealed_payload_for_record(&record, payload_len);
         Entry {
             log_id: log_id(index),
-            payload: EntryPayload::Normal(SessionConsensusCommand {
-                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
-                identity: identity(),
-                request_id: SessionConsensusRequestId::from_bytes(request_id),
-                logical_time: timestamp(u8::try_from(index).expect("test index")),
-                intent: SessionMutationIntent::CompareAndSet(Box::new(crate::CompareAndSet {
-                    key,
-                    lease,
-                    expected_generation,
-                    new_record: record,
-                })),
-            }),
+            payload: EntryPayload::Normal(DurableSessionConsensusCommand::current(
+                SessionConsensusCommand {
+                    schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                    identity: identity(),
+                    request_id: SessionConsensusRequestId::from_bytes(request_id),
+                    logical_time: timestamp(u8::try_from(index).expect("test index")),
+                    intent: SessionMutationIntent::CompareAndSet(Box::new(crate::CompareAndSet {
+                        key,
+                        lease,
+                        expected_generation,
+                        new_record: record,
+                    })),
+                },
+            )),
         }
     }
 
     #[tokio::test]
-    async fn consensus_core_retains_the_capped_profile_across_reopen_and_apply() {
+    async fn consensus_core_retains_the_capped_profile_and_rejects_live_reentry() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let snapshots = tempfile::tempdir().expect("snapshot directory");
         let members = expected_members();
@@ -10577,7 +15836,7 @@ mod tests {
         assert_eq!(advertised, core.caps);
         assert_eq!(1_048_576, core.caps.max_value_bytes);
 
-        let reopened = SqliteConsensusCore::initialize(
+        let reentry_error = match SqliteConsensusCore::initialize(
             &backend,
             snapshots.path().join("snapshots"),
             identity(),
@@ -10587,14 +15846,20 @@ mod tests {
             None,
         )
         .await
-        .expect("reopen consensus core");
-        assert_eq!(advertised, reopened.caps);
+        {
+            Ok(_) => panic!("a live consensus backend cannot be initialized twice"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            SessionConsensusStorageError::BackendUnavailable,
+            reentry_error
+        );
 
-        let conn = reopened.conn.lock().await;
+        let conn = core.conn.lock().await;
         let applied = apply_entries_sync(
             &conn,
             identity(),
-            &reopened.caps,
+            &core.caps,
             vec![
                 membership_entry(),
                 acquire_entry(1, [0xA1; 16], "consensus-cap-owner"),
@@ -10609,15 +15874,15 @@ mod tests {
         let exact = apply_entries_sync(
             &conn,
             identity(),
-            &reopened.caps,
-            vec![capped_cas_entry(
+            &core.caps,
+            vec![with_legacy_admission_revision(capped_cas_entry(
                 2,
                 [0xA2; 16],
                 lease.clone(),
                 None,
                 crate::Generation::new(1),
                 advertised.max_value_bytes,
-            )],
+            ))],
         )
         .expect("exact consensus cap applies");
         assert!(matches!(
@@ -10642,15 +15907,15 @@ mod tests {
         let rejected = apply_entries_sync(
             &conn,
             identity(),
-            &reopened.caps,
-            vec![capped_cas_entry(
+            &core.caps,
+            vec![with_legacy_admission_revision(capped_cas_entry(
                 3,
                 [0xA3; 16],
                 lease,
                 Some(crate::Generation::new(1)),
                 crate::Generation::new(2),
                 advertised.max_value_bytes + 1,
-            )],
+            ))],
         )
         .expect("oversized command returns a deterministic rejection");
         assert!(matches!(
@@ -10688,21 +15953,25 @@ mod tests {
     ) -> Entry<SessionRaftTypeConfig> {
         Entry {
             log_id: log_id(index),
-            payload: EntryPayload::Normal(SessionConsensusCommand {
-                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
-                identity: identity(),
-                request_id: SessionConsensusRequestId::from_bytes(request_id),
-                logical_time: timestamp(u8::try_from(index).expect("test index fits timestamp")),
-                intent: SessionMutationIntent::Authorized {
-                    origin,
-                    authority_identity,
-                    mutation: Box::new(SessionMutationIntent::AcquireLease {
-                        key: key(),
-                        owner: OwnerId::new("authority-owner").expect("owner"),
-                        ttl: Duration::from_secs(300),
-                    }),
+            payload: EntryPayload::Normal(DurableSessionConsensusCommand::legacy(
+                SessionConsensusCommand {
+                    schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                    identity: identity(),
+                    request_id: SessionConsensusRequestId::from_bytes(request_id),
+                    logical_time: timestamp(
+                        u8::try_from(index).expect("test index fits timestamp"),
+                    ),
+                    intent: SessionMutationIntent::Authorized {
+                        origin,
+                        authority_identity,
+                        mutation: Box::new(SessionMutationIntent::AcquireLease {
+                            key: key(),
+                            owner: OwnerId::new("authority-owner").expect("owner"),
+                            ttl: Duration::from_secs(300),
+                        }),
+                    },
                 },
-            }),
+            )),
         }
     }
 
@@ -10746,7 +16015,7 @@ mod tests {
             logical_time,
             1,
         );
-        let command = SessionConsensusCommand {
+        let command = DurableSessionConsensusCommand::current(SessionConsensusCommand {
             schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
             identity: identity(),
             request_id: SessionConsensusRequestId::from_bytes([0x44; 16]),
@@ -10769,9 +16038,9 @@ mod tests {
                     payload: crate::EncryptedSessionPayload::new(b"payload"),
                 },
             })),
-        };
+        });
 
-        let error = validate_command_for_log(&command, identity())
+        let error = validate_command_for_log_with_cap(&command, identity(), true)
             .expect_err("follower log admission must reject the leader command");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(
@@ -11826,6 +17095,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pristine_standalone_candidate_probe_is_narrow_and_fail_closed() {
+        let directory = tempfile::tempdir().expect("directory");
+        let storage_identity = identity();
+        let transition_id = [0x43; MEMBERSHIP_TRANSITION_ID_BYTES];
+        let transition_digest = [0x44; 32];
+
+        let pristine = SqliteSessionBackend::open(directory.path().join("pristine.sqlite"))
+            .expect("open pristine candidate");
+        assert_eq!(
+            Ok(false),
+            pristine
+                .provisional_consensus_candidate_is_cancelled(
+                    storage_identity,
+                    member(10),
+                    transition_id,
+                    transition_digest,
+                )
+                .await
+        );
+        {
+            let conn = pristine.conn.lock().await;
+            conn.execute(
+                "INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp) VALUES (1, 'occupied', '{}', '1970-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("add standalone authority");
+        }
+        assert_eq!(
+            Err(MembershipScopeMutationError::CorruptState),
+            pristine
+                .provisional_consensus_candidate_is_cancelled(
+                    storage_identity,
+                    member(10),
+                    transition_id,
+                    transition_digest,
+                )
+                .await
+        );
+
+        let partial = SqliteSessionBackend::open(directory.path().join("partial.sqlite"))
+            .expect("open partial candidate");
+        {
+            let conn = partial.conn.lock().await;
+            conn.execute_batch("CREATE TABLE consensus_partial (value INTEGER NOT NULL)")
+                .expect("add partial consensus footprint");
+        }
+        assert_eq!(
+            Err(MembershipScopeMutationError::CorruptState),
+            partial
+                .provisional_consensus_candidate_is_cancelled(
+                    storage_identity,
+                    member(10),
+                    transition_id,
+                    transition_digest,
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
     async fn aborted_candidate_reuse_requires_exact_durable_abort_proof() {
         let directory = tempfile::tempdir().expect("directory");
         let database = directory.path().join("aborted-candidate.sqlite");
@@ -12654,6 +17983,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_install_rejects_source_log_authority_and_retains_destination_vote() {
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.lock().await;
+        let identity = identity();
+        let expected = expected_members();
+        initialize_schema(&source_conn, identity, &expected).expect("source consensus schema");
+        apply_entries_sync(
+            &source_conn,
+            identity,
+            &source.caps,
+            vec![membership_entry()],
+        )
+        .expect("apply source membership");
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("source.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity, &snapshot_path)
+                .expect("build source snapshot");
+        drop(source_conn);
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "destination-vote-retained".into(),
+        };
+
+        let snapshot_conn = Connection::open(&snapshot_path).expect("open source snapshot");
+        for table in [
+            "consensus_vote",
+            "consensus_committed",
+            "consensus_purged",
+            "consensus_log",
+            "consensus_snapshot",
+        ] {
+            assert_eq!(
+                0_i64,
+                snapshot_conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("read empty source-local authority table"),
+                "incoming snapshot source must exclude {table}"
+            );
+        }
+        drop(snapshot_conn);
+
+        // Keep this target file-backed: snapshot ATTACH must remain compatible
+        // with the portable live-WAL constructor while still binding the
+        // incoming source through its Linux descriptor-pinned boundary.
+        let target = SqliteSessionBackend::open(directory.path().join("target.sqlite"))
+            .expect("file-backed target backend");
+        let target_conn = target.conn.lock().await;
+        initialize_schema(&target_conn, identity, &expected).expect("target consensus schema");
+        save_vote_sync(&target_conn, identity, &Vote::new_committed(7, node_id()))
+            .expect("persist target-local vote");
+        let byte_length = std::fs::metadata(&snapshot_path)
+            .expect("snapshot metadata")
+            .len();
+        install_snapshot_database_sync(
+            &target_conn,
+            identity,
+            &snapshot_path,
+            &meta,
+            "destination-vote-retained.opc",
+            [0x7e; 32],
+            byte_length,
+        )
+        .expect("install valid incoming snapshot into target with local vote");
+        assert_eq!(
+            Some(Vote::new_committed(7, node_id())),
+            read_vote_sync(&target_conn, identity).expect("read retained target-local vote")
+        );
+    }
+
+    #[tokio::test]
     async fn node_local_intent_fault_aborts_apply_without_advancing_state() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.lock().await;
@@ -12668,7 +18071,12 @@ mod tests {
         let baseline_globals: Vec<(String, i64)> = conn
             .prepare("SELECT key, val FROM lease_globals ORDER BY key")
             .expect("prepare globals")
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| {
+                Ok::<(String, i64), rusqlite::Error>((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                ))
+            })
             .expect("query globals")
             .collect::<rusqlite::Result<_>>()
             .expect("collect globals");
@@ -12728,7 +18136,9 @@ mod tests {
         let globals: Vec<(String, i64)> = conn
             .prepare("SELECT key, val FROM lease_globals ORDER BY key")
             .expect("prepare globals")
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .expect("query globals")
             .collect::<rusqlite::Result<_>>()
             .expect("collect globals");
@@ -14497,5 +19907,851 @@ mod tests {
             verify_pinned_snapshot_descriptor(&pinned, &retained)
                 .expect("retained descriptor must still be A before mutation");
         }
+    }
+
+    fn seed_file_backed_consensus(path: &std::path::Path) {
+        let backend = SqliteSessionBackend::open(path).expect("fresh backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("fresh consensus schema");
+    }
+
+    #[test]
+    fn fresh_file_backed_production_initializer_seeds_uncommitted_admission() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let path = directory.path().join("fresh-production.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("fresh backend");
+        let conn = backend.conn.blocking_lock();
+        let members = expected_members();
+        let bindings = test_member_bindings(&members);
+        initialize_schema_with_storage_anchor_and_pending_and_bindings(
+            &conn,
+            None,
+            identity(),
+            &members,
+            &bindings,
+            None,
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .expect("fresh production consensus schema");
+        let row: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT configuration_epoch, admission_revision, strict_activation_index, cutover_committed FROM consensus_command_admission WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read fresh admission row");
+        assert_eq!(
+            row,
+            (
+                epoch_i64(identity()).expect("identity epoch"),
+                COMMAND_ADMISSION_REVISION,
+                0,
+                0,
+            )
+        );
+    }
+
+    type ConsensusSchemaEvidence = Vec<(String, String)>;
+    type ConsensusTableCounts = Vec<(String, Option<i64>)>;
+
+    fn consensus_reopen_evidence(
+        path: &std::path::Path,
+    ) -> (ConsensusSchemaEvidence, ConsensusTableCounts) {
+        let conn = Connection::open(path).expect("inspect database");
+        let schema = conn
+            .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .expect("schema query")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("schema rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect schema");
+        let counts = schema
+            .iter()
+            .map(|(table, _)| {
+                let count = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .ok();
+                (table.clone(), count)
+            })
+            .collect();
+        (schema, counts)
+    }
+
+    fn assert_file_backed_consensus_initializer_rejects_without_repair(
+        path: &std::path::Path,
+        case: &str,
+    ) {
+        let before = consensus_reopen_evidence(path);
+        let backend = SqliteSessionBackend::open(path)
+            .unwrap_or_else(|error| panic!("raw backend must admit {case}: {error}"));
+        let conn = backend.conn.blocking_lock();
+        assert!(
+            initialize_schema(&conn, identity(), &expected_members()).is_err(),
+            "consensus initializer must reject corrupt consensus row authority for {case}"
+        );
+        drop(conn);
+        drop(backend);
+        assert_eq!(
+            consensus_reopen_evidence(path),
+            before,
+            "failed consensus initialization must not repair schema or singleton data for {case}"
+        );
+    }
+
+    fn assert_file_backed_raw_reopen_rejects_without_repair(path: &std::path::Path, case: &str) {
+        let before = consensus_reopen_evidence(path);
+        assert!(
+            SqliteSessionBackend::open(path).is_err(),
+            "raw backend must reject an incomplete consensus schema inventory for {case}"
+        );
+        assert_eq!(
+            consensus_reopen_evidence(path),
+            before,
+            "failed raw reopen must not repair schema or singleton data for {case}"
+        );
+    }
+
+    #[test]
+    fn file_backed_reopen_rejects_ambiguous_operator_recovery_digests_without_repair() {
+        for (case, mutation) in [
+            (
+                "pristine-epoch-with-plan",
+                "UPDATE consensus_operator_recovery SET recovery_epoch = 0, last_plan_digest = CAST(X'01' || zeroblob(31) AS BLOB) WHERE singleton = 1",
+            ),
+            (
+                "recovered-epoch-without-plan",
+                "UPDATE consensus_operator_recovery SET recovery_epoch = 1, last_plan_digest = zeroblob(32) WHERE singleton = 1",
+            ),
+            (
+                "pending-workflow-without-plan",
+                "UPDATE consensus_operator_recovery SET pending_epoch = 1, pending_plan_digest = zeroblob(32) WHERE singleton = 1",
+            ),
+        ] {
+            let directory = tempfile::tempdir().expect("database directory");
+            let path = directory.path().join("consensus.sqlite");
+            seed_file_backed_consensus(&path);
+            let conn = Connection::open(&path).expect("mutate stopped database");
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+                .expect("allow corrupt recovery fixture");
+            conn.execute(mutation, [])
+                .unwrap_or_else(|error| panic!("inject {case} recovery corruption: {error}"));
+            drop(conn);
+
+            assert_file_backed_consensus_initializer_rejects_without_repair(&path, case);
+        }
+    }
+
+    #[test]
+    fn file_backed_reopen_never_repairs_missing_consensus_authority_evidence() {
+        let mut schema_cases: Vec<(&str, String)> = CONSENSUS_BASE_TABLES
+            .iter()
+            .chain(CONSENSUS_UPGRADE_TABLES)
+            .map(|table| (*table, format!("DROP TABLE {table}")))
+            .collect();
+        schema_cases.extend([
+            (
+                "authority-profile-column",
+                "ALTER TABLE consensus_identity DROP COLUMN authority_profile".into(),
+            ),
+            (
+                "placement-policy-column",
+                "ALTER TABLE consensus_identity DROP COLUMN fixed_placement_policy".into(),
+            ),
+            (
+                "recovery-cursor-column",
+                "ALTER TABLE consensus_operator_recovery DROP COLUMN watch_cursor_invalidation_floor".into(),
+            ),
+            (
+                "admission-column",
+                "ALTER TABLE consensus_command_admission DROP COLUMN cutover_committed".into(),
+            ),
+        ]);
+        for (case, mutation) in schema_cases {
+            let directory = tempfile::tempdir().expect("database directory");
+            let path = directory.path().join("consensus.sqlite");
+            seed_file_backed_consensus(&path);
+            let conn = Connection::open(&path).expect("mutate stopped database");
+            conn.execute_batch("PRAGMA foreign_keys = OFF")
+                .expect("allow malformed authority corruption fixture");
+            conn.execute_batch(&mutation).unwrap_or_else(|error| {
+                panic!("fixture mutation {case} must be supported: {error}")
+            });
+            drop(conn);
+            assert_file_backed_raw_reopen_rejects_without_repair(&path, case);
+        }
+
+        for (case, mutation) in [
+            ("identity-singleton", "DELETE FROM consensus_identity"),
+            ("machine-singleton", "DELETE FROM consensus_machine"),
+            ("membership-singleton", "DELETE FROM consensus_membership"),
+            (
+                "admission-singleton",
+                "DELETE FROM consensus_command_admission",
+            ),
+            (
+                "recovery-singleton",
+                "DELETE FROM consensus_operator_recovery",
+            ),
+            ("scope-singleton", "DELETE FROM consensus_membership_scope"),
+        ] {
+            let directory = tempfile::tempdir().expect("database directory");
+            let path = directory.path().join("consensus.sqlite");
+            seed_file_backed_consensus(&path);
+            let conn = Connection::open(&path).expect("mutate stopped database");
+            conn.execute_batch("PRAGMA foreign_keys = OFF")
+                .expect("allow malformed authority corruption fixture");
+            conn.execute_batch(mutation).unwrap_or_else(|error| {
+                panic!("fixture mutation {case} must be supported: {error}")
+            });
+            drop(conn);
+
+            let backend = SqliteSessionBackend::open(&path).unwrap_or_else(|error| {
+                panic!("raw schema-only reopen must admit exact DDL with missing {case}: {error}")
+            });
+            drop(backend);
+            assert_file_backed_consensus_initializer_rejects_without_repair(&path, case);
+        }
+    }
+
+    #[test]
+    fn file_backed_raw_reopen_rejects_exact_ddl_and_extra_object_mutations() {
+        for (case, mutation) in [
+            (
+                "ddl-change",
+                "ALTER TABLE consensus_vote ADD COLUMN unreviewed INTEGER;",
+            ),
+            (
+                "extra-object",
+                "CREATE VIEW consensus_unreviewed AS SELECT 1 AS value;",
+            ),
+        ] {
+            let directory = tempfile::tempdir().expect("database directory");
+            let path = directory.path().join("consensus.sqlite");
+            seed_file_backed_consensus(&path);
+            let conn = Connection::open(&path).expect("open stopped database");
+            conn.execute_batch(mutation)
+                .unwrap_or_else(|error| panic!("install {case} schema mutation: {error}"));
+            drop(conn);
+
+            assert_file_backed_raw_reopen_rejects_without_repair(&path, case);
+        }
+    }
+
+    #[test]
+    fn file_backed_complete_frozen_base_schema_migrates() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let path = directory.path().join("frozen-base.sqlite");
+        seed_file_backed_consensus(&path);
+        let conn = Connection::open(&path).expect("open stopped database");
+        for table in CONSENSUS_UPGRADE_TABLES {
+            conn.execute_batch(&format!("DROP TABLE {table}"))
+                .expect("remove current add-on table");
+        }
+        conn.execute_batch(
+            "ALTER TABLE consensus_identity DROP COLUMN fixed_placement_policy;
+             ALTER TABLE consensus_identity DROP COLUMN authority_profile;",
+        )
+        .expect("restore frozen identity columns");
+        drop(conn);
+
+        let backend = SqliteSessionBackend::open(&path).expect("open frozen local database");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members())
+            .expect("complete frozen base schema migrates");
+        assert_eq!(
+            classify_consensus_reopen_schema(&conn).expect("classify frozen-base migration output"),
+            ConsensusReopenSchema::HistoricalBaseMigrated,
+            "frozen-base migration must preserve its reviewed add-on recovery DDL",
+        );
+        drop(conn);
+        drop(backend);
+
+        let reopened = SqliteSessionBackend::open(&path)
+            .expect("raw reopen admits the exact frozen-base migration output");
+        let conn = reopened.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members())
+            .expect("restart validates the frozen-base migration output");
+    }
+
+    #[test]
+    fn file_backed_immediate_predecessor_without_receipt_head_classifies_and_migrates() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let path = directory.path().join("immediate-predecessor.sqlite");
+        seed_file_backed_consensus(&path);
+        let conn = Connection::open(&path).expect("open stopped database");
+        downgrade_to_immediate_predecessor_fixture_sync(&conn)
+            .expect("install exact predecessor schema");
+        let has_receipt_head: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_machine') WHERE name = 'last_receipt_digest')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect predecessor machine schema");
+        assert!(
+            !has_receipt_head,
+            "the frozen predecessor did not persist a receipt-chain head"
+        );
+        assert!(
+            is_immediate_predecessor_schema(&conn).expect("classify predecessor"),
+            "fixture must model the exact reviewed predecessor manifest"
+        );
+        assert!(
+            read_immediate_predecessor_machine_sync(&conn, identity()).is_ok(),
+            "the predecessor-specific reader must not project absent receipt authority"
+        );
+        assert!(
+            read_machine_sync(&conn, identity()).is_err(),
+            "the current reader must not accept the predecessor machine layout"
+        );
+        drop(conn);
+
+        let backend = SqliteSessionBackend::open(&path).expect("open predecessor database");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members())
+            .expect("immediate predecessor schema migrates");
+    }
+
+    #[test]
+    fn file_backed_pre_receipt_and_operator_recovery_variants_classify_and_migrate() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let path = directory.path().join("pre-receipt.sqlite");
+        seed_file_backed_consensus(&path);
+        let conn = Connection::open(&path).expect("open stopped database");
+        let machine: (i64, i64, i64, Vec<u8>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT singleton, configuration_epoch, application_sequence, last_digest, logical_time, watch_sequence FROM consensus_machine WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("read current machine row");
+        conn.execute_batch(
+            "DROP TABLE consensus_request_outcomes;
+             DROP TABLE consensus_machine;",
+        )
+        .expect("remove receipt-chain tables");
+        conn.execute_batch(IMMEDIATE_PREDECESSOR_CONSENSUS_MACHINE_SCHEMA)
+            .expect("install pre-receipt machine schema");
+        conn.execute_batch(PRE_RECEIPT_CHAIN_CONSENSUS_REQUEST_OUTCOMES_SCHEMA)
+            .expect("install pre-receipt outcome schema");
+        conn.execute(
+            "INSERT INTO consensus_machine (singleton, configuration_epoch, application_sequence, last_digest, logical_time, watch_sequence) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![machine.0, machine.1, machine.2, machine.3, machine.4, machine.5],
+        )
+        .expect("restore pre-receipt machine row");
+        drop(conn);
+
+        let backend = SqliteSessionBackend::open(&path)
+            .expect("raw open admits the exact pre-receipt inventory");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members())
+            .expect("pre-receipt inventory migrates");
+        drop(conn);
+        drop(backend);
+        assert!(SqliteSessionBackend::open(&path).is_ok());
+
+        for (case, schema) in [
+            ("add-on", ConsensusReopenSchema::OperatorRecoveryAddOn),
+            (
+                "cursor-migrated",
+                ConsensusReopenSchema::OperatorRecoveryCursorMigrated,
+            ),
+            (
+                "pre-high-water",
+                ConsensusReopenSchema::OperatorRecoveryPreHighWater,
+            ),
+            ("migrated", ConsensusReopenSchema::OperatorRecoveryMigrated),
+        ] {
+            let directory = tempfile::tempdir().expect("database directory");
+            let path = directory.path().join(format!("operator-{case}.sqlite"));
+            seed_file_backed_consensus(&path);
+            let conn = Connection::open(&path).expect("open stopped database");
+            match schema {
+                ConsensusReopenSchema::OperatorRecoveryAddOn => {
+                    replace_operator_recovery_schema(&conn, |conn| {
+                        install_recovery_validation_schema_sync(conn, true)
+                    })
+                }
+                ConsensusReopenSchema::OperatorRecoveryCursorMigrated => {
+                    replace_operator_recovery_schema(&conn, |conn| {
+                        install_cursor_migrated_operator_recovery_validation_schema_sync(conn)
+                    })
+                }
+                ConsensusReopenSchema::OperatorRecoveryPreHighWater => {
+                    replace_operator_recovery_schema(&conn, |conn| {
+                        install_pre_high_water_operator_recovery_validation_schema_sync(conn)
+                    })
+                }
+                ConsensusReopenSchema::OperatorRecoveryMigrated => {
+                    replace_operator_recovery_schema(&conn, |conn| {
+                        install_migrated_operator_recovery_validation_schema_sync(conn)
+                    })
+                }
+                _ => unreachable!(),
+            }
+            .unwrap_or_else(|error| panic!("install {case} recovery schema: {error}"));
+            conn.execute(
+                "INSERT INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor) VALUES (1, ?1, 0, ?2, NULL, NULL, 0)",
+                params![
+                    epoch_i64(identity()).expect("identity epoch"),
+                    [0_u8; 32].as_slice(),
+                ],
+            )
+            .unwrap_or_else(|error| panic!("seed {case} recovery singleton: {error}"));
+            drop(conn);
+
+            let backend = SqliteSessionBackend::open(&path)
+                .unwrap_or_else(|error| panic!("raw open admits {case} schema: {error}"));
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members())
+                .unwrap_or_else(|error| panic!("{case} recovery schema migrates: {error}"));
+            assert_eq!(
+                classify_consensus_reopen_schema(&conn).unwrap_or_else(|error| panic!(
+                    "classify migrated {case} recovery schema: {error}"
+                )),
+                schema.expected_schema_after_initialization(),
+                "initializer must produce the reviewed {case} recovery schema output",
+            );
+            drop(conn);
+            drop(backend);
+            assert!(
+                SqliteSessionBackend::open(&path).is_ok(),
+                "raw reopen admits migrated {case} recovery schema"
+            );
+        }
+    }
+
+    #[test]
+    fn file_backed_hybrid_predecessor_schema_is_rejected_without_repair() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let path = directory.path().join("hybrid-predecessor.sqlite");
+        seed_file_backed_consensus(&path);
+        let conn = Connection::open(&path).expect("open stopped database");
+        conn.execute_batch(
+            "DROP TABLE consensus_command_admission;
+             DROP TABLE consensus_request_outcomes;",
+        )
+        .expect("remove current admission and receipt tables");
+        conn.execute_batch(LEGACY_CONSENSUS_REQUEST_OUTCOMES_SCHEMA)
+            .expect("install predecessor receipt table only");
+        assert_eq!(
+            classify_consensus_reopen_schema(&conn),
+            Err(SessionConsensusStorageError::CorruptState),
+            "a current high-water authority table cannot be mistaken for the predecessor"
+        );
+        drop(conn);
+
+        assert_file_backed_raw_reopen_rejects_without_repair(&path, "hybrid-predecessor");
+    }
+
+    fn legacy_payload_too_large_entry() -> Entry<SessionRaftTypeConfig> {
+        let legacy_lease = crate::LeaseGuard::new(
+            key(),
+            OwnerId::new("frozen-legacy-cap-owner").expect("owner"),
+            crate::FenceToken::new(1),
+            timestamp(1),
+            timestamp(2),
+            1,
+        );
+        let mut entry = capped_cas_entry(
+            1,
+            [0xE1; 16],
+            legacy_lease,
+            None,
+            crate::Generation::new(1),
+            1_048_577,
+        );
+        let EntryPayload::Normal(command) = &mut entry.payload else {
+            unreachable!("capped CAS fixture is a normal command");
+        };
+        *command = DurableSessionConsensusCommand::legacy((**command).clone());
+        entry
+    }
+
+    #[test]
+    fn retained_legacy_payload_compatibility_is_one_over_only() {
+        let exact_one_over = match legacy_payload_too_large_entry().payload {
+            EntryPayload::Normal(command) => command,
+            _ => panic!("legacy capped CAS fixture is normal"),
+        };
+        validate_command_for_log_with_cap(&exact_one_over, identity(), false)
+            .expect("the frozen base one-over rejection remains readable");
+        assert!(matches!(
+            rederive_legacy_payload_too_large_result(&exact_one_over, identity()),
+            Ok(Err(StoreError::PayloadTooLarge {
+                actual: BASE_ADMITTED_LEGACY_PAYLOAD_BYTES,
+                max: BASE_ADVERTISED_LEGACY_PAYLOAD_MAX_BYTES,
+            }))
+        ));
+
+        for payload_len in [
+            BASE_ADMITTED_LEGACY_PAYLOAD_BYTES + 1,
+            BASE_ADMITTED_LEGACY_PAYLOAD_BYTES + 1_024,
+        ] {
+            let mut overage = exact_one_over.clone();
+            let SessionMutationIntent::CompareAndSet(operation) = &mut overage.intent else {
+                panic!("legacy capped CAS fixture intent changed");
+            };
+            let payload = sealed_payload_for_record(&operation.new_record, payload_len);
+            operation.new_record.payload = payload;
+            for validation in [
+                validate_command_for_log_with_cap(&overage, identity(), false),
+                rederive_legacy_payload_too_large_result(&overage, identity()).map(|_| ()),
+            ] {
+                let error = validation
+                    .expect_err("legacy compatibility must reject every non-base overage");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+        }
+
+        let nested = DurableSessionConsensusCommand::legacy(SessionConsensusCommand {
+            intent: SessionMutationIntent::Authorized {
+                origin: member(7),
+                authority_identity: identity(),
+                mutation: Box::new(SessionMutationIntent::Authorized {
+                    origin: member(7),
+                    authority_identity: identity(),
+                    mutation: Box::new(exact_one_over.intent.clone()),
+                }),
+            },
+            ..(*exact_one_over).clone()
+        });
+        let error = validate_command_for_log_with_cap(&nested, identity(), false)
+            .expect_err("legacy compatibility must not admit nested follower commands");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "session consensus authorized intent nesting is invalid"
+        );
+    }
+
+    /// Make a file that is byte-for-byte shaped like the reviewed immediate
+    /// predecessor where it matters: a four-column outcome table and a
+    /// retained revision-zero command whose JSON predates the admission field.
+    /// Its one outcome is the only legacy response the new migration may
+    /// derive without looking at mutable state.
+    fn seed_file_backed_frozen_legacy_payload_too_large(
+        path: &std::path::Path,
+    ) -> DurableSessionConsensusCommand {
+        let backend = SqliteSessionBackend::open(path).expect("fresh backend");
+        let caps = backend.consensus_capabilities();
+        let (command, response) = {
+            let conn = backend.conn.blocking_lock();
+            let members = expected_members();
+            let bindings = test_member_bindings(&members);
+            initialize_schema_with_storage_anchor_and_pending_and_bindings(
+                &conn,
+                None,
+                identity(),
+                &members,
+                &bindings,
+                None,
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .expect("fresh production consensus schema");
+            let oversized = legacy_payload_too_large_entry();
+            let command = match &oversized.payload {
+                EntryPayload::Normal(command) => command.clone(),
+                _ => unreachable!("capped CAS fixture is a normal command"),
+            };
+            let entries = vec![membership_entry(), oversized];
+            append_logs_sync(&conn, identity(), &entries).expect("append retained legacy log");
+            let applied = apply_entries_sync(&conn, identity(), &caps, entries)
+                .expect("apply retained legacy payload rejection");
+            assert!(matches!(
+                applied.responses.as_slice(),
+                [
+                    _,
+                    SessionConsensusResponse {
+                        result: Err(StoreError::PayloadTooLarge {
+                            actual: 1_048_577,
+                            max: 1_048_576,
+                        }),
+                        ..
+                    }
+                ]
+            ));
+            (command, applied.responses[1].clone())
+        };
+        drop(backend);
+
+        let conn = Connection::open(path).expect("open stopped legacy database");
+        let mut frozen_entry: serde_json::Value = conn
+            .query_row(
+                "SELECT entry_json FROM consensus_log WHERE log_index = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map(|encoded: Vec<u8>| {
+                serde_json::from_slice(&encoded).expect("decode frozen legacy log entry")
+            })
+            .expect("read retained legacy log entry");
+        frozen_entry
+            .as_object_mut()
+            .expect("entry JSON object")
+            .get_mut("payload")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|payload| payload.get_mut("Normal"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("normal command JSON object")
+            .remove("admission_revision")
+            .expect("frozen command has admission revision before omission");
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 1",
+            [serde_json::to_vec(&frozen_entry).expect("encode frozen legacy log entry")],
+        )
+        .expect("remove revision from retained legacy log");
+        downgrade_to_immediate_predecessor_fixture_sync(&conn)
+            .expect("install exact frozen predecessor schema");
+        conn.execute(
+            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, response_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                command.request_id.as_bytes(),
+                epoch_i64(identity()).expect("identity epoch"),
+                payload_digest(&command).expect("legacy payload digest").as_slice(),
+                encode_json(&response).expect("encode frozen legacy response"),
+            ],
+        )
+        .expect("seed frozen legacy outcome");
+        assert!(
+            is_immediate_predecessor_schema(&conn).expect("classify frozen predecessor"),
+            "fixture must remain the exact immediate predecessor manifest"
+        );
+        command
+    }
+
+    fn assert_file_backed_legacy_outcome_requires_recovery_without_repair(path: &std::path::Path) {
+        let before = consensus_reopen_evidence(path);
+        let backend = SqliteSessionBackend::open(path).expect("open frozen local database");
+        let conn = backend.conn.blocking_lock();
+        assert_eq!(
+            initialize_schema(&conn, identity(), &expected_members()),
+            Err(SessionConsensusStorageError::RecoveryRequired),
+            "unqualified legacy replay state must require operator recovery"
+        );
+        drop(conn);
+        drop(backend);
+        assert_eq!(
+            consensus_reopen_evidence(path),
+            before,
+            "failed legacy migration must not publish a partial schema repair"
+        );
+    }
+
+    #[test]
+    fn file_backed_retained_legacy_payload_too_large_migrates_then_supports_duplicate_marker_and_follower(
+    ) {
+        let directory = tempfile::tempdir().expect("database directory");
+        let path = directory
+            .path()
+            .join("frozen-retained-payload-too-large.sqlite");
+        let legacy_command = seed_file_backed_frozen_legacy_payload_too_large(&path);
+
+        let backend = SqliteSessionBackend::open(&path).expect("open frozen predecessor");
+        let caps = backend.consensus_capabilities();
+        {
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members())
+                .expect("complete retained payload rejection migrates");
+            let (_, migrated) = read_outcome_sync(&conn, identity(), legacy_command.request_id)
+                .expect("read migrated receipt")
+                .expect("migrated payload rejection receipt");
+            assert!(matches!(
+                migrated.result,
+                Err(StoreError::PayloadTooLarge {
+                    actual: 1_048_577,
+                    max: 1_048_576,
+                })
+            ));
+            assert_eq!(
+                read_log_range_sync(&conn, identity(), 0, None, None)
+                    .expect("read full retained prefix")
+                    .iter()
+                    .map(|entry| entry.log_id.index)
+                    .collect::<Vec<_>>(),
+                vec![0, 1],
+            );
+            assert_eq!(
+                read_limited_log_range_sync(&conn, identity(), 0, 2, 1)
+                    .expect("read limited retained prefix")
+                    .iter()
+                    .map(|entry| entry.log_id.index)
+                    .collect::<Vec<_>>(),
+                vec![0],
+            );
+
+            let duplicate = Entry {
+                log_id: log_id(2),
+                payload: EntryPayload::Normal(legacy_command.clone()),
+            };
+            append_logs_sync(&conn, identity(), std::slice::from_ref(&duplicate))
+                .expect("follower appends duplicate legacy command");
+            let duplicate_applied = apply_entries_sync(&conn, identity(), &caps, vec![duplicate])
+                .expect("duplicate retained outcome applies idempotently");
+            assert_eq!(
+                duplicate_applied.responses.as_slice(),
+                std::slice::from_ref(&migrated)
+            );
+
+            let marker = Entry {
+                log_id: log_id(3),
+                payload: EntryPayload::Normal(DurableSessionConsensusCommand::current(
+                    SessionConsensusCommand {
+                    schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                    identity: identity(),
+                    request_id: SessionConsensusRequestId::from_bytes(
+                        crate::consensus::SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID,
+                    ),
+                    logical_time: crate::consensus::types::command_admission_cutover_logical_time(),
+                    intent: SessionMutationIntent::AdvanceLogicalTime,
+                },
+                )),
+            };
+            append_logs_sync(&conn, identity(), std::slice::from_ref(&marker))
+                .expect("append current admission marker");
+            apply_entries_sync(&conn, identity(), &caps, vec![marker])
+                .expect("apply current admission marker");
+            assert_eq!(
+                read_command_admission_sync(&conn, identity())
+                    .expect("read committed admission marker")
+                    .strict_activation_index,
+                4,
+            );
+
+            let follower = with_current_admission_revision(topology_entry_at(
+                4,
+                0xE4,
+                SessionMutationIntent::AdvanceLogicalTime,
+            ));
+            append_logs_sync(&conn, identity(), std::slice::from_ref(&follower))
+                .expect("follower appends current command after marker");
+            let follower_applied = apply_entries_sync(&conn, identity(), &caps, vec![follower])
+                .expect("follower applies current command after marker");
+            assert!(matches!(
+                follower_applied.responses.as_slice(),
+                [SessionConsensusResponse {
+                    result: Ok(SessionMutationOutcome::Unit),
+                    sequence: 3,
+                    raft_log_index: 4,
+                    ..
+                }]
+            ));
+        }
+        drop(backend);
+
+        let reopened = SqliteSessionBackend::open(&path).expect("restart migrated predecessor");
+        let conn = reopened.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members())
+            .expect("restart validates migrated receipt chain");
+        assert!(
+            read_command_admission_sync(&conn, identity())
+                .expect("read restarted admission boundary")
+                .cutover_committed
+        );
+    }
+
+    #[test]
+    fn file_backed_legacy_payload_too_large_migration_rejects_swizzled_or_compacted_history_without_repair(
+    ) {
+        for case in ["unit", "state-dependent-error", "missing-log"] {
+            let directory = tempfile::tempdir().expect("database directory");
+            let path = directory
+                .path()
+                .join(format!("frozen-legacy-{case}.sqlite"));
+            let command = seed_file_backed_frozen_legacy_payload_too_large(&path);
+            let conn = Connection::open(&path).expect("open frozen predecessor");
+            match case {
+                "unit" | "state-dependent-error" => {
+                    let result = if case == "unit" {
+                        Ok(SessionMutationOutcome::Unit)
+                    } else {
+                        Err(StoreError::StaleFence)
+                    };
+                    let digest = command
+                        .calculate_applied_result_digest(
+                            1,
+                            SessionConsensusEntryDigest::GENESIS,
+                            timestamp(1),
+                            1,
+                            &result,
+                        )
+                        .expect("syntactically valid swizzled legacy digest");
+                    let response = SessionConsensusResponse {
+                        result,
+                        sequence: 1,
+                        digest: Some(digest),
+                        logical_time: Some(timestamp(1)),
+                        raft_log_index: 1,
+                    };
+                    conn.execute(
+                        "UPDATE consensus_request_outcomes SET response_json = ?1",
+                        [encode_json(&response).expect("encode swizzled legacy response")],
+                    )
+                    .expect("replace frozen legacy response");
+                }
+                "missing-log" => {
+                    conn.execute("DELETE FROM consensus_log WHERE log_index = 1", [])
+                        .expect("compact retained command log");
+                }
+                _ => unreachable!("enumerated legacy migration case"),
+            }
+            drop(conn);
+            assert_file_backed_legacy_outcome_requires_recovery_without_repair(&path);
+        }
+    }
+
+    #[test]
+    fn file_backed_nonempty_immediate_predecessor_requires_operator_recovery() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let path = directory
+            .path()
+            .join("immediate-predecessor-outcome.sqlite");
+        seed_file_backed_consensus(&path);
+        let conn = Connection::open(&path).expect("open stopped database");
+        append_logs_sync(&conn, identity(), &[membership_entry()])
+            .expect("retain a predecessor command log");
+        downgrade_to_immediate_predecessor_fixture_sync(&conn)
+            .expect("install exact predecessor schema");
+        // This response is syntactically valid, while the retained command log
+        // is complete. It is still semantically untrusted: a legacy digest
+        // binds only the command, so no retained log can prove the result was
+        // actually produced by that command.
+        let response = serde_json::to_vec(&SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::Unit),
+            sequence: 1,
+            digest: Some(SessionConsensusEntryDigest::from_bytes([0x93; 32])),
+            logical_time: Some(timestamp(1)),
+            raft_log_index: 0,
+        })
+        .expect("encode syntactically valid swizzled response");
+        conn.execute(
+            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, response_json) VALUES (?1, 1, ?2, ?3)",
+            params![[0x91_u8; 16].as_slice(), [0x92_u8; 32].as_slice(), response],
+        )
+        .expect("insert legacy replay outcome");
+        drop(conn);
+
+        let backend = SqliteSessionBackend::open(&path).expect("open predecessor database");
+        let conn = backend.conn.blocking_lock();
+        assert_eq!(
+            initialize_schema(&conn, identity(), &expected_members()),
+            Err(SessionConsensusStorageError::RecoveryRequired),
+            "normal reopen must not promote a legacy replay result into a v2 receipt"
+        );
     }
 }

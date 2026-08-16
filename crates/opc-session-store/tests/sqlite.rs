@@ -9,7 +9,6 @@ use opc_session_store::{
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use std::{sync::Arc, time::Duration};
-use tempfile::NamedTempFile;
 
 fn tenant() -> TenantId {
     TenantId::new("tenant-a").expect("tenant")
@@ -58,9 +57,10 @@ fn test_record(
 
 #[test]
 fn new_sqlite_schema_enforces_stable_id_type_and_width() {
-    let file = NamedTempFile::new().expect("temporary SQLite file");
-    drop(SqliteSessionBackend::open(file.path()).expect("initialize schema"));
-    let connection = rusqlite::Connection::open(file.path()).expect("open raw SQLite");
+    let directory = tempfile::tempdir().expect("temporary SQLite directory");
+    let path = directory.path().join("sessions.sqlite");
+    drop(SqliteSessionBackend::open(&path).expect("initialize schema"));
+    let connection = rusqlite::Connection::open(&path).expect("open raw SQLite");
 
     for (index, width) in [1_usize, opc_session_store::STABLE_ID_MAX_BYTES]
         .into_iter()
@@ -164,8 +164,8 @@ async fn test_sqlite_restore_order_matches_canonical_key_type_order() {
 
 #[tokio::test]
 async fn test_sqlite_file_backend_applies_wal_profile() {
-    let file = NamedTempFile::new().unwrap();
-    let path = file.path().to_path_buf();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sessions.sqlite");
 
     {
         let backend = SqliteSessionBackend::open(&path).unwrap();
@@ -301,8 +301,8 @@ async fn test_sqlite_max_payload_bytes_is_enforced() {
 
 #[tokio::test]
 async fn sqlite_restore_reopens_an_exact_stored_value_cap_record() {
-    let file = NamedTempFile::new().expect("temporary SQLite file");
-    let path = file.path().to_path_buf();
+    let directory = tempfile::tempdir().expect("temporary SQLite directory");
+    let path = directory.path().join("sessions.sqlite");
     let backend = SqliteSessionBackend::open(&path).expect("open SQLite");
     let caps = backend.capabilities().await;
     let key = test_key(b"restore-exact-stored-cap");
@@ -777,8 +777,8 @@ async fn test_sqlite_expired_lease_takeover() {
 
 #[tokio::test]
 async fn test_sqlite_backend_restart_preserves_state() {
-    let file = NamedTempFile::new().unwrap();
-    let path = file.path().to_path_buf();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sessions.sqlite");
 
     let key = test_key(b"restart-key");
     let lease = {

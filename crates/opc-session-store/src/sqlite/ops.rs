@@ -122,6 +122,36 @@ pub(crate) fn persisted_u64(value: i64) -> Result<u64, StoreError> {
         .map_err(|_| StoreError::Serialization("persisted session integer is negative".to_string()))
 }
 
+/// A record at the currently authorized fence must belong to the owner whose
+/// lease authorizes the mutation. A lower-fence record is historical and can
+/// coexist with a successor lease for a different owner.
+pub(crate) fn check_record_lease_consistency(
+    conn: &Connection,
+    key: &SessionKey,
+    owner: &OwnerId,
+    fence: u64,
+) -> Result<(), StoreError> {
+    let record = conn
+        .query_row(
+            "SELECT owner, fence FROM session_records WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4",
+            params![
+                key.tenant.as_str(),
+                key.nf_kind.as_str(),
+                key.key_type.to_string(),
+                key.stable_id.as_ref(),
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
+    if let Some((stored_owner, stored_fence)) = record {
+        if persisted_u64(stored_fence)? == fence && persisted_owner_id(stored_owner)? != *owner {
+            return Err(StoreError::StaleFence);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn persisted_session_key(
     tenant_str: String,
     nf_kind_str: String,
@@ -170,12 +200,57 @@ pub(crate) fn format_rfc3339_normalized(ts: Timestamp) -> String {
     )
 }
 
+/// Parse a timestamp stored in SQLite only when its spelling is the exact
+/// normalized form emitted by this backend.  SQLite compares TEXT values
+/// lexically in several expiry paths, so accepting an equivalent offset or
+/// abbreviated fractional spelling would make visibility depend on spelling.
+pub(crate) fn parse_persisted_rfc3339_normalized(value: &str) -> Result<Timestamp, StoreError> {
+    let timestamp = Timestamp::from_str(value)
+        .map_err(|_| StoreError::Serialization("persisted session timestamp is invalid".into()))?;
+    if format_rfc3339_normalized(timestamp) != value {
+        return Err(StoreError::Serialization(
+            "persisted session timestamp is not normalized".into(),
+        ));
+    }
+    Ok(timestamp)
+}
+
+/// Reject noncanonical persisted deadline text before any SQLite lexical
+/// comparison can classify it as expired or live.
+fn validate_persisted_deadline_texts_sync(conn: &Connection) -> Result<(), StoreError> {
+    for sql in [
+        "SELECT expires_at FROM session_records WHERE expires_at IS NOT NULL",
+        "SELECT guard_expires_at FROM leases",
+    ] {
+        let mut statement = conn
+            .prepare(sql)
+            .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
+        let values = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
+        for value in values {
+            parse_persisted_rfc3339_normalized(
+                &value.map_err(|error| StoreError::BackendUnavailable(error.to_string()))?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn initialize_restore_scan_metadata_sync(conn: &Connection) -> Result<(), StoreError> {
     let tx = conn
         .unchecked_transaction()
         .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))?;
+    initialize_restore_scan_metadata_in_transaction_sync(&tx)?;
+    tx.commit()
+        .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))
+}
+
+pub(crate) fn initialize_restore_scan_metadata_in_transaction_sync(
+    conn: &Connection,
+) -> Result<(), StoreError> {
     let has_cursor_key = {
-        let mut stmt = tx
+        let mut stmt = conn
             .prepare("PRAGMA table_info(restore_scan_state)")
             .map_err(|_| {
                 StoreError::BackendUnavailable("session restore metadata failed".into())
@@ -197,7 +272,7 @@ pub(crate) fn initialize_restore_scan_metadata_sync(conn: &Connection) -> Result
         found
     };
     if !has_cursor_key {
-        tx.execute(
+        conn.execute(
             "ALTER TABLE restore_scan_state ADD COLUMN cursor_key BLOB CHECK (cursor_key IS NULL OR length(cursor_key) = 32)",
             [],
         )
@@ -209,19 +284,18 @@ pub(crate) fn initialize_restore_scan_metadata_sync(conn: &Connection) -> Result
         .try_fill_bytes(cursor_key.as_mut())
         .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))?;
     let restore_epoch = *uuid::Uuid::new_v4().as_bytes();
-    tx.execute(
+    conn.execute(
         "INSERT OR IGNORE INTO restore_scan_state (singleton, epoch, revision, cursor_key) VALUES (1, ?1, 0, ?2)",
         params![restore_epoch.as_slice(), cursor_key.as_slice()],
     )
     .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))?;
-    tx.execute(
+    conn.execute(
         "UPDATE restore_scan_state SET cursor_key = ?1 WHERE singleton = 1 AND cursor_key IS NULL",
         [cursor_key.as_slice()],
     )
     .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))?;
-    read_restore_scan_state_sync(&tx)?;
-    tx.commit()
-        .map_err(|_| StoreError::BackendUnavailable("session restore metadata failed".into()))
+    read_restore_scan_state_sync(conn)?;
+    Ok(())
 }
 
 pub(crate) fn read_restore_scan_state_sync(
@@ -313,6 +387,7 @@ pub(crate) fn rotate_restore_scan_incarnation_sync(conn: &Connection) -> Result<
 }
 
 pub(crate) fn prune_sync(conn: &Connection, now: Timestamp) -> Result<(), StoreError> {
+    validate_persisted_deadline_texts_sync(conn)?;
     let now_str = format_rfc3339_normalized(now);
     // 1. Delete expired session records
     let removed_records = conn
@@ -395,8 +470,7 @@ pub(crate) fn validate_fenced_mutation_sync(
         return Err(StoreError::StaleFence);
     }
 
-    let guard_expires_at = opc_types::Timestamp::from_str(guard_expires_at_str.as_str())
-        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+    let guard_expires_at = parse_persisted_rfc3339_normalized(&guard_expires_at_str)?;
 
     if guard_expires_at != lease.expires_at() {
         return Err(StoreError::StaleFence);
@@ -505,15 +579,12 @@ pub(crate) fn get_sync(
         _ => {
             return Err(StoreError::Serialization(format!(
                 "unknown state class: {state_class_str}"
-            )))
+            )));
         }
     };
     let state_type = StateType::new(state_type_str).map_err(StoreError::Serialization)?;
     let expires_at = match &expires_at_str {
-        Some(s) => Some(
-            opc_types::Timestamp::from_str(s.as_str())
-                .map_err(|e| StoreError::Serialization(e.to_string()))?,
-        ),
+        Some(s) => Some(parse_persisted_rfc3339_normalized(s)?),
         None => None,
     };
     let payload = match encoding {
@@ -536,7 +607,7 @@ pub(crate) fn get_sync(
         _ => {
             return Err(StoreError::Serialization(format!(
                 "unknown payload encoding: {encoding}"
-            )))
+            )));
         }
     };
 
@@ -589,18 +660,15 @@ impl RestoreScanCandidate {
         let state_type = restore_scan_text(row, 8)?;
         let expires_at = match row.get_ref(9).map_err(|_| restore_scan_failed())? {
             ValueRef::Null => None,
-            ValueRef::Text(value) => Some(
-                Timestamp::from_str(std::str::from_utf8(value).map_err(|_| {
-                    StoreError::Serialization("persisted session timestamp is invalid".into())
-                })?)
-                .map_err(|_| {
+            ValueRef::Text(value) => Some(parse_persisted_rfc3339_normalized(
+                std::str::from_utf8(value).map_err(|_| {
                     StoreError::Serialization("persisted session timestamp is invalid".into())
                 })?,
-            ),
+            )?),
             _ => {
                 return Err(StoreError::Serialization(
                     "persisted session timestamp is invalid".into(),
-                ))
+                ));
             }
         };
         Ok(Self {
@@ -732,7 +800,7 @@ fn restore_scan_row_budget(row: &Row<'_>) -> Result<RestoreScanRowBudget, StoreE
         _ => {
             return Err(StoreError::Serialization(
                 "persisted session timestamp is invalid".into(),
-            ))
+            ));
         }
     };
     let payload_bytes = usize::try_from(restore_scan_integer(row, 10)?).map_err(|_| {
@@ -1028,10 +1096,7 @@ pub(crate) fn stored_record_from_row(
     let state_class = state_class_from_str(&state_class_str)?;
     let state_type = StateType::new(state_type_str).map_err(StoreError::Serialization)?;
     let expires_at = match &expires_at_str {
-        Some(s) => Some(
-            opc_types::Timestamp::from_str(s.as_str())
-                .map_err(|e| StoreError::Serialization(e.to_string()))?,
-        ),
+        Some(s) => Some(parse_persisted_rfc3339_normalized(s)?),
         None => None,
     };
     let payload = payload_from_row(payload_bytes, encoding)?;
@@ -1206,6 +1271,7 @@ pub(crate) fn compare_and_set_sync(
     if op.lease.fence().get() < current_fence {
         return Err(StoreError::StaleFence);
     }
+    check_record_lease_consistency(conn, &op.key, op.lease.owner(), op.lease.fence().get())?;
 
     let existing = get_sync(conn, &op.key, now)?;
 
@@ -1325,7 +1391,110 @@ pub(crate) fn refresh_ttl_sync(
 
 #[cfg(test)]
 mod tests {
+    use std::{str::FromStr, time::Duration};
+
+    use opc_types::{NetworkFunctionKind, TenantId};
+
     use super::*;
+    use crate::{
+        EncryptedSessionPayload, FenceToken, Generation, OwnerId, SessionKeyType,
+        SqliteSessionBackend, StateClass, StateType, StoredSessionRecord,
+    };
+
+    fn cas_key() -> SessionKey {
+        SessionKey {
+            tenant: TenantId::new("cas-fence").expect("tenant"),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
+            key_type: SessionKeyType::PduSession,
+            stable_id: [0x6b; 32].into(),
+        }
+    }
+
+    fn cas_timestamp() -> Timestamp {
+        Timestamp::from_str("2026-07-12T00:00:00Z").expect("timestamp")
+    }
+
+    fn cas_record(
+        key: SessionKey,
+        generation: u64,
+        owner: OwnerId,
+        fence: FenceToken,
+    ) -> StoredSessionRecord {
+        StoredSessionRecord {
+            key,
+            generation: Generation::new(generation),
+            owner,
+            fence,
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("cas-fence-fixture"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([]),
+        }
+    }
+
+    #[test]
+    fn compare_and_set_rejects_equal_fence_cross_owner_without_mutation() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        let key = cas_key();
+        let now = cas_timestamp();
+        let lease = super::super::lease::acquire_sync(
+            &conn,
+            &key,
+            OwnerId::new("lease-owner").expect("lease owner"),
+            Duration::from_secs(60),
+            now,
+        )
+        .expect("lease");
+        let current = cas_record(
+            key.clone(),
+            1,
+            OwnerId::new("record-owner").expect("record owner"),
+            lease.fence(),
+        );
+        insert_or_replace_record_sync(&conn, &current).expect("seed malformed record");
+
+        let candidate = cas_record(key.clone(), 2, lease.owner().clone(), lease.fence());
+        assert!(matches!(
+            compare_and_set_sync(
+                &conn,
+                CompareAndSet {
+                    key: key.clone(),
+                    lease: lease.clone(),
+                    expected_generation: Some(Generation::new(1)),
+                    new_record: candidate,
+                },
+                &backend.caps,
+                now,
+            ),
+            Err(StoreError::StaleFence)
+        ));
+        assert_eq!(
+            get_sync(&conn, &key, now).expect("read retained record"),
+            Some(current)
+        );
+        assert_eq!(
+            current_fence_sync(&conn, &key).expect("read retained fence"),
+            lease.fence().get()
+        );
+    }
+
+    #[test]
+    fn persisted_timestamps_must_use_exact_normalized_spelling() {
+        let canonical = "2026-07-12T00:00:00.123000000Z";
+        assert!(parse_persisted_rfc3339_normalized(canonical).is_ok());
+        for noncanonical in [
+            "2026-07-12T00:00:00.123Z",
+            "2026-07-12T00:00:00.123000000z",
+            "2026-07-12t00:00:00.123000000Z",
+            "2026-07-11T19:00:00.123000000-05:00",
+        ] {
+            assert!(
+                parse_persisted_rfc3339_normalized(noncanonical).is_err(),
+                "{noncanonical} must not enter SQLite"
+            );
+        }
+    }
 
     #[test]
     fn restore_continuation_uses_primary_key_range_search() {

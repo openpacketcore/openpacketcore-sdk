@@ -13,8 +13,8 @@ use opc_consensus::{
 };
 use opc_key::{
     EncryptedPayload, EnvelopeAad, KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose,
-    MemoryKeyProvider, MemoryRemoteSealProvider, RemoteSealProvider, Zeroizing,
-    AES_256_GCM_SIV_KEY_LEN,
+    MemoryKeyProvider, MemoryRemoteSealProvider, RemoteSealCapabilities, RemoteSealProvider,
+    Zeroizing, AES_256_GCM_SIV_KEY_LEN,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
@@ -636,6 +636,10 @@ impl RemoteRotationPeer {
         *self.handler.write().await = Some(handler);
     }
 
+    async fn clear_handler(&self) {
+        *self.handler.write().await = None;
+    }
+
     fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::SeqCst);
     }
@@ -1029,12 +1033,14 @@ impl RemoteRotationCluster {
     }
 
     async fn shutdown_and_restart(self) -> Self {
-        let results = futures_util::future::join_all(
-            self.stores.iter().map(|store| store.inner.raft.shutdown()),
-        )
-        .await;
+        let results =
+            futures_util::future::join_all(self.stores.iter().map(ConsensusSessionStore::shutdown))
+                .await;
         for result in results {
-            result.expect("shut down remote rotation member");
+            result.expect("shut down and clear remote rotation member");
+        }
+        for path in self.paths.values() {
+            path.clear_handler().await;
         }
         let Self {
             directory,
@@ -1048,12 +1054,23 @@ impl RemoteRotationCluster {
         Self::open(directory).await
     }
 
-    async fn shutdown(&self) {
-        let results = futures_util::future::join_all(
-            self.stores.iter().map(|store| store.inner.raft.shutdown()),
-        )
-        .await;
+    async fn shutdown(self) {
+        let results =
+            futures_util::future::join_all(self.stores.iter().map(ConsensusSessionStore::shutdown))
+                .await;
         assert!(results.into_iter().all(|result| result.is_ok()));
+        for path in self.paths.values() {
+            path.clear_handler().await;
+        }
+        let Self {
+            directory: _,
+            backends,
+            stores,
+            paths,
+        } = self;
+        drop(paths);
+        drop(stores);
+        drop(backends);
     }
 }
 
@@ -1082,6 +1099,39 @@ impl CountingRemoteSealProvider {
 
 #[async_trait]
 impl RemoteSealProvider for CountingRemoteSealProvider {
+    fn capabilities(&self) -> RemoteSealCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn active_keyed_digest(
+        &self,
+        domain: &[u8],
+        input: &[u8],
+    ) -> Result<opc_key::RemoteSealActiveKeyedDigest, KeyError> {
+        self.seal_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.active_keyed_digest(domain, input).await
+    }
+
+    async fn keyed_digest(
+        &self,
+        key_id: &KeyId,
+        domain: &[u8],
+        input: &[u8],
+    ) -> Result<[u8; 32], KeyError> {
+        self.unseal_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.keyed_digest(key_id, domain, input).await
+    }
+
+    async fn seal_with_key_id(
+        &self,
+        key_id: &KeyId,
+        aad: &EnvelopeAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedPayload, KeyError> {
+        self.seal_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.seal_with_key_id(key_id, aad, plaintext).await
+    }
+
     async fn seal(
         &self,
         aad: &EnvelopeAad,
@@ -1178,14 +1228,14 @@ async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart()
         CompareAndSetResult::Success
     );
     assert_ne!(old_key_id, new_key_id);
-    assert_eq!(provider.call_counts(), (2, 0));
+    assert_eq!(provider.call_counts(), (4, 0));
 
     cluster
         .snapshot_surviving_majority(&partition.surviving_members, lagging_applied)
         .await;
     assert_eq!(
         provider.call_counts(),
-        (2, 0),
+        (4, 0),
         "replication or snapshot construction called remote provider"
     );
 
@@ -1218,7 +1268,7 @@ async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart()
     }
     assert_eq!(
         provider.call_counts(),
-        (2, 0),
+        (4, 0),
         "snapshot install or raw consensus read called remote provider"
     );
     assert_file_tree_is_sealed(cluster.directory.path());
@@ -1227,7 +1277,7 @@ async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart()
     let cluster = cluster.shutdown_and_restart().await;
     assert_eq!(
         provider.call_counts(),
-        (2, 0),
+        (4, 0),
         "shutdown, replay, quorum formation, or recovery called remote provider"
     );
     let reader = RemoteSealingSessionBackend::new(
@@ -1253,7 +1303,7 @@ async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart()
     }
     assert_eq!(
         provider.call_counts(),
-        (2, 2),
+        (4, 4),
         "only outer restore unseal may call remote provider"
     );
 

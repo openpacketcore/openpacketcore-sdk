@@ -1,11 +1,11 @@
 use opc_types::Timestamp;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::str::FromStr;
 
 use super::ops::{
-    advance_restore_scan_revision_sync, current_fence_sync, format_rfc3339_normalized, get_sync,
-    insert_or_replace_fence_sync, insert_or_replace_record_sync, persisted_owner_id, persisted_u64,
-    sqlite_u64, timestamp_unix_millis,
+    advance_restore_scan_revision_sync, check_record_lease_consistency, current_fence_sync,
+    format_rfc3339_normalized, get_sync, insert_or_replace_fence_sync,
+    insert_or_replace_record_sync, parse_persisted_rfc3339_normalized, persisted_owner_id,
+    persisted_u64, sqlite_u64, timestamp_unix_millis,
 };
 use crate::{
     backend::{
@@ -14,7 +14,51 @@ use crate::{
     },
     capability::BackendCapabilities,
     error::StoreError,
+    model::{OwnerId, SessionKey},
 };
+
+/// A replayed renewal or release must still address the lease that originally
+/// authorized it.  Do not turn either operation into an upsert: a matching
+/// key with a different owner, fence, or credential is a fenced-off lease.
+fn require_exact_active_lease(
+    conn: &Connection,
+    key: &SessionKey,
+    owner: &OwnerId,
+    fence: u64,
+    credential_id: u64,
+) -> Result<(), StoreError> {
+    let lease = conn
+        .query_row(
+            "SELECT active, credential_id, owner, fence FROM leases WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4",
+            params![
+                key.tenant.as_str(),
+                key.nf_kind.as_str(),
+                key.key_type.to_string(),
+                key.stable_id.as_ref(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i32>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
+    let Some((active, stored_credential, stored_owner, stored_fence)) = lease else {
+        return Err(StoreError::StaleFence);
+    };
+    if active != 1
+        || persisted_u64(stored_credential)? != credential_id
+        || persisted_owner_id(stored_owner)? != *owner
+        || persisted_u64(stored_fence)? != fence
+    {
+        return Err(StoreError::StaleFence);
+    }
+    Ok(())
+}
 
 pub(crate) fn sqlite_replication_sequence(sequence: u64) -> Result<i64, StoreError> {
     if sequence == 0 {
@@ -35,6 +79,7 @@ pub(crate) fn hydrate_replication_entry(
     stored_sequence: i64,
     stored_tx_id: Option<String>,
     encoded: &str,
+    stored_timestamp: &str,
 ) -> Result<ReplicationEntry, StoreError> {
     let stored_sequence = stored_replication_sequence(stored_sequence)?;
     let stored_tx_id: ReplicationTxId = stored_tx_id
@@ -54,6 +99,12 @@ pub(crate) fn hydrate_replication_entry(
     if entry.tx_id != stored_tx_id {
         return Err(StoreError::Serialization(
             "persisted replication transaction ID is inconsistent".into(),
+        ));
+    }
+    let timestamp = parse_persisted_rfc3339_normalized(stored_timestamp)?;
+    if entry.timestamp != timestamp {
+        return Err(StoreError::Serialization(
+            "persisted replication timestamp is inconsistent".into(),
         ));
     }
     Ok(entry)
@@ -90,6 +141,7 @@ fn apply_validated_replicated_op_sync(
             if new_record.fence.get() < current_fence {
                 return Err(StoreError::StaleFence);
             }
+            check_record_lease_consistency(conn, &key, &new_record.owner, new_record.fence.get())?;
 
             let mut lease_stmt = conn
                 .prepare(
@@ -133,8 +185,8 @@ fn apply_validated_replicated_op_sync(
             {
                 return Err(StoreError::StaleFence);
             }
-            let stored_guard_expires_at = Timestamp::from_str(guard_expires_at_str.as_str())
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            let stored_guard_expires_at =
+                parse_persisted_rfc3339_normalized(&guard_expires_at_str)?;
             if stored_guard_expires_at != guard_expires_at {
                 return Err(StoreError::StaleFence);
             }
@@ -166,15 +218,12 @@ fn apply_validated_replicated_op_sync(
                 _ => Err(StoreError::CasConflict),
             }
         }
-        ReplicationOp::DeleteFenced {
-            key,
-            owner: _,
-            fence,
-        } => {
+        ReplicationOp::DeleteFenced { key, owner, fence } => {
             let current_fence = current_fence_sync(conn, &key)?;
             if fence.get() < current_fence {
                 return Err(StoreError::StaleFence);
             }
+            check_record_lease_consistency(conn, &key, &owner, fence.get())?;
             let removed = conn
                 .execute(
                     r#"
@@ -197,7 +246,7 @@ fn apply_validated_replicated_op_sync(
         }
         ReplicationOp::RefreshTtl {
             key,
-            owner: _,
+            owner,
             fence,
             ttl: _,
             expires_at,
@@ -206,6 +255,7 @@ fn apply_validated_replicated_op_sync(
             if fence.get() < current_fence {
                 return Err(StoreError::StaleFence);
             }
+            check_record_lease_consistency(conn, &key, &owner, fence.get())?;
             let record = get_sync(conn, &key, now)?;
             let Some(mut record) = record else {
                 return Err(StoreError::NotFound);
@@ -227,6 +277,7 @@ fn apply_validated_replicated_op_sync(
             if fence.get() < current_fence {
                 return Err(StoreError::StaleFence);
             }
+            check_record_lease_consistency(conn, &key, &owner, fence.get())?;
             let mut stmt = conn
                 .prepare(
                     r#"
@@ -258,8 +309,9 @@ fn apply_validated_replicated_op_sync(
             if let Some((active, owner_str, guard_expires_at_str)) = row {
                 let stored_owner = persisted_owner_id(owner_str)?;
                 if active != 0 && stored_owner != owner {
-                    let guard_expires_at = Timestamp::from_str(guard_expires_at_str.as_str())
-                        .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                    let guard_expires_at =
+                        parse_persisted_rfc3339_normalized(&guard_expires_at_str)
+                            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
                     if guard_expires_at > now {
                         return Err(StoreError::LeaseHeld);
                     }
@@ -321,34 +373,41 @@ fn apply_validated_replicated_op_sync(
             if fence.get() < current_fence {
                 return Err(StoreError::StaleFence);
             }
+            check_record_lease_consistency(conn, &key, &owner, fence.get())?;
+            require_exact_active_lease(conn, &key, &owner, fence.get(), credential_id)?;
             let expires_at_unix_ms = timestamp_unix_millis(expires_at)?;
 
-            conn.execute(
-                r#"
-                INSERT OR REPLACE INTO leases (
-                    tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at
-                ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9)
+            let renewed = conn
+                .execute(
+                    r#"
+                UPDATE leases
+                SET expires_at_unix_ms = ?1, guard_expires_at = ?2
+                WHERE tenant = ?3 AND nf_kind = ?4 AND key_type = ?5 AND stable_id = ?6
+                  AND active = 1 AND credential_id = ?7 AND owner = ?8 AND fence = ?9
                 "#,
-                params![
-                    key.tenant.as_str(),
-                    key.nf_kind.as_str(),
-                    key.key_type.to_string(),
-                    key.stable_id.as_ref(),
-                    sqlite_u64(credential_id)?,
-                    owner.as_str(),
-                    sqlite_u64(fence.get())?,
-                    expires_at_unix_ms,
-                    format_rfc3339_normalized(expires_at),
-                ],
-            )
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                    params![
+                        expires_at_unix_ms,
+                        format_rfc3339_normalized(expires_at),
+                        key.tenant.as_str(),
+                        key.nf_kind.as_str(),
+                        key.key_type.to_string(),
+                        key.stable_id.as_ref(),
+                        sqlite_u64(credential_id)?,
+                        owner.as_str(),
+                        sqlite_u64(fence.get())?,
+                    ],
+                )
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            if renewed != 1 {
+                return Err(StoreError::StaleFence);
+            }
 
             insert_or_replace_fence_sync(conn, &key, fence.get())?;
             Ok(())
         }
         ReplicationOp::ReleaseLease {
             key,
-            owner: _,
+            owner,
             fence,
             credential_id,
         } => {
@@ -356,21 +415,30 @@ fn apply_validated_replicated_op_sync(
             if fence.get() < current_fence {
                 return Err(StoreError::StaleFence);
             }
-            conn.execute(
-                r#"
+            check_record_lease_consistency(conn, &key, &owner, fence.get())?;
+            require_exact_active_lease(conn, &key, &owner, fence.get(), credential_id)?;
+            let released = conn
+                .execute(
+                    r#"
                 UPDATE leases
                 SET active = 0
-                WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4 AND credential_id = ?5
+                WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4
+                  AND active = 1 AND credential_id = ?5 AND owner = ?6 AND fence = ?7
                 "#,
-                params![
-                    key.tenant.as_str(),
-                    key.nf_kind.as_str(),
-                    key.key_type.to_string(),
-                    key.stable_id.as_ref(),
-                    sqlite_u64(credential_id)?,
-                ],
-            )
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                    params![
+                        key.tenant.as_str(),
+                        key.nf_kind.as_str(),
+                        key.key_type.to_string(),
+                        key.stable_id.as_ref(),
+                        sqlite_u64(credential_id)?,
+                        owner.as_str(),
+                        sqlite_u64(fence.get())?,
+                    ],
+                )
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            if released != 1 {
+                return Err(StoreError::StaleFence);
+            }
             insert_or_replace_fence_sync(conn, &key, fence.get())?;
             Ok(())
         }
@@ -453,7 +521,7 @@ pub(crate) fn replicate_entry_sync(
 
     if entry.sequence <= max_seq {
         // Check for duplicate delivery and idempotency
-        let existing: Option<(Option<String>, String)> = tx
+        let existing: Option<(Option<String>, String, String)> = tx
             .query_row(
                 r#"
                 SELECT CASE
@@ -461,7 +529,8 @@ pub(crate) fn replicate_entry_sync(
                             AND length(CAST(tx_id AS BLOB)) BETWEEN ?2 AND ?3
                            THEN tx_id
                        END,
-                       entry_json
+                       entry_json,
+                       timestamp
                 FROM session_replication_log
                 WHERE sequence = ?1
                 "#,
@@ -470,13 +539,17 @@ pub(crate) fn replicate_entry_sync(
                     REPLICATION_TX_ID_MIN_BYTES,
                     REPLICATION_TX_ID_MAX_BYTES
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        if let Some((stored_tx_id, existing_entry_json)) = existing {
-            let existing =
-                hydrate_replication_entry(sqlite_sequence, stored_tx_id, &existing_entry_json)?;
+        if let Some((stored_tx_id, existing_entry_json, stored_timestamp)) = existing {
+            let existing = hydrate_replication_entry(
+                sqlite_sequence,
+                stored_tx_id,
+                &existing_entry_json,
+                &stored_timestamp,
+            )?;
             if existing == *entry {
                 return Ok(false); // Already applied, do not notify watchers again
             }
@@ -572,4 +645,193 @@ pub(crate) fn rebuild_replication_state_sync(
     tx.commit()
         .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    use opc_types::{NetworkFunctionKind, TenantId};
+
+    use super::*;
+    use crate::{
+        EncryptedSessionPayload, FenceToken, Generation, SessionKeyType, SqliteSessionBackend,
+        StateClass, StateType, StoredSessionRecord,
+    };
+
+    fn key() -> SessionKey {
+        SessionKey {
+            tenant: TenantId::new("replication-fence").expect("tenant"),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
+            key_type: SessionKeyType::PduSession,
+            stable_id: [0x6b; 32].into(),
+        }
+    }
+
+    fn timestamp(second: u8) -> Timestamp {
+        Timestamp::from_str(&format!("2026-07-12T00:00:{second:02}Z")).expect("timestamp")
+    }
+
+    fn seed_record_fence(conn: &Connection, key: &SessionKey, owner: &str, fence: u64) {
+        conn.execute(
+            "INSERT INTO session_records (tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, 'authoritative-session', 'fixture', NULL, X'', 0)",
+            params![
+                key.tenant.as_str(),
+                key.nf_kind.as_str(),
+                key.key_type.to_string(),
+                key.stable_id.as_ref(),
+                owner,
+                sqlite_u64(fence).expect("fence"),
+            ],
+        )
+        .expect("seed record");
+        insert_or_replace_fence_sync(conn, key, fence).expect("seed fence");
+    }
+
+    fn seed_active_lease(
+        conn: &Connection,
+        key: &SessionKey,
+        owner: &OwnerId,
+        fence: FenceToken,
+        expires_at: Timestamp,
+    ) {
+        conn.execute(
+            "INSERT INTO leases (tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at) VALUES (?1, ?2, ?3, ?4, 1, 1, ?5, ?6, ?7, ?8)",
+            params![
+                key.tenant.as_str(),
+                key.nf_kind.as_str(),
+                key.key_type.to_string(),
+                key.stable_id.as_ref(),
+                owner.as_str(),
+                sqlite_u64(fence.get()).expect("fence"),
+                timestamp_unix_millis(expires_at).expect("expiry"),
+                format_rfc3339_normalized(expires_at),
+            ],
+        )
+        .expect("seed active lease");
+    }
+
+    fn cas_record(key: SessionKey, owner: OwnerId, fence: FenceToken) -> StoredSessionRecord {
+        StoredSessionRecord {
+            key,
+            generation: Generation::new(2),
+            owner,
+            fence,
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("replication-fence-fixture"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([]),
+        }
+    }
+
+    #[test]
+    fn replay_rejects_equal_fence_cross_owner_for_every_lease_variant() {
+        let key = key();
+        let record_owner = OwnerId::new("record-owner").expect("record owner");
+        let replay_owner = OwnerId::new("replay-owner").expect("replay owner");
+        let fence = FenceToken::new(5);
+        let expiry = timestamp(30);
+        let variants = [
+            (
+                "delete",
+                ReplicationOp::DeleteFenced {
+                    key: key.clone(),
+                    owner: replay_owner.clone(),
+                    fence,
+                },
+            ),
+            (
+                "refresh",
+                ReplicationOp::RefreshTtl {
+                    key: key.clone(),
+                    owner: replay_owner.clone(),
+                    fence,
+                    ttl: Duration::from_secs(30),
+                    expires_at: expiry,
+                },
+            ),
+            (
+                "acquire",
+                ReplicationOp::AcquireLease {
+                    key: key.clone(),
+                    owner: replay_owner.clone(),
+                    fence,
+                    credential_id: 1,
+                    ttl: Duration::from_secs(30),
+                    expires_at: expiry,
+                },
+            ),
+            (
+                "renew",
+                ReplicationOp::RenewLease {
+                    key: key.clone(),
+                    owner: replay_owner.clone(),
+                    fence,
+                    credential_id: 1,
+                    ttl: Duration::from_secs(30),
+                    expires_at: expiry,
+                },
+            ),
+            (
+                "release",
+                ReplicationOp::ReleaseLease {
+                    key: key.clone(),
+                    owner: replay_owner.clone(),
+                    fence,
+                    credential_id: 1,
+                },
+            ),
+            (
+                "compare-and-set",
+                ReplicationOp::CompareAndSet {
+                    key: key.clone(),
+                    expected_generation: Some(Generation::new(1)),
+                    credential_id: 1,
+                    guard_expires_at: expiry,
+                    new_record: cas_record(key.clone(), replay_owner.clone(), fence),
+                },
+            ),
+        ];
+        for (name, operation) in variants {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.blocking_lock();
+            seed_record_fence(&conn, &key, record_owner.as_str(), fence.get());
+            seed_active_lease(&conn, &key, &replay_owner, fence, expiry);
+            assert!(
+                matches!(
+                    apply_replicated_op_sync(&conn, operation, &backend.caps, timestamp(1)),
+                    Err(StoreError::StaleFence)
+                ),
+                "{name} must reject an equal-fence owner mismatch"
+            );
+            let retained = get_sync(&conn, &key, timestamp(1))
+                .expect("read record after rejected replay")
+                .expect("seeded record remains");
+            assert_eq!(
+                retained.owner, record_owner,
+                "{name} must not overwrite owner"
+            );
+            assert_eq!(retained.generation, Generation::new(1));
+            assert_eq!(retained.fence, fence);
+        }
+    }
+
+    #[test]
+    fn replay_allows_cross_owner_record_when_record_fence_is_lower() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        let key = key();
+        seed_record_fence(&conn, &key, "historical-owner", 4);
+        let operation = ReplicationOp::AcquireLease {
+            key: key.clone(),
+            owner: OwnerId::new("current-owner").expect("owner"),
+            fence: FenceToken::new(5),
+            credential_id: 1,
+            ttl: Duration::from_secs(30),
+            expires_at: timestamp(30),
+        };
+        apply_replicated_op_sync(&conn, operation, &backend.caps, timestamp(1))
+            .expect("lower-fence historical record remains admissible");
+    }
 }

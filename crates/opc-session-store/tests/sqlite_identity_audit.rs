@@ -6,7 +6,7 @@ use opc_session_store::sqlite::audit::{
 };
 use opc_session_store::{
     checked_session_deadline, FenceToken, Generation, OwnerId, ReplicationEntry, ReplicationOp,
-    SessionBackend, SessionKey, SessionKeyType, SqliteSessionBackend, StateClass, StateType,
+    SessionKey, SessionKeyType, SqliteSessionBackend, StateClass, StateType, StoreError,
     StoredSessionRecord, MAX_SESSION_TTL, OWNER_ID_MAX_BYTES, REPLICATION_TX_ID_MAX_BYTES,
     SESSION_KEY_TYPE_MAX_BYTES, STABLE_ID_MAX_BYTES,
 };
@@ -93,17 +93,42 @@ fn replication_entry(sequence: u64, owner: &str) -> ReplicationEntry {
             owner: OwnerId::new(owner).expect("owner"),
             fence: FenceToken::new(1),
         },
-        timestamp: Timestamp::now_utc(),
+        timestamp: audit_timestamp(),
     }
+}
+
+fn audit_timestamp() -> Timestamp {
+    Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("audit timestamp"),
+    )
+}
+
+fn format_rfc3339_normalized(value: Timestamp) -> String {
+    let value = value.as_offset_datetime();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
+        value.year(),
+        value.month() as u8,
+        value.day(),
+        value.hour(),
+        value.minute(),
+        value.second(),
+        value.nanosecond()
+    )
 }
 
 fn insert_replication_json(conn: &Connection, sequence: i64, json: &str) {
     conn.execute(
         r#"
         INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp)
-        VALUES (?1, ?2, ?3, '2030-01-01T00:00:00Z')
+        VALUES (?1, ?2, ?3, ?4)
         "#,
-        params![sequence, format!("tx-{sequence}"), json],
+        params![
+            sequence,
+            format!("tx-{sequence}"),
+            json,
+            format_rfc3339_normalized(audit_timestamp())
+        ],
     )
     .expect("insert replication row");
 }
@@ -248,6 +273,76 @@ fn exact_utf8_byte_limits_pass_and_one_over_fails() {
 }
 
 #[test]
+fn lease_deadline_storage_types_are_counted_without_mutating_or_leaking_values() {
+    let (_dir, path) = database();
+    let conn = Connection::open(&path).expect("open fixture");
+    let guard_expires_at = "2030-01-01T00:00:00.000000000Z";
+    for (rowid, expires_at_unix_ms) in [
+        (1_i64, rusqlite::types::Value::Text("sensitive-text-deadline".into())),
+        (2_i64, rusqlite::types::Value::Real(1.5)),
+        (
+            3_i64,
+            rusqlite::types::Value::Blob(b"sensitive-blob-deadline".to_vec()),
+        ),
+    ] {
+        conn.execute(
+            r#"
+            INSERT INTO leases (
+                rowid, tenant, nf_kind, key_type, stable_id, active,
+                credential_id, owner, fence, expires_at_unix_ms, guard_expires_at
+            ) VALUES (?1, 'tenant-a', 'smf', 'pdu-session', ?2, 1, 1,
+                      'owner-a', 1, ?3, ?4)
+            "#,
+            params![
+                rowid,
+                format!("lease-{rowid}").into_bytes(),
+                expires_at_unix_ms,
+                guard_expires_at,
+            ],
+        )
+        .expect("insert malformed deadline fixture");
+    }
+    let snapshot = || {
+        let mut statement = conn
+            .prepare(
+                "SELECT rowid, typeof(expires_at_unix_ms), quote(expires_at_unix_ms) \
+                 FROM leases ORDER BY rowid",
+            )
+            .expect("snapshot query");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("snapshot rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect snapshot")
+    };
+    let before = snapshot();
+
+    let report =
+        audit_sqlite_identity_invariants(&path, limits(10, 1024, 1024)).expect("audit succeeds");
+
+    assert_eq!(report.status(), SqliteIdentityAuditStatus::ViolationsFound);
+    assert_eq!(report.incomplete_reason(), None);
+    assert_eq!(report.scanned().leases(), 3);
+    assert_eq!(report.violations().invalid_record_expiry_fields(), 3);
+    assert_eq!(snapshot(), before);
+    let encoded = serde_json::to_string(&report).expect("report JSON");
+    for sensitive in [
+        "sensitive-text-deadline",
+        "sensitive-blob-deadline",
+        "tenant-a",
+        "owner-a",
+    ] {
+        assert!(!encoded.contains(sensitive), "leaked {sensitive}");
+    }
+}
+
+#[test]
 fn strict_replication_decode_reuses_nested_identity_validation() {
     let (_dir, path) = database();
     let conn = Connection::open(&path).expect("open fixture");
@@ -319,9 +414,14 @@ fn replication_transaction_id_audit_is_exact_bounded_and_cross_checks_json() {
         conn.execute(
             r#"
             INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp)
-            VALUES (?1, ?2, ?3, '2030-01-01T00:00:00Z')
+            VALUES (?1, ?2, ?3, ?4)
             "#,
-            params![sequence, stored_tx_id, encoded],
+            params![
+                sequence,
+                stored_tx_id,
+                encoded,
+                format_rfc3339_normalized(audit_timestamp())
+            ],
         )
         .expect("insert transaction-ID fixture");
     }
@@ -374,7 +474,7 @@ fn absolute_expiry_audit_uses_explicit_reference_and_reports_counts_only() {
                 rowid,
                 format!("sensitive-stable-{rowid}").into_bytes(),
                 class,
-                expires_at.map(|value| value.to_string()),
+                expires_at.map(format_rfc3339_normalized),
             ],
         )
         .expect("insert expiry fixture");
@@ -401,9 +501,7 @@ fn absolute_expiry_audit_uses_explicit_reference_and_reports_counts_only() {
 #[test]
 fn replication_cas_expiry_audit_is_bound_to_entry_timestamp() {
     let (_dir, path) = database();
-    let timestamp = Timestamp::from_offset_datetime(
-        time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("reference"),
-    );
+    let timestamp = audit_timestamp();
     let key = SessionKey {
         tenant: TenantId::from_static("tenant-a"),
         nf_kind: NetworkFunctionKind::smf(),
@@ -451,8 +549,8 @@ fn replication_cas_expiry_audit_is_bound_to_entry_timestamp() {
     assert_eq!(report.violations().invalid_replication_entries(), 1);
 }
 
-#[tokio::test]
-async fn duplicate_json_fields_match_runtime_rejection_and_exact_audit_counters() {
+#[test]
+fn duplicate_json_fields_match_runtime_rejection_and_exact_audit_counters() {
     for (duplicate, invalid_tx_id) in [
         ("tx_id", true),
         ("sequence", false),
@@ -500,10 +598,13 @@ async fn duplicate_json_fields_match_runtime_rejection_and_exact_audit_counters(
         );
         assert_eq!(report.violations().invalid_replication_entries(), 1);
 
-        let backend = SqliteSessionBackend::open(&path).expect("open runtime backend");
-        assert!(
-            backend.get_replication_log(1, 1).await.is_err(),
-            "runtime hydration must reject duplicate {duplicate}"
+        let error = SqliteSessionBackend::open(&path)
+            .err()
+            .expect("runtime admission must reject invalid persisted state");
+        assert_eq!(
+            error,
+            StoreError::Serialization("persisted standalone session state is invalid".into()),
+            "runtime admission must reject duplicate {duplicate}"
         );
     }
 }
@@ -630,6 +731,56 @@ fn unsupported_schema_is_incomplete_and_database_remains_unchanged() {
     );
     let after = std::fs::read(&path).expect("read fixture after audit");
     assert_eq!(before, after, "read-only audit modified the database");
+}
+
+#[test]
+fn replication_schema_missing_scanned_timestamp_is_unsupported() {
+    let (_dir, path) = database();
+    let conn = Connection::open(&path).expect("open fixture");
+    conn.execute_batch("ALTER TABLE session_replication_log DROP COLUMN timestamp")
+        .expect("remove scanned timestamp column");
+    drop(conn);
+
+    let report = audit_sqlite_identity_invariants(&path, limits(10, 1024, 1024))
+        .expect("audit returns report");
+    assert_eq!(report.status(), SqliteIdentityAuditStatus::Incomplete);
+    assert_eq!(
+        report.incomplete_reason(),
+        Some(SqliteIdentityAuditIncompleteReason::UnsupportedSchema)
+    );
+}
+
+#[test]
+fn null_lease_guard_is_counted_by_supported_lookalike_schema() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("null-lease-guard.db");
+    let conn = Connection::open(&path).expect("create database");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE session_records (
+            owner, key_type, stable_id, state_class, expires_at
+        );
+        CREATE TABLE leases (
+            owner, key_type, stable_id, guard_expires_at, expires_at_unix_ms
+        );
+        CREATE TABLE key_fences (key_type, stable_id);
+        CREATE TABLE session_replication_log (
+            sequence INTEGER PRIMARY KEY, tx_id, entry_json, timestamp
+        );
+        INSERT INTO leases (
+            owner, key_type, stable_id, guard_expires_at, expires_at_unix_ms
+        ) VALUES ('owner-a', 'pdu-session', X'01', NULL, 0);
+        "#,
+    )
+    .expect("create supported lookalike fixture");
+    drop(conn);
+
+    let report = audit_sqlite_identity_invariants(&path, limits(10, 1024, 1024))
+        .expect("audit returns report");
+    assert_eq!(report.status(), SqliteIdentityAuditStatus::ViolationsFound);
+    assert_eq!(report.incomplete_reason(), None);
+    assert_eq!(report.scanned().leases(), 1);
+    assert_eq!(report.violations().invalid_record_expiry_fields(), 1);
 }
 
 #[test]
