@@ -1597,17 +1597,19 @@ resources, soak, remote HKMS, deployed CNFs, and signed release evidence under
 certificate/identity-denylist revocation MUST remain explicit. #158 remains the
 umbrella until that fleet evidence passes.
 
-### 12.5 Stateless Session-Quorum Consumer Transport
+### 12.5 Typed Session-Quorum Consumer Transport
 
-`StatelessSessionConsumerClient` and `SessionQuorumConsumerServer` provide the
-only production application-consumer boundary. They MUST use mutual TLS and
-the dedicated `opc-session-consumer/1` ALPN with transport revision 1. This is
-a separate exact protocol from both `opc-session-consensus/2` and the
-quarantined `opc-session-net/5` compatibility protocol. A listener MUST NOT
-offer a fallback, negotiate a common revision, or multiplex either other
-protocol as equivalent consumer authority. Because this SDK is unreleased,
-deployments MUST make a coordinated cutover to this final boundary; dual-mode
-or compatibility consumer operation is unsupported.
+`StatelessSessionConsumerClient`, `PersistentSessionConsumerClient`, and
+`SessionQuorumConsumerServer` provide the only production
+application-consumer boundary. They MUST use mutual TLS and the dedicated
+`opc-session-consumer/1` ALPN with transport revision 2. This is a separate
+exact protocol from both `opc-session-consensus/2` and the quarantined
+`opc-session-net/5` compatibility protocol. A listener MUST NOT offer a
+fallback, negotiate a common revision, or multiplex either other protocol as
+equivalent consumer authority. Revision 1 and revision 2 do not interoperate.
+Because this SDK is unreleased, deployments MUST drain consumer clients and
+listeners, then make one coordinated revision-2 cutover; fallback, dual-mode,
+and mixed-revision consumer operation are unsupported.
 
 The consumer listener authenticates the peer from the live mTLS connection and
 authorizes it only through the store-issued current-member manifest and the
@@ -1622,39 +1624,68 @@ values.
 The API exposes typed session reads, bounded mutation/lease operations,
 bounded restore scans, capability discovery, and a coarse committed-change
 watch. It does not expose membership, voting, peer discovery, replication-log
-read/append, raw replication operation trees, snapshots, rebuild/recovery, or
-any topology/consensus authority. The server constructor accepts only the
-`SessionQuorumConsumer` port, and all accepted mutations route through the
-durable quorum leader path.
+read/append, raw replication operation trees, snapshots, rebuild/recovery,
+atomic transition/product composition, or any topology/consensus authority.
+It also excludes every legacy `RemoteSessionBackend` API and all
+consensus/replication/snapshot/rebuild/membership/admin APIs. The server
+constructor accepts only the existing least-authority `SessionQuorumConsumer`
+port, and all accepted mutations route through the durable quorum leader path.
 
-Each normal connection processes exactly one application request. The default
-listener limit is 256 live connections and its retained connection-task set is
-bounded by that limit; each watch owns one delivery task. Consumer frames are
-at most 16 MiB and a configured listener frame limit cannot be lower than the
-8 MiB batch-response limit plus 4 KiB framing allowance. The default bootstrap
-and active-frame idle bound is 5 seconds and one complete request/response
-operation has a 10-second deadline. A watch has a 64-item, 512 KiB transport
-queue, rechecks cancellation at least every 50 ms, and is also bounded by the
-256 KiB store-side projection buffer. The fixed request identity is 16 bytes;
-consumer identity input is capped at 253 UTF-8 bytes; one batch has at most
-256 operations and retains at most 8 MiB of serialized response data.
+Each request connection carries a connection-local, nonzero `u32`
+correlation that increases monotonically and never wraps; it is retired after
+at most 4,096 sequential calls. There is exactly one in-flight call per such
+connection, with no multiplexing. This is structural: it isolates cancellation
+and late responses and removes write-position ambiguity. The client uses a
+fixed, fair pool of four request connections by default (at most 16 when
+configured), with 64 pending calls by default and a hard maximum of 256. A
+pending call may wait or age for at most 250 ms. Watches use two separate slots
+by default (at most 16 when configured), never consuming request-pool capacity.
 
-Every client and listener applies the finite `ConnectionLifecyclePolicy`: by
-default authentication age is at most 15 minutes, retirement drain is at most
-30 seconds, reconnect backoff is 50 ms through 1 second, and material-rotation
-jitter is at most 30 seconds. Reauthentication, material changes, certificate
-expiry, idle retirement, cancellation, malformed frames, EOF, or an uncertain
-stream position terminate the connection/watch and release its transport task
-slot; they do not create another request on that connection.
+The hard listener limit is 256 live connections and its retained
+connection-task set is bounded by that limit; each watch owns one delivery
+task. Consumer frames are at most 16 MiB and a configured listener frame limit
+cannot be lower than the 8 MiB batch-response limit plus 4 KiB framing
+allowance. The bootstrap and active-frame idle bound remains 5 seconds and one
+complete request/response operation remains bounded to 10 seconds. A watch has
+a 64-item, 512 KiB transport queue, rechecks cancellation at least every 50
+ms, and is also bounded by the 256 KiB store-side projection buffer. The fixed
+request identity is 16 bytes; consumer identity input is capped at 253 UTF-8
+bytes; one batch has at most 256 operations and retains at most 8 MiB of
+serialized response data.
 
-The caller owns the request ID for every mutation or lease operation. If a
-request can have crossed the durable effect point without a complete response,
-the outcome is ambiguous. The SDK MUST NOT automatically replay it or mint a
-new request ID. Recovery may retry only the identical request body under the
-retained ID, which resolves through the durable request binding; reuse of that
-ID for a different request is a closed conflict. Applications otherwise must
-perform authoritative readback and apply the existing fencing/idempotency
+Every client and listener retains the existing finite TLS lifecycle bounds: by
+default authentication age is at most 15 minutes, connection-retirement drain
+is at most 30 seconds, and material-rotation jitter is at most 30 seconds. A
+consumer shutdown drains for at most 5 seconds. An establishment attempt has a
+1,500 ms setup limit and a call makes at most two pre-write establishment
+attempts. Resolution occurs only for establishment or re-establishment, never
+for a reused connection. With two attempts there is one between-attempt delay:
+the lifecycle backoff floor (50 ms by default) plus at most 25 ms jitter,
+clipped to the logical deadline. Reauthentication, material
+changes, certificate expiry, idle retirement, cancellation, malformed frames,
+EOF, or an uncertain stream position terminate the connection/watch and release
+its transport task slot; they do not create another request on that connection.
+
+The caller owns the request ID for every mutation or lease operation. Only a
+failure classified as `NotTransmitted` may be automatically retried, and then
+only with the identical request ID and body. Anything possibly written is
+`OutcomeUnknown`: the client evicts that lane and MUST NOT replay the request.
+The SDK MUST NOT mint a new request ID. Recovery may retry only the identical
+request body under the retained ID through the durable request binding; reuse
+of that ID for a different request is a closed conflict. Applications otherwise
+must perform authoritative readback and apply the existing fencing/idempotency
 contract.
+
+Prewarm and readiness may prove authenticated consumer transport capacity only;
+they never prove quorum or product readiness. Readiness deliberately becomes
+false while a request lane is leased; isolated watch slots are non-gating.
+Diagnostics are fixed and
+nonidentifying: setup phase, pool wait, active/maximum/idle counts,
+reuse/reconnect, queue/in-flight/oldest age, and bounded outcome classes. They
+MUST NOT include endpoints, identities, scope values, credentials, keys,
+payloads, request or correlation IDs, owners, or fences. Any performance
+evidence for this transport is synthetic only and makes no ePDG production-SLO
+claim.
 
 The v6 qualification profile records this dedicated ALPN/revision and the
 connection, frame, request/response, watch, task, and lifecycle limits beside

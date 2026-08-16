@@ -237,6 +237,49 @@ ALPN replaces the legacy backend ALPN. Restore now consumes the local
 Openraft-applied state after a linearizable barrier rather than reopening raw
 mutation or rebuild authority beside Openraft.
 
+## Persistent session-consumer transport (#695)
+
+#695 extends the existing least-authority `SessionQuorumConsumer` boundary only:
+`StatelessSessionConsumerClient`, `PersistentSessionConsumerClient`, and
+`SessionQuorumConsumerServer` use
+mutual TLS with the unchanged `opc-session-consumer/1` ALPN and exact consumer
+transport revision 2. Revision 1 will not fall back or interoperate. The
+unreleased SDK requires one coordinated, drained client/listener cutover; there
+is no dual mode. This does not add `RemoteSessionBackend` or any
+consensus/replication/snapshot/rebuild/membership/admin authority, and it
+explicitly excludes #696 atomic transition and product composition.
+
+Each request connection carries a nonzero, monotonically increasing
+connection-local `u32` correlation with no wrap and at most 4,096 sequential
+calls. It will admit only one in-flight call: no multiplexing is permitted,
+because cancellation/late-response isolation and write-position ambiguity are
+structural. The fair request pool defaults to four connections, allows at most
+16 configured connections, and bounds pending calls to 64 by default and 256
+absolutely; queue wait/age is at most 250 ms. Watches have two separate slots
+by default and at most 16 configured slots, so they cannot consume request
+capacity.
+
+An establishment has a 1,500 ms setup limit and a call makes at most two
+pre-write attempts. Resolution occurs only when establishing or
+re-establishing a connection. With two attempts there is one between-attempt
+delay: the lifecycle backoff floor (50 ms by default) plus bounded jitter of
+at most 25 ms, clipped to its logical deadline. The existing 5-second idle,
+10-second operation, 16 MiB frame, 256-server-connection, and TLS lifecycle
+bounds remain in force; shutdown drain is at most 5 seconds.
+
+Only `NotTransmitted` may be automatically retried, and only with the identical
+request ID and body. Anything possibly written is `OutcomeUnknown`, evicts the
+lane, and is never replayed. Prewarm and readiness establish authenticated
+transport capacity only, not quorum or product readiness. Diagnostics are
+fixed and nonidentifying: setup phase, pool wait, active/maximum/idle counts,
+reuse/reconnect, queue/in-flight/oldest age, and bounded outcome classes. They
+never contain endpoints, identities, scopes, credentials, keys, payloads,
+request/correlation IDs, owners, or fences. Readiness deliberately becomes
+false while a request lane is leased; isolated watch slots are non-gating.
+Performance evidence is synthetic only and is not an ePDG production-SLO
+claim; the exact method and bounded raw samples are retained in
+[`qualification-695-persistent-consumer.md`](../../docs/qualification-695-persistent-consumer.md).
+
 ## API Shape
 
 - `SessionReplicationManifest::try_new_with_epoch` validates one cluster ID,

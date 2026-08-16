@@ -6,12 +6,23 @@ use std::process::{Command, Output};
 use opc_consensus::{DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_PROFILE};
 use opc_session_net::{
     CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE, DEFAULT_MAX_AUTHENTICATION_AGE,
-    DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW,
-    DEFAULT_ROTATION_JITTER, MAX_NEGOTIATED_FRAME_SIZE,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS, DEFAULT_RECONNECT_BACKOFF_MAX,
+    DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
+    MAX_NEGOTIATED_FRAME_SIZE, MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
+    MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+    MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+    MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION,
     MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION, MIN_SESSION_CONSENSUS_FRAME_SIZE,
     RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES, SESSION_CONSENSUS_ALPN,
     SESSION_CONSENSUS_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_ALPN,
-    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+    SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, MAX_REPLICATION_LOG_PAGE_ENTRIES,
@@ -579,7 +590,7 @@ fn current_v6_profile_matches_its_declared_consensus_and_store_contract() {
         .protocol
         .stateless_consumer
         .as_ref()
-        .expect("current v6 profile has the stateless consumer contract");
+        .expect("current v6 profile has the consumer compatibility and persistent contract");
     assert_eq!(consumer.alpn.as_bytes(), SESSION_QUORUM_CONSUMER_ALPN);
     assert_eq!(
         consumer.transport_revision,
@@ -590,7 +601,59 @@ fn current_v6_profile_matches_its_declared_consensus_and_store_contract() {
         consumer.max_requests_per_connection,
         MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION
     );
+    assert_eq!(
+        consumer.correlation_id_bytes,
+        SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES
+    );
+    assert_eq!(
+        consumer.max_in_flight_per_connection,
+        MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION
+    );
     assert_eq!(consumer.default_max_connections, 256);
+    assert_eq!(
+        consumer.default_persistent_request_connections,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.max_persistent_request_connections,
+        MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.default_persistent_pending_calls,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS
+    );
+    assert_eq!(
+        consumer.max_persistent_pending_calls,
+        MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS
+    );
+    assert_eq!(
+        consumer.default_persistent_pool_wait_timeout_millis,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT.as_millis() as u64
+    );
+    assert_eq!(
+        consumer.default_persistent_watch_connections,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.max_persistent_watch_connections,
+        MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.default_persistent_setup_timeout_millis,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT.as_millis() as u64
+    );
+    assert_eq!(
+        consumer.default_persistent_connect_attempts,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS
+    );
+    assert_eq!(
+        consumer.default_persistent_reconnect_jitter_millis,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER.as_millis() as u64
+    );
+    assert_eq!(
+        consumer.default_persistent_shutdown_drain_millis,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN.as_millis() as u64
+    );
     assert_eq!(
         consumer.min_response_frame_bytes,
         MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES + 4 * 1024

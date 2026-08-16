@@ -1,18 +1,20 @@
-//! Authenticated stateless application access to a fixed session quorum.
+//! Authenticated typed application access to a fixed session quorum.
 //!
 //! The transport in this module is intentionally separate from both the
 //! consensus-member ALPN and the quarantined compatibility ALPN. It exposes
-//! only [`opc_session_store::SessionConsumerOperation`] and uses a fresh,
-//! bounded mutual-TLS connection for each normal operation. A consumer never
+//! only [`opc_session_store::SessionConsumerOperation`] and uses a bounded
+//! mutual-TLS transport with both fresh stateless calls and an optional fixed
+//! persistent-client pool. A consumer never
 //! receives a local member ID, Openraft peer, SQLite backend, snapshot path,
 //! or raw replication append/rebuild operation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use futures_util::stream::{self, BoxStream, StreamExt};
@@ -30,7 +32,7 @@ use opc_types::SpiffeId;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::consensus::RemoteAddrResolver;
@@ -44,18 +46,46 @@ use crate::protocol::{
     FrameWriteError, MAX_NEGOTIATED_FRAME_SIZE,
 };
 
-/// Dedicated ALPN for authenticated stateless session-quorum consumers.
+/// Dedicated ALPN for authenticated session-quorum consumers.
 pub const SESSION_QUORUM_CONSUMER_ALPN: &[u8] = b"opc-session-consumer/1";
 
 /// Fixed wire revision for [`SESSION_QUORUM_CONSUMER_ALPN`].
-pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 1;
+pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 2;
 
-/// Maximum application requests processed on one consumer connection.
-///
-/// Keeping this at one makes cancellation and ambiguous mutation handling
-/// structural: a failed connection never causes this SDK to submit a second
-/// application request automatically.
-pub const MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION: usize = 1;
+/// Maximum sequential application requests processed on one consumer
+/// connection. Every request has an exact nonzero connection-local
+/// correlation and only one can be in flight.
+pub const MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION: usize = 4096;
+/// Fixed logical width of the nonzero connection-local correlation value.
+pub const SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES: usize = std::mem::size_of::<u32>();
+/// Revision 2 deliberately admits one in-flight request per physical lane.
+pub const MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION: usize = 1;
+
+/// Default number of authenticated request lanes retained by a persistent
+/// consumer client.
+pub const DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS: usize = 4;
+/// Hard upper bound for persistent request lanes.
+pub const MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS: usize = 16;
+/// Default bounded admission count for persistent calls.
+pub const DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS: usize = 64;
+/// Hard upper bound for persistent call admission.
+pub const MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS: usize = 256;
+/// Default maximum age of a request-pool wait.
+pub const DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT: Duration =
+    Duration::from_millis(250);
+/// Default number of separate persistent watch slots.
+pub const DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS: usize = 2;
+/// Hard upper bound for persistent watch slots.
+pub const MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS: usize = 16;
+/// Default cold connection setup budget for a persistent lane.
+pub const DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Default maximum number of pre-write connection attempts for one call.
+pub const DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS: usize = 2;
+/// Default upper bound for reconnect jitter.
+pub const DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER: Duration =
+    Duration::from_millis(25);
+/// Default bounded graceful persistent-client shutdown drain.
+pub const DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 const DEFAULT_CONSUMER_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CONSUMER_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -76,7 +106,7 @@ struct QueuedConsumerWatchItem {
     _byte_permit: OwnedSemaphorePermit,
 }
 
-/// Redaction-safe construction or transport failure for a stateless consumer.
+/// Redaction-safe construction or transport failure for a typed consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SessionConsumerClientError {
@@ -95,6 +125,263 @@ pub enum SessionConsumerClientError {
     /// The bounded connection or operation deadline elapsed.
     #[error("session consumer deadline elapsed")]
     Deadline,
+    /// The fixed persistent consumer pool could not admit the call.
+    #[error("session consumer is overloaded")]
+    Overloaded,
+    /// The persistent consumer client has begun shutdown.
+    #[error("session consumer is shutting down")]
+    ShuttingDown,
+}
+
+/// Effect-boundary-preserving failure from the persistent client's raw typed
+/// request surface.
+///
+/// Callers that use the operation-specific mutation helpers receive their
+/// corresponding mutation error type. Callers that retain a complete typed
+/// request can use this error to distinguish a request proven not transmitted
+/// from one whose outcome must be recovered under the exact retained request
+/// identity and body.
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PersistentSessionConsumerExecuteError {
+    /// No call-frame byte crossed the transport boundary.
+    #[error("persistent consumer request was not transmitted: {cause}")]
+    NotTransmitted {
+        /// Redaction-safe pre-write transport classification.
+        cause: SessionConsumerClientError,
+    },
+    /// The call may have crossed the transport boundary.
+    #[error("persistent consumer request outcome is unconfirmed; retry only the retained request")]
+    OutcomeUnknown {
+        /// Caller-owned identity of the complete request that may be retried.
+        request_id: SessionConsumerRequestId,
+    },
+}
+
+impl fmt::Debug for PersistentSessionConsumerExecuteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::NotTransmitted { .. } => "not_transmitted",
+            Self::OutcomeUnknown { .. } => "outcome_unknown",
+        };
+        formatter
+            .debug_struct("PersistentSessionConsumerExecuteError")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PersistentSessionConsumerExecuteError {
+    /// Return the only request identity permitted for exact recovery.
+    pub const fn exact_retry_id(&self) -> Option<SessionConsumerRequestId> {
+        match self {
+            Self::OutcomeUnknown { request_id } => Some(*request_id),
+            Self::NotTransmitted { .. } => None,
+        }
+    }
+}
+
+/// Redaction-safe invalid persistent-consumer configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PersistentSessionConsumerConfigError {
+    /// A bounded numeric capacity was outside the public hard limits.
+    #[error("invalid persistent session consumer capacity")]
+    Capacity,
+    /// A required finite duration or retry count was invalid.
+    #[error("invalid persistent session consumer timing")]
+    Timing,
+}
+
+/// Fixed, validated capacity and timing policy for a persistent consumer.
+///
+/// Fields are private so a pool cannot be constructed with an unbounded task,
+/// queue, or connection cardinality. A pending-call count of zero deliberately
+/// selects fail-fast admission.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PersistentSessionConsumerConfig {
+    request_connections: usize,
+    pending_calls: usize,
+    pool_wait_timeout: Duration,
+    watch_connections: usize,
+    setup_timeout: Duration,
+    connect_attempts: usize,
+    reconnect_jitter: Duration,
+    shutdown_drain: Duration,
+}
+
+impl fmt::Debug for PersistentSessionConsumerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistentSessionConsumerConfig")
+            .field("request_connections", &self.request_connections)
+            .field("pending_calls", &self.pending_calls)
+            .field("pool_wait_timeout", &self.pool_wait_timeout)
+            .field("watch_connections", &self.watch_connections)
+            .field("setup_timeout", &self.setup_timeout)
+            .field("connect_attempts", &self.connect_attempts)
+            .field("reconnect_jitter", &self.reconnect_jitter)
+            .field("shutdown_drain", &self.shutdown_drain)
+            .finish()
+    }
+}
+
+impl Default for PersistentSessionConsumerConfig {
+    fn default() -> Self {
+        Self {
+            request_connections: DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+            pending_calls: DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
+            pool_wait_timeout: DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+            watch_connections: DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+            setup_timeout: DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
+            connect_attempts: DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+            reconnect_jitter: DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
+            shutdown_drain: DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
+        }
+    }
+}
+
+impl PersistentSessionConsumerConfig {
+    /// Construct a complete bounded persistent-client configuration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        request_connections: usize,
+        pending_calls: usize,
+        pool_wait_timeout: Duration,
+        watch_connections: usize,
+        setup_timeout: Duration,
+        connect_attempts: usize,
+        reconnect_jitter: Duration,
+        shutdown_drain: Duration,
+    ) -> Result<Self, PersistentSessionConsumerConfigError> {
+        let config = Self {
+            request_connections,
+            pending_calls,
+            pool_wait_timeout,
+            watch_connections,
+            setup_timeout,
+            connect_attempts,
+            reconnect_jitter,
+            shutdown_drain,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), PersistentSessionConsumerConfigError> {
+        if !(1..=MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS)
+            .contains(&self.request_connections)
+            || self.pending_calls > MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS
+            || !(1..=MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS)
+                .contains(&self.watch_connections)
+        {
+            return Err(PersistentSessionConsumerConfigError::Capacity);
+        }
+        if self.pool_wait_timeout.is_zero()
+            || self.pool_wait_timeout > DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT
+            || self.setup_timeout.is_zero()
+            || self.setup_timeout > DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT
+            || self.shutdown_drain.is_zero()
+            || self.shutdown_drain > DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN
+            || self.connect_attempts == 0
+            || self.connect_attempts > DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS
+            || self.reconnect_jitter > DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER
+        {
+            return Err(PersistentSessionConsumerConfigError::Timing);
+        }
+        Ok(())
+    }
+
+    /// Return the fixed normal-request lane count.
+    pub const fn request_connections(&self) -> usize {
+        self.request_connections
+    }
+    /// Return the bounded persistent-call admission count.
+    pub const fn pending_calls(&self) -> usize {
+        self.pending_calls
+    }
+    /// Return the maximum bounded wait for a request lane.
+    pub const fn pool_wait_timeout(&self) -> Duration {
+        self.pool_wait_timeout
+    }
+    /// Return the isolated watch capacity.
+    pub const fn watch_connections(&self) -> usize {
+        self.watch_connections
+    }
+    /// Return the cold physical setup deadline.
+    pub const fn setup_timeout(&self) -> Duration {
+        self.setup_timeout
+    }
+    /// Return the maximum safe pre-write attempt count.
+    pub const fn connect_attempts(&self) -> usize {
+        self.connect_attempts
+    }
+    /// Return the bounded reconnect jitter maximum.
+    pub const fn reconnect_jitter(&self) -> Duration {
+        self.reconnect_jitter
+    }
+    /// Return the shutdown drain limit.
+    pub const fn shutdown_drain(&self) -> Duration {
+        self.shutdown_drain
+    }
+}
+
+/// Fixed numeric, nonidentifying persistent-pool diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PersistentSessionConsumerDiagnostics {
+    pub setup_attempts: u64,
+    pub setup_failures: u64,
+    pub setup_successes: u64,
+    pub resolve_attempts: u64,
+    pub resolve_failures: u64,
+    pub tcp_attempts: u64,
+    pub tcp_failures: u64,
+    pub tls_attempts: u64,
+    pub tls_failures: u64,
+    pub hello_attempts: u64,
+    pub hello_failures: u64,
+    pub pool_wait_current: u64,
+    pub pool_wait_max: u64,
+    pub pool_wait_count: u64,
+    pub pool_wait_max_duration_millis: u64,
+    pub pool_wait_oldest_age_millis: u64,
+    pub active: u64,
+    pub max_active: u64,
+    pub idle: u64,
+    pub reused: u64,
+    pub reconnects: u64,
+    pub failures: u64,
+    pub queued: u64,
+    pub inflight: u64,
+    pub max_inflight: u64,
+    pub watch_active: u64,
+    pub max_watch_active: u64,
+    pub successes: u64,
+    pub not_transmitted: u64,
+    pub outcome_unknown: u64,
+    pub overload: u64,
+    pub shutdown: u64,
+    pub authentication: u64,
+    pub scope: u64,
+    pub protocol: u64,
+    pub deadline: u64,
+}
+
+/// Conservative transport-capacity readiness only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PersistentSessionConsumerReadiness {
+    pub ready: bool,
+    pub configured_request_connections: usize,
+    pub ready_request_connections: usize,
+}
+
+/// Bounded persistent-client shutdown result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PersistentSessionConsumerShutdownReport {
+    pub drained_calls: u64,
+    pub forced_calls: u64,
+    pub drained_watches: u64,
+    pub forced_watches: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +440,18 @@ fn ensure_pre_request_budget_remaining(
         Err(SessionConsumerClientError::Unavailable)
     } else {
         Ok(())
+    }
+}
+
+fn complete_before_deadline<T, E>(
+    value: T,
+    deadline: tokio::time::Instant,
+    late_error: E,
+) -> Result<T, E> {
+    if tokio::time::Instant::now() < deadline {
+        Ok(value)
+    } else {
+        Err(late_error)
     }
 }
 
@@ -294,7 +593,7 @@ pub enum SessionConsumerAuthorizationError {
     InvalidIdentity,
 }
 
-/// Exact mTLS authorization policy for stateless application consumers.
+/// Exact mTLS authorization policy for typed application consumers.
 ///
 /// Consumers and consensus members are separate identity sets. An identity in
 /// the consensus-member set is rejected even if it is also present in the
@@ -310,7 +609,6 @@ impl fmt::Debug for SessionConsumerAuthorizer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SessionConsumerAuthorizer")
-            .field("scope", &self.scope)
             .field("consumer_count", &self.consumers.len())
             .field("consensus_member_count", &self.consensus_members.len())
             .finish()
@@ -404,6 +702,57 @@ struct ConsumerHelloAck {
     scope: SessionConsumerScope,
 }
 
+/// Connection-local request/response correlation. It is deliberately not an
+/// application request ID and is never surfaced in public diagnostics/errors.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsumerCall {
+    correlation: NonZeroU32,
+    request: Box<SessionConsumerRequest>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BorrowedConsumerCall<'a> {
+    correlation: NonZeroU32,
+    request: &'a SessionConsumerRequest,
+}
+
+/// Serialization-only view of a call. Keeping the caller-owned request
+/// borrowed avoids copying a potentially maximum-sized payload for every safe
+/// pre-write reconnect attempt while retaining the exact revision-2 encoding.
+#[derive(Serialize)]
+#[serde(
+    tag = "kind",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum BorrowedConsumerWireRequest<'a> {
+    Call(BorrowedConsumerCall<'a>),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsumerCallResponse {
+    correlation: NonZeroU32,
+    response: Box<SessionConsumerResponse>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BorrowedConsumerCallResponse<'a> {
+    correlation: NonZeroU32,
+    response: &'a SessionConsumerResponse,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsumerWatchEntry {
+    correlation: NonZeroU32,
+    entry: Box<Result<SessionConsumerChange, SessionConsumerStoreError>>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -413,7 +762,7 @@ struct ConsumerHelloAck {
 )]
 enum ConsumerWireRequest {
     Hello(ConsumerHello),
-    Call(Box<SessionConsumerRequest>),
+    Call(ConsumerCall),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -425,8 +774,142 @@ enum ConsumerWireRequest {
 )]
 enum ConsumerWireResponse {
     HelloAck(ConsumerHelloAck),
-    Response(Box<SessionConsumerResponse>),
-    WatchEntry(Box<Result<SessionConsumerChange, SessionConsumerStoreError>>),
+    HelloRejected(SessionConsumerRejection),
+    Response(ConsumerCallResponse),
+    WatchEntry(ConsumerWatchEntry),
+}
+
+#[derive(Serialize)]
+#[serde(
+    tag = "kind",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum BorrowedConsumerWireResponse<'a> {
+    Response(BorrowedConsumerCallResponse<'a>),
+}
+
+fn exact_correlation(expected: NonZeroU32, received: NonZeroU32) -> Result<(), ProtocolError> {
+    if expected != received {
+        Err(ProtocolError::UnexpectedResponse)
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConsumerOperationKind {
+    Capabilities,
+    Get,
+    PreflightRecordExpiry,
+    CompareAndSet,
+    DeleteFenced,
+    RefreshTtl,
+    Batch { contains_mutation: bool },
+    ScanRestoreRecords,
+    Watch,
+    AcquireLease,
+    RenewLease,
+    ReleaseLease,
+}
+
+impl ConsumerOperationKind {
+    fn from_operation(operation: &SessionConsumerOperation) -> Self {
+        match operation {
+            SessionConsumerOperation::Capabilities => Self::Capabilities,
+            SessionConsumerOperation::Get { .. } => Self::Get,
+            SessionConsumerOperation::PreflightRecordExpiry { .. } => Self::PreflightRecordExpiry,
+            SessionConsumerOperation::CompareAndSet { .. } => Self::CompareAndSet,
+            SessionConsumerOperation::DeleteFenced { .. } => Self::DeleteFenced,
+            SessionConsumerOperation::RefreshTtl { .. } => Self::RefreshTtl,
+            SessionConsumerOperation::Batch { ops } => Self::Batch {
+                contains_mutation: ops.iter().any(|op| !matches!(op, SessionOp::Get { .. })),
+            },
+            SessionConsumerOperation::ScanRestoreRecords { .. } => Self::ScanRestoreRecords,
+            SessionConsumerOperation::Watch { .. } => Self::Watch,
+            SessionConsumerOperation::AcquireLease { .. } => Self::AcquireLease,
+            SessionConsumerOperation::RenewLease { .. } => Self::RenewLease,
+            SessionConsumerOperation::ReleaseLease { .. } => Self::ReleaseLease,
+            // A newer operation reaching this revision is conservatively an
+            // effectful mutation for timeout and response-family purposes.
+            _ => Self::CompareAndSet,
+        }
+    }
+}
+
+fn response_matches_operation(
+    operation: ConsumerOperationKind,
+    response: &SessionConsumerResponse,
+) -> bool {
+    if matches!(response, SessionConsumerResponse::Rejected(_)) {
+        return true;
+    }
+    matches!(
+        (operation, response),
+        (
+            ConsumerOperationKind::Capabilities,
+            SessionConsumerResponse::Capabilities(_)
+        ) | (ConsumerOperationKind::Get, SessionConsumerResponse::Get(_))
+            | (
+                ConsumerOperationKind::PreflightRecordExpiry,
+                SessionConsumerResponse::PreflightRecordExpiry(_),
+            )
+            | (
+                ConsumerOperationKind::CompareAndSet,
+                SessionConsumerResponse::CompareAndSet(_)
+            )
+            | (
+                ConsumerOperationKind::DeleteFenced,
+                SessionConsumerResponse::DeleteFenced(_)
+            )
+            | (
+                ConsumerOperationKind::RefreshTtl,
+                SessionConsumerResponse::RefreshTtl(_)
+            )
+            | (
+                ConsumerOperationKind::Batch { .. },
+                SessionConsumerResponse::Batch(_)
+            )
+            | (
+                ConsumerOperationKind::ScanRestoreRecords,
+                SessionConsumerResponse::ScanRestoreRecords(_),
+            )
+            | (
+                ConsumerOperationKind::Watch,
+                SessionConsumerResponse::WatchOpened
+            )
+            | (
+                ConsumerOperationKind::AcquireLease,
+                SessionConsumerResponse::AcquireLease(_)
+            )
+            | (
+                ConsumerOperationKind::RenewLease,
+                SessionConsumerResponse::RenewLease(_)
+            )
+            | (
+                ConsumerOperationKind::ReleaseLease,
+                SessionConsumerResponse::ReleaseLease(_)
+            )
+            | (
+                ConsumerOperationKind::CompareAndSet
+                    | ConsumerOperationKind::DeleteFenced
+                    | ConsumerOperationKind::RefreshTtl,
+                SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Mutation),
+            )
+            | (
+                ConsumerOperationKind::Batch {
+                    contains_mutation: true,
+                },
+                SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Mutation),
+            )
+            | (
+                ConsumerOperationKind::AcquireLease
+                    | ConsumerOperationKind::RenewLease
+                    | ConsumerOperationKind::ReleaseLease,
+                SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Lease),
+            )
+    )
 }
 
 /// Decode the fixed consumer revision without accepting a shared DTO's
@@ -497,6 +980,7 @@ impl fmt::Debug for ConsumerWireResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HelloAck(_) => formatter.write_str("ConsumerWireResponse::HelloAck"),
+            Self::HelloRejected(_) => formatter.write_str("ConsumerWireResponse::HelloRejected"),
             Self::Response(_) => formatter.write_str("ConsumerWireResponse::Response(<redacted>)"),
             Self::WatchEntry(_) => {
                 formatter.write_str("ConsumerWireResponse::WatchEntry(<redacted>)")
@@ -551,6 +1035,49 @@ struct ConsumerConnection {
     lifecycle: ConnectionLifecycle,
     admitted_generation: u64,
     admitted_material_epoch: opc_tls::TlsMaterialEpoch,
+    next_correlation: NonZeroU32,
+    calls: usize,
+    idle_deadline: tokio::time::Instant,
+}
+
+#[derive(Clone, Copy)]
+enum ConsumerSetupPhase {
+    Resolve,
+    Tcp,
+    Tls,
+    Hello,
+}
+
+fn record_setup_phase_attempt(
+    counters: Option<&PersistentConsumerCounters>,
+    phase: ConsumerSetupPhase,
+) {
+    let Some(counters) = counters else {
+        return;
+    };
+    let counter = match phase {
+        ConsumerSetupPhase::Resolve => &counters.resolve_attempts,
+        ConsumerSetupPhase::Tcp => &counters.tcp_attempts,
+        ConsumerSetupPhase::Tls => &counters.tls_attempts,
+        ConsumerSetupPhase::Hello => &counters.hello_attempts,
+    };
+    counter_increment(counter);
+}
+
+fn record_setup_phase_failure(
+    counters: Option<&PersistentConsumerCounters>,
+    phase: ConsumerSetupPhase,
+) {
+    let Some(counters) = counters else {
+        return;
+    };
+    let counter = match phase {
+        ConsumerSetupPhase::Resolve => &counters.resolve_failures,
+        ConsumerSetupPhase::Tcp => &counters.tcp_failures,
+        ConsumerSetupPhase::Tls => &counters.tls_failures,
+        ConsumerSetupPhase::Hello => &counters.hello_failures,
+    };
+    counter_increment(counter);
 }
 
 impl ConsumerConnection {
@@ -560,16 +1087,51 @@ impl ConsumerConnection {
         reauthentication: &SessionReauthenticationControl,
     ) -> bool {
         let now = tokio::time::Instant::now();
-        self.lifecycle.observe_rotation(
+        observe_consumer_rotation(
+            &mut self.lifecycle,
             now,
             reauthentication.generation(),
-            Some(config.material_status().epoch()),
-            b"session-quorum-consumer",
+            config.material_status().epoch(),
         );
         self.lifecycle.retirement(now).is_none()
             && self.admitted_generation == reauthentication.generation()
             && self.admitted_material_epoch == config.material_status().epoch()
     }
+
+    fn take_correlation(&mut self) -> Result<NonZeroU32, SessionConsumerClientError> {
+        if self.calls >= MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION {
+            return Err(SessionConsumerClientError::Unavailable);
+        }
+        let correlation = self.next_correlation;
+        self.next_correlation = NonZeroU32::new(
+            self.next_correlation
+                .get()
+                .checked_add(1)
+                .ok_or(SessionConsumerClientError::Unavailable)?,
+        )
+        .ok_or(SessionConsumerClientError::Unavailable)?;
+        self.calls = self.calls.saturating_add(1);
+        Ok(correlation)
+    }
+
+    fn reusable(&self) -> bool {
+        self.calls < MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION
+            && tokio::time::Instant::now() < self.idle_deadline
+    }
+}
+
+fn observe_consumer_rotation(
+    lifecycle: &mut ConnectionLifecycle,
+    now: tokio::time::Instant,
+    generation: u64,
+    material_epoch: opc_tls::TlsMaterialEpoch,
+) {
+    lifecycle.observe_rotation(
+        now,
+        generation,
+        Some(material_epoch),
+        b"session-quorum-consumer",
+    );
 }
 
 fn server_connection_current(
@@ -582,12 +1144,7 @@ fn server_connection_current(
     let now = tokio::time::Instant::now();
     let current_generation = reauthentication.generation();
     let current_material_epoch = config.material_status().epoch();
-    lifecycle.observe_rotation(
-        now,
-        current_generation,
-        Some(current_material_epoch),
-        b"session-quorum-consumer",
-    );
+    observe_consumer_rotation(lifecycle, now, current_generation, current_material_epoch);
     lifecycle.retirement(now).is_none()
         && admitted_generation == current_generation
         && admitted_material_epoch == current_material_epoch
@@ -760,6 +1317,7 @@ impl StatelessSessionConsumerClient {
         &self,
         pre_request_deadline: tokio::time::Instant,
         pre_request_budget_active: bool,
+        setup_counters: Option<&PersistentConsumerCounters>,
     ) -> Result<ConsumerConnection, SessionConsumerClientError> {
         if self.idle_timeout.is_zero()
             || self.operation_timeout.is_zero()
@@ -770,19 +1328,38 @@ impl StatelessSessionConsumerClient {
         {
             return Err(SessionConsumerClientError::Protocol);
         }
+        record_setup_phase_attempt(setup_counters, ConsumerSetupPhase::Resolve);
         let address = tokio::time::timeout_at(pre_request_deadline, (self.resolve)())
             .await
-            .map_err(|_| SessionConsumerClientError::Unavailable)?
-            .map_err(|_| SessionConsumerClientError::Unavailable)?;
+            .map_err(|_| {
+                record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Resolve);
+                SessionConsumerClientError::Unavailable
+            })?
+            .map_err(|_| {
+                record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Resolve);
+                SessionConsumerClientError::Unavailable
+            })?;
         let generation = self.reauthentication.generation();
-        let handshake = self
-            .tls_config
-            .begin_handshake()
-            .map_err(|_| SessionConsumerClientError::Authentication)?;
+        record_setup_phase_attempt(setup_counters, ConsumerSetupPhase::Tcp);
         let tcp = tokio::time::timeout_at(pre_request_deadline, TcpStream::connect(address))
             .await
-            .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
-            .map_err(|_| SessionConsumerClientError::Unavailable)?;
+            .map_err(|_| {
+                record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Tcp);
+                pre_request_timeout_error(pre_request_budget_active)
+            })?
+            .map_err(|_| {
+                record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Tcp);
+                SessionConsumerClientError::Unavailable
+            })?;
+        tcp.set_nodelay(true).map_err(|_| {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Tcp);
+            SessionConsumerClientError::Unavailable
+        })?;
+        record_setup_phase_attempt(setup_counters, ConsumerSetupPhase::Tls);
+        let handshake = self.tls_config.begin_handshake().map_err(|_| {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Tls);
+            SessionConsumerClientError::Authentication
+        })?;
         let connector =
             tokio_rustls::TlsConnector::from(consumer_client_tls_config(handshake.rustls_config()));
         let tls = tokio::time::timeout_at(
@@ -790,19 +1367,37 @@ impl StatelessSessionConsumerClient {
             connector.connect(self.server_name.clone(), tcp),
         )
         .await
-        .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
+        .map_err(|_| {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Tls);
+            pre_request_timeout_error(pre_request_budget_active)
+        })?
         .map_err(|error| SessionConsumerClientError::from(classify_tls_io_error(error)))
-        .map_err(|error| pre_request_error(error, pre_request_budget_active))?;
+        .map_err(|error| {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Tls);
+            pre_request_error(error, pre_request_budget_active)
+        })?;
         let established_at = tokio::time::Instant::now();
         if tls.get_ref().1.alpn_protocol() != Some(SESSION_QUORUM_CONSUMER_ALPN) {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Tls);
             return Err(SessionConsumerClientError::Protocol);
         }
-        let peer = opc_tls::peer_tls_identity_from_client_connection(tls.get_ref().1)
-            .map_err(|_| SessionConsumerClientError::Authentication)?;
+        let peer =
+            opc_tls::peer_tls_identity_from_client_connection(tls.get_ref().1).map_err(|_| {
+                record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Tls);
+                SessionConsumerClientError::Authentication
+            })?;
         if peer.spiffe_id() != &self.expected_server_identity {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Tls);
             return Err(SessionConsumerClientError::Authentication);
         }
         let (mut reader, mut writer) = tokio::io::split(tls);
+        record_setup_phase_attempt(setup_counters, ConsumerSetupPhase::Hello);
+        // The server starts its between-frame timeout after HelloAck. Stamp
+        // from before our Hello write and never extend beyond the protocol's
+        // fixed five-second idle ceiling, making this conservatively earlier.
+        let idle_deadline = tokio::time::Instant::now()
+            .checked_add(self.idle_timeout.min(DEFAULT_CONSUMER_IDLE_TIMEOUT))
+            .ok_or(SessionConsumerClientError::Protocol)?;
         let hello = ConsumerWireRequest::Hello(ConsumerHello {
             transport_revision: SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
             scope: self.scope,
@@ -815,43 +1410,49 @@ impl StatelessSessionConsumerClient {
         )
         .await
         .map_err(SessionConsumerClientError::from)
-        .map_err(|error| pre_request_error(error, pre_request_budget_active))?;
+        .map_err(|error| {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
+            pre_request_error(error, pre_request_budget_active)
+        })?;
         let ack = tokio::time::timeout_at(
             pre_request_deadline,
             read_consumer_frame::<_, ConsumerWireResponse>(&mut reader, MAX_NEGOTIATED_FRAME_SIZE),
         )
         .await
-        .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
+        .map_err(|_| {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
+            pre_request_timeout_error(pre_request_budget_active)
+        })?
         .map_err(SessionConsumerClientError::from)
-        .map_err(|error| pre_request_error(error, pre_request_budget_active))?;
+        .map_err(|error| {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
+            pre_request_error(error, pre_request_budget_active)
+        })?;
         match ack {
             ConsumerWireResponse::HelloAck(ack)
                 if ack.transport_revision == SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION
                     && ack.scope == self.scope => {}
-            ConsumerWireResponse::Response(response)
-                if matches!(
-                    response.as_ref(),
-                    SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch,)
-                ) =>
-            {
-                return Err(SessionConsumerClientError::Scope)
+            ConsumerWireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch) => {
+                record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
+                return Err(SessionConsumerClientError::Scope);
             }
-            ConsumerWireResponse::Response(response)
-                if matches!(
-                    response.as_ref(),
-                    SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized,)
-                ) =>
-            {
-                return Err(SessionConsumerClientError::Authentication)
+            ConsumerWireResponse::HelloRejected(SessionConsumerRejection::Unauthorized) => {
+                record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
+                return Err(SessionConsumerClientError::Authentication);
             }
-            _ => return Err(SessionConsumerClientError::Protocol),
+            _ => {
+                record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
+                return Err(SessionConsumerClientError::Protocol);
+            }
         }
-        let admission = handshake
-            .admit()
-            .map_err(|_| SessionConsumerClientError::Authentication)?;
+        let admission = handshake.admit().map_err(|_| {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
+            SessionConsumerClientError::Authentication
+        })?;
         if generation != self.reauthentication.generation()
             || admission.epoch() != self.tls_config.material_status().epoch()
         {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
             return Err(SessionConsumerClientError::Deadline);
         }
         let lifecycle = ConnectionLifecycle::new(
@@ -870,18 +1471,179 @@ impl StatelessSessionConsumerClient {
             generation,
             Some(admission.epoch()),
         )
-        .map_err(|_| SessionConsumerClientError::Protocol)?;
+        .map_err(|_| {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
+            SessionConsumerClientError::Protocol
+        })?;
         let mut connection = ConsumerConnection {
             reader: Box::new(reader),
             writer: Box::new(writer),
             lifecycle,
             admitted_generation: generation,
             admitted_material_epoch: admission.epoch(),
+            next_correlation: NonZeroU32::MIN,
+            calls: 0,
+            idle_deadline,
         };
         if !connection.current(&self.tls_config, &self.reauthentication) {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
             return Err(SessionConsumerClientError::Deadline);
         }
         Ok(connection)
+    }
+
+    async fn execute_on_connection(
+        &self,
+        connection: &mut ConsumerConnection,
+        request: &SessionConsumerRequest,
+        pre_request_deadline: tokio::time::Instant,
+        pre_request_budget_active: bool,
+        deadline: tokio::time::Instant,
+        mut force_shutdown: Option<watch::Receiver<PersistentShutdownPhase>>,
+    ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        let mut reauthentication_changes = self.reauthentication.subscribe();
+        let mut material_changes = Some(self.tls_config.subscribe_material_changes());
+        if !connection.current(&self.tls_config, &self.reauthentication) {
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Unavailable,
+            ));
+        }
+        let correlation = connection
+            .take_correlation()
+            .map_err(SessionConsumerCallError::BeforeCallWrite)?;
+        let operation = ConsumerOperationKind::from_operation(request.operation());
+        let outbound = BorrowedConsumerWireRequest::Call(BorrowedConsumerCall {
+            correlation,
+            request,
+        });
+        // The peer's next-frame idle retirement starts after its response
+        // write. Stamping before our call write is conservatively earlier and
+        // prevents an idle FIN race from ever being recycled as a new call.
+        connection.idle_deadline = tokio::time::Instant::now()
+            .checked_add(self.idle_timeout.min(DEFAULT_CONSUMER_IDLE_TIMEOUT))
+            .ok_or(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Protocol,
+            ))?;
+        let write_result = {
+            let lifecycle = &mut connection.lifecycle;
+            let initial_hard_deadline = lifecycle.hard_deadline().map_err(|_| {
+                SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol)
+            })?;
+            let write_deadline = pre_request_deadline.min(initial_hard_deadline);
+            let write = write_frame_bounded_until_classified(
+                &mut connection.writer,
+                &outbound,
+                MAX_NEGOTIATED_FRAME_SIZE,
+                write_deadline,
+            );
+            tokio::pin!(write);
+            loop {
+                let hard_deadline = lifecycle.hard_deadline().map_err(|_| {
+                    SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Protocol)
+                })?;
+                tokio::select! {
+                    biased;
+                    result = &mut write => break result,
+                    _ = wait_for_optional_forced_shutdown(&mut force_shutdown) => {
+                        return Err(SessionConsumerCallError::MayHaveSent(
+                            SessionConsumerClientError::ShuttingDown,
+                        ));
+                    }
+                    _ = reauthentication_changes.changed() => {
+                        observe_consumer_rotation(
+                            lifecycle,
+                            tokio::time::Instant::now(),
+                            self.reauthentication.generation(),
+                            self.tls_config.material_status().epoch(),
+                        );
+                    }
+                    _ = wait_consumer_material_change(&mut material_changes) => {
+                        observe_consumer_rotation(
+                            lifecycle,
+                            tokio::time::Instant::now(),
+                            self.reauthentication.generation(),
+                            self.tls_config.material_status().epoch(),
+                        );
+                    }
+                    _ = wait_for_shortened_deadline(hard_deadline, write_deadline) => {
+                        lifecycle.record_hard_overrun();
+                        return Err(SessionConsumerCallError::MayHaveSent(
+                            SessionConsumerClientError::Deadline,
+                        ));
+                    }
+                }
+            }
+        };
+        write_result
+            .map_err(|error| classify_call_write_error(error, pre_request_budget_active))?;
+        let response = {
+            let lifecycle = &mut connection.lifecycle;
+            let read = read_consumer_frame::<_, ConsumerWireResponse>(
+                &mut connection.reader,
+                MAX_NEGOTIATED_FRAME_SIZE,
+            );
+            tokio::pin!(read);
+            loop {
+                let hard_deadline = lifecycle.hard_deadline().map_err(|_| {
+                    SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Protocol)
+                })?;
+                let response_deadline = deadline.min(hard_deadline);
+                let response = tokio::select! {
+                    biased;
+                    response = &mut read => Some(response),
+                    _ = wait_for_optional_forced_shutdown(&mut force_shutdown) => {
+                        return Err(SessionConsumerCallError::MayHaveSent(
+                            SessionConsumerClientError::ShuttingDown,
+                        ));
+                    }
+                    _ = reauthentication_changes.changed() => {
+                        observe_consumer_rotation(
+                            lifecycle,
+                            tokio::time::Instant::now(),
+                            self.reauthentication.generation(),
+                            self.tls_config.material_status().epoch(),
+                        );
+                        None
+                    }
+                    _ = wait_consumer_material_change(&mut material_changes) => {
+                        observe_consumer_rotation(
+                            lifecycle,
+                            tokio::time::Instant::now(),
+                            self.reauthentication.generation(),
+                            self.tls_config.material_status().epoch(),
+                        );
+                        None
+                    }
+                    _ = tokio::time::sleep_until(response_deadline) => {
+                        if hard_deadline <= deadline {
+                            lifecycle.record_hard_overrun();
+                        }
+                        return Err(SessionConsumerCallError::MayHaveSent(
+                            SessionConsumerClientError::Deadline,
+                        ));
+                    }
+                };
+                if let Some(response) = response {
+                    break response;
+                }
+            }
+        };
+        let response = response
+            .map_err(SessionConsumerClientError::from)
+            .map_err(SessionConsumerCallError::MayHaveSent)?;
+        match response {
+            ConsumerWireResponse::Response(ConsumerCallResponse {
+                correlation: received,
+                response,
+            }) if exact_correlation(correlation, received).is_ok()
+                && response_matches_operation(operation, response.as_ref()) =>
+            {
+                Ok(*response)
+            }
+            _ => Err(SessionConsumerCallError::MayHaveSent(
+                SessionConsumerClientError::Protocol,
+            )),
+        }
     }
 
     /// Execute one caller-owned request exactly once.
@@ -921,47 +1683,20 @@ impl StatelessSessionConsumerClient {
         let (pre_request_deadline, pre_request_budget_active) =
             self.pre_request_deadline(started_at, deadline);
         let mut connection = self
-            .connect(pre_request_deadline, pre_request_budget_active)
+            .connect(pre_request_deadline, pre_request_budget_active, None)
             .await
             .map_err(SessionConsumerCallError::BeforeCallWrite)?;
         ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
             .map_err(SessionConsumerCallError::BeforeCallWrite)?;
-        let outbound = ConsumerWireRequest::Call(Box::new(request));
-        write_frame_bounded_until_classified(
-            &mut connection.writer,
-            &outbound,
-            MAX_NEGOTIATED_FRAME_SIZE,
+        self.execute_on_connection(
+            &mut connection,
+            &request,
             pre_request_deadline,
-        )
-        .await
-        .map_err(|error| classify_call_write_error(error, pre_request_budget_active))?;
-        if !connection.current(&self.tls_config, &self.reauthentication) {
-            return Err(SessionConsumerCallError::MayHaveSent(
-                SessionConsumerClientError::Deadline,
-            ));
-        }
-        let response = tokio::time::timeout_at(
+            pre_request_budget_active,
             deadline,
-            read_consumer_frame::<_, ConsumerWireResponse>(
-                &mut connection.reader,
-                MAX_NEGOTIATED_FRAME_SIZE,
-            ),
+            None,
         )
         .await
-        .map_err(|_| SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Deadline))?
-        .map_err(SessionConsumerClientError::from)
-        .map_err(SessionConsumerCallError::MayHaveSent)?;
-        if !connection.current(&self.tls_config, &self.reauthentication) {
-            return Err(SessionConsumerCallError::MayHaveSent(
-                SessionConsumerClientError::Deadline,
-            ));
-        }
-        match response {
-            ConsumerWireResponse::Response(response) => Ok(*response),
-            _ => Err(SessionConsumerCallError::MayHaveSent(
-                SessionConsumerClientError::Protocol,
-            )),
-        }
     }
 
     fn request(
@@ -1199,6 +1934,15 @@ impl StatelessSessionConsumerClient {
         &self,
         start_sequence: u64,
     ) -> Result<BoxStream<'static, Result<SessionConsumerChange, StoreError>>, StoreError> {
+        self.watch_with_counters(start_sequence, None, None).await
+    }
+
+    async fn watch_with_counters(
+        &self,
+        start_sequence: u64,
+        setup_counters: Option<&PersistentConsumerCounters>,
+        persistent_runtime: Option<PersistentWatchRuntime>,
+    ) -> Result<BoxStream<'static, Result<SessionConsumerChange, StoreError>>, StoreError> {
         let started_at = tokio::time::Instant::now();
         let deadline = started_at
             .checked_add(self.operation_timeout)
@@ -1206,7 +1950,11 @@ impl StatelessSessionConsumerClient {
         let (pre_request_deadline, pre_request_budget_active) =
             self.pre_request_deadline(started_at, deadline);
         let mut connection = self
-            .connect(pre_request_deadline, pre_request_budget_active)
+            .connect(
+                pre_request_deadline,
+                pre_request_budget_active,
+                setup_counters,
+            )
             .await
             .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
         ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
@@ -1215,28 +1963,59 @@ impl StatelessSessionConsumerClient {
             SessionConsumerRequestId::new(),
             SessionConsumerOperation::Watch { start_sequence },
         );
+        let correlation = connection
+            .take_correlation()
+            .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
+        connection.idle_deadline = tokio::time::Instant::now()
+            .checked_add(self.idle_timeout.min(DEFAULT_CONSUMER_IDLE_TIMEOUT))
+            .ok_or_else(|| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
+        let mut reauthentication_changes = self.reauthentication.subscribe();
+        let mut material_changes = Some(self.tls_config.subscribe_material_changes());
         write_frame_bounded_until(
             &mut connection.writer,
-            &ConsumerWireRequest::Call(Box::new(request)),
+            &ConsumerWireRequest::Call(ConsumerCall {
+                correlation,
+                request: Box::new(request),
+            }),
             MAX_NEGOTIATED_FRAME_SIZE,
-            pre_request_deadline,
+            pre_request_deadline.min(connection.lifecycle.retire_at()),
         )
         .await
         .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
-        let response = tokio::time::timeout_at(
-            deadline,
-            read_consumer_frame::<_, ConsumerWireResponse>(
-                &mut connection.reader,
-                MAX_NEGOTIATED_FRAME_SIZE,
-            ),
-        )
-        .await
+        let response = tokio::select! {
+            biased;
+            _ = reauthentication_changes.changed() => {
+                return Err(StoreError::BackendUnavailable(
+                    "consumer watch unavailable".into(),
+                ));
+            }
+            _ = wait_consumer_material_change(&mut material_changes) => {
+                return Err(StoreError::BackendUnavailable(
+                    "consumer watch unavailable".into(),
+                ));
+            }
+            _ = tokio::time::sleep_until(connection.lifecycle.retire_at()) => {
+                return Err(StoreError::BackendUnavailable(
+                    "consumer watch unavailable".into(),
+                ));
+            }
+            response = tokio::time::timeout_at(
+                deadline.min(connection.lifecycle.retire_at()),
+                read_consumer_frame::<_, ConsumerWireResponse>(
+                    &mut connection.reader,
+                    MAX_NEGOTIATED_FRAME_SIZE,
+                ),
+            ) => response,
+        }
         .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))?
         .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
         if !matches!(
             response,
-            ConsumerWireResponse::Response(response)
-                if matches!(response.as_ref(), SessionConsumerResponse::WatchOpened)
+            ConsumerWireResponse::Response(ConsumerCallResponse {
+                correlation: received,
+                response,
+            }) if exact_correlation(correlation, received).is_ok()
+                && matches!(response.as_ref(), SessionConsumerResponse::WatchOpened)
         ) {
             return Err(StoreError::BackendUnavailable(
                 "consumer watch unavailable".into(),
@@ -1247,27 +2026,35 @@ impl StatelessSessionConsumerClient {
         let tls_config = self.tls_config.clone();
         let reauthentication = self.reauthentication.clone();
         tokio::spawn(async move {
+            let mut force_shutdown = persistent_runtime
+                .as_ref()
+                .map(|runtime| runtime.shutdown.clone());
+            // The runtime owns the fixed watch permit. Keeping it in the
+            // physical reader task releases capacity on peer close, rotation,
+            // forced shutdown, or caller stream drop even if the caller never
+            // polls its returned stream again.
+            let _persistent_runtime = persistent_runtime;
             let mut reauthentication_changes = reauthentication.subscribe();
             let mut material_changes = Some(tls_config.subscribe_material_changes());
             loop {
                 if !connection.current(&tls_config, &reauthentication) {
-                    let permit = tokio::select! {
-                        _ = tx.closed() => return,
-                        permit = Arc::clone(&byte_budget).acquire_owned() => {
-                            match permit {
-                                Ok(permit) => permit,
-                                Err(_) => return,
-                            }
-                        }
+                    // Never wait behind already queued entries merely to
+                    // report retirement. An unpolled receiver must not retain
+                    // authenticated transport or fixed watch capacity.
+                    let Ok(permit) = Arc::clone(&byte_budget).try_acquire_owned() else {
+                        return;
                     };
-                    let _ = tx
-                        .send(QueuedConsumerWatchItem {
+                    let _ = tokio::select! {
+                        _ = wait_for_optional_forced_shutdown(&mut force_shutdown) => return,
+                        _ = tx.closed() => return,
+                        result = tx.send(QueuedConsumerWatchItem {
                             item: Err(StoreError::BackendUnavailable(
                                 "consumer watch authentication retired".into(),
                             )),
                             _byte_permit: permit,
                         })
-                        .await;
+                        => result,
+                    };
                     return;
                 }
                 // A quiet, healthy watch is normal. Frame sizing still bounds
@@ -1276,6 +2063,7 @@ impl StatelessSessionConsumerClient {
                 // interrupt this otherwise unbounded wait.
                 let response = tokio::select! {
                     biased;
+                    _ = wait_for_optional_forced_shutdown(&mut force_shutdown) => return,
                     _ = tx.closed() => return,
                     _ = reauthentication_changes.changed() => return,
                     _ = wait_consumer_material_change(&mut material_changes) => return,
@@ -1289,7 +2077,10 @@ impl StatelessSessionConsumerClient {
                     return;
                 }
                 let entry = match response {
-                    Ok(ConsumerWireResponse::WatchEntry(entry)) => {
+                    Ok(ConsumerWireResponse::WatchEntry(ConsumerWatchEntry {
+                        correlation: received,
+                        entry,
+                    })) if exact_correlation(correlation, received).is_ok() => {
                         (*entry).map_err(SessionConsumerStoreError::into_store_error)
                     }
                     Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
@@ -1326,7 +2117,12 @@ impl StatelessSessionConsumerClient {
                 };
                 let stop = entry.is_err();
                 let permit = tokio::select! {
+                    biased;
+                    _ = wait_for_optional_forced_shutdown(&mut force_shutdown) => return,
                     _ = tx.closed() => return,
+                    _ = reauthentication_changes.changed() => return,
+                    _ = wait_consumer_material_change(&mut material_changes) => return,
+                    _ = tokio::time::sleep_until(connection.lifecycle.retire_at()) => return,
                     permit = Arc::clone(&byte_budget).acquire_many_owned(byte_count) => {
                         match permit {
                             Ok(permit) => permit,
@@ -1334,15 +2130,19 @@ impl StatelessSessionConsumerClient {
                         }
                     }
                 };
-                if tx
-                    .send(QueuedConsumerWatchItem {
+                let sent = tokio::select! {
+                    biased;
+                    _ = wait_for_optional_forced_shutdown(&mut force_shutdown) => return,
+                    _ = reauthentication_changes.changed() => return,
+                    _ = wait_consumer_material_change(&mut material_changes) => return,
+                    _ = tokio::time::sleep_until(connection.lifecycle.retire_at()) => return,
+                    result = tx.send(QueuedConsumerWatchItem {
                         item: entry,
                         _byte_permit: permit,
                     })
-                    .await
-                    .is_err()
-                    || stop
-                {
+                    => result,
+                };
+                if sent.is_err() || stop {
                     return;
                 }
             }
@@ -1355,6 +2155,1401 @@ impl StatelessSessionConsumerClient {
 }
 
 impl StatelessSessionConsumer for StatelessSessionConsumerClient {}
+
+#[derive(Default)]
+struct PersistentConsumerCounters {
+    setup_attempts: AtomicU64,
+    setup_failures: AtomicU64,
+    setup_successes: AtomicU64,
+    resolve_attempts: AtomicU64,
+    resolve_failures: AtomicU64,
+    tcp_attempts: AtomicU64,
+    tcp_failures: AtomicU64,
+    tls_attempts: AtomicU64,
+    tls_failures: AtomicU64,
+    hello_attempts: AtomicU64,
+    hello_failures: AtomicU64,
+    pool_wait_current: AtomicU64,
+    pool_wait_max: AtomicU64,
+    pool_wait_count: AtomicU64,
+    pool_wait_max_duration_millis: AtomicU64,
+    active: AtomicU64,
+    max_active: AtomicU64,
+    reused: AtomicU64,
+    reconnects: AtomicU64,
+    failures: AtomicU64,
+    queued: AtomicU64,
+    inflight: AtomicU64,
+    max_inflight: AtomicU64,
+    watch_active: AtomicU64,
+    max_watch_active: AtomicU64,
+    successes: AtomicU64,
+    not_transmitted: AtomicU64,
+    outcome_unknown: AtomicU64,
+    overload: AtomicU64,
+    shutdown: AtomicU64,
+    authentication: AtomicU64,
+    scope: AtomicU64,
+    protocol: AtomicU64,
+    deadline: AtomicU64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum PersistentShutdownPhase {
+    Running = 0,
+    Draining = 1,
+    Forced = 2,
+}
+
+impl PersistentShutdownPhase {
+    fn load(value: &AtomicU8) -> Self {
+        match value.load(Ordering::Acquire) {
+            0 => Self::Running,
+            1 => Self::Draining,
+            _ => Self::Forced,
+        }
+    }
+}
+
+async fn wait_for_forced_shutdown(receiver: &mut watch::Receiver<PersistentShutdownPhase>) {
+    loop {
+        if *receiver.borrow_and_update() == PersistentShutdownPhase::Forced {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+async fn wait_for_optional_forced_shutdown(
+    receiver: &mut Option<watch::Receiver<PersistentShutdownPhase>>,
+) {
+    match receiver {
+        Some(receiver) => wait_for_forced_shutdown(receiver).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn wait_for_shortened_deadline(
+    candidate: tokio::time::Instant,
+    original: tokio::time::Instant,
+) {
+    if candidate < original {
+        tokio::time::sleep_until(candidate).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+async fn wait_for_shutdown(receiver: &mut watch::Receiver<PersistentShutdownPhase>) {
+    loop {
+        if *receiver.borrow_and_update() != PersistentShutdownPhase::Running {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+struct PersistentPoolWait<'a> {
+    counters: &'a PersistentConsumerCounters,
+    wait_started: &'a StdMutex<Vec<Option<tokio::time::Instant>>>,
+    slot: Option<usize>,
+    started: tokio::time::Instant,
+}
+
+impl Drop for PersistentPoolWait<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot {
+            let mut wait_started = self
+                .wait_started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            wait_started[slot] = None;
+        }
+        self.counters
+            .pool_wait_current
+            .fetch_sub(1, Ordering::Relaxed);
+        self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+        counter_max(
+            &self.counters.pool_wait_max_duration_millis,
+            duration_millis(self.started.elapsed()),
+        );
+    }
+}
+
+fn counter_increment(counter: &AtomicU64) -> u64 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_add(1))
+        })
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+}
+
+fn counter_max(counter: &AtomicU64, value: u64) {
+    counter.fetch_max(value, Ordering::Relaxed);
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+struct PersistentSessionConsumerPool {
+    client: StatelessSessionConsumerClient,
+    config: PersistentSessionConsumerConfig,
+    lanes: Arc<Semaphore>,
+    pending: Arc<Semaphore>,
+    watches: Arc<Semaphore>,
+    prewarm: Arc<Semaphore>,
+    idle: StdMutex<VecDeque<ConsumerConnection>>,
+    wait_started: StdMutex<Vec<Option<tokio::time::Instant>>>,
+    activity: StdMutex<PersistentActivityState>,
+    shutdown_phase: AtomicU8,
+    shutdown_tx: watch::Sender<PersistentShutdownPhase>,
+    reconnect_sequence: AtomicU64,
+    counters: PersistentConsumerCounters,
+    active_calls: AtomicUsize,
+    active_watches: AtomicUsize,
+    drained_notify: Notify,
+}
+
+struct PersistentActivityState {
+    phase: PersistentShutdownPhase,
+    calls: usize,
+    watches: usize,
+    prewarms: usize,
+}
+
+struct PersistentWatchLease {
+    _permit: OwnedSemaphorePermit,
+    pool: Arc<PersistentSessionConsumerPool>,
+}
+
+struct PersistentWatchRuntime {
+    _lease: PersistentWatchLease,
+    shutdown: watch::Receiver<PersistentShutdownPhase>,
+}
+
+struct PersistentCallActivity {
+    pool: Arc<PersistentSessionConsumerPool>,
+}
+
+struct PersistentPrewarmActivity {
+    pool: Arc<PersistentSessionConsumerPool>,
+}
+
+impl Drop for PersistentCallActivity {
+    fn drop(&mut self) {
+        let mut activity = self
+            .pool
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        activity.calls = activity.calls.saturating_sub(1);
+        drop(activity);
+        self.pool.active_calls.fetch_sub(1, Ordering::Relaxed);
+        self.pool.counters.active.fetch_sub(1, Ordering::Relaxed);
+        self.pool.counters.inflight.fetch_sub(1, Ordering::Relaxed);
+        self.pool.drained_notify.notify_waiters();
+    }
+}
+
+impl Drop for PersistentWatchLease {
+    fn drop(&mut self) {
+        let mut activity = self
+            .pool
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        activity.watches = activity.watches.saturating_sub(1);
+        drop(activity);
+        self.pool.active_watches.fetch_sub(1, Ordering::Relaxed);
+        self.pool
+            .counters
+            .watch_active
+            .fetch_sub(1, Ordering::Relaxed);
+        self.pool.drained_notify.notify_waiters();
+    }
+}
+
+impl Drop for PersistentPrewarmActivity {
+    fn drop(&mut self) {
+        let mut activity = self
+            .pool
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        activity.prewarms = activity.prewarms.saturating_sub(1);
+        drop(activity);
+        self.pool.drained_notify.notify_waiters();
+    }
+}
+
+impl PersistentSessionConsumerPool {
+    fn phase(&self) -> PersistentShutdownPhase {
+        PersistentShutdownPhase::load(&self.shutdown_phase)
+    }
+
+    fn register_call(
+        self: &Arc<Self>,
+    ) -> Result<PersistentCallActivity, SessionConsumerClientError> {
+        let mut activity = self
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if activity.phase != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        activity.calls = activity.calls.saturating_add(1);
+        drop(activity);
+        let active = self.active_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let active_u64 = u64::try_from(active).unwrap_or(u64::MAX);
+        counter_increment(&self.counters.active);
+        counter_max(&self.counters.max_active, active_u64);
+        let inflight = counter_increment(&self.counters.inflight);
+        counter_max(&self.counters.max_inflight, inflight);
+        Ok(PersistentCallActivity {
+            pool: Arc::clone(self),
+        })
+    }
+
+    fn register_watch(
+        self: &Arc<Self>,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<PersistentWatchLease, SessionConsumerClientError> {
+        let mut activity = self
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if activity.phase != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        activity.watches = activity.watches.saturating_add(1);
+        drop(activity);
+        let active = self
+            .active_watches
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let current = counter_increment(&self.counters.watch_active);
+        counter_max(
+            &self.counters.max_watch_active,
+            u64::try_from(active).unwrap_or(u64::MAX).max(current),
+        );
+        Ok(PersistentWatchLease {
+            _permit: permit,
+            pool: Arc::clone(self),
+        })
+    }
+
+    fn register_prewarm(
+        self: &Arc<Self>,
+    ) -> Result<PersistentPrewarmActivity, SessionConsumerClientError> {
+        let mut activity = self
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if activity.phase != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        activity.prewarms = activity.prewarms.saturating_add(1);
+        Ok(PersistentPrewarmActivity {
+            pool: Arc::clone(self),
+        })
+    }
+
+    fn record_error(&self, error: SessionConsumerClientError, may_have_sent: bool) {
+        counter_increment(&self.counters.failures);
+        match error {
+            SessionConsumerClientError::Authentication => {
+                counter_increment(&self.counters.authentication);
+            }
+            SessionConsumerClientError::Scope => {
+                counter_increment(&self.counters.scope);
+            }
+            SessionConsumerClientError::Protocol => {
+                counter_increment(&self.counters.protocol);
+            }
+            SessionConsumerClientError::Deadline => {
+                counter_increment(&self.counters.deadline);
+            }
+            SessionConsumerClientError::Overloaded => {
+                counter_increment(&self.counters.overload);
+            }
+            SessionConsumerClientError::ShuttingDown => {
+                counter_increment(&self.counters.shutdown);
+            }
+            SessionConsumerClientError::Unavailable => {}
+        }
+        if may_have_sent {
+            counter_increment(&self.counters.outcome_unknown);
+        } else {
+            counter_increment(&self.counters.not_transmitted);
+        }
+    }
+
+    async fn admit_call(
+        &self,
+    ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), SessionConsumerClientError> {
+        if self.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        let started = tokio::time::Instant::now();
+        // This immediate total-admission acquisition structurally bounds
+        // active plus queued caller futures. Tokio's lane semaphore supplies
+        // the fair bounded wait only after admission succeeds.
+        let pending = Arc::clone(&self.pending)
+            .try_acquire_owned()
+            .map_err(|_| SessionConsumerClientError::Overloaded)?;
+        let lane = match Arc::clone(&self.lanes).try_acquire_owned() {
+            Ok(lane) => lane,
+            Err(_) => {
+                let mut shutdown = self.shutdown_tx.subscribe();
+                if self.phase() != PersistentShutdownPhase::Running {
+                    return Err(SessionConsumerClientError::ShuttingDown);
+                }
+                counter_increment(&self.counters.queued);
+                let current = counter_increment(&self.counters.pool_wait_current);
+                counter_max(&self.counters.pool_wait_max, current);
+                counter_increment(&self.counters.pool_wait_count);
+                let slot = {
+                    let mut wait_started = self
+                        .wait_started
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let slot = wait_started.iter().position(Option::is_none);
+                    if let Some(slot) = slot {
+                        wait_started[slot] = Some(started);
+                    }
+                    slot
+                };
+                let wait = PersistentPoolWait {
+                    counters: &self.counters,
+                    wait_started: &self.wait_started,
+                    slot,
+                    started,
+                };
+                let wait_deadline = started
+                    .checked_add(self.config.pool_wait_timeout)
+                    .ok_or(SessionConsumerClientError::Overloaded)?;
+                let lane = tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut shutdown) => {
+                        Err(SessionConsumerClientError::ShuttingDown)
+                    }
+                    lane = tokio::time::timeout_at(
+                        wait_deadline,
+                        Arc::clone(&self.lanes).acquire_owned(),
+                    ) => {
+                        lane.ok().and_then(Result::ok)
+                            .ok_or(SessionConsumerClientError::Overloaded)
+                    }
+                };
+                drop(wait);
+                let lane = lane?;
+                // `timeout_at` polls the semaphore first. Do not admit a
+                // permit that became ready only after the fixed wait cap.
+                complete_before_deadline(
+                    lane,
+                    wait_deadline,
+                    SessionConsumerClientError::Overloaded,
+                )?
+            }
+        };
+        if self.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        Ok((pending, lane))
+    }
+
+    fn take_idle(&self) -> Option<ConsumerConnection> {
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while let Some(mut connection) = idle.pop_front() {
+            if connection.reusable()
+                && connection.current(&self.client.tls_config, &self.client.reauthentication)
+            {
+                return Some(connection);
+            }
+            counter_increment(&self.counters.reconnects);
+        }
+        None
+    }
+
+    fn return_idle(&self, mut connection: ConsumerConnection) {
+        if self.phase() != PersistentShutdownPhase::Running {
+            return;
+        }
+        if !connection.reusable()
+            || !connection.current(&self.client.tls_config, &self.client.reauthentication)
+        {
+            counter_increment(&self.counters.reconnects);
+            return;
+        }
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.phase() != PersistentShutdownPhase::Running {
+            return;
+        }
+        if !connection.reusable()
+            || !connection.current(&self.client.tls_config, &self.client.reauthentication)
+        {
+            counter_increment(&self.counters.reconnects);
+            return;
+        }
+        if idle.len() < self.config.request_connections {
+            idle.push_back(connection);
+        }
+    }
+
+    fn clear_idle(&self) {
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    fn prune_idle(&self, idle: &mut VecDeque<ConsumerConnection>) {
+        let before = idle.len();
+        idle.retain_mut(|connection| {
+            connection.reusable()
+                && connection.current(&self.client.tls_config, &self.client.reauthentication)
+        });
+        for _ in idle.len()..before {
+            counter_increment(&self.counters.reconnects);
+        }
+    }
+
+    fn reconnect_delay(&self) -> Duration {
+        let maximum_millis = duration_millis(self.config.reconnect_jitter);
+        let jitter = if maximum_millis == 0 {
+            Duration::ZERO
+        } else {
+            let sequence = self
+                .reconnect_sequence
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            let mixed = sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17)
+                ^ sequence.rotate_right(11);
+            Duration::from_millis(mixed % maximum_millis.saturating_add(1))
+        };
+        self.client
+            .lifecycle_policy
+            .reconnect_backoff_min()
+            .checked_add(jitter)
+            .unwrap_or_else(|| self.client.lifecycle_policy.reconnect_backoff_max())
+            .min(self.client.lifecycle_policy.reconnect_backoff_max())
+    }
+
+    async fn connect(
+        &self,
+        operation_deadline: tokio::time::Instant,
+    ) -> Result<ConsumerConnection, SessionConsumerClientError> {
+        let setup_started = tokio::time::Instant::now();
+        let mut setup_deadline = setup_started
+            .checked_add(self.config.setup_timeout)
+            .map(|deadline| deadline.min(operation_deadline))
+            .ok_or(SessionConsumerClientError::Deadline)?;
+        if let Some(inherited_deadline) = self
+            .client
+            .pre_request_connection_timeout
+            .and_then(|timeout| setup_started.checked_add(timeout))
+        {
+            setup_deadline = setup_deadline.min(inherited_deadline);
+        }
+        counter_increment(&self.counters.setup_attempts);
+        let result = self
+            .client
+            .connect(setup_deadline, true, Some(&self.counters))
+            .await;
+        // Tokio polls a timed inner future before its deadline future. Reject
+        // setup that completed while this task was descheduled before the
+        // connection can carry an application frame.
+        match result.and_then(|connection| {
+            complete_before_deadline(
+                connection,
+                setup_deadline,
+                SessionConsumerClientError::Unavailable,
+            )
+        }) {
+            Ok(connection) => {
+                counter_increment(&self.counters.setup_successes);
+                Ok(connection)
+            }
+            Err(error) => {
+                counter_increment(&self.counters.setup_failures);
+                Err(error)
+            }
+        }
+    }
+
+    fn snapshot(&self, idle: u64) -> PersistentSessionConsumerDiagnostics {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let now = tokio::time::Instant::now();
+        let pool_wait_oldest_age_millis = self
+            .wait_started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .flatten()
+            .map(|started| duration_millis(now.saturating_duration_since(*started)))
+            .max()
+            .unwrap_or(0);
+        PersistentSessionConsumerDiagnostics {
+            setup_attempts: load(&self.counters.setup_attempts),
+            setup_failures: load(&self.counters.setup_failures),
+            setup_successes: load(&self.counters.setup_successes),
+            resolve_attempts: load(&self.counters.resolve_attempts),
+            resolve_failures: load(&self.counters.resolve_failures),
+            tcp_attempts: load(&self.counters.tcp_attempts),
+            tcp_failures: load(&self.counters.tcp_failures),
+            tls_attempts: load(&self.counters.tls_attempts),
+            tls_failures: load(&self.counters.tls_failures),
+            hello_attempts: load(&self.counters.hello_attempts),
+            hello_failures: load(&self.counters.hello_failures),
+            pool_wait_current: load(&self.counters.pool_wait_current),
+            pool_wait_max: load(&self.counters.pool_wait_max),
+            pool_wait_count: load(&self.counters.pool_wait_count),
+            pool_wait_max_duration_millis: load(&self.counters.pool_wait_max_duration_millis),
+            pool_wait_oldest_age_millis,
+            active: load(&self.counters.active),
+            max_active: load(&self.counters.max_active),
+            idle,
+            reused: load(&self.counters.reused),
+            reconnects: load(&self.counters.reconnects),
+            failures: load(&self.counters.failures),
+            queued: load(&self.counters.queued),
+            inflight: load(&self.counters.inflight),
+            max_inflight: load(&self.counters.max_inflight),
+            watch_active: load(&self.counters.watch_active),
+            max_watch_active: load(&self.counters.max_watch_active),
+            successes: load(&self.counters.successes),
+            not_transmitted: load(&self.counters.not_transmitted),
+            outcome_unknown: load(&self.counters.outcome_unknown),
+            overload: load(&self.counters.overload),
+            shutdown: load(&self.counters.shutdown),
+            authentication: load(&self.counters.authentication),
+            scope: load(&self.counters.scope),
+            protocol: load(&self.counters.protocol),
+            deadline: load(&self.counters.deadline),
+        }
+    }
+}
+
+/// Fixed-capacity, least-authority persistent session-consumer client.
+///
+/// Clones share one bounded pool; they never silently serialize all work onto
+/// a clone-local socket. A socket is returned to the pool only after one exact
+/// correlated response completes, so cancellation after write drops it.
+#[derive(Clone)]
+pub struct PersistentSessionConsumerClient {
+    pool: Arc<PersistentSessionConsumerPool>,
+}
+
+impl fmt::Debug for PersistentSessionConsumerClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistentSessionConsumerClient")
+            .field("redacted", &true)
+            .field("config", &self.pool.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PersistentSessionConsumerClient {
+    /// Construct a default bounded pool from an already configured stateless
+    /// client, retaining its TLS, resolver, timeout, and lifecycle policy.
+    pub fn from_stateless(client: StatelessSessionConsumerClient) -> Self {
+        Self::try_from_stateless(client, PersistentSessionConsumerConfig::default())
+            .expect("default persistent consumer configuration is valid")
+    }
+
+    /// Construct a bounded pool from a configured stateless client.
+    pub fn try_from_stateless(
+        client: StatelessSessionConsumerClient,
+        config: PersistentSessionConsumerConfig,
+    ) -> Result<Self, PersistentSessionConsumerConfigError> {
+        config.validate()?;
+        let (shutdown_tx, _) = watch::channel(PersistentShutdownPhase::Running);
+        // A per-pool random starting point prevents independently constructed
+        // clients from aligning their otherwise bounded reconnect sequences.
+        // The seed is local-only and is never included in diagnostics.
+        let (jitter_seed_high, jitter_seed_low) = uuid::Uuid::new_v4().as_u64_pair();
+        Ok(Self {
+            pool: Arc::new(PersistentSessionConsumerPool {
+                client,
+                config,
+                lanes: Arc::new(Semaphore::new(config.request_connections)),
+                // Includes active lane owners so `pending_calls == 0` is
+                // fail-fast only once every request lane is occupied.
+                pending: Arc::new(Semaphore::new(
+                    config
+                        .request_connections
+                        .saturating_add(config.pending_calls),
+                )),
+                watches: Arc::new(Semaphore::new(config.watch_connections)),
+                prewarm: Arc::new(Semaphore::new(1)),
+                idle: StdMutex::new(VecDeque::with_capacity(config.request_connections)),
+                wait_started: StdMutex::new(vec![None; config.pending_calls]),
+                activity: StdMutex::new(PersistentActivityState {
+                    phase: PersistentShutdownPhase::Running,
+                    calls: 0,
+                    watches: 0,
+                    prewarms: 0,
+                }),
+                shutdown_phase: AtomicU8::new(PersistentShutdownPhase::Running as u8),
+                shutdown_tx,
+                reconnect_sequence: AtomicU64::new(jitter_seed_high ^ jitter_seed_low),
+                counters: PersistentConsumerCounters::default(),
+                active_calls: AtomicUsize::new(0),
+                active_watches: AtomicUsize::new(0),
+                drained_notify: Notify::new(),
+            }),
+        })
+    }
+
+    /// Return this pool's validated fixed configuration.
+    pub fn config(&self) -> PersistentSessionConsumerConfig {
+        self.pool.config
+    }
+
+    /// Return the fixed consumer scope bound to this pool.
+    pub fn scope(&self) -> SessionConsumerScope {
+        self.pool.client.scope()
+    }
+
+    /// Return redaction-safe current client material health.
+    #[must_use]
+    pub fn credential_health(&self) -> opc_tls::TlsMaterialStatus {
+        self.pool.client.credential_health()
+    }
+
+    /// Request reauthentication; stale idle lanes fail the current check and
+    /// are never leased again.
+    pub fn request_reauthentication(&self) -> Result<u64, crate::ConnectionLifecycleError> {
+        let generation = self.pool.client.request_reauthentication()?;
+        let mut idle = self
+            .pool
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for _ in 0..idle.len() {
+            counter_increment(&self.pool.counters.reconnects);
+        }
+        idle.clear();
+        Ok(generation)
+    }
+
+    fn request(
+        &self,
+        request_id: SessionConsumerRequestId,
+        operation: SessionConsumerOperation,
+    ) -> SessionConsumerRequest {
+        SessionConsumerRequest::new(self.scope(), request_id, operation)
+    }
+
+    /// Execute one complete typed request on a fair fixed request lane while
+    /// retaining its transport effect boundary. The request is borrowed so
+    /// an ambiguous outcome always leaves the exact durable ID and body in
+    /// caller ownership for authoritative recovery.
+    pub async fn execute(
+        &self,
+        request: &SessionConsumerRequest,
+    ) -> Result<SessionConsumerResponse, PersistentSessionConsumerExecuteError> {
+        let request_id = request.request_id();
+        match self.execute_classified(request).await {
+            Ok(response) => Ok(response),
+            Err(SessionConsumerCallError::BeforeCallWrite(cause)) => {
+                Err(PersistentSessionConsumerExecuteError::NotTransmitted { cause })
+            }
+            Err(SessionConsumerCallError::MayHaveSent(_)) => {
+                Err(PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id })
+            }
+        }
+    }
+
+    async fn execute_read(
+        &self,
+        request: SessionConsumerRequest,
+    ) -> Result<SessionConsumerResponse, SessionConsumerClientError> {
+        self.execute_classified(&request)
+            .await
+            .map_err(SessionConsumerCallError::into_client_error)
+    }
+
+    async fn execute_classified(
+        &self,
+        request: &SessionConsumerRequest,
+    ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        if request.scope() != self.pool.client.scope {
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Scope,
+            ));
+        }
+        if matches!(request.operation(), SessionConsumerOperation::Watch { .. }) {
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Protocol,
+            ));
+        }
+        if request.validate().is_err() {
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Protocol,
+            ));
+        }
+        let (_pending, _lane) = self.pool.admit_call().await.map_err(|error| {
+            self.pool.record_error(error, false);
+            SessionConsumerCallError::BeforeCallWrite(error)
+        })?;
+        let _activity = self.pool.register_call().map_err(|error| {
+            self.pool.record_error(error, false);
+            SessionConsumerCallError::BeforeCallWrite(error)
+        })?;
+        let result = self.execute_admitted(request).await;
+        match result {
+            Ok(response) => {
+                counter_increment(&self.pool.counters.successes);
+                Ok(response)
+            }
+            Err(error) => {
+                self.pool.record_error(
+                    error.into_client_error(),
+                    matches!(error, SessionConsumerCallError::MayHaveSent(_)),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Read current capabilities through a retained request lane.
+    pub async fn capabilities(&self) -> Result<BackendCapabilities, SessionConsumerClientError> {
+        match self
+            .execute_read(self.request(
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::Capabilities,
+            ))
+            .await?
+        {
+            SessionConsumerResponse::Capabilities(value) => Ok(value),
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch) => {
+                Err(SessionConsumerClientError::Scope)
+            }
+            _ => Err(SessionConsumerClientError::Protocol),
+        }
+    }
+
+    pub async fn get(
+        &self,
+        key: opc_session_store::SessionKey,
+    ) -> Result<Option<opc_session_store::StoredSessionRecord>, StoreError> {
+        match self
+            .execute_read(self.request(
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::Get { key },
+            ))
+            .await
+        {
+            Ok(SessionConsumerResponse::Get(value)) => {
+                value.map_err(SessionConsumerStoreError::into_store_error)
+            }
+            Ok(SessionConsumerResponse::Rejected(value)) => Err(rejection_into_store_error(value)),
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer authoritative read unavailable".into(),
+            )),
+        }
+    }
+
+    pub async fn preflight_record_expiry(
+        &self,
+        preflights: Vec<RecordExpiryPreflight>,
+    ) -> Result<(), StoreError> {
+        match self
+            .execute_read(self.request(
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::PreflightRecordExpiry { preflights },
+            ))
+            .await
+        {
+            Ok(SessionConsumerResponse::PreflightRecordExpiry(value)) => {
+                value.map_err(SessionConsumerStoreError::into_store_error)
+            }
+            Ok(SessionConsumerResponse::Rejected(value)) => Err(rejection_into_store_error(value)),
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer expiry authority unavailable".into(),
+            )),
+        }
+    }
+
+    pub async fn compare_and_set_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        op: CompareAndSet,
+    ) -> Result<CompareAndSetResult, SessionConsumerMutationError> {
+        mutation_response(
+            request_id,
+            self.execute_classified(&self.request(
+                request_id,
+                SessionConsumerOperation::CompareAndSet { op: Box::new(op) },
+            ))
+            .await,
+            |response| match response {
+                SessionConsumerResponse::CompareAndSet(value) => Some(value),
+                _ => None,
+            },
+        )
+    }
+
+    pub async fn delete_fenced_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        lease: LeaseGuard,
+    ) -> Result<(), SessionConsumerMutationError> {
+        mutation_response(
+            request_id,
+            self.execute_classified(
+                &self.request(request_id, SessionConsumerOperation::DeleteFenced { lease }),
+            )
+            .await,
+            |response| match response {
+                SessionConsumerResponse::DeleteFenced(value) => Some(value),
+                _ => None,
+            },
+        )
+    }
+
+    pub async fn refresh_ttl_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        lease: LeaseGuard,
+        ttl: Duration,
+    ) -> Result<(), SessionConsumerMutationError> {
+        mutation_response(
+            request_id,
+            self.execute_classified(&self.request(
+                request_id,
+                SessionConsumerOperation::RefreshTtl { lease, ttl },
+            ))
+            .await,
+            |response| match response {
+                SessionConsumerResponse::RefreshTtl(value) => Some(value),
+                _ => None,
+            },
+        )
+    }
+
+    pub async fn batch_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        ops: Vec<SessionOp>,
+    ) -> Result<Vec<SessionOpResult>, SessionConsumerMutationError> {
+        mutation_response(
+            request_id,
+            self.execute_classified(
+                &self.request(request_id, SessionConsumerOperation::Batch { ops }),
+            )
+            .await,
+            |response| match response {
+                SessionConsumerResponse::Batch(value) => Some(value),
+                _ => None,
+            },
+        )
+        .map(|value| {
+            value
+                .into_iter()
+                .map(session_consumer_batch_result_into_store)
+                .collect()
+        })
+    }
+
+    pub async fn scan_restore_records(
+        &self,
+        request: RestoreScanRequest,
+    ) -> Result<RestoreScanPage, StoreError> {
+        match self
+            .execute_read(self.request(
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::ScanRestoreRecords { request },
+            ))
+            .await
+        {
+            Ok(SessionConsumerResponse::ScanRestoreRecords(value)) => {
+                value.map_err(SessionConsumerStoreError::into_store_error)
+            }
+            Ok(SessionConsumerResponse::Rejected(value)) => Err(rejection_into_store_error(value)),
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer restore unavailable".into(),
+            )),
+        }
+    }
+
+    pub async fn acquire_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        key: opc_session_store::SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+    ) -> Result<LeaseGuard, SessionConsumerLeaseMutationError> {
+        lease_response(
+            request_id,
+            self.execute_classified(&self.request(
+                request_id,
+                SessionConsumerOperation::AcquireLease { key, owner, ttl },
+            ))
+            .await,
+            |response| match response {
+                SessionConsumerResponse::AcquireLease(value) => Some(value),
+                _ => None,
+            },
+        )
+    }
+
+    pub async fn renew_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        lease: LeaseGuard,
+        ttl: Duration,
+    ) -> Result<LeaseGuard, SessionConsumerLeaseMutationError> {
+        lease_response(
+            request_id,
+            self.execute_classified(&self.request(
+                request_id,
+                SessionConsumerOperation::RenewLease { lease, ttl },
+            ))
+            .await,
+            |response| match response {
+                SessionConsumerResponse::RenewLease(value) => Some(value),
+                _ => None,
+            },
+        )
+    }
+
+    pub async fn release_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        lease: LeaseGuard,
+    ) -> Result<(), SessionConsumerLeaseMutationError> {
+        lease_response(
+            request_id,
+            self.execute_classified(
+                &self.request(request_id, SessionConsumerOperation::ReleaseLease { lease }),
+            )
+            .await,
+            |response| match response {
+                SessionConsumerResponse::ReleaseLease(value) => Some(value),
+                _ => None,
+            },
+        )
+    }
+
+    /// Open a watch using slots isolated from normal request lanes.
+    pub async fn open_watch(
+        &self,
+        start_sequence: u64,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, StoreError>>,
+        SessionConsumerClientError,
+    > {
+        if self.pool.phase() != PersistentShutdownPhase::Running {
+            self.pool
+                .record_error(SessionConsumerClientError::ShuttingDown, false);
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        let permit = Arc::clone(&self.pool.watches)
+            .try_acquire_owned()
+            .map_err(|_| {
+                self.pool
+                    .record_error(SessionConsumerClientError::Overloaded, false);
+                SessionConsumerClientError::Overloaded
+            })?;
+        let lease = self.pool.register_watch(permit).inspect_err(|&error| {
+            self.pool.record_error(error, false);
+        })?;
+        let mut shutdown = self.pool.shutdown_tx.subscribe();
+        let mut watch_client = self.pool.client.clone();
+        watch_client.pre_request_connection_timeout = Some(
+            watch_client
+                .pre_request_connection_timeout
+                .map_or(self.pool.config.setup_timeout, |timeout| {
+                    timeout.min(self.pool.config.setup_timeout)
+                }),
+        );
+        counter_increment(&self.pool.counters.setup_attempts);
+        let runtime = PersistentWatchRuntime {
+            _lease: lease,
+            shutdown: shutdown.clone(),
+        };
+        let upstream = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => {
+                self.pool.record_error(SessionConsumerClientError::ShuttingDown, false);
+                counter_increment(&self.pool.counters.setup_failures);
+                return Err(SessionConsumerClientError::ShuttingDown);
+            }
+            upstream = watch_client.watch_with_counters(
+                start_sequence,
+                Some(&self.pool.counters),
+                Some(runtime),
+            ) => upstream,
+        }
+        .map_err(|_| {
+            counter_increment(&self.pool.counters.setup_failures);
+            self.pool
+                .record_error(SessionConsumerClientError::Unavailable, false);
+            SessionConsumerClientError::Unavailable
+        })?;
+        counter_increment(&self.pool.counters.setup_successes);
+        if self.pool.phase() != PersistentShutdownPhase::Running {
+            self.pool
+                .record_error(SessionConsumerClientError::ShuttingDown, false);
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        Ok(stream::unfold(
+            (upstream, shutdown),
+            |(mut upstream, mut shutdown)| async move {
+                tokio::select! {
+                    _ = wait_for_shutdown(&mut shutdown) => None,
+                    item = upstream.next() => item.map(|item| (item, (upstream, shutdown))),
+                }
+            },
+        )
+        .boxed())
+    }
+
+    pub async fn watch(
+        &self,
+        start_sequence: u64,
+    ) -> Result<BoxStream<'static, Result<SessionConsumerChange, StoreError>>, StoreError> {
+        self.open_watch(start_sequence)
+            .await
+            .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))
+    }
+
+    async fn execute_admitted(
+        &self,
+        request: &SessionConsumerRequest,
+    ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        let started = tokio::time::Instant::now();
+        let deadline = started
+            .checked_add(self.pool.client.operation_timeout)
+            .ok_or(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Deadline,
+            ))?;
+        let (pre_request_deadline, pre_request_budget_active) =
+            self.pool.client.pre_request_deadline(started, deadline);
+        let mut shutdown = self.pool.shutdown_tx.subscribe();
+        let mut attempt = 0_usize;
+        loop {
+            if self.pool.phase() == PersistentShutdownPhase::Forced {
+                return Err(SessionConsumerCallError::BeforeCallWrite(
+                    SessionConsumerClientError::ShuttingDown,
+                ));
+            }
+            attempt = attempt.saturating_add(1);
+            let connection = match self.pool.take_idle() {
+                Some(connection) => {
+                    counter_increment(&self.pool.counters.reused);
+                    Ok(connection)
+                }
+                None => tokio::select! {
+                    biased;
+                    _ = wait_for_forced_shutdown(&mut shutdown) => {
+                        Err(SessionConsumerClientError::ShuttingDown)
+                    }
+                    result = self.pool.connect(pre_request_deadline) => result,
+                },
+            };
+            let mut connection = match connection {
+                Ok(connection) => connection,
+                Err(error)
+                    if attempt < self.pool.config.connect_attempts
+                        && matches!(
+                            error,
+                            SessionConsumerClientError::Unavailable
+                                | SessionConsumerClientError::Deadline
+                        ) =>
+                {
+                    counter_increment(&self.pool.counters.reconnects);
+                    let delay = self.pool.reconnect_delay();
+                    if !delay.is_zero() && tokio::time::Instant::now() < deadline {
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_forced_shutdown(&mut shutdown) => {
+                                return Err(SessionConsumerCallError::BeforeCallWrite(
+                                    SessionConsumerClientError::ShuttingDown,
+                                ));
+                            }
+                            _ = tokio::time::sleep_until(
+                                (tokio::time::Instant::now() + delay).min(deadline),
+                            ) => {}
+                        }
+                    }
+                    continue;
+                }
+                Err(error) => return Err(SessionConsumerCallError::BeforeCallWrite(error)),
+            };
+            ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
+                .map_err(SessionConsumerCallError::BeforeCallWrite)?;
+            let result = self
+                .pool
+                .client
+                .execute_on_connection(
+                    &mut connection,
+                    request,
+                    pre_request_deadline,
+                    pre_request_budget_active,
+                    deadline,
+                    Some(shutdown.clone()),
+                )
+                .await;
+            match result {
+                Ok(response) => {
+                    self.pool.return_idle(connection);
+                    return Ok(response);
+                }
+                Err(SessionConsumerCallError::BeforeCallWrite(error))
+                    if attempt < self.pool.config.connect_attempts
+                        && matches!(
+                            error,
+                            SessionConsumerClientError::Unavailable
+                                | SessionConsumerClientError::Deadline
+                        ) =>
+                {
+                    counter_increment(&self.pool.counters.reconnects);
+                    let delay = self.pool.reconnect_delay();
+                    if !delay.is_zero() && tokio::time::Instant::now() < deadline {
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_forced_shutdown(&mut shutdown) => {
+                                return Err(SessionConsumerCallError::BeforeCallWrite(
+                                    SessionConsumerClientError::ShuttingDown,
+                                ));
+                            }
+                            _ = tokio::time::sleep_until(
+                                (tokio::time::Instant::now() + delay).min(deadline),
+                            ) => {}
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Concurrently establish all configured request lanes without dispatching
+    /// an application operation. Only one prewarm may run at a time.
+    pub async fn prewarm(
+        &self,
+    ) -> Result<PersistentSessionConsumerReadiness, SessionConsumerClientError> {
+        if self.pool.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        let _gate = Arc::clone(&self.pool.prewarm)
+            .try_acquire_owned()
+            .map_err(|_| SessionConsumerClientError::Overloaded)?;
+        let _activity = self.pool.register_prewarm()?;
+        let mut shutdown = self.pool.shutdown_tx.subscribe();
+        let reservation_deadline = tokio::time::Instant::now()
+            .checked_add(self.pool.config.pool_wait_timeout)
+            .ok_or(SessionConsumerClientError::Overloaded)?;
+        // Reserve the active-width share of total admission before taking all
+        // lanes. Calls already admitted can finish; after this completes, at
+        // most the configured additional pending callers can wait behind this
+        // administrative operation.
+        let admission_permits = futures_util::future::try_join_all(
+            (0..self.pool.config.request_connections).map(|_| async {
+                match tokio::time::timeout_at(
+                    reservation_deadline,
+                    Arc::clone(&self.pool.pending).acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => complete_before_deadline(
+                        permit,
+                        reservation_deadline,
+                        SessionConsumerClientError::Overloaded,
+                    ),
+                    Ok(Err(_)) if self.pool.phase() != PersistentShutdownPhase::Running => {
+                        Err(SessionConsumerClientError::ShuttingDown)
+                    }
+                    Ok(Err(_)) | Err(_) => Err(SessionConsumerClientError::Overloaded),
+                }
+            }),
+        )
+        .await?;
+        // Reserve every fixed lane before replacing idles; prewarm can never
+        // transiently exceed the configured physical connection width.
+        let lane_permits = futures_util::future::try_join_all(
+            (0..self.pool.config.request_connections).map(|_| async {
+                match tokio::time::timeout_at(
+                    reservation_deadline,
+                    Arc::clone(&self.pool.lanes).acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => complete_before_deadline(
+                        permit,
+                        reservation_deadline,
+                        SessionConsumerClientError::Overloaded,
+                    ),
+                    Ok(Err(_)) if self.pool.phase() != PersistentShutdownPhase::Running => {
+                        Err(SessionConsumerClientError::ShuttingDown)
+                    }
+                    Ok(Err(_)) | Err(_) => Err(SessionConsumerClientError::Overloaded),
+                }
+            }),
+        )
+        .await?;
+        let retained = {
+            let mut idle = self
+                .pool
+                .idle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.pool.prune_idle(&mut idle);
+            idle.len()
+        };
+        let deficit = self
+            .pool
+            .config
+            .request_connections
+            .saturating_sub(retained);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.pool.config.setup_timeout)
+            .ok_or(SessionConsumerClientError::Deadline)?;
+        let established = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => {
+                return Err(SessionConsumerClientError::ShuttingDown);
+            }
+            established = futures_util::future::try_join_all(
+                (0..deficit).map(|_| self.pool.connect(deadline)),
+            ) => established?,
+        };
+        for connection in established {
+            self.pool.return_idle(connection);
+        }
+        drop(lane_permits);
+        drop(admission_permits);
+        if self.pool.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        Ok(self.readiness().await)
+    }
+
+    /// Return a conservative authenticated-idle-capacity snapshot.
+    pub async fn readiness(&self) -> PersistentSessionConsumerReadiness {
+        let lane_count = u32::try_from(self.pool.config.request_connections)
+            .expect("validated persistent request width fits u32");
+        // Holding every request-lane permit closes the checkout/return race:
+        // readiness is true only for fixed authenticated capacity that is
+        // idle for the complete snapshot, never for a merely leased lane.
+        let all_lanes_idle = Arc::clone(&self.pool.lanes)
+            .try_acquire_many_owned(lane_count)
+            .ok();
+        let mut idle = self
+            .pool
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.pool.prune_idle(&mut idle);
+        let ready_request_connections = idle.len();
+        PersistentSessionConsumerReadiness {
+            ready: self.pool.phase() == PersistentShutdownPhase::Running
+                && all_lanes_idle.is_some()
+                && ready_request_connections == self.pool.config.request_connections,
+            configured_request_connections: self.pool.config.request_connections,
+            ready_request_connections,
+        }
+    }
+
+    /// Return a nonidentifying fixed numeric diagnostics snapshot.
+    pub async fn diagnostics(&self) -> PersistentSessionConsumerDiagnostics {
+        let mut idle_connections = self
+            .pool
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.pool.prune_idle(&mut idle_connections);
+        let idle = u64::try_from(idle_connections.len()).unwrap_or(u64::MAX);
+        self.pool.snapshot(idle)
+    }
+
+    /// Stop admission, bound the drain, and force idle transport closure.
+    pub async fn shutdown(&self) -> PersistentSessionConsumerShutdownReport {
+        let (initial_calls, initial_watches, published_phase) = {
+            let mut activity = self
+                .pool
+                .activity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if activity.phase == PersistentShutdownPhase::Running {
+                activity.phase = PersistentShutdownPhase::Draining;
+                self.pool
+                    .shutdown_phase
+                    .store(PersistentShutdownPhase::Draining as u8, Ordering::Release);
+            }
+            (activity.calls, activity.watches, activity.phase)
+        };
+        self.pool.shutdown_tx.send_replace(published_phase);
+        self.pool.pending.close();
+        self.pool.lanes.close();
+        self.pool.watches.close();
+        self.pool.prewarm.close();
+        self.pool.clear_idle();
+        let deadline = tokio::time::Instant::now() + self.pool.config.shutdown_drain;
+        loop {
+            let notified = self.pool.drained_notify.notified();
+            let drained = {
+                let activity = self
+                    .pool
+                    .activity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                activity.calls == 0 && activity.watches == 0 && activity.prewarms == 0
+            };
+            if drained || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                break;
+            }
+        }
+        let (forced_calls, forced_watches) = {
+            let mut activity = self
+                .pool
+                .activity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            activity.phase = PersistentShutdownPhase::Forced;
+            self.pool
+                .shutdown_phase
+                .store(PersistentShutdownPhase::Forced as u8, Ordering::Release);
+            (activity.calls, activity.watches)
+        };
+        self.pool
+            .shutdown_tx
+            .send_replace(PersistentShutdownPhase::Forced);
+        // This independently retires stateless watch reader tasks after the
+        // grace period even if the returned stream is held without polling.
+        let _ = self.pool.client.request_reauthentication();
+        PersistentSessionConsumerShutdownReport {
+            drained_calls: u64::try_from(initial_calls.saturating_sub(forced_calls))
+                .unwrap_or(u64::MAX),
+            forced_calls: u64::try_from(forced_calls).unwrap_or(u64::MAX),
+            drained_watches: u64::try_from(initial_watches.saturating_sub(forced_watches))
+                .unwrap_or(u64::MAX),
+            forced_watches: u64::try_from(forced_watches).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+impl StatelessSessionConsumer for PersistentSessionConsumerClient {}
 
 fn rejection_into_store_error(rejection: SessionConsumerRejection) -> StoreError {
     match rejection {
@@ -1430,7 +3625,7 @@ fn lease_response<T>(
     }
 }
 
-/// Dedicated server for stateless session-quorum consumers.
+/// Dedicated server for typed session-quorum consumers.
 ///
 /// The constructor accepts only the typed [`SessionQuorumConsumer`] port. It
 /// cannot be wired to a generic backend or a compatibility replication
@@ -1482,7 +3677,9 @@ impl SessionQuorumConsumerServer {
         }
     }
 
-    /// Set the maximum simultaneous authenticated consumer connections.
+    /// Set the maximum simultaneous live consumer connections, including TLS
+    /// handshakes. Values above the fixed 256-slot listener ceiling fail
+    /// validation before bind.
     #[must_use]
     pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
@@ -1496,7 +3693,8 @@ impl SessionQuorumConsumerServer {
         self
     }
 
-    /// Set the bootstrap and active-frame idle deadline.
+    /// Set the bootstrap and active-frame idle deadline, capped at five
+    /// seconds by listener validation.
     #[must_use]
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
@@ -1604,10 +3802,11 @@ impl SessionQuorumConsumerServer {
 
     fn validate(&self) -> io::Result<()> {
         if self.max_connections == 0
-            || self.max_connections > Semaphore::MAX_PERMITS
+            || self.max_connections > DEFAULT_CONSUMER_MAX_CONNECTIONS
             || self.max_frame_size < MIN_SESSION_CONSUMER_RESPONSE_FRAME_SIZE
             || self.max_frame_size > MAX_NEGOTIATED_FRAME_SIZE
             || self.idle_timeout.is_zero()
+            || self.idle_timeout > DEFAULT_CONSUMER_IDLE_TIMEOUT
             || self.operation_timeout.is_zero()
             || self
                 .lifecycle_policy
@@ -1616,14 +3815,14 @@ impl SessionQuorumConsumerServer {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid stateless consumer listener configuration",
+                "invalid typed consumer listener configuration",
             ));
         }
         Ok(())
     }
 }
 
-/// Handle for a running stateless consumer listener.
+/// Handle for a running typed consumer listener.
 #[derive(Debug)]
 pub struct SessionQuorumConsumerServerHandle {
     accept_handle: tokio::task::JoinHandle<()>,
@@ -1668,6 +3867,10 @@ async fn handle_server_connection(
     reauthentication: SessionReauthenticationControl,
     cancellation: Arc<AtomicBool>,
 ) -> Result<(), ProtocolError> {
+    // Revision 2 reuses a socket for small request/response frames. Disable
+    // Nagle on both peers so a warm exchange cannot inherit the platform's
+    // delayed-ACK cadence and consume the bounded fair-pool wait budget.
+    stream.set_nodelay(true).map_err(ProtocolError::Io)?;
     let generation = reauthentication.generation();
     let handshake = tls_config
         .begin_handshake()
@@ -1702,14 +3905,13 @@ async fn handle_server_connection(
     let ConsumerWireRequest::Hello(hello) = hello else {
         return Err(ProtocolError::UnexpectedResponse);
     };
-    if hello.transport_revision != SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION
-        || hello.scope != authorizer.scope()
-    {
+    if hello.transport_revision != SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION {
+        return Err(ProtocolError::UnexpectedResponse);
+    }
+    if hello.scope != authorizer.scope() {
         let _ = write_consumer_response(
             &mut writer,
-            ConsumerWireResponse::Response(Box::new(SessionConsumerResponse::Rejected(
-                SessionConsumerRejection::ScopeMismatch,
-            ))),
+            ConsumerWireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch),
             max_frame_size,
             idle_timeout,
         )
@@ -1773,127 +3975,28 @@ async fn handle_server_connection(
         idle_timeout,
     )
     .await?;
-    if cancellation.load(Ordering::Acquire) {
-        return Ok(());
-    }
-    let request = tokio::select! {
-        biased;
-        _ = reauthentication_changes.changed() => return Ok(()),
-        _ = wait_consumer_material_change(&mut material_changes) => return Ok(()),
-        request = read_consumer_frame_within::<_, ConsumerWireRequest>(&mut reader, max_frame_size, idle_timeout) => request?,
-    };
-    let ConsumerWireRequest::Call(request) = request else {
-        return Err(ProtocolError::UnexpectedResponse);
-    };
-    if !server_connection_current(
-        &mut lifecycle,
-        &tls_config,
-        &reauthentication,
-        admitted_generation,
-        admitted_material_epoch,
-    ) {
-        return Ok(());
-    }
-    if request.scope() != authorizer.scope() {
-        return write_consumer_response(
-            &mut writer,
-            ConsumerWireResponse::Response(Box::new(SessionConsumerResponse::Rejected(
-                SessionConsumerRejection::ScopeMismatch,
-            ))),
-            max_frame_size,
-            idle_timeout,
-        )
-        .await;
-    }
-    if let Err(rejection) = request.validate() {
-        return write_consumer_response(
-            &mut writer,
-            ConsumerWireResponse::Response(Box::new(SessionConsumerResponse::Rejected(rejection))),
-            max_frame_size,
-            idle_timeout,
-        )
-        .await;
-    }
-    let watch_start = match request.operation() {
-        SessionConsumerOperation::Watch { start_sequence } => Some(*start_sequence),
-        _ => None,
-    };
-    let restore_request = match request.operation() {
-        SessionConsumerOperation::ScanRestoreRecords { request } => Some(request.clone()),
-        _ => None,
-    };
-    let timeout_response = consumer_timeout_response(request.operation());
-    let scope = request.scope();
-    let request_deadline = tokio::time::Instant::now()
-        .checked_add(operation_timeout)
-        .ok_or(ProtocolError::InvalidWireValue)?;
-    let mut response = tokio::select! {
-        biased;
-        _ = reauthentication_changes.changed() => return Ok(()),
-        _ = wait_consumer_material_change(&mut material_changes) => return Ok(()),
-        response = tokio::time::timeout_at(request_deadline, service.execute(&identity, *request)) => {
-            response.unwrap_or(timeout_response)
+    let mut expected_correlation = NonZeroU32::MIN;
+    for _ in 0..MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION {
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(());
         }
-    };
-    if !server_connection_current(
-        &mut lifecycle,
-        &tls_config,
-        &reauthentication,
-        admitted_generation,
-        admitted_material_epoch,
-    ) {
-        return Ok(());
-    }
-    if let (Some(request), SessionConsumerResponse::ScanRestoreRecords(Ok(page))) =
-        (&restore_request, &response)
-    {
-        // A restore page carries record byte arrays and can be valid for the
-        // store while exceeding the consumer frame after JSON expansion.
-        // Replace it before the response write with a small typed error; do
-        // not let a cursor become permanently unframeable after dispatch.
-        if page.validate_for_request(request).is_err()
-            || !consumer_response_fits(&response, max_frame_size)
-        {
-            response = SessionConsumerResponse::ScanRestoreRecords(Err(
-                SessionConsumerStoreError::RestoreBudgetExceeded,
-            ));
-        }
-    }
-    write_consumer_response_until(
-        &mut writer,
-        ConsumerWireResponse::Response(Box::new(response.clone())),
-        max_frame_size,
-        request_deadline,
-    )
-    .await?;
-    let Some(start_sequence) = watch_start else {
-        return Ok(());
-    };
-    if !matches!(response, SessionConsumerResponse::WatchOpened) {
-        return Ok(());
-    }
-    let mut watch = match tokio::time::timeout_at(
-        request_deadline,
-        service.watch(&identity, scope, start_sequence),
-    )
-    .await
-    {
-        Ok(Ok(watch)) => watch,
-        Ok(Err(rejection)) => {
-            return write_consumer_response(
-                &mut writer,
-                ConsumerWireResponse::Response(Box::new(SessionConsumerResponse::Rejected(
-                    rejection,
-                ))),
-                max_frame_size,
-                operation_timeout,
-            )
-            .await;
-        }
-        Err(_) => return Ok(()),
-    };
-    let mut peer_probe = [0_u8; 1];
-    loop {
+        let call = tokio::select! {
+            biased;
+            _ = reauthentication_changes.changed() => return Ok(()),
+            _ = wait_consumer_material_change(&mut material_changes) => return Ok(()),
+            _ = tokio::time::sleep_until(lifecycle.retire_at()) => return Ok(()),
+            request = read_consumer_frame_within::<_, ConsumerWireRequest>(&mut reader, max_frame_size, idle_timeout) => request?,
+        };
+        let ConsumerWireRequest::Call(ConsumerCall {
+            correlation,
+            request,
+        }) = call
+        else {
+            return Err(ProtocolError::UnexpectedResponse);
+        };
+        // A connection admits exactly one ordered sequence. Zero, duplicate,
+        // future, and late call IDs all close it before dispatch.
+        exact_correlation(expected_correlation, correlation)?;
         if !server_connection_current(
             &mut lifecycle,
             &tls_config,
@@ -1903,66 +4006,373 @@ async fn handle_server_connection(
         ) {
             return Ok(());
         }
-        let entry = tokio::select! {
-            biased;
-            _ = reauthentication_changes.changed() => return Ok(()),
-            _ = wait_consumer_material_change(&mut material_changes) => return Ok(()),
-            _ = tokio::time::sleep_until(lifecycle.retire_at()) => return Ok(()),
-            _ = tokio::time::sleep(CONSUMER_WATCH_CANCELLATION_RECHECK_INTERVAL) => {
-                if cancellation.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                continue;
-            }
-            // The client sends exactly one request per connection. Continue
-            // polling its read half after watch admission so an otherwise idle
-            // stream terminates when the peer goes away instead of retaining
-            // its backend watch until a future change arrives.
-            _ = reader.read(&mut peer_probe) => return Ok(()),
-            entry = watch.next() => entry,
-        };
-        let Some(entry) = entry else {
+        if request.scope() != authorizer.scope() {
+            write_consumer_response(
+                &mut writer,
+                ConsumerWireResponse::Response(ConsumerCallResponse {
+                    correlation,
+                    response: Box::new(SessionConsumerResponse::Rejected(
+                        SessionConsumerRejection::ScopeMismatch,
+                    )),
+                }),
+                max_frame_size,
+                idle_timeout,
+            )
+            .await?;
             return Ok(());
+        }
+        if let Err(rejection) = request.validate() {
+            write_consumer_response(
+                &mut writer,
+                ConsumerWireResponse::Response(ConsumerCallResponse {
+                    correlation,
+                    response: Box::new(SessionConsumerResponse::Rejected(rejection)),
+                }),
+                max_frame_size,
+                idle_timeout,
+            )
+            .await?;
+            return Ok(());
+        }
+        let watch_start = match request.operation() {
+            SessionConsumerOperation::Watch { start_sequence } => Some(*start_sequence),
+            _ => None,
         };
+        let restore_request = match request.operation() {
+            SessionConsumerOperation::ScanRestoreRecords { request } => Some(request.clone()),
+            _ => None,
+        };
+        let operation = ConsumerOperationKind::from_operation(request.operation());
+        let scope = request.scope();
+        let request_deadline = tokio::time::Instant::now()
+            .checked_add(operation_timeout)
+            .ok_or(ProtocolError::InvalidWireValue)?;
+        let execute = service.execute(&identity, *request);
+        tokio::pin!(execute);
+        let mut response = loop {
+            let hard_deadline = lifecycle
+                .hard_deadline()
+                .map_err(|_| ProtocolError::InvalidWireValue)?;
+            let admitted_deadline = request_deadline.min(hard_deadline);
+            let response = tokio::select! {
+                biased;
+                response = &mut execute => Some(response),
+                _ = reauthentication_changes.changed() => {
+                    observe_consumer_rotation(
+                        &mut lifecycle,
+                        tokio::time::Instant::now(),
+                        reauthentication.generation(),
+                        tls_config.material_status().epoch(),
+                    );
+                    None
+                }
+                _ = wait_consumer_material_change(&mut material_changes) => {
+                    observe_consumer_rotation(
+                        &mut lifecycle,
+                        tokio::time::Instant::now(),
+                        reauthentication.generation(),
+                        tls_config.material_status().epoch(),
+                    );
+                    None
+                }
+                _ = tokio::time::sleep_until(admitted_deadline) => {
+                    if hard_deadline <= request_deadline {
+                        lifecycle.record_hard_overrun();
+                        return Ok(());
+                    }
+                    Some(consumer_timeout_response(operation))
+                }
+            };
+            if let Some(response) = response {
+                break response;
+            }
+        };
+        observe_consumer_rotation(
+            &mut lifecycle,
+            tokio::time::Instant::now(),
+            reauthentication.generation(),
+            tls_config.material_status().epoch(),
+        );
+        let hard_deadline = lifecycle
+            .hard_deadline()
+            .map_err(|_| ProtocolError::InvalidWireValue)?;
+        if tokio::time::Instant::now() >= hard_deadline {
+            lifecycle.record_hard_overrun();
+            return Ok(());
+        }
         if cancellation.load(Ordering::Acquire) {
             return Ok(());
         }
-        write_consumer_response(
-            &mut writer,
-            ConsumerWireResponse::WatchEntry(Box::new(entry)),
-            max_frame_size,
-            operation_timeout,
-        )
-        .await?;
+        if !response_matches_operation(operation, &response) {
+            return Err(ProtocolError::UnexpectedResponse);
+        }
+        if let (Some(request), SessionConsumerResponse::ScanRestoreRecords(Ok(page))) =
+            (&restore_request, &response)
+        {
+            // Keep #684's page validation and response-fit replacement before
+            // writing a frame; revision-2 only adds the small correlation
+            // envelope to the fit calculation.
+            if page.validate_for_request(request).is_err()
+                || !consumer_response_fits_for_correlation(correlation, &response, max_frame_size)
+            {
+                response = SessionConsumerResponse::ScanRestoreRecords(Err(
+                    SessionConsumerStoreError::RestoreBudgetExceeded,
+                ));
+            }
+        }
+        // A watch admission has exactly one correlated response. Resolve the
+        // backend stream before writing WatchOpened so a backend rejection can
+        // replace that response instead of emitting a duplicate correlation.
+        let mut opened_watch = None;
+        if let Some(start_sequence) = watch_start {
+            if matches!(response, SessionConsumerResponse::WatchOpened) {
+                let watch_setup = service.watch(&identity, scope, start_sequence);
+                tokio::pin!(watch_setup);
+                let watch_result = loop {
+                    let hard_deadline = lifecycle
+                        .hard_deadline()
+                        .map_err(|_| ProtocolError::InvalidWireValue)?;
+                    let admitted_deadline = request_deadline.min(hard_deadline);
+                    let result = tokio::select! {
+                        biased;
+                        result = &mut watch_setup => Some(result),
+                        _ = reauthentication_changes.changed() => {
+                            observe_consumer_rotation(
+                                &mut lifecycle,
+                                tokio::time::Instant::now(),
+                                reauthentication.generation(),
+                                tls_config.material_status().epoch(),
+                            );
+                            None
+                        }
+                        _ = wait_consumer_material_change(&mut material_changes) => {
+                            observe_consumer_rotation(
+                                &mut lifecycle,
+                                tokio::time::Instant::now(),
+                                reauthentication.generation(),
+                                tls_config.material_status().epoch(),
+                            );
+                            None
+                        }
+                        _ = tokio::time::sleep_until(admitted_deadline) => {
+                            if hard_deadline <= request_deadline {
+                                lifecycle.record_hard_overrun();
+                            }
+                            return Ok(());
+                        }
+                    };
+                    if let Some(result) = result {
+                        break result;
+                    }
+                };
+                match watch_result {
+                    Ok(watch) => opened_watch = Some(watch),
+                    Err(rejection) => {
+                        response = SessionConsumerResponse::Rejected(rejection);
+                    }
+                }
+            }
+            observe_consumer_rotation(
+                &mut lifecycle,
+                tokio::time::Instant::now(),
+                reauthentication.generation(),
+                tls_config.material_status().epoch(),
+            );
+            let hard_deadline = lifecycle
+                .hard_deadline()
+                .map_err(|_| ProtocolError::InvalidWireValue)?;
+            if tokio::time::Instant::now() >= hard_deadline || cancellation.load(Ordering::Acquire)
+            {
+                lifecycle.record_hard_overrun();
+                return Ok(());
+            }
+        }
+        let watch_opened = matches!(response, SessionConsumerResponse::WatchOpened);
+        {
+            let initial_hard_deadline = lifecycle
+                .hard_deadline()
+                .map_err(|_| ProtocolError::InvalidWireValue)?;
+            let response_write_deadline = request_deadline.min(initial_hard_deadline);
+            let response_write = write_consumer_response_until(
+                &mut writer,
+                ConsumerWireResponse::Response(ConsumerCallResponse {
+                    correlation,
+                    response: Box::new(response),
+                }),
+                max_frame_size,
+                response_write_deadline,
+            );
+            tokio::pin!(response_write);
+            loop {
+                let hard_deadline = lifecycle
+                    .hard_deadline()
+                    .map_err(|_| ProtocolError::InvalidWireValue)?;
+                let result = tokio::select! {
+                    biased;
+                    result = &mut response_write => Some(result),
+                    _ = reauthentication_changes.changed() => {
+                        observe_consumer_rotation(
+                            &mut lifecycle,
+                            tokio::time::Instant::now(),
+                            reauthentication.generation(),
+                            tls_config.material_status().epoch(),
+                        );
+                        None
+                    }
+                    _ = wait_consumer_material_change(&mut material_changes) => {
+                        observe_consumer_rotation(
+                            &mut lifecycle,
+                            tokio::time::Instant::now(),
+                            reauthentication.generation(),
+                            tls_config.material_status().epoch(),
+                        );
+                        None
+                    }
+                    _ = wait_for_shortened_deadline(hard_deadline, response_write_deadline) => {
+                        lifecycle.record_hard_overrun();
+                        return Ok(());
+                    }
+                    _ = tokio::time::sleep(CONSUMER_WATCH_CANCELLATION_RECHECK_INTERVAL) => {
+                        if cancellation.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        None
+                    }
+                };
+                if let Some(result) = result {
+                    result?;
+                    break;
+                }
+            }
+        }
+        if watch_start.is_none() {
+            expected_correlation = expected_correlation
+                .get()
+                .checked_add(1)
+                .and_then(NonZeroU32::new)
+                .ok_or(ProtocolError::InvalidWireValue)?;
+            continue;
+        }
+        if !watch_opened {
+            return Ok(());
+        }
+        // A watch is terminal: no subsequent call is decoded after opening it.
+        let mut watch = opened_watch.ok_or(ProtocolError::UnexpectedResponse)?;
+        let mut peer_probe = [0_u8; 1];
+        loop {
+            if !server_connection_current(
+                &mut lifecycle,
+                &tls_config,
+                &reauthentication,
+                admitted_generation,
+                admitted_material_epoch,
+            ) {
+                return Ok(());
+            }
+            let entry = tokio::select! {
+                biased;
+                _ = reauthentication_changes.changed() => return Ok(()),
+                _ = wait_consumer_material_change(&mut material_changes) => return Ok(()),
+                _ = tokio::time::sleep_until(lifecycle.retire_at()) => return Ok(()),
+                _ = tokio::time::sleep(CONSUMER_WATCH_CANCELLATION_RECHECK_INTERVAL) => {
+                    if cancellation.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                _ = reader.read(&mut peer_probe) => return Ok(()),
+                entry = watch.next() => entry,
+            };
+            let Some(entry) = entry else {
+                return Ok(());
+            };
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let watch_write_deadline = tokio::time::Instant::now()
+                .checked_add(operation_timeout)
+                .ok_or(ProtocolError::InvalidWireValue)?
+                .min(
+                    lifecycle
+                        .hard_deadline()
+                        .map_err(|_| ProtocolError::InvalidWireValue)?,
+                );
+            let watch_write = write_consumer_response_until(
+                &mut writer,
+                ConsumerWireResponse::WatchEntry(ConsumerWatchEntry {
+                    correlation,
+                    entry: Box::new(entry),
+                }),
+                max_frame_size,
+                watch_write_deadline,
+            );
+            tokio::pin!(watch_write);
+            loop {
+                let hard_deadline = lifecycle
+                    .hard_deadline()
+                    .map_err(|_| ProtocolError::InvalidWireValue)?;
+                let result = tokio::select! {
+                    biased;
+                    result = &mut watch_write => Some(result),
+                    _ = reauthentication_changes.changed() => {
+                        observe_consumer_rotation(
+                            &mut lifecycle,
+                            tokio::time::Instant::now(),
+                            reauthentication.generation(),
+                            tls_config.material_status().epoch(),
+                        );
+                        None
+                    }
+                    _ = wait_consumer_material_change(&mut material_changes) => {
+                        observe_consumer_rotation(
+                            &mut lifecycle,
+                            tokio::time::Instant::now(),
+                            reauthentication.generation(),
+                            tls_config.material_status().epoch(),
+                        );
+                        None
+                    }
+                    _ = wait_for_shortened_deadline(hard_deadline, watch_write_deadline) => {
+                        lifecycle.record_hard_overrun();
+                        return Ok(());
+                    }
+                    _ = tokio::time::sleep(CONSUMER_WATCH_CANCELLATION_RECHECK_INTERVAL) => {
+                        if cancellation.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        None
+                    }
+                    _ = reader.read(&mut peer_probe) => return Ok(()),
+                };
+                if let Some(result) = result {
+                    result?;
+                    break;
+                }
+            }
+        }
     }
+    Ok(())
 }
 
-fn consumer_timeout_response(operation: &SessionConsumerOperation) -> SessionConsumerResponse {
+fn consumer_timeout_response(operation: ConsumerOperationKind) -> SessionConsumerResponse {
     let mutation_may_have_been_accepted = match operation {
-        SessionConsumerOperation::CompareAndSet { .. }
-        | SessionConsumerOperation::DeleteFenced { .. }
-        | SessionConsumerOperation::RefreshTtl { .. } => {
-            Some(SessionConsumerOutcomeUnknown::Mutation)
+        ConsumerOperationKind::CompareAndSet
+        | ConsumerOperationKind::DeleteFenced
+        | ConsumerOperationKind::RefreshTtl => Some(SessionConsumerOutcomeUnknown::Mutation),
+        ConsumerOperationKind::AcquireLease
+        | ConsumerOperationKind::RenewLease
+        | ConsumerOperationKind::ReleaseLease => Some(SessionConsumerOutcomeUnknown::Lease),
+        ConsumerOperationKind::Batch {
+            contains_mutation: true,
+        } => Some(SessionConsumerOutcomeUnknown::Mutation),
+        ConsumerOperationKind::Capabilities
+        | ConsumerOperationKind::Get
+        | ConsumerOperationKind::PreflightRecordExpiry
+        | ConsumerOperationKind::Batch {
+            contains_mutation: false,
         }
-        SessionConsumerOperation::AcquireLease { .. }
-        | SessionConsumerOperation::RenewLease { .. }
-        | SessionConsumerOperation::ReleaseLease { .. } => {
-            Some(SessionConsumerOutcomeUnknown::Lease)
-        }
-        SessionConsumerOperation::Batch { ops }
-            if ops.iter().any(|op| !matches!(op, SessionOp::Get { .. })) =>
-        {
-            Some(SessionConsumerOutcomeUnknown::Mutation)
-        }
-        SessionConsumerOperation::Capabilities
-        | SessionConsumerOperation::Get { .. }
-        | SessionConsumerOperation::PreflightRecordExpiry { .. }
-        | SessionConsumerOperation::Batch { .. }
-        | SessionConsumerOperation::ScanRestoreRecords { .. }
-        | SessionConsumerOperation::Watch { .. } => None,
-        // A newer operation may have an effect unknown to this transport
-        // revision. Preserve mutation safety across that version skew.
-        _ => Some(SessionConsumerOutcomeUnknown::Mutation),
+        | ConsumerOperationKind::ScanRestoreRecords
+        | ConsumerOperationKind::Watch => None,
     };
     mutation_may_have_been_accepted.map_or(
         SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable),
@@ -1970,9 +4380,56 @@ fn consumer_timeout_response(operation: &SessionConsumerOperation) -> SessionCon
     )
 }
 
+#[cfg(test)]
 fn consumer_response_fits(response: &SessionConsumerResponse, max_frame_size: usize) -> bool {
-    serde_json::to_vec(&ConsumerWireResponse::Response(Box::new(response.clone())))
-        .is_ok_and(|encoded| encoded.len() <= max_frame_size)
+    consumer_response_fits_for_correlation(NonZeroU32::MIN, response, max_frame_size)
+}
+
+fn consumer_response_fits_for_correlation(
+    correlation: NonZeroU32,
+    response: &SessionConsumerResponse,
+    max_frame_size: usize,
+) -> bool {
+    struct BoundedResponseSize {
+        encoded: usize,
+        maximum: usize,
+    }
+
+    impl io::Write for BoundedResponseSize {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let encoded = self.encoded.checked_add(bytes.len()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "consumer response size overflow",
+                )
+            })?;
+            if encoded > self.maximum {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "consumer response exceeds negotiated frame size",
+                ));
+            }
+            self.encoded = encoded;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut size = BoundedResponseSize {
+        encoded: 0,
+        maximum: max_frame_size,
+    };
+    serde_json::to_writer(
+        &mut size,
+        &BorrowedConsumerWireResponse::Response(BorrowedConsumerCallResponse {
+            correlation,
+            response,
+        }),
+    )
+    .is_ok()
 }
 
 async fn write_consumer_response<W>(
@@ -2017,23 +4474,45 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::num::NonZeroU32;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
     use super::{
-        classify_call_write_error, consumer_response_fits, decode_consumer_frame_payload,
-        ensure_pre_request_budget_remaining, lease_response, mutation_response,
-        ConsumerWireResponse, SessionConsumerAuthorizationError, SessionConsumerAuthorizer,
-        SessionConsumerCallError, SessionConsumerClientError, SessionConsumerLeaseMutationError,
-        SessionConsumerMutationError,
+        classify_call_write_error, complete_before_deadline, consumer_response_fits,
+        decode_consumer_frame_payload, ensure_pre_request_budget_remaining, exact_correlation,
+        lease_response, mutation_response, response_matches_operation, BorrowedConsumerCall,
+        BorrowedConsumerCallResponse, BorrowedConsumerWireRequest, BorrowedConsumerWireResponse,
+        ConsumerCall, ConsumerCallResponse, ConsumerOperationKind, ConsumerWireRequest,
+        ConsumerWireResponse, PersistentSessionConsumerConfig,
+        PersistentSessionConsumerConfigError, SessionConsumerAuthorizationError,
+        SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerClientError,
+        SessionConsumerLeaseMutationError, SessionConsumerMutationError,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+        MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
+        MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+        MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
     };
     use bytes::Bytes;
     use opc_session_store::{
         BackendCapabilities, EncryptedSessionPayload, FenceToken, Generation, OwnerId,
         RestoreScanPage, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
         SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerLeaseError,
-        SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-        SessionConsumerStoreError, SessionKey, SessionKeyType, StateClass, StateType,
-        StoredSessionRecord,
+        SessionConsumerOperation, SessionConsumerRequest, SessionConsumerRequestId,
+        SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionKey,
+        SessionKeyType, StateClass, StateType, StoredSessionRecord,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+    use tokio::io::AsyncWrite;
 
     use crate::protocol::MAX_NEGOTIATED_FRAME_SIZE;
 
@@ -2050,6 +4529,164 @@ mod tests {
             "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/{suffix}"
         ))
         .expect("test SPIFFE ID")
+    }
+
+    fn mutation_request(request_id: SessionConsumerRequestId) -> SessionConsumerRequest {
+        SessionConsumerRequest::new(
+            scope(),
+            request_id,
+            SessionConsumerOperation::AcquireLease {
+                key: SessionKey {
+                    tenant: TenantId::new("wire-test").expect("test tenant"),
+                    nf_kind: NetworkFunctionKind::smf(),
+                    key_type: SessionKeyType::PduSession,
+                    stable_id: Bytes::from_static(b"opaque-session")
+                        .try_into()
+                        .expect("bounded stable ID"),
+                },
+                owner: OwnerId::new("wire-owner").expect("test owner"),
+                ttl: Duration::from_secs(30),
+            },
+        )
+    }
+
+    struct PhaseFailWriter {
+        accepted: usize,
+        fail_after: Option<usize>,
+        fail_flush: bool,
+    }
+
+    impl AsyncWrite for PhaseFailWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if let Some(fail_after) = self.fail_after {
+                if self.accepted >= fail_after {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "controlled write failure",
+                    )));
+                }
+                let accepted = bytes.len().min(fail_after - self.accepted);
+                self.accepted += accepted;
+                return Poll::Ready(Ok(accepted));
+            }
+            self.accepted += bytes.len();
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.fail_flush {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "controlled flush failure",
+                )))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_write_phases_preserve_the_exact_effect_boundary() {
+        let request_id = SessionConsumerRequestId::new();
+        let request = mutation_request(request_id);
+        let outbound = BorrowedConsumerWireRequest::Call(BorrowedConsumerCall {
+            correlation: NonZeroU32::MIN,
+            request: &request,
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+
+        let mut before_write = PhaseFailWriter {
+            accepted: 0,
+            fail_after: None,
+            fail_flush: false,
+        };
+        let error = crate::protocol::write_frame_bounded_until_classified(
+            &mut before_write,
+            &outbound,
+            1,
+            deadline,
+        )
+        .await
+        .expect_err("oversize mutation must fail before the prefix");
+        assert_eq!(before_write.accepted, 0);
+        let classified = classify_call_write_error(error, false);
+        let not_transmitted: Result<(), SessionConsumerLeaseMutationError> =
+            lease_response(request_id, Err(classified), |_| None);
+        assert!(matches!(
+            not_transmitted,
+            Err(SessionConsumerLeaseMutationError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol
+            })
+        ));
+
+        for (phase, fail_after, fail_flush) in [
+            ("partial_prefix", Some(2), false),
+            ("partial_payload", Some(12), false),
+            ("flush", None, true),
+        ] {
+            let mut writer = PhaseFailWriter {
+                accepted: 0,
+                fail_after,
+                fail_flush,
+            };
+            let error = crate::protocol::write_frame_bounded_until_classified(
+                &mut writer,
+                &outbound,
+                MAX_NEGOTIATED_FRAME_SIZE,
+                deadline,
+            )
+            .await
+            .expect_err("controlled phase must fail");
+            let classified = classify_call_write_error(error, false);
+            let outcome: Result<(), SessionConsumerLeaseMutationError> =
+                lease_response(request_id, Err(classified), |_| None);
+            assert!(matches!(
+                outcome,
+                Err(SessionConsumerLeaseMutationError::OutcomeUnknown { request_id: retry_id })
+                    if retry_id == request_id
+            ));
+            assert!(writer.accepted > 0, "{phase} crossed the write boundary");
+        }
+    }
+
+    #[test]
+    fn borrowed_revision_two_envelopes_are_wire_identical() {
+        let request = mutation_request(SessionConsumerRequestId::new());
+        let owned_request = ConsumerWireRequest::Call(ConsumerCall {
+            correlation: NonZeroU32::MIN,
+            request: Box::new(request.clone()),
+        });
+        let borrowed_request = BorrowedConsumerWireRequest::Call(BorrowedConsumerCall {
+            correlation: NonZeroU32::MIN,
+            request: &request,
+        });
+        assert_eq!(
+            serde_json::to_vec(&owned_request).expect("owned request encodes"),
+            serde_json::to_vec(&borrowed_request).expect("borrowed request encodes")
+        );
+
+        let response = SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled());
+        let owned_response = ConsumerWireResponse::Response(ConsumerCallResponse {
+            correlation: NonZeroU32::MIN,
+            response: Box::new(response.clone()),
+        });
+        let borrowed_response =
+            BorrowedConsumerWireResponse::Response(BorrowedConsumerCallResponse {
+                correlation: NonZeroU32::MIN,
+                response: &response,
+            });
+        assert_eq!(
+            serde_json::to_vec(&owned_response).expect("owned response encodes"),
+            serde_json::to_vec(&borrowed_response).expect("borrowed response encodes")
+        );
     }
 
     #[test]
@@ -2089,9 +4726,12 @@ mod tests {
 
     #[test]
     fn consumer_decoder_rejects_unknown_shared_dto_fields() {
-        let response = ConsumerWireResponse::Response(Box::new(
-            SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled()),
-        ));
+        let response = ConsumerWireResponse::Response(ConsumerCallResponse {
+            correlation: NonZeroU32::MIN,
+            response: Box::new(SessionConsumerResponse::Capabilities(
+                BackendCapabilities::all_enabled(),
+            )),
+        });
         let mut encoded = serde_json::to_value(response).expect("consumer response encodes");
         encoded["body"]["Capabilities"]["unexpected"] = serde_json::Value::Bool(true);
         let payload = serde_json::to_vec(&encoded).expect("JSON payload");
@@ -2100,12 +4740,161 @@ mod tests {
 
     #[test]
     fn consumer_decoder_rejects_trailing_json_values() {
-        let response = ConsumerWireResponse::Response(Box::new(
-            SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled()),
-        ));
+        let response = ConsumerWireResponse::Response(ConsumerCallResponse {
+            correlation: NonZeroU32::MIN,
+            response: Box::new(SessionConsumerResponse::Capabilities(
+                BackendCapabilities::all_enabled(),
+            )),
+        });
         let mut payload = serde_json::to_vec(&response).expect("consumer response encodes");
         payload.extend_from_slice(br#"{}"#);
         assert!(decode_consumer_frame_payload::<ConsumerWireResponse>(&payload).is_err());
+    }
+
+    #[test]
+    fn correlation_sequence_and_response_kind_fail_closed() {
+        let one = NonZeroU32::MIN;
+        let two = NonZeroU32::new(2).expect("nonzero correlation");
+        assert!(exact_correlation(one, one).is_ok());
+        assert!(exact_correlation(one, two).is_err(), "future correlation");
+        assert!(
+            exact_correlation(two, one).is_err(),
+            "duplicate or late correlation"
+        );
+
+        let response = ConsumerWireResponse::Response(ConsumerCallResponse {
+            correlation: one,
+            response: Box::new(SessionConsumerResponse::Capabilities(
+                BackendCapabilities::all_enabled(),
+            )),
+        });
+        let mut zero = serde_json::to_value(response).expect("consumer response encodes");
+        zero["body"]["correlation"] = serde_json::Value::from(0);
+        let zero = serde_json::to_vec(&zero).expect("zero-correlation payload encodes");
+        assert!(
+            decode_consumer_frame_payload::<ConsumerWireResponse>(&zero).is_err(),
+            "zero is not a representable wire correlation"
+        );
+        assert!(!response_matches_operation(
+            ConsumerOperationKind::Capabilities,
+            &SessionConsumerResponse::Get(Ok(None)),
+        ));
+    }
+
+    #[test]
+    fn persistent_config_rejects_every_unbounded_dimension() {
+        let config = |request_connections,
+                      pending_calls,
+                      pool_wait_timeout,
+                      watch_connections,
+                      setup_timeout,
+                      connect_attempts,
+                      reconnect_jitter,
+                      shutdown_drain| {
+            PersistentSessionConsumerConfig::try_new(
+                request_connections,
+                pending_calls,
+                pool_wait_timeout,
+                watch_connections,
+                setup_timeout,
+                connect_attempts,
+                reconnect_jitter,
+                shutdown_drain,
+            )
+        };
+        let (requests, pending, wait, watches, setup, attempts, jitter, drain) = (
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
+        );
+        assert!(config(requests, pending, wait, watches, setup, attempts, jitter, drain).is_ok());
+        for (invalid_requests, invalid_pending, invalid_watches) in [
+            (0, pending, watches),
+            (
+                MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS + 1,
+                pending,
+                watches,
+            ),
+            (
+                requests,
+                MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS + 1,
+                watches,
+            ),
+            (
+                requests,
+                pending,
+                MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS + 1,
+            ),
+            (requests, pending, 0),
+        ] {
+            assert_eq!(
+                config(
+                    invalid_requests,
+                    invalid_pending,
+                    wait,
+                    invalid_watches,
+                    setup,
+                    attempts,
+                    jitter,
+                    drain,
+                ),
+                Err(PersistentSessionConsumerConfigError::Capacity)
+            );
+        }
+        for (invalid_wait, invalid_setup, invalid_attempts, invalid_jitter, invalid_drain) in [
+            (Duration::ZERO, setup, attempts, jitter, drain),
+            (
+                wait + Duration::from_millis(1),
+                setup,
+                attempts,
+                jitter,
+                drain,
+            ),
+            (wait, Duration::ZERO, attempts, jitter, drain),
+            (
+                wait,
+                setup + Duration::from_millis(1),
+                attempts,
+                jitter,
+                drain,
+            ),
+            (wait, setup, 0, jitter, drain),
+            (wait, setup, attempts + 1, jitter, drain),
+            (
+                wait,
+                setup,
+                attempts,
+                jitter + Duration::from_millis(1),
+                drain,
+            ),
+            (wait, setup, attempts, jitter, Duration::ZERO),
+            (
+                wait,
+                setup,
+                attempts,
+                jitter,
+                drain + Duration::from_millis(1),
+            ),
+        ] {
+            assert_eq!(
+                config(
+                    requests,
+                    pending,
+                    invalid_wait,
+                    watches,
+                    invalid_setup,
+                    invalid_attempts,
+                    invalid_jitter,
+                    invalid_drain,
+                ),
+                Err(PersistentSessionConsumerConfigError::Timing)
+            );
+        }
     }
 
     #[test]
@@ -2231,6 +5020,67 @@ mod tests {
             ensure_pre_request_budget_remaining(deadline, false),
             Ok(()),
             "the default operation deadline retains its existing write classification"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_setup_and_pool_permit_are_rejected_before_publication() {
+        let setup_ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let setup_signal = std::sync::Arc::clone(&setup_ready);
+        let setup_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let mut setup = Box::pin(async move {
+            setup_signal.notified().await;
+        });
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(setup.as_mut(), context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        setup_ready.notify_one();
+        setup.await;
+        let dispatched = std::sync::atomic::AtomicBool::new(false);
+        let setup_result =
+            complete_before_deadline((), setup_deadline, SessionConsumerClientError::Unavailable);
+        if setup_result.is_ok() {
+            dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert_eq!(
+            setup_result,
+            Err(SessionConsumerClientError::Unavailable),
+            "late setup must remain NotTransmitted"
+        );
+        assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
+
+        let lanes = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let lane_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let mut acquisition = Box::pin(tokio::time::timeout_at(
+            lane_deadline,
+            std::sync::Arc::clone(&lanes).acquire_owned(),
+        ));
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(acquisition.as_mut(), context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        lanes.add_permits(1);
+        let late_permit = acquisition
+            .await
+            .expect("locked Tokio polls the ready semaphore before the elapsed timer")
+            .expect("test semaphore remains open");
+        assert!(matches!(
+            complete_before_deadline(
+                late_permit,
+                lane_deadline,
+                SessionConsumerClientError::Overloaded,
+            ),
+            Err(SessionConsumerClientError::Overloaded)
+        ));
+        assert_eq!(
+            lanes.available_permits(),
+            1,
+            "a late acquisition is dropped instead of being published"
         );
     }
 

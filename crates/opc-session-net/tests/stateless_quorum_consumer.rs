@@ -346,6 +346,75 @@ async fn one_authenticated_consumer_call_uses_the_dedicated_alpn_without_replay(
 }
 
 #[tokio::test]
+async fn stateless_serial_calls_authenticate_fresh_and_accumulate_setup_delay() {
+    const CALLS: usize = 4;
+    const SETUP_DELAY: Duration = Duration::from_millis(40);
+
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("red-server");
+    let client_spiffe = spiffe("red-client");
+    let service = Arc::new(CountingConsumer::default());
+    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (handle, upstream_address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+
+    // Delay every end-to-end TLS connection before forwarding any handshake
+    // byte. A completed capability response therefore proves that the counted
+    // proxy connection completed the authenticated consumer setup.
+    let proxy_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind deterministic setup-delay proxy");
+    let proxy_address = proxy_listener.local_addr().expect("proxy address");
+    let accepted_connections = Arc::new(AtomicUsize::new(0));
+    let proxy_task = {
+        let accepted_connections = Arc::clone(&accepted_connections);
+        tokio::spawn(async move {
+            loop {
+                let (mut downstream, _) = proxy_listener.accept().await.expect("accept client");
+                accepted_connections.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    tokio::time::sleep(SETUP_DELAY).await;
+                    let Ok(mut upstream) = tokio::net::TcpStream::connect(upstream_address).await
+                    else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                });
+            }
+        })
+    };
+
+    let client = consumer_client(&pki, proxy_address, &server_spiffe, &client_spiffe, scope);
+    let started_at = tokio::time::Instant::now();
+    for _ in 0..CALLS {
+        assert_eq!(
+            client.capabilities().await,
+            Ok(BackendCapabilities::all_enabled())
+        );
+    }
+    let elapsed = started_at.elapsed();
+
+    assert!(
+        elapsed >= SETUP_DELAY * u32::try_from(CALLS).expect("small call count"),
+        "serial cold calls must accumulate the deterministic setup delay"
+    );
+    assert_eq!(
+        accepted_connections.load(Ordering::SeqCst),
+        CALLS,
+        "the compatibility client deliberately authenticates a fresh transport per call"
+    );
+
+    proxy_task.abort();
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn consumer_resolver_reconnects_the_same_client_after_endpoint_replacement() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("resolver-server");

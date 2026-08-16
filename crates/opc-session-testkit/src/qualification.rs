@@ -1333,8 +1333,10 @@ pub struct QualificationProtocol {
     pub stateless_consumer: Option<QualificationStatelessConsumerProtocol>,
 }
 
-/// Fixed/default bounded contract inventory for the dedicated stateless
-/// session-quorum consumer transport.
+/// Fixed/default bounded contract inventory for the dedicated session-quorum
+/// consumer transport. The `stateless_consumer` profile field remains for
+/// schema compatibility and inventories both the one-shot compatibility
+/// client and the persistent request client; watches remain dedicated.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationStatelessConsumerProtocol {
@@ -1342,7 +1344,20 @@ pub struct QualificationStatelessConsumerProtocol {
     pub transport_revision: u16,
     pub fallback_or_dual_mode_enabled: bool,
     pub max_requests_per_connection: usize,
+    pub correlation_id_bytes: usize,
+    pub max_in_flight_per_connection: usize,
     pub default_max_connections: usize,
+    pub default_persistent_request_connections: usize,
+    pub max_persistent_request_connections: usize,
+    pub default_persistent_pending_calls: usize,
+    pub max_persistent_pending_calls: usize,
+    pub default_persistent_pool_wait_timeout_millis: u64,
+    pub default_persistent_watch_connections: usize,
+    pub max_persistent_watch_connections: usize,
+    pub default_persistent_setup_timeout_millis: u64,
+    pub default_persistent_connect_attempts: usize,
+    pub default_persistent_reconnect_jitter_millis: u64,
+    pub default_persistent_shutdown_drain_millis: u64,
     pub min_response_frame_bytes: usize,
     pub max_frame_bytes: usize,
     pub default_idle_timeout_millis: u64,

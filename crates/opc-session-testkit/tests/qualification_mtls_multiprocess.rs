@@ -23,15 +23,16 @@ use opc_identity::{
     TrustBundleSet, TrustDomain,
 };
 use opc_session_net::{
-    ConnectionLifecyclePolicy, RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId,
-    SessionConfigurationEpoch, SessionConfigurationGeneration, SessionConsumerLeaseMutationError,
+    ConnectionLifecyclePolicy, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
+    RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId, SessionConfigurationEpoch,
+    SessionConfigurationGeneration, SessionConsumerClientError, SessionConsumerLeaseMutationError,
     SessionReplicationManifest, StatelessSessionConsumerClient, DEFAULT_MAX_AUTHENTICATION_AGE,
     DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW,
     DEFAULT_ROTATION_JITTER,
 };
 use opc_session_store::{
-    OwnerId, QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint,
-    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionConsensusPeer,
+    BackendCapabilities, LeaseGuard, OwnerId, QuorumReplicaDescriptor, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionConsensusPeer,
     SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusWireRequest,
     SessionConsumerOperation, SessionConsumerRequest, SessionConsumerRequestId,
     SessionConsumerResponse, SessionConsumerScope, SessionKey, SessionKeyType,
@@ -8136,7 +8137,87 @@ fn stateless_consumer_key(index: usize) -> SessionKey {
     }
 }
 
-fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
+#[derive(Clone, Copy)]
+enum ConsumerQualificationMode {
+    Stateless,
+    Persistent,
+}
+
+impl ConsumerQualificationMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Stateless => "stateless",
+            Self::Persistent => "persistent",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum QualificationConsumerClient {
+    Stateless(Box<StatelessSessionConsumerClient>),
+    Persistent(PersistentSessionConsumerClient),
+}
+
+#[derive(Debug)]
+enum QualificationConsumerExecuteError {
+    Stateless,
+    Persistent,
+}
+
+impl QualificationConsumerClient {
+    async fn execute(
+        &self,
+        request: SessionConsumerRequest,
+    ) -> Result<SessionConsumerResponse, QualificationConsumerExecuteError> {
+        match self {
+            Self::Stateless(client) => client
+                .execute(request)
+                .await
+                .map_err(|_| QualificationConsumerExecuteError::Stateless),
+            Self::Persistent(client) => client
+                .execute(&request)
+                .await
+                .map_err(|_| QualificationConsumerExecuteError::Persistent),
+        }
+    }
+
+    async fn capabilities(&self) -> Result<BackendCapabilities, SessionConsumerClientError> {
+        match self {
+            Self::Stateless(client) => client.capabilities().await,
+            Self::Persistent(client) => client.capabilities().await,
+        }
+    }
+
+    async fn acquire_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+    ) -> Result<LeaseGuard, SessionConsumerLeaseMutationError> {
+        match self {
+            Self::Stateless(client) => client.acquire_with_id(request_id, key, owner, ttl).await,
+            Self::Persistent(client) => client.acquire_with_id(request_id, key, owner, ttl).await,
+        }
+    }
+
+    async fn prewarm(&self) -> Result<bool, SessionConsumerClientError> {
+        match self {
+            Self::Stateless(_) => Ok(true),
+            Self::Persistent(client) => Ok(client.prewarm().await?.ready),
+        }
+    }
+
+    async fn shutdown(&self) {
+        if let Self::Persistent(client) = self {
+            let report = client.shutdown().await;
+            assert_eq!(report.forced_calls, 0);
+            assert_eq!(report.forced_watches, 0);
+        }
+    }
+}
+
+fn run_consumer_multiprocess_qualification(member_count: usize, mode: ConsumerQualificationMode) {
     let mut fleet = Fleet::start(member_count);
     let consumer_identities = (0..12).map(stateless_consumer_identity).collect::<Vec<_>>();
     let mut endpoints = Vec::with_capacity(member_count);
@@ -8172,22 +8253,42 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
                 .allow_any_trusted_peer()
                 .build_authenticated_client_config()
                 .expect("stateless consumer client mTLS configuration");
-            StatelessSessionConsumerClient::new(
+            let stateless = StatelessSessionConsumerClient::new(
                 endpoints[node_index],
                 rustls_pki_types::ServerName::IpAddress(endpoints[node_index].ip().into()),
                 SpiffeId::new(spiffe_id(node_index))
                     .expect("qualification consumer server identity"),
                 scope,
                 tls,
-            )
+            );
+            match mode {
+                ConsumerQualificationMode::Stateless => {
+                    QualificationConsumerClient::Stateless(Box::new(stateless))
+                }
+                ConsumerQualificationMode::Persistent => QualificationConsumerClient::Persistent(
+                    PersistentSessionConsumerClient::try_from_stateless(
+                        stateless,
+                        PersistentSessionConsumerConfig::default(),
+                    )
+                    .expect("fixed persistent consumer configuration"),
+                ),
+            }
         })
         .collect::<Vec<_>>();
     assert_eq!(clients.len(), 12);
+    if matches!(mode, ConsumerQualificationMode::Persistent) {
+        assert!(runtime.block_on(async {
+            futures_util::future::join_all(clients.iter().map(QualificationConsumerClient::prewarm))
+                .await
+                .into_iter()
+                .all(|result| result.is_ok_and(|ready| ready))
+        }));
+    }
     assert!(runtime.block_on(async {
         futures_util::future::join_all(
             clients
                 .iter()
-                .map(StatelessSessionConsumerClient::capabilities),
+                .map(QualificationConsumerClient::capabilities),
         )
         .await
         .into_iter()
@@ -8270,7 +8371,8 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
         previous_converged = signature;
         assert!(
             Instant::now() < convergence_deadline,
-            "stateless consumer quorum did not reach a stable all-voter log head before leader loss: reports={reports:?}"
+            "{} consumer quorum did not reach a stable all-voter log head before leader loss: reports={reports:?}",
+            mode.name(),
         );
         let observation_interval = if wait_for_heartbeat {
             Duration::from_millis(
@@ -8324,7 +8426,8 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
         previous_replacement = replacement_signature;
         assert!(
             Instant::now() < leader_loss_deadline,
-            "stateless consumer quorum exceeded its bounded functional leader-recovery path: reports={reports:?}"
+            "{} consumer quorum exceeded its bounded functional leader-recovery path: reports={reports:?}",
+            mode.name(),
         );
         thread::sleep(Duration::from_millis(50));
     }
@@ -8410,7 +8513,8 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
         }
         assert!(
             Instant::now() < voter_loss_deadline,
-            "stateless consumer quorum did not recover one voter loss: reports={reports:?}"
+            "{} consumer quorum did not recover one voter loss: reports={reports:?}",
+            mode.name(),
         );
         thread::sleep(Duration::from_millis(50));
     }
@@ -8460,8 +8564,23 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
         voter_ids_after,
         vec![member_count; voter_ids_before.len() - 1]
     );
+    if matches!(mode, ConsumerQualificationMode::Persistent) {
+        runtime.block_on(async {
+            for client in &clients {
+                client.shutdown().await;
+            }
+        });
+    }
     drop(identity_sources);
     fleet.shutdown();
+}
+
+fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
+    run_consumer_multiprocess_qualification(member_count, ConsumerQualificationMode::Stateless);
+}
+
+fn run_persistent_consumer_multiprocess_qualification(member_count: usize) {
+    run_consumer_multiprocess_qualification(member_count, ConsumerQualificationMode::Persistent);
 }
 
 #[test]
@@ -8478,6 +8597,22 @@ fn five_process_projected_mtls_stateless_quorum_consumers() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     run_stateless_consumer_multiprocess_qualification(5);
+}
+
+#[test]
+fn three_process_projected_mtls_persistent_quorum_consumers() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_persistent_consumer_multiprocess_qualification(3);
+}
+
+#[test]
+fn five_process_projected_mtls_persistent_quorum_consumers() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_persistent_consumer_multiprocess_qualification(5);
 }
 
 #[test]

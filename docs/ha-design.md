@@ -431,6 +431,42 @@ This is payload-envelope encryption, not full-database encryption. Membership,
 indexes, routing fields, owners, fences, timestamps, and envelope key IDs remain
 visible unless a separate approved storage layer protects them.
 
+### Persistent consumer transport (#695)
+
+#695 extends only the existing least-authority `SessionQuorumConsumer` application
+boundary. It retains the `opc-session-consumer/1` ALPN and advances the exact
+consumer transport revision from 1 to 2. There is no fallback, dual mode, or
+mixed-revision path: clients and listeners must be drained and cut over
+coordinately. This boundary remains separate from consensus and the quarantined
+legacy backend protocol; it exposes no `RemoteSessionBackend`, consensus,
+replication, snapshot, rebuild, membership, or admin API, and does not include
+#696 atomic transition or product composition.
+
+Request connections are deliberately sequential: a nonzero connection-local
+monotonic `u32` correlation never wraps, retires after at most 4,096 calls, and
+permits only one in-flight call. This is required for cancellation/late-response
+isolation and to avoid write-position ambiguity. The fair request pool defaults
+to four connections (at most 16 configured), with 64 pending calls by default,
+256 absolutely, and a 250 ms queue wait/age limit. Two default watch slots (at
+most 16 configured) are separate from request capacity. An establishment is
+limited to 1,500 ms and at most two pre-write attempts; resolution happens only
+on establishment/re-establishment. With two attempts there is one
+between-attempt delay: the lifecycle backoff floor (50 ms by default) plus at
+most 25 ms jitter, clipped to its logical deadline. Existing 5-second idle,
+10-second operation, 16 MiB frame, 256 listener-connection, and TLS lifecycle
+bounds are retained; consumer shutdown drain is at most 5 seconds.
+
+Only `NotTransmitted` may automatically retry, with an identical request ID and
+body. A possibly written call is `OutcomeUnknown`, evicts its lane, and is never
+replayed. Prewarm/readiness proves authenticated transport capacity only, never
+quorum or product readiness. Diagnostics are fixed and nonidentifying (setup
+phase, pool wait, active/maximum/idle, reuse/reconnect,
+queue/in-flight/oldest-age, and bounded outcome class); they exclude endpoints,
+identities, scopes, credentials, keys, payloads, request/correlation IDs,
+owners, and fences. Readiness deliberately becomes false while a request lane
+is leased; isolated watch slots are non-gating. Performance evidence is
+synthetic only and makes no ePDG production-SLO claim.
+
 ### Legacy backend and restore transport (protocol v5)
 
 The opt-in `opc-session-net` protocol v5 carries validated restore-scan

@@ -1052,6 +1052,43 @@ partition, a broader restart/fault matrix, resource pressure, supported
 platforms, soak, remote HKMS, or signed release evidence; keep #164/#143 gates
 closed until those campaigns pass.
 
+### Persistent consumer transport (#695)
+
+#695 extends only the existing least-authority `SessionQuorumConsumer` boundary.
+Its mutual-TLS ALPN remains `opc-session-consumer/1`, while its exact transport
+revision advances from 1 to 2 with no fallback or dual mode. Drain consumer
+clients and listeners for one coordinated cutover; revision-1 and revision-2
+consumer peers must never coexist. This does not admit the legacy
+`RemoteSessionBackend` surface or consensus, replication, snapshot, rebuild,
+membership, or admin authority, and explicitly excludes #696 atomic transition
+and product composition.
+
+Operators should size the fixed fair client pool as four request connections by
+default (at most 16 configured), 64 pending calls by default (hard maximum
+256), and a 250 ms queue wait/age limit. Watches use two separate slots by
+default (at most 16), not request capacity. A request connection has one
+in-flight call only and uses a nonzero monotonically increasing connection-local
+`u32` correlation with no wrap and at most 4,096 sequential calls. That
+sequential contract is required to isolate cancellation and late responses and
+avoid write ambiguity. Keep the 1,500 ms setup ceiling, at most two pre-write
+establishment attempts, resolver use only during establishment or
+re-establishment, one between-attempt lifecycle backoff floor (50 ms by default)
+plus at most 25 ms jitter clipped to the logical deadline, 5-second shutdown
+drain, and the existing 5-second idle, 10-second operation, 16 MiB frame, 256
+listener-connection, and TLS lifecycle bounds.
+
+Only `NotTransmitted` may automatically retry, with the same request ID and
+body. A possibly written call is `OutcomeUnknown`: evict its lane and never
+replay it. Prewarm/readiness establishes authenticated transport capacity only;
+it is not quorum or product readiness. Emit only fixed, nonidentifying setup
+phase, pool-wait, active/maximum/idle, reuse/reconnect,
+queue/in-flight/oldest-age, and bounded-outcome diagnostics. Never expose
+endpoints, identities, scope values, credentials, keys, payloads,
+request/correlation IDs, owners, or fences. Expect capacity readiness to become
+false while any request lane is leased; isolated watch slots are non-gating.
+Any performance evidence is synthetic only and is not an ePDG production-SLO
+claim.
+
 ### Legacy direct-backend session-net v5 rollout boundary
 
 The opt-in legacy `opc-session-net` v5 surface carries cursor-paged remote

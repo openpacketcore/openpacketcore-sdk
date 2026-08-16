@@ -61,11 +61,26 @@ pub use consensus::{
     SessionConsensusServerHandle,
 };
 pub use consumer::{
-    SessionConsumerAuthorizationError, SessionConsumerAuthorizer, SessionConsumerClientError,
-    SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionQuorumConsumerServer,
-    SessionQuorumConsumerServerHandle, StatelessSessionConsumerClient,
+    PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
+    PersistentSessionConsumerConfigError, PersistentSessionConsumerDiagnostics,
+    PersistentSessionConsumerExecuteError, PersistentSessionConsumerReadiness,
+    PersistentSessionConsumerShutdownReport, SessionConsumerAuthorizationError,
+    SessionConsumerAuthorizer, SessionConsumerClientError, SessionConsumerLeaseMutationError,
+    SessionConsumerMutationError, SessionQuorumConsumerServer, SessionQuorumConsumerServerHandle,
+    StatelessSessionConsumerClient, DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+    MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
+    MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+    MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+    MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION,
     MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION, SESSION_QUORUM_CONSUMER_ALPN,
-    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+    SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 pub use error::ProtocolError;
 pub use identity::{
