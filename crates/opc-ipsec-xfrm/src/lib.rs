@@ -23,6 +23,17 @@
 //! deployment policy. [`LinuxXfrmBackend::bind_current_network_namespace`]
 //! can pin backend execution to the calling thread's already-selected network
 //! namespace without exposing its filesystem identity.
+//! Fixed-DSCP users that must recover durable state before opening external
+//! egress authority can use [`LinuxXfrmBackend::with_deferred_dscp_marking`].
+//! That constructor validates and retains configuration without loading,
+//! pinning, attaching, adopting, or changing tc/eBPF state; namespace binding,
+//! including atomic durable-store binding, preserves the same effect-free
+//! boundary. [`NamespaceBoundLinuxXfrmBackend::activate_dscp_marking`] later
+//! performs activation on that exact actor. Until success is deliverable,
+//! every DSCP-bearing SA mutation fails closed while durable recovery and
+//! unmarked operations remain available. A clean deferred rejection of a
+//! prepared durable SA returns its exact authority through
+//! [`XfrmObjectInstallRunError::into_retry_authority`].
 //!
 //! [`XfrmStagedInstall::run_and_commit_outbound_sa_policy`] issues an opaque,
 //! key-free [`InstalledOutboundSaBinding`] only after an exact ESP SA plus sole
@@ -48,21 +59,110 @@
 //! loss, `LinuxXfrmBackend::bind_current_network_namespace_with_object_recovery`
 //! authenticates and permanently leases one `XfrmObjectInstallRecoveryStore`
 //! on the namespace actor before returning any mutation-capable backend handle.
-//! `NamespaceBoundLinuxXfrmBackend::run_durable_object_install`
-//! persists intent before mutation admission and persists a definitive
-//! acquisition, definitive no-mutation, or indeterminate outcome before it
-//! returns. The consumer finalizes only after its adoption decision is durable;
-//! otherwise restart recovery removes residue solely from authenticated,
-//! epoch-current acquisition authority. Linux has no conditional SA/policy
-//! delete, so unresolved cleanup authority blocks every later cooperating
-//! actor mutation. Deployments must exclude all raw or independently stored
-//! XFRM writers in that namespace and keep the proof key in durable secret
-//! configuration. Store records retain independent keyed fingerprints of the
-//! deletion identity and complete install request, but no request identity
-//! values or key material; public diagnostics remain value-free. The leased
-//! root is trusted authoritative non-rollback storage under the documented
-//! POSIX crash model. A deployment whose storage can restore an older complete
-//! authenticated snapshot needs an external monotonic witness.
+//! `NamespaceBoundLinuxXfrmBackend::prepare_durable_object_install` persists
+//! authenticated `Prepared` truth and returns an affine, process-local
+//! [`XfrmObjectInstallAdmissionAuthority`] before any effect is admitted. The
+//! consumer first durably records poll admission, then
+//! `NamespaceBoundLinuxXfrmBackend::run_durable_object_install` consumes that
+//! exact actor-, store-, correlation-, generation-, and request-bound authority
+//! and persists `Issuing` before any possible backend mutation. Immediately
+//! beforehand, the actor witnesses the exact deletion identity and stores that
+//! presence as a durable pre-effect proof in the same record. An absence proof
+//! permits effect admission; a conflict proof admits no effect. The
+//! consumer finalizes only after its adoption decision is durable; otherwise
+//! restart recovery treats `Prepared` as authoritative no-mutation, removes
+//! residue solely from authenticated, epoch-current acquisition authority, and
+//! reconciles `Issuing`/`Indeterminate` records from their pre-effect proof
+//! plus a fresh exact readback. Linux has no conditional SA/policy delete, so
+//! an unresolved `Issuing`, `Indeterminate`, `Acquired`, or `RemovalAdmitted`
+//! record blocks every later cooperating actor mutation. Deployments must
+//! exclude all raw or independently stored XFRM writers in that namespace and
+//! keep the proof key in durable secret configuration. Store records retain
+//! independent keyed fingerprints of the deletion identity and complete install
+//! request, but no request identity values or key material; public diagnostics
+//! remain value-free. The leased root is trusted authoritative non-rollback
+//! storage under the documented POSIX crash model. A deployment whose storage
+//! can restore an older complete authenticated snapshot needs an external
+//! monotonic witness.
+//!
+//! Exact SA relocation receives the same durable, crash-recoverable boundary
+//! through a separate self-contained store family.
+//! `LinuxXfrmBackend::bind_current_network_namespace_with_sa_relocation_recovery`
+//! (or the combined object-and-relocation constructor) authenticates and
+//! permanently leases one `XfrmSaRelocationRecoveryStore` on the same
+//! namespace actor before any mutation-capable handle is returned.
+//! `NamespaceBoundLinuxXfrmBackend::prepare_sa_relocation` persists
+//! authenticated `Prepared` truth and returns an affine
+//! [`XfrmSaRelocationAdmissionAuthority`];
+//! `NamespaceBoundLinuxXfrmBackend::run_durable_sa_relocation` witnesses the
+//! old and target identities as a durable pre-effect proof, persists
+//! `Issuing`, and only then admits the single `relocate_sa` effect,
+//! publishing `Relocated`, `NoMutation`, or `Indeterminate` before returning.
+//! There is no finalize/adoption call: a terminal `Relocated` record is the
+//! durable proof that the consumer continues on the new addresses. After
+//! process loss, `NamespaceBoundLinuxXfrmBackend::recover_durable_sa_relocation`
+//! classifies unresolved records from their proof plus fresh exact readbacks
+//! and deletes only a proved owned residue through the exact target deletion
+//! identity; prepared records retire as authoritative no-mutation, terminal
+//! proof is returned idempotently, and unreadable, stale-epoch, or
+//! inconsistent records stay fail-closed. Every unresolved relocation phase,
+//! including `Prepared`, gates all later cooperating mutations in the
+//! namespace, and the install and relocation stores gate each other. Relocation
+//! records use an independent format with no compatibility path, migration
+//! bridge, or unconditional-delete escape hatch; their diagnostics remain
+//! value-free like the install boundary.
+//!
+//! A dependency-ordered group of XFRM objects receives that same durable
+//! boundary as one transaction through a third self-contained store family.
+//! `LinuxXfrmBackend::bind_current_network_namespace_with_object_roster_recovery`
+//! is the recommended constructor;
+//! `bind_current_network_namespace_with_object_sa_relocation_and_roster_recovery`
+//! binds all three families while a deployment still migrates. Either
+//! authenticates and permanently leases one `XfrmObjectRosterRecoveryStore` on
+//! the namespace actor before any mutation-capable handle is returned.
+//! `NamespaceBoundLinuxXfrmBackend::prepare_durable_object_roster` binds the
+//! complete ordered roster into one authenticated `Prepared` record before any
+//! effect: the group identity, every member's durable identity and generation,
+//! every exact install request, and one ordered keyed digest over all of them.
+//! It returns an affine [`XfrmObjectRosterAdmissionAuthority`], and
+//! `NamespaceBoundLinuxXfrmBackend::run_durable_object_roster` consumes that
+//! authority in a single actor command that applies the members in the
+//! caller-declared order, publishing each member's exact absence proof before
+//! that member's own effect and burning the roster's one writer epoch at
+//! `Prepared` to `Issuing`. The group is all-or-nothing: a pre-existing object
+//! at any member identity is authoritative no-mutation with zero effects, and a
+//! divergence after at least one acquisition reverse-compensates exactly the
+//! acquired prefix and terminates as `RolledBack`. Roster records retain only
+//! opaque group and member correlation, phases, proof codes, incarnations, the
+//! epoch, and independent proof-keyed fingerprints of each member's exact
+//! deletion identity and complete install request; no request identity value or
+//! key material is persisted or rendered. After process loss the consumer calls
+//! exactly one of
+//! `NamespaceBoundLinuxXfrmBackend::adopt_durable_object_roster`, which commits
+//! a converged `Applied` roster additively without deleting anything, or
+//! `NamespaceBoundLinuxXfrmBackend::recover_durable_object_roster`, which
+//! retires it as owned residue. That call must come before any other namespace
+//! mutation: an intervening ordinary mutation burns the writer epoch every
+//! absence proof depends on and leaves the record retained for product repair.
+//! Every unresolved roster phase gates all later cooperating mutations in the
+//! namespace and both other durable families, and an unresolved install or
+//! relocation record gates rosters. Every one of those gates is screened before
+//! the run consumes anything, so a blocked run returns its exact affine
+//! authority through `XfrmObjectRosterRunError::into_retry_authority` and
+//! succeeds later unchanged. Missing, malformed, duplicated, reordered,
+//! substituted, stale-epoch, wrong-namespace, and wrong-incarnation roster
+//! state fails closed, and handles, outcomes, errors, and diagnostics stay
+//! value-free. The leased root carries the same trusted, non-rollback storage
+//! obligation as the install boundary; because records hold fingerprints rather
+//! than values, adopting or recovering a roster requires the consumer to have
+//! durably retained every member request, including its key material. A
+//! finalized roster retains one terminal idempotence record but no unresolved
+//! cleanup authority; the next cooperating prepare or epoch advance prunes it
+//! deterministically. Automatic roster recovery of an `Absent` witness followed
+//! by a present object is valid only while the deployment excludes raw or
+//! independently stored XFRM writers from the namespace. The SDK epoch orders
+//! cooperating actor writes only, not that external fence: otherwise identical
+//! ownership is observationally ambiguous and Linux deletion is unconditional.
 //!
 //! Same-SPI successor activation uses
 //! [`NamespaceBoundLinuxXfrmBackend::apply_and_read_back_outbound_esp_counter`].
@@ -109,6 +209,14 @@ mod dscp;
 mod durable_install;
 #[cfg(unix)]
 mod durable_object;
+#[cfg(unix)]
+mod durable_relocation;
+#[cfg(unix)]
+mod durable_relocation_flow;
+#[cfg(unix)]
+mod durable_roster;
+#[cfg(unix)]
+mod durable_roster_flow;
 pub mod error;
 #[cfg(feature = "ikev2")]
 pub mod ikev2;
@@ -149,6 +257,29 @@ pub use durable_object::{
     XfrmObjectInstallRecoveryHandle, XfrmObjectInstallRecoveryStore, XfrmObjectRecoveryProofKey,
     XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES,
 };
+#[cfg(unix)]
+pub use durable_relocation::{
+    XfrmSaRelocationDurableError, XfrmSaRelocationDurablePhase,
+    XfrmSaRelocationOperationGeneration, XfrmSaRelocationOperationId,
+    XfrmSaRelocationRecoveryHandle, XfrmSaRelocationRecoveryProofKey,
+    XfrmSaRelocationRecoveryStore, XFRM_SA_RELOCATION_RECOVERY_HANDLE_BYTES,
+};
+#[cfg(unix)]
+pub use durable_relocation_flow::{XfrmSaRelocationDurableOutcome, XfrmSaRelocationRestartOutcome};
+#[cfg(unix)]
+pub use durable_roster::{
+    XfrmObjectRosterAdjacentProof, XfrmObjectRosterDurableError, XfrmObjectRosterDurablePhase,
+    XfrmObjectRosterGroupId, XfrmObjectRosterMemberPhase, XfrmObjectRosterOperationGeneration,
+    XfrmObjectRosterRecoveryHandle, XfrmObjectRosterRecoveryProofKey,
+    XfrmObjectRosterRecoveryStore, XfrmObjectRosterSweepProof, XFRM_OBJECT_ROSTER_MAX_MEMBERS,
+    XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES,
+};
+#[cfg(unix)]
+pub use durable_roster_flow::{
+    XfrmObjectRosterDurableOutcome, XfrmObjectRosterMemberDisposition,
+    XfrmObjectRosterMemberDispositions, XfrmObjectRosterMemberRequest, XfrmObjectRosterRequest,
+    XfrmObjectRosterRequestError, XfrmObjectRosterRestartOutcome,
+};
 pub use error::XfrmError;
 #[cfg(feature = "ikev2")]
 pub use ikev2::{
@@ -163,18 +294,22 @@ pub use mock::{MockOperation, MockSaRelocation, MockXfrmBackend};
 pub use model::{
     AeadAlgorithm, Algorithm, AllocateSpiRequest, AuthAlgorithm, ExactRemovePolicyRequest,
     InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig,
-    LifetimeCurrent, PolicyParameters, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest,
-    RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters, SaRelocationDirection,
-    SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector, SaReplayState, SaState,
-    SaStatistics, SpiAllocation, UdpEncap, UdpEncapError, XfrmAction, XfrmBackendKind,
-    XfrmCapability, XfrmDirection, XfrmId, XfrmLookupMark, XfrmLookupMarkError, XfrmMark, XfrmMode,
-    XfrmProbe, XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP,
+    LifetimeCurrent, PolicyParameters, QueryPolicyRequest, QuerySaRequest, RekeyPolicyRequest,
+    RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters,
+    SaRelocationDirection, SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector,
+    SaReplayState, SaState, SaStatistics, SpiAllocation, UdpEncap, UdpEncapError, XfrmAction,
+    XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmLookupMark, XfrmLookupMarkError,
+    XfrmMark, XfrmMode, XfrmProbe, XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP,
     XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA1, XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384,
     XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
 };
-#[cfg(unix)]
-pub use namespace::XfrmObjectRecoveryBindError;
 pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY};
+#[cfg(unix)]
+pub use namespace::{
+    XfrmObjectInstallAdmissionAuthority, XfrmObjectInstallRunError, XfrmObjectRecoveryBindError,
+    XfrmObjectRosterAdmissionAuthority, XfrmObjectRosterRunError,
+    XfrmSaRelocationAdmissionAuthority, XfrmSaRelocationRunError,
+};
 pub use observation::{
     EspPeerAddressFamily, EspPeerIngestTally, EspPeerObservation, EspPeerObservationEpoch,
     EspPeerObservationKey, EspPeerObservationLoss, EspPeerObservationRejection,

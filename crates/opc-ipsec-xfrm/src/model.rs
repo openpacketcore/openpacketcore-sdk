@@ -953,6 +953,101 @@ pub(crate) fn validate_sa_query(request: QuerySaRequest) -> Result<(), XfrmError
     Ok(())
 }
 
+/// Request to query one exactly identified Security Policy.
+///
+/// This mirrors the SA exact-readback authority for policies: the identity is
+/// the selector, direction, optional full-mask lookup mark, and optional XFRM
+/// interface ID. It is observation only and never authorizes a mutation.
+///
+/// Debug output is deliberately redacted because the selector contains traffic
+/// addresses and the mark carries packet-classification values.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct QueryPolicyRequest {
+    selector: XfrmSelector,
+    direction: XfrmDirection,
+    mark: Option<XfrmLookupMark>,
+    if_id: Option<u32>,
+}
+
+impl QueryPolicyRequest {
+    /// Build a policy query for an unmarked, unscoped policy.
+    #[must_use]
+    pub const fn new(selector: XfrmSelector, direction: XfrmDirection) -> Self {
+        Self {
+            selector,
+            direction,
+            mark: None,
+            if_id: None,
+        }
+    }
+
+    /// Select a policy carrying the supplied Linux XFRM lookup mark.
+    #[must_use]
+    pub const fn with_mark(mut self, mark: XfrmLookupMark) -> Self {
+        self.mark = Some(mark);
+        self
+    }
+
+    /// Select the policy carrying the supplied Linux XFRM interface ID.
+    ///
+    /// A present zero value is rejected by validation before the backend
+    /// performs an operation; use an unscoped request when no interface ID is
+    /// present.
+    #[must_use]
+    pub const fn with_if_id(mut self, if_id: u32) -> Self {
+        self.if_id = Some(if_id);
+        self
+    }
+
+    /// Select an optional Linux XFRM interface ID.
+    #[must_use]
+    pub const fn with_optional_if_id(mut self, if_id: Option<u32>) -> Self {
+        self.if_id = if_id;
+        self
+    }
+
+    /// Borrow the queried packet selector.
+    #[must_use]
+    pub fn selector(&self) -> &XfrmSelector {
+        &self.selector
+    }
+
+    /// The queried policy direction.
+    #[must_use]
+    pub const fn direction(&self) -> XfrmDirection {
+        self.direction
+    }
+
+    /// The queried lookup mark, when present.
+    #[must_use]
+    pub const fn mark(&self) -> Option<XfrmLookupMark> {
+        self.mark
+    }
+
+    /// The queried XFRM interface ID, when present.
+    #[must_use]
+    pub const fn if_id(&self) -> Option<u32> {
+        self.if_id
+    }
+}
+
+impl fmt::Debug for QueryPolicyRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("QueryPolicyRequest(<redacted>)")
+    }
+}
+
+pub(crate) fn validate_policy_query(request: &QueryPolicyRequest) -> Result<(), XfrmError> {
+    validate_exact_lookup_mark(request.mark, "policy.mark")?;
+    if request.if_id == Some(0) {
+        return Err(XfrmError::invalid_config(
+            "policy.if_id",
+            "interface identifier must be nonzero; use None when absent",
+        ));
+    }
+    Ok(())
+}
+
 /// Redaction-safe kernel state for a queried SA.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaState {

@@ -63,7 +63,7 @@ pub use health::{
     Readiness, StartupPhase,
 };
 pub use profile::{ResourceBudget, RuntimeMode, RuntimeProfile, SigintHandling};
-pub use shutdown::{DrainHook, ShutdownPhase, ShutdownToken};
+pub use shutdown::{DrainHook, ShutdownDisposition, ShutdownPhase, ShutdownToken};
 pub use supervisor::{MemoryLimiter, Supervisor};
 pub use task::{
     Criticality, RestartPolicy, RuntimeError, ShutdownPolicy, TaskError, TaskHandle, TaskKind,

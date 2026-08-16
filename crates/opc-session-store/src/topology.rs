@@ -16,6 +16,7 @@ use thiserror::Error;
 
 use crate::capability::SessionStorePlatformProfile;
 use crate::consensus::{SessionConsensusIdentity, SessionConsensusNodeId};
+use crate::readiness::PlacementResiliencePolicy;
 use crate::topology_attestation::{
     verify_topology_attestations, QuorumTopologyAttestor, TopologyAttestationAdmission,
     TopologyAttestationEvidence, TopologyAttestationPolicy, TopologyAttestationSummary,
@@ -108,6 +109,14 @@ pub enum QuorumTopologyError {
     /// An HA topology contained an even number of configured members.
     #[error("validated HA topology requires an odd member count; configured {configured}")]
     HaMemberCountMustBeOdd {
+        /// Number of configured members.
+        configured: usize,
+    },
+    /// A fixed durable quorum did not contain exactly three or five voters.
+    #[error(
+        "fixed durable quorum requires exactly three or five members; configured {configured}"
+    )]
+    FixedQuorumMemberCount {
         /// Number of configured members.
         configured: usize,
     },
@@ -470,6 +479,48 @@ pub struct QuorumReplicaDescriptor {
 
 const REPLICA_DESCRIPTOR_FINGERPRINT_DOMAIN: &[u8] =
     b"openpacketcore/session-store/quorum-replica-descriptor/v1\0";
+const FIXED_QUORUM_AUTHORITY_PROFILE_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/fixed-quorum-authority-profile/v1\0";
+const FIXED_QUORUM_POLICY_BINDING_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/fixed-quorum-placement-policy/v1\0";
+
+/// Derive the authenticated scope for one immutable fixed durable quorum.
+///
+/// Dynamic consensus identities continue to derive directly from the member
+/// descriptor fingerprints. Fixed quorum authority additionally commits both
+/// its fixed authority-profile marker and explicit placement-resilience policy
+/// under distinct domains, preventing dynamic and fixed deployments (or fixed
+/// deployments that make different resilience claims) from sharing peers,
+/// durable state, snapshots, or Openraft traffic.
+pub fn derive_fixed_durable_quorum_consensus_identity(
+    cluster_id: crate::consensus::SessionConsensusClusterId,
+    configuration_epoch: crate::consensus::SessionConsensusConfigurationEpoch,
+    member_fingerprints: &[[u8; 32]],
+    placement_policy: PlacementResiliencePolicy,
+) -> SessionConsensusIdentity {
+    let mut profile_hasher = Sha256::new();
+    profile_hasher.update(FIXED_QUORUM_AUTHORITY_PROFILE_DOMAIN);
+    profile_hasher.update([1_u8]);
+    let profile_binding: [u8; 32] = profile_hasher.finalize().into();
+    let policy_tag = match placement_policy {
+        PlacementResiliencePolicy::RequireIndependentFailureDomains => 1_u8,
+        PlacementResiliencePolicy::AllowReducedResilience => 2_u8,
+    };
+    let mut policy_hasher = Sha256::new();
+    policy_hasher.update(FIXED_QUORUM_POLICY_BINDING_DOMAIN);
+    policy_hasher.update([policy_tag]);
+    let policy_binding: [u8; 32] = policy_hasher.finalize().into();
+
+    let mut authority_components = member_fingerprints.to_vec();
+    authority_components.push(profile_binding);
+    authority_components.push(policy_binding);
+    let configuration_id = opc_consensus::derive_configuration_id(
+        cluster_id,
+        configuration_epoch,
+        &authority_components,
+    );
+    SessionConsensusIdentity::new(cluster_id, configuration_id, configuration_epoch)
+}
 
 fn update_configuration_fingerprint_field(hasher: &mut Sha256, tag: u8, value: &[u8]) {
     // Each variable-width field is independently hashed before entering the
@@ -609,6 +660,13 @@ pub enum QuorumTopologyMode {
     /// Odd membership whose platform facts were authenticated and bound to the
     /// exact consensus epoch.
     AttestedHa,
+    /// Exact fixed 3- or 5-voter durable quorum.
+    ///
+    /// This admission retains descriptor, endpoint, TLS-identity, and backing
+    /// uniqueness, but intentionally does not treat a caller-declared failure
+    /// domain as physical-placement proof. The fixed-quorum readiness API
+    /// reports placement resilience separately under an explicit policy.
+    FixedDurableQuorum,
     /// Explicit one-member lab profile; never an HA claim.
     LabSingleton,
 }
@@ -619,6 +677,7 @@ impl QuorumTopologyMode {
         match self {
             Self::ValidatedHa => "descriptor-only-lab-ha",
             Self::AttestedHa => "attested-ha",
+            Self::FixedDurableQuorum => "fixed-durable-quorum",
             Self::LabSingleton => "lab-singleton",
         }
     }
@@ -631,7 +690,9 @@ impl QuorumTopologyMode {
     /// lab singleton remains a stable single-replica profile.
     pub const fn platform_profile(self) -> SessionStorePlatformProfile {
         match self {
-            Self::ValidatedHa | Self::AttestedHa => SessionStorePlatformProfile::Unknown,
+            Self::ValidatedHa | Self::AttestedHa | Self::FixedDurableQuorum => {
+                SessionStorePlatformProfile::Unknown
+            }
             Self::LabSingleton => SessionStorePlatformProfile::SingleReplica,
         }
     }
@@ -644,6 +705,7 @@ pub struct QuorumTopologySummary {
     configured_members: usize,
     required_quorum: usize,
     local_replica_id: Option<ReplicaId>,
+    fixed_durable_placement_policy: Option<PlacementResiliencePolicy>,
     attestation: TopologyAttestationAdmission,
 }
 
@@ -667,6 +729,14 @@ impl QuorumTopologySummary {
     /// optional shape is retained for source compatibility with readiness code.
     pub fn local_replica_id(&self) -> Option<&ReplicaId> {
         self.local_replica_id.as_ref()
+    }
+
+    /// Immutable fixed-durable placement policy, when this is a fixed quorum.
+    ///
+    /// The policy describes only the physical-placement resilience claim. It
+    /// cannot alter Openraft membership, durable authority, or sequencing.
+    pub const fn fixed_durable_placement_policy(&self) -> Option<PlacementResiliencePolicy> {
+        self.fixed_durable_placement_policy
     }
 
     /// Evaluate redaction-safe wall-clock platform-fact status for diagnostics.
@@ -722,6 +792,8 @@ impl ValidatedQuorumTopology {
             config.members,
             QuorumTopologyMode::AttestedHa,
             config.consensus_identity,
+            false,
+            None,
         )?;
         let verified = verify_topology_attestations(&topology, evidence, policy, attestor, now)?;
         topology.summary.attestation = verified.admission().clone();
@@ -764,7 +836,91 @@ impl ValidatedQuorumTopology {
             members,
             QuorumTopologyMode::LabSingleton,
             Some(consensus_identity),
+            false,
+            None,
         )
+    }
+
+    /// Validate the exact fixed 3- or 5-voter durable-quorum topology.
+    ///
+    /// Logical replica IDs, endpoints, TLS identities, backing identities, and
+    /// declared failure domains must remain unique. Declared failure domains
+    /// are descriptors rather than authenticated physical facts; callers must
+    /// use the fixed-quorum readiness report to distinguish the strict
+    /// descriptor admission from independently verified physical placement.
+    pub fn try_from_fixed_durable_quorum(
+        config: QuorumTopologyConfig,
+    ) -> Result<Self, QuorumTopologyError> {
+        Self::try_from_fixed_durable_quorum_with_placement_policy(
+            config,
+            PlacementResiliencePolicy::default(),
+        )
+    }
+
+    /// Validate a fixed durable quorum under an explicit physical-placement
+    /// resilience policy.
+    ///
+    /// The default constructor requires distinct declared failure domains.
+    /// `AllowReducedResilience` admits correlation but records that explicit
+    /// reduction in the immutable topology summary. It never turns descriptor
+    /// values into authenticated physical-placement proof.
+    pub fn try_from_fixed_durable_quorum_with_placement_policy(
+        config: QuorumTopologyConfig,
+        placement_policy: PlacementResiliencePolicy,
+    ) -> Result<Self, QuorumTopologyError> {
+        validate_topology(
+            config.local_replica_id,
+            config.members,
+            QuorumTopologyMode::FixedDurableQuorum,
+            config.consensus_identity,
+            matches!(
+                placement_policy,
+                PlacementResiliencePolicy::AllowReducedResilience
+            ),
+            Some(placement_policy),
+        )
+    }
+
+    /// Validate a fixed durable quorum and authenticate its physical-placement
+    /// evidence.
+    ///
+    /// This is additive placement evidence only. Its freshness and expiry do
+    /// not change fixed durable quorum traffic authority, membership, recovery,
+    /// fencing, or sequencing; they only determine whether the separate
+    /// placement-resilience report may assert independence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_from_fixed_durable_quorum_with_authenticated_placement(
+        config: QuorumTopologyConfig,
+        placement_policy: PlacementResiliencePolicy,
+        evidence: Vec<TopologyAttestationEvidence>,
+        policy: &TopologyAttestationPolicy,
+        attestor: &dyn QuorumTopologyAttestor,
+        now: TopologyAttestationTime,
+    ) -> Result<Self, QuorumTopologyError> {
+        let mut topology =
+            Self::try_from_fixed_durable_quorum_with_placement_policy(config, placement_policy)?;
+        let verified = verify_topology_attestations(&topology, evidence, policy, attestor, now)?;
+        topology.summary.attestation = verified.admission().clone();
+        Ok(topology)
+    }
+
+    /// Authenticate replacement placement evidence for this exact immutable
+    /// fixed durable quorum.
+    ///
+    /// The returned proof can refresh only the separate placement-resilience
+    /// result. It cannot change the fixed voter set, traffic authority, or
+    /// local durable voter-store binding.
+    pub fn verify_fixed_durable_quorum_placement_evidence(
+        &self,
+        evidence: Vec<TopologyAttestationEvidence>,
+        policy: &TopologyAttestationPolicy,
+        attestor: &dyn QuorumTopologyAttestor,
+        now: TopologyAttestationTime,
+    ) -> Result<VerifiedQuorumTopologyAttestation, QuorumTopologyError> {
+        if self.summary.mode != QuorumTopologyMode::FixedDurableQuorum {
+            return Err(QuorumTopologyError::TopologyEvidenceRequiresAttestedHa);
+        }
+        verify_topology_attestations(self, evidence, policy, attestor, now)
     }
 
     /// Redaction-safe admitted shape.
@@ -817,6 +973,8 @@ impl TryFrom<QuorumTopologyConfig> for ValidatedQuorumTopology {
             config.members,
             QuorumTopologyMode::ValidatedHa,
             config.consensus_identity,
+            false,
+            None,
         )
     }
 }
@@ -826,6 +984,8 @@ fn validate_topology(
     members: Vec<QuorumReplicaDescriptor>,
     mode: QuorumTopologyMode,
     consensus_identity: Option<SessionConsensusIdentity>,
+    allow_correlated_failure_domains: bool,
+    fixed_durable_placement_policy: Option<PlacementResiliencePolicy>,
 ) -> Result<ValidatedQuorumTopology, QuorumTopologyError> {
     if members.len() > QUORUM_TOPOLOGY_MAX_MEMBERS {
         return Err(QuorumTopologyError::MemberCountTooLarge {
@@ -844,6 +1004,11 @@ fn validate_topology(
             if members.len().is_multiple_of(2) =>
         {
             return Err(QuorumTopologyError::HaMemberCountMustBeOdd {
+                configured: members.len(),
+            });
+        }
+        QuorumTopologyMode::FixedDurableQuorum if !matches!(members.len(), 3 | 5) => {
+            return Err(QuorumTopologyError::FixedQuorumMemberCount {
                 configured: members.len(),
             });
         }
@@ -880,7 +1045,9 @@ fn validate_topology(
         if !tls_identities.insert(descriptor.tls_identity.clone()) {
             return Err(QuorumTopologyError::DuplicateTlsIdentity);
         }
-        if !failure_domains.insert(descriptor.failure_domain.clone()) {
+        if !allow_correlated_failure_domains
+            && !failure_domains.insert(descriptor.failure_domain.clone())
+        {
             return Err(QuorumTopologyError::DuplicateFailureDomain);
         }
         if !backing_identities.insert(descriptor.backing_identity.clone()) {
@@ -895,12 +1062,26 @@ fn validate_topology(
             .iter()
             .map(QuorumReplicaDescriptor::configuration_fingerprint)
             .collect::<Vec<_>>();
-        let expected_configuration_id = opc_consensus::derive_configuration_id(
-            identity.cluster_id(),
-            identity.configuration_epoch(),
-            &component_fingerprints,
-        );
-        if identity.configuration_id() != expected_configuration_id {
+        let expected_identity = match (mode, fixed_durable_placement_policy) {
+            (QuorumTopologyMode::FixedDurableQuorum, Some(placement_policy)) => {
+                derive_fixed_durable_quorum_consensus_identity(
+                    identity.cluster_id(),
+                    identity.configuration_epoch(),
+                    &component_fingerprints,
+                    placement_policy,
+                )
+            }
+            _ => SessionConsensusIdentity::new(
+                identity.cluster_id(),
+                opc_consensus::derive_configuration_id(
+                    identity.cluster_id(),
+                    identity.configuration_epoch(),
+                    &component_fingerprints,
+                ),
+                identity.configuration_epoch(),
+            ),
+        };
+        if identity != expected_identity {
             return Err(QuorumTopologyError::ConsensusConfigurationIdMismatch);
         }
 
@@ -918,7 +1099,9 @@ fn validate_topology(
         }
     } else if matches!(
         mode,
-        QuorumTopologyMode::ValidatedHa | QuorumTopologyMode::AttestedHa
+        QuorumTopologyMode::ValidatedHa
+            | QuorumTopologyMode::AttestedHa
+            | QuorumTopologyMode::FixedDurableQuorum
     ) {
         return Err(QuorumTopologyError::MissingConsensusIdentity);
     }
@@ -933,6 +1116,7 @@ fn validate_topology(
             configured_members,
             required_quorum,
             local_replica_id: Some(local_replica_id),
+            fixed_durable_placement_policy,
             attestation: TopologyAttestationAdmission::descriptor_only(configuration_epoch),
         },
         members,

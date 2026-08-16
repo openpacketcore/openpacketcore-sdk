@@ -3,6 +3,7 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 
 use opc_gtpu_ebpf_common::GtpuEndpointAddress;
 pub use opc_gtpu_ebpf_common::{
@@ -377,6 +378,160 @@ pub enum CurrentEbpfGraphRecoveryOutcome {
     Partial(CurrentEbpfGraphRecoveryProgress),
 }
 
+/// Request to acquire cleanup-only recovery authority over a retained
+/// current-schema eBPF graph.
+///
+/// This is the durable-reconciliation primitive an ePDG-style consumer uses
+/// after process loss: it takes ownership of the exact retained pin graph and
+/// fences forwarding so stale PDP contexts can be read back and removed
+/// without reactivating the stale graph. Unlike
+/// [`CurrentEbpfGraphRecoveryRequest`] it never deletes the graph, and unlike
+/// ordinary device creation/resolution it never attaches or reattaches the tc
+/// forwarding hooks before cleanup is complete.
+///
+/// The pin namespace is the interface name in `device`; the configured pin
+/// root is supplied by the backend. The expected interface identity
+/// (`device`) and the configured local endpoint identity (`local_endpoint`)
+/// are both validated before any mutation. The prior-writer attestation is
+/// intentionally separate from any drain attestation: cleanup-only authority
+/// never removes the graph or its retained forwarding entries wholesale, so a
+/// drain proof is not required to acquire it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RetainedGraphCleanupRequest {
+    device: GtpDevice,
+    local_endpoint: Ipv4Addr,
+    writer_proof: CurrentEbpfGraphWriterProof,
+}
+
+impl RetainedGraphCleanupRequest {
+    /// Build a cleanup-authority request for one exact retained graph.
+    ///
+    /// `device` is the expected interface identity (name and ifindex) of the
+    /// attachment that owns the retained pin namespace. `local_endpoint` is
+    /// the configured local S2b-U IPv4 the graph is expected to record.
+    /// `writer_proof` attests that the process which previously owned the
+    /// graph has stopped.
+    #[must_use]
+    pub const fn new(
+        device: GtpDevice,
+        local_endpoint: Ipv4Addr,
+        writer_proof: CurrentEbpfGraphWriterProof,
+    ) -> Self {
+        Self {
+            device,
+            local_endpoint,
+            writer_proof,
+        }
+    }
+
+    /// Return the expected interface identity of the retained graph.
+    #[must_use]
+    pub const fn device(&self) -> &GtpDevice {
+        &self.device
+    }
+
+    /// Return the expected configured local endpoint identity.
+    #[must_use]
+    pub const fn local_endpoint(&self) -> Ipv4Addr {
+        self.local_endpoint
+    }
+
+    /// Return the prior-writer stop attestation.
+    #[must_use]
+    pub const fn writer_proof(&self) -> CurrentEbpfGraphWriterProof {
+        self.writer_proof
+    }
+}
+
+impl fmt::Debug for RetainedGraphCleanupRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetainedGraphCleanupRequest")
+            .field("device", &"<redacted-interface-identity>")
+            .field("local_endpoint", &"<redacted-local-endpoint>")
+            .field("writer_proof", &self.writer_proof)
+            .finish()
+    }
+}
+
+/// Stable reason cleanup-only recovery authority was refused.
+///
+/// Variants deliberately separate ownership/configuration conflicts,
+/// retryable indeterminate evidence, and structural repairs so a consumer can
+/// choose between retrying, failing over, or escalating to maintenance.
+/// Interface/configuration and retained pin/schema preflight refusals are
+/// established before graph mutation. A structural content refusal can follow
+/// the forwarding safety fence or exact reduction of a recoverable interrupted
+/// commit, and `IndeterminateState` can follow a partially completed fence or
+/// uncertain map operation. Callers must not infer an untouched graph from the
+/// reason alone.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetainedGraphCleanupRefusal {
+    /// The interface name no longer resolves to the expected ifindex. The
+    /// caller's expected interface identity is stale; this is a conflict, not
+    /// a retryable state.
+    InterfaceIdentityChanged,
+    /// The retained graph records a different local endpoint than the one the
+    /// caller configured. Ownership/configuration conflict; the graph belongs
+    /// to a different endpoint and is never mutated.
+    LocalEndpointMismatch,
+    /// This backend instance already manages the attachment through the
+    /// ordinary device lifecycle or an existing cleanup authority.
+    ManagedAttachment,
+    /// Another process holds the host-global lease for this pin namespace, or
+    /// a prior acquisition is still completing. Retryable once the owner
+    /// releases the namespace.
+    ActiveOwner,
+    /// The graph is not the exact current schema supported by this SDK build,
+    /// carries unsupported grouped authority, or contains stable malformed
+    /// PDP state. Structural repair (drained reprovisioning or migration) is
+    /// required. Malformed PDP state can be diagnosed after safety fencing or
+    /// exact interrupted-commit reduction.
+    NotCurrentSchema,
+    /// A pin, loaded program, or tc hook is foreign, replaced, or no longer
+    /// has the exact SDK-owned identity. Structural repair is required.
+    IdentityMismatch,
+    /// Complete, stable kernel state or mutation authority could not be
+    /// established. Retryable; the caller should re-run the exact request.
+    IndeterminateState,
+}
+
+impl RetainedGraphCleanupRefusal {
+    /// Return whether the refusal is safe to retry with the exact request.
+    ///
+    /// Retryable refusals represent transient ownership or observation races,
+    /// not conflicts or structural damage.
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        matches!(self, Self::ActiveOwner | Self::IndeterminateState)
+    }
+}
+
+/// Classified result of acquiring cleanup-only recovery authority over a
+/// retained current-schema eBPF graph.
+///
+/// `Acquired` is delivered through the supervised completion handle returned
+/// by the backend; the handle is affine and its blocking worker converges the
+/// graph state even if the observing future is dropped.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetainedGraphCleanupClassification {
+    /// Cleanup authority was acquired. Both forwarding hooks are
+    /// authoritatively absent; exact readback and removal are now permitted
+    /// while forwarding stays disabled.
+    Acquired,
+    /// No retained graph exists for the requested namespace, both reserved
+    /// hook slots are empty, and no SDK forwarding hook exists at another tc
+    /// placement. Nothing was manufactured to prove absence.
+    AlreadyAbsent,
+    /// Cleanup authority was not granted. Preflight conflicts leave the graph
+    /// untouched, but a refusal discovered during fencing or interrupted-
+    /// commit recovery can follow safe hook removal or exact map reduction.
+    /// No refusal reattaches forwarding. Callers must re-observe kernel state
+    /// before deciding whether to retry or enter structural maintenance.
+    Refused(RetainedGraphCleanupRefusal),
+}
+
 /// Explicit caller attestation required before removing a drained legacy v2
 /// eBPF pin graph.
 ///
@@ -518,9 +673,13 @@ pub struct CreateGtpDeviceRequest {
     pub name: String,
     /// Linux GTP role.
     pub role: GtpRole,
-    /// UDP address bound before passing the GTP-U socket to the kernel.
+    /// UDP address bound before passing an ordinary GTP-U socket to the
+    /// kernel. Linux recoverable creation instead uses the kernel-owned socket
+    /// profile and requires wildcard IPv4 (`0.0.0.0`).
     pub bind_address: IpAddr,
-    /// UDP port bound before passing the GTP-U socket to the kernel.
+    /// UDP port bound before passing an ordinary GTP-U socket to the kernel.
+    /// Linux recoverable creation requires the standard GTP-U port 2152 and
+    /// also reserves the kernel driver's standard GTPv0 port 3386.
     pub bind_port: u16,
     /// Optional PDP hash size. The default request uses
     /// [`DEFAULT_PDP_HASHSIZE`], mirroring libgtpnl examples.
@@ -605,8 +764,8 @@ pub enum GtpuSessionModelError {
     AttachmentMismatch,
     /// An entry's local outer address is not in the managed endpoint set.
     LocalEndpointNotManaged,
-    /// Selector-reuse evidence names the wrong device, group, or graph.
-    ReuseProofMismatch,
+    /// An opaque SDK selector admission names another device, group, or graph.
+    SelectorAdmissionMismatch,
 }
 
 impl fmt::Display for GtpuSessionModelError {
@@ -628,7 +787,7 @@ impl fmt::Display for GtpuSessionModelError {
             Self::DeviceIdentityMismatch => "grouped GTP-U device identity differs",
             Self::AttachmentMismatch => "grouped GTP-U attachment differs",
             Self::LocalEndpointNotManaged => "grouped GTP-U local endpoint is not managed",
-            Self::ReuseProofMismatch => "grouped GTP-U selector reuse proof differs",
+            Self::SelectorAdmissionMismatch => "grouped GTP-U selector admission differs",
         })
     }
 }
@@ -1282,18 +1441,24 @@ pub struct GtpuSessionSelectorReuseProof {
 }
 
 impl GtpuSessionSelectorReuseProof {
-    /// Attest that traffic for the exact retired group was fully drained.
+    /// Mint trusted traffic-drain evidence inside the SDK/backend boundary.
+    ///
+    /// A public constructor would let a caller assert a drain it did not
+    /// observe. Production issuance is therefore intentionally restricted to
+    /// the selector authority and its backend adapters.
     #[must_use]
-    pub const fn after_traffic_drain(retired_group: GtpuSessionGroup) -> Self {
+    #[allow(dead_code)] // Issued by backend-specific trusted evidence paths.
+    pub(crate) const fn after_traffic_drain(retired_group: GtpuSessionGroup) -> Self {
         Self {
             retired_group,
             evidence: GtpuSessionSelectorReuseEvidence::TrafficDrained,
         }
     }
 
-    /// Attest that an RCU grace period completed after exact group removal.
+    /// Mint trusted RCU-grace evidence inside the SDK/backend boundary.
     #[must_use]
-    pub const fn after_rcu_grace_period(retired_group: GtpuSessionGroup) -> Self {
+    #[allow(dead_code)] // Issued by backend-specific trusted evidence paths.
+    pub(crate) const fn after_rcu_grace_period(retired_group: GtpuSessionGroup) -> Self {
         Self {
             retired_group,
             evidence: GtpuSessionSelectorReuseEvidence::RcuGracePeriodElapsed,
@@ -1326,55 +1491,78 @@ impl fmt::Debug for GtpuSessionSelectorReuseProof {
     }
 }
 
-/// Provenance of selectors newly introduced by one reconciliation.
+/// Read-only classification for an explicit retired-selector reissue.
+///
+/// Fresh admission is deliberately absent from this public type: only the
+/// selector namespace authority can issue it.  `Reused` remains available to
+/// backend implementors so they can retain the exact retired-source and
+/// drain/grace validation at their dataplane boundary.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GtpuSessionSelectorProvenance {
-    /// The caller's durable registry proves every selector not already owned
-    /// by this same active group has never been published in the stable pin
-    /// namespace.
-    Fresh,
     /// Reuse after exact removal and explicit drain/grace evidence.
-    ///
-    /// The proof's one retired graph must cover every desired selector not
-    /// retained from the active base generation.
     Reused(GtpuSessionSelectorReuseProof),
 }
 
 /// Complete request for grouped-session convergence.
 ///
-/// Selector provenance is mandatory because the bounded dataplane journal
-/// does not retain permanent selector tombstones. A backend rejects reused or
-/// historically indeterminate selectors as
-/// [`GtpuSessionGroupIndeterminateReason::GraceUnproven`] unless the request
-/// carries exact source-bound completion evidence.
-#[derive(Clone, PartialEq, Eq)]
+/// An opaque SDK-issued selector admission is mandatory because the bounded
+/// dataplane journal does not retain permanent selector tombstones.  The
+/// admission is affine: constructing this request consumes it, binding this
+/// operation to one stable device namespace, exact group, selector set, and
+/// SDK-minted generation.
 pub struct GtpuSessionGroupReconcileRequest {
     desired: GtpuSessionGroup,
-    selector_provenance: GtpuSessionSelectorProvenance,
+    selector_admission: crate::GtpuSessionSelectorAdmission,
+    selector_provenance: Option<GtpuSessionSelectorProvenance>,
 }
 
 impl GtpuSessionGroupReconcileRequest {
-    /// Construct a request with an explicit selector-history claim.
+    /// Construct a request with an SDK-issued selector namespace admission.
     ///
     /// # Errors
     ///
-    /// Reuse proof for the same group or another device is rejected before a
-    /// backend can inspect or mutate dataplane state.
-    pub fn new(
+    /// An admission bound to another device, group, or complete selector set
+    /// is rejected before a backend can inspect or mutate dataplane state.
+    pub(crate) fn new(
         desired: GtpuSessionGroup,
-        selector_provenance: GtpuSessionSelectorProvenance,
+        selector_admission: crate::GtpuSessionSelectorAdmission,
     ) -> Result<Self, GtpuSessionModelError> {
-        if let GtpuSessionSelectorProvenance::Reused(proof) = &selector_provenance {
-            if proof.retired_group.device_id != desired.device_id
-                || proof.retired_group.id == desired.id
-            {
-                return Err(GtpuSessionModelError::ReuseProofMismatch);
-            }
+        if !selector_admission.validates(&desired)
+            || !selector_admission.authorizes_install_effect()
+            || selector_admission.is_retired_reissue()
+        {
+            return Err(GtpuSessionModelError::SelectorAdmissionMismatch);
         }
         Ok(Self {
             desired,
-            selector_provenance,
+            selector_admission,
+            selector_provenance: None,
+        })
+    }
+
+    /// Construct an explicitly retired-selector reissue request.
+    ///
+    /// The opaque admission must have been issued by the authority's distinct
+    /// retired-reissue path.  Backends must continue to prove that the exact
+    /// old source is absent and that the stated drain/grace condition holds.
+    pub(crate) fn new_reused(
+        desired: GtpuSessionGroup,
+        selector_admission: crate::GtpuSessionSelectorAdmission,
+        reuse: GtpuSessionSelectorReuseProof,
+    ) -> Result<Self, GtpuSessionModelError> {
+        if !selector_admission.validates(&desired)
+            || !selector_admission.authorizes_install_effect()
+            || !selector_admission.is_retired_reissue()
+            || reuse.retired_group.device_id != desired.device_id
+            || reuse.retired_group.id == desired.id
+        {
+            return Err(GtpuSessionModelError::SelectorAdmissionMismatch);
+        }
+        Ok(Self {
+            desired,
+            selector_admission,
+            selector_provenance: Some(GtpuSessionSelectorProvenance::Reused(reuse)),
         })
     }
 
@@ -1384,16 +1572,37 @@ impl GtpuSessionGroupReconcileRequest {
         &self.desired
     }
 
-    /// Explicit freshness or reuse evidence for introduced selectors.
+    /// Return the opaque immutable backend binding carried by this SDK-issued
+    /// effect request. This exposes no selector material or admission secret.
     #[must_use]
-    pub const fn selector_provenance(&self) -> &GtpuSessionSelectorProvenance {
-        &self.selector_provenance
+    pub const fn selector_backend_binding(&self) -> crate::GtpuSessionSelectorBackendBinding {
+        self.selector_admission.binding()
     }
 
-    /// Consume the request without discarding mandatory selector provenance.
+    pub(crate) const fn selector_admission(&self) -> &crate::GtpuSessionSelectorAdmission {
+        &self.selector_admission
+    }
+
+    /// Explicit retired-selector evidence, if this is a reissue request.
     #[must_use]
-    pub fn into_parts(self) -> (GtpuSessionGroup, GtpuSessionSelectorProvenance) {
-        (self.desired, self.selector_provenance)
+    pub const fn selector_provenance(&self) -> Option<&GtpuSessionSelectorProvenance> {
+        self.selector_provenance.as_ref()
+    }
+
+    /// Consume the request without discarding mandatory selector admission.
+    #[must_use]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        GtpuSessionGroup,
+        crate::GtpuSessionSelectorAdmission,
+        Option<GtpuSessionSelectorProvenance>,
+    ) {
+        (
+            self.desired,
+            self.selector_admission,
+            self.selector_provenance,
+        )
     }
 }
 
@@ -1405,6 +1614,7 @@ impl fmt::Debug for GtpuSessionGroupReconcileRequest {
                 &GtpuSessionGroupSelector::new(self.desired.id, self.desired.device_id),
             )
             .field("semantic_graph", &"<redacted>")
+            .field("selector_admission", &self.selector_admission)
             .field("selector_provenance", &self.selector_provenance)
             .finish()
     }
@@ -1849,6 +2059,24 @@ pub enum PdpContextInstallOutcome {
     Indeterminate(PdpContextIndeterminateReason),
 }
 
+/// Structural reason an exact PDP-context removal was refused before any
+/// mutation.
+///
+/// These outcomes are fail-closed and deliberately distinct from the
+/// retryable [`PdpContextIndeterminateReason`]s: retrying the identical
+/// request cannot succeed until the underlying structural condition is
+/// repaired (for example, by reprovisioning the durable descriptor against
+/// the current device identity). Values are never carried.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PdpContextRepairReason {
+    /// The expected GTP device identity no longer matches the durable
+    /// descriptor: its name, ifindex, or kernel-bound incarnation changed (the
+    /// device was replaced, renamed, or removed). The resident state was left
+    /// untouched and the descriptor must be reprovisioned.
+    DeviceIdentityChanged,
+}
+
 /// Classified result of exact PDP-context removal.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1861,6 +2089,578 @@ pub enum PdpContextRemovalOutcome {
     Conflict(PdpContextConflict),
     /// Exact ownership or the final mutation state could not be proven.
     Indeterminate(PdpContextIndeterminateReason),
+    /// A structural precondition failed closed before any mutation; retrying
+    /// the identical request cannot succeed without repair.
+    RepairRequired(PdpContextRepairReason),
+}
+
+/// Opaque, non-reusable identity of one Linux GTP device incarnation.
+///
+/// Callers must generate this identity with a cryptographically secure random
+/// number generator before creating the device, durably persist it with every
+/// recovery descriptor for that device, and never reuse it for another device
+/// incarnation. The all-zero value is reserved so omitted or uninitialized
+/// identity cannot silently authorize recovery.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PdpDeviceIncarnation([u8; 16]);
+
+impl PdpDeviceIncarnation {
+    /// Decode a persisted device-incarnation identity.
+    ///
+    /// Returns `None` for the reserved all-zero value.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 16]) -> Option<Self> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            None
+        } else {
+            Some(Self(bytes))
+        }
+    }
+
+    /// Return the exact fixed-width representation for durable persistence.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for PdpDeviceIncarnation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PdpDeviceIncarnation(<redacted>)")
+    }
+}
+
+/// Explicit caller attestation that the process which previously owned a
+/// durable Linux kernel-GTP device and its PDP state has stopped.
+///
+/// Supplying this value authorizes restart recovery over an exact PDP
+/// context and identity acquisition of a retained device. It never bypasses
+/// device-identity, dual-selector, or cross-process authority validation; it
+/// only records the caller's assertion that the prior writer is gone and its
+/// durable descriptors may be reconciled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PdpRestartRecoveryProof {
+    _private: (),
+}
+
+impl PdpRestartRecoveryProof {
+    /// Attest that the prior writer of the durable PDP descriptor is stopped.
+    #[must_use]
+    pub const fn previous_writer_stopped() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Request to acquire exact restart-recovery authority over one durable Linux
+/// kernel-GTP PDP context.
+///
+/// This is the durable-reconciliation primitive an ePDG-style consumer uses
+/// after process loss: the kernel-GTP PDP context (and the GTP device that
+/// owns it) survive the writer, and the consumer must prove either exact
+/// removal or exact absence of the descriptor before protocol egress. The
+/// request binds the complete expected identity — the device identity
+/// (`device`), its non-reusable incarnation (`incarnation`), and both selector
+/// axes and full context (`expected`) — so a resident context is only ever
+/// removed when it matches exactly.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PdpRestartRecoveryRequest {
+    device: GtpDevice,
+    incarnation: PdpDeviceIncarnation,
+    expected: GtpPdpContext,
+    writer_proof: PdpRestartRecoveryProof,
+}
+
+impl PdpRestartRecoveryRequest {
+    /// Build a restart-recovery request for one exact durable PDP context.
+    ///
+    /// `device` is the expected GTP device identity (name and ifindex) that
+    /// the durable descriptor records. `incarnation` is the cryptographically
+    /// unpredictable, durably persisted identity minted before that device was
+    /// created and never reused. `expected` is the complete expected PDP
+    /// context (both selector axes and every identity field). `writer_proof`
+    /// attests that the prior writer has stopped.
+    #[must_use]
+    pub const fn new(
+        device: GtpDevice,
+        incarnation: PdpDeviceIncarnation,
+        expected: GtpPdpContext,
+        writer_proof: PdpRestartRecoveryProof,
+    ) -> Self {
+        Self {
+            device,
+            incarnation,
+            expected,
+            writer_proof,
+        }
+    }
+
+    /// Return the expected GTP device identity of the durable context.
+    #[must_use]
+    pub const fn device(&self) -> &GtpDevice {
+        &self.device
+    }
+
+    /// Return the non-reusable identity of the expected device incarnation.
+    #[must_use]
+    pub const fn incarnation(&self) -> PdpDeviceIncarnation {
+        self.incarnation
+    }
+
+    /// Return the complete expected PDP context identity.
+    #[must_use]
+    pub const fn expected(&self) -> &GtpPdpContext {
+        &self.expected
+    }
+
+    /// Return the prior-writer stop attestation.
+    #[must_use]
+    pub const fn writer_proof(&self) -> PdpRestartRecoveryProof {
+        self.writer_proof
+    }
+}
+
+impl fmt::Debug for PdpRestartRecoveryRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PdpRestartRecoveryRequest")
+            .field("device", &"<redacted-device-identity>")
+            .field("incarnation", &"<redacted-device-incarnation>")
+            .field("expected", &"<redacted-pdp-context>")
+            .field("writer_proof", &self.writer_proof)
+            .finish()
+    }
+}
+
+/// Explicit caller attestation that the caller is the current cooperating
+/// live writer of a durable Linux kernel-GTP device and its PDP state.
+///
+/// Supplying this value authorizes live-writer exact removal over an exact PDP
+/// context while the writer remains live and continues to own the mutation
+/// namespace. Unlike [`PdpRestartRecoveryProof`], it never asserts that a
+/// prior writer stopped, so it is the only honest authority for same-process
+/// session replacement. It never bypasses recovery-root binding, device
+/// identity, dual-selector, incarnation, or writer-lease validation. It records
+/// the caller's assertion and binds it to the backend's exact recovery root and
+/// network-namespace identity for revalidation before mutation. The
+/// restart-recovery authority remains strict and distinct; acquiring this proof
+/// does not weaken it.
+///
+/// A proof is issued only by a backend's attestation boundary. It is affine:
+/// callers must move the proof into exactly one removal request, and cannot
+/// duplicate or manufacture it through the public API.
+///
+/// ```compile_fail
+/// # use opc_gtpu_dataplane::PdpLiveWriterProof;
+/// fn cannot_clone(proof: PdpLiveWriterProof) -> PdpLiveWriterProof {
+///     proof.clone()
+/// }
+/// ```
+#[must_use = "carry the live-writer proof into exactly one removal request"]
+pub struct PdpLiveWriterProof {
+    recovery_root: PathBuf,
+    namespace: PdpLiveWriterNamespaceIdentity,
+}
+
+impl PdpLiveWriterProof {
+    pub(crate) fn bound_to(
+        recovery_root: PathBuf,
+        namespace: PdpLiveWriterNamespaceIdentity,
+    ) -> Self {
+        Self {
+            recovery_root,
+            namespace,
+        }
+    }
+
+    pub(crate) fn matches(
+        &self,
+        recovery_root: &Path,
+        namespace: PdpLiveWriterNamespaceIdentity,
+    ) -> bool {
+        self.recovery_root == recovery_root && self.namespace == namespace
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        recovery_root: PathBuf,
+        namespace: PdpLiveWriterNamespaceIdentity,
+    ) -> Self {
+        Self::bound_to(recovery_root, namespace)
+    }
+}
+
+/// Exact identity of the network namespace in which a live-writer proof was
+/// acquired. Linux derives this from `/proc/thread-self/ns/net` metadata.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PdpLiveWriterNamespaceIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl PdpLiveWriterNamespaceIdentity {
+    pub(crate) const fn from_dev_ino(device: u64, inode: u64) -> Self {
+        Self { device, inode }
+    }
+}
+
+impl fmt::Debug for PdpLiveWriterProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PdpLiveWriterProof")
+            .field("recovery_root", &"<redacted-recovery-root>")
+            .field("namespace", &"<redacted-network-namespace>")
+            .finish()
+    }
+}
+
+/// Request to remove one exact Linux kernel-GTP PDP context under the
+/// authority of the current cooperating live writer.
+///
+/// This is the same-process replacement primitive an ePDG-style consumer uses
+/// while it remains the live writer: a subscriber-session replacement must
+/// remove the prior session's kernel-GTP PDP context with exact authority
+/// before the replacement dataplane can be proven converged, and the
+/// cooperating writer is still live, so the prior-writer stop attestation
+/// required by [`PdpRestartRecoveryRequest`] would be false. The request
+/// binds the complete expected identity — the device identity (`device`), its
+/// non-reusable incarnation (`incarnation`), and both selector axes and full
+/// context (`expected`) — so a resident context is only ever removed when it
+/// matches exactly. The durable PDP recovery root must already be bound, and
+/// the removal serializes under the same topology and per-device writer
+/// gates as every other cooperating mutation.
+///
+/// ```compile_fail
+/// # use opc_gtpu_dataplane::PdpLiveWriterRemovalRequest;
+/// fn cannot_clone(request: PdpLiveWriterRemovalRequest) -> PdpLiveWriterRemovalRequest {
+///     request.clone()
+/// }
+/// ```
+pub struct PdpLiveWriterRemovalRequest {
+    device: GtpDevice,
+    incarnation: PdpDeviceIncarnation,
+    expected: GtpPdpContext,
+    writer_proof: PdpLiveWriterProof,
+}
+
+impl PdpLiveWriterRemovalRequest {
+    /// Build a live-writer exact-removal request for one exact PDP context.
+    ///
+    /// `device` is the expected GTP device identity (name and ifindex) of the
+    /// live writer's device. `incarnation` is the cryptographically
+    /// unpredictable, durably persisted identity minted before that device
+    /// was created and never reused. `expected` is the complete expected PDP
+    /// context (both selector axes and every identity field). `writer_proof`
+    /// attests that the caller is the current cooperating writer.
+    #[must_use]
+    pub const fn new(
+        device: GtpDevice,
+        incarnation: PdpDeviceIncarnation,
+        expected: GtpPdpContext,
+        writer_proof: PdpLiveWriterProof,
+    ) -> Self {
+        Self {
+            device,
+            incarnation,
+            expected,
+            writer_proof,
+        }
+    }
+
+    /// Return the expected GTP device identity of the live writer's device.
+    #[must_use]
+    pub const fn device(&self) -> &GtpDevice {
+        &self.device
+    }
+
+    /// Return the non-reusable identity of the expected device incarnation.
+    #[must_use]
+    pub const fn incarnation(&self) -> PdpDeviceIncarnation {
+        self.incarnation
+    }
+
+    /// Return the complete expected PDP context identity.
+    #[must_use]
+    pub const fn expected(&self) -> &GtpPdpContext {
+        &self.expected
+    }
+
+    /// Return the live-writer ownership attestation.
+    #[must_use = "inspect the affine live-writer proof reference"]
+    pub const fn writer_proof(&self) -> &PdpLiveWriterProof {
+        &self.writer_proof
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        GtpDevice,
+        PdpDeviceIncarnation,
+        GtpPdpContext,
+        PdpLiveWriterProof,
+    ) {
+        (
+            self.device,
+            self.incarnation,
+            self.expected,
+            self.writer_proof,
+        )
+    }
+}
+
+impl fmt::Debug for PdpLiveWriterRemovalRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PdpLiveWriterRemovalRequest")
+            .field("device", &"<redacted-device-identity>")
+            .field("incarnation", &"<redacted-device-incarnation>")
+            .field("expected", &"<redacted-pdp-context>")
+            .field("writer_proof", &self.writer_proof)
+            .finish()
+    }
+}
+
+/// Request to acquire the identity of one retained Linux kernel-GTP device
+/// after its previous writer stopped.
+///
+/// This is the identity-bearing, mutation-free companion of
+/// [`PdpRestartRecoveryRequest`]: an ePDG-style consumer that restarts after
+/// process loss may hold a durable record of a shared recoverable device that
+/// was created but never admitted a PDP effect. Before choosing between
+/// serving reuse and fresh creation, the consumer must learn whether the
+/// exact device identity survived without reading, installing, or deleting
+/// any PDP context and without mutating the device. The request binds the
+/// durable device name (`name`), its non-reusable incarnation
+/// (`incarnation`), the optional exact ifindex already committed by an active
+/// record (`expected_ifindex`), and the prior-writer stop attestation
+/// (`writer_proof`). A prepared record intentionally has no expected ifindex:
+/// successful acquisition returns the exact live [`GtpDevice`] so the caller
+/// can durably complete that record.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RetainedDeviceIdentityRequest {
+    name: String,
+    expected_ifindex: Option<u32>,
+    incarnation: PdpDeviceIncarnation,
+    writer_proof: PdpRestartRecoveryProof,
+}
+
+impl RetainedDeviceIdentityRequest {
+    /// Build an identity-acquisition request for one retained device.
+    ///
+    /// `name` and `incarnation` must have been durably committed before device
+    /// creation. `expected_ifindex` is `None` for a prepared record whose
+    /// create result was never durably published, and `Some` only when the
+    /// exact returned ifindex was committed. `writer_proof` attests that the
+    /// prior writer has stopped.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        expected_ifindex: Option<u32>,
+        incarnation: PdpDeviceIncarnation,
+        writer_proof: PdpRestartRecoveryProof,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            expected_ifindex,
+            incarnation,
+            writer_proof,
+        }
+    }
+
+    /// Return the durable expected device name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Return the exact durably recorded ifindex, when publication completed.
+    #[must_use]
+    pub const fn expected_ifindex(&self) -> Option<u32> {
+        self.expected_ifindex
+    }
+
+    /// Return the non-reusable identity of the expected device incarnation.
+    #[must_use]
+    pub const fn incarnation(&self) -> PdpDeviceIncarnation {
+        self.incarnation
+    }
+
+    /// Return the prior-writer stop attestation.
+    #[must_use]
+    pub const fn writer_proof(&self) -> PdpRestartRecoveryProof {
+        self.writer_proof
+    }
+}
+
+impl fmt::Debug for RetainedDeviceIdentityRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetainedDeviceIdentityRequest")
+            .field("name", &"<redacted-device-name>")
+            .field(
+                "expected_ifindex",
+                &self.expected_ifindex.map(|_| "<redacted-device-ifindex>"),
+            )
+            .field("incarnation", &"<redacted-device-incarnation>")
+            .field("writer_proof", &self.writer_proof)
+            .finish()
+    }
+}
+
+/// Structural reason a retained-device identity conflicts with the expected
+/// identity.
+///
+/// These outcomes are fail-closed and deliberately distinct from the
+/// retryable [`RetainedDeviceIndeterminateReason`]s and from the structural
+/// [`RetainedDeviceRepairReason`]s: a live, readable link occupies the
+/// expected identity slot but is provably not the expected incarnation.
+/// Values are never carried.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetainedDeviceConflictReason {
+    /// The expected name is occupied by a link with a different ifindex, or
+    /// the expected name and ifindex are occupied by a link whose
+    /// kernel-bound `IFLA_IFALIAS` identity differs from the expected
+    /// incarnation (including foreign or malformed alias content). The live
+    /// state was left untouched; the durable record must be reconciled
+    /// against the replacement identity.
+    ReplacementIdentity,
+}
+
+/// Stable reason a retained-device identity acquisition could not prove a
+/// final state.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetainedDeviceIndeterminateReason {
+    /// Topology or per-device writer authority is held by a concurrent
+    /// cooperating writer; retry the identical request.
+    AuthorityUnavailable,
+}
+
+/// Structural reason a retained-device identity acquisition failed closed
+/// even though a link matching the expected name and ifindex exists.
+///
+/// These outcomes are fail-closed and deliberately distinct from the
+/// retryable [`RetainedDeviceIndeterminateReason`]s: retrying the identical
+/// request cannot succeed until the underlying structural condition is
+/// repaired (for example, by removing the unpublished link and creating a
+/// fresh recoverable device). Values are never carried.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetainedDeviceRepairReason {
+    /// The live link matching the expected name and ifindex carries no
+    /// incarnation stamp in `IFLA_IFALIAS`: it was never published as a
+    /// recoverable device, so ownership cannot be proven.
+    Unstamped,
+}
+
+/// Classified result of an identity-bearing retained-device acquisition.
+///
+/// The acquisition is mutation-free: no device or PDP context is created,
+/// read, installed, renamed, or removed on any path. Every variant is
+/// value-free so diagnostics cannot carry device identity, incarnation,
+/// endpoint, TEID, packet, or descriptor values.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetainedDeviceIdentityOutcome {
+    /// The expected name, ifindex, and kernel-bound incarnation were all
+    /// proven live under writer authority. The retained device may be reused
+    /// as-is; no mutation occurred.
+    Retained,
+    /// The expected name was proven authoritatively absent under writer
+    /// authority. The durable record did not survive as a live device; one
+    /// fresh `create_recoverable_device` call with a newly minted incarnation
+    /// is the supported next step. No mutation occurred.
+    Absent,
+    /// Live state conflicts with the expected identity and was left
+    /// untouched.
+    Conflict(RetainedDeviceConflictReason),
+    /// The acquisition could not be completed; a retry of the identical
+    /// request may succeed.
+    Indeterminate(RetainedDeviceIndeterminateReason),
+    /// A structural precondition failed closed before any classification
+    /// could authorize reuse; retrying the identical request cannot succeed
+    /// without repair.
+    RepairRequired(RetainedDeviceRepairReason),
+}
+
+/// Completed retained-device identity acquisition.
+///
+/// [`Self::outcome`] is always a typed, value-free classification. When that
+/// classification is [`RetainedDeviceIdentityOutcome::Retained`],
+/// [`Self::retained_device`] and [`Self::into_retained_device`] return the
+/// exact live [`GtpDevice`] proven under writer authority. Every other
+/// classification carries no device. Diagnostics redact the returned device
+/// identity.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RetainedDeviceIdentityAcquisition {
+    outcome: RetainedDeviceIdentityOutcome,
+    retained_device: Option<GtpDevice>,
+}
+
+impl RetainedDeviceIdentityAcquisition {
+    pub(crate) fn retained(device: GtpDevice) -> Self {
+        Self {
+            outcome: RetainedDeviceIdentityOutcome::Retained,
+            retained_device: Some(device),
+        }
+    }
+
+    pub(crate) const fn absent() -> Self {
+        Self {
+            outcome: RetainedDeviceIdentityOutcome::Absent,
+            retained_device: None,
+        }
+    }
+
+    pub(crate) const fn conflict(reason: RetainedDeviceConflictReason) -> Self {
+        Self {
+            outcome: RetainedDeviceIdentityOutcome::Conflict(reason),
+            retained_device: None,
+        }
+    }
+
+    pub(crate) const fn indeterminate(reason: RetainedDeviceIndeterminateReason) -> Self {
+        Self {
+            outcome: RetainedDeviceIdentityOutcome::Indeterminate(reason),
+            retained_device: None,
+        }
+    }
+
+    pub(crate) const fn repair_required(reason: RetainedDeviceRepairReason) -> Self {
+        Self {
+            outcome: RetainedDeviceIdentityOutcome::RepairRequired(reason),
+            retained_device: None,
+        }
+    }
+
+    /// Return the stable, value-free identity classification.
+    #[must_use]
+    pub const fn outcome(&self) -> RetainedDeviceIdentityOutcome {
+        self.outcome
+    }
+
+    /// Borrow the exact retained device proven on a `Retained` outcome.
+    #[must_use]
+    pub const fn retained_device(&self) -> Option<&GtpDevice> {
+        self.retained_device.as_ref()
+    }
+
+    /// Consume the acquisition and return the exact proven retained device.
+    #[must_use]
+    pub fn into_retained_device(self) -> Option<GtpDevice> {
+        self.retained_device
+    }
+}
+
+impl fmt::Debug for RetainedDeviceIdentityAcquisition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetainedDeviceIdentityAcquisition")
+            .field("outcome", &self.outcome)
+            .field(
+                "retained_device",
+                &self
+                    .retained_device
+                    .as_ref()
+                    .map(|_| "<redacted-device-identity>"),
+            )
+            .finish()
+    }
 }
 
 /// Capabilities of the explicit PDP-context reconciliation contract.
@@ -2498,6 +3298,224 @@ mod tests {
     }
 
     #[test]
+    fn pdp_device_incarnation_rejects_zero() {
+        assert_eq!(PdpDeviceIncarnation::from_bytes([0; 16]), None);
+    }
+
+    #[test]
+    fn pdp_device_incarnation_round_trips_persisted_bytes() {
+        let bytes = [0xa5; 16];
+        let incarnation = PdpDeviceIncarnation::from_bytes(bytes).unwrap();
+
+        assert_eq!(incarnation.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn pdp_device_incarnation_debug_is_redacted() {
+        let incarnation = PdpDeviceIncarnation::from_bytes([0xa5; 16]).unwrap();
+
+        assert_eq!(
+            format!("{incarnation:?}"),
+            "PdpDeviceIncarnation(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn pdp_restart_recovery_request_binds_incarnation_and_redacts_identity() {
+        let device = GtpDevice {
+            name: "tenant-sensitive-gtp".to_string(),
+            ifindex: 41,
+        };
+        let incarnation = PdpDeviceIncarnation::from_bytes([0xa5; 16]).unwrap();
+        let expected = reconciliation_context();
+        let writer_proof = PdpRestartRecoveryProof::previous_writer_stopped();
+        let request = PdpRestartRecoveryRequest::new(
+            device.clone(),
+            incarnation,
+            expected.clone(),
+            writer_proof,
+        );
+
+        assert_eq!(request.device(), &device);
+        assert_eq!(request.incarnation(), incarnation);
+        assert_eq!(request.expected(), &expected);
+        assert_eq!(request.writer_proof(), writer_proof);
+
+        let debug = format!("{request:?}");
+        for sensitive in [
+            "tenant-sensitive-gtp",
+            "/var/lib/opc/recovery",
+            "10.23.0.2",
+            "192.0.2.10",
+            "12345678",
+            "87654321",
+            "[165, 165",
+        ] {
+            assert!(!debug.contains(sensitive));
+        }
+        assert!(debug.contains("<redacted-device-incarnation>"));
+    }
+
+    #[test]
+    fn pdp_live_writer_removal_request_binds_incarnation_and_redacts_identity() {
+        let device = GtpDevice {
+            name: "tenant-sensitive-gtp".to_string(),
+            ifindex: 41,
+        };
+        let incarnation = PdpDeviceIncarnation::from_bytes([0x5a; 16]).unwrap();
+        let expected = reconciliation_context();
+        let writer_proof = PdpLiveWriterProof::for_test(
+            PathBuf::from("/var/lib/opc/recovery"),
+            PdpLiveWriterNamespaceIdentity::from_dev_ino(7, 11),
+        );
+        let request = PdpLiveWriterRemovalRequest::new(
+            device.clone(),
+            incarnation,
+            expected.clone(),
+            writer_proof,
+        );
+
+        assert_eq!(request.device(), &device);
+        assert_eq!(request.incarnation(), incarnation);
+        assert_eq!(request.expected(), &expected);
+        assert!(format!("{:?}", request.writer_proof()).contains("PdpLiveWriterProof"));
+
+        let debug = format!("{request:?}");
+        for sensitive in [
+            "tenant-sensitive-gtp",
+            "10.23.0.2",
+            "192.0.2.10",
+            "12345678",
+            "87654321",
+            "[90, 90",
+        ] {
+            assert!(
+                !debug.contains(sensitive),
+                "request debug leaked {sensitive}: {debug}"
+            );
+        }
+        assert!(debug.contains("<redacted-device-identity>"));
+        assert!(debug.contains("<redacted-device-incarnation>"));
+        assert!(debug.contains("<redacted-pdp-context>"));
+    }
+
+    #[test]
+    fn retained_device_identity_request_binds_identity_and_redacts_values() {
+        let device = GtpDevice {
+            name: "tenant-sensitive-gtp".to_string(),
+            ifindex: 41,
+        };
+        let incarnation = PdpDeviceIncarnation::from_bytes([0xa5; 16]).unwrap();
+        let writer_proof = PdpRestartRecoveryProof::previous_writer_stopped();
+        let request = RetainedDeviceIdentityRequest::new(
+            device.name.clone(),
+            Some(device.ifindex),
+            incarnation,
+            writer_proof,
+        );
+
+        assert_eq!(request.name(), device.name);
+        assert_eq!(request.expected_ifindex(), Some(device.ifindex));
+        assert_eq!(request.incarnation(), incarnation);
+        assert_eq!(request.writer_proof(), writer_proof);
+
+        let prepared = RetainedDeviceIdentityRequest::new(
+            device.name.clone(),
+            None,
+            incarnation,
+            writer_proof,
+        );
+        assert_eq!(prepared.name(), device.name);
+        assert_eq!(prepared.expected_ifindex(), None);
+
+        let debug = format!("{request:?}");
+        for sensitive in ["tenant-sensitive-gtp", "41", "[165, 165"] {
+            assert!(
+                !debug.contains(sensitive),
+                "request debug leaked {sensitive}: {debug}"
+            );
+        }
+        assert!(debug.contains("<redacted-device-name>"));
+        assert!(debug.contains("<redacted-device-ifindex>"));
+        assert!(debug.contains("<redacted-device-incarnation>"));
+    }
+
+    #[test]
+    fn retained_device_identity_acquisition_returns_device_only_for_retained() {
+        let device = GtpDevice {
+            name: "tenant-sensitive-gtp".to_string(),
+            ifindex: 41,
+        };
+        let acquisition = RetainedDeviceIdentityAcquisition::retained(device.clone());
+
+        assert_eq!(
+            acquisition.outcome(),
+            RetainedDeviceIdentityOutcome::Retained
+        );
+        assert_eq!(acquisition.retained_device(), Some(&device));
+        assert_eq!(
+            acquisition.clone().into_retained_device(),
+            Some(device.clone())
+        );
+        let debug = format!("{acquisition:?}");
+        for sensitive in ["tenant-sensitive-gtp", "41"] {
+            assert!(
+                !debug.contains(sensitive),
+                "acquisition debug leaked {sensitive}: {debug}"
+            );
+        }
+        assert!(debug.contains("<redacted-device-identity>"));
+
+        let absent = RetainedDeviceIdentityAcquisition::absent();
+        assert_eq!(absent.outcome(), RetainedDeviceIdentityOutcome::Absent);
+        assert_eq!(absent.retained_device(), None);
+        assert_eq!(absent.into_retained_device(), None);
+    }
+
+    #[test]
+    fn retained_device_identity_outcomes_are_value_free_and_structurally_distinct() {
+        let retained = RetainedDeviceIdentityOutcome::Retained;
+        let absent = RetainedDeviceIdentityOutcome::Absent;
+        let conflict = RetainedDeviceIdentityOutcome::Conflict(
+            RetainedDeviceConflictReason::ReplacementIdentity,
+        );
+        let indeterminate = RetainedDeviceIdentityOutcome::Indeterminate(
+            RetainedDeviceIndeterminateReason::AuthorityUnavailable,
+        );
+        let repair =
+            RetainedDeviceIdentityOutcome::RepairRequired(RetainedDeviceRepairReason::Unstamped);
+
+        // Every classification is pairwise distinct: no structural, conflict,
+        // or absent state can collapse into transient authority unavailability.
+        let outcomes = [retained, absent, conflict, indeterminate, repair];
+        for (i, lhs) in outcomes.iter().enumerate() {
+            for rhs in &outcomes[i + 1..] {
+                assert_ne!(lhs, rhs);
+            }
+        }
+
+        // Reasons are copyable, hashable, and redaction-safe by
+        // construction: their debug carries no device identity or
+        // incarnation values.
+        let copied = RetainedDeviceConflictReason::ReplacementIdentity;
+        assert_eq!(conflict, RetainedDeviceIdentityOutcome::Conflict(copied));
+        for rendered in [
+            format!("{retained:?}"),
+            format!("{absent:?}"),
+            format!("{conflict:?}"),
+            format!("{indeterminate:?}"),
+            format!("{repair:?}"),
+        ] {
+            for sensitive in ["tenant-sensitive-gtp", "41", "a5a5"] {
+                assert!(
+                    !rendered.contains(sensitive),
+                    "outcome debug leaked {sensitive}: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn current_graph_recovery_request_is_typed_and_redacts_deployment_identity() {
         let request = CurrentEbpfGraphRecoveryRequest::new(
             "tenant-sensitive-pin",
@@ -2691,53 +3709,18 @@ mod tests {
             group.entries().to_vec(),
         )
         .unwrap();
-        let reuse_proof = GtpuSessionSelectorReuseProof::after_rcu_grace_period(group.clone());
-        let reconcile = GtpuSessionGroupReconcileRequest::new(
-            desired.clone(),
-            GtpuSessionSelectorProvenance::Reused(reuse_proof),
-        )
-        .unwrap();
+        let namespace = crate::selector_namespace::TestGtpuSessionSelectorNamespaceAuthority::new(
+            crate::InMemoryGtpuSessionSelectorNamespaceStore::default(),
+            [0x53; 32],
+            32,
+        );
+        let admission = namespace.claim(&desired, None).unwrap();
+        let reconcile = GtpuSessionGroupReconcileRequest::new(desired.clone(), admission).unwrap();
         assert_eq!(reconcile.desired(), &desired);
         assert!(matches!(
-            reconcile.selector_provenance(),
-            GtpuSessionSelectorProvenance::Reused(proof)
-                if proof.retired_group() == &group
-                    && proof.evidence()
-                        == GtpuSessionSelectorReuseEvidence::RcuGracePeriodElapsed
+            namespace.claim(&desired, None),
+            Err(crate::GtpuSessionSelectorNamespaceError::GroupClaimed)
         ));
-        let (round_trip_desired, round_trip_provenance) = reconcile.clone().into_parts();
-        assert_eq!(round_trip_desired, desired);
-        assert_eq!(
-            round_trip_provenance,
-            reconcile.selector_provenance().clone()
-        );
-        let parts_debug = format!("{round_trip_desired:?} {round_trip_provenance:?}");
-        for secret in ["10.23.0.2", "2001:db8", "gtp0", "ifindex", "[1, 1"] {
-            assert!(!parts_debug.contains(secret));
-        }
-        let same_group_proof = GtpuSessionSelectorReuseProof::after_traffic_drain(desired.clone());
-        assert_eq!(
-            GtpuSessionGroupReconcileRequest::new(
-                desired.clone(),
-                GtpuSessionSelectorProvenance::Reused(same_group_proof),
-            ),
-            Err(GtpuSessionModelError::ReuseProofMismatch)
-        );
-        let other_device_source = GtpuSessionGroup::new(
-            GtpuSessionGroupId::new([4; 16]).unwrap(),
-            GtpuSessionDeviceId::new([9; 16]).unwrap(),
-            group.entries().to_vec(),
-        )
-        .unwrap();
-        assert_eq!(
-            GtpuSessionGroupReconcileRequest::new(
-                desired,
-                GtpuSessionSelectorProvenance::Reused(
-                    GtpuSessionSelectorReuseProof::after_traffic_drain(other_device_source,),
-                ),
-            ),
-            Err(GtpuSessionModelError::ReuseProofMismatch)
-        );
         let debug = format!("{reconcile:?}");
         for secret in ["10.23.0.2", "2001:db8", "gtp0", "ifindex", "[1, 1"] {
             assert!(!debug.contains(secret));

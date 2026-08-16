@@ -136,9 +136,19 @@ control-plane stack.
   `Gtpv2cDecodeError` end to end, or its member identity will vanish with no
   compile error.
 
-  Declared residual: the non-`ProcedureAware` S2b receive branches still select
-  the clause 7.7.8 discard from a type allowlist rather than from a resolved
-  per-IE profile.
+  The clause 7.7.8 malformed-optional-IE discard is keyed on resolved presence,
+  not IE type: the profiled receiver resolves
+  `(procedure, direction, scope, ie_type, instance)` from the receive grammar
+  and discards a malformed IE only where its slot is presence-O (Tables
+  7.2.1-1, 7.2.2-1, 7.2.3-1, 7.2.3-2, 7.2.9.1-1, 7.2.9.2-1), at every
+  validation level. The exact S2b rows include Create Session Request ePDG IP
+  Address and Node Identifier, Create Session Response APCO, and Delete Session
+  Sender F-TEID. Bearer TFT, PCO and Failed Bearer Context entries are the
+  issue-requested cross-interface compatibility rows already admitted by the
+  receive grammar; their table conditions name S4/S11 or S5/S8/S11, not S2b.
+  Mandatory, Conditional, unlisted and unresolvable slots fail closed; the
+  profile-less sequence decoders and the canonical builder always fail closed.
+  See CONFORMANCE.md for the full contract.
 - `inspect_gtpv2c_request` and `Gtpv2cErrorResponsePlanner` form a separate
   zero-allocation error boundary. Inspection retains only a reply-safe fixed
   header envelope; planning returns either an explicit standards-required

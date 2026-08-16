@@ -506,7 +506,8 @@ pub struct S2bCreateBearerResponse<'a> {
     pub message_priority: Option<MessagePriority>,
     /// Message-level acceptance, partial acceptance, or rejection Cause.
     pub cause: CauseValue,
-    /// One result for every request Bearer Context.
+    /// One result for every request Bearer Context, or an empty list for a
+    /// cause-only whole-message rejection per TS 29.274 clause 6.1.1.
     pub bearer_contexts: Vec<S2bCreateBearerResult<'a>>,
     /// Other conditional or extension top-level IEs retained in order.
     pub additional_ies: Vec<TypedIe<'a>>,
@@ -1479,7 +1480,16 @@ fn project_create_bearer_response<'a>(
         ));
     }
 
-    let contexts = bearer_contexts(&view.ies)?;
+    // TS 29.274 clause 6.1.1 overrides the table-level mandatory presence
+    // rule when the message-level Cause rejects the request: the response may
+    // contain only that Cause. If Bearer Contexts are present, validate every
+    // one normally; accepted and partially accepted responses still require
+    // at least one context.
+    let contexts = if message_cause.is_rejection() {
+        optional_bearer_contexts(&view.ies)?
+    } else {
+        bearer_contexts(&view.ies)?
+    };
     let mut projected = Vec::with_capacity(contexts.len());
     let mut response_ebis = Vec::with_capacity(contexts.len());
     let mut correlation_keys = Vec::with_capacity(contexts.len());
@@ -2288,7 +2298,9 @@ pub fn s2b_delete_bearer_response(
 ///
 /// Correlation uses the PGW F-TEID copied from request instance 4 into
 /// response instance 9, as required by Table 7.2.4-2. Each request context
-/// and response context must participate exactly once.
+/// and response context must participate exactly once, except that a
+/// cause-only whole-message rejection has no response contexts per clause
+/// 6.1.1.
 ///
 /// # Errors
 ///
@@ -2301,6 +2313,9 @@ pub fn correlate_create_bearer_response(
         return Err(DedicatedBearerError::message(
             DedicatedBearerErrorKind::CorrelationMismatch,
         ));
+    }
+    if response.cause.is_rejection() && response.bearer_contexts.is_empty() {
+        return Ok(());
     }
     if request.bearer_contexts.len() != response.bearer_contexts.len() {
         return Err(DedicatedBearerError::message(

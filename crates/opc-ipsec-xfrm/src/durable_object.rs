@@ -49,14 +49,17 @@ pub const XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES: usize = 208;
 const RECORD_BODY_BYTES: usize = 176;
 const AUTH_TAG_BYTES: usize = 32;
 const RECORD_MAGIC: [u8; 8] = *b"OPCXOBJ1";
-const RECORD_VERSION: u16 = 1;
+const RECORD_VERSION: u16 = 2;
 const RECORD_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-record-v1\0";
 const INSTALL_REQUEST_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-install-request-v1\0";
+const DELETION_IDENTITY_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-deletion-identity-v1\0";
+const NAMESPACE_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-namespace-v1\0";
 const CONTROL_BYTES: usize = 128;
 const CONTROL_BODY_BYTES: usize = CONTROL_BYTES - AUTH_TAG_BYTES;
 const CONTROL_MAGIC: [u8; 8] = *b"OPCXCTL1";
 const CONTROL_AUTH_DOMAIN: &[u8] = b"opc-xfrm-object-control-v1\0";
 const CONTROL_NAME: &str = "control";
+const TEMPORARY_PREFIX: &str = ".opc-xfrm-object-pending-";
 const EPOCH_BYTES: usize = 80;
 const EPOCH_BODY_BYTES: usize = EPOCH_BYTES - AUTH_TAG_BYTES;
 const EPOCH_MAGIC: [u8; 8] = *b"OPCXEPC1";
@@ -68,9 +71,9 @@ const FILE_MODE: u32 = 0o600;
 const DIRECTORY_MODE: u32 = 0o700;
 const CREATE_ATTEMPTS: usize = 8;
 
-type HmacSha256 = ZeroizingHmacSha256;
+pub(crate) type HmacSha256 = ZeroizingHmacSha256;
 
-struct ZeroizingHmacSha256 {
+pub(crate) struct ZeroizingHmacSha256 {
     inner: Sha256,
     outer_pad: Zeroizing<[u8; 64]>,
 }
@@ -92,11 +95,11 @@ impl ZeroizingHmacSha256 {
         Self { inner, outer_pad }
     }
 
-    fn update(&mut self, bytes: &[u8]) {
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
         self.inner.update(bytes);
     }
 
-    fn finalize(self) -> Zeroizing<[u8; AUTH_TAG_BYTES]> {
+    pub(crate) fn finalize(self) -> Zeroizing<[u8; AUTH_TAG_BYTES]> {
         let mut inner_digest = self.inner.finalize();
         let mut outer = Sha256::new();
         outer.update(self.outer_pad.as_slice());
@@ -108,6 +111,54 @@ impl ZeroizingHmacSha256 {
         digest.as_mut_slice().zeroize();
         output
     }
+}
+
+/// Borrow-scoped view of one durable family's secret proof-key bytes.
+///
+/// Every durable record family owns a distinct zeroizing proof-key newtype.
+/// The canonical encoders below are shared across those families, so they take
+/// this borrow instead of a concrete key type. The borrow is the point: the
+/// secret is never copied out of its owning newtype, so each family keeps its
+/// own `Drop`-time zeroization discipline.
+#[derive(Clone, Copy)]
+pub(crate) struct CanonicalMacKey<'a>(&'a [u8; AUTH_TAG_BYTES]);
+
+impl<'a> CanonicalMacKey<'a> {
+    /// Borrow a proof-key newtype's secret bytes for canonical encoding.
+    ///
+    /// Call this only from a proof-key newtype's own accessor so the borrow
+    /// cannot outlive the key it observes.
+    pub(crate) const fn new(bytes: &'a [u8; AUTH_TAG_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    /// Start a keyed MAC already bound to one family-specific domain.
+    ///
+    /// The domain separator is unconditionally absorbed first, so no caller can
+    /// produce a domain-free tag by forgetting it.
+    pub(crate) fn begin(self, domain: &[u8]) -> HmacSha256 {
+        let mut mac = HmacSha256::new(self.0);
+        mac.update(domain);
+        mac
+    }
+}
+
+impl fmt::Debug for CanonicalMacKey<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CanonicalMacKey(<redacted>)")
+    }
+}
+
+/// Value-free failure of a shared canonical encoder.
+///
+/// Each durable family maps this into its own public error enum so no family
+/// leaks another family's diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalEncodeError {
+    /// A variable-length field exceeds the bounded canonical encoding.
+    CapacityExceeded,
+    /// The request cannot produce an exact canonical identity.
+    Malformed,
 }
 
 /// Secret proof key used to authenticate staged-object recovery state.
@@ -129,8 +180,9 @@ impl XfrmObjectRecoveryProofKey {
         Ok(Self(bytes))
     }
 
-    fn bytes(&self) -> &[u8; AUTH_TAG_BYTES] {
-        &self.0
+    /// Borrow this key for the shared canonical encoders.
+    pub(crate) const fn canonical_mac_key(&self) -> CanonicalMacKey<'_> {
+        CanonicalMacKey::new(&self.0)
     }
 }
 
@@ -239,7 +291,7 @@ pub enum XfrmObjectInstallDurablePhase {
     Issuing,
     /// Linux acknowledged that this operation acquired the object.
     Acquired,
-    /// An explicit create-exclusive collision proved no mutation.
+    /// A pre-effect conflict or create-exclusive collision proved no mutation.
     NoMutation,
     /// The backend result cannot safely prove ownership or absence.
     Indeterminate,
@@ -301,11 +353,69 @@ impl XfrmObjectInstallDurablePhase {
                 | (Self::Issuing, Self::Acquired)
                 | (Self::Issuing, Self::NoMutation)
                 | (Self::Issuing, Self::Indeterminate)
+                | (Self::Issuing, Self::RemovalAdmitted)
+                | (Self::Indeterminate, Self::NoMutation)
+                | (Self::Indeterminate, Self::RemovalAdmitted)
                 | (Self::Acquired, Self::RemovalAdmitted)
                 | (Self::Acquired, Self::Committed)
                 | (Self::NoMutation, Self::Retired)
                 | (Self::RemovalAdmitted, Self::Retired)
         )
+    }
+}
+
+/// Durable pre-effect proof witnessed before possible backend install
+/// admission.
+///
+/// Immediately before the `Prepared -> Issuing` transition, the namespace
+/// actor performs an exact readback of the deletion identity and embeds the
+/// observed presence in the record. After process loss, combining this proof
+/// with a fresh exact readback distinguishes a provably-owned residue from a
+/// foreign or absent object without relying on retained intent alone.
+///
+/// This type is crate-internal: it never appears in a public signature and is
+/// only observable through the recovery outcome it authorizes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum XfrmObjectInstallPreEffectProof {
+    /// The exact deletion identity was absent immediately before possible
+    /// effect admission.
+    Absent = 1,
+    /// The exact deletion identity was already present, so the install effect
+    /// was not admitted.
+    Conflict = 2,
+}
+
+impl XfrmObjectInstallPreEffectProof {
+    /// Stable, value-free proof label.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Conflict => "conflict",
+        }
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            Self::Absent => 1,
+            Self::Conflict => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self, XfrmObjectInstallDurableError> {
+        match code {
+            1 => Ok(Self::Absent),
+            2 => Ok(Self::Conflict),
+            _ => Err(XfrmObjectInstallDurableError::Malformed),
+        }
+    }
+}
+
+impl fmt::Debug for XfrmObjectInstallPreEffectProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("XfrmObjectInstallPreEffectProof")
+            .field(&self.as_str())
+            .finish()
     }
 }
 
@@ -414,6 +524,7 @@ impl Error for XfrmObjectInstallDurableError {}
 pub(crate) struct DurableObjectRecord {
     pub(crate) phase: XfrmObjectInstallDurablePhase,
     pub(crate) object: XfrmInstallObject,
+    pub(crate) pre_effect_proof: Option<XfrmObjectInstallPreEffectProof>,
     pub(crate) store_incarnation: [u8; 16],
     pub(crate) namespace_seal: [u8; 32],
     pub(crate) actor_incarnation: [u8; 16],
@@ -465,6 +576,7 @@ impl DurableObjectRecord {
             XfrmInstallObject::Sa => 1,
             XfrmInstallObject::Policy => 2,
         };
+        encoded[12] = self.pre_effect_proof.map_or(0, |proof| proof.code());
         encoded[16..32].copy_from_slice(&self.store_incarnation);
         encoded[32..64].copy_from_slice(&self.namespace_seal);
         encoded[64..80].copy_from_slice(&self.actor_incarnation);
@@ -473,7 +585,7 @@ impl DurableObjectRecord {
         encoded[104..112].copy_from_slice(&self.writer_epoch.get().to_be_bytes());
         encoded[112..144].copy_from_slice(&self.deletion_identity_fingerprint);
         encoded[144..176].copy_from_slice(&self.install_request_fingerprint);
-        let tag = authenticate(key, &encoded[..RECORD_BODY_BYTES])?;
+        let tag = authenticate(key, &encoded[..RECORD_BODY_BYTES]);
         encoded[RECORD_BODY_BYTES..].copy_from_slice(&tag);
         Ok(encoded)
     }
@@ -484,10 +596,14 @@ impl DurableObjectRecord {
     ) -> Result<Self, XfrmObjectInstallDurableError> {
         if encoded[0..8] != RECORD_MAGIC
             || encoded[8..10] != RECORD_VERSION.to_be_bytes()
-            || encoded[12..16] != [0_u8; 4]
+            || encoded[13..16] != [0_u8; 3]
         {
             return Err(XfrmObjectInstallDurableError::Malformed);
         }
+        let pre_effect_proof = match encoded[12] {
+            0 => None,
+            code => Some(XfrmObjectInstallPreEffectProof::from_code(code)?),
+        };
         verify_authentication(
             key,
             &encoded[..RECORD_BODY_BYTES],
@@ -501,6 +617,7 @@ impl DurableObjectRecord {
         let record = Self {
             phase: XfrmObjectInstallDurablePhase::from_code(encoded[10])?,
             object,
+            pre_effect_proof,
             store_incarnation: array_at(encoded, 16),
             namespace_seal: array_at(encoded, 32),
             actor_incarnation: array_at(encoded, 64),
@@ -539,6 +656,26 @@ fn validate_record(record: &DurableObjectRecord) -> Result<(), XfrmObjectInstall
     {
         return Err(XfrmObjectInstallDurableError::Malformed);
     }
+    // The pre-effect proof is witnessed exactly at the `Prepared -> Issuing`
+    // transition and preserved by every subsequent transition. A `Prepared`
+    // record therefore never carries a proof, every effect-possible or
+    // terminal-effect phase must carry one, and a `Retired` record may or may
+    // not depending on whether it retired through an effect-possible phase.
+    let proof_required = matches!(
+        record.phase,
+        XfrmObjectInstallDurablePhase::Issuing
+            | XfrmObjectInstallDurablePhase::Acquired
+            | XfrmObjectInstallDurablePhase::NoMutation
+            | XfrmObjectInstallDurablePhase::Indeterminate
+            | XfrmObjectInstallDurablePhase::RemovalAdmitted
+            | XfrmObjectInstallDurablePhase::Committed
+    );
+    let proof_forbidden = record.phase == XfrmObjectInstallDurablePhase::Prepared;
+    if (proof_required && record.pre_effect_proof.is_none())
+        || (proof_forbidden && record.pre_effect_proof.is_some())
+    {
+        return Err(XfrmObjectInstallDurableError::Malformed);
+    }
     Ok(())
 }
 
@@ -560,22 +697,19 @@ fn record_matches_fingerprints(
     )
 }
 
-fn authenticate(
-    key: &XfrmObjectRecoveryProofKey,
-    body: &[u8],
-) -> Result<[u8; AUTH_TAG_BYTES], XfrmObjectInstallDurableError> {
-    authenticate_domain(key, RECORD_AUTH_DOMAIN, body)
+fn authenticate(key: &XfrmObjectRecoveryProofKey, body: &[u8]) -> [u8; AUTH_TAG_BYTES] {
+    authenticate_domain(key.canonical_mac_key(), RECORD_AUTH_DOMAIN, body)
 }
 
-fn authenticate_domain(
-    key: &XfrmObjectRecoveryProofKey,
+/// Compute the domain-separated keyed tag over one canonical body.
+pub(crate) fn authenticate_domain(
+    key: CanonicalMacKey<'_>,
     domain: &[u8],
     body: &[u8],
-) -> Result<[u8; AUTH_TAG_BYTES], XfrmObjectInstallDurableError> {
-    let mut mac = HmacSha256::new(key.bytes());
-    mac.update(domain);
+) -> [u8; AUTH_TAG_BYTES] {
+    let mut mac = key.begin(domain);
     mac.update(body);
-    Ok(*mac.finalize())
+    *mac.finalize()
 }
 
 fn verify_authentication(
@@ -583,23 +717,27 @@ fn verify_authentication(
     body: &[u8],
     tag: &[u8],
 ) -> Result<(), XfrmObjectInstallDurableError> {
-    verify_authentication_domain(key, RECORD_AUTH_DOMAIN, body, tag)
-}
-
-fn verify_authentication_domain(
-    key: &XfrmObjectRecoveryProofKey,
-    domain: &[u8],
-    body: &[u8],
-    tag: &[u8],
-) -> Result<(), XfrmObjectInstallDurableError> {
-    let mut mac = HmacSha256::new(key.bytes());
-    mac.update(domain);
-    mac.update(body);
-    if bool::from(mac.finalize().as_slice().ct_eq(tag)) {
+    if verify_authentication_domain(key.canonical_mac_key(), RECORD_AUTH_DOMAIN, body, tag) {
         Ok(())
     } else {
         Err(XfrmObjectInstallDurableError::AuthenticationFailed)
     }
+}
+
+/// Report whether a tag matches the domain-separated keyed tag of one body.
+///
+/// The comparison is constant time. Callers map `false` into their own family's
+/// authentication failure so no family leaks another family's diagnostics.
+#[must_use]
+pub(crate) fn verify_authentication_domain(
+    key: CanonicalMacKey<'_>,
+    domain: &[u8],
+    body: &[u8],
+    tag: &[u8],
+) -> bool {
+    let mut mac = key.begin(domain);
+    mac.update(body);
+    bool::from(mac.finalize().as_slice().ct_eq(tag))
 }
 
 fn array_at<const N: usize>(bytes: &[u8], start: usize) -> [u8; N] {
@@ -683,7 +821,11 @@ impl ControlRecord {
         encoded[64..80].copy_from_slice(&self.actor_incarnation);
         encoded[80..88].copy_from_slice(&self.root_device.to_be_bytes());
         encoded[88..96].copy_from_slice(&self.root_inode.to_be_bytes());
-        let tag = authenticate_domain(key, CONTROL_AUTH_DOMAIN, &encoded[..CONTROL_BODY_BYTES])?;
+        let tag = authenticate_domain(
+            key.canonical_mac_key(),
+            CONTROL_AUTH_DOMAIN,
+            &encoded[..CONTROL_BODY_BYTES],
+        );
         encoded[CONTROL_BODY_BYTES..].copy_from_slice(&tag);
         Ok(encoded)
     }
@@ -698,12 +840,14 @@ impl ControlRecord {
         {
             return Err(XfrmObjectInstallDurableError::Malformed);
         }
-        verify_authentication_domain(
-            key,
+        if !verify_authentication_domain(
+            key.canonical_mac_key(),
             CONTROL_AUTH_DOMAIN,
             &encoded[..CONTROL_BODY_BYTES],
             &encoded[CONTROL_BODY_BYTES..],
-        )?;
+        ) {
+            return Err(XfrmObjectInstallDurableError::AuthenticationFailed);
+        }
         let control = Self {
             store_incarnation: array_at(encoded, 16),
             namespace_seal: array_at(encoded, 32),
@@ -739,7 +883,11 @@ impl EpochRecord {
         encoded[8..10].copy_from_slice(&RECORD_VERSION.to_be_bytes());
         encoded[16..32].copy_from_slice(&self.store_incarnation);
         encoded[32..40].copy_from_slice(&self.epoch.get().to_be_bytes());
-        let tag = authenticate_domain(key, EPOCH_AUTH_DOMAIN, &encoded[..EPOCH_BODY_BYTES])?;
+        let tag = authenticate_domain(
+            key.canonical_mac_key(),
+            EPOCH_AUTH_DOMAIN,
+            &encoded[..EPOCH_BODY_BYTES],
+        );
         encoded[EPOCH_BODY_BYTES..].copy_from_slice(&tag);
         Ok(encoded)
     }
@@ -755,12 +903,14 @@ impl EpochRecord {
         {
             return Err(XfrmObjectInstallDurableError::Malformed);
         }
-        verify_authentication_domain(
-            key,
+        if !verify_authentication_domain(
+            key.canonical_mac_key(),
             EPOCH_AUTH_DOMAIN,
             &encoded[..EPOCH_BODY_BYTES],
             &encoded[EPOCH_BODY_BYTES..],
-        )?;
+        ) {
+            return Err(XfrmObjectInstallDurableError::AuthenticationFailed);
+        }
         let store_incarnation = array_at(encoded, 16);
         let epoch =
             NonZeroU64::new(u64_at(encoded, 32)).ok_or(XfrmObjectInstallDurableError::Malformed)?;
@@ -789,11 +939,13 @@ type NamedDurableRecord = (String, DurableObjectRecord);
 type ReconciledOperationRecords = (Vec<NamedDurableRecord>, Vec<String>);
 
 impl Inventory {
-    fn has_unresolved_cleanup_authority(&self) -> bool {
+    fn has_unresolved_writer_authority(&self) -> bool {
         self.records.iter().any(|(_, record)| {
             matches!(
                 record.phase,
-                XfrmObjectInstallDurablePhase::Acquired
+                XfrmObjectInstallDurablePhase::Issuing
+                    | XfrmObjectInstallDurablePhase::Indeterminate
+                    | XfrmObjectInstallDurablePhase::Acquired
                     | XfrmObjectInstallDurablePhase::RemovalAdmitted
             )
         })
@@ -858,7 +1010,7 @@ impl XfrmObjectInstallRecoveryStore {
         // prior process died after mkdir but before its parent fsync.
         sync_store_root_parent(path, &descriptor)?;
 
-        let namespace_seal = namespace_seal(&proof_key, namespace_binding)?;
+        let namespace_seal = namespace_seal(&proof_key, namespace_binding);
         let owner_process_id = std::process::id();
         let mut inner = StoreInner {
             visible_path: path.to_path_buf(),
@@ -890,9 +1042,9 @@ impl XfrmObjectInstallRecoveryStore {
     /// The fingerprints must be independent opaque, proof-keyed digests of
     /// the exact kernel deletion identity and complete install request. A
     /// duplicate active deletion identity is rejected globally. Any unresolved
-    /// `Acquired` or `RemovalAdmitted` authority blocks preparation so consumer
-    /// bookkeeping/recovery remains ordered before every later cooperating
-    /// writer.
+    /// `Issuing`, `Indeterminate`, `Acquired`, or `RemovalAdmitted` authority
+    /// blocks preparation so consumer bookkeeping/recovery remains ordered
+    /// before every later cooperating writer.
     pub(crate) fn prepare(
         &self,
         operation_id: XfrmObjectInstallOperationId,
@@ -905,7 +1057,7 @@ impl XfrmObjectInstallRecoveryStore {
         if lease.prune_terminal_records(&inventory)? {
             inventory = lease.inventory()?;
         }
-        if inventory.has_unresolved_cleanup_authority() {
+        if inventory.has_unresolved_writer_authority() {
             return Err(XfrmObjectInstallDurableError::InvalidTransition);
         }
         if inventory.records.len() >= MAX_ACTIVE_RECORDS {
@@ -932,6 +1084,7 @@ impl XfrmObjectInstallRecoveryStore {
         let record = DurableObjectRecord {
             phase: XfrmObjectInstallDurablePhase::Prepared,
             object,
+            pre_effect_proof: None,
             store_incarnation: lease.store.control.store_incarnation,
             namespace_seal: lease.store.control.namespace_seal,
             actor_incarnation: lease.store.control.actor_incarnation,
@@ -955,14 +1108,17 @@ impl XfrmObjectInstallRecoveryStore {
         validate_exact_lookup_mark(removal.lookup_mark(), "durable_object.install.mark")
             .map_err(|_| XfrmObjectInstallDurableError::NonExactRemovalIdentity)?;
         let lease = self.lease()?;
-        let mut canonical = Zeroizing::new([0_u8; 64]);
-        let length = encode_deletion_identity(&removal, request.policy_if_id(), &mut canonical)?;
-        let deletion_identity = authenticate_domain(
-            &lease.store.proof_key,
-            b"opc-xfrm-object-deletion-identity-v1\0",
-            &canonical[..length],
-        )?;
-        let install_request = authenticate_install_request(&lease.store.proof_key, request)?;
+        let key = lease.store.proof_key.canonical_mac_key();
+        let deletion_identity = authenticate_deletion_identity(
+            key,
+            DELETION_IDENTITY_AUTH_DOMAIN,
+            &removal,
+            request.policy_if_id(),
+        )
+        .map_err(map_canonical_encode_error)?;
+        let install_request =
+            authenticate_install_request(key, INSTALL_REQUEST_AUTH_DOMAIN, request)
+                .map_err(map_canonical_encode_error)?;
         Ok(DurableObjectFingerprints {
             deletion_identity,
             install_request,
@@ -978,13 +1134,13 @@ impl XfrmObjectInstallRecoveryStore {
         validate_exact_lookup_mark(removal.lookup_mark(), "durable_object.install.mark")
             .map_err(|_| XfrmObjectInstallDurableError::NonExactRemovalIdentity)?;
         let lease = self.lease()?;
-        let mut canonical = Zeroizing::new([0_u8; 64]);
-        let length = encode_deletion_identity(removal, policy_if_id, &mut canonical)?;
-        authenticate_domain(
-            &lease.store.proof_key,
-            b"opc-xfrm-object-deletion-identity-v1\0",
-            &canonical[..length],
+        authenticate_deletion_identity(
+            lease.store.proof_key.canonical_mac_key(),
+            DELETION_IDENTITY_AUTH_DOMAIN,
+            removal,
+            policy_if_id,
         )
+        .map_err(map_canonical_encode_error)
     }
 
     /// Inspect the authenticated current phase for a retained handle.
@@ -1070,16 +1226,26 @@ impl XfrmObjectInstallRecoveryStore {
     /// directory synchronization.
     ///
     /// Entering `Issuing` burns a fresh global writer epoch before the new
-    /// phase is published. `Acquired` already excludes every cooperating
-    /// writer, so `RemovalAdmitted` is published at that same current epoch;
-    /// this avoids an ambiguous half-advanced epoch crash cut before deletion.
+    /// phase is published, and it is the sole transition that consumes a
+    /// pre-effect proof: `pre_effect_proof` must be `Some` exactly for
+    /// `Prepared -> Issuing` and `None` for every other transition, which
+    /// preserves the current record's proof. `Acquired` already excludes every
+    /// cooperating writer, so `RemovalAdmitted` is published at that same
+    /// current epoch; this avoids an ambiguous half-advanced epoch crash cut
+    /// before deletion.
     pub(crate) fn transition(
         &self,
         handle: &XfrmObjectInstallRecoveryHandle,
         expected: XfrmObjectInstallDurablePhase,
         next: XfrmObjectInstallDurablePhase,
+        pre_effect_proof: Option<XfrmObjectInstallPreEffectProof>,
     ) -> Result<DurableObjectRecord, XfrmObjectInstallDurableError> {
         if !expected.permits(next) {
+            return Err(XfrmObjectInstallDurableError::InvalidTransition);
+        }
+        let entering_issuing = expected == XfrmObjectInstallDurablePhase::Prepared
+            && next == XfrmObjectInstallDurablePhase::Issuing;
+        if entering_issuing != pre_effect_proof.is_some() {
             return Err(XfrmObjectInstallDurableError::InvalidTransition);
         }
         let lease = self.lease()?;
@@ -1089,7 +1255,7 @@ impl XfrmObjectInstallRecoveryStore {
             return Err(XfrmObjectInstallDurableError::InvalidTransition);
         }
         if next == XfrmObjectInstallDurablePhase::Issuing
-            && inventory.has_unresolved_cleanup_authority()
+            && inventory.has_unresolved_writer_authority()
         {
             return Err(XfrmObjectInstallDurableError::InvalidTransition);
         }
@@ -1110,6 +1276,11 @@ impl XfrmObjectInstallRecoveryStore {
         let next_record = DurableObjectRecord {
             phase: next,
             writer_epoch,
+            pre_effect_proof: if entering_issuing {
+                pre_effect_proof
+            } else {
+                current.pre_effect_proof
+            },
             ..current.clone()
         };
         lease.publish_record(&next_record)?;
@@ -1117,19 +1288,43 @@ impl XfrmObjectInstallRecoveryStore {
         Ok(next_record)
     }
 
+    /// Report whether any record keeps the writer gate closed, without
+    /// mutating the store.
+    ///
+    /// The namespace actor uses this predicate for the cross-family
+    /// cooperating-writer gate: an unresolved `Issuing`, `Indeterminate`,
+    /// `Acquired`, or `RemovalAdmitted` record fences every cooperating SA
+    /// relocation admission until it is finalized or recovered.
+    pub(crate) fn has_unresolved_writer_authority(
+        &self,
+    ) -> Result<bool, XfrmObjectInstallDurableError> {
+        let lease = self.lease()?;
+        let inventory = lease.inventory()?;
+        Ok(inventory.records.iter().any(|(_, record)| {
+            matches!(
+                record.phase,
+                XfrmObjectInstallDurablePhase::Issuing
+                    | XfrmObjectInstallDurablePhase::Indeterminate
+                    | XfrmObjectInstallDurablePhase::Acquired
+                    | XfrmObjectInstallDurablePhase::RemovalAdmitted
+            )
+        }))
+    }
+
     /// Burn a fresh global epoch before an independently issued XFRM mutation.
     ///
     /// The actor calls this for every mutation outside the staged-object flow;
     /// even a later backend failure burns its epoch. The call is rejected while
-    /// any `Acquired` or `RemovalAdmitted` authority remains unresolved, so no
-    /// cooperating replacement can race consumer bookkeeping or cleanup.
+    /// any `Issuing`, `Indeterminate`, `Acquired`, or `RemovalAdmitted`
+    /// authority remains unresolved, so no cooperating replacement can race
+    /// consumer bookkeeping or cleanup.
     pub(crate) fn advance_writer_epoch(&self) -> Result<NonZeroU64, XfrmObjectInstallDurableError> {
         let lease = self.lease()?;
         let mut inventory = lease.inventory()?;
         if lease.prune_terminal_records(&inventory)? {
             inventory = lease.inventory()?;
         }
-        if inventory.has_unresolved_cleanup_authority() {
+        if inventory.has_unresolved_writer_authority() {
             return Err(XfrmObjectInstallDurableError::InvalidTransition);
         }
         lease.advance_epoch(&inventory)
@@ -1138,6 +1333,23 @@ impl XfrmObjectInstallRecoveryStore {
     /// True only for clones sharing this exact open store lease.
     pub(crate) fn is_same_instance(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Report whether a restored record's writer epoch equals the store's
+    /// current epoch without exposing the epoch value.
+    ///
+    /// Recovery uses this as a fail-closed freshness predicate for
+    /// `Issuing`/`Indeterminate` records: a durable anomaly that advanced or
+    /// rewound the epoch underneath an unresolved record removes the proof's
+    /// ordering guarantee and must be classified for repair, never deletion.
+    pub(crate) fn record_writer_epoch_is_current(
+        &self,
+        record: &DurableObjectRecord,
+    ) -> Result<bool, XfrmObjectInstallDurableError> {
+        let lease = self.lease()?;
+        let inventory = lease.inventory()?;
+        lease.validate_record_binding(record)?;
+        Ok(record.writer_epoch == lease.current_epoch(&inventory)?)
     }
 
     fn lease(&self) -> Result<StoreLease<'_>, XfrmObjectInstallDurableError> {
@@ -1487,7 +1699,9 @@ fn validate_single_cleanup_authority(
         .filter(|(_, record)| {
             matches!(
                 record.phase,
-                XfrmObjectInstallDurablePhase::Acquired
+                XfrmObjectInstallDurablePhase::Issuing
+                    | XfrmObjectInstallDurablePhase::Indeterminate
+                    | XfrmObjectInstallDurablePhase::Acquired
                     | XfrmObjectInstallDurablePhase::RemovalAdmitted
             )
         })
@@ -1521,6 +1735,19 @@ fn is_exact_publication_successor(
             &next.install_request_fingerprint,
         )
     {
+        return false;
+    }
+    // Only `Prepared -> Issuing` witnesses the pre-effect proof; every other
+    // transition preserves it. A successor that invents or drops a proof on
+    // any other edge is not an exact publication of this state machine.
+    let entering_issuing = old.phase == XfrmObjectInstallDurablePhase::Prepared
+        && next.phase == XfrmObjectInstallDurablePhase::Issuing;
+    let proof_ok = if entering_issuing {
+        old.pre_effect_proof.is_none() && next.pre_effect_proof.is_some()
+    } else {
+        old.pre_effect_proof == next.pre_effect_proof
+    };
+    if !proof_ok {
         return false;
     }
     if next.phase == XfrmObjectInstallDurablePhase::Issuing {
@@ -1699,6 +1926,7 @@ fn initialize_or_load_control(
     namespace_seal: [u8; 32],
 ) -> Result<ControlRecord, XfrmObjectInstallDurableError> {
     verify_visible_identity(store)?;
+    cleanup_interrupted_publications(store)?;
     let names = scan_raw_names(store)?;
     if names.is_empty() {
         let control = ControlRecord {
@@ -1770,6 +1998,46 @@ fn scan_raw_names(store: &StoreInner) -> Result<Vec<String>, XfrmObjectInstallDu
         );
     }
     Ok(names)
+}
+
+/// Remove only SDK-owned named staging files left by process death before
+/// their atomic rename. Unknown entries and unsafe lookalikes remain
+/// fail-closed; the store root is a trusted, permanently leased directory.
+fn cleanup_interrupted_publications(
+    store: &StoreInner,
+) -> Result<(), XfrmObjectInstallDurableError> {
+    let names = scan_raw_names(store)?;
+    let mut removed = false;
+    for name in names {
+        if !is_temporary_name(&name) {
+            continue;
+        }
+        let descriptor = openat(
+            store.descriptor.as_fd(),
+            name.as_str(),
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| XfrmObjectInstallDurableError::Malformed)?;
+        let metadata = fstat(&descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+        if !FileType::from_raw_mode(metadata.st_mode).is_file()
+            || stat_device(&metadata)? != store.root_device
+            || metadata.st_uid != store.root_owner
+            || metadata.st_mode.store_permissions() != FILE_MODE
+            || metadata.st_nlink != 1
+            || metadata.st_size < 0
+            || metadata.st_size > XFRM_OBJECT_INSTALL_RECOVERY_HANDLE_BYTES as i64
+        {
+            return Err(XfrmObjectInstallDurableError::Malformed);
+        }
+        unlinkat(store.descriptor.as_fd(), name.as_str(), AtFlags::empty())
+            .map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+        removed = true;
+    }
+    if removed {
+        fsync(&store.descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+    }
+    Ok(())
 }
 
 fn read_fixed_file<const N: usize>(
@@ -1932,7 +2200,21 @@ fn random_nonzero_16() -> Result<[u8; 16], XfrmObjectInstallDurableError> {
 
 #[cfg(target_os = "linux")]
 fn temporary_name() -> Result<String, XfrmObjectInstallDurableError> {
-    Ok(format!(".pending-{}", encode_hex(&random_nonzero_16()?)))
+    Ok(format!(
+        "{TEMPORARY_PREFIX}{}",
+        encode_hex(&random_nonzero_16()?)
+    ))
+}
+
+fn is_temporary_name(name: &str) -> bool {
+    let Some(encoded) = name.strip_prefix(TEMPORARY_PREFIX) else {
+        return false;
+    };
+    encoded.len() == 32
+        && encoded
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && encoded.bytes().any(|byte| byte != b'0')
 }
 
 fn epoch_name(epoch: NonZeroU64) -> String {
@@ -1947,19 +2229,35 @@ fn parse_epoch_name(name: &str) -> Option<NonZeroU64> {
     NonZeroU64::new(u64::from_str_radix(encoded, 16).ok()?)
 }
 
-fn namespace_seal(
-    key: &XfrmObjectRecoveryProofKey,
-    binding: [u8; 40],
-) -> Result<[u8; 32], XfrmObjectInstallDurableError> {
-    authenticate_domain(key, b"opc-xfrm-object-namespace-v1\0", &binding)
+fn namespace_seal(key: &XfrmObjectRecoveryProofKey, binding: [u8; 40]) -> [u8; 32] {
+    authenticate_domain(key.canonical_mac_key(), NAMESPACE_AUTH_DOMAIN, &binding)
 }
 
-fn authenticate_install_request(
-    key: &XfrmObjectRecoveryProofKey,
+fn map_canonical_encode_error(error: CanonicalEncodeError) -> XfrmObjectInstallDurableError {
+    match error {
+        CanonicalEncodeError::CapacityExceeded => XfrmObjectInstallDurableError::CapacityExceeded,
+        CanonicalEncodeError::Malformed => XfrmObjectInstallDurableError::Malformed,
+    }
+}
+
+/// Compute the domain-separated keyed fingerprint of one complete install
+/// request.
+///
+/// The encoding is length-prefixed and covers every field the backend would
+/// send, so two requests that differ anywhere produce different fingerprints.
+/// The `domain` argument keeps sibling record families separate even when a
+/// deployment configures the same key bytes for both.
+///
+/// # Errors
+///
+/// Returns [`CanonicalEncodeError::CapacityExceeded`] when a variable-length
+/// field exceeds the bounded canonical encoding.
+pub(crate) fn authenticate_install_request(
+    key: CanonicalMacKey<'_>,
+    domain: &[u8],
     request: &XfrmObjectInstallRequest,
-) -> Result<[u8; AUTH_TAG_BYTES], XfrmObjectInstallDurableError> {
-    let mut mac = HmacSha256::new(key.bytes());
-    mac.update(INSTALL_REQUEST_AUTH_DOMAIN);
+) -> Result<[u8; AUTH_TAG_BYTES], CanonicalEncodeError> {
+    let mut mac = key.begin(domain);
     match request {
         XfrmObjectInstallRequest::Sa(request) => {
             mac_u8(&mut mac, 1);
@@ -2020,7 +2318,7 @@ fn authenticate_install_request(
             mac_u64(
                 &mut mac,
                 u64::try_from(parameters.templates.len())
-                    .map_err(|_| XfrmObjectInstallDurableError::CapacityExceeded)?,
+                    .map_err(|_| CanonicalEncodeError::CapacityExceeded)?,
             );
             for template in &parameters.templates {
                 mac_template(&mut mac, *template);
@@ -2032,32 +2330,43 @@ fn authenticate_install_request(
     Ok(*mac.finalize())
 }
 
-fn mac_bytes(mac: &mut HmacSha256, bytes: &[u8]) -> Result<(), XfrmObjectInstallDurableError> {
+/// Absorb one length-prefixed byte string.
+///
+/// # Errors
+///
+/// Returns [`CanonicalEncodeError::CapacityExceeded`] when the length cannot be
+/// represented in the fixed-width prefix.
+pub(crate) fn mac_bytes(mac: &mut HmacSha256, bytes: &[u8]) -> Result<(), CanonicalEncodeError> {
     mac_u64(
         mac,
-        u64::try_from(bytes.len()).map_err(|_| XfrmObjectInstallDurableError::CapacityExceeded)?,
+        u64::try_from(bytes.len()).map_err(|_| CanonicalEncodeError::CapacityExceeded)?,
     );
     mac.update(bytes);
     Ok(())
 }
 
-fn mac_u8(mac: &mut HmacSha256, value: u8) {
+/// Absorb one unsigned byte.
+pub(crate) fn mac_u8(mac: &mut HmacSha256, value: u8) {
     mac.update(&[value]);
 }
 
-fn mac_u16(mac: &mut HmacSha256, value: u16) {
+/// Absorb one big-endian 16-bit value.
+pub(crate) fn mac_u16(mac: &mut HmacSha256, value: u16) {
     mac.update(&value.to_be_bytes());
 }
 
-fn mac_u32(mac: &mut HmacSha256, value: u32) {
+/// Absorb one big-endian 32-bit value.
+pub(crate) fn mac_u32(mac: &mut HmacSha256, value: u32) {
     mac.update(&value.to_be_bytes());
 }
 
-fn mac_u64(mac: &mut HmacSha256, value: u64) {
+/// Absorb one big-endian 64-bit value.
+pub(crate) fn mac_u64(mac: &mut HmacSha256, value: u64) {
     mac.update(&value.to_be_bytes());
 }
 
-fn mac_ip_address(mac: &mut HmacSha256, address: IpAddress) {
+/// Absorb one address with its family discriminant.
+pub(crate) fn mac_ip_address(mac: &mut HmacSha256, address: IpAddress) {
     match address {
         IpAddress::Ipv4(octets) => {
             mac_u8(mac, 4);
@@ -2070,7 +2379,8 @@ fn mac_ip_address(mac: &mut HmacSha256, address: IpAddress) {
     }
 }
 
-fn mac_selector(mac: &mut HmacSha256, selector: &XfrmSelector) {
+/// Absorb one traffic selector.
+pub(crate) fn mac_selector(mac: &mut HmacSha256, selector: &XfrmSelector) {
     mac_ip_address(mac, selector.source);
     mac_ip_address(mac, selector.destination);
     mac_u16(mac, selector.source_port);
@@ -2080,17 +2390,20 @@ fn mac_selector(mac: &mut HmacSha256, selector: &XfrmSelector) {
     mac_u8(mac, selector.destination_prefix_len);
 }
 
-fn mac_id(mac: &mut HmacSha256, id: XfrmId) {
+/// Absorb one exact XFRM identity triple.
+pub(crate) fn mac_id(mac: &mut HmacSha256, id: XfrmId) {
     mac_ip_address(mac, id.destination);
     mac_u32(mac, id.spi);
     mac_u8(mac, id.protocol);
 }
 
-fn mac_request_id(mac: &mut HmacSha256, request_id: Option<XfrmRequestId>) {
+/// Absorb one optional request identifier.
+pub(crate) fn mac_request_id(mac: &mut HmacSha256, request_id: Option<XfrmRequestId>) {
     mac_optional_u32(mac, request_id.map(XfrmRequestId::get));
 }
 
-fn mac_optional_u32(mac: &mut HmacSha256, value: Option<u32>) {
+/// Absorb one optional 32-bit value with its presence discriminant.
+pub(crate) fn mac_optional_u32(mac: &mut HmacSha256, value: Option<u32>) {
     match value {
         Some(value) => {
             mac_u8(mac, 1);
@@ -2100,7 +2413,8 @@ fn mac_optional_u32(mac: &mut HmacSha256, value: Option<u32>) {
     }
 }
 
-fn mac_mode(mac: &mut HmacSha256, mode: XfrmMode) {
+/// Absorb one transform mode.
+pub(crate) fn mac_mode(mac: &mut HmacSha256, mode: XfrmMode) {
     mac_u8(
         mac,
         match mode {
@@ -2111,7 +2425,8 @@ fn mac_mode(mac: &mut HmacSha256, mode: XfrmMode) {
     );
 }
 
-fn mac_direction(mac: &mut HmacSha256, direction: XfrmDirection) {
+/// Absorb one policy direction.
+pub(crate) fn mac_direction(mac: &mut HmacSha256, direction: XfrmDirection) {
     mac_u8(
         mac,
         match direction {
@@ -2122,7 +2437,8 @@ fn mac_direction(mac: &mut HmacSha256, direction: XfrmDirection) {
     );
 }
 
-fn mac_action(mac: &mut HmacSha256, action: XfrmAction) {
+/// Absorb one policy action.
+pub(crate) fn mac_action(mac: &mut HmacSha256, action: XfrmAction) {
     mac_u8(
         mac,
         match action {
@@ -2132,7 +2448,8 @@ fn mac_action(mac: &mut HmacSha256, action: XfrmAction) {
     );
 }
 
-fn mac_lifetime(mac: &mut HmacSha256, lifetime: LifetimeConfig) {
+/// Absorb one complete lifetime configuration.
+pub(crate) fn mac_lifetime(mac: &mut HmacSha256, lifetime: LifetimeConfig) {
     mac_u64(mac, lifetime.soft_byte_limit);
     mac_u64(mac, lifetime.hard_byte_limit);
     mac_u64(mac, lifetime.soft_packet_limit);
@@ -2141,10 +2458,16 @@ fn mac_lifetime(mac: &mut HmacSha256, lifetime: LifetimeConfig) {
     mac_u64(mac, lifetime.hard_add_expires_seconds);
 }
 
-fn mac_replay_state(
+/// Absorb one optional replay state including its bitmap.
+///
+/// # Errors
+///
+/// Returns [`CanonicalEncodeError::CapacityExceeded`] when the bitmap length
+/// cannot be represented in the fixed-width prefix.
+pub(crate) fn mac_replay_state(
     mac: &mut HmacSha256,
     state: Option<&SaReplayState>,
-) -> Result<(), XfrmObjectInstallDurableError> {
+) -> Result<(), CanonicalEncodeError> {
     let Some(state) = state else {
         mac_u8(mac, 0);
         return Ok(());
@@ -2158,8 +2481,7 @@ fn mac_replay_state(
     mac_u32(mac, state.replay_window);
     mac_u64(
         mac,
-        u64::try_from(state.bitmap.len())
-            .map_err(|_| XfrmObjectInstallDurableError::CapacityExceeded)?,
+        u64::try_from(state.bitmap.len()).map_err(|_| CanonicalEncodeError::CapacityExceeded)?,
     );
     for word in &state.bitmap {
         mac_u32(mac, *word);
@@ -2167,7 +2489,8 @@ fn mac_replay_state(
     Ok(())
 }
 
-fn mac_encap(mac: &mut HmacSha256, encap: Option<UdpEncap>) {
+/// Absorb one optional UDP encapsulation descriptor.
+pub(crate) fn mac_encap(mac: &mut HmacSha256, encap: Option<UdpEncap>) {
     match encap {
         Some(encap) => {
             mac_u8(mac, 1);
@@ -2179,7 +2502,8 @@ fn mac_encap(mac: &mut HmacSha256, encap: Option<UdpEncap>) {
     }
 }
 
-fn mac_lookup_mark(mac: &mut HmacSha256, mark: Option<XfrmLookupMark>) {
+/// Absorb one optional lookup mark.
+pub(crate) fn mac_lookup_mark(mac: &mut HmacSha256, mark: Option<XfrmLookupMark>) {
     match mark {
         Some(mark) => {
             mac_u8(mac, 1);
@@ -2190,7 +2514,8 @@ fn mac_lookup_mark(mac: &mut HmacSha256, mark: Option<XfrmLookupMark>) {
     }
 }
 
-fn mac_output_mark(mac: &mut HmacSha256, mark: Option<XfrmMark>) {
+/// Absorb one optional post-transform output mark.
+pub(crate) fn mac_output_mark(mac: &mut HmacSha256, mark: Option<XfrmMark>) {
     match mark {
         Some(mark) => {
             mac_u8(mac, 1);
@@ -2201,23 +2526,46 @@ fn mac_output_mark(mac: &mut HmacSha256, mark: Option<XfrmMark>) {
     }
 }
 
-fn mac_template(mac: &mut HmacSha256, template: XfrmTemplate) {
+/// Absorb one policy template.
+pub(crate) fn mac_template(mac: &mut HmacSha256, template: XfrmTemplate) {
     mac_id(mac, template.id);
     mac_ip_address(mac, template.source_address);
     mac_request_id(mac, template.request_id);
     mac_mode(mac, template.mode);
 }
 
+/// Compute the domain-separated keyed fingerprint of one exact kernel deletion
+/// identity.
+///
+/// The canonical plaintext exists only in a zeroizing buffer for the duration
+/// of the call; the caller receives the tag alone. `policy_if_id` must already
+/// be canonicalized, so an encoded zero arrives as `None`.
+///
+/// # Errors
+///
+/// Returns [`CanonicalEncodeError::Malformed`] when the removal request cannot
+/// produce an exact canonical identity.
+pub(crate) fn authenticate_deletion_identity(
+    key: CanonicalMacKey<'_>,
+    domain: &[u8],
+    removal: &XfrmObjectRemovalRequest,
+    policy_if_id: Option<u32>,
+) -> Result<[u8; AUTH_TAG_BYTES], CanonicalEncodeError> {
+    let mut canonical = Zeroizing::new([0_u8; 64]);
+    let length = encode_deletion_identity(removal, policy_if_id, &mut canonical)?;
+    Ok(authenticate_domain(key, domain, &canonical[..length]))
+}
+
 fn encode_deletion_identity(
     removal: &XfrmObjectRemovalRequest,
     policy_if_id: Option<u32>,
     output: &mut [u8; 64],
-) -> Result<usize, XfrmObjectInstallDurableError> {
+) -> Result<usize, CanonicalEncodeError> {
     let mut cursor = 0_usize;
     match removal {
         XfrmObjectRemovalRequest::Sa(request) => {
             if policy_if_id.is_some() {
-                return Err(XfrmObjectInstallDurableError::Malformed);
+                return Err(CanonicalEncodeError::Malformed);
             }
             output[cursor] = 1;
             cursor += 1;
@@ -2245,7 +2593,7 @@ fn encode_policy_identity(
     if_id: Option<u32>,
     output: &mut [u8; 64],
     cursor: &mut usize,
-) -> Result<(), XfrmObjectInstallDurableError> {
+) -> Result<(), CanonicalEncodeError> {
     encode_selector(&request.selector, output, cursor);
     output[*cursor] = match request.direction {
         XfrmDirection::In => 1,
@@ -2260,7 +2608,7 @@ fn encode_policy_identity(
             *cursor += 1;
             push_bytes(output, cursor, &value.to_be_bytes());
         }
-        Some(_) => return Err(XfrmObjectInstallDurableError::Malformed),
+        Some(_) => return Err(CanonicalEncodeError::Malformed),
         None => {
             output[*cursor] = 0;
             *cursor += 1;
@@ -2403,6 +2751,8 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
+    use rustix::fs::{mkfifoat, CWD};
+
     use crate::{IpAddress, RemovePolicyRequest, RemoveSaRequest, XfrmLookupMark, XfrmSelector};
 
     use super::*;
@@ -2440,6 +2790,7 @@ mod tests {
         DurableObjectRecord {
             phase,
             object: XfrmInstallObject::Policy,
+            pre_effect_proof: valid_proof_for(phase),
             store_incarnation: [1; 16],
             namespace_seal: [2; 32],
             actor_incarnation: [3; 16],
@@ -2451,8 +2802,31 @@ mod tests {
         }
     }
 
+    fn valid_proof_for(
+        phase: XfrmObjectInstallDurablePhase,
+    ) -> Option<XfrmObjectInstallPreEffectProof> {
+        match phase {
+            XfrmObjectInstallDurablePhase::Prepared => None,
+            XfrmObjectInstallDurablePhase::Retired => None,
+            _ => Some(XfrmObjectInstallPreEffectProof::Absent),
+        }
+    }
+
     fn store(root: &TestRoot) -> XfrmObjectInstallRecoveryStore {
         XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]).unwrap()
+    }
+
+    fn proof_for(
+        expected: XfrmObjectInstallDurablePhase,
+        next: XfrmObjectInstallDurablePhase,
+    ) -> Option<XfrmObjectInstallPreEffectProof> {
+        if expected == XfrmObjectInstallDurablePhase::Prepared
+            && next == XfrmObjectInstallDurablePhase::Issuing
+        {
+            Some(XfrmObjectInstallPreEffectProof::Absent)
+        } else {
+            None
+        }
     }
 
     fn next_handle(
@@ -2462,7 +2836,7 @@ mod tests {
         next: XfrmObjectInstallDurablePhase,
     ) -> XfrmObjectInstallRecoveryHandle {
         store
-            .transition(current, expected, next)
+            .transition(current, expected, next, proof_for(expected, next))
             .unwrap()
             .handle(&store.inner.proof_key)
             .unwrap()
@@ -2493,6 +2867,159 @@ mod tests {
                 assert_eq!(handle.to_bytes(), encoded);
             }
         }
+    }
+
+    /// Fixed SA install request for the object family's golden vectors.
+    fn golden_sa_request() -> XfrmObjectInstallRequest {
+        XfrmObjectInstallRequest::Sa(crate::InstallSaRequest {
+            parameters: crate::SaParameters {
+                selector: XfrmSelector::new(
+                    IpAddress::Ipv4([10, 0, 0, 1]),
+                    IpAddress::Ipv4([10, 0, 0, 2]),
+                    50,
+                ),
+                id: XfrmId {
+                    destination: IpAddress::Ipv4([10, 0, 0, 2]),
+                    spi: 0x1234_5678,
+                    protocol: 50,
+                },
+                source_address: IpAddress::Ipv4([10, 0, 0, 1]),
+                request_id: None,
+                auth: Some((
+                    crate::AuthAlgorithm::hmac_sha256(96),
+                    crate::KeyMaterial::new(vec![0xab; 32]),
+                )),
+                crypt: Some((
+                    crate::Algorithm::cbc_aes(),
+                    crate::KeyMaterial::new(vec![0xcd; 32]),
+                )),
+                aead: None,
+                mode: XfrmMode::Tunnel,
+                lifetime: LifetimeConfig::default(),
+                replay_window: 32,
+                replay_state: None,
+                encap: None,
+                mark: None,
+                output_mark: None,
+                if_id: None,
+                egress_dscp: None,
+            },
+        })
+    }
+
+    /// Fixed interface-scoped policy install request for the golden vectors.
+    fn golden_policy_request() -> XfrmObjectInstallRequest {
+        XfrmObjectInstallRequest::Policy(crate::InstallPolicyRequest {
+            parameters: crate::PolicyParameters {
+                selector: XfrmSelector::new(
+                    IpAddress::Ipv4([10, 0, 0, 1]),
+                    IpAddress::Ipv4([10, 0, 0, 2]),
+                    50,
+                ),
+                direction: XfrmDirection::Out,
+                action: XfrmAction::Allow,
+                priority: 616,
+                templates: vec![XfrmTemplate {
+                    id: XfrmId {
+                        destination: IpAddress::Ipv4([10, 0, 0, 2]),
+                        spi: 0x1234_5678,
+                        protocol: 50,
+                    },
+                    source_address: IpAddress::Ipv4([10, 0, 0, 1]),
+                    request_id: None,
+                    mode: XfrmMode::Tunnel,
+                }],
+                mark: None,
+                if_id: Some(600),
+            },
+        })
+    }
+
+    /// Byte-pinned canonical encodings for the object family.
+    ///
+    /// The three encoders are now shared with the roster family and take their
+    /// domain separator as a parameter, so nothing in a round-trip test can
+    /// notice if the object family's domain is changed: both sides of every
+    /// comparison would move together. These vectors are the only thing that
+    /// does notice. A domain change silently invalidates every persisted
+    /// `DurableObjectRecord`, which turns `recover_durable_object_install`
+    /// into a permanent `WrongBinding` and leaves the writer gate closed
+    /// forever, so this must fail loudly rather than pass quietly.
+    #[test]
+    fn golden_vectors_pin_the_object_install_request_and_deletion_identity_encoding() {
+        let proof_key = key(9);
+        let borrowed = proof_key.canonical_mac_key();
+        let sa = golden_sa_request();
+        let policy = golden_policy_request();
+
+        assert_eq!(
+            authenticate_install_request(borrowed, INSTALL_REQUEST_AUTH_DOMAIN, &sa).unwrap(),
+            [
+                0x25, 0x45, 0x12, 0x78, 0x88, 0x1a, 0xe4, 0xa7, 0x0c, 0x35, 0x75, 0xb6, 0xc5, 0x4c,
+                0xbc, 0x46, 0xbc, 0x33, 0xe0, 0xc2, 0x6c, 0xc2, 0x77, 0xa4, 0xfb, 0x48, 0x3b, 0x64,
+                0xb6, 0x9d, 0x02, 0x54,
+            ],
+            "object SA install-request fingerprint encoding changed"
+        );
+        assert_eq!(
+            authenticate_install_request(borrowed, INSTALL_REQUEST_AUTH_DOMAIN, &policy).unwrap(),
+            [
+                0xc5, 0xc9, 0xb4, 0x1f, 0x1b, 0x7e, 0x3c, 0x34, 0x15, 0x62, 0x28, 0x7b, 0x00, 0xb7,
+                0xa2, 0x4a, 0xa6, 0x88, 0x71, 0xda, 0x6c, 0x42, 0x94, 0x1e, 0x8d, 0x66, 0x2b, 0x53,
+                0xf2, 0xa5, 0x6c, 0x2a,
+            ],
+            "object policy install-request fingerprint encoding changed"
+        );
+        assert_eq!(
+            authenticate_deletion_identity(
+                borrowed,
+                DELETION_IDENTITY_AUTH_DOMAIN,
+                &sa.removal(),
+                sa.policy_if_id(),
+            )
+            .unwrap(),
+            [
+                0x02, 0x4d, 0x3a, 0x78, 0xe3, 0x53, 0xf9, 0x5b, 0x32, 0x63, 0x89, 0x19, 0xca, 0x2c,
+                0x68, 0xdb, 0xb1, 0x85, 0xe6, 0x02, 0xc1, 0x2c, 0xe4, 0x2d, 0x3a, 0xfe, 0x72, 0x20,
+                0xbd, 0xe6, 0xf5, 0x36,
+            ],
+            "object SA deletion-identity fingerprint encoding changed"
+        );
+        assert_eq!(
+            authenticate_deletion_identity(
+                borrowed,
+                DELETION_IDENTITY_AUTH_DOMAIN,
+                &policy.removal(),
+                policy.policy_if_id(),
+            )
+            .unwrap(),
+            [
+                0x98, 0x42, 0xce, 0x31, 0xc7, 0xaa, 0x69, 0x82, 0x51, 0x08, 0x22, 0x72, 0x25, 0x14,
+                0x36, 0x04, 0x86, 0xac, 0x14, 0x04, 0x0e, 0x3f, 0x57, 0xef, 0x2d, 0x33, 0xe2, 0x2e,
+                0xcb, 0xc2, 0x9e, 0x44,
+            ],
+            "object scoped-policy deletion-identity fingerprint encoding changed"
+        );
+        assert_eq!(
+            namespace_seal(&proof_key, [0x42; 40]),
+            [
+                0x26, 0xa8, 0x2e, 0x11, 0x15, 0xb3, 0x48, 0x52, 0x82, 0x39, 0x7c, 0x6c, 0x24, 0x54,
+                0xd0, 0x5d, 0x64, 0x91, 0x54, 0x58, 0xf2, 0x97, 0x24, 0x16, 0x5b, 0xda, 0xc9, 0xf9,
+                0x50, 0x44, 0x66, 0x31,
+            ],
+            "object namespace seal encoding changed"
+        );
+        assert_eq!(
+            record(XfrmObjectInstallDurablePhase::Acquired)
+                .encode(&proof_key)
+                .unwrap()[RECORD_BODY_BYTES..],
+            [
+                0xb4, 0x48, 0x2b, 0xf7, 0xdc, 0x72, 0xad, 0x30, 0x56, 0xeb, 0x26, 0x45, 0x5f, 0xae,
+                0xe6, 0x13, 0xc0, 0x91, 0x77, 0x6c, 0x9d, 0x04, 0x69, 0xf6, 0x87, 0x96, 0x07, 0x44,
+                0x98, 0x5a, 0x14, 0x04,
+            ],
+            "object record tag encoding changed"
+        );
     }
 
     #[test]
@@ -2538,8 +3065,9 @@ mod tests {
         let valid = record(XfrmObjectInstallDurablePhase::Prepared)
             .encode(&key(9))
             .unwrap();
+        // Bytes 13..16 remain reserved and must stay zero.
         let mut reserved = valid;
-        reserved[12] = 1;
+        reserved[13] = 1;
         assert_eq!(
             DurableObjectRecord::decode(&reserved, &key(9)),
             Err(XfrmObjectInstallDurableError::Malformed)
@@ -2585,8 +3113,17 @@ mod tests {
         );
         assert!(XfrmObjectInstallDurablePhase::Acquired
             .permits(XfrmObjectInstallDurablePhase::RemovalAdmitted));
-        assert!(!XfrmObjectInstallDurablePhase::Issuing
+        // Recovery edges that prove-and-retire an unresolved record.
+        assert!(XfrmObjectInstallDurablePhase::Issuing
             .permits(XfrmObjectInstallDurablePhase::RemovalAdmitted));
+        assert!(XfrmObjectInstallDurablePhase::Indeterminate
+            .permits(XfrmObjectInstallDurablePhase::RemovalAdmitted));
+        assert!(XfrmObjectInstallDurablePhase::Indeterminate
+            .permits(XfrmObjectInstallDurablePhase::NoMutation));
+        // An unresolved record may never retire directly without a verdict.
+        assert!(
+            !XfrmObjectInstallDurablePhase::Issuing.permits(XfrmObjectInstallDurablePhase::Retired)
+        );
         assert!(!XfrmObjectInstallDurablePhase::Indeterminate
             .permits(XfrmObjectInstallDurablePhase::Retired));
         assert!(!XfrmObjectInstallDurablePhase::NoMutation
@@ -2697,6 +3234,84 @@ mod tests {
         let inventory = reopened.lease().unwrap().inventory().unwrap();
         assert_eq!(inventory.epoch, NonZeroU64::new(1).unwrap());
         assert!(inventory.records.is_empty());
+    }
+
+    #[test]
+    fn process_loss_staging_residue_is_removed_before_reopen() {
+        let root = TestRoot::new();
+        let initial = store(&root);
+        drop(initial);
+        let pending = root
+            .path()
+            .join(".opc-xfrm-object-pending-1234567890abcdef1234567890abcdef");
+        fs::write(&pending, [0xa5; 17]).unwrap();
+        fs::set_permissions(&pending, fs::Permissions::from_mode(FILE_MODE)).unwrap();
+        std::fs::File::open(&pending).unwrap().sync_all().unwrap();
+        std::fs::File::open(root.path())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+
+        let reopened = store(&root);
+        assert!(!pending.exists());
+        assert!(reopened.lease().unwrap().inventory().is_ok());
+    }
+
+    #[test]
+    fn first_publication_staging_residue_is_removed_before_initialization() {
+        let root = TestRoot::new();
+        fs::create_dir(root.path()).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(DIRECTORY_MODE)).unwrap();
+        let pending = root
+            .path()
+            .join(".opc-xfrm-object-pending-abcdef1234567890abcdef1234567890");
+        fs::write(&pending, [0x5a; 9]).unwrap();
+        fs::set_permissions(&pending, fs::Permissions::from_mode(FILE_MODE)).unwrap();
+        std::fs::File::open(&pending).unwrap().sync_all().unwrap();
+        std::fs::File::open(root.path())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+
+        let initialized = store(&root);
+        assert!(!pending.exists());
+        let inventory = initialized.lease().unwrap().inventory().unwrap();
+        assert_eq!(inventory.epoch, NonZeroU64::new(1).unwrap());
+        assert!(inventory.records.is_empty());
+    }
+
+    #[test]
+    fn unsafe_staging_lookalike_remains_fail_closed() {
+        let root = TestRoot::new();
+        let initial = store(&root);
+        drop(initial);
+        let pending = root
+            .path()
+            .join(".opc-xfrm-object-pending-fedcba0987654321fedcba0987654321");
+        symlink(root.path().join(CONTROL_NAME), &pending).unwrap();
+
+        assert!(matches!(
+            XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]),
+            Err(XfrmObjectInstallDurableError::Malformed)
+        ));
+        assert!(pending.symlink_metadata().is_ok());
+    }
+
+    #[test]
+    fn staging_fifo_is_rejected_without_blocking() {
+        let root = TestRoot::new();
+        let initial = store(&root);
+        drop(initial);
+        let pending = root
+            .path()
+            .join(".opc-xfrm-object-pending-0123456789abcdef0123456789abcdef");
+        mkfifoat(CWD, &pending, Mode::from_raw_mode(FILE_MODE)).unwrap();
+
+        assert!(matches!(
+            XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]),
+            Err(XfrmObjectInstallDurableError::Malformed)
+        ));
+        assert!(pending.symlink_metadata().is_ok());
     }
 
     #[test]
@@ -2817,6 +3432,10 @@ mod tests {
                 &prepared,
                 XfrmObjectInstallDurablePhase::Prepared,
                 XfrmObjectInstallDurablePhase::Issuing,
+                proof_for(
+                    XfrmObjectInstallDurablePhase::Prepared,
+                    XfrmObjectInstallDurablePhase::Issuing
+                ),
             ),
             Err(XfrmObjectInstallDurableError::Stale)
         );
@@ -2850,12 +3469,8 @@ mod tests {
                 DurableObjectFingerprints::repeated(0xa1),
             )
             .unwrap();
-        let issuing_a = next_handle(
-            &store,
-            &prepared_a,
-            XfrmObjectInstallDurablePhase::Prepared,
-            XfrmObjectInstallDurablePhase::Issuing,
-        );
+        // Prepare B before A becomes unresolved writer authority, so a queued
+        // second operation exists to be gated once A advances.
         let operation_b = XfrmObjectInstallOperationId::generate().unwrap();
         let prepared_b = store
             .prepare(
@@ -2865,6 +3480,25 @@ mod tests {
                 DurableObjectFingerprints::repeated(0xb2),
             )
             .unwrap();
+        let issuing_a = next_handle(
+            &store,
+            &prepared_a,
+            XfrmObjectInstallDurablePhase::Prepared,
+            XfrmObjectInstallDurablePhase::Issuing,
+        );
+        // While A is Issuing, B is already prepared but may not be admitted.
+        assert_eq!(
+            store.transition(
+                &prepared_b,
+                XfrmObjectInstallDurablePhase::Prepared,
+                XfrmObjectInstallDurablePhase::Issuing,
+                proof_for(
+                    XfrmObjectInstallDurablePhase::Prepared,
+                    XfrmObjectInstallDurablePhase::Issuing
+                ),
+            ),
+            Err(XfrmObjectInstallDurableError::InvalidTransition)
+        );
         let acquired_a = next_handle(
             &store,
             &issuing_a,
@@ -2876,6 +3510,10 @@ mod tests {
                 &prepared_b,
                 XfrmObjectInstallDurablePhase::Prepared,
                 XfrmObjectInstallDurablePhase::Issuing,
+                proof_for(
+                    XfrmObjectInstallDurablePhase::Prepared,
+                    XfrmObjectInstallDurablePhase::Issuing
+                ),
             ),
             Err(XfrmObjectInstallDurableError::InvalidTransition)
         );
@@ -2905,6 +3543,7 @@ mod tests {
                 &acquired_a,
                 XfrmObjectInstallDurablePhase::Acquired,
                 XfrmObjectInstallDurablePhase::RemovalAdmitted,
+                None,
             )
             .is_ok());
     }
@@ -3024,6 +3663,7 @@ mod tests {
                 &acquired,
                 XfrmObjectInstallDurablePhase::Acquired,
                 XfrmObjectInstallDurablePhase::RemovalAdmitted,
+                None,
             ),
             Err(XfrmObjectInstallDurableError::Stale)
         );
@@ -3078,6 +3718,7 @@ mod tests {
                 &admitted,
                 XfrmObjectInstallDurablePhase::RemovalAdmitted,
                 XfrmObjectInstallDurablePhase::Retired,
+                None,
             )
             .is_ok());
     }
@@ -3145,6 +3786,7 @@ mod tests {
         let next = DurableObjectRecord {
             phase: XfrmObjectInstallDurablePhase::Issuing,
             writer_epoch: NonZeroU64::new(inventory.epoch.get() + 1).unwrap(),
+            pre_effect_proof: Some(XfrmObjectInstallPreEffectProof::Absent),
             ..current.clone()
         };
         lease.publish_record(&next).unwrap();
@@ -3158,6 +3800,10 @@ mod tests {
                 &prepared,
                 XfrmObjectInstallDurablePhase::Prepared,
                 XfrmObjectInstallDurablePhase::Issuing,
+                proof_for(
+                    XfrmObjectInstallDurablePhase::Prepared,
+                    XfrmObjectInstallDurablePhase::Issuing
+                ),
             ),
             Err(XfrmObjectInstallDurableError::Duplicate)
         );
@@ -3185,6 +3831,18 @@ mod tests {
             (
                 XfrmObjectInstallDurablePhase::Issuing,
                 XfrmObjectInstallDurablePhase::Indeterminate,
+            ),
+            (
+                XfrmObjectInstallDurablePhase::Issuing,
+                XfrmObjectInstallDurablePhase::RemovalAdmitted,
+            ),
+            (
+                XfrmObjectInstallDurablePhase::Indeterminate,
+                XfrmObjectInstallDurablePhase::NoMutation,
+            ),
+            (
+                XfrmObjectInstallDurablePhase::Indeterminate,
+                XfrmObjectInstallDurablePhase::RemovalAdmitted,
             ),
             (
                 XfrmObjectInstallDurablePhase::Acquired,
@@ -3219,15 +3877,24 @@ mod tests {
                 lease.current_from_handle(&inventory, &prepared).unwrap();
             let prepared_name = prepared_name.to_owned();
             let mut old = prepared_record.clone();
+            old.phase = old_phase;
+            old.pre_effect_proof = valid_proof_for(old_phase);
             if old_phase != XfrmObjectInstallDurablePhase::Prepared {
-                old.phase = old_phase;
                 lease.remove_record(&prepared_name).unwrap();
                 lease.publish_record(&old).unwrap();
             }
             let inventory = lease.inventory().unwrap();
             let old_name = record_name(&old);
+            let entering_issuing = old_phase == XfrmObjectInstallDurablePhase::Prepared
+                && next_phase == XfrmObjectInstallDurablePhase::Issuing;
+            let next_proof = if entering_issuing {
+                Some(XfrmObjectInstallPreEffectProof::Absent)
+            } else {
+                old.pre_effect_proof
+            };
             let mut next = DurableObjectRecord {
                 phase: next_phase,
+                pre_effect_proof: next_proof,
                 ..old.clone()
             };
             if next_phase == XfrmObjectInstallDurablePhase::Issuing {
@@ -3336,6 +4003,29 @@ mod tests {
     }
 
     #[test]
+    fn relocation_family_store_root_rejects_install_open_fail_closed() {
+        let root = TestRoot::new();
+        let relocation_store =
+            crate::durable_relocation::XfrmSaRelocationRecoveryStore::open_bound(
+                root.path(),
+                crate::durable_relocation::XfrmSaRelocationRecoveryProofKey::new([9; 32]).unwrap(),
+                [0x42; 40],
+            )
+            .unwrap();
+        drop(relocation_store);
+        // The dropped relocation store's root passes ownership, mode, and
+        // flock validation on reopen; the rejection must come from
+        // control-record validation, where the relocation family's distinct
+        // control magic fails `ControlRecord::decode` before authentication
+        // is even attempted.
+        assert_eq!(
+            XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40])
+                .unwrap_err(),
+            XfrmObjectInstallDurableError::Malformed
+        );
+    }
+
+    #[test]
     fn deletion_fingerprint_covers_sa_and_scoped_policy_identity() {
         let root = TestRoot::new();
         let store = store(&root);
@@ -3377,6 +4067,311 @@ mod tests {
         assert_eq!(
             store.deletion_identity_fingerprint_with_policy_if_id(&sa, Some(9)),
             Err(XfrmObjectInstallDurableError::Malformed)
+        );
+    }
+
+    #[test]
+    fn record_version_one_fails_closed_after_format_bump() {
+        let encoded = record(XfrmObjectInstallDurablePhase::Acquired)
+            .encode(&key(9))
+            .unwrap();
+        let mut v1 = encoded;
+        v1[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        assert_eq!(
+            DurableObjectRecord::decode(&v1, &key(9)),
+            Err(XfrmObjectInstallDurableError::Malformed)
+        );
+    }
+
+    #[test]
+    fn proof_encoding_rules_fail_closed() {
+        // Unknown proof codes are malformed.
+        let valid = record(XfrmObjectInstallDurablePhase::Issuing)
+            .encode(&key(9))
+            .unwrap();
+        let mut bad_code = valid;
+        bad_code[12] = 3;
+        assert_eq!(
+            DurableObjectRecord::decode(&bad_code, &key(9)),
+            Err(XfrmObjectInstallDurableError::Malformed)
+        );
+        // A trailing reserved byte must stay zero.
+        let mut bad_reserved = valid;
+        bad_reserved[13] = 1;
+        assert_eq!(
+            DurableObjectRecord::decode(&bad_reserved, &key(9)),
+            Err(XfrmObjectInstallDurableError::Malformed)
+        );
+        // Prepared must not carry a proof.
+        let mut prepared_with_proof = record(XfrmObjectInstallDurablePhase::Prepared);
+        prepared_with_proof.pre_effect_proof = Some(XfrmObjectInstallPreEffectProof::Absent);
+        assert_eq!(
+            prepared_with_proof.encode(&key(9)),
+            Err(XfrmObjectInstallDurableError::Malformed)
+        );
+        // An effect-possible record must carry a proof.
+        let mut issuing_without_proof = record(XfrmObjectInstallDurablePhase::Issuing);
+        issuing_without_proof.pre_effect_proof = None;
+        assert_eq!(
+            issuing_without_proof.encode(&key(9)),
+            Err(XfrmObjectInstallDurableError::Malformed)
+        );
+    }
+
+    #[test]
+    fn proof_round_trips_both_witnesses() {
+        for proof in [
+            XfrmObjectInstallPreEffectProof::Absent,
+            XfrmObjectInstallPreEffectProof::Conflict,
+        ] {
+            let mut expected = record(XfrmObjectInstallDurablePhase::Issuing);
+            expected.pre_effect_proof = Some(proof);
+            let encoded = expected.encode(&key(9)).unwrap();
+            assert_eq!(
+                DurableObjectRecord::decode(&encoded, &key(9)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn transition_requires_proof_exactly_for_entering_issuing() {
+        let root = TestRoot::new();
+        let store = store(&root);
+        let prepared = store
+            .prepare(
+                XfrmObjectInstallOperationId::generate().unwrap(),
+                XfrmObjectInstallOperationGeneration::new(1).unwrap(),
+                XfrmInstallObject::Sa,
+                DurableObjectFingerprints::repeated(0x61),
+            )
+            .unwrap();
+        // Missing proof for Prepared -> Issuing is rejected.
+        assert_eq!(
+            store.transition(
+                &prepared,
+                XfrmObjectInstallDurablePhase::Prepared,
+                XfrmObjectInstallDurablePhase::Issuing,
+                None,
+            ),
+            Err(XfrmObjectInstallDurableError::InvalidTransition)
+        );
+        let issuing = store
+            .transition(
+                &prepared,
+                XfrmObjectInstallDurablePhase::Prepared,
+                XfrmObjectInstallDurablePhase::Issuing,
+                Some(XfrmObjectInstallPreEffectProof::Absent),
+            )
+            .unwrap();
+        assert_eq!(
+            issuing.pre_effect_proof,
+            Some(XfrmObjectInstallPreEffectProof::Absent)
+        );
+        // A supplied proof on any non-issuing transition is rejected.
+        let issuing_handle = issuing.handle(&store.inner.proof_key).unwrap();
+        assert_eq!(
+            store.transition(
+                &issuing_handle,
+                XfrmObjectInstallDurablePhase::Issuing,
+                XfrmObjectInstallDurablePhase::Acquired,
+                Some(XfrmObjectInstallPreEffectProof::Conflict),
+            ),
+            Err(XfrmObjectInstallDurableError::InvalidTransition)
+        );
+        // The accepted transition preserves the witnessed proof.
+        let acquired = store
+            .transition(
+                &issuing_handle,
+                XfrmObjectInstallDurablePhase::Issuing,
+                XfrmObjectInstallDurablePhase::Acquired,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            acquired.pre_effect_proof,
+            Some(XfrmObjectInstallPreEffectProof::Absent)
+        );
+    }
+
+    #[test]
+    fn unresolved_issuing_gates_prepare_and_writer_epoch_until_retired() {
+        for unresolved_phase in [
+            XfrmObjectInstallDurablePhase::Issuing,
+            XfrmObjectInstallDurablePhase::Indeterminate,
+        ] {
+            let root = TestRoot::new();
+            let store = store(&root);
+            let operation = XfrmObjectInstallOperationId::generate().unwrap();
+            let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+            let prepared = store
+                .prepare(
+                    operation,
+                    generation,
+                    XfrmInstallObject::Sa,
+                    DurableObjectFingerprints::repeated(0x62),
+                )
+                .unwrap();
+            let issuing = next_handle(
+                &store,
+                &prepared,
+                XfrmObjectInstallDurablePhase::Prepared,
+                XfrmObjectInstallDurablePhase::Issuing,
+            );
+            let unresolved_handle = if unresolved_phase == XfrmObjectInstallDurablePhase::Issuing {
+                issuing.clone()
+            } else {
+                next_handle(
+                    &store,
+                    &issuing,
+                    XfrmObjectInstallDurablePhase::Issuing,
+                    XfrmObjectInstallDurablePhase::Indeterminate,
+                )
+            };
+            assert_eq!(
+                store.prepare(
+                    XfrmObjectInstallOperationId::generate().unwrap(),
+                    generation,
+                    XfrmInstallObject::Policy,
+                    DurableObjectFingerprints::repeated(0x63),
+                ),
+                Err(XfrmObjectInstallDurableError::InvalidTransition)
+            );
+            assert_eq!(
+                store.advance_writer_epoch(),
+                Err(XfrmObjectInstallDurableError::InvalidTransition)
+            );
+            // Retire the unresolved record through a no-mutation verdict and
+            // confirm the gate reopens.
+            let no_mutation = next_handle(
+                &store,
+                &unresolved_handle,
+                unresolved_phase,
+                XfrmObjectInstallDurablePhase::NoMutation,
+            );
+            let _retired = next_handle(
+                &store,
+                &no_mutation,
+                XfrmObjectInstallDurablePhase::NoMutation,
+                XfrmObjectInstallDurablePhase::Retired,
+            );
+            assert!(store.advance_writer_epoch().is_ok());
+            assert!(store
+                .prepare(
+                    XfrmObjectInstallOperationId::generate().unwrap(),
+                    generation,
+                    XfrmInstallObject::Policy,
+                    DurableObjectFingerprints::repeated(0x63),
+                )
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn duplicate_issuing_authorities_fail_closed() {
+        let root = TestRoot::new();
+        let store = store(&root);
+        let prepared = store
+            .prepare(
+                XfrmObjectInstallOperationId::from_bytes([0x64; 16]).unwrap(),
+                XfrmObjectInstallOperationGeneration::new(1).unwrap(),
+                XfrmInstallObject::Sa,
+                DurableObjectFingerprints::repeated(0x65),
+            )
+            .unwrap();
+        let issuing = next_handle(
+            &store,
+            &prepared,
+            XfrmObjectInstallDurablePhase::Prepared,
+            XfrmObjectInstallDurablePhase::Issuing,
+        );
+        let lease = store.lease().unwrap();
+        let inventory = lease.inventory().unwrap();
+        let (_, first) = lease.current_from_handle(&inventory, &issuing).unwrap();
+        let second = DurableObjectRecord {
+            operation_id: XfrmObjectInstallOperationId::from_bytes([0x66; 16]).unwrap(),
+            deletion_identity_fingerprint: [0x67; 32],
+            install_request_fingerprint: [0x68; 32],
+            ..first.clone()
+        };
+        lease.publish_record(&second).unwrap();
+        drop(lease);
+        assert_eq!(
+            store.advance_writer_epoch(),
+            Err(XfrmObjectInstallDurableError::Duplicate)
+        );
+    }
+
+    #[test]
+    fn epoch_currency_predicate_tracks_writer_epoch_advances() {
+        let root = TestRoot::new();
+        let store = store(&root);
+        let operation = XfrmObjectInstallOperationId::generate().unwrap();
+        let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+        let prepared = store
+            .prepare(
+                operation,
+                generation,
+                XfrmInstallObject::Sa,
+                DurableObjectFingerprints::repeated(0x69),
+            )
+            .unwrap();
+        let issuing = store
+            .transition(
+                &prepared,
+                XfrmObjectInstallDurablePhase::Prepared,
+                XfrmObjectInstallDurablePhase::Issuing,
+                Some(XfrmObjectInstallPreEffectProof::Absent),
+            )
+            .unwrap();
+        assert!(store.record_writer_epoch_is_current(&issuing).unwrap());
+        // Forge a later epoch underneath the unresolved record; the predicate
+        // must then report the record as no longer current.
+        let lease = store.lease().unwrap();
+        let inventory = lease.inventory().unwrap();
+        lease.advance_epoch(&inventory).unwrap();
+        drop(lease);
+        assert!(!store.record_writer_epoch_is_current(&issuing).unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_epoch_under_unresolved_record_recovers_repair_required() {
+        // A durable anomaly that advances the epoch underneath an unresolved
+        // record removes the proof's ordering guarantee. Recovery must refuse
+        // to delete and classify the record for repair, keeping it gating.
+        let root = TestRoot::new();
+        let store = store(&root);
+        let operation = XfrmObjectInstallOperationId::generate().unwrap();
+        let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+        let request = crate::durable_install::tests_sa_request_for_repair();
+        let fingerprints = store.fingerprints_for_request(&request).unwrap();
+        let prepared = store
+            .prepare(operation, generation, request.object(), fingerprints)
+            .unwrap();
+        store
+            .transition(
+                &prepared,
+                XfrmObjectInstallDurablePhase::Prepared,
+                XfrmObjectInstallDurablePhase::Issuing,
+                Some(XfrmObjectInstallPreEffectProof::Absent),
+            )
+            .unwrap();
+        let lease = store.lease().unwrap();
+        let inventory = lease.inventory().unwrap();
+        lease.advance_epoch(&inventory).unwrap();
+        drop(lease);
+
+        let backend = crate::MockXfrmBackend::new();
+        let outcome = crate::durable_install::recover_durable_object_install(
+            &store, operation, generation, &request, &backend,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.as_str(), "repair_required");
+        // The record remains unresolved and keeps gating writers.
+        assert_eq!(
+            store.advance_writer_epoch(),
+            Err(XfrmObjectInstallDurableError::InvalidTransition)
         );
     }
 }

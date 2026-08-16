@@ -45,6 +45,7 @@ jobs:
           fi
           lsmod | grep '^gtp'
           sudo modprobe wireguard
+          sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
           sudo unshare -n -- ip link set lo up
 
       - name: Build privileged GTP-U test
@@ -69,7 +70,7 @@ jobs:
             "OPC_GTPU_RUN_PRIVILEGED=1" \
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up
-              cargo test --locked -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture
+              cargo test --locked -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture --test-threads=1
             '
 
       - name: Build privileged eBPF GTP-U test
@@ -119,7 +120,7 @@ jobs:
             "OPC_GTPU_RUN_PRIVILEGED=1" \
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up
-              cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture
+              cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1
               # Both filters go after `--`: cargo accepts only one positional
               # TESTNAME, so naming two before it is a hard argument error,
               # while libtest itself takes any number.
@@ -138,6 +139,9 @@ jobs:
           grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_IPV6_PROOF_PROVEN' "${datapath_log}"
 
           # The two lib tag proofs return Ok early without printing `skipping:`
           # when the environment is not privileged, so the skip check above
@@ -173,6 +177,16 @@ jobs:
           test -n "${test_binary}"
           test -x "${test_binary}"
           cp "${test_binary}" "${RUNNER_TEMP}/opc-gtpu-linux68-test"
+
+          cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged --no-run --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-linux68-datapath-build.jsonl"
+          datapath_binary="$(
+            jq -r 'select(.profile.test == true and .target.name == "ebpf_gtpu_privileged") | .executable // empty' \
+              "${RUNNER_TEMP}/gtpu-linux68-datapath-build.jsonl" | tail -n 1
+          )"
+          test -n "${datapath_binary}"
+          test -x "${datapath_binary}"
+          cp "${datapath_binary}" "${RUNNER_TEMP}/opc-gtpu-linux68-datapath"
 
       - name: Load both classifiers on pinned Linux 6.8
         run: |
@@ -272,6 +286,16 @@ jobs:
             -o UserKnownHostsFile=/dev/null \
             "${RUNNER_TEMP}/opc-gtpu-linux68-test" \
             opc@127.0.0.1:/tmp/opc-gtpu-linux68-test
+          scp \
+            -i "${key}" \
+            -P 2227 \
+            -o BatchMode=yes \
+            -o ConnectTimeout=2 \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${RUNNER_TEMP}/opc-gtpu-linux68-datapath" \
+            opc@127.0.0.1:/tmp/opc-gtpu-linux68-datapath
           ssh "${ssh_options[@]}" opc@127.0.0.1 '
             set -euo pipefail
             test "$(uname -r)" = "6.8.0-134-generic"
@@ -283,12 +307,16 @@ jobs:
             esac
             sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
             chmod 0755 /tmp/opc-gtpu-linux68-test
+            chmod 0755 /tmp/opc-gtpu-linux68-datapath
           '
-          load_output="$(
+          if ! load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
               2>&1
-          )"
+          )"; then
+            printf '%s\n' "${load_output}"
+            exit 1
+          fi
           printf '%s\n' "${load_output}"
           grep -Fq 'test result: ok. 3 passed; 0 failed;' <<< "${load_output}"
           # Every one of these tests returns early when
@@ -297,6 +325,22 @@ jobs:
           grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_PRE_REDIRECT_TAG_PROOF_PROVEN' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_LOAD_CAPABILITY_PROVEN' <<< "${load_output}"
+
+          if ! live_output="$(
+            ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-linux68-datapath --ignored --nocapture --test-threads=1 ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract"' \
+              2>&1
+          )"; then
+            printf '%s\n' "${live_output}"
+            exit 1
+          fi
+          printf '%s\n' "${live_output}"
+          if grep -q 'skipping:' <<< "${live_output}"; then
+            echo '::error::Linux 6.8 TFT live proof skipped instead of running'
+            exit 1
+          fi
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' <<< "${live_output}"
 
   el9-514-classifier-load:
     name: RHEL 9 / OpenShift 4.18 datapath
@@ -316,12 +360,20 @@ jobs:
         with:
           shared-key: opc-gtpu-el9
 
+      - name: Install musl compiler
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
       # Statically linked so the guest's glibc is irrelevant. The runner is
       # Ubuntu and the guest is el9; a default gnu build would not start there.
       - name: Build committed-object load test for el9
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-el9-target"
+          export CC_x86_64_unknown_linux_musl=musl-gcc
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
           cargo test --locked -p opc-gtpu-dataplane --lib --no-run \
             --target x86_64-unknown-linux-musl --message-format=json \
             > "${RUNNER_TEMP}/gtpu-el9-build.jsonl"
@@ -495,11 +547,14 @@ jobs:
             sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
             chmod 0755 /tmp/opc-gtpu-el9-test
           '
-          load_output="$(
+          if ! load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-el9-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
               2>&1
-          )"
+          )"; then
+            printf '%s\n' "${load_output}"
+            exit 1
+          fi
           printf '%s\n' "${load_output}"
           grep -Fq 'test result: ok. 3 passed; 0 failed;' <<< "${load_output}"
           grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' <<< "${load_output}"
@@ -649,6 +704,9 @@ jobs:
           grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_IPV6_PROOF_PROVEN' "${datapath_log}"
 
   ebpf-object:
     name: eBPF datapath object rebuild
@@ -737,11 +795,22 @@ jobs:
           readelf -sW "${object_path}" | awk '$4 == "FUNC" && $8 ~ /^opc_gtpu_/ {print $8}' | sort > pre-redirect.programs
           readelf -sW "${object_path}" | awk '$4 == "OBJECT" && $8 ~ /^GTPU_/ {print $8}' | sort > pre-redirect.maps
           diff -u <(printf '%s\n' opc_gtpu_downlink opc_gtpu_uplink) pre-redirect.programs
-          # Same map inventory as the current object. This generation differs by
-          # its instruction stream and by GTPU_COUNTERS width, not by map set,
-          # which is exactly why a fixture built from the current object could
-          # imitate its shape while proving nothing about its identity.
-          diff -u <(readelf -sW "${current_path}" | awk '$4 == "OBJECT" && $8 ~ /^GTPU_/ {print $8}' | sort) pre-redirect.maps
+          # This generation predates the TFT classifier maps. Prove that its
+          # map inventory remains an exact subset of the current object and
+          # that only the versioned selector, TFT, and issue-655 observation
+          # maps were added. The historical generation still differs by its
+          # instruction stream and by GTPU_COUNTERS width, so a current-object
+          # fixture cannot stand in for its byte authority.
+          readelf -sW "${current_path}" | awk '$4 == "OBJECT" && $8 ~ /^GTPU_/ {print $8}' | sort > current.maps
+          comm -23 pre-redirect.maps current.maps > removed-pre-redirect.maps
+          test ! -s removed-pre-redirect.maps
+          comm -13 pre-redirect.maps current.maps > added-after-pre-redirect.maps
+          diff -u \
+            <(printf '%s\n' \
+              GTPU_OBS_EVT GTPU_OBS_FLOW GTPU_OBS_GATE GTPU_OBS_LCK \
+              GTPU_OBS_LOSS GTPU_OBS_REDIR GTPU_OBS_REG GTPU_OBS_SEQ GTPU_SEL_STAMP \
+              GTPU_TFT_DROP GTPU_TFT_FILT GTPU_TFT_META GTPU_TFT_SCHEMA) \
+            added-after-pre-redirect.maps
           # The whole guard rests on these being different programs. Byte
           # equality with the current object would make the historical-upgrade
           # tests vacuous while still passing.
@@ -767,13 +836,17 @@ jobs:
             # Private verifier-bounded subprograms retain local linkage. Rust
             # therefore gives them v0-mangled symbols whose crate-disambiguator
             # prefixes can differ across source roots. Normalize only that
-            # non-ABI prefix while preserving the complete module/function
-            # suffix, then require every packet-path helper explicitly below.
+            # non-ABI prefix and LLVM's content-addressed anonymous-object
+            # suffix while preserving the complete module/function suffix,
+            # then require every packet-path helper explicitly below. Exact
+            # functional section bytes and relocation locations remain gated
+            # separately below.
             readelf -sW "$1" | awk '
               $4 == "FUNC" || $4 == "OBJECT" {
                 name = $8
                 gsub(/C[^_]+_17opc_gtpu_datapath/, "C<crate>_17opc_gtpu_datapath", name)
                 gsub(/C[^_]+_20opc_gtpu_ebpf_common/, "C<crate>_20opc_gtpu_ebpf_common", name)
+                gsub(/anon\.[[:xdigit:]]+\.0/, "anon.<hash>.0", name)
                 print $4, name
               }
             ' | sort
@@ -785,20 +858,39 @@ jobs:
           for symbol in opc_gtpu_uplink opc_gtpu_downlink \
             checksum_loop_chunk parse_downlink authorize_and_decap_legacy_downlink \
             handle_downlink_ipv6 parse_downlink_ipv6 ipv6_udp_offset \
-            software_ipv6_udp_checksum_is_valid walk_ipv6_extension_step \
+            software_ipv6_udp_checksum_is_valid ipv6_udp_pseudo_sum \
+            walk_ipv6_extension_step \
             grouped_uplink_authority grouped_downlink_authority decap_grouped_downlink \
-            encapsulate_grouped_ipv4 encapsulate_grouped_ipv6 \
+            encapsulate_grouped_ipv4 prepare_grouped_ipv6_encapsulation \
+            encapsulate_grouped_ipv6 \
             checksum_bytes_are_materialized select_gtpu_session_entry_wire \
-            wire_address_is_canonical apply_uplink_mtu_policy \
+            authority_slots_are_canonical entry_wire_is_canonical bytes_80_are_zero \
+            apply_uplink_mtu_policy \
+            handle_grouped_downlink_ipv4 \
+            validated_observation_icmp_echo \
+            authenticate_observation_icmp_echo checksum_skb_region checksum_packet_chunk \
+            observation_icmp_checksum_40_is_valid observation_icmpv6_checksum_is_valid \
+            rewrite_authenticated_observation_icmp_echo_request \
+            emit_grouped_observation \
+            publish_grouped_observation_event \
+            emit_grouped_uplink_observation_on_reentry \
+            encoded_is_valid validate_ipv4_downlink_binding_wire \
+            constant_time_difference_16 siphash128_from_registration_sample \
             pdp_commit_wire_is_valid pdp_commit_wire_authorizes_graph \
             marked_owner_wire_authorizes_uplink pdp_commit_wire_authorizes_downlink \
-            marked_owner_wire_authorizes_downlink \
+            marked_owner_wire_authorizes_downlink classify_tft_filter_step \
             GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP \
             GTPU_UL_SPORT GTPU_ULM_SPORT GTPU_PMTU_CFG GTPU_PMTU_DROP \
             GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_DL_BIND GTPU_DL_DROP \
             GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG GTPU_SESSIONS \
-            GTPU_UL_INDEX GTPU_DL_INDEX GTPU_SESS_TXN GTPU_SCHEMA6 GTPU_CONFIG6; do
-            grep -Eq "( |[[:digit:]])${symbol}$" committed.inventory
+            GTPU_UL_INDEX GTPU_DL_INDEX GTPU_SESS_TXN GTPU_SCHEMA6 GTPU_CONFIG6 \
+            GTPU_OBS_REG GTPU_OBS_REDIR GTPU_OBS_EVT GTPU_OBS_LOSS GTPU_OBS_SEQ \
+            GTPU_OBS_GATE GTPU_OBS_LCK GTPU_OBS_FLOW \
+            GTPU_SEL_STAMP \
+            GTPU_TFT_SCHEMA GTPU_TFT_META GTPU_TFT_FILT GTPU_TFT_DROP; do
+            grep -Eq \
+              "( |[[:digit:]])${symbol}((Kb[01]|Kj(4|8|10|20|40))_EB[[:digit:]]+_)?$" \
+              committed.inventory
           done
 
           functional_section_names() {
@@ -859,6 +951,7 @@ jobs:
                 }
                 gsub(/_RNvC[^_]+_17opc_gtpu_datapath/, "_RNvC<crate>_17opc_gtpu_datapath", line)
                 gsub(/_RNvC[^_]+_20opc_gtpu_ebpf_common/, "_RNvC<crate>_20opc_gtpu_ebpf_common", line)
+                gsub(/anon\.[[:xdigit:]]+\.0/, "anon.<hash>.0", line)
                 print line
               }
             '

@@ -104,9 +104,11 @@ closes the queue and lets the detached actor drain without blocking `Drop`.
   authenticates `XfrmObjectInstallRecoveryStore` on the namespace actor before
   returning any mutation-capable backend handle. The store keeps value-free
   operation records under a permanent filesystem lease, while
-  `run_durable_object_install`,
+  `prepare_durable_object_install`, `run_durable_object_install`,
   `finalize_durable_object_install`, and `recover_durable_object_install`
-  serialize the corresponding kernel mutation through the namespace actor.
+  serialize preparation, effect admission, and recovery through the namespace
+  actor. Running the effect requires consuming the opaque authority returned by
+  preparation; there is no combined prepare-and-effect entrypoint.
   This boundary supplements rather than changes the process-local
   `XfrmStagedObjectInstall` cancellation and classification API.
 - `InstalledOutboundSaBinding` is an opaque, unforgeable direction authority
@@ -148,44 +150,105 @@ namespace outside the retained epoch.
 
 The required ordering after that atomic bind is:
 
-1. Persist the consumer's poll-admitted record and operation correlation.
-2. Call `run_durable_object_install`. It publishes `Prepared` before actor
-   mutation admission, then durably publishes `Acquired`, `NoMutation`, or
-   `Indeterminate` before returning that outcome.
-3. Durably record the consumer decision. If an acquired object is adopted,
+1. Call `prepare_durable_object_install` with the retained operation ID,
+   generation, and complete request. It durably publishes authenticated
+   `Prepared` truth and returns a non-cloneable
+   `XfrmObjectInstallAdmissionAuthority`. No backend effect has been admitted
+   when this call returns.
+2. Durably commit the consumer's poll-admitted transition.
+3. Pass the authority to `run_durable_object_install`. After the deferred-DSCP
+   gate, the actor performs an exact readback of the deletion identity and
+   embeds the witnessed presence (`Absent` or `Conflict`) as a durable
+   pre-effect proof in the same authenticated record, then publishes
+   `Issuing`. An `Absent` proof permits the actor-serialized backend effect;
+   a `Conflict` proof admits no effect and proceeds directly to `NoMutation`,
+   because an SA may expire autonomously after readback. The method durably
+   publishes `Acquired`, `NoMutation`, or `Indeterminate` before returning its
+   outcome. Two pre-consumption rejections return the same authenticated
+   authority and retain `Prepared` for an exact retry: a deferred DSCP
+   activation gate, and a pre-effect readback that could not be trusted
+   (reported as `xfrm_object_install_pre_effect_readback_failed`).
+4. Durably record the consumer decision. If an acquired object is adopted,
    call `finalize_durable_object_install` only after that adoption is durable.
    Finalization surrenders cleanup authority and leaves the object installed.
-4. After restart, consult the consumer record. Finalize an adoption that was
+5. After restart, consult the consumer record. Finalize an adoption that was
    already committed; otherwise call `recover_durable_object_install` with the
    exact retained operation ID, generation, and request. Recovery retires a
-   definitive no-mutation result without removal and removes only residue with
-   authenticated, current `Acquired` authority.
+   definitive no-mutation result without removal, removes only residue with
+   authenticated, current `Acquired` authority, and additionally reconciles
+   `Issuing` and `Indeterminate` records using their pre-effect proof.
 
-Once admitted, dropping the observing future does not cancel actor work. A
-retry uses the same operation ID, generation, and request; inventing new
-correlation is not reconciliation. A crash while an install is merely
-`Issuing`, including after a kernel acknowledgement but before terminal record
-publication, is deliberately indeterminate and authorizes no deletion. Missing,
-malformed, duplicated, unauthenticated, stale, wrong-request,
-wrong-namespace, or wrong-incarnation state likewise fails closed. An
-`AlreadyExists` acknowledgement becomes durable `NoMutation` and never
-authorizes removal.
+A crash after preparation, whether before or after the consumer commits poll
+admission, leaves authenticated `Prepared` truth. Restart recovery retires that
+record as authoritative no-mutation and performs no `DELSA` or `DELPOLICY`.
+Dropping an unsubmitted authority has the same recovery result. While
+registered, a live authority intentionally blocks same-process retirement;
+dropping it, losing the process, or losing a preparation reply leaves the
+durable record recoverable. An independently admitted actor mutation
+invalidates every prepared authority before its backend effect. Once the run
+command is admitted to the actor, dropping the observing future does not cancel
+its work.
+
+The authority is process-local, non-serializable, and bound to the exact open
+store, namespace actor, operation ID, generation, and complete request. A
+duplicate preparation, replay, stale phase, wrong request, wrong store, or
+presentation to another actor fails before the backend. Each new preparation
+receives a fresh live actor seal, so retiring and recreating the same durable
+correlation cannot revive an old admission authority. Missing, malformed,
+duplicated, unauthenticated, wrong-namespace, or wrong-incarnation state
+remains fail-closed. Callers reconcile a lost run result from the durable
+record; they do not invent new correlation or bypass the authority boundary.
+
+A crash after durable `Issuing` — before the syscall, after a kernel
+acknowledgement but before terminal publication, or after an indeterminate
+backend result — leaves an `Issuing` or `Indeterminate` record that carries
+the pre-effect proof. `recover_durable_object_install` reconciles it by
+combining that proof with a fresh exact readback of the deletion identity
+(`GETSA` for an SA, exact `GETPOLICY` for a policy). Because the writer gate
+excluded every other cooperating writer for the whole time the record stayed
+unresolved, the proof plus the current presence is a complete classification:
+
+| Readback | Pre-effect proof | Verdict | Deletion |
+| --- | --- | --- | --- |
+| absent | `Absent` | effect provably never happened | none; retired no-mutation |
+| present | `Absent` | residue can only be this operation's | exact removal; `owned_residue_retired` |
+| present | `Conflict` | witnessed foreign identity; no install was attempted | none; `foreign_untouched` |
+| absent | `Conflict` | prior conflict is gone; no install was attempted | none; retired no-mutation |
+| unreadable | either | retryable; record unchanged | none; `indeterminate` |
+| stale epoch / missing proof | either | durable anomaly, product repair | none; `repair_required` |
+
+Retained intent or a matching readback alone is never deletion authority: the
+owned-residue verdict additionally requires the `Absent` proof, an
+epoch-current record, and exact binding re-validation. An `AlreadyExists`
+acknowledgement still becomes durable `NoMutation` and never authorizes
+removal. Recovery is idempotent after a record retires, and a retryable
+outcome leaves the record gating until it converges.
 
 Linux has no owner- or generation-conditional `DELSA` or `DELPOLICY`. The
 store therefore implements a cooperating-writer protocol: an unresolved
-`Acquired` or `RemovalAdmitted` record blocks every later mutation admitted by
-that namespace actor, including ordinary `XfrmBackend` operations, until it is
-finalized or recovered. Entering `Issuing` and every independent actor mutation
-burns a durable global writer epoch. `Acquired` already holds the writer gate,
-so publishing `RemovalAdmitted` stays at that current epoch before deletion and
-has no ambiguous half-advanced epoch crash cut. A scoped policy recovery
-additionally proves the exact
-nonzero `XFRMA_IF_ID` with `GETPOLICY` before deletion. These guarantees do not
-exclude another raw-netlink socket, another namespace actor with a different
-store, or packet/product activity outside this protocol. A deployment must use
-one store and one cooperating writer domain for all XFRM identity mutations in
-the namespace; violating that exclusion can let an unconditional delete race a
-same-identity replacement.
+`Issuing`, `Indeterminate`, `Acquired`, or `RemovalAdmitted` record blocks
+every later cooperating mutation admitted by that namespace actor — including
+ordinary `XfrmBackend` operations, new preparation, and any other
+`Prepared -> Issuing` transition — until it is finalized or recovered.
+Entering `Issuing` and every independent actor mutation burns a durable global
+writer epoch. Prepared authority remains actor-local and one-shot; the
+current-epoch deletion check applies to `Acquired` and `RemovalAdmitted`, and
+the same epoch-currency predicate guards `Issuing`/`Indeterminate`
+reconciliation. `Acquired` already holds the writer gate, so publishing
+`RemovalAdmitted` stays at that current epoch before deletion and has no
+ambiguous half-advanced epoch crash cut. A scoped policy recovery additionally
+proves the exact nonzero `XFRMA_IF_ID` with `GETPOLICY` before deletion. These
+guarantees do not exclude another raw-netlink socket, another namespace actor
+with a different store, or packet/product activity outside this protocol. A
+deployment must use one store and one cooperating writer domain for all XFRM
+identity mutations in the namespace; violating that exclusion can let an
+unconditional delete race a same-identity replacement.
+
+Durable records use format version 2, which carries the pre-effect proof in a
+byte that version 1 reserved as zero. Version 1 records fail closed as
+malformed; there is no compatibility path, migration bridge, or
+unconditional-delete escape hatch. A store that still contains version 1
+records must be repaired out-of-band before recovery is attempted.
 
 As with the process-local staged-object boundary, a durable SA or policy
 removal identity may be unmarked or use only a full-mask lookup mark. A narrow
@@ -214,6 +277,362 @@ relative to the live inventory, but cannot detect a coherent rollback of the
 directory itself. Deployments where such storage rollback is possible must add
 an independent product monotonic witness outside that rollback domain and must
 not recover until it matches; otherwise unconditional deletion is unsafe.
+
+## Durable SA relocation restart recovery
+
+`relocate_sa` is not blindly idempotent after process loss: a crash around the
+single `XFRM_MSG_MIGRATE_STATE` effect can leave kernel state that readback
+can observe but not own, while the outbound block policy (consumer-owned) and
+the namespace-wide writer exclusion must stay fenced until reconciliation.
+MOBIKE makes this a first-class restart case: UPDATE_SA_ADDRESSES changes only
+the outer tunnel-header addresses and UDP-encapsulation port (RFC 4555 §1.1,
+§3.3), one address pair exists per SA at a time so kernel migration is a move,
+not a copy (RFC 4555 §1.2), NAT rebinding may change "IP address and/or port"
+so encapsulation-only same-XfrmId relocation is expected (RFC 4555 §3.8),
+and the initiator detects and recovers from failures, so fail-closed
+cleanup of an unproven move is spec-consistent (RFC 4555 §3.11). Because the
+Linux SAD identity is destination/SPI/protocol (RFC 4301 §4.1; plus lookup
+mark on Linux), an address-changing relocation changes the XfrmId while an
+encapsulation-only relocation does not; the durable boundary witnesses both
+cases. NAT-T context follows RFC 3948.
+
+`LinuxXfrmBackend::bind_current_network_namespace_with_sa_relocation_recovery`
+(or the combined
+`bind_current_network_namespace_with_object_and_sa_relocation_recovery` for
+consumers that also run durable installs) authenticates and permanently leases
+one `XfrmSaRelocationRecoveryStore` on the namespace actor before any
+mutation-capable handle is returned. The store is a separate self-contained
+record family (`OPCXRLC1`, format version 1 with the pre-effect proof byte
+present from version 1); it shares no records or compatibility path with the
+staged-object store.
+
+The required ordering after that atomic bind is:
+
+1. Call `prepare_sa_relocation` with the retained operation ID, generation,
+   and complete `RelocateSaRequest`. It durably publishes authenticated
+   `Prepared` truth and returns a non-cloneable
+   `XfrmSaRelocationAdmissionAuthority`. No backend effect has been admitted
+   when this call returns.
+2. Durably commit the consumer's poll-admitted transition.
+3. Pass the authority to `run_durable_sa_relocation`. After the deferred-DSCP
+   gate, the actor performs exact `GETSA` readbacks of the old and target
+   identities and embeds the witnessed target disposition as a durable
+   pre-effect proof in the same authenticated record, publishes `Issuing`,
+   and only then admits the single `relocate_sa` effect. The method durably
+   publishes `Relocated`, `NoMutation`, or `Indeterminate` before returning
+   its outcome. Pre-consumption rejections return the same authenticated
+   authority and retain `Prepared` for an exact retry when they are proved
+   and deterministic: a deferred DSCP activation gate, a present target
+   identity (`xfrm_sa_relocation_target_conflict`), and an untrustworthy
+   readback (`xfrm_sa_relocation_pre_effect_readback_failed`). A mismatching
+   current state consumes the authority
+   (`xfrm_sa_relocation_current_state_mismatch`); the retained `Prepared`
+   record recovers as authoritative no-mutation.
+4. Durably record the consumer decision. There is no finalize/adoption call:
+   a terminal `Relocated` record is the durable proof that the consumer
+   continues on the new addresses.
+5. After restart, call `recover_durable_sa_relocation` with the exact
+   retained operation ID, generation, and request.
+
+The pre-effect proof is witnessed immediately before `Prepared -> Issuing`:
+
+| Relocation shape | Proof | Meaning |
+| --- | --- | --- |
+| changed XfrmId (address change) | `TargetAbsent` | the distinct target identity was absent when the effect was admitted |
+| unchanged XfrmId (encap/source only) | `SameIdentityWitnessed` | the shared identity matched the bound current identity when the effect was admitted |
+
+Recovery of an unresolved `Issuing`/`Indeterminate` record revalidates the
+binding, requires a current writer epoch and a proof consistent with the bound
+request, and classifies fresh exact readbacks. With `OLD-INTACT` meaning the
+old identity is present exactly matching the bound current identity, and
+`TARGET-RELOCATED` meaning the target identity matches the bound current
+identity with the relocated destination, new source, and resulting
+encapsulation:
+
+Different identities (`TargetAbsent`):
+
+| Old readback | Target readback | Verdict | Recovery outcome | Deletion |
+| --- | --- | --- | --- | --- |
+| intact | absent | effect provably never happened | `no_mutation` (retired) | none |
+| intact | present (any) | atomic move cannot duplicate | `foreign_untouched` | none |
+| absent | TARGET-RELOCATED | move happened, never published | `owned_residue_retired` | exact `DELSA` of the target identity |
+| absent | foreign/present-other | foreign | `foreign_untouched` | none |
+| absent | absent | foreign removal/expiry; mutation history is unknown | `state_absent` | none |
+| foreign | any | foreign | `foreign_untouched` | none |
+| unreadable | any unreadable | retryable; record unchanged | `indeterminate` | none |
+| stale epoch / missing or inconsistent proof | durable anomaly | `repair_required`, record keeps gating | none |
+
+Same identity (`SameIdentityWitnessed`), one readback of the shared identity:
+
+| Readback | Verdict | Recovery outcome | Deletion |
+| --- | --- | --- | --- |
+| matches bound current | never happened | `no_mutation` (retired) | none |
+| matches relocation expectation | happened | `owned_residue_retired` | exact `DELSA` of the same identity |
+| matches neither | foreign | `foreign_untouched` | none |
+| absent | foreign removal/expiry; mutation history is unknown | `state_absent` | none |
+| unreadable | retryable; record unchanged | `indeterminate` | none |
+
+Recovery deletes only through the exact target deletion identity
+(new destination, SPI, protocol, and lookup mark) after publishing
+`RemovalAdmitted`; a failed removal stays `removal_pending` and retryable
+across restart. Recovery is idempotent after a record retires, returns terminal
+`Relocated` or `StateAbsent` proof without ever deleting after terminal
+publication, and a retryable outcome leaves the record gating until it
+converges. `StateAbsent` is intentionally distinct from `NoMutation`: absence
+cannot prove whether the move happened before external removal or expiry.
+Terminal idempotence holds only until the next cooperating write prunes the
+terminal record; once pruned, restore fails `NotFound`.
+
+Linux has no owner- or generation-conditional `DELSA`. The store therefore
+implements a cooperating-writer protocol: every unresolved relocation phase —
+`Prepared`, `Issuing`, `Indeterminate`, and `RemovalAdmitted` — blocks every
+later cooperating mutation admitted by that namespace actor, including
+ordinary `XfrmBackend` operations and new preparation, until recovery retires
+the record. A prepared-but-unrecovered relocation reserves the namespace: the
+relocation fencing holds while recovery authority and protocol egress remain
+fenced. Entering `Issuing` and every independent actor mutation burns a
+durable global writer epoch. Relocation `Prepared` and every effect-capable
+record in either family gate the other family. Object `Prepared` is
+metadata-only and may coexist with a prepared relocation; a relocation run
+advances the object epoch and invalidates all older object admissions before
+kernel access. Every object run is first gated by unresolved relocation
+authority and advances the relocation epoch before kernel access. Each
+admitted mutation advances both epochs.
+Metadata-only recovery remains the escape from its own gate. A recovery phase
+that may issue exact cleanup also respects the other durable family's gate and
+advances that family's epoch before kernel access. These guarantees do not
+exclude another raw-netlink socket, another namespace actor with a different
+store, or packet/product activity outside this protocol; a deployment must use
+one cooperating writer domain for all XFRM identity mutations in the namespace.
+
+Relocation records carry only opaque operation correlation, phase, proof code,
+incarnation, epoch, and independent proof-keyed fingerprints of the exact
+deletion identity and complete relocation request. No address, selector, SPI,
+mark, encap port, namespace identity, request body, or operation identity is
+rendered; handles, outcomes, errors, and diagnostics are value-free. The
+store root, proof-key, lease, and non-rollback obligations match the durable
+staged-object boundary. Relocation records use format version 1 with the
+pre-effect proof byte present from version 1; there is no compatibility path,
+migration bridge, legacy fallback, or unconditional-delete escape hatch.
+
+## Durable grouped object roster restart recovery
+
+One protected flow usually needs several dependency-ordered XFRM objects at
+once — an inbound SA, its inbound and forward policies, an outbound SA, and its
+outbound policy. Driving those through the single-object boundary costs one
+durable admission and one finalization per object, so the consumer waits on
+five independent durable lifecycles before it can report success. The roster
+boundary makes the whole ordered group one durable record, one namespace-actor
+command, one queue permit, and one writer-epoch burn, with the same
+crash-recovery contract.
+
+`LinuxXfrmBackend::bind_current_network_namespace_with_object_roster_recovery`
+is the recommended constructor: it authenticates and permanently leases one
+`XfrmObjectRosterRecoveryStore` (`OPCXROS1` records under family-distinct
+`OPCXRSC1`/`OPCXRSE1` control and epoch magics) on the namespace actor before
+any mutation-capable handle is returned.
+`bind_current_network_namespace_with_object_sa_relocation_and_roster_recovery`
+binds all three durable families for consumers that still run single-object
+installs or SA relocations; it is the opt-in migration form, not the default,
+because every ordinary mutation then scans and fsyncs three stores.
+
+The required ordering after that atomic bind is:
+
+1. Validate the group with `XfrmObjectRosterRequest::new`, passing up to
+   `XFRM_OBJECT_ROSTER_MAX_MEMBERS` (8) `XfrmObjectRosterMemberRequest` values
+   in the caller-declared apply order. Construction is the only place member
+   admissibility is decided — exact removal identity, no shared deletion
+   identity, no shared caller-supplied durable member identity, and no
+   collision in the kernel's own coarse selection relation; it returns a
+   value-free `XfrmObjectRosterRequestError` and contacts no backend.
+2. Call `prepare_durable_object_roster` with the retained
+   `XfrmObjectRosterGroupId`, a nonzero `XfrmObjectRosterOperationGeneration`,
+   and that roster. It publishes one authenticated `Prepared` record binding
+   the group identity, every member's durable identity and generation, and a
+   keyed ordered digest over the whole member tuple, then returns a
+   non-cloneable `XfrmObjectRosterAdmissionAuthority`. No backend effect has
+   been admitted when this call returns, and a `Prepared` roster has no effects
+   to recover, so it does not itself fence cooperating writers.
+3. Durably commit the consumer's poll-admitted transition.
+4. Pass the authority to `run_durable_object_roster`. One actor command runs
+   the deferred-DSCP preflight for every SA member, sweeps every member's exact
+   identity read-only, burns the roster's single writer epoch on
+   `Prepared -> Issuing`, and then applies members in order, publishing each
+   member's adjacent absence proof *before* that member's effect. Three proved
+   pre-effect rejections return the exact authority through
+   `XfrmObjectRosterRunError::into_retry_authority`: a closed
+   cooperating-writer gate (`xfrm_object_roster_gated` — an unresolved
+   single-object install, an unresolved SA relocation, or an unresolved sibling
+   roster in the same store), a still-closed deferred DSCP gate
+   (`xfrm_object_roster_dscp_activation_required`), and an untrusted sweep
+   readback (`xfrm_object_roster_pre_effect_readback_failed`). The gated
+   rejection is screened before anything at all is consumed, so it is a
+   transient block that succeeds later with that very same authority.
+5. Durably record the consumer decision, then call
+   `finalize_durable_object_roster` only after adoption is durable. `Applied`
+   becomes `Committed` with every member slot preserved as acquired. This leaves
+   one terminal idempotence record, not unresolved cleanup authority; the next
+   cooperating prepare or epoch advance deterministically prunes it.
+6. After restart, call `adopt_durable_object_roster` or
+   `recover_durable_object_roster` for every retained roster **before any other
+   namespace mutation**. An intervening ordinary mutation burns the writer
+   epoch that every adjacent absence proof depends on, and the roster then
+   reports `repair_required` with the record retained and nothing deleted.
+
+The SDK imposes no deadline. A roster collapses N consumer deadline scopes into
+one, so a caller times the group rather than the members, and a caller-side
+timeout does not stop the actor: once admitted, the command runs to a durable
+terminal record even if the observing future is dropped. The correct action
+after a caller-side timeout is adoption or recovery, never a replay.
+
+Roster recovery's `Absent`-then-present cleanup rule requires the deployment to
+exclude raw-netlink and independently stored XFRM writers for the namespace.
+The SDK writer epoch orders cooperating actor writes only; it does not fence an
+external writer. If that exclusion is violated, an identical object is
+observationally ambiguous after a crash, and Linux's unconditional delete could
+remove the external writer's object.
+
+### Ordered apply and reverse compensation
+
+Ordinal zero is applied first and compensated last. For a five-member roster:
+
+| Ordinal | Member | Apply position | Compensation position |
+| --- | --- | --- | --- |
+| 0 | inbound SA | 1st | 5th |
+| 1 | inbound policy | 2nd | 4th |
+| 2 | inbound forward policy | 3rd | 3rd |
+| 3 | outbound SA | 4th | 2nd |
+| 4 | outbound policy | 5th | 1st |
+
+Any member result other than a clean acquisition diverts the whole group. The
+observed mutating call log is the applied prefix — up to and including the
+install that diverted the group — followed by the exact reverse of whatever was
+actually acquired. The read-only sweep and adjacent readbacks are omitted from
+the table below; the sweep alone is one `query_*` per member.
+
+| Divergence | Mutating backend calls | Terminal phase | Outcome |
+| --- | --- | --- | --- |
+| sweep proves a conflict at any ordinal | none | `NoMutation` | `no_mutation`, dispositions name the conflicting ordinals |
+| ordinal 0 witnesses an adjacent conflict | none | `NoMutation` | `no_mutation` |
+| ordinal 0 fails, or returns `AlreadyExists` | install 0 | `RolledBack` | `rolled_back`, `failed_member` 0, zero acquisitions and zero removals |
+| ordinal 3 fails after 0-2 acquired | install 0, 1, 2, 3, then remove 2, 1, 0 | `RolledBack` | `rolled_back`, `failed_member` 3 |
+| ordinal 4 returns `AlreadyExists` | install 0-4, then remove 3, 2, 1, 0 | `RolledBack` | `rolled_back`, `failed_member` 4 |
+| a compensation removal fails | applied prefix, partial reverse | stays `Compensating` | `indeterminate`, record retained and gating |
+| every member acknowledged | install 0-4 | `Applied` | `applied`, awaiting finalize |
+
+The failing member's own install IS issued in the two failure rows: on a real
+kernel that is a `XFRM_MSG_NEWSA`/`NEWPOLICY` message the kernel rejects, not a
+call that never happened. `rolled_back` therefore does not imply that any
+kernel object was created and then removed — at ordinal 0 the compensated
+prefix is empty.
+
+`AlreadyExists` from a member install under an `Absent` adjacent proof records
+that member as no-mutation and **fails** the roster, deliberately diverging
+from the single-object family's `AlreadyExists` success semantics. A
+dependency-ordered roster must not report success when one leg is a foreign
+object of unknown parameters: RFC 7296 §1.3/§2.8 give a partial Child SA
+installation no wire representation, and RFC 4301 §4.4 treats the SPD and SAD
+entries of one protected flow as a single consistent unit. The foreign object
+is never deleted, at any phase, regardless of proof codes — deletion authority
+for a member additionally requires its own `Absent` adjacent proof, an
+epoch-current record, and exact binding re-validation.
+
+Every outcome and every restart verdict carries
+`XfrmObjectRosterMemberDispositions`: a value-free per-member ordinal plus the
+member's durable state as closed enums — `XfrmObjectRosterMemberPhase`,
+`XfrmObjectRosterSweepProof`, and `XfrmObjectRosterAdjacentProof` — so a
+consumer branching on member state gets compiler-checked exhaustiveness. The
+`&'static str` label accessors remain as logging conveniences over the same
+values.
+`XfrmObjectRosterRecoveryStore::inspect_dispositions` re-authenticates a
+retained `XfrmObjectRosterRecoveryHandle` against this exact lease, group
+identity, generation, and member set before yielding the same descriptor; it
+publishes nothing and authorizes no deletion.
+
+### Adopting against recovering after process loss
+
+| Situation | Call |
+| --- | --- |
+| Record is `Applied` and the consumer's bookkeeping can still accept the group | `adopt_durable_object_roster` |
+| Record is `Applied` but the consumer already gave up on the group | `recover_durable_object_roster` |
+| Caller-side deadline expired while the actor converged | adopt first, recover if refused |
+| Record is `Prepared`, `Issuing`, `Compensating`, `NoMutation`, or `RolledBack` | recover; adoption refuses |
+| Record is `Committed` or `Retired` | either; both report it idempotently |
+
+Adoption is additive and never deletes. It re-authenticates the binding,
+incarnations, member digest, and epoch currency, reads every member back
+exactly, and publishes `Applied -> Committed` only when every acquired member
+is present. Otherwise it publishes nothing, leaves the record `Applied` with
+the writer gate closed, and reports `adoption_refused` so the consumer can
+still choose recovery. A refusal decided by an unresolved `Issuing` or
+`Compensating` phase costs nothing across families: the namespace actor screens
+those phases before it fences the other two durable stores, so using adoption
+as a probe cannot burn their writer epochs or invalidate a prepared
+single-object install or SA relocation authority. Only an `Applied` record,
+which adoption can actually commit, carries recovery's full fencing cost. Recovery classifies each unresolved member from its own
+adjacent proof plus a fresh exact readback — there is no conflict shortcut, a
+member that never entered its effect window is never deleted, and a member that
+witnessed a foreign object is left exactly as found (`foreign_untouched`) —
+then reverse-compensates the acquired prefix. A prepared roster retires as
+authoritative no-mutation without any backend call; an unfinalized `Applied`
+roster is owned residue and is removed in reverse order
+(`owned_residue_retired`). A failed removal stays `removal_pending`, an
+untrustworthy readback stays `indeterminate`, and a stale writer epoch under an
+unresolved roster reports `repair_required`; all three retain the record and
+keep the writer gate closed until the product converges them.
+
+### Migration and cross-family fencing
+
+An unresolved roster fences single-object durable installs and durable SA
+relocations, and an unresolved install or relocation fences rosters. That
+coupling is deliberately fail-closed in both directions: a roster store that is
+malformed, unreadable, or over full therefore fails single-object installs
+closed too. A migrating consumer binds all three stores and uses either one
+roster or the equivalent single-object operations for a given protected flow,
+never both interleaved for the same flow. A half-migrated consumer is
+serialized by the gates rather than corrupted, but each family then waits for
+the other's resolution; consumers that have finished migrating should move back
+to the roster-only constructor.
+
+Because each family's recovery is itself gated on the other bound families, a
+namespace that starts up already holding an unresolved record in *two* families
+cannot recover either one while all three stores are bound. Running operations
+never produce that state, but changing the bound store set across restarts can.
+The escape is to bind only the family being recovered, run its recovery to a
+terminal verdict, drop that backend, repeat for the next family, and only then
+rebind the full set. That deletes, reorders, and replays nothing: it only lifts
+the mutual gate while each recovery re-authenticates its own record and epoch.
+
+### Kernel-proven notes
+
+`XfrmObjectRosterRequest::new` rejects two members that share the kernel's
+coarse selection key — the same destination, protocol, and SPI for SAs
+regardless of mark, or the same selector, direction, and interface ID for
+policies — with `AmbiguousKernelSelection`. That rule mirrors kernel truth
+rather than guarding a durable invariant: on Linux 6.19.14, adding an unmarked
+SA and then a full-mask marked SA at the same destination, protocol, and SPI is
+refused outright by the kernel at insert with `EEXIST` ("File exists"), leaving
+the first SA untouched. A roster that admitted such a pair would install one
+member and then fail the other. Only a real kernel witnesses this: the mock
+backend keys on the whole request and accepts both members happily.
+
+When verifying roster state by hand, use the plain listings
+(`ip xfrm state list`, `ip xfrm policy list`). Some supported iproute2 builds,
+6.12 among them, ignore `-j` for `ip xfrm` and render numeric attributes as
+hexadecimal text, so a JSON parser cannot be relied on for these objects.
+
+Roster records are fixed size, carry `XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES`
+of authenticated handle material, and retain only opaque group and member
+correlation, group and member phases, sweep and adjacent proof codes,
+incarnations, the publication sequence, the writer epoch, and independent
+proof-keyed fingerprints of each member's exact deletion identity and complete
+install request. No address, selector, SPI, mark, interface ID, request body,
+or key material is persisted or rendered, so the consumer must durably retain
+every complete member request, including key material, to adopt or recover.
+`XFRM_OBJECT_ROSTER_MAX_MEMBERS` is a wire-format bound: raising it changes the
+record size and is a format break with no compatibility path. The store root,
+proof-key, lease, and non-rollback obligations match the durable staged-object
+boundary, and handles, outcomes, errors, and diagnostics are value-free.
 
 ## Opaque outbound-SA binding
 
@@ -822,6 +1241,48 @@ let backend = LinuxXfrmBackend::with_dscp_marking(marking)?;
 # Ok::<(), opc_ipsec_xfrm::XfrmError>(())
 ```
 
+When another external egress authority must become active before the
+companion, retain the same validated configuration without effects and
+activate it later on the namespace actor:
+
+```rust,no_run
+use opc_ipsec_xfrm::{LinuxXfrmBackend, LinuxXfrmDscpMarkingConfig};
+
+# async fn example() -> Result<(), opc_ipsec_xfrm::XfrmError> {
+let marking = LinuxXfrmDscpMarkingConfig::new([String::from("swu0")], 25)?;
+
+// Validation and retention only: no eBPF load/pin, tc creation/attachment,
+// or live companion adoption occurs here or during namespace binding.
+let backend = LinuxXfrmBackend::with_deferred_dscp_marking(marking)?
+    .bind_current_network_namespace()?;
+
+// Establish the external egress authority here.
+backend.activate_dscp_marking().await?;
+# Ok(())
+# }
+```
+
+`with_config_and_deferred_dscp_marking` provides the same boundary with a
+custom `LinuxXfrmBackendConfig`. Binding through
+`bind_current_network_namespace_with_object_recovery` likewise opens and
+returns the authenticated durable store without loading, pinning, attaching,
+adopting, or otherwise changing tc/eBPF DSCP state. That path must be ordered
+as durable reconciliation, external egress-authority activation, and then
+`activate_dscp_marking`. Before actor-local activation succeeds, every
+DSCP-bearing SA mutation—including install, rekey, relocation, durable install
+admission, and outbound replay-counter update—fails before XFRM mutation;
+unmarked operations and durable preparation/finalization/recovery remain
+available. A clean durable-admission rejection returns the original authority
+through `XfrmObjectInstallRunError::into_retry_authority`, leaving its record
+at `Prepared` for retry after activation.
+
+Activation is serialized with those operations on the same namespace actor
+and is idempotent after success. A failed attempt does not publish readiness
+and may be retried after the caller establishes that the failure was clean. If
+an activation observer is cancelled before success can be delivered, runtime
+state from that attempt is not readiness authority: marked mutations remain
+closed until a later activation revalidates or adopts it successfully.
+
 The pin root must be a normalized child of `/sys/fs/bpf`. Interface names,
 the tc priority/handle, and the exact seven-bit mask are validated. The CNF
 must reserve the chosen mark window against every output-mark producer and
@@ -834,14 +1295,16 @@ caller still prevents their packet values from accidentally encoding a token
 on an interface where that companion runs. Fixed DSCP is accepted only for
 tunnel-mode ESP SAs.
 
-Construction eagerly attaches or adopts the exact owned tc slot. Every marked
-install/rekey revalidates the live map and filter before sending netlink. The
-netlink filter is deliberately kernel-owned rather than loader-owned, so an
-old process dropping its Aya handles cannot remove a slot already adopted by
-its replacement. Adoption requires the live tc program ID, pinned program ID,
-pinned config-map ID/profile, and the embedded SDK artifact's kernel program
-tag/type/name to match exactly. A stale pre-upgrade or foreign classifier fails
-closed without detaching or replacing the live filter.
+The existing `with_dscp_marking` constructors eagerly attach or adopt the exact
+owned tc slot; the distinct deferred constructors do so only during explicit
+actor-local activation. Every marked install/rekey revalidates the live map and
+filter before sending netlink. The netlink filter is deliberately kernel-owned
+rather than loader-owned, so an old process dropping its Aya handles cannot
+remove a slot already adopted by its replacement. Adoption requires the live
+tc program ID, pinned program ID, pinned config-map ID/profile, and the embedded
+SDK artifact's kernel program tag/type/name to match exactly. A stale
+pre-upgrade or foreign classifier fails closed without detaching or replacing
+the live filter.
 
 Classifier upgrades are intentionally drain-and-replace, not in-place: stop
 all SDK writers for the namespace, drain/remove every marked SA and traffic
@@ -851,11 +1314,13 @@ again. Network-namespace teardown performs that cleanup naturally. Never
 delete the pin or live filter while marked SAs can still emit traffic; this
 implementation does not claim an atomic program-upgrade mechanism.
 
-The probe reports `egress_dscp_marking = Unknown` until exact marked GETSA
-readback proves the stable redaction-safe SA fields and both `XFRMA_SET_MARK`
-attributes; a NEWSA/UPDSA ACK alone is never attribute proof because an older
-kernel may ignore unknown attributes. The ACK linearizes kernel acceptance of
-that request, while the later GETSA observes current state. GETSA deliberately
+The deferred probe does not consult runtime capability before activation and
+reports `egress_dscp_marking = Unknown`. After eager readiness or explicit
+activation, it remains `Unknown` until exact marked GETSA readback proves the
+stable redaction-safe SA fields and both `XFRMA_SET_MARK` attributes; a
+NEWSA/UPDSA ACK alone is never attribute proof because an older kernel may
+ignore unknown attributes. The ACK linearizes kernel acceptance of that
+request, while the later GETSA observes current state. GETSA deliberately
 excludes key material, so it cannot prove cryptographic ownership or exclude a
 later same-identity UPDSA from another writer. The CNF must serialize
 namespace-wide XFRM SA and policy identity mutations and rollback: Linux

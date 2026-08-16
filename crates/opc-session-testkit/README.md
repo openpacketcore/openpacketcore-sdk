@@ -389,8 +389,8 @@ authoritative, and a recovered watcher must still reconcile the bounded durable
 journal before subscribing at `head + 1`.
 
 `qualification/v6/session-ha-profile.json` is the current experimental
-foundation inventory. It binds consensus transport and wire-schema revision 3
-and deterministic error-set revision 5. All earlier v1 through v5 profile and
+foundation inventory. It binds consensus transport and wire-schema revision 4
+and deterministic error-set revision 6. All earlier v1 through v5 profile and
 evidence artifacts remain byte-for-byte frozen; new runtime contract revisions
 receive a new profile namespace instead of rewriting retained qualification
 evidence.

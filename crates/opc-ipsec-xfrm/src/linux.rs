@@ -30,9 +30,14 @@ use zeroize::Zeroizing;
 use crate::dscp::{production_runtime, LinuxXfrmDscpMarkingConfig, XfrmDscpRuntime};
 #[cfg(unix)]
 use crate::durable_object::{XfrmObjectInstallRecoveryStore, XfrmObjectRecoveryProofKey};
+#[cfg(unix)]
+use crate::durable_relocation::{XfrmSaRelocationRecoveryProofKey, XfrmSaRelocationRecoveryStore};
+#[cfg(unix)]
+use crate::durable_roster::{XfrmObjectRosterRecoveryProofKey, XfrmObjectRosterRecoveryStore};
 use crate::model::{
-    sa_uses_esn, validate_exact_remove_policy_request, validate_relocate_sa_request,
-    validate_sa_output_mark, validate_sa_query, ExactRemovePolicyRequest,
+    sa_uses_esn, validate_exact_remove_policy_request, validate_policy_query,
+    validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query,
+    ExactRemovePolicyRequest, QueryPolicyRequest,
 };
 #[cfg(unix)]
 use crate::namespace::XfrmObjectRecoveryBindError;
@@ -64,6 +69,7 @@ const XFRM_USER_SA_ID_LEN: usize = 24;
 const XFRM_USER_POLICY_INFO_LEN: usize = 168;
 const XFRM_USER_POLICY_ID_LEN: usize = 64;
 const XFRM_USER_TEMPLATE_LEN: usize = 64;
+const XFRM_POLICY_TEMPLATE_LIMIT: usize = 6;
 const XFRM_USER_SPI_INFO_LEN: usize = 232;
 const XFRM_USER_MIGRATE_STATE_LEN: usize = 132;
 const XFRM_AEVENT_ID_LEN: usize = 48;
@@ -147,6 +153,8 @@ struct LinuxXfrmBackendInner {
     config: LinuxXfrmBackendConfig,
     dscp_config: Option<LinuxXfrmDscpMarkingConfig>,
     dscp_runtime: Arc<dyn XfrmDscpRuntime>,
+    dscp_activation_deferred: bool,
+    dscp_activation_ready: AtomicBool,
     dscp_xfrm_attributes_verified: AtomicBool,
     sa_relocation_capability: AtomicU8,
     namespace_binding: Option<NetworkNamespaceBinding>,
@@ -195,6 +203,8 @@ impl LinuxXfrmBackend {
                 config,
                 dscp_config: None,
                 dscp_runtime: production_runtime(),
+                dscp_activation_deferred: false,
+                dscp_activation_ready: AtomicBool::new(false),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
                 namespace_binding: None,
@@ -226,6 +236,65 @@ impl LinuxXfrmBackend {
                 config,
                 dscp_config: Some(dscp_config),
                 dscp_runtime: runtime,
+                dscp_activation_deferred: false,
+                dscp_activation_ready: AtomicBool::new(true),
+                dscp_xfrm_attributes_verified: AtomicBool::new(false),
+                sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
+                namespace_binding: None,
+            }),
+        })
+    }
+
+    /// Create a backend that retains validated fixed-DSCP configuration for
+    /// later namespace-bound activation.
+    ///
+    /// This constructor is explicitly effect-free with respect to the DSCP
+    /// runtime: it does not load or pin eBPF objects, create tc state, attach
+    /// programs, or adopt existing programs. The retained companion remains
+    /// fail-closed until [`NamespaceBoundLinuxXfrmBackend::activate_dscp_marking`]
+    /// succeeds on the bound namespace actor. Unmarked XFRM operations and
+    /// durable recovery remain available before activation.
+    pub fn with_deferred_dscp_marking(
+        dscp_config: LinuxXfrmDscpMarkingConfig,
+    ) -> Result<Self, XfrmError> {
+        Self::with_config_and_deferred_dscp_marking(LinuxXfrmBackendConfig::default(), dscp_config)
+    }
+
+    /// Create a custom-config backend with effect-free deferred fixed-DSCP
+    /// activation.
+    ///
+    /// Only validation and in-memory retention occur here. Binding the
+    /// backend, including binding with durable object recovery, also leaves
+    /// tc/eBPF state untouched. Activation is available only through the
+    /// returned namespace-bound backend.
+    pub fn with_config_and_deferred_dscp_marking(
+        config: LinuxXfrmBackendConfig,
+        dscp_config: LinuxXfrmDscpMarkingConfig,
+    ) -> Result<Self, XfrmError> {
+        Self::with_deferred_dscp_components(
+            Arc::new(NetlinkXfrmTransport),
+            config,
+            dscp_config,
+            production_runtime(),
+        )
+    }
+
+    fn with_deferred_dscp_components(
+        transport: Arc<dyn LinuxXfrmTransport>,
+        config: LinuxXfrmBackendConfig,
+        dscp_config: LinuxXfrmDscpMarkingConfig,
+        dscp_runtime: Arc<dyn XfrmDscpRuntime>,
+    ) -> Result<Self, XfrmError> {
+        dscp_config.validate()?;
+        Ok(Self {
+            inner: Arc::new(LinuxXfrmBackendInner {
+                transport,
+                next_sequence: AtomicU32::new(1),
+                config,
+                dscp_config: Some(dscp_config),
+                dscp_runtime,
+                dscp_activation_deferred: true,
+                dscp_activation_ready: AtomicBool::new(false),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
                 namespace_binding: None,
@@ -249,6 +318,8 @@ impl LinuxXfrmBackend {
                 },
                 dscp_config: None,
                 dscp_runtime: production_runtime(),
+                dscp_activation_deferred: false,
+                dscp_activation_ready: AtomicBool::new(false),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
                 namespace_binding: None,
@@ -279,11 +350,35 @@ impl LinuxXfrmBackend {
                 },
                 dscp_config: Some(dscp_config),
                 dscp_runtime: Arc::new(dscp_runtime),
+                dscp_activation_deferred: false,
+                dscp_activation_ready: AtomicBool::new(true),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
                 sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
                 namespace_binding: None,
             }),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_transport_and_deferred_dscp_runtime<T, R>(
+        transport: T,
+        dscp_config: LinuxXfrmDscpMarkingConfig,
+        dscp_runtime: R,
+    ) -> Result<Self, XfrmError>
+    where
+        T: LinuxXfrmTransport + 'static,
+        R: XfrmDscpRuntime + 'static,
+    {
+        Self::with_deferred_dscp_components(
+            Arc::new(transport),
+            LinuxXfrmBackendConfig {
+                receive_attempts: 1,
+                receive_buffer_len: 4096,
+                retry_delay: Duration::ZERO,
+            },
+            dscp_config,
+            Arc::new(dscp_runtime),
+        )
     }
 
     /// Bind this backend to the calling thread's current Linux network
@@ -328,6 +423,168 @@ impl LinuxXfrmBackend {
         namespace::bind_current_network_namespace_with_object_recovery(self, path, proof_key)
     }
 
+    /// Bind to the calling thread's current network namespace and attach its
+    /// durable SA relocation recovery store atomically.
+    ///
+    /// Store authentication and the permanent lease complete on the actor
+    /// thread before any mutation-capable backend handle is returned. Durable
+    /// relocation recovery users must use this constructor on every process
+    /// start so an ordinary SDK mutation cannot occur before the retained
+    /// writer epoch and relocation authority are active.
+    #[cfg(unix)]
+    pub fn bind_current_network_namespace_with_sa_relocation_recovery(
+        self,
+        path: PathBuf,
+        proof_key: XfrmSaRelocationRecoveryProofKey,
+    ) -> Result<
+        (
+            NamespaceBoundLinuxXfrmBackend,
+            XfrmSaRelocationRecoveryStore,
+        ),
+        XfrmObjectRecoveryBindError,
+    > {
+        namespace::bind_current_network_namespace_with_sa_relocation_recovery(self, path, proof_key)
+    }
+
+    /// Bind to the calling thread's current network namespace and attach both
+    /// the durable staged-object recovery store and the durable SA relocation
+    /// recovery store atomically.
+    ///
+    /// Consumers such as an ePDG that run durable installs and durable
+    /// relocations under one namespace actor must bind both stores before any
+    /// mutation-capable handle becomes visible, so the cross-family
+    /// cooperating-writer gate is active from the first operation. The two
+    /// stores must use distinct leased roots.
+    #[cfg(unix)]
+    pub fn bind_current_network_namespace_with_object_and_sa_relocation_recovery(
+        self,
+        object_path: PathBuf,
+        object_proof_key: XfrmObjectRecoveryProofKey,
+        relocation_path: PathBuf,
+        relocation_proof_key: XfrmSaRelocationRecoveryProofKey,
+    ) -> Result<
+        (
+            NamespaceBoundLinuxXfrmBackend,
+            XfrmObjectInstallRecoveryStore,
+            XfrmSaRelocationRecoveryStore,
+        ),
+        XfrmObjectRecoveryBindError,
+    > {
+        namespace::bind_current_network_namespace_with_object_and_sa_relocation_recovery(
+            self,
+            object_path,
+            object_proof_key,
+            relocation_path,
+            relocation_proof_key,
+        )
+    }
+
+    /// Bind to the calling thread's current network namespace and attach its
+    /// durable grouped object roster recovery store atomically.
+    ///
+    /// This is the RECOMMENDED constructor for consumers adopting the grouped
+    /// roster boundary. A consumer that applies every XFRM object of an IKEv2
+    /// Child SA through one roster needs only this store, and binding it alone
+    /// avoids the per-command cross-family scan and fsync cost of the
+    /// all-three constructor.
+    ///
+    /// Store authentication and the permanent lease complete on the actor
+    /// thread before any mutation-capable backend handle is returned. Durable
+    /// roster users must use this constructor on every process start so an
+    /// ordinary SDK mutation cannot occur before the retained writer epoch and
+    /// cleanup authority are active, and must call
+    /// [`NamespaceBoundLinuxXfrmBackend::adopt_durable_object_roster`] or
+    /// [`NamespaceBoundLinuxXfrmBackend::recover_durable_object_roster`] for
+    /// any retained roster before any other namespace mutation.
+    #[cfg(unix)]
+    pub fn bind_current_network_namespace_with_object_roster_recovery(
+        self,
+        path: PathBuf,
+        proof_key: XfrmObjectRosterRecoveryProofKey,
+    ) -> Result<
+        (
+            NamespaceBoundLinuxXfrmBackend,
+            XfrmObjectRosterRecoveryStore,
+        ),
+        XfrmObjectRecoveryBindError,
+    > {
+        namespace::bind_current_network_namespace_with_object_roster_recovery(self, path, proof_key)
+    }
+
+    /// Bind to the calling thread's current network namespace and attach the
+    /// durable staged-object, SA relocation, and grouped object roster recovery
+    /// stores atomically.
+    ///
+    /// This is the opt-in migration constructor, not the default. Use it while
+    /// a deployment still runs single-object installs or SA relocations
+    /// alongside rosters, so the cross-family cooperating-writer gate is active
+    /// from the first operation. The three stores must use distinct leased
+    /// roots.
+    ///
+    /// # Cost
+    ///
+    /// Binding all three stores is not free. Every ordinary namespace mutation
+    /// and every durable admission now scans and fsyncs three stores instead of
+    /// one, and the coupling is deliberately fail-closed in both directions: an
+    /// unresolved roster fences single-object installs and SA relocations, and
+    /// an unresolved install or relocation fences rosters. A roster store that
+    /// is malformed, unreadable, or over full therefore fails single-object
+    /// installs closed too. That is the intended behaviour — a namespace with
+    /// an unreadable durable writer gate must not admit a cooperating mutation
+    /// — but it is a real operational coupling, so consumers that have finished
+    /// migrating should move to
+    /// [`Self::bind_current_network_namespace_with_object_roster_recovery`].
+    ///
+    /// # Migration
+    ///
+    /// Use one roster OR the equivalent single-object operations per Child SA,
+    /// never both interleaved for the same Child SA. A half-migrated consumer
+    /// is serialized by the gates rather than corrupted, but each family then
+    /// waits for the other's resolution.
+    ///
+    /// Each family's recovery is itself gated on the other bound families, so
+    /// a namespace that starts up already holding an unresolved record in TWO
+    /// families cannot recover either one while all three stores are bound:
+    /// each recovery is refused by the other's closed gate, and this is not
+    /// the repair-required path. Running operations never produce that state —
+    /// the run-path gates make it unreachable — but changing the BOUND STORE
+    /// SET across restarts can, for example by leaving an `Applied` roster
+    /// behind while an older single-object `Acquired` record still exists in a
+    /// root this process had stopped binding. The escape is to bind only the
+    /// family being recovered, run its recovery to a terminal verdict, drop
+    /// that backend, then repeat for the next family, and only then rebind the
+    /// full set. No record is deleted, reordered, or replayed by that
+    /// procedure: it only lifts the mutual gate while each recovery runs, and
+    /// every recovery still re-authenticates its own record and epoch.
+    #[cfg(unix)]
+    pub fn bind_current_network_namespace_with_object_sa_relocation_and_roster_recovery(
+        self,
+        object_path: PathBuf,
+        object_proof_key: XfrmObjectRecoveryProofKey,
+        relocation_path: PathBuf,
+        relocation_proof_key: XfrmSaRelocationRecoveryProofKey,
+        roster_path: PathBuf,
+        roster_proof_key: XfrmObjectRosterRecoveryProofKey,
+    ) -> Result<
+        (
+            NamespaceBoundLinuxXfrmBackend,
+            XfrmObjectInstallRecoveryStore,
+            XfrmSaRelocationRecoveryStore,
+            XfrmObjectRosterRecoveryStore,
+        ),
+        XfrmObjectRecoveryBindError,
+    > {
+        namespace::bind_current_network_namespace_with_object_sa_relocation_and_roster_recovery(
+            self,
+            object_path,
+            object_proof_key,
+            relocation_path,
+            relocation_proof_key,
+            roster_path,
+            roster_proof_key,
+        )
+    }
+
     pub(crate) fn for_namespace_actor(self, binding: NetworkNamespaceBinding) -> Self {
         let inner = self.inner;
         Self {
@@ -337,6 +594,10 @@ impl LinuxXfrmBackend {
                 config: inner.config,
                 dscp_config: inner.dscp_config.clone(),
                 dscp_runtime: inner.dscp_runtime.fresh_namespace_runtime(),
+                dscp_activation_deferred: inner.dscp_activation_deferred,
+                // A newly created runtime has no namespace-local readiness
+                // authority, even when the source backend was eagerly ready.
+                dscp_activation_ready: AtomicBool::new(false),
                 // Both observations were made through the source backend's
                 // execution context. They are not authority in a newly bound
                 // namespace, even when the underlying kernel is shared.
@@ -349,13 +610,49 @@ impl LinuxXfrmBackend {
 
     pub(crate) fn prepare_namespace_actor(&self) -> Result<(), XfrmError> {
         self.ensure_namespace_binding()?;
-        if let Some(config) = &self.inner.dscp_config {
-            // DSCP program/map adoption is namespace-scoped too. Repeat the
-            // identity check immediately before entering that runtime.
-            self.ensure_namespace_binding()?;
-            self.inner.dscp_runtime.ensure_ready(config)?;
+        if !self.inner.dscp_activation_deferred {
+            if let Some(config) = &self.inner.dscp_config {
+                // DSCP program/map adoption is namespace-scoped too. Repeat
+                // the identity check immediately before entering that
+                // runtime.
+                self.ensure_namespace_binding()?;
+                self.inner.dscp_runtime.ensure_ready(config)?;
+                self.inner
+                    .dscp_activation_ready
+                    .store(true, Ordering::Release);
+            }
         }
         Ok(())
+    }
+
+    pub(crate) fn dscp_activation_is_ready(&self) -> bool {
+        self.inner.dscp_activation_ready.load(Ordering::Acquire)
+    }
+
+    /// Perform activation effects without publishing mutation readiness.
+    ///
+    /// Publication is deliberately owned by the namespace command so a lost
+    /// activation observer cannot admit a later DSCP-bearing SA mutation.
+    pub(crate) fn prepare_dscp_activation(&self) -> Result<(), XfrmError> {
+        self.ensure_namespace_binding()?;
+        let config = self
+            .inner
+            .dscp_config
+            .as_ref()
+            .ok_or(XfrmError::UnsupportedFeature {
+                feature: "fixed_outer_dscp",
+            })?;
+        if self.dscp_activation_is_ready() {
+            return Ok(());
+        }
+        self.ensure_namespace_binding()?;
+        self.inner.dscp_runtime.ensure_ready(config)
+    }
+
+    pub(crate) fn publish_dscp_activation(&self) {
+        self.inner
+            .dscp_activation_ready
+            .store(true, Ordering::Release);
     }
 
     pub(crate) fn verify_namespace_actor(&self) -> Result<(), XfrmError> {
@@ -369,10 +666,53 @@ impl LinuxXfrmBackend {
         }
     }
 
+    pub(crate) fn ensure_dscp_mutation_activated(
+        &self,
+        parameters: &SaParameters,
+    ) -> Result<(), XfrmError> {
+        if parameters.egress_dscp.is_none() {
+            return Ok(());
+        }
+        if self.inner.dscp_config.is_none() {
+            return Err(XfrmError::UnsupportedFeature {
+                feature: "fixed_outer_dscp",
+            });
+        }
+        if !self.dscp_activation_is_ready() {
+            return Err(XfrmError::Unavailable);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_dscp_relocation_activated(
+        &self,
+        request: &RelocateSaRequest,
+    ) -> Result<(), XfrmError> {
+        let (Some(config), Some(output_mark)) =
+            (&self.inner.dscp_config, request.current.output_mark)
+        else {
+            return Ok(());
+        };
+        let profile = config.profile()?;
+        if output_mark.mask & profile.mask != profile.mask
+            || !matches!(
+                profile.decode_token(output_mark.value),
+                opc_ipsec_xfrm_ebpf_common::MarkToken::Dscp(_)
+            )
+        {
+            return Ok(());
+        }
+        if !self.dscp_activation_is_ready() {
+            return Err(XfrmError::Unavailable);
+        }
+        Ok(())
+    }
+
     fn prepare_dscp(&self, parameters: &SaParameters) -> Result<Option<MarkProfile>, XfrmError> {
         let Some(dscp) = parameters.egress_dscp else {
             return Ok(None);
         };
+        self.ensure_dscp_mutation_activated(parameters)?;
         let config = self
             .inner
             .dscp_config
@@ -614,6 +954,7 @@ impl LinuxXfrmBackend {
         parameters: &SaParameters,
         replay_state: &SaReplayState,
     ) -> Result<(), XfrmError> {
+        self.ensure_dscp_mutation_activated(parameters)?;
         let body = encode_sa_replay_update(parameters, replay_state)?;
         self.run_ack(
             "update_outbound_sa_replay_state",
@@ -881,6 +1222,46 @@ impl XfrmBackend for LinuxXfrmBackend {
         Ok(state)
     }
 
+    async fn query_policy(
+        &self,
+        request: QueryPolicyRequest,
+    ) -> Result<PolicyParameters, XfrmError> {
+        validate_policy_query(&request)?;
+        let body = encode_policy_id(
+            request.selector(),
+            request.direction(),
+            request.mark(),
+            request.if_id(),
+        )?;
+        let response = self
+            .transact_blocking(
+                "query_policy",
+                XFRM_MSG_GETPOLICY,
+                NLM_F_REQUEST | NLM_F_ACK,
+                body,
+            )
+            .await?
+            .ok_or_else(|| {
+                XfrmError::io("query_policy", invalid_data("missing getpolicy response"))
+            })?;
+        let state = parse_policy_state(&response)?;
+        // GETPOLICY may answer with a policy whose identity only overlaps the
+        // request. Prove the exact selector/direction/mark/interface identity
+        // before reporting presence; any deviation means the requested exact
+        // identity is absent.
+        let observed = &state.parameters;
+        let observed_if_id = observed.if_id.filter(|if_id| *if_id != 0);
+        let requested_if_id = request.if_id().filter(|if_id| *if_id != 0);
+        if observed.selector != *request.selector()
+            || observed.direction != request.direction()
+            || observed.mark != request.mark()
+            || observed_if_id != requested_if_id
+        {
+            return Err(XfrmError::NotFound);
+        }
+        Ok(state.parameters)
+    }
+
     async fn query_sa_relocation_identity(
         &self,
         request: QuerySaRequest,
@@ -927,6 +1308,7 @@ impl XfrmBackend for LinuxXfrmBackend {
     }
 
     async fn relocate_sa(&self, request: RelocateSaRequest) -> Result<(), XfrmError> {
+        self.ensure_dscp_relocation_activated(&request)?;
         validate_relocate_sa_request(&request)?;
         let before = self
             .query_sa_for_relocation(
@@ -1069,6 +1451,9 @@ impl XfrmBackend for LinuxXfrmBackend {
                 .dscp_config
                 .as_ref()
                 .map_or(XfrmCapability::Missing, |config| {
+                    if !self.dscp_activation_is_ready() {
+                        return XfrmCapability::Unknown;
+                    }
                     let companion = self.inner.dscp_runtime.capability(config);
                     if companion == XfrmCapability::Available
                         && !self
@@ -1260,6 +1645,7 @@ fn receive_netlink_response(
                     },
                 });
             }
+            Ok(ReceiveMessageOutcome::RejectedNonKernel) => {}
             Err(error)
                 if matches!(
                     error.kind(),
@@ -3072,20 +3458,25 @@ fn parse_policy_state(payload: &[u8]) -> Result<PolicyState, XfrmError> {
         XFRM_USER_POLICY_INFO_LEN,
         XFRMA_TMPL,
         "query_outbound_policy_binding",
-    )?
-    .ok_or_else(|| {
-        XfrmError::io(
-            "query_outbound_policy_binding",
-            invalid_data("missing policy template"),
-        )
-    })?;
-    if templates.len() != XFRM_USER_TEMPLATE_LEN {
-        return Err(XfrmError::io(
-            "query_outbound_policy_binding",
-            invalid_data("policy must contain exactly one template"),
-        ));
-    }
-    let template = decode_exact_template(templates)?;
+    )?;
+    let templates = match templates {
+        None => Vec::new(),
+        Some(encoded) => {
+            if encoded.is_empty()
+                || encoded.len() % XFRM_USER_TEMPLATE_LEN != 0
+                || encoded.len() / XFRM_USER_TEMPLATE_LEN > XFRM_POLICY_TEMPLATE_LIMIT
+            {
+                return Err(XfrmError::io(
+                    "query_outbound_policy_binding",
+                    invalid_data("invalid policy template vector"),
+                ));
+            }
+            encoded
+                .chunks_exact(XFRM_USER_TEMPLATE_LEN)
+                .map(decode_exact_template)
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
     let mark = parse_exact_mark_attribute(
         payload,
         XFRM_USER_POLICY_INFO_LEN,
@@ -3118,7 +3509,7 @@ fn parse_policy_state(payload: &[u8]) -> Result<PolicyState, XfrmError> {
             direction: decode_policy_direction(read_u8(payload, 160)?)?,
             action: decode_policy_action(read_u8(payload, 161)?)?,
             priority: read_u32_ne(payload, 152)?,
-            templates: vec![template],
+            templates,
             mark,
             if_id,
         },
@@ -3893,6 +4284,12 @@ fn is_known_aead_algorithm(name: &str) -> bool {
 
 fn validate_policy_parameters(parameters: &PolicyParameters) -> Result<(), XfrmError> {
     validate_selector_family(&parameters.selector)?;
+    if parameters.templates.len() > XFRM_POLICY_TEMPLATE_LIMIT {
+        return Err(XfrmError::invalid_config(
+            "templates",
+            "policy supports at most six templates",
+        ));
+    }
     if matches!(parameters.action, XfrmAction::Allow) && parameters.templates.is_empty() {
         return Err(XfrmError::invalid_config(
             "templates",
@@ -4336,6 +4733,39 @@ pub(crate) fn test_outbound_binding_readback_bodies(
 }
 
 #[cfg(test)]
+pub(crate) fn test_dscp_sa_readback_body(
+    parameters: &SaParameters,
+    config: &LinuxXfrmDscpMarkingConfig,
+) -> Result<SensitiveBuffer, XfrmError> {
+    encode_sa_info_with_dscp(parameters, Some(config.profile()?))
+}
+
+/// Test-only helper: encode one GETSA relocation readback body and derive
+/// the exact [`SaRelocationIdentity`] it parses to.
+#[cfg(test)]
+pub(crate) fn test_sa_relocation_readback(
+    parameters: &SaParameters,
+) -> Result<(Vec<u8>, SaRelocationIdentity), XfrmError> {
+    let body = encode_sa_info(parameters)?;
+    let snapshot = parse_sa_relocation_snapshot(&body)?;
+    Ok((body.to_vec(), snapshot.identity))
+}
+
+#[cfg(test)]
+pub(crate) fn test_sa_readback_body(
+    parameters: &SaParameters,
+) -> Result<SensitiveBuffer, XfrmError> {
+    encode_sa_info(parameters)
+}
+
+#[cfg(test)]
+pub(crate) fn test_policy_readback_body(
+    parameters: &PolicyParameters,
+) -> Result<SensitiveBuffer, XfrmError> {
+    encode_policy_info(parameters)
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -4474,6 +4904,7 @@ mod tests {
     #[derive(Debug)]
     struct FakeDscpRuntimeState {
         ensure_calls: usize,
+        capability_calls: usize,
         ready: bool,
         capability: XfrmCapability,
     }
@@ -4483,6 +4914,7 @@ mod tests {
             Self {
                 state: Arc::new(Mutex::new(FakeDscpRuntimeState {
                     ensure_calls: 0,
+                    capability_calls: 0,
                     ready: true,
                     capability: XfrmCapability::Available,
                 })),
@@ -4506,6 +4938,13 @@ mod tests {
             state.ready = false;
             state.capability = XfrmCapability::Missing;
         }
+
+        fn capability_calls(&self) -> usize {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .capability_calls
+        }
     }
 
     impl XfrmDscpRuntime for FakeDscpRuntime {
@@ -4527,10 +4966,12 @@ mod tests {
         }
 
         fn capability(&self, _config: &LinuxXfrmDscpMarkingConfig) -> XfrmCapability {
-            self.state
+            let mut state = self
+                .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .capability
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.capability_calls += 1;
+            state.capability
         }
     }
 
@@ -5214,6 +5655,73 @@ mod tests {
         .unwrap();
         let observed = parse_policy_state(&policy_body).unwrap();
         assert_eq!(observed.parameters, request.policy.parameters);
+    }
+
+    #[test]
+    fn policy_parser_accepts_every_supported_template_cardinality() {
+        let mut block = policy_parameters();
+        block.action = XfrmAction::Block;
+        block.templates.clear();
+        let block_body = encode_policy_info(&block).unwrap();
+        assert_eq!(parse_policy_state(&block_body).unwrap().parameters, block);
+
+        let mut multiple = policy_parameters();
+        let mut second = multiple.templates[0];
+        second.id.spi = second.id.spi.checked_add(1).unwrap();
+        multiple.templates.push(second);
+        let multiple_body = encode_policy_info(&multiple).unwrap();
+        assert_eq!(
+            parse_policy_state(&multiple_body).unwrap().parameters,
+            multiple
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_policy_query_recovers_zero_and_multiple_template_policies() {
+        let mut cases = Vec::new();
+        let mut block = policy_parameters();
+        block.action = XfrmAction::Block;
+        block.templates.clear();
+        cases.push(block);
+
+        let mut multiple = policy_parameters();
+        let mut second = multiple.templates[0];
+        second.id.spi = second.id.spi.checked_add(1).unwrap();
+        multiple.templates.push(second);
+        cases.push(multiple);
+
+        for parameters in cases {
+            let response = encode_policy_info(&parameters).unwrap().to_vec();
+            let backend =
+                LinuxXfrmBackend::with_transport(CapturingTransport::with_response(response));
+            let mut query =
+                QueryPolicyRequest::new(parameters.selector.clone(), parameters.direction);
+            if let Some(mark) = parameters.mark {
+                query = query.with_mark(mark);
+            }
+            query = query.with_optional_if_id(parameters.if_id.filter(|if_id| *if_id != 0));
+
+            assert_eq!(backend.query_policy(query).await.unwrap(), parameters);
+        }
+    }
+
+    #[test]
+    fn policy_template_vectors_fail_closed_outside_kernel_bounds() {
+        let mut too_many = policy_parameters();
+        too_many.templates = vec![too_many.templates[0]; XFRM_POLICY_TEMPLATE_LIMIT + 1];
+        assert!(matches!(
+            encode_policy_info(&too_many),
+            Err(XfrmError::InvalidConfig {
+                field: "templates",
+                reason: "policy supports at most six templates"
+            })
+        ));
+
+        let mut malformed = encode_policy_info(&policy_parameters()).unwrap();
+        let template_length = ROUTE_ATTRIBUTE_HEADER_LEN + XFRM_USER_TEMPLATE_LEN - 1;
+        malformed[168..170].copy_from_slice(&(template_length as u16).to_ne_bytes());
+        malformed.truncate(168 + align_to_netlink(template_length).unwrap());
+        assert!(parse_policy_state(&malformed).is_err());
     }
 
     #[test]
@@ -7351,6 +7859,57 @@ mod tests {
             }
         ));
         assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_dscp_construction_and_preactivation_are_effect_free() {
+        let transport = CapturingTransport::default();
+        let runtime = FakeDscpRuntime::default();
+        let backend = LinuxXfrmBackend::with_transport_and_deferred_dscp_runtime(
+            transport.clone(),
+            dscp_config(),
+            runtime.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(runtime.ensure_calls(), 0);
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Unknown
+        );
+        assert_eq!(
+            runtime.capability_calls(),
+            0,
+            "an inactive retained configuration is not capability authority"
+        );
+
+        let mut marked = sa_parameters();
+        marked.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        assert!(matches!(
+            backend
+                .install_sa(InstallSaRequest {
+                    parameters: marked.clone(),
+                })
+                .await,
+            Err(XfrmError::Unavailable)
+        ));
+        assert!(matches!(
+            backend
+                .rekey_sa(RekeySaRequest { parameters: marked })
+                .await,
+            Err(XfrmError::Unavailable)
+        ));
+        assert!(transport.requests().is_empty());
+        assert_eq!(runtime.ensure_calls(), 0);
+
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: sa_parameters(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(transport.requests().len(), 1);
+        assert_eq!(runtime.ensure_calls(), 0);
     }
 
     #[tokio::test]
