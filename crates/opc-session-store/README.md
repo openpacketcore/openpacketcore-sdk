@@ -116,6 +116,85 @@ evidence.
   quorum evidence. Descriptor-only labs may use that engine-only probe;
   production traffic uses `probe_production_durable_readiness`, which first
   requires still-fresh `AuthenticatedPlatform` topology evidence.
+
+### Fixed durable-quorum consumer recipe
+
+For a fixed deployment, choose one `PlacementResiliencePolicy` and carry that
+same value through topology admission and the runtime. Build exactly three or
+five `QuorumReplicaDescriptor` values, each with a distinct `ReplicaId`,
+`ReplicaEndpoint` (use `.invalid` names in examples), `ReplicaTlsIdentity`
+(for example `spiffe://example.invalid/session/voter/0`), and
+`ReplicaBackingIdentity`; the strict default also requires distinct declared
+`ReplicaFailureDomain` values. For each local voter, construct the topology and
+open its file-backed SQLite store as follows. The `identity` must be the
+fixed-profile- and policy-bound result of
+`derive_fixed_durable_quorum_consensus_identity`; the ordinary descriptor-only
+consensus identity remains for dynamic profiles. This constructor is supported
+only on Linux because fixed quorum recovery uses descriptor-pinned SQLite
+snapshots; on other platforms it returns
+`ConsensusSessionStoreOpenError::FixedQuorumUnsupportedPlatform` before
+initializing durable Raft state.
+
+```rust
+let members = vec![
+    QuorumReplicaDescriptor::new(
+        ReplicaId::new("voter-0")?,
+        ReplicaEndpoint::new("voter-0.session.invalid", 7443)?,
+        ReplicaTlsIdentity::new("spiffe://example.invalid/session/voter/0")?,
+        ReplicaFailureDomain::new("failure-domain-0")?,
+        ReplicaBackingIdentity::new("backing-0")?,
+    ),
+    QuorumReplicaDescriptor::new(
+        ReplicaId::new("voter-1")?,
+        ReplicaEndpoint::new("voter-1.session.invalid", 7443)?,
+        ReplicaTlsIdentity::new("spiffe://example.invalid/session/voter/1")?,
+        ReplicaFailureDomain::new("failure-domain-1")?,
+        ReplicaBackingIdentity::new("backing-1")?,
+    ),
+    QuorumReplicaDescriptor::new(
+        ReplicaId::new("voter-2")?,
+        ReplicaEndpoint::new("voter-2.session.invalid", 7443)?,
+        ReplicaTlsIdentity::new("spiffe://example.invalid/session/voter/2")?,
+        ReplicaFailureDomain::new("failure-domain-2")?,
+        ReplicaBackingIdentity::new("backing-2")?,
+    ),
+]; // use five entries for the fixed five-voter profile
+let policy = PlacementResiliencePolicy::default();
+// Or explicitly opt in: PlacementResiliencePolicy::AllowReducedResilience.
+let fingerprints = members
+    .iter()
+    .map(QuorumReplicaDescriptor::configuration_fingerprint)
+    .collect::<Vec<_>>();
+let identity = derive_fixed_durable_quorum_consensus_identity(
+    cluster_id,
+    configuration_epoch,
+    &fingerprints,
+    policy,
+);
+let topology = ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy(
+    QuorumTopologyConfig::new_consensus(local_replica_id, members.clone(), identity),
+    policy,
+)?;
+let store = ConsensusSessionStore::open_fixed_durable_quorum(
+    topology,
+    SqliteSessionBackend::open("voter-0.sqlite")?,
+    "snapshots-voter-0",
+    consensus_peers,
+).await?;
+```
+
+`consensus_peers` must contain exactly the other fixed voters and each peer must
+be authenticated and bound to the same policy-bound fixed-quorum identity.
+`open_fixed_durable_quorum` rejects in-memory SQLite, non-fixed topologies, and
+peer-set or scope mismatches; it does not add members dynamically. After
+`initialize_cluster`, gate live traffic only on
+`probe_fixed_durable_quorum_readiness[_at](...).traffic_authority().is_granted()`.
+Inspect `placement_resilience().disposition()` separately. A fresh controller
+or attestation observation can qualify, withhold, or expire the placement
+claim, but its freshness is not a live traffic gate; traffic authority comes
+from the durable recovery/membership/linearizable-majority check. The explicit
+`AllowReducedResilience` mode never lowers the quorum majority and never claims
+independent HA placement.
 - `recovery::LegacyForkRecovery` is the default-deny offline administrative
   boundary for a drained fleet. It creates a sealed, redaction-safe plan,
   quarantines every explicit target before mutation, installs one immutable
@@ -497,10 +576,11 @@ cluster, configuration digest, epoch, peer role, and fresh challenge must all
 agree before an Openraft RPC is dispatched. Resolver or DNS aliases change
 only the dial address; a bare self ID such as `epdg-app-0` can correctly name
 the member whose route is an FQDN because the SDK never compares those strings.
-The exact consensus contract uses transport/wire-schema revision 3 and
-error-set revision 5. Revision 3 adds the bounded topology-admission barrier,
-and error revision 5 adds `TopologyAuthorityRevoked`.
-Revision 2/error revision 4 or older fails before dispatch. Drain traffic and
+The exact consensus contract uses transport/wire-schema revision 4 and
+error-set revision 6. Revision 4 makes the forwarded consumer scope explicit,
+so a peer cannot silently downgrade a consumer-scoped operation to an internal
+call; error revision 6 binds that semantic boundary into the exact profile.
+Revision 3/error revision 5 or older fails before dispatch. Drain traffic and
 writers, then stop and upgrade every consensus member together; mixed-profile
 rolling operation is unsupported.
 

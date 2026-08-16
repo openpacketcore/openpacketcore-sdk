@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
 use opc_identity::projected_svid::MIN_PROJECTED_SVID_POLL_INTERVAL;
 use opc_identity::{
@@ -23,14 +24,17 @@ use opc_identity::{
 };
 use opc_session_net::{
     ConnectionLifecyclePolicy, RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId,
-    SessionConfigurationEpoch, SessionConfigurationGeneration, SessionReplicationManifest,
-    DEFAULT_MAX_AUTHENTICATION_AGE, DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN,
-    DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
+    SessionConfigurationEpoch, SessionConfigurationGeneration, SessionConsumerLeaseMutationError,
+    SessionReplicationManifest, StatelessSessionConsumerClient, DEFAULT_MAX_AUTHENTICATION_AGE,
+    DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW,
+    DEFAULT_ROTATION_JITTER,
 };
 use opc_session_store::{
-    QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRpcFamily, SessionConsensusWireRequest,
+    OwnerId, QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusWireRequest,
+    SessionConsumerOperation, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerResponse, SessionConsumerScope, SessionKey, SessionKeyType,
 };
 use opc_session_testkit::qualification::{
     qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
@@ -84,7 +88,7 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
     SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
 };
-use opc_types::Timestamp;
+use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SanType};
 use rustix::fs::{
     fchmod, fstat, fsync, mkdirat, open, openat, renameat_with, unlinkat, AtFlags, FileType, Mode,
@@ -98,6 +102,18 @@ use opc_tls::TlsConfigBuilder;
 
 const CLUSTER_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
+        + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis,
+);
+// Functional recovery bound for the stateless-consumer fault detector. This
+// is deliberately not the profile's 30-second production-evidence threshold:
+// the pinned engine may retain one leader lease, defer one smaller-log
+// campaign, resample through one split campaign, and consume one vote plus
+// readiness-operation deadline. Exceeding the profile threshold still
+// withholds production evidence; this test only proves eventual consumer
+// recovery through that explicitly bounded engine path.
+const STATELESS_CONSUMER_LEADER_RECOVERY_TIMEOUT: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 6
+        + DURABLE_CONSENSUS_TIMING_PROFILE.vote_timeout_millis
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis,
 );
 const CHILD_TIMEOUT: Duration = Duration::from_millis(QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS);
@@ -1863,6 +1879,26 @@ impl TestPki {
         )
         .expect("build qualification identity state")
     }
+
+    fn consumer_identity_state(&self, identity: &str) -> IdentityState {
+        let credential = self.old_intermediate.issue_workload(identity);
+        let trust_domain =
+            TrustDomain::new("qualification.invalid").expect("qualification trust domain is valid");
+        let mut trust_bundles = TrustBundleSet::new();
+        trust_bundles.insert(TrustBundle {
+            trust_domain,
+            certificates: parse_certs_pem(&self.old_root_pem)
+                .expect("parse qualification consumer trust bundle"),
+        });
+        build_identity_state(
+            parse_certs_pem(&credential.certificate_chain_pem)
+                .expect("parse qualification consumer certificate chain"),
+            parse_key_pem(&credential.private_key_pem)
+                .expect("parse qualification consumer private key"),
+            trust_bundles,
+        )
+        .expect("build qualification consumer identity state")
+    }
 }
 
 enum ReaderMessage {
@@ -2584,6 +2620,36 @@ impl Fleet {
 
     fn required_quorum(&self) -> usize {
         self.member_count() / 2 + 1
+    }
+
+    fn start_stateless_consumer(
+        &mut self,
+        node_index: usize,
+        consumer_identities: Vec<String>,
+    ) -> (SocketAddr, SessionConsumerScope) {
+        match self.nodes[node_index].invoke(&QualificationNodeCommand::StartStatelessConsumer {
+            consumer_identities,
+        }) {
+            QualificationNodeReply::StatelessConsumerStarted { bind_addr, scope } => {
+                (bind_addr, scope)
+            }
+            reply => panic!(
+                "stateless consumer listener did not start: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn arm_stateless_consumer_outcome_unknown(&mut self, node_index: usize) {
+        match self.nodes[node_index]
+            .invoke(&QualificationNodeCommand::ArmStatelessConsumerOutcomeUnknown)
+        {
+            QualificationNodeReply::StatelessConsumerOutcomeUnknownArmed => {}
+            reply => panic!(
+                "stateless consumer outcome-unknown simulation did not arm: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
     }
 
     fn readiness_reports(&mut self, node_indices: &[usize]) -> Vec<FleetReadiness> {
@@ -8051,6 +8117,367 @@ fn five_process_projected_mtls_rotation_core() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     run_projected_mtls_rotation_core(5);
+}
+
+fn stateless_consumer_identity(index: usize) -> String {
+    format!(
+        "spiffe://qualification.invalid/tenant/test/ns/test/sa/session-consumer/nf/test/instance/{index}"
+    )
+}
+
+fn stateless_consumer_key(index: usize) -> SessionKey {
+    SessionKey {
+        tenant: TenantId::new("qualification-consumer").expect("qualification consumer tenant"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from(format!("opaque-consumer-session-{index}"))
+            .try_into()
+            .expect("bounded opaque consumer session key"),
+    }
+}
+
+fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
+    let mut fleet = Fleet::start(member_count);
+    let consumer_identities = (0..12).map(stateless_consumer_identity).collect::<Vec<_>>();
+    let mut endpoints = Vec::with_capacity(member_count);
+    let mut scope = None;
+    for node_index in 0..member_count {
+        let (address, node_scope) =
+            fleet.start_stateless_consumer(node_index, consumer_identities.clone());
+        if let Some(expected) = scope {
+            assert_eq!(
+                node_scope, expected,
+                "consumer scope differs between voters"
+            );
+        } else {
+            scope = Some(node_scope);
+        }
+        endpoints.push(address);
+    }
+    let scope = scope.expect("one consumer scope per qualification fleet");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("stateless consumer qualification runtime");
+    let mut identity_sources = Vec::with_capacity(consumer_identities.len());
+    let clients = consumer_identities
+        .iter()
+        .enumerate()
+        .map(|(consumer_index, identity)| {
+            let node_index = consumer_index % member_count;
+            let (identity_source, identity_receiver) =
+                watch::channel(Some(fleet.pki.consumer_identity_state(identity)));
+            identity_sources.push(identity_source);
+            let tls = TlsConfigBuilder::new(identity_receiver)
+                .allow_any_trusted_peer()
+                .build_authenticated_client_config()
+                .expect("stateless consumer client mTLS configuration");
+            StatelessSessionConsumerClient::new(
+                endpoints[node_index],
+                rustls_pki_types::ServerName::IpAddress(endpoints[node_index].ip().into()),
+                SpiffeId::new(spiffe_id(node_index))
+                    .expect("qualification consumer server identity"),
+                scope,
+                tls,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(clients.len(), 12);
+    assert!(runtime.block_on(async {
+        futures_util::future::join_all(
+            clients
+                .iter()
+                .map(StatelessSessionConsumerClient::capabilities),
+        )
+        .await
+        .into_iter()
+        .all(|result| result.is_ok())
+    }));
+    for client in &clients {
+        let diagnostic = format!("{client:?}");
+        for forbidden in [
+            "snapshot",
+            "replica",
+            "voter",
+            "learner",
+            "session-consumer-",
+        ] {
+            assert!(
+                !diagnostic.contains(forbidden),
+                "consumer diagnostics must not expose member or replica authority"
+            );
+        }
+    }
+
+    let known_request = SessionConsumerRequest::new(
+        scope,
+        SessionConsumerRequestId::from_bytes([0x41; 16]),
+        SessionConsumerOperation::AcquireLease {
+            key: stateless_consumer_key(0),
+            owner: OwnerId::new("qualification-consumer-owner").expect("consumer owner"),
+            ttl: Duration::from_secs(30),
+        },
+    );
+    let known_response = runtime
+        .block_on(clients[0].execute(known_request.clone()))
+        .expect("known consumer mutation response");
+    assert!(matches!(
+        known_response,
+        SessionConsumerResponse::AcquireLease(Ok(_))
+    ));
+    assert_eq!(
+        runtime
+            .block_on(clients[0].execute(known_request))
+            .expect("exact known consumer mutation retry"),
+        known_response,
+        "a known durable consumer success must be recoverable by its retained request ID"
+    );
+
+    // Keep the consumer outcome proof and the leader-loss proof distinct. A
+    // known quorum result does not imply that every follower has already
+    // applied the same log head. Wait for two identical all-voter observations
+    // before injecting the leader fault so this case measures stable-cluster
+    // leader failover rather than stacking a lagging-log campaign onto it.
+    let all_nodes = (0..member_count).collect::<Vec<_>>();
+    let convergence_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    let mut previous_converged = None;
+    let before_fault = loop {
+        let reports = fleet.readiness_reports(&all_nodes);
+        let first = reports.first().copied().expect("nonempty quorum fleet");
+        let converged = first.ready
+            && first.reason_code == QualificationReadinessCode::Ready
+            && first.leader_id.is_some()
+            && first.committed_index.is_some()
+            && first.committed_index == first.applied_index
+            && reports.iter().all(|report| {
+                report.ready
+                    && report.reason_code == QualificationReadinessCode::Ready
+                    && report.term == first.term
+                    && report.leader_id == first.leader_id
+                    && report.committed_index == first.committed_index
+                    && report.applied_index == first.applied_index
+            });
+        let signature = converged.then_some((
+            first.term,
+            first.leader_id,
+            first.committed_index,
+            first.applied_index,
+        ));
+        if signature.is_some() && signature == previous_converged {
+            break reports;
+        }
+        let wait_for_heartbeat = signature.is_some();
+        previous_converged = signature;
+        assert!(
+            Instant::now() < convergence_deadline,
+            "stateless consumer quorum did not reach a stable all-voter log head before leader loss: reports={reports:?}"
+        );
+        let observation_interval = if wait_for_heartbeat {
+            Duration::from_millis(
+                DURABLE_CONSENSUS_TIMING_PROFILE
+                    .append_entries_timeout_millis
+                    .saturating_add(100),
+            )
+        } else {
+            Duration::from_millis(100)
+        };
+        thread::sleep(observation_interval);
+    };
+    let old_leader_id = before_fault[0]
+        .leader_id
+        .expect("stable qualification leader identity");
+    let old_term = before_fault[0].term;
+    let leader_node_index = before_fault
+        .iter()
+        .find_map(|report| {
+            report
+                .leader_id
+                .filter(|leader| *leader == report.node_id)
+                .map(|_| report.node_index)
+        })
+        .expect("stable qualification leader");
+    let (leader_address, leader_process_id) = fleet.kill_node_unclean(leader_node_index);
+    let leader_survivors = all_nodes
+        .iter()
+        .copied()
+        .filter(|node_index| *node_index != leader_node_index)
+        .collect::<Vec<_>>();
+    let leader_loss_deadline = Instant::now() + STATELESS_CONSUMER_LEADER_RECOVERY_TIMEOUT;
+    let mut previous_replacement = None;
+    loop {
+        let reports = fleet.readiness_reports(&leader_survivors);
+        let replacement = reports.first().and_then(|report| report.leader_id);
+        let coherent_replacement = replacement.is_some_and(|leader| leader != old_leader_id)
+            && reports.iter().all(|report| {
+                report.ready
+                    && report.reason_code == QualificationReadinessCode::Ready
+                    && report.term > old_term
+                    && report.term == reports[0].term
+                    && report.leader_id == replacement
+                    && report.configured_voters == member_count
+                    && report.required_quorum == fleet.required_quorum()
+            });
+        let replacement_signature = coherent_replacement.then_some((replacement, reports[0].term));
+        if replacement_signature.is_some() && replacement_signature == previous_replacement {
+            break;
+        }
+        previous_replacement = replacement_signature;
+        assert!(
+            Instant::now() < leader_loss_deadline,
+            "stateless consumer quorum exceeded its bounded functional leader-recovery path: reports={reports:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let leader_survivor_client = clients
+        .iter()
+        .enumerate()
+        .find(|(index, _)| index % member_count != leader_node_index)
+        .map(|(_, client)| client)
+        .expect("consumer client on a surviving voter");
+    let leader_failover_request_id = SessionConsumerRequestId::from_bytes([0x51; 16]);
+    let leader_failover_key = stateless_consumer_key(2);
+    let leader_failover_owner = OwnerId::new("qualification-leader-failover-owner")
+        .expect("leader-failover consumer owner");
+    let leader_failover_lease = runtime
+        .block_on(leader_survivor_client.acquire_with_id(
+            leader_failover_request_id,
+            leader_failover_key.clone(),
+            leader_failover_owner.clone(),
+            Duration::from_secs(30),
+        ))
+        .expect("consumer mutation must commit through the replacement leader");
+    assert_eq!(
+        runtime
+            .block_on(leader_survivor_client.acquire_with_id(
+                leader_failover_request_id,
+                leader_failover_key,
+                leader_failover_owner,
+                Duration::from_secs(30),
+            ))
+            .expect("replacement leader must recover the durable mutation outcome"),
+        leader_failover_lease,
+        "the replacement leader must return the exact committed consumer outcome"
+    );
+
+    fleet.spawn_node_at_manifest_address(leader_node_index, leader_address, leader_process_id);
+    let restart_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    loop {
+        let reports = fleet.readiness_reports(&all_nodes);
+        if reports.iter().all(|report| report.ready) {
+            break;
+        }
+        assert!(
+            Instant::now() < restart_deadline,
+            "leader restart did not regain readiness"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (_, restarted_scope) =
+        fleet.start_stateless_consumer(leader_node_index, consumer_identities.clone());
+    assert_eq!(restarted_scope, scope);
+
+    let recovered_reports = fleet.readiness_reports(&all_nodes);
+    let recovered_leader = recovered_reports
+        .iter()
+        .find_map(|report| {
+            report
+                .leader_id
+                .filter(|leader| *leader == report.node_id)
+                .map(|_| report.node_index)
+        })
+        .expect("leader after restart");
+    let voter_loss_node = all_nodes
+        .iter()
+        .copied()
+        .find(|node_index| *node_index != recovered_leader)
+        .expect("nonleader voter for loss qualification");
+    let (_voter_address, _voter_process_id) = fleet.kill_node_unclean(voter_loss_node);
+    let voter_survivors = all_nodes
+        .iter()
+        .copied()
+        .filter(|node_index| *node_index != voter_loss_node)
+        .collect::<Vec<_>>();
+    let voter_loss_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    loop {
+        let reports = fleet.readiness_reports(&voter_survivors);
+        if reports.iter().all(|report| {
+            report.ready
+                && report.reason_code == QualificationReadinessCode::Ready
+                && report.configured_voters == member_count
+                && report.required_quorum == fleet.required_quorum()
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < voter_loss_deadline,
+            "stateless consumer quorum did not recover one voter loss: reports={reports:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (healthy_node_index, healthy_client) = clients
+        .iter()
+        .enumerate()
+        .find(|(index, _)| index % member_count != voter_loss_node)
+        .map(|(index, client)| (index % member_count, client))
+        .expect("consumer client on a live voter endpoint");
+    fleet.arm_stateless_consumer_outcome_unknown(healthy_node_index);
+    let ambiguous_request_id = SessionConsumerRequestId::from_bytes([0x52; 16]);
+    let ambiguous_key = stateless_consumer_key(1);
+    let ambiguous_owner =
+        OwnerId::new("qualification-ambiguous-owner").expect("ambiguous consumer owner");
+    assert!(matches!(
+        runtime.block_on(healthy_client.acquire_with_id(
+            ambiguous_request_id,
+            ambiguous_key.clone(),
+            ambiguous_owner.clone(),
+            Duration::from_secs(30),
+        )),
+        Err(SessionConsumerLeaseMutationError::OutcomeUnknown { request_id }) if request_id == ambiguous_request_id
+    ));
+    assert!(
+        runtime
+            .block_on(healthy_client.acquire_with_id(
+                ambiguous_request_id,
+                ambiguous_key,
+                ambiguous_owner,
+                Duration::from_secs(30),
+            ))
+            .is_ok(),
+        "only the caller's retained request ID may recover a durable ambiguous mutation"
+    );
+    assert!(runtime.block_on(healthy_client.capabilities()).is_ok());
+
+    let voter_ids_before = before_fault
+        .iter()
+        .map(|report| report.configured_voters)
+        .collect::<Vec<_>>();
+    let voter_ids_after = fleet
+        .readiness_reports(&voter_survivors)
+        .iter()
+        .map(|report| report.configured_voters)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        voter_ids_after,
+        vec![member_count; voter_ids_before.len() - 1]
+    );
+    drop(identity_sources);
+    fleet.shutdown();
+}
+
+#[test]
+fn three_process_projected_mtls_stateless_quorum_consumers() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_stateless_consumer_multiprocess_qualification(3);
+}
+
+#[test]
+fn five_process_projected_mtls_stateless_quorum_consumers() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_stateless_consumer_multiprocess_qualification(5);
 }
 
 #[test]

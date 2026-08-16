@@ -94,6 +94,12 @@ pub enum ReceiveMessageOutcome {
         /// Full datagram size reported by Linux through `MSG_TRUNC`.
         datagram_bytes: usize,
     },
+    /// The consumed datagram came from a userspace netlink peer rather than
+    /// the kernel (`sockaddr_nl.nl_pid != 0` or a multicast source).
+    ///
+    /// Its bytes are intentionally unavailable: callers must discard the
+    /// datagram without parsing it as a reply or acknowledgement.
+    RejectedNonKernel,
 }
 
 /// Receive and classify one raw netlink XFRM datagram from the kernel.
@@ -136,6 +142,10 @@ pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<
             format!(
                 "netlink XFRM datagram truncated: buffer is {buffer_bytes} bytes but datagram is {datagram_bytes} bytes"
             ),
+        )),
+        ReceiveMessageOutcome::RejectedNonKernel => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "netlink XFRM datagram did not originate from the kernel",
         )),
     }
 }

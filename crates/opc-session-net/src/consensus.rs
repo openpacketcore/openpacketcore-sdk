@@ -95,9 +95,9 @@ impl ConsensusDeadlinePolicy {
     }
 }
 
-/// Resolver callback used by [`RemoteSessionConsensusPeer::new_with_resolver`]
-/// and, when explicitly enabled, the legacy remote-backend compatibility
-/// client.
+/// Resolver callback used by [`RemoteSessionConsensusPeer::new_with_resolver`],
+/// [`crate::StatelessSessionConsumerClient::new_with_resolver`], and, when
+/// explicitly enabled, the legacy remote-backend compatibility client.
 pub type RemoteAddrResolver =
     Arc<dyn Fn() -> BoxFuture<'static, io::Result<SocketAddr>> + Send + Sync>;
 
@@ -2201,6 +2201,14 @@ pub struct SessionConsensusServerHandle {
 }
 
 impl SessionConsensusServerHandle {
+    /// Return whether the consensus listener accept task has terminated.
+    ///
+    /// This observes only the listener lifecycle. It does not claim quorum
+    /// health or consensus progress; callers must probe those separately.
+    pub fn is_finished(&self) -> bool {
+        self.accept_handle.is_finished()
+    }
+
     /// Schedule immediate cancellation of the listener and all connections.
     ///
     /// A handler that already queued cancellation-unsafe consensus work is not
@@ -3079,7 +3087,7 @@ mod tests {
     use super::*;
     use crate::identity::{
         SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
-        SessionReplicationManifest,
+        SessionPlacementPolicy, SessionReplicationManifest,
     };
     use crate::protocol::{write_frame, Request};
 
@@ -3444,9 +3452,6 @@ mod tests {
                 lifecycle,
             }),
         };
-        let before = METRICS
-            .session_net_lifecycle_retirement_explicit
-            .load(Ordering::Relaxed);
         control
             .request_reauthentication()
             .expect("advance staged connection generation");
@@ -3458,10 +3463,8 @@ mod tests {
         ));
         assert_eq!(retirement_probe.recorded_retirement_count(), 1);
         assert_eq!(
-            METRICS
-                .session_net_lifecycle_retirement_explicit
-                .load(Ordering::Relaxed),
-            before + 1
+            retirement_probe.recorded_retirement_reason(),
+            Some(RetirementReason::Explicit)
         );
     }
 
@@ -3514,12 +3517,6 @@ mod tests {
                 lifecycle,
             }),
         };
-        let material_before = METRICS
-            .session_net_lifecycle_retirement_material_epoch
-            .load(Ordering::Relaxed);
-        let explicit_before = METRICS
-            .session_net_lifecycle_retirement_explicit
-            .load(Ordering::Relaxed);
         material.rotate();
 
         assert!(matches!(
@@ -3529,16 +3526,8 @@ mod tests {
         ));
         assert_eq!(retirement_probe.recorded_retirement_count(), 1);
         assert_eq!(
-            METRICS
-                .session_net_lifecycle_retirement_material_epoch
-                .load(Ordering::Relaxed),
-            material_before + 1
-        );
-        assert_eq!(
-            METRICS
-                .session_net_lifecycle_retirement_explicit
-                .load(Ordering::Relaxed),
-            explicit_before
+            retirement_probe.recorded_retirement_reason(),
+            Some(RetirementReason::MaterialEpoch)
         );
         let mut dispatched = Vec::new();
         remote
@@ -4690,6 +4679,108 @@ mod tests {
             .expect("read rejection"),
             SessionConsensusBootstrapResponse::Rejected(SessionConsensusPeerError::Protocol)
         ));
+        assert_eq!(handler.0.load(Ordering::Relaxed), 0);
+        handle.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn fixed_quorum_network_handshake_rejects_mixed_placement_policies() {
+        let descriptors = vec![descriptor(1), descriptor(2), descriptor(3)];
+        let strict = Arc::new(
+            SessionReplicationManifest::try_new_with_epoch(
+                SessionClusterId::new("fixed-policy-handshake").expect("cluster"),
+                SessionConfigurationGeneration::new("fixed").expect("generation"),
+                SessionConfigurationEpoch::new(1).expect("epoch"),
+                descriptors.clone(),
+            )
+            .expect("strict manifest"),
+        );
+        let reduced = Arc::new(
+            SessionReplicationManifest::try_new_with_epoch_and_placement_policy(
+                SessionClusterId::new("fixed-policy-handshake").expect("cluster"),
+                SessionConfigurationGeneration::new("fixed").expect("generation"),
+                SessionConfigurationEpoch::new(1).expect("epoch"),
+                descriptors,
+                SessionPlacementPolicy::AllowReducedResilience,
+            )
+            .expect("reduced manifest"),
+        );
+        assert_eq!(
+            strict.consensus_identity(),
+            reduced.consensus_identity(),
+            "dynamic-profile identity remains descriptor-derived"
+        );
+        assert_ne!(
+            strict.fixed_durable_quorum_consensus_identity(),
+            reduced.fixed_durable_quorum_consensus_identity(),
+            "fixed policy must bind the authenticated authority scope"
+        );
+        assert_ne!(
+            strict.consensus_identity(),
+            strict.fixed_durable_quorum_consensus_identity(),
+            "the fixed authority profile must not share the dynamic scope"
+        );
+
+        let server_binding = strict
+            .bind_fixed_durable_quorum_local(ReplicaId::new("replica-2").expect("server ID"))
+            .expect("strict server binding");
+        let client_binding = reduced
+            .bind_fixed_durable_quorum_local(ReplicaId::new("replica-1").expect("client ID"))
+            .expect("reduced client binding")
+            .bind_remote(ReplicaId::new("replica-2").expect("server ID"))
+            .expect("remote binding");
+        let handler = Arc::new(CountingHandler(AtomicUsize::new(0)));
+        let server = SessionConsensusServer::from_transport(
+            handler.clone(),
+            None,
+            SessionMembershipAdmission::from_current_binding(server_binding),
+        );
+        let (handle, address) = server
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("listen");
+        let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolver),
+            None,
+            client_binding.clone(),
+            Some(Duration::from_secs(1)),
+        );
+        let request = SessionConsensusWireRequest::try_new(
+            client_binding.consensus_identity(),
+            client_binding.local_consensus_node_id(),
+            SessionConsensusRpcFamily::Vote,
+            b"fixed-policy-scope".to_vec(),
+        )
+        .expect("bounded request");
+        assert_eq!(
+            peer.call(request).await,
+            Err(SessionConsensusPeerError::ScopeMismatch)
+        );
+        let dynamic_client_binding = strict
+            .bind_local(ReplicaId::new("replica-1").expect("client ID"))
+            .expect("dynamic client binding")
+            .bind_remote(ReplicaId::new("replica-2").expect("server ID"))
+            .expect("dynamic remote binding");
+        let dynamic_resolver: RemoteAddrResolver =
+            Arc::new(move || Box::pin(async move { Ok(address) }));
+        let dynamic_peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&dynamic_client_binding, dynamic_resolver),
+            None,
+            dynamic_client_binding.clone(),
+            Some(Duration::from_secs(1)),
+        );
+        let dynamic_request = SessionConsensusWireRequest::try_new(
+            dynamic_client_binding.consensus_identity(),
+            dynamic_client_binding.local_consensus_node_id(),
+            SessionConsensusRpcFamily::Vote,
+            b"dynamic-profile-scope".to_vec(),
+        )
+        .expect("bounded request");
+        assert_eq!(
+            dynamic_peer.call(dynamic_request).await,
+            Err(SessionConsensusPeerError::ScopeMismatch)
+        );
         assert_eq!(handler.0.load(Ordering::Relaxed), 0);
         handle.abort_and_wait().await;
     }

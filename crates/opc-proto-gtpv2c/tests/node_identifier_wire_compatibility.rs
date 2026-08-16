@@ -37,6 +37,7 @@ const INJECTED_IE_TYPES: &[(&str, u8)] = &[
 const INJECTED_SPARE_NIBBLES: &[u8] = &[0x0, 0x5];
 
 const LEVELS: &[(&str, ValidationLevel)] = &[
+    ("header_only", ValidationLevel::HeaderOnly),
     ("structural", ValidationLevel::Structural),
     ("procedure_aware", ValidationLevel::ProcedureAware),
     ("strict", ValidationLevel::Strict),
@@ -53,43 +54,42 @@ const INJECTION_CARRIER: &str = "spec/create_session_request_s2b_subset.bin";
 /// notice either one shrinking. These literals can.
 const FIXTURE_CORPUS_LEN: usize = 40;
 const INJECTED_VALUE_CLASSES: usize = 11;
-const BLOCK_A_POINTS: usize = 480;
-const BLOCK_B_POINTS: usize = 10_560;
+const BLOCK_A_POINTS: usize = 640;
+const BLOCK_B_POINTS: usize = 14_080;
 
 /// Digest of the ordered Block A `(label, outcome)` list: every committed
-/// fixture, decoded and re-encoded across both surfaces, all three validation
+/// fixture, decoded and re-encoded across both surfaces, all four validation
 /// levels, and both encode modes. No fixture carries IE 176, so this is the
 /// "zero byte changes for every committed fixture" claim, frozen.
 ///
 /// Regenerate deliberately, never to make a red run green: run the suite with
 /// `GTPV2C_ENCODER_DUMP=<path>`, diff the dump against the previous one, and
 /// only then update this literal.
-const BLOCK_A_DIGEST: u64 = 10_922_305_812_464_877_325;
+const BLOCK_A_DIGEST: u64 = 8_393_444_349_946_952_941;
 
 /// Digest of the ordered Block B `(label, outcome)` list. This is where the
 /// IE 176 canonical-encode deltas live: spare-nibble zeroing, Extendable
-/// suffix stripping, the clause 7.7.9 instance discard, and the clause 7.7.8
-/// malformed-value discard. Regenerate under the same discipline as
-/// `BLOCK_A_DIGEST`.
+/// suffix stripping, the clause 7.7.9 instance discard, the clause 7.7.8
+/// malformed-value discard at the exact Optional slot, and fail-closed
+/// malformed values outside that slot. Regenerate under the same discipline
+/// as `BLOCK_A_DIGEST`.
 ///
-/// Block B enumerates all three validation levels. It previously stopped at
-/// two, which left the 96 `Strict` canonical points that IE 176 actually
-/// changes outside the digest: the whole-PR canonical delta is 539 points, of
-/// which only 443 were guarded. `Strict` is the level
-/// `DecodeContext::conservative()` selects, so it was the one level a wire
-/// guard could least afford to skip.
-const BLOCK_B_DIGEST: u64 = 15_588_910_344_812_376_123;
+/// Block B enumerates all four validation levels so the HeaderOnly contract
+/// and the `Strict` level selected by `DecodeContext::conservative()` are both
+/// inside the same closed wire guard.
+const BLOCK_B_DIGEST: u64 = 11_473_439_687_548_183_547;
 
 /// Injection points whose carrier actually decodes, and whose raw-preserving
 /// re-encode is therefore checkable. Pinned exactly so a change that made most
 /// points fail decode cannot quietly shrink the guard.
 ///
-/// This is unchanged from the pre-change baseline at `dae1919a`, on the same
-/// three-level grid: typing IE 176 narrowed the set of injected values that
-/// decode at all, and the clause 7.7.8 discard restores it exactly. Every one
-/// of these points re-encodes byte-exact, which is the half of the discard
-/// that says the untouched octets must still be there.
-const RAW_PRESERVING_CHECKED_POINTS: usize = 3079;
+/// Exact-slot presence resolution intentionally removes malformed IE 176 at an
+/// unlisted instance from this set under the non-ProcedureAware levels: without
+/// clause 7.7.9 filtering, those values now fail closed rather than inheriting
+/// instance 0's Optional disposition. Every point that still decodes re-encodes
+/// byte-exact, which is the half of the discard that says the untouched octets
+/// must still be there.
+const RAW_PRESERVING_CHECKED_POINTS: usize = 4176;
 
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -343,7 +343,7 @@ fn encoder_point_space_is_closed_and_its_outcomes_are_pinned() {
         2,
         "injected spare nibble axis changed"
     );
-    assert_eq!(LEVELS.len(), 3, "validation level axis changed");
+    assert_eq!(LEVELS.len(), 4, "validation level axis changed");
     assert_eq!(ENCODE_MODES.len(), 2, "encode mode axis changed");
 
     let points = enumerate_points();
@@ -483,6 +483,19 @@ fn recorded_outcomes_match_the_documented_canonical_deltas() {
         bare_carrier,
         "clause 7.7.9 disposition must precede typing and reach the same result"
     );
+
+    // Without ProcedureAware's clause 7.7.9 filter, the same malformed value
+    // reaches the typed decoder. Instance 5 has no presence-O row, so it must
+    // fail closed instead of inheriting instance 0's disposition.
+    for level in ["header_only", "structural", "strict"] {
+        let unlisted_malformed = outcome(&format!(
+            "B|node_identifier_176|spare0|inst5|name_length_overruns_value|{level}|canonical"
+        ));
+        assert!(
+            unlisted_malformed.starts_with("decode_err:Truncated"),
+            "{level} licensed malformed IE 176 outside its exact Optional slot: {unlisted_malformed}"
+        );
+    }
 }
 
 /// Raw-preserving encoding blits the originally parsed IE region, so typing an

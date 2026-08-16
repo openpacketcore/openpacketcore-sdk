@@ -14,9 +14,10 @@ privilege selection, or deployment defaults.
 - `NetlinkSocket`: close-on-exec, nonblocking XFRM netlink socket wrapper.
 - Functions: `open_netlink_socket`, `send_message`, `receive_message`, and the
   typed `receive_message_outcome` boundary.
-- `ReceiveMessageOutcome` distinguishes a complete bounded datagram from an
-  oversized datagram that Linux has already consumed, retaining both sizes
-  without parsing an error string.
+- `ReceiveMessageOutcome` distinguishes a complete bounded kernel datagram
+  from an oversized one or a consumed userspace-forged datagram. Receive
+  provenance requires an exact unicast kernel `sockaddr_nl` (`pid=0`,
+  `groups=0`) before any payload is exposed to callers.
 - UAPI constants for netlink flags/control messages, XFRM SA/policy message
   types, policy directions/actions, modes, optional attributes, ESN flags, and
   algorithm name length.
@@ -57,6 +58,8 @@ let _len = receive_message(&socket, &mut response)?;
   `ConsumedOversize` with the configured and actual sizes after Linux consumes
   an oversized datagram; callers must not try a second receive for that
   datagram.
+- Userspace-originated netlink datagrams are consumed and classified as
+  `RejectedNonKernel`; their payload is never surfaced as kernel evidence.
 - The source-compatible `receive_message` wrapper maps `ConsumedOversize` to
   `InvalidData`. Mutation-aware callers should use the typed API so they can
   preserve ownership ambiguity.

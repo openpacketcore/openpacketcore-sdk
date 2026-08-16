@@ -140,6 +140,9 @@ pub enum SessionTopologyTransitionError {
     /// Retained or replacement members violate cross-epoch identity bindings.
     #[error("session topology transition member bindings are invalid")]
     InvalidTransitionBindings,
+    /// This store was opened with an immutable fixed voter set.
+    #[error("fixed session quorum membership is immutable")]
+    ImmutableFixedQuorum,
     /// Another nonterminal transition already owns the cluster scope.
     #[error("session topology transition is already in progress")]
     TransitionInProgress,
@@ -178,6 +181,7 @@ impl SessionTopologyTransitionError {
             Self::QuorumLosingChange => "session_topology_transition_quorum_losing_change",
             Self::NoMembershipChange => "session_topology_transition_no_membership_change",
             Self::InvalidTransitionBindings => "session_topology_transition_invalid_bindings",
+            Self::ImmutableFixedQuorum => "session_topology_transition_fixed_quorum_immutable",
             Self::TransitionInProgress => "session_topology_transition_in_progress",
             Self::DeadlineExceededResumable => {
                 "session_topology_transition_deadline_exceeded_resumable"

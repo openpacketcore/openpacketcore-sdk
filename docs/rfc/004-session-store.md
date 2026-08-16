@@ -805,7 +805,7 @@ That method is engine/lab evidence only: it does not authenticate observed
 physical node, failure-domain, or durable-backing facts, and its `Ready` result
 MUST NOT authorize production traffic.
 
-Production session traffic MUST use topology admitted through
+Attested-HA production session traffic MUST use topology admitted through
 `ValidatedQuorumTopology::try_from_attested`, require `Quorum` from the store's
 time-aware production profile, then require
 `DurableReadinessScope::ProductionTopologyAttested` and
@@ -828,13 +828,16 @@ proof/replay policy decides whether a still-unexpired underlying proof may be
 re-presented or replacement evidence is required. Token non-serializability
 alone is not proof anti-replay.
 
-The shared readiness report MUST carry the bounded `DurableReadinessScope`.
-Production callers MUST require `ProductionTopologyAttested` and
-`is_production_traffic_ready()` and MUST NOT route an `EngineOnly` report into
-the traffic gate. Every readiness result is point-in-time evidence, never an
-ownership lease. Products MUST continuously gate ownership publication,
-VIP/service advertisement, and traffic on fresh production readiness. Restore
-scans MUST execute only
+The attested-HA readiness report MUST carry the bounded
+`DurableReadinessScope`. Attested-HA callers MUST require
+`ProductionTopologyAttested` and `is_production_traffic_ready()` and MUST NOT
+route an `EngineOnly` report into the traffic gate. Fixed durable quorums use
+the separate typed authority and placement results in §11.2.2.1; an attested
+report cannot be substituted for their immutable-voter authority. Every
+readiness result is point-in-time evidence, never an ownership lease. Products
+MUST continuously gate ownership publication, VIP/service advertisement, and
+traffic on fresh attested-HA readiness or, for a fixed durable quorum, a fresh
+fixed-quorum authority observation. Restore scans MUST execute only
 after the Openraft barrier and local apply. One absolute deadline MUST begin at
 the public restore entry and cover the barrier/apply path, blocking-worker and
 asynchronous connection admission, SQLite progress, and blocking-task join.
@@ -853,6 +856,52 @@ backend epoch, record revision, logical-time snapshot, scope, and examined
 progress. Any edit or mismatch MUST return `RestoreScanCursorStale` before the
 record query rather than skip, merge, or guess. Restore method availability
 alone is not readiness evidence.
+
+#### 11.2.2.1 Fixed Durable Quorum Authority and Placement Resilience
+
+`ValidatedQuorumTopology::try_from_fixed_durable_quorum` admits only an exact
+three- or five-voter immutable Openraft configuration. It requires distinct
+logical replica IDs, network endpoints, authenticated TLS identities, and
+declared backing identities. It does not promote a caller-declared failure
+domain into physical-placement evidence. The default rejects correlated
+failure-domain descriptors; only an explicit reduced-resilience policy admits
+them so the deployment can report their resilience disposition truthfully.
+The fixed authority-profile marker and explicit placement policy are part of a
+domain-separated fixed-quorum authority identity: otherwise-identical strict
+and reduced-resilience fixed profiles MUST derive different authenticated peer,
+durable-store, and snapshot scopes. A fixed profile and a dynamic profile with
+the same descriptor set MUST also derive different scopes. Mixed-policy or
+mixed-profile peers MUST fail authenticated admission before Openraft or durable
+Raft initialization. Dynamic-profile identities remain descriptor- and
+epoch-derived and do not include the fixed-profile or placement-policy binding.
+`ConsensusSessionStore::open_fixed_durable_quorum` is supported only on Linux,
+where descriptor-pinned SQLite snapshots are available; other platforms MUST
+return `FixedQuorumUnsupportedPlatform` before durable initialization.
+Fixed membership does not authorize dynamic membership transitions, a second
+consensus engine, a controller feed, or a new packet-core protocol path.
+`try_from_fixed_durable_quorum_with_authenticated_placement` may additionally
+verify a fresh exact-member `AuthenticatedPlatform` placement evidence set.
+Replacement evidence is verified through
+`verify_fixed_durable_quorum_placement_evidence`; neither constructor nor
+replacement proof changes the immutable voter configuration. A verified
+replacement proof is consumed only by the fixed probe's explicit
+placement-attestation form; it cannot refresh traffic authority.
+
+`probe_fixed_durable_quorum_readiness` MUST return separate typed results for
+traffic authority and placement resilience. Traffic authority requires the
+exact persisted consensus identity and admitted 3/5 voter set, distinct
+authenticated voter identities and declared backing bindings, a clear recovery
+latch, and a fresh linearizable Openraft majority barrier. Lost membership,
+unavailable majority, or recovery state revokes traffic authority immediately.
+Placement uses the strict `RequireIndependentFailureDomains` policy by default:
+only fresh `AuthenticatedPlatform` evidence may report independent placement.
+The explicit `AllowReducedResilience` policy may report correlated or unknown
+placement as reduced resilience, never as independent. Expiring placement
+evidence may only downgrade that placement result; it MUST NOT alter
+fixed-quorum authority, Openraft sequencing, fencing, leases, or mutation
+admission. Concrete backing-instance and voter-incarnation hardening remain a
+separate concern; this contract does not manufacture those facts from paths or
+caller descriptors.
 
 #### 11.2.3 Replication-Log Range Cursors
 
@@ -1364,10 +1413,12 @@ replication append, or rebuild request. The consensus ALPN and legacy
 `opc-session-net/5` ALPN MUST NOT be multiplexed as equivalent authority on one
 production listener.
 
-The exact consensus contract profile MUST use transport/wire-schema revision 3
-and error-set revision 5. Revision 3 adds the bounded topology-admission
-barrier family; error revision 5 adds `TopologyAuthorityRevoked`. Revision
-2/error revision 4 or older MUST fail before engine dispatch.
+The exact consensus contract profile MUST use transport/wire-schema revision 4
+and error-set revision 6. Revision 4 makes the forwarded consumer scope
+explicit, so a peer cannot silently downgrade a consumer-scoped operation to
+an internal call; error revision 6 binds that semantic boundary into the
+exact profile. Revision 3/error revision 5 or older MUST fail before engine
+dispatch.
 Operators MUST drain traffic and writers, stop every consensus member, upgrade
 the full membership together, verify exact-profile handshakes, and only then
 restore traffic. Mixed-profile rolling operation is unsupported.
@@ -1535,6 +1586,69 @@ resources, soak, remote HKMS, deployed CNFs, and signed release evidence under
 #164/#143. The lack of immediate generic CRL, OCSP, or
 certificate/identity-denylist revocation MUST remain explicit. #158 remains the
 umbrella until that fleet evidence passes.
+
+### 12.5 Stateless Session-Quorum Consumer Transport
+
+`StatelessSessionConsumerClient` and `SessionQuorumConsumerServer` provide the
+only production application-consumer boundary. They MUST use mutual TLS and
+the dedicated `opc-session-consumer/1` ALPN with transport revision 1. This is
+a separate exact protocol from both `opc-session-consensus/2` and the
+quarantined `opc-session-net/5` compatibility protocol. A listener MUST NOT
+offer a fallback, negotiate a common revision, or multiplex either other
+protocol as equivalent consumer authority. Because this SDK is unreleased,
+deployments MUST make a coordinated cutover to this final boundary; dual-mode
+or compatibility consumer operation is unsupported.
+
+The consumer listener authenticates the peer from the live mTLS connection and
+authorizes it only through the store-issued current-member manifest and the
+configured consumer allow-list. Consensus-member identities are excluded from
+the consumer role. Every bootstrap and request carries the exact
+cluster/configuration/epoch scope, which the listener and quorum-side service
+MUST verify before backend work. Consumer identity and scope values are
+security-sensitive: diagnostics, profile inventories, and observability MUST
+record only redaction-safe status/count information, never their concrete
+values.
+
+The API exposes typed session reads, bounded mutation/lease operations,
+bounded restore scans, capability discovery, and a coarse committed-change
+watch. It does not expose membership, voting, peer discovery, replication-log
+read/append, raw replication operation trees, snapshots, rebuild/recovery, or
+any topology/consensus authority. The server constructor accepts only the
+`SessionQuorumConsumer` port, and all accepted mutations route through the
+durable quorum leader path.
+
+Each normal connection processes exactly one application request. The default
+listener limit is 256 live connections and its retained connection-task set is
+bounded by that limit; each watch owns one delivery task. Consumer frames are
+at most 16 MiB and a configured listener frame limit cannot be lower than the
+8 MiB batch-response limit plus 4 KiB framing allowance. The default bootstrap
+and active-frame idle bound is 5 seconds and one complete request/response
+operation has a 10-second deadline. A watch has a 64-item, 512 KiB transport
+queue, rechecks cancellation at least every 50 ms, and is also bounded by the
+256 KiB store-side projection buffer. The fixed request identity is 16 bytes;
+consumer identity input is capped at 253 UTF-8 bytes; one batch has at most
+256 operations and retains at most 8 MiB of serialized response data.
+
+Every client and listener applies the finite `ConnectionLifecyclePolicy`: by
+default authentication age is at most 15 minutes, retirement drain is at most
+30 seconds, reconnect backoff is 50 ms through 1 second, and material-rotation
+jitter is at most 30 seconds. Reauthentication, material changes, certificate
+expiry, idle retirement, cancellation, malformed frames, EOF, or an uncertain
+stream position terminate the connection/watch and release its transport task
+slot; they do not create another request on that connection.
+
+The caller owns the request ID for every mutation or lease operation. If a
+request can have crossed the durable effect point without a complete response,
+the outcome is ambiguous. The SDK MUST NOT automatically replay it or mint a
+new request ID. Recovery may retry only the identical request body under the
+retained ID, which resolves through the durable request binding; reuse of that
+ID for a different request is a closed conflict. Applications otherwise must
+perform authoritative readback and apply the existing fencing/idempotency
+contract.
+
+The v6 qualification profile records this dedicated ALPN/revision and the
+connection, frame, request/response, watch, task, and lifecycle limits beside
+the consensus profile. It records no consumer identity or scope material.
 
 ## 13. Local Cache
 

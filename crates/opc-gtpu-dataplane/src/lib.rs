@@ -14,8 +14,24 @@
 //! exact removal. Existing backend implementations inherit fail-closed
 //! unsupported defaults. The eBPF adapter proves complete pinned-map state and
 //! held mutation authority; the Linux adapter provides strict double-read
-//! `GETPDP` inspection but intentionally cannot claim exact removal because the
-//! kernel API has no compare-delete primitive.
+//! `GETPDP` inspection and, once a durable recovery root is bound, exact
+//! restart-recovery authority: a cross-process per-device lease plus the
+//! authoritative dual-axis readback that together compensate for the kernel's
+//! missing compare-delete primitive. A distinct live-writer authority removes
+//! one exact PDP context while the cooperating writer remains live for
+//! same-process session replacement, without weakening the strict
+//! prior-writer-stopped restart contract. Linux callers acquire an affine,
+//! opaque `PdpLiveWriterProof` through
+//! `GtpuDataplaneBackend::acquire_pdp_live_writer_proof`; the proof binds the
+//! exact configured recovery root and current network-namespace identity and
+//! is consumed by the removal request. It cannot be cloned or statically
+//! constructed, and a wrong-root or wrong-namespace proof is rejected before
+//! any netlink access. A separate identity-bearing,
+//! mutation-free retained-device acquisition classifies a durable Linux
+//! kernel-GTP device record after process loss — exact retained identity,
+//! authoritative absence, conflicting replacement identity, structural
+//! repair, or retryable authority unavailability — without reading,
+//! installing, or deleting any PDP context.
 //!
 //! A separate maintenance-only drained-v2 teardown accepts an explicit typed
 //! drain attestation, proves the complete frozen legacy program/map identity,
@@ -44,9 +60,16 @@ pub mod linux;
 pub mod mock;
 pub mod model;
 pub mod reassembly;
+pub mod selector_namespace;
+mod selector_namespace_v2;
+pub mod tft_classifier;
+pub mod traffic_observation;
 pub mod unsupported;
 
-pub use backend::GtpuDataplaneBackend;
+pub use backend::{
+    GtpuDataplaneBackend, GtpuSessionSelectorInstallRecovery, GtpuSessionSelectorInstallResume,
+    GtpuSessionSelectorRetiringRecovery, GtpuSessionSelectorRetiringResume,
+};
 pub use ebpf::{
     probe_committed_classifier_load, ClassifierLoadBlocker, ClassifierLoadCapability,
     EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuDataplaneBackend,
@@ -80,10 +103,17 @@ pub use model::{
     GtpuUplinkChecksumOffloadContract, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
     GtpuV2DrainProof, PdpContextConflict, PdpContextIndeterminateReason, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextMismatchField, PdpContextReadback,
-    PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextSelector,
-    PdpContextSelectorOccupancy, PdpContextUplinkIdentity, PdpContextUplinkSelector,
-    RemovePdpContextRequest, Teid, GTPU_PORT,
+    PdpContextReconciliationCapabilities, PdpContextRemovalOutcome, PdpContextRepairReason,
+    PdpContextSelector, PdpContextSelectorOccupancy, PdpContextUplinkIdentity,
+    PdpContextUplinkSelector, PdpDeviceIncarnation, PdpLiveWriterProof,
+    PdpLiveWriterRemovalRequest, PdpRestartRecoveryProof, PdpRestartRecoveryRequest,
+    RemovePdpContextRequest, RetainedDeviceConflictReason, RetainedDeviceIdentityAcquisition,
+    RetainedDeviceIdentityOutcome, RetainedDeviceIdentityRequest,
+    RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
+    RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest,
+    Teid, GTPU_PORT,
 };
+pub use opc_dataplane_observation::TrafficContinuityPolicy;
 pub use opc_types::DscpCodepoint;
 #[cfg(target_os = "linux")]
 pub use reassembly::{
@@ -94,6 +124,45 @@ pub use reassembly::{
     reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuReassemblyConsumer,
     GtpuReassemblyCounters, GtpuReassemblyDrop, GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome,
     GtpuReassemblyPdr, GtpuReassemblySelector,
+};
+pub use selector_namespace::GtpuSelectorNamespaceBootstrap;
+pub use selector_namespace::{
+    GtpuSessionSelectorActiveClaim, GtpuSessionSelectorAdmission,
+    GtpuSessionSelectorAuthorityGeneration, GtpuSessionSelectorBackendBinding,
+    GtpuSessionSelectorBackendReceipt, GtpuSessionSelectorBindingLease,
+    GtpuSessionSelectorCoordinatorError, GtpuSessionSelectorDecommissionInspectRequest,
+    GtpuSessionSelectorDecommissionReadbackRequest, GtpuSessionSelectorDecommissionRequest,
+    GtpuSessionSelectorEffectRequest, GtpuSessionSelectorInstallingNoEffectRequest,
+    GtpuSessionSelectorNamespaceAuthority, GtpuSessionSelectorNamespaceError,
+    GtpuSessionSelectorOperation, GtpuSessionSelectorProvisionRequest,
+    GtpuSessionSelectorReadbackRequest, GtpuSessionSelectorRemovalRequest,
+    GtpuSessionSelectorRetiredClaim, GtpuSessionSelectorRetiringNoEffectRequest,
+    GtpuSessionSelectorReuseAuthorization, GtpuSessionSelectorReuseReceipt,
+    GtpuSessionSelectorReuseRequest,
+};
+#[cfg(test)]
+pub(crate) use selector_namespace::{
+    InMemoryGtpuSessionSelectorNamespace, InMemoryGtpuSessionSelectorNamespaceStore,
+};
+pub use selector_namespace_v2::{
+    GtpuSessionSelectorNamespaceLossInspectionRequest, GtpuSessionSelectorNamespaceLossObservation,
+    GtpuSessionSelectorNamespaceRestoreReadbackReceipt,
+    GtpuSessionSelectorNamespaceRestoreReadbackRequest, GtpuSessionSelectorNamespaceRestoreReceipt,
+    GtpuSessionSelectorNamespaceRestoreRequest, GtpuSessionSelectorRetiredDrainReceipt,
+    GtpuSessionSelectorRetiredDrainRequest,
+};
+pub use tft_classifier::{
+    TftUplinkBearer, TftUplinkClassification, TftUplinkClassifier, TftUplinkClassifierReadback,
+    TftUplinkClassifierReconcileOutcome, TftUplinkClassifierRemovalOutcome, TftUplinkDropReason,
+};
+pub use traffic_observation::{
+    GtpuTrafficProof, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityError,
+    GtpuTrafficProofAuthorityLease, GtpuTrafficProofAuthorityStore,
+    GtpuTrafficProofAuthorityStoreUpdateError, GtpuTrafficProofChallenge,
+    GtpuTrafficProofDispatchError, GtpuTrafficProofDispatchPort, GtpuTrafficProofDispatchReceipt,
+    GtpuTrafficProofDispatchRequest, GtpuTrafficProofDispatchRoute, GtpuTrafficProofInvalidation,
+    GtpuTrafficProofPoll, GtpuTrafficProofSession, GtpuTrafficProofSummary,
+    GtpuTrafficProofValidation, UnsupportedGtpuTrafficProofDispatchPort,
 };
 pub use unsupported::UnsupportedGtpuDataplaneBackend;
 

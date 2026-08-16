@@ -32,6 +32,7 @@ pub mod backend;
 pub mod capability;
 pub mod clock;
 pub mod consensus;
+pub mod consumer;
 pub mod error;
 pub mod fake;
 pub mod handover;
@@ -62,12 +63,13 @@ pub use backend::{
     validate_replication_prefix_owned, validate_session_ops_at, validate_session_ops_profile,
     validate_session_ops_ttls, BackendInstanceIdentity, BackendPeerBinding,
     BackendPeerScopeIdentity, CompareAndSet, CompareAndSetResult, EncryptingSessionBackend,
-    RecordExpiryPreflight, RemoteSealingSessionBackend, ReplicationEntry, ReplicationLogRange,
-    ReplicationOp, ReplicationTxId, ReplicationTxIdError, ReplicationWatchCursor, SessionBackend,
-    SessionOp, SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS, MAX_REPLICATION_LOG_PAGE_ENTRIES,
-    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
-    MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, REPLICATION_TX_ID_CANONICAL_BYTES,
-    REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
+    ProtectedSelectorLedgerBase, ProtectedSessionBackend, RecordExpiryPreflight,
+    RemoteSealingSessionBackend, ReplicationEntry, ReplicationLogRange, ReplicationOp,
+    ReplicationTxId, ReplicationTxIdError, ReplicationWatchCursor, SelectorLedgerStorageScope,
+    SessionBackend, SessionOp, SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
+    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    MAX_REPLICATION_OPERATION_DEPTH, MAX_REPLICATION_WATCH_BACKLOG_ENTRIES,
+    REPLICATION_TX_ID_CANONICAL_BYTES, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 pub use capability::{
     assert_backend_suitable_for_profile, assert_suitable_for,
@@ -77,18 +79,30 @@ pub use capability::{
 };
 pub use clock::{Clock, MonotonicClock, SystemClock, TokioVirtualClock};
 pub use consensus::{
-    ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusClusterId,
-    SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-    SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusIdentityError,
-    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpc,
-    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusStatus,
-    SessionConsensusStorageAnchor, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionMutationIntent, SessionMutationOutcome, SessionTopologyCandidateBootstrap,
-    SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
-    SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
-    SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    ConsensusSessionConsumerService, ConsensusSessionStore, ConsensusSessionStoreOpenError,
+    SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
+    SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusIdentity,
+    SessionConsensusIdentityError, SessionConsensusNodeId, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusRequestId, SessionConsensusResponse,
+    SessionConsensusRpc, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
+    SessionConsensusStatus, SessionConsensusStorageAnchor, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionMutationIntent, SessionMutationOutcome,
+    SessionTopologyCandidateBootstrap, SessionTopologyTransitionPeers,
+    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
+    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
+    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
+};
+pub use consumer::{
+    derive_consumer_consensus_request_id, session_consumer_batch_result,
+    session_consumer_batch_result_into_store, SessionConsumerAuthorizationManifest,
+    SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerChangeItem,
+    SessionConsumerChangeKind, SessionConsumerIdentity, SessionConsumerIdentityError,
+    SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+    SessionQuorumConsumer, StatelessSessionConsumer, MAX_SESSION_CONSUMER_BATCH_OPERATIONS,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES,
+    SESSION_CONSUMER_IDENTITY_MAX_BYTES, SESSION_CONSUMER_REQUEST_ID_BYTES,
 };
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;
@@ -135,8 +149,9 @@ pub use payload_codec::{
 pub use quorum::{QuorumSessionStore, SessionStoreBackend};
 pub use readiness::{
     DurableReadinessReport, DurableReadinessScope, DurableReadinessState, DurableRecoveryProgress,
-    DurableRecoveryState, ReplicaReadinessFailure, ReplicaReadinessObservation,
-    ReplicaReadinessOutcome,
+    DurableRecoveryState, FixedQuorumReadinessReport, FixedQuorumTrafficAuthority,
+    PlacementResilienceDisposition, PlacementResiliencePolicy, PlacementResilienceReport,
+    ReplicaReadinessFailure, ReplicaReadinessObservation, ReplicaReadinessOutcome,
 };
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 pub use recovery::{
@@ -158,11 +173,11 @@ pub use restore::{
 pub use sqlite::SqliteSessionBackend;
 pub use store::SessionStore;
 pub use topology::{
-    QuorumReplicaDescriptor, QuorumTopologyConfig, QuorumTopologyError, QuorumTopologyMode,
-    QuorumTopologySummary, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, ReplicaTopologyField, ReplicaTopologyFieldError,
-    ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS, REPLICA_IDENTITY_MAX_BYTES,
-    REPLICA_ID_MAX_BYTES,
+    derive_fixed_durable_quorum_consensus_identity, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    QuorumTopologyError, QuorumTopologyMode, QuorumTopologySummary, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicaTopologyField,
+    ReplicaTopologyFieldError, ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
+    REPLICA_IDENTITY_MAX_BYTES, REPLICA_ID_MAX_BYTES,
 };
 pub use topology_attestation::{
     ObservedPhysicalNodeIdentity, QuorumTopologyAttestor, TopologyAttestationBuildError,

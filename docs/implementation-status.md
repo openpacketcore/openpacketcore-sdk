@@ -1086,6 +1086,38 @@ and
 
 ---
 
+## RFC 016 – Opaque Durable GTP-U Selector Namespace
+
+RFC 016 is **proposed** and experimental. The rows below are design
+requirements for issue [#662](https://github.com/openpacketcore/openpacketcore-sdk/issues/662),
+not implementation claims. Maintainer approval and merge of the RFC are
+required before an implementation PR can rely on it.
+
+| AC | Criterion | Crate(s) | Tests | Status | Known Gaps |
+|:---|:---|:---|:---|:---|:---|
+| 016-1 | SDK-minted opaque affine capability replaces caller-constructible `Fresh` provenance for a complete selector group. | `opc-gtpu-dataplane`, `opc-session-store` | Planned compile-fail and deterministic namespace tests | **not-implemented** | Proposed RFC requirement; no implementation is claimed. |
+| 016-2 | One device/pin-namespace durable ledger atomically binds all TEID/PAA/mark atoms, generation, nonce, and permanent tombstones. | `opc-gtpu-dataplane`, `opc-session-store` | Planned CAS, fault-injection, restart, and tombstone tests | **not-implemented** | Proposed RFC requirement; mixed provenance and same-group republish are excluded to #663. |
+| 016-3 | eBPF control binding and backend conformance fail closed across map/program loss, replacement, cancellation, and conflicting authority. | `opc-gtpu-dataplane`, `opc-gtpu-dataplane-ebpf` | Planned privileged isolated-eBPF and backend conformance tests | **not-implemented** | Proposed RFC requirement; traffic-proof authority rebind is excluded to #664. |
+| 016-4 | Public diagnostics and RFC 006 evidence remain bounded and identity-free. | `opc-gtpu-dataplane`, `opc-evidence`, `opc-redaction` | Planned redaction and evidence-mutation tests | **not-implemented** | Proposed RFC requirement; it does not establish product readiness or carrier acceptance. |
+
+---
+
+## RFC 017 – Mixed Selector Provenance and Loss-Qualified Restore
+
+RFC 017 is **proposed** and experimental. The rows below are design
+requirements for issue [#663](https://github.com/openpacketcore/openpacketcore-sdk/issues/663),
+not implementation claims. Maintainer approval and merge of the RFC are
+required before an implementation PR can rely on it.
+
+| AC | Criterion | Crate(s) | Tests | Status | Known Gaps |
+|:---|:---|:---|:---|:---|:---|
+| 017-1 | One protected selector-ledger CAS admits an exact partition of SDK-derived never-published atoms and subsets from multiple fully retired, drain-qualified predecessors. | `opc-gtpu-dataplane`, `opc-session-store` | Planned codec, model, CAS-race, restart, fix-removal, and mutation tests | **not-implemented** | RFC 016 supports only uniform fresh or one whole retired predecessor. |
+| 017-2 | Durable atom rows and bounded immutable lineage reject gaps, overlap, contradictory provenance, stale authority, partial drain, and replay before any backend effect. | `opc-gtpu-dataplane`, `opc-session-store` | Planned public-API, coverage, lineage, capacity, stale-fence, and fault-injection tests | **not-implemented** | No RFC 017 ledger-v2 codec, stamp-v2 ABI, or explicit stopped migration exists. |
+| 017-3 | Exact retained state is adopted, while same-group republish requires opaque qualified total mutable-backend loss and one fenced whole-namespace restore that preserves the marker, binding, epoch, desired graph, and lineage. | `opc-gtpu-dataplane`, `opc-gtpu-dataplane-ebpf` | Planned adoption, total-loss, restore, restart, replacement, and privileged isolated-eBPF tests | **not-implemented** | The built-in eBPF restore profile remains unsupported until the privileged qualification is implemented and passes. |
+| 017-4 | Backend authority and diagnostics remain SDK-owned, affine, bounded, and non-identifying; structural convergence, semantic absence, mocks, and traffic cannot qualify provenance or loss. | `opc-gtpu-dataplane`, `opc-evidence`, `opc-redaction` | Planned compile-fail, conformance, redaction, and adversarial-mutation tests | **not-implemented** | External adapters remain unsupported until #671 publishes the SDK-owned codec and conformance boundary. |
+
+---
+
 <a id="known-gaps"></a>
 
 ## Known Gaps Registry

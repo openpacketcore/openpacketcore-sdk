@@ -8,12 +8,288 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Durable grouped XFRM object roster transaction — `opc-ipsec-xfrm`:**
+  `LinuxXfrmBackend::bind_current_network_namespace_with_object_roster_recovery`
+  and the opt-in migration constructor
+  `bind_current_network_namespace_with_object_sa_relocation_and_roster_recovery`
+  authenticate and permanently lease a self-contained
+  `XfrmObjectRosterRecoveryStore` (own `XfrmObjectRosterRecoveryProofKey`,
+  `XfrmObjectRosterRecoveryHandle`, `XfrmObjectRosterGroupId`,
+  `XfrmObjectRosterOperationGeneration`, and `XfrmObjectRosterDurablePhase`) on
+  the namespace actor before returning a mutation-capable backend. A
+  dependency-ordered group of XFRM objects now applies as one durable
+  transaction rather than one durable lifecycle per object.
+  `XfrmObjectRosterRequest::new` validates up to
+  `XFRM_OBJECT_ROSTER_MAX_MEMBERS` `XfrmObjectRosterMemberRequest` values in
+  caller-declared apply order, rejecting non-exact removal identities,
+  duplicate deletion identities, duplicate caller-supplied member identities,
+  and members the kernel's own coarse selection relation cannot tell apart,
+  through `XfrmObjectRosterRequestError`.
+  `prepare_durable_object_roster` publishes one authenticated `Prepared` record
+  binding the group identity, every member identity and generation, every exact
+  install request, and one ordered keyed digest, then returns a non-cloneable
+  `XfrmObjectRosterAdmissionAuthority`; `run_durable_object_roster` consumes it
+  in one actor command holding one queue permit, burns one writer epoch at
+  `Prepared -> Issuing`, and publishes each member's adjacent absence proof
+  before that member's effect; `finalize_durable_object_roster` commits
+  `Applied` to `Committed` with every member slot preserved. The group is
+  all-or-nothing: a conflict proved before any effect is authoritative
+  no-mutation with zero backend calls, a divergence after at least one
+  acquisition reverse-compensates exactly the acquired prefix in strict reverse
+  order, and a member `AlreadyExists` under an absence proof fails the roster
+  instead of succeeding (RFC 7296 §1.3/§2.8, RFC 4301 §4.4) while never
+  deleting the foreign object. After process loss `adopt_durable_object_roster`
+  commits a converged applied roster additively without any deletion or leaves
+  it untouched as adoption-refused, and `recover_durable_object_roster` retires
+  it as owned residue; one of them must run before any other namespace
+  mutation, or the burned writer epoch forces a repair-required verdict with
+  the record retained. Both classify every unresolved member from its own
+  adjacent proof plus a fresh exact readback and report
+  `XfrmObjectRosterRestartOutcome`: no-mutation, rolled-back,
+  owned-residue-retired, adopted, adoption-refused, indeterminate, committed,
+  retired, removal-pending, foreign-untouched, or repair-required. The
+  indeterminate and removal-pending verdicts both carry the redaction-safe
+  backend failure the recovering process observed. Adoption screens a phase it
+  will refuse outright before it fences the other durable families, so using it
+  as a probe is free across families.
+  `XfrmObjectRosterDurableOutcome`, `XfrmObjectRosterRestartOutcome`, and the
+  authenticated re-read `XfrmObjectRosterRecoveryStore::inspect_dispositions`
+  all carry value-free `XfrmObjectRosterMemberDispositions` /
+  `XfrmObjectRosterMemberDisposition` descriptors, whose member state is
+  exposed as the closed enums `XfrmObjectRosterMemberPhase`,
+  `XfrmObjectRosterSweepProof`, and `XfrmObjectRosterAdjacentProof` (through
+  `member_phase`, `sweep_proof_kind`, and `adjacent_proof_kind`, with the
+  `&'static str` label accessors kept as conveniences), while
+  `XfrmObjectRosterRunError::into_retry_authority` returns the exact affine
+  authority for the three proved pre-effect rejections — a closed
+  cooperating-writer gate (`xfrm_object_roster_gated`, screened before anything
+  is consumed, covering an unresolved install, relocation, or sibling roster),
+  a still-closed deferred DSCP activation, and an untrusted pre-effect sweep
+  readback — and `XfrmObjectRosterDurableError` names every fail-closed durable
+  rejection.
+  Behavior change: an unresolved roster now fences single-object durable
+  installs and durable SA relocations, and an unresolved install or relocation
+  fences rosters. Fixed-size records of
+  `XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES` retain only opaque group and
+  member correlation, group and member phases, sweep and adjacent proof codes,
+  incarnations, publication sequence, writer epoch, and independent
+  proof-keyed fingerprints of each member's deletion identity and complete
+  install request; no request identity value and no key material is persisted
+  or rendered, so consumers must durably retain every complete member request.
+- **Generation-fenced live GTP-U traffic-continuity proof —
+  `opc-dataplane-observation`, `opc-gtpu-dataplane`,
+  `opc-gtpu-dataplane-ebpf`:** adds a backend-neutral, non-authoritative
+  evaluator for bounded bidirectional continuity and a production eBPF
+  adapter that alone can promote authenticated forwarding observations into
+  a session-scoped proof. Proofs bind the exact grouped-session and device
+  identities, dataplane and product-owner generations, reconcile fence and
+  revision, backend incarnation, source epoch, clock origin, policy, and a
+  finite non-reused publication identity. The datapath records uplink packets
+  only after successful local redirect and downlink packets only after
+  validated decapsulation into the access-side stack; both directions require
+  one opaque per-attempt flow correlation across a nonzero minimum window.
+  Per-CPU loss fencing, a globally ordered producer sequence, exact pinned-map
+  and program identity, cancellation-safe authority leases, and current
+  readback reject gaps, replay, stale in-flight packets, restart, restore,
+  generation or reconcile drift, malformed state, and expiry. Structural
+  convergence, aggregate counters, mocks, and unsupported adapters cannot mint
+  proof. Events and diagnostics contain no addresses, TEIDs, SPIs, packet
+  bytes, subscriber fields, or reusable flow identifiers. The port is packet
+  evidence only and explicitly cannot gate pod health or service admission.
+- **Fixed durable Openraft quorum authority — `opc-session-store`:** adds an
+  exact immutable three- or five-voter topology admission path and separate
+  typed fixed-quorum traffic-authority and physical-placement-resilience
+  observations. The strict default withholds an independent-placement claim
+  without fresh authenticated evidence; an explicit reduced-resilience policy
+  reports correlated or unknown placement without changing Openraft authority,
+  recovery, fencing, or sequencing.
+- **Fail-closed canonical TFT uplink classifier contract — `opc-gtpu-dataplane`:**
+  `TftUplinkClassifier` composes the existing canonical `opc-proto-tft` packet
+  filter model with one shared PAA and explicit default/dedicated bearer
+  ownership. It selects the lowest evaluation-precedence matching uplink TFT,
+  falls back only to the sole unfiltered bearer, and otherwise silently drops.
+  Its bounded parser covers the supported IPv4/IPv6 address, protocol,
+  port/range, traffic-class, ESP SPI, and IPv6 flow-label components; malformed,
+  fragmented, unsupported-extension, and foreign-PAA packets fail closed.
+  Duplicate marks/precedence/default ownership and non-uplink, partial, or
+  unsupported TFT snapshots are rejected before install. The additive backend
+  methods expose capability, exact readback, idempotent reconcile, atomic
+  self-owned replacement, and exact removal; the mock provides deterministic
+  lifecycle proof. A replacement never transiently publishes absent or
+  wrong-bearer state, while foreign ownership conflicts and partial, mixed, or
+  stale state remains indeterminate. Native exact removal first publishes a
+  SHA-256-bound, fail-closed metadata tombstone, removes only canonical records
+  under the current authority, and removes the tombstone last. A durable
+  dense-rank cursor authorizes each active-row deletion before it occurs, so a
+  retry distinguishes acknowledged cleanup progress from an unexplained
+  missing active row. The backend-neutral model retains IPv4/IPv6
+  semantics. Native adoption rejects partial TFT pin graphs and promotes an
+  all-zero schema marker only after both behavior-bearing maps are proven empty
+  before hook mutation and rechecked empty immediately before publication.
+  Native eBPF TFT classifier ABI/schema v4 remains IPv4-only. Metadata-bound
+  filter keys carry owner and generation identity, dense key rank is the
+  executable precedence order, and a durable removal cursor distinguishes an
+  authorized partial cleanup from an unexplained missing active row. IPv6
+  PAA/components and flow-label filters are rejected before map writes. This
+  increment does not claim IPv6 native packet execution. Linux `gtp` and unsupported adapters
+  report the capability missing; no adapter claims host-model packet processing
+  as dataplane evidence.
+- **Live-writer exact Linux PDP removal authority — `opc-gtpu-dataplane`:**
+  `LinuxGtpuDataplaneBackend::remove_pdp_context_exact_live_writer` (also
+  exposed as an additive trait method of the same name) removes one exact
+  kernel-GTP PDP context under the authority of the current cooperating live
+  writer, for same-process subscriber-session replacement where the restart
+  contract's prior-writer stop attestation would be false. The request binds
+  the expected device name and ifindex, the device's non-reusable
+  `PdpDeviceIncarnation`, the complete expected PDP context, and an affine
+  `PdpLiveWriterProof` acquired from
+  `GtpuDataplaneBackend::acquire_pdp_live_writer_proof`. Acquisition binds the
+  proof to the exact configured recovery root and current network-namespace
+  identity; it cannot be cloned or statically constructed and never asserts a
+  writer stopped. The durable recovery root must already be bound; the removal
+  revalidates the proof before any netlink operation and serializes under the
+  same topology-then-device `flock` writer gates as every other cooperating
+  mutation, proves the kernel-bound
+  incarnation, and runs the identical dual-axis `GETPDP` admission and
+  post-mutation readback classification as restart recovery. Typed outcomes
+  distinguish `Removed`, idempotent `AlreadyAbsent`, untouched `Conflict`,
+  retryable `Indeterminate`, and structural `RepairRequired`; replaced,
+  renamed, unstamped, or removed device identities fail closed before any
+  netlink work. The detached blocking worker retains both authorities to a
+  terminal classified result even if the caller future is dropped, so a
+  concurrent cooperating mutation can never overlap the transaction. The
+  restart-recovery contract remains strict and distinct: the two authorities
+  carry different proof types, report independent capabilities
+  (`pdp_live_writer_removal_capability` versus
+  `pdp_restart_recovery_capability`), and the generationless trait removal
+  stays `UnsupportedFeature` with `exact_removal: Missing`. Request, proof,
+  and outcome diagnostics redact TEID, address, device-identity, and
+  incarnation values.
+- **Retained Linux GTP device identity acquisition — `opc-gtpu-dataplane`:**
+  `LinuxGtpuDataplaneBackend::acquire_retained_device_identity` takes the
+  durable name, optional exact expected ifindex, non-reusable
+  `PdpDeviceIncarnation`, and prior-writer stop attestation. A prepared record
+  with no published ifindex resolves the name under topology authority,
+  acquires the discovered device authority, and re-proves the name, ifindex,
+  and kernel `IFLA_IFALIAS` incarnation with read-only `RTM_GETLINK` probes;
+  an active record additionally proves its exact committed ifindex. A
+  successful acquisition returns the exact retained `GtpDevice`, allowing a
+  process that stopped after link creation and stamping but before ifindex
+  publication to durably complete its prepared record. The acquisition never
+  reads, installs, or deletes a PDP context and never mutates the device,
+  closing the gap left by `create_recoverable_device`, `resolve_device`, and
+  `recover_pdp_context_exact`. Recoverable creation now uses kernel-owned GTP
+  sockets (`IFLA_GTP_CREATE_SOCKETS`) so the retained device remains
+  serviceable after its creator exits. Its deliberately narrow profile
+  requires wildcard IPv4 and GTP-U port 2152, also reserves the kernel's GTPv0
+  port 3386, and has no userspace-socket fallback; ordinary device creation
+  keeps its existing custom-address/port behavior. The versioned kernel alias
+  is now `opc-pdp-recovery-v2`, attesting that socket-lifetime contract as well
+  as the incarnation. Legacy `v1` links fail closed and must be drained,
+  removed, and freshly created rather than adopted or mutated in place. Typed
+  value-free outcomes distinguish exact `Retained` identity,
+  authoritative `Absent` (safe to follow with one fresh
+  `create_recoverable_device` call), untouched
+  `Conflict(ReplacementIdentity)` for a same name with a different ifindex or
+  a different/foreign/malformed kernel-bound identity, retryable
+  `Indeterminate(AuthorityUnavailable)`, and structural
+  `RepairRequired(Unstamped)`; renamed, removed, unstamped, malformed-alias,
+  and unrepresentable states are all structurally distinct from transient
+  authority unavailability. Authoritative absence uses route netlink rather
+  than libc name lookup, so descriptor/resource failures remain errors, and
+  contradictory, duplicate, or unterminated netlink evidence fails closed.
+  The detached blocking worker retains acquired authorities to completion, so
+  cancellation cannot overlap an admitted acquisition, and the mutation-free
+  classification is idempotent under retry. Request, acquisition, and outcome
+  diagnostics redact device identity, incarnation, endpoint, TEID, packet,
+  and descriptor values.
+- **Exact Linux PDP restart recovery authority — `opc-gtpu-dataplane`:**
+  `with_pdp_recovery_root` now returns `Result` and binds one validated absolute,
+  non-rebindable authority root shared by all backend clones. Every cooperating
+  create/remove, ordinary install/remove, classified-install, and restart-
+  recovery writer uses the same topology-then-device `flock` hierarchy where a
+  live device exists; creation holds the stronger topology lease through
+  publication. Callers
+  mint a cryptographically unpredictable, non-reusable `PdpDeviceIncarnation`,
+  durably persist it before the create effect, and provision through
+  `create_recoverable_device`, which proves the requested name absent and
+  reconciles ambiguous create acknowledgements before publishing a verified
+  link; recovery then proves the durable name and ifindex
+  plus the live kernel `IFLA_IFALIAS` incarnation under both locks before a
+  stable dual-axis `GETPDP` can authorize unconditional `DELPDP`. Unknown or
+  flagged `GETPDP` attributes fail closed. Removal outcomes distinguish
+  `Removed`, idempotent `AlreadyAbsent`, untouched `Conflict`, retryable
+  `Indeterminate`, and structural `RepairRequired`; a detached blocking worker
+  retains authority to completion, so retries are fenced and re-read converged
+  state. Linux's trait `remove_pdp_context_exact(GtpPdpContext)` remains
+  `UnsupportedFeature` with `exact_removal: Missing` because it carries no
+  incarnation; callers use the authority-bearing `recover_pdp_context_exact`
+  trait API (also exposed on the concrete Linux backend) and query its separate
+  `pdp_restart_recovery_capability`. All
+  cooperating processes must share the trusted, stable root and ancestors;
+  uncoordinated privileged writers or principals controlling that namespace
+  are outside the supported safety model. Request and outcome diagnostics
+  redact TEID, address, and device-identity values.
+- **Cleanup-only retained eBPF recovery authority — `opc-gtpu-dataplane`:**
+  `EbpfGtpuDataplaneBackend::acquire_cleanup_only_recovery` takes ownership of
+  the exact retained current-schema pin graph after process loss and fences the
+  forwarding tc hooks, so stale PDP contexts can be reconciled without
+  reactivating the stale graph. Unlike ordinary device creation/resolution it
+  never attaches or reattaches the forwarding hooks before cleanup is complete,
+  and unlike orphaned-graph recovery it never deletes the graph. The expected
+  interface name/ifindex identity is re-proved and the complete current pin
+  ABI/schema is validated before the retained CONFIG endpoint is read; identity,
+  configuration, and retained pin/config/schema conflicts are refused before
+  graph mutation. The independent grouped CONFIG6/SCHEMA6 authority must be
+  all-zero and all four grouped hashes empty; initialized, populated, or
+  malformed grouped state is refused as `NotCurrentSchema`. Older or partial
+  schemas are never migrated or repaired through this path. Stable malformed
+  legacy PDP content found after the forwarding safety fence is likewise
+  structural, while kernel/map observation and mutation failures remain
+  retryable indeterminate state.
+  Acquisition returns an affine, supervised
+  completion handle whose blocking worker converges the graph state under the
+  host-global namespace lease and operation lock even if the observing future is
+  dropped, so a retry never overlaps the same graph. While authority is held the
+  ordinary classified readback and `remove_pdp_context_exact` boundaries operate
+  only while both forwarding hooks are authoritatively absent. Their
+  capabilities are reported independently from classified installation;
+  installation, non-exact removal, and unrelated datapath mutations remain
+  denied throughout cleanup-only mode.
+  `activate_cleanup_recovery` is the sole explicit step that reattaches the
+  forwarding hooks and returns the device to normal management. Acquisition
+  classifies a provably absent graph, ownership/configuration conflicts,
+  retryable indeterminate evidence, and structural repairs distinctly, and the
+  request, handle, and all diagnostics remain redaction-safe.
+- **Deferred namespace-bound fixed-DSCP activation — `opc-ipsec-xfrm`:**
+  `LinuxXfrmBackend::with_deferred_dscp_marking` and its custom-config variant
+  validate and retain marking configuration without loading, pinning,
+  attaching, adopting, or changing tc/eBPF state. Namespace binding, including
+  atomic durable-recovery-store binding, preserves that zero-effect boundary
+  so consumers can reconcile authenticated `Prepared` state while external
+  egress authority remains closed. The same
+  `NamespaceBoundLinuxXfrmBackend` then activates the companion through its
+  serialized actor. Every DSCP-bearing SA mutation, including durable install
+  admission, relocation, and outbound replay-counter updates, fails before
+  XFRM mutation until activation succeeds. A clean durable rejection returns
+  its exact affine retry authority while retaining `Prepared` state. Failed or
+  cancelled activation cannot publish readiness, clean failures can be retried
+  on the same actor, success is idempotent, and capability remains
+  unadvertised until both actor-local activation and existing exact
+  marked-GETSA readback gates are satisfied.
 - **Durable staged-object ownership recovery — `opc-ipsec-xfrm`:**
   `LinuxXfrmBackend::bind_current_network_namespace_with_object_recovery` now
   authenticates and permanently leases `XfrmObjectInstallRecoveryStore` on the
-  namespace actor before returning a mutation-capable backend, which can then
-  run, finalize, or recover SA-only and policy-only create-exclusive installs
-  across process loss. The
+  namespace actor before returning a mutation-capable backend. SA-only and
+  policy-only create-exclusive installs now expose a durable pre-effect split:
+  `prepare_durable_object_install` publishes authenticated `Prepared` truth and
+  returns a non-cloneable authority; only
+  `run_durable_object_install(authority)` can consume that exact actor-, store-,
+  correlation-, generation-, and request-bound authority and admit the external
+  effect. This closes the crash cut between a consumer's durable poll admission
+  and the SDK method's first poll. A retained `Prepared` operation recovers as
+  authoritative no-mutation without deletion, while duplicated, replayed,
+  stale, or mismatched authority fails before the backend. The
   fixed-size durable records retain only opaque correlation, object kind,
   namespace/writer incarnation, product generation, writer epoch, outcome,
   and independent proof-keyed fingerprints of the exact deletion identity and
@@ -27,6 +303,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scope proof before `DELPOLICY`. Atomic file publication, durable global
   epochs, cancellation-safe actor completion, mock SA/policy outcomes, and
   kill/restart namespace detectors cover the crash-ordering contract.
+- **Durable SA relocation recovery — `opc-ipsec-xfrm`:**
+  `LinuxXfrmBackend::bind_current_network_namespace_with_sa_relocation_recovery`
+  and the combined
+  `bind_current_network_namespace_with_object_and_sa_relocation_recovery`
+  authenticate and permanently lease a self-contained
+  `XfrmSaRelocationRecoveryStore` on the namespace actor before returning a
+  mutation-capable backend, so an ordinary SDK mutation can never precede the
+  retained relocation writer epoch. Exact SA relocations now expose the same
+  durable pre-effect split as staged-object installs: `prepare_sa_relocation`
+  publishes authenticated `Prepared` truth and returns a non-cloneable
+  `XfrmSaRelocationAdmissionAuthority`; `run_durable_sa_relocation` witnesses
+  the old and target identities through exact `GETSA` readbacks, embeds the
+  witnessed target disposition (`TargetAbsent` for a changed XfrmId,
+  `SameIdentityWitnessed` for encapsulation/source-only relocation at an
+  unchanged XfrmId, mirroring RFC 4301 §4.1 SAD identity and RFC 4555
+  §1.1/§1.2/§3.8 move-not-copy semantics) as a durable pre-effect proof in
+  the authenticated record, persists `Issuing`, and only then admits the
+  single `relocate_sa` MIGRATE effect, publishing `Relocated`, `NoMutation`,
+  or `Indeterminate` before returning. Proved deterministic pre-effect
+  rejections — a deferred DSCP gate, a present target identity, and an
+  untrustworthy readback — return the exact affine authority with `Prepared`
+  retained; a mismatching current state consumes it under a value-free label.
+  There is no finalize/adoption call: a terminal `Relocated` record is the
+  durable proof that the consumer continues on the new addresses. After
+  process loss, `recover_durable_sa_relocation` classifies unresolved
+  `Issuing`/`Indeterminate` records from their proof plus fresh exact
+  readbacks — intact old state retires as no-mutation, absent current/target
+  state publishes the distinct terminal `StateAbsent` outcome without
+  claiming no mutation, and an unpublished owned move is removed through the
+  exact target deletion identity after `RemovalAdmitted`; foreign or ambiguous
+  state authorizes no deletion, and stale-epoch or missing/inconsistent-proof
+  records stay fail-closed for repair — while prepared records retire as
+  authoritative no-mutation and terminal proof is returned idempotently.
+  Every unresolved relocation phase, including `Prepared`, gates all later
+  cooperating mutations in the namespace. Effect-capable install and
+  relocation records gate each other, and every admitted mutation advances
+  both durable writer epochs. Durable runs and effect-capable recovery
+  cross-fence older prepared authority before kernel access. Reopen also
+  removes only strictly validated, family-specific staging residue left by
+  process death before atomic rename; unsafe lookalikes stay fail-closed.
+  Fixed-size relocation records (`OPCXRLC1`, format
+  version 1 with the proof byte present from version 1, and family-distinct
+  `OPCXRCT1`/`OPCXREP1` control/epoch file magics so an open against another
+  durable family's root fails closed) retain only opaque
+  correlation, phase, proof code, incarnation, epoch, and independent
+  proof-keyed fingerprints of the deletion identity and complete relocation
+  request; no address, selector, SPI, mark, encap port, namespace identity,
+  request body, or operation identity is rendered. Privileged
+  process-loss detectors cover prepared cuts, issuing cuts before and after
+  the MIGRATE effect for inbound, outbound-block-policy, and same-XfrmId
+  encapsulation relocations, foreign-state injection, and wrong-namespace
+  binding; there is no compatibility path, migration bridge, or
+  unconditional-delete escape hatch.
 - **Bounded IPCP syntax validation in PCO/APCO — `opc-proto-gtpv2c`:**
   `PcoAddressConfiguration::validate_network_contents_ipcp_syntax` traverses
   the same bounded PCO framing cursor as address decode and checks the RFC 1661
@@ -567,6 +896,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fixture, so no message that already round-tripped moves on the wire.
 
 ### Fixed
+- **Bounded stateless-consumer connection establishment — `opc-session-net`
+  (#691):** `StatelessSessionConsumerClient::with_pre_request_connection_timeout`
+  adds an opt-in per-operation deadline for endpoint resolution, TCP, TLS, and
+  the value-free Hello exchange through the application-call write boundary.
+  Expiry before any call bytes are written is retry-safe and reported as
+  unavailable; a partial call write and every post-write failure retain the
+  existing exact-request-ID unknown-outcome contract. Clients that do not opt
+  in retain the existing complete-operation deadline behavior.
+- **Reconnect-time stateless consumer endpoint resolution — `opc-session-net`
+  (#688):** `StatelessSessionConsumerClient::new_with_resolver` now resolves a
+  stable endpoint before each fresh connection, so ordinary endpoint
+  replacement does not pin a process to a retired address. The authenticated
+  TLS server name, expected SPIFFE identity, and consumer scope remain fixed;
+  resolver failures are classified before request transmission, and ambiguous
+  mutations are never replayed. The existing `new(SocketAddr, ...)`
+  constructor remains a constant-address convenience.
+- **Cause-only Create Bearer rejection — `opc-proto-gtpv2c` (#653):**
+  S2b Create Bearer Responses whose message-level Cause rejects the request may
+  now omit Bearer Context IEs, as permitted by TS 29.274 clause 6.1.1. Typed
+  projection, canonical building, and request/response correlation preserve
+  exact sequence checking while accepted, partially accepted, and non-empty
+  rejected responses continue to require their complete context set.
+- **Prevent shutdown log amplification — `opc-runtime` (#633):**
+  `ShutdownToken::request_shutdown` and `ShutdownToken::cancel` no longer emit
+  a tracing event on every invocation. They now return a closed, value-free
+  `ShutdownDisposition` (`Initiated` / `AlreadyRequested`) naming whether the
+  invocation won the token's single effective `Running` → `Draining`
+  transition, and stay silent otherwise. The supervisor owns the initiation
+  record: the first non-`Immediate` `Supervisor::shutdown_all` of a
+  supervisor emits exactly one aggregate `shutdown requested` event, decided
+  by a linearized supervisor-level gate rather than token dispositions — so
+  the record survives the runtime pre-initiating the global token or every
+  task token being requested upstream, and concurrent or repeat aggregate
+  drains announce nothing further, regardless of task count (previously one
+  global request event plus two request events per task).
+  `Supervisor::shutdown_task` records only when it initiates the task
+  shutdown. `DrainGuard::transition` likewise records only effective phase
+  advances. Watch publication also stays monotonic when concurrent phase
+  publishers complete out of order, so subscribers cannot regress to a stale
+  phase. Subscriber wakeups, drain ordering, and all drain timeouts are
+  preserved.
 - **NETCONF candidate commits now fail closed before mutation without lying
   after a known success — `opc-netconf-server`:** `<commit>` records a
   path-scoped `AuditOutcome::Intent` before config-bus submission, so an audit

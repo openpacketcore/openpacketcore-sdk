@@ -20,12 +20,13 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::raft_adapter::{SessionRaftAdapterError, SessionRaftPeerDirectory};
-use super::snapshot::SessionSnapshotFile;
+use super::snapshot::{PinnedSqliteFile, SessionSnapshotFile};
 use super::{
     SessionConsensusIdentity, SessionConsensusNodeId, SessionRaftTypeConfig,
     SessionTopologyMemberBinding,
 };
 use crate::backend::ReplicationEntry;
+use crate::readiness::PlacementResiliencePolicy;
 use crate::sqlite::consensus::{self, SqliteConsensusCore};
 use crate::sqlite::SqliteSessionBackend;
 
@@ -58,6 +59,19 @@ pub enum SessionConsensusStorageError {
     /// SQLite or snapshot storage could not be initialized.
     #[error("session consensus storage is unavailable")]
     BackendUnavailable,
+}
+
+/// Immutable authority model bound to one durable consensus database.
+///
+/// Dynamic authority permits the existing staged membership-transition model.
+/// Fixed authority is set only when a pristine database is first admitted and
+/// requires the original storage identity on every later open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsensusAuthorityProfile {
+    /// The durable store uses the normal dynamic-membership authority model.
+    Dynamic,
+    /// The durable store is permanently bound to one exact fixed quorum.
+    FixedImmutable,
 }
 
 /// Serialized Openraft vote/log persistence.
@@ -130,12 +144,78 @@ pub(crate) async fn open_with_member_bindings(
     ),
     SessionConsensusStorageError,
 > {
+    open_with_member_bindings_for_profile(
+        backend,
+        snapshot_dir,
+        identity,
+        expected_members,
+        expected_bindings,
+        membership_admission,
+        ConsensusAuthorityProfile::Dynamic,
+        None,
+    )
+    .await
+}
+
+/// Open one durable fixed-quorum authority store.
+///
+/// Unlike the dynamic entry point, this binds the original durable storage
+/// identity to `identity` permanently and rejects membership transitions.
+pub(crate) async fn open_fixed_with_member_bindings(
+    backend: &SqliteSessionBackend,
+    snapshot_dir: impl Into<PathBuf>,
+    identity: SessionConsensusIdentity,
+    expected_members: BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    membership_admission: SessionRaftPeerDirectory,
+    placement_policy: PlacementResiliencePolicy,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
+    open_with_member_bindings_for_profile(
+        backend,
+        snapshot_dir,
+        identity,
+        expected_members,
+        expected_bindings,
+        membership_admission,
+        ConsensusAuthorityProfile::FixedImmutable,
+        Some(placement_policy),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_with_member_bindings_for_profile(
+    backend: &SqliteSessionBackend,
+    snapshot_dir: impl Into<PathBuf>,
+    identity: SessionConsensusIdentity,
+    expected_members: BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    membership_admission: SessionRaftPeerDirectory,
+    authority_profile: ConsensusAuthorityProfile,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
     let core = SqliteConsensusCore::initialize(
         backend,
         snapshot_dir.into(),
         identity,
         expected_members,
         expected_bindings,
+        authority_profile,
+        fixed_placement_policy,
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
@@ -181,6 +261,8 @@ async fn open(
         identity,
         expected_members,
         bindings,
+        ConsensusAuthorityProfile::Dynamic,
+        None,
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
@@ -237,6 +319,8 @@ pub(crate) async fn open_with_pending_membership(
             desired_members,
             desired_bindings,
         },
+        ConsensusAuthorityProfile::Dynamic,
+        None,
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
@@ -264,7 +348,10 @@ async fn validate_and_clean_snapshot_directory(
         .map(|(_, file_name, _, _)| file_name.as_str());
     if let Some((_, file_name, expected_checksum, expected_length)) = &current {
         let path = core.snapshot_dir.join(file_name);
-        let (_, checksum, length) = verify_snapshot_envelope(&path)
+        let mut snapshot = SessionSnapshotFile::open(path)
+            .await
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        let (_, checksum, length) = verify_snapshot_envelope_reader(&mut snapshot)
             .await
             .map_err(|_| SessionConsensusStorageError::CorruptState)?;
         if checksum != *expected_checksum || length != *expected_length {
@@ -375,12 +462,22 @@ impl RaftLogReader<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     ) -> Result<Vec<Entry<SessionRaftTypeConfig>>, StorageError<SessionConsensusNodeId>> {
         let (start, end) = range_to_half_open(&range)
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
-        if end.is_some_and(|end| start >= end) {
-            return Ok(Vec::new());
-        }
         let conn = self.core.conn.lock().await;
-        consensus::read_log_range_sync(&conn, self.core.storage_identity, start, end, None)
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
+        consensus::with_durable_authority_raw_read_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
+            |conn| {
+                if end.is_some_and(|end| start >= end) {
+                    return Ok(Vec::new());
+                }
+                consensus::read_log_range_sync(conn, self.core.storage_identity, start, end, None)
+            },
+        )
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
     }
 
     async fn limited_get_log_entries(
@@ -388,18 +485,31 @@ impl RaftLogReader<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         start: u64,
         end: u64,
     ) -> Result<Vec<Entry<SessionRaftTypeConfig>>, StorageError<SessionConsensusNodeId>> {
-        if start >= end {
-            return Ok(Vec::new());
-        }
         let conn = self.core.conn.lock().await;
-        let entries = consensus::read_limited_log_range_sync(
+        let entries = consensus::with_durable_authority_raw_read_sync(
             &conn,
             self.core.storage_identity,
-            start,
-            end,
-            DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
+            |conn| {
+                if start >= end {
+                    return Ok(Vec::new());
+                }
+                consensus::read_limited_log_range_sync(
+                    conn,
+                    self.core.storage_identity,
+                    start,
+                    end,
+                    DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
+                )
+            },
         )
         .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
+        if start >= end {
+            return Ok(entries);
+        }
         if entries.is_empty() {
             return Err(storage_error(
                 ErrorSubject::Logs,
@@ -420,10 +530,21 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
     ) -> Result<LogState<SessionRaftTypeConfig>, StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        let last_purged_log_id = consensus::read_purged_sync(&conn, self.core.storage_identity)
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
-        let last_log_id = consensus::last_log_sync(&conn, self.core.storage_identity)
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
+        let (last_purged_log_id, last_log_id) = consensus::with_durable_authority_raw_read_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
+            |conn| {
+                Ok((
+                    consensus::read_purged_sync(conn, self.core.storage_identity)?,
+                    consensus::last_log_sync(conn, self.core.storage_identity)?,
+                ))
+            },
+        )
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
         Ok(LogState {
             last_purged_log_id,
             last_log_id,
@@ -439,16 +560,32 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         vote: &Vote<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        consensus::save_vote_sync(&conn, self.core.storage_identity, vote)
-            .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Write, error))
+        consensus::save_vote_with_authority_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
+            vote,
+        )
+        .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Write, error))
     }
 
     async fn read_vote(
         &mut self,
     ) -> Result<Option<Vote<SessionConsensusNodeId>>, StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        consensus::read_vote_sync(&conn, self.core.storage_identity)
-            .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Read, error))
+        consensus::with_durable_authority_raw_read_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
+            |conn| consensus::read_vote_sync(conn, self.core.storage_identity),
+        )
+        .map_err(|error| storage_error(ErrorSubject::Vote, ErrorVerb::Read, error))
     }
 
     async fn save_committed(
@@ -456,16 +593,32 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         committed: Option<LogId<SessionConsensusNodeId>>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        consensus::save_committed_sync(&conn, self.core.storage_identity, committed)
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))
+        consensus::save_committed_with_authority_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
+            committed,
+        )
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))
     }
 
     async fn read_committed(
         &mut self,
     ) -> Result<Option<LogId<SessionConsensusNodeId>>, StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        consensus::read_committed_sync(&conn, self.core.storage_identity)
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
+        consensus::with_durable_authority_raw_read_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
+            |conn| consensus::read_committed_sync(conn, self.core.storage_identity),
+        )
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
     }
 
     async fn append<I>(
@@ -479,7 +632,15 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     {
         let entries: Vec<_> = entries.into_iter().collect();
         let conn = self.core.conn.lock().await;
-        match consensus::append_logs_sync(&conn, self.core.storage_identity, &entries) {
+        match consensus::append_logs_with_authority_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
+            &entries,
+        ) {
             Ok(()) => {
                 callback.log_io_completed(Ok(()));
                 Ok(())
@@ -497,8 +658,16 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         log_id: LogId<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let conn = self.core.conn.lock().await;
-        consensus::truncate_logs_sync(&conn, self.core.storage_identity, &log_id)
-            .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
+        consensus::truncate_logs_with_authority_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
+            &log_id,
+        )
+        .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
     }
 
     async fn purge(
@@ -509,8 +678,16 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             .await
             .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))?;
         let conn = self.core.conn.lock().await;
-        consensus::purge_logs_sync(&conn, self.core.storage_identity, &log_id)
-            .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
+        consensus::purge_logs_with_authority_sync(
+            &conn,
+            self.core.storage_identity,
+            self.core.authority_profile,
+            &self.core.expected_members,
+            &self.core.expected_bindings,
+            self.core.fixed_placement_policy,
+            &log_id,
+        )
+        .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))
     }
 }
 
@@ -529,13 +706,21 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         let (applied, membership) = {
             let _membership_apply = self.begin_membership_apply().await;
             let conn = self.core.conn.lock().await;
-            let applied = consensus::read_applied_sync(&conn, self.core.storage_identity).map_err(
-                |error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error),
-            )?;
-            let membership = consensus::read_membership_sync(&conn, self.core.storage_identity)
-                .map_err(|error| {
-                    storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error)
-                })?;
+            let (applied, membership) = consensus::with_durable_authority_raw_read_sync(
+                &conn,
+                self.core.storage_identity,
+                self.core.authority_profile,
+                &self.core.expected_members,
+                &self.core.expected_bindings,
+                self.core.fixed_placement_policy,
+                |conn| {
+                    Ok((
+                        consensus::read_applied_sync(conn, self.core.storage_identity)?,
+                        consensus::read_membership_sync(conn, self.core.storage_identity)?,
+                    ))
+                },
+            )
+            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error))?;
             self.observe_applied_membership(&membership)
                 .map_err(membership_admission_storage_error)?;
             (applied, membership)
@@ -579,10 +764,14 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 None
             };
             let conn = self.core.conn.lock().await;
-            let applied = consensus::apply_entries_sync(
+            let applied = consensus::apply_entries_with_authority_sync(
                 &conn,
                 self.core.storage_identity,
                 &self.core.caps,
+                self.core.authority_profile,
+                &self.core.expected_members,
+                &self.core.expected_bindings,
+                self.core.fixed_placement_policy,
                 entries,
             )
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
@@ -636,9 +825,51 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             )
         })?;
         let incoming_path = snapshot.path().to_path_buf();
+        let (payload_length, checksum, total_length) =
+            verify_snapshot_envelope_reader(&mut snapshot)
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
+        let raw_path = self
+            .core
+            .snapshot_dir
+            .join(format!("install-{}.sqlite", uuid::Uuid::new_v4()));
+        let raw_snapshot =
+            extract_snapshot_database_from_reader(&mut snapshot, &raw_path, payload_length)
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Write,
+                        error,
+                    )
+                })?;
+
+        let file_name = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
+        let final_path = self.core.snapshot_dir.join(&file_name);
+        let promoted_path = self
+            .core
+            .snapshot_dir
+            .join(format!("promote-{}.part", uuid::Uuid::new_v4()));
+        if let Err(error) =
+            copy_and_promote_from_reader(&mut snapshot, &promoted_path, &final_path, total_length)
+                .await
+        {
+            let _ = tokio::fs::remove_file(&raw_path).await;
+            return Err(storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Write,
+                error,
+            ));
+        }
         drop(snapshot);
 
-        let (payload_length, checksum, total_length) = verify_snapshot_envelope(&incoming_path)
+        let mut promoted_snapshot = SessionSnapshotFile::open(final_path.clone())
             .await
             .map_err(|error| {
                 storage_error(
@@ -647,34 +878,41 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                     error,
                 )
             })?;
-        let raw_path = self
-            .core
-            .snapshot_dir
-            .join(format!("install-{}.sqlite", uuid::Uuid::new_v4()));
-        extract_snapshot_database(&incoming_path, &raw_path, payload_length)
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Write,
-                    error,
-                )
-            })?;
-
-        let file_name = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
-        let final_path = self.core.snapshot_dir.join(&file_name);
-        let promoted_path = self
-            .core
-            .snapshot_dir
-            .join(format!("promote-{}.part", uuid::Uuid::new_v4()));
-        if let Err(error) = copy_and_promote(&incoming_path, &promoted_path, &final_path).await {
+        let (_, promoted_checksum, promoted_length) =
+            verify_snapshot_envelope_reader(&mut promoted_snapshot)
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
+        if promoted_checksum != checksum || promoted_length != total_length {
+            let _ = tokio::fs::remove_file(&final_path).await;
             let _ = tokio::fs::remove_file(&raw_path).await;
             return Err(storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Write,
-                error,
+                ErrorVerb::Read,
+                consensus::invalid_data("session consensus promoted snapshot is inconsistent"),
             ));
         }
+        let promoted_pin =
+            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                Some(
+                    snapshot_handle_pin(&promoted_snapshot, &final_path)
+                        .await
+                        .map_err(|error| {
+                            storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                error,
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
 
         let installs_uniform_cutover =
             self.membership_admission.as_ref().is_some_and(|admission| {
@@ -695,10 +933,35 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                         error,
                     )
                 })?;
-            match consensus::install_snapshot_database_sync(
+            if let Some(promoted_pin) = &promoted_pin {
+                if !promoted_pin
+                    .path_matches_identity(&final_path)
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?
+                {
+                    return Err(storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        consensus::invalid_data(
+                            "session consensus published snapshot was replaced",
+                        ),
+                    ));
+                }
+            }
+            match consensus::install_snapshot_database_from_pinned_with_authority_sync(
                 &conn,
                 self.core.storage_identity,
-                &raw_path,
+                self.core.authority_profile,
+                Some(&self.core.expected_members),
+                Some(&self.core.expected_bindings),
+                self.core.fixed_placement_policy,
+                raw_snapshot,
+                promoted_pin.as_ref().map(|pin| (pin, final_path.as_path())),
                 meta,
                 &file_name,
                 checksum,
@@ -736,21 +999,37 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
     ) -> Result<Option<Snapshot<SessionRaftTypeConfig>>, StorageError<SessionConsensusNodeId>> {
         let current = {
             let conn = self.core.conn.lock().await;
-            consensus::read_current_snapshot_sync(&conn, self.core.storage_identity).map_err(
-                |error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error),
-            )?
+            consensus::with_durable_authority_raw_read_sync(
+                &conn,
+                self.core.storage_identity,
+                self.core.authority_profile,
+                &self.core.expected_members,
+                &self.core.expected_bindings,
+                self.core.fixed_placement_policy,
+                |conn| consensus::read_current_snapshot_sync(conn, self.core.storage_identity),
+            )
+            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?
         };
         let Some((meta, file_name, expected_checksum, expected_length)) = current else {
             return Ok(None);
         };
         let path = self.core.snapshot_dir.join(file_name);
-        let (_, checksum, length) = verify_snapshot_envelope(&path).await.map_err(|error| {
+        let mut snapshot = SessionSnapshotFile::open(path).await.map_err(|error| {
             storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
                 ErrorVerb::Read,
                 error,
             )
         })?;
+        let (_, checksum, length) = verify_snapshot_envelope_reader(&mut snapshot)
+            .await
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
         if checksum != expected_checksum || length != expected_length {
             return Err(storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
@@ -758,13 +1037,32 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 consensus::invalid_data("session consensus snapshot metadata is inconsistent"),
             ));
         }
-        let snapshot = SessionSnapshotFile::open(path).await.map_err(|error| {
+        snapshot.rewind().await.map_err(|error| {
             storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
                 ErrorVerb::Read,
                 error,
             )
         })?;
+        {
+            let conn = self.core.conn.lock().await;
+            consensus::with_durable_authority_raw_read_sync(
+                &conn,
+                self.core.storage_identity,
+                self.core.authority_profile,
+                &self.core.expected_members,
+                &self.core.expected_bindings,
+                self.core.fixed_placement_policy,
+                |_| Ok(()),
+            )
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
+        }
         Ok(Some(Snapshot {
             meta,
             snapshot: Box::new(snapshot),
@@ -815,24 +1113,59 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             .core
             .snapshot_dir
             .join(format!("build-{}.sqlite", uuid::Uuid::new_v4()));
-        let (last_log_id, last_membership) = {
-            let conn = self.core.conn.lock().await;
-            consensus::build_snapshot_database_sync(&conn, self.core.storage_identity, &raw_path)
-                .map_err(|error| {
-                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-                })?
-        };
         let file_name = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
         let final_path = self.core.snapshot_dir.join(&file_name);
         let temporary_path = self
             .core
             .snapshot_dir
             .join(format!("seal-{}.part", uuid::Uuid::new_v4()));
-        let (checksum, byte_length) = seal_snapshot_database(&raw_path, &temporary_path)
-            .await
-            .map_err(|error| {
-                storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-            })?;
+        let ((last_log_id, last_membership), (mut snapshot, checksum, byte_length)) =
+            if self.core.authority_profile == ConsensusAuthorityProfile::Dynamic {
+                let membership = {
+                    let conn = self.core.conn.lock().await;
+                    consensus::build_snapshot_database_with_authority_sync(
+                        &conn,
+                        self.core.storage_identity,
+                        self.core.authority_profile,
+                        &self.core.expected_members,
+                        &self.core.expected_bindings,
+                        self.core.fixed_placement_policy,
+                        &raw_path,
+                    )
+                }
+                .map_err(|error| {
+                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                })?;
+                let sealed =
+                    seal_snapshot_database_from_path(&raw_path, &temporary_path, &final_path)
+                        .await
+                        .map_err(|error| {
+                            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                        })?;
+                (membership, sealed)
+            } else {
+                let (membership, raw_snapshot) = {
+                    let conn = self.core.conn.lock().await;
+                    consensus::build_snapshot_database_pinned_with_authority_sync(
+                        &conn,
+                        self.core.storage_identity,
+                        self.core.authority_profile,
+                        &self.core.expected_members,
+                        &self.core.expected_bindings,
+                        self.core.fixed_placement_policy,
+                        &raw_path,
+                    )
+                }
+                .map_err(|error| {
+                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                })?;
+                let sealed = seal_snapshot_database(raw_snapshot, &temporary_path, &final_path)
+                    .await
+                    .map_err(|error| {
+                        storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                    })?;
+                (membership, sealed)
+            };
         tokio::fs::rename(&temporary_path, &final_path)
             .await
             .map_err(|error| {
@@ -847,6 +1180,22 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             last_membership,
             snapshot_id,
         };
+        let published_pin =
+            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                Some(
+                    snapshot_handle_pin(&snapshot, &final_path)
+                        .await
+                        .map_err(|error| {
+                            storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                error,
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
         let previous = {
             let conn = self.core.conn.lock().await;
             let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
@@ -857,9 +1206,33 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                         error,
                     )
                 })?;
-            consensus::save_current_snapshot_sync(
+            if let Some(published_pin) = &published_pin {
+                if !published_pin
+                    .path_matches_identity(&final_path)
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?
+                {
+                    return Err(storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        consensus::invalid_data(
+                            "session consensus published snapshot was replaced",
+                        ),
+                    ));
+                }
+            }
+            consensus::save_current_snapshot_with_authority_sync(
                 &conn,
                 self.core.storage_identity,
+                self.core.authority_profile,
+                &self.core.expected_members,
+                &self.core.expected_bindings,
+                self.core.fixed_placement_policy,
                 &meta,
                 &file_name,
                 checksum,
@@ -876,15 +1249,30 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         };
         let _ = tokio::fs::remove_file(&raw_path).await;
         remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name).await;
-        let snapshot = SessionSnapshotFile::open(final_path)
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
-                )
-            })?;
+        let (_, observed_checksum, observed_length) =
+            verify_snapshot_envelope_reader(&mut snapshot)
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
+        if observed_checksum != checksum || observed_length != byte_length {
+            return Err(storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                consensus::invalid_data("session consensus sealed snapshot is inconsistent"),
+            ));
+        }
+        snapshot.rewind().await.map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                error,
+            )
+        })?;
         Ok(Snapshot {
             meta,
             snapshot: Box::new(snapshot),
@@ -900,22 +1288,61 @@ async fn notify_watchers(core: &SqliteConsensusCore, notifications: &[Replicatio
     for notification in notifications {
         watchers.retain_mut(|watcher| watcher.notify(notification));
     }
+    drop(watchers);
+
+    let mut consumer_watchers = core.consumer_watchers.lock().await;
+    for notification in notifications {
+        let projected = crate::consumer::session_consumer_change(notification);
+        let Ok(projected) = projected else {
+            // Invalid replay shape cannot be safely projected. Closing the
+            // affected consumers forces coherent catch-up instead of exposing
+            // raw state or retaining it in an unbounded queue.
+            consumer_watchers.clear();
+            return;
+        };
+        let Ok(encoded_bytes) = crate::consumer::session_consumer_change_encoded_bytes(&projected)
+        else {
+            consumer_watchers.clear();
+            return;
+        };
+        consumer_watchers.retain_mut(|watcher| watcher.notify(&projected, encoded_bytes));
+    }
+}
+
+fn secure_snapshot_create_options(read: bool) -> tokio::fs::OpenOptions {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create_new(true).read(read).write(true);
+    #[cfg(unix)]
+    {
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    options
+}
+
+async fn snapshot_handle_pin(
+    snapshot: &SessionSnapshotFile,
+    path: &Path,
+) -> io::Result<PinnedSqliteFile> {
+    let cloned = snapshot.try_clone().await?;
+    PinnedSqliteFile::from_file(cloned.into_std().await, path.to_path_buf())
 }
 
 async fn seal_snapshot_database(
-    raw_path: &Path,
+    raw_snapshot: PinnedSqliteFile,
     output_path: &Path,
-) -> io::Result<([u8; 32], u64)> {
-    let payload_length = tokio::fs::metadata(raw_path).await?.len();
+    final_path: &Path,
+) -> io::Result<(SessionSnapshotFile, [u8; 32], u64)> {
+    raw_snapshot.verify_identity()?;
+    let payload_length = raw_snapshot.file().metadata()?.len();
     if payload_length == 0 || payload_length > SNAPSHOT_MAX_BYTES {
         return Err(consensus::invalid_data(
             "session consensus snapshot size is invalid",
         ));
     }
-    let mut source = tokio::fs::File::open(raw_path).await?;
-    let mut output = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
+    let mut source = tokio::fs::File::from_std(raw_snapshot.into_file());
+    let mut output = secure_snapshot_create_options(true)
         .open(output_path)
         .await?;
     let mut hasher = Sha256::new();
@@ -950,14 +1377,80 @@ async fn seal_snapshot_database(
     output.write_all(&checksum).await?;
     output.flush().await?;
     output.sync_all().await?;
+    // `output` is the same descriptor that will survive the caller's atomic
+    // promotion from `output_path` to `final_path`; the diagnostic path is
+    // therefore deliberately the eventual published name, never reopened.
+    let snapshot = SessionSnapshotFile::from_file(output, final_path.to_path_buf()).await?;
     let total = payload_length
         .checked_add(SNAPSHOT_FOOTER_BYTES)
         .ok_or_else(|| consensus::invalid_data("session consensus snapshot length overflow"))?;
-    Ok((checksum, total))
+    Ok((snapshot, checksum, total))
 }
 
-async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64)> {
-    let total_length = tokio::fs::metadata(path).await?.len();
+/// Seal a Dynamic snapshot using the portable path-based SQLite image flow.
+///
+/// Dynamic consensus intentionally retains the released cross-platform
+/// behavior. Fixed authority uses `seal_snapshot_database` above, whose
+/// descriptor pinning remains an additional Linux-only identity fence.
+async fn seal_snapshot_database_from_path(
+    raw_path: &Path,
+    output_path: &Path,
+    final_path: &Path,
+) -> io::Result<(SessionSnapshotFile, [u8; 32], u64)> {
+    let payload_length = tokio::fs::metadata(raw_path).await?.len();
+    if payload_length == 0 || payload_length > SNAPSHOT_MAX_BYTES {
+        return Err(consensus::invalid_data(
+            "session consensus snapshot size is invalid",
+        ));
+    }
+    let mut source = tokio::fs::File::open(raw_path).await?;
+    let mut output = secure_snapshot_create_options(true)
+        .open(output_path)
+        .await?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(u64::try_from(read).map_err(|_| {
+                consensus::invalid_data("session consensus snapshot length overflow")
+            })?)
+            .ok_or_else(|| consensus::invalid_data("session consensus snapshot length overflow"))?;
+        if copied > SNAPSHOT_MAX_BYTES {
+            return Err(consensus::invalid_data(
+                "session consensus snapshot exceeds size limit",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        output.write_all(&buffer[..read]).await?;
+    }
+    if copied != payload_length {
+        return Err(consensus::invalid_data(
+            "session consensus snapshot changed while sealing",
+        ));
+    }
+    let checksum: [u8; 32] = hasher.finalize().into();
+    output.write_all(SNAPSHOT_FOOTER_MAGIC).await?;
+    output.write_all(&payload_length.to_be_bytes()).await?;
+    output.write_all(&checksum).await?;
+    output.flush().await?;
+    output.sync_all().await?;
+    let snapshot = SessionSnapshotFile::from_file(output, final_path.to_path_buf()).await?;
+    let total = payload_length
+        .checked_add(SNAPSHOT_FOOTER_BYTES)
+        .ok_or_else(|| consensus::invalid_data("session consensus snapshot length overflow"))?;
+    Ok((snapshot, checksum, total))
+}
+
+async fn verify_snapshot_envelope_reader<R>(file: &mut R) -> io::Result<(u64, [u8; 32], u64)>
+where
+    R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
+{
+    let total_length = file.seek(io::SeekFrom::End(0)).await?;
     if total_length <= SNAPSHOT_FOOTER_BYTES
         || total_length > SNAPSHOT_MAX_BYTES.saturating_add(SNAPSHOT_FOOTER_BYTES)
     {
@@ -965,7 +1458,6 @@ async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64
             "session consensus snapshot size is invalid",
         ));
     }
-    let mut file = tokio::fs::File::open(path).await?;
     file.seek(io::SeekFrom::End(
         -i64::try_from(SNAPSHOT_FOOTER_BYTES).map_err(|_| {
             consensus::invalid_data("session consensus snapshot footer size is invalid")
@@ -1018,15 +1510,18 @@ async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64
     Ok((payload_length, actual_checksum, total_length))
 }
 
-async fn extract_snapshot_database(
-    source: &Path,
+async fn extract_snapshot_database_from_reader<R>(
+    source: &mut R,
     destination: &Path,
     length: u64,
-) -> io::Result<()> {
-    let mut source = tokio::fs::File::open(source).await?.take(length);
-    let mut destination = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
+) -> io::Result<PinnedSqliteFile>
+where
+    R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
+{
+    source.seek(io::SeekFrom::Start(0)).await?;
+    let mut source = source.take(length);
+    let destination_path = destination.to_path_buf();
+    let mut destination = secure_snapshot_create_options(false)
         .open(destination)
         .await?;
     let copied = tokio::io::copy(&mut source, &mut destination).await?;
@@ -1036,17 +1531,29 @@ async fn extract_snapshot_database(
         ));
     }
     destination.flush().await?;
-    destination.sync_all().await
+    destination.sync_all().await?;
+    PinnedSqliteFile::from_file(destination.into_std().await, destination_path)
 }
 
-async fn copy_and_promote(source: &Path, temporary: &Path, final_path: &Path) -> io::Result<()> {
-    let mut source = tokio::fs::File::open(source).await?;
-    let mut output = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
+async fn copy_and_promote_from_reader<R>(
+    source: &mut R,
+    temporary: &Path,
+    final_path: &Path,
+    expected_length: u64,
+) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
+{
+    source.seek(io::SeekFrom::Start(0)).await?;
+    let mut output = secure_snapshot_create_options(false)
         .open(temporary)
         .await?;
-    tokio::io::copy(&mut source, &mut output).await?;
+    let copied = tokio::io::copy(source, &mut output).await?;
+    if copied != expected_length {
+        return Err(consensus::invalid_data(
+            "session consensus promoted snapshot length changed",
+        ));
+    }
     output.flush().await?;
     output.sync_all().await?;
     drop(output);
@@ -1102,6 +1609,37 @@ mod tests {
 
     const PLAINTEXT_CANARY: &[u8] = b"never-persist-this-plaintext-canary";
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn publication_identity_check_rejects_atomic_aba_replacement() {
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let published = directory.path().join("snapshot.opc");
+        tokio::fs::write(&published, b"verified envelope A")
+            .await
+            .expect("write first envelope");
+        let snapshot = SessionSnapshotFile::open(published.clone())
+            .await
+            .expect("open first envelope");
+        let pinned = snapshot_handle_pin(&snapshot, &published)
+            .await
+            .expect("pin first envelope");
+
+        let replacement = directory.path().join("replacement.opc");
+        tokio::fs::write(&replacement, b"different valid envelope B")
+            .await
+            .expect("write replacement envelope");
+        tokio::fs::rename(&replacement, &published)
+            .await
+            .expect("replace published name");
+
+        assert!(
+            !pinned
+                .path_matches_identity(&published)
+                .expect("compare published inode"),
+            "a verified handle must not authorize a replacement published name"
+        );
+    }
+
     fn identity(configuration_byte: u8) -> SessionConsensusIdentity {
         SessionConsensusIdentity::new(
             SessionConsensusClusterId::new("storage-tests").expect("cluster identity"),
@@ -1116,6 +1654,81 @@ mod tests {
 
     fn expected_members() -> BTreeSet<SessionConsensusNodeId> {
         BTreeSet::from([node_id()])
+    }
+
+    fn fixed_raw_read_members() -> BTreeSet<SessionConsensusNodeId> {
+        BTreeSet::from([
+            SessionConsensusNodeId::new(7).expect("fixed node ID"),
+            SessionConsensusNodeId::new(8).expect("fixed node ID"),
+            SessionConsensusNodeId::new(9).expect("fixed node ID"),
+        ])
+    }
+
+    fn fixed_raw_read_bindings(
+        members: &BTreeSet<SessionConsensusNodeId>,
+    ) -> BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding> {
+        members
+            .iter()
+            .copied()
+            .map(|node| {
+                let mut descriptor = [0x11; 32];
+                descriptor[..8].copy_from_slice(&node.get().to_be_bytes());
+                let mut endpoint = [0x22; 32];
+                endpoint[..8].copy_from_slice(&node.get().to_be_bytes());
+                let mut tls = [0x33; 32];
+                tls[..8].copy_from_slice(&node.get().to_be_bytes());
+                let mut backing = [0x44; 32];
+                backing[..8].copy_from_slice(&node.get().to_be_bytes());
+                (
+                    node,
+                    SessionTopologyMemberBinding::new(descriptor, endpoint, tls, backing),
+                )
+            })
+            .collect()
+    }
+
+    async fn open_fixed_raw_read_store(
+        directory: &tempfile::TempDir,
+    ) -> (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        PathBuf,
+    ) {
+        let database = directory.path().join("fixed-raw-read.sqlite");
+        let backend = SqliteSessionBackend::open(&database).expect("fixed raw-read backend");
+        let members = fixed_raw_read_members();
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            directory.path().join("fixed-raw-read-snapshots"),
+            identity(1),
+            members.clone(),
+            fixed_raw_read_bindings(&members),
+            ConsensusAuthorityProfile::FixedImmutable,
+            Some(PlacementResiliencePolicy::AllowReducedResilience),
+        )
+        .await
+        .expect("open exact fixed raw-read store");
+        (
+            SqliteConsensusLogStore { core: core.clone() },
+            SqliteConsensusStateMachine {
+                core,
+                membership_admission: None,
+            },
+            database,
+        )
+    }
+
+    async fn assert_fixed_raw_reads_fail_closed(
+        log_store: &mut SqliteConsensusLogStore,
+        state_machine: &mut SqliteConsensusStateMachine,
+    ) {
+        assert!(log_store.try_get_log_entries(0..0).await.is_err());
+        assert!(log_store.limited_get_log_entries(0, 0).await.is_err());
+        assert!(log_store.get_log_state().await.is_err());
+        assert!(log_store.read_vote().await.is_err());
+        assert!(log_store.read_committed().await.is_err());
+        assert!(state_machine.applied_state().await.is_err());
+        assert!(state_machine.get_current_snapshot().await.is_err());
     }
 
     fn log_id(index: u64) -> LogId<SessionConsensusNodeId> {
@@ -1323,6 +1936,47 @@ mod tests {
             );
         }
         assert!(log_store.limited_get_log_entries(4, 5).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fixed_raw_reads_reject_persisted_profile_policy_and_scope_drift() {
+        for drift in [
+            "UPDATE consensus_identity SET authority_profile = 1 WHERE singleton = 1",
+            "UPDATE consensus_identity SET fixed_placement_policy = 1 WHERE singleton = 1",
+            "UPDATE consensus_membership_scope SET application_authority_epoch = application_authority_epoch + 1 WHERE singleton = 1",
+        ] {
+            let directory = tempfile::tempdir().expect("fixed raw-read directory");
+            let (mut log_store, mut state_machine, database) =
+                open_fixed_raw_read_store(&directory).await;
+            let connection = rusqlite::Connection::open(database).expect("open fixed raw-read db");
+            connection.execute(drift, []).expect("persist fixed raw-read drift");
+            drop(connection);
+
+            assert_fixed_raw_reads_fail_closed(&mut log_store, &mut state_machine).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_raw_reads_do_not_require_fixed_authority() {
+        let directory = tempfile::tempdir().expect("dynamic raw-read directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("dynamic-raw-read.sqlite"))
+            .expect("dynamic raw-read backend");
+        let (mut log_store, mut state_machine) = open(
+            &backend,
+            directory.path().join("dynamic-raw-read-snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("open dynamic raw-read store");
+
+        assert!(log_store.try_get_log_entries(0..0).await.is_ok());
+        assert!(log_store.limited_get_log_entries(0, 0).await.is_ok());
+        assert!(log_store.get_log_state().await.is_ok());
+        assert!(log_store.read_vote().await.is_ok());
+        assert!(log_store.read_committed().await.is_ok());
+        assert!(state_machine.applied_state().await.is_ok());
+        assert!(state_machine.get_current_snapshot().await.is_ok());
     }
 
     #[tokio::test]

@@ -31,6 +31,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_ignored = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 futures-util = "0.3"

@@ -203,10 +203,12 @@ attestor supplies that provenance; the CNF chooses and configures the
 Kubernetes/cloud/CSI/TPM/SPIFFE adapter and must still map each logical voter
 to exactly one durable backing volume.
 
-The exact consensus contract is transport/wire-schema revision 3 and error-set
-revision 5. Revision 3 adds the bounded topology-admission barrier family;
-error revision 5 adds `TopologyAuthorityRevoked`. Older exact profiles fail
-before engine dispatch and require a drained full-membership upgrade.
+The exact consensus contract is transport/wire-schema revision 4 and error-set
+revision 6. Revision 4 makes the forwarded consumer scope explicit, so a
+peer cannot silently downgrade a consumer-scoped operation to an internal
+call; error revision 6 binds that semantic boundary into the exact profile.
+Older exact profiles fail before engine dispatch and require a drained
+full-membership upgrade.
 
 ### Structural identity and legacy persistence admission
 

@@ -1429,10 +1429,9 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
   `probe_durable_readiness` uses an Openraft linearizable barrier and local-apply
   wait, not bind or cached capability evidence; only attested topology plus
   `probe_production_durable_readiness` may gate production traffic. Its exact
-  profile uses transport/wire-schema revision 3
-  and error-set revision 5, including the bounded topology-admission barrier
-  and `TopologyAuthorityRevoked`.
-  Revision-2/error-revision-4-or-older peers fail before dispatch and all
+  profile uses transport/wire-schema revision 4
+  and error-set revision 6, including the explicit forwarded-consumer scope
+  boundary. Revision-3/error-revision-5-or-older peers fail before dispatch and all
   consensus members must be upgraded together while traffic is drained.
 - **Fault Coverage**: Tests cover concurrent pristine formation, cross-node
   lease/CAS visibility, follower linearizable reads, partition-bounded failure

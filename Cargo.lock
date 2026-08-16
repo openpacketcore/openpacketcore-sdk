@@ -2734,6 +2734,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-dataplane-observation"
+version = "0.2.0"
+
+[[package]]
 name = "opc-dataplane-testkit"
 version = "0.2.0"
 dependencies = [
@@ -2872,20 +2876,31 @@ dependencies = [
 name = "opc-gtpu-dataplane"
 version = "0.2.0"
 dependencies = [
+ "aes-gcm-siv",
  "async-trait",
  "aya",
  "aya-obj",
+ "bytes",
+ "hmac 0.12.1",
  "nix",
+ "opc-dataplane-observation",
  "opc-gtpu-ebpf-common",
  "opc-ipsec-xfrm",
+ "opc-key",
  "opc-linux-gtpu-sys",
+ "opc-proto-gtpu",
+ "opc-proto-tft",
+ "opc-protocol",
+ "opc-session-store",
  "opc-types",
  "rand 0.10.2",
  "rustix",
  "sha1",
  "sha2 0.10.9",
+ "subtle",
  "thiserror 2.0.19",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -3649,6 +3664,7 @@ dependencies = [
  "rcgen",
  "rustls-pki-types",
  "serde",
+ "serde_ignored",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -3711,6 +3727,7 @@ dependencies = [
  "opc-types",
  "rcgen",
  "rustix",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5184,6 +5201,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

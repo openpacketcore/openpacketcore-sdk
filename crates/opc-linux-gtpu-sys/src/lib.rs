@@ -614,6 +614,18 @@ pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<
     platform::receive_message(&socket.inner, buffer)
 }
 
+/// Receive one raw unicast netlink datagram and authenticate its kernel sender.
+///
+/// Unlike [`receive_message`], this boundary retains and validates the source
+/// `sockaddr_nl`. It rejects user-space peers even if their payload forges the
+/// expected netlink sequence and port-id fields. Authoritative ACK, echo, and
+/// dump consumers should use this function.
+///
+/// The same truncation guarantee as [`receive_message`] applies.
+pub fn receive_kernel_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<usize> {
+    platform::receive_kernel_message(&socket.inner, buffer)
+}
+
 /// Netlink request flag.
 pub const NLM_F_REQUEST: u16 = 0x0001;
 /// Netlink multipart response flag.
@@ -690,6 +702,8 @@ pub const IFF_UP: u32 = 0x1;
 
 /// Link attribute: interface name.
 pub const IFLA_IFNAME: u16 = 3;
+/// Link attribute: interface alias.
+pub const IFLA_IFALIAS: u16 = 20;
 /// Link attribute: link information nest.
 pub const IFLA_LINKINFO: u16 = 18;
 /// Link-info attribute: device kind string.
@@ -889,6 +903,7 @@ mod tests {
         assert_eq!(AF_INET, 2);
         assert_eq!(AF_INET6, 10);
         assert_eq!(IFLA_IFNAME, 3);
+        assert_eq!(IFLA_IFALIAS, 20);
         assert_eq!(IFLA_LINKINFO, 18);
         assert_eq!(IFLA_INFO_KIND, 1);
         assert_eq!(IFLA_INFO_DATA, 2);

@@ -7,16 +7,17 @@ GTP-U dataplane state. It models GTP devices and PDP contexts, provides Linux,
 eBPF, mock, and unsupported backends, and keeps raw syscalls in
 `opc-linux-gtpu-sys`.
 
-The crate does not implement GTP-C, PFCP, packet parsing, namespace management,
-route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
+The crate does not implement GTP-C, PFCP, namespace management, route steering,
+XFRM policy, deployment defaults, or traffic-readiness policy.
 
 ## API Shape
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.
-  The reconciliation methods are additive defaults, so existing third-party
-  implementations remain source-compatible and report typed unsupported
-  results until they opt in.
+  New trait ports retain default unsupported bodies for third-party backend
+  compatibility. Grouped request construction is intentionally source-
+  breaking: production callers now enter through the protected selector
+  coordinator and cannot construct fresh/reused authority themselves.
 - `LinuxGtpuDataplaneBackend`: safe adapter over the Linux `gtp` netdevice and
   GTP generic-netlink family.
 - `EbpfGtpuDataplaneBackend`: tc `clsact` eBPF datapath adapter for
@@ -50,6 +51,44 @@ route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
   `EbpfManagedDeviceInventoryCompleteness`,
   `MAX_EBPF_MANAGED_DEVICE_IDENTITIES`, `GtpRole`, `GtpVersion`,
   `GtpAddressFamily`, and `GTPU_PORT`.
+  The provenance and reuse-proof exports are read-only backend projections,
+  not authority: their production constructors and request constructors are
+  SDK-private, and every effect additionally consumes an opaque admission.
+- `TftUplinkClassifier` is a backend-neutral, bounded classifier contract for
+  multiple GTP-U contexts sharing one PAA on an unmarked uplink packet path. It
+  uses the canonical `opc-proto-tft` model, accepts only complete
+  uplink-capable TFT snapshots and packet-filter components the
+  backend-neutral parser can represent (including IPv4 and IPv6 semantics),
+  and returns a pre-existing bearer mark or a silent drop. The unfiltered
+  bearer is the explicit default fallback; absent one, no-match, malformed,
+  fragmented, unsafe-to-parse, and foreign-PAA packets drop.
+  `GtpuDataplaneBackend::tft_uplink_classification_capability` is separate from
+  `per_bearer_marking`: a backend must not advertise it until its actual
+  dataplane program and exact readback ABI support it. The deterministic mock
+  implements exact install, idempotence, atomic self-owned replacement,
+  readback, and exact removal lifecycle proof. A differing complete
+  self-owned snapshot is replaced without a transient absent or wrong-bearer
+  publication; foreign ownership conflicts and partial, mixed, or stale state
+  is indeterminate. Native exact removal first publishes a SHA-256-bound
+  metadata tombstone that the tc program rejects, removes only canonical rows
+  under the current authority, and removes the tombstone last. Its durable
+  dense-rank cursor authorizes each active-row deletion before it occurs, so a
+  retry accepts only the exact remaining suffix plus any acknowledged-loss
+  rows in the authorized prefix; an unexplained missing row fails closed.
+  Retries also prove the exact fingerprint. This fingerprint is a consistency proof, not
+  authentication against a privileged raw map writer. Native eBPF TFT
+  adoption rejects partial pin graphs and promotes an all-zero schema marker
+  only after both behavior-bearing maps are proven empty before hook mutation
+  and rechecked empty immediately before publication. Native eBPF TFT
+  classifier ABI/schema v4 remains IPv4-only: filter-map keys include the
+  current owner and snapshot generations, and each value carries its dense
+  precedence rank. TC therefore finds only rows named by validated metadata;
+  exact userspace readback verifies the redundant value identity and rank.
+  This is a consistency boundary, not protection from a privileged actor that
+  can co-mutate raw maps. IPv6 PAA, IPv6 components, and flow-label filters
+  are rejected before any map mutation. This contract does not claim IPv6
+  native packet execution. Linux `gtp` and unsupported adapters
+  fail closed as unsupported rather than simulate packet proof.
 - `GtpuError` is intentionally redaction-safe; TEIDs and addresses are not
   emitted by `Debug`/`Display`. A `BPF_PROG_LOAD` failure is reported as one of
   two variants, preserving only its stable operation, I/O kind, and errno:
@@ -148,6 +187,198 @@ interface and `bind_address` is the local outer IPv4 address. It pins maps under
 downlink PDR state from one `GtpPdpContext`, and supports restore through
 `resolve_device`. It only supports IPv4 session state today.
 
+### Generation-fenced traffic-continuity proof
+
+`GtpuDataplaneBackend` exposes an additive, session-scoped traffic-proof port.
+Only the production `EbpfGtpuDataplaneBackend` can implement that port;
+structural reconciliation, object readback, aggregate counters, the mock
+backend, and unsupported adapters cannot mint a proof. The ownership boundary
+is one complete `GtpuSessionGroup`, matching the unit whose entries and indexes
+are activated under one dataplane generation. It is not a pod-wide aggregate
+and evidence from separate groups is never combined.
+
+The product begins an attempt with the exact desired group, its nonzero owner
+generation, a nonzero 128-bit reconcile fence, a nonzero reconcile revision,
+and an immutable `TrafficContinuityPolicy`. The dataplane generation is never
+caller supplied: the adapter obtains it from a stable, complete `Active`
+group readback and binds it into the private attempt. A successful proof retains
+all of those dimensions plus the exact device attachment, backend incarnation,
+observation-source epoch, and monotonic-clock origin. Validation repeats the
+live readback under the adapter's writer authority; equality of a previously
+read object is not sufficient.
+
+When reconciliation changes the exact desired group, callers consume a lease
+from the canonical store with
+`GtpuDataplaneBackend::rebind_gtpu_traffic_proof_authority` only after the
+normal grouped reconcile succeeds. Rebind closes the old authority gate before
+waiting for existing leases, retires old attempts and registrations, performs
+one final exact active readback of the new group, and only then publishes the
+new authority. A failed, canceled, stale, or concurrently mutated rebind
+leaves the old authority terminal and never reports an authority gap as traffic
+evidence. The trait's inherited implementation first authenticates the store
+and lease as belonging to that backend. A production-proof wrapper may delegate
+that ownership check and will terminally revoke before returning
+`UnsupportedFeature`; a mock, unsupported, or foreign backend cannot establish
+ownership and returns unsupported without mutating another backend's authority.
+The publish transaction is crate-private, so only SDK-owned trusted adapters
+can complete rebind.
+
+The product drives an authenticated ICMP Echo challenge through the live
+session by calling `GtpuTrafficProofSession::challenge` with a distinct nonzero
+sample ID. The sample's high and low 16-bit halves are the exact ICMP Echo
+identifier and sequence. Every request starts `CoreToAccess`; accepting an
+`AccessToCore`-initiated request would expose its private return capability on
+the untrusted core side and is therefore deliberately unsupported. The public
+fixed-size request payload commits to the attempt's private registration,
+publication identity, sample, identifier, sequence, and request role.
+
+### Independent core-side challenge delivery
+
+`GtpuDataplaneBackend::dispatch_gtpu_traffic_proof_challenge` is the production
+delivery boundary. The caller supplies its affine session, an independent
+`GtpuTrafficProofDispatchPort`, one inner address family present in the exact
+live group, and a distinct nonzero sample. While holding the canonical
+authority-version lease, the SDK selects that group entry and builds the
+complete plain G-PDU plus optionless/unfragmented IPv4 or base IPv6 ICMP Echo
+Request with materialized checksums. After route resolution and construction,
+the owning backend performs a final revalidation of the exact attempt,
+authority-store version, dataplane generation, observation source, and
+readback before any transport effect. It never accepts caller-provided PAA,
+TEID, group, generation, challenge tag, or packet bytes.
+
+The port resolves one atomic deployment-configured
+`GtpuTrafficProofDispatchRoute`; the SDK checks its core origin, exact
+access-side destination (including a full IPv6 IID within the selected PAA),
+and outer source port against the selected entry before handoff. The request is
+opaque and redacted in diagnostics, although its transport implementation can
+read its exact packet and route solely to send it. The SDK defines no local
+ingress, AF_PACKET, or tc self-injection fallback: the default
+`UnsupportedGtpuTrafficProofDispatchPort` fails closed, and deployments must
+place their port on an independently trusted core-side path.
+
+A `GtpuTrafficProofDispatchReceipt` means only local transport handoff. It is
+not delivery, continuity, or proof evidence, and cannot advance or mint a
+`GtpuTrafficProof`. After handoff begins the sample is retired—even on a
+transport error or canceled caller future—because a remote send cannot be
+retracted honestly. The session bounds this retired-sample ledger by its
+continuity policy. Separate monotonic gates bind the current product-authority
+version and the individual attempt: closing or completing one attempt does not
+revoke a later attempt under the same unchanged product authority. Authority
+replacement, group mutation or removal, device detach, backend restart, and
+attempt close revoke the applicable gate and cancel a cooperative pending
+handoff. Source loss and generation/readback drift observed during final
+preflight prevent the port call; if they race an already irreversible remote
+send, the next poll or validation invalidates the attempt or proof. No receipt
+or stale packet is evidence, so neither can produce a current proof.
+
+After exact packet, checksum, binding, generation, publication, and request-tag
+validation, the trusted downlink tc program replaces the public request tag
+with a distinct private return tag and repairs the ICMP checksum before the
+packet enters the access-side stack. The ordinary ICMP Echo Reply copies that
+private tag. The trusted uplink program accepts only that private-tagged reply,
+with the exact identifier and sequence. It never exposes the private payload in
+the supported product API, event ABI, product readback, log, metric, or
+diagnostic. The unpublished low-level common crate carries the secret-bearing
+registration only through its hidden trusted loader/tc map ABI; that privileged
+wire boundary is not re-exported here. Consequently,
+copying the public request into a syntactically valid reply cannot fabricate a
+return leg. Ordinary subscriber TCP, UDP, ICMP, counters, structural readback,
+and mock packets never mint proof evidence.
+
+Direction is relative to the access gateway and describes the two halves of a
+validated challenge round trip:
+
+- `AccessToCore` is emitted only after a grouped inner packet has been
+  successfully submitted to the local GTP-U uplink redirect.
+- `CoreToAccess` is emitted only after a grouped G-PDU has passed the live
+  downlink checks, been decapsulated, and been accepted past the local tc
+  ingress hook into the access-side network stack.
+
+These are authenticated challenge observations at the local forwarding
+boundaries, not peer authentication or a claim that a remote endpoint received
+the packet. The private return tag is a one-attempt bearer capability. The
+proof is sound when the trusted downlink rewrite feeds immediately into the
+product's protected access path; a principal that can inspect plaintext after
+that rewrite, or a compromised peer, is outside this proof's trust boundary.
+An end-to-end claim must compose this boundary proof with protocol-specific
+delivery authority and a disposable real protected-path round trip. The
+observation ABI carries no addresses, TEIDs,
+SPIs, packet lengths, packet bytes, subscriber fields, or reusable raw flow
+identifier. Its challenge-stream correlation is opaque, freshly keyed per
+attempt, and never logged. Parsing accepts only exact, unfragmented IPv4 or
+IPv6 ICMP Echo messages with the fixed challenge payload, exact Echo header
+fields, and valid network/transport checksums; other protocols, fragments,
+malformed messages, and trailing bytes continue through normal forwarding
+policy but do not contribute proof evidence.
+
+Continuity is deliberately policy-bound instead of inferred from one packet or
+from aggregate traffic. One authenticated challenge stream must independently
+have at least `minimum_samples_per_direction` observations in both directions, and each
+direction's first-to-last span must be at least the nonzero
+`minimum_window_per_direction`. The last sample in each direction must be no
+older than `maximum_freshness`, every retained sample must fit within
+`maximum_evidence_age`, and storage is capped by `maximum_retained_events`.
+The retention cap must hold at least the minimum sample count for both
+directions combined, so a constructed policy is achievable.
+The product selects these nonzero bounded values for its operational readiness
+window; the proof retains the exact policy so a weaker assessment cannot be
+relabeled under a stronger one.
+
+The production adapter drains the attachment's bounded kernel ring, rejects
+malformed or excess records, and brackets every drain with the saturating
+per-CPU loss counter. Only after that producer-gap fence succeeds does it sort
+trusted boot-monotonic timestamps, breaking valid cross-CPU clock ties with a
+distinct global producer sequence. A reused sequence or replayed record fails
+closed. The sequence may be sparse, so it does not replace the kernel loss
+counter: that independently bracketed counter is the authoritative
+producer-gap fence.
+
+Each registration also receives a finite, monotonically allocated publication
+identity retained in the pinned attachment state. It remains a capacity and
+same-graph replacement fence: the downlink path captures it before
+decapsulation and verifies it again at the final observation boundary. Source
+reset never rewinds that allocator, invalid or uncertain readback burns the
+candidate identity, and exhaustion fails closed. Publication readback alone is
+not packet-causal: the per-attempt challenge tag additionally prevents a
+packet queued under an earlier registration from being relabeled when it is
+processed after a replacement.
+
+Uplink neighbour redirect uses a separate `GTPU_OBS_REDIR` authority: the
+registration's private CSPRNG-filled correlation secret is reused as the exact
+per-attempt redirect nonce, and the 20-byte tc scratch area contains only an
+ownership marker plus all 16 nonce bytes. The nonce is never logged, emitted,
+or exposed as a metric; event correlation is instead a one-way keyed
+derivation from that secret. At publication the host atomically installs and
+reads back `nonce -> group` with `BPF_NOEXIST` alongside the exact group
+registration. Re-entry resolves the nonce through that map and then requires
+an active exact group registration with matching binding, publication identity,
+and nonce before emitting. Revocation and source reset delete both maps and
+prove them empty. Thus a delayed skb from an unpinned graph cannot be relabeled
+after a fresh graph restarts its finite publication sequence at one:
+publication high-water alone does not span graph recreation, while the fresh
+nonce closes that ABA without relying on queue quiescence.
+
+Proof lifetime is a half-open monotonic interval. Its exclusive end is the
+earliest of issuance plus `maximum_assessment_lifetime`, either direction's
+last sample plus `maximum_freshness`, and the oldest retained sample plus
+`maximum_evidence_age`. The adapter reads Linux boot-monotonic time itself;
+caller time never validates a proof. Expiry,
+event loss, malformed or overflowing observation state, a registration or
+source reset, backend restart, group restore, any generation/phase/model/index
+change, reconcile-fence drift, attachment or pinned-map/hook replacement, or
+an indeterminate readback permanently invalidates the attempt or proof. A
+fresh attempt uses a new source epoch, correlation key, and publication
+identity plus a newly authenticated challenge payload, so packets queued under
+an earlier generation, registration, or process cannot be replayed as current
+evidence.
+
+The port reports packet-continuity evidence only. Products must not derive
+PodReady, process health, structural convergence, or service admission from
+prior subscriber traffic: doing so would deadlock a correctly converged cold
+start before its first subscriber packet. A product may use a current proof as
+one input to a separate traffic-readiness condition while keeping those
+control-plane decisions independent.
+
 ### Conflict-safe PDP reconciliation
 
 Use `read_pdp_context` to inspect either the local/downlink TEID axis or the
@@ -209,22 +440,138 @@ same authority and confirms both selector axes absent afterward.
 
 The Linux `gtp` adapter uses response-required generic-netlink `GETPDP` queries
 for both axes and requires two identical bounded observations. It validates the
-outer generic-family message type, the kernel's historical family-ID-in-command
-reply quirk (or a future canonical `GETPDP` command), every known attribute,
-MS/PAA-family consistency, selector correlation, and the complete returned
-identity. `GTPA_FAMILY` describes only the inner MS/PAA lookup key; the outer
-peer family follows the GTP device's UDP socket and may differ. Current kernels
-may omit `GTPA_FAMILY`; one unambiguous MS/PAA attribute still determines its
-family independently of the required peer attribute. Linux currently stores an
-IPv6 MS/PAA as a canonical `/64` prefix. A kernel that cannot perform the
-requested family lookup fails closed rather than reporting absence. Mainline
-Linux exposes unconditional `DELPDP` but no compare-delete primitive or
-cross-process writer lease, so `remove_pdp_context_exact` is intentionally
-unsupported there.
+kernel origin of every ACK and readback datagram, the outer generic-family
+message type, the kernel's historical family-ID-in-command reply quirk (or a
+future canonical `GETPDP` command), every known attribute, MS/PAA-family
+consistency, selector correlation, and the complete returned identity.
+`GTPA_FAMILY` describes only the inner MS/PAA lookup key; the outer peer family
+follows the GTP device's UDP socket and may differ. Current kernels may omit
+`GTPA_FAMILY`; one unambiguous MS/PAA attribute still determines its family
+independently of the required peer attribute. Linux currently stores an IPv6
+MS/PAA as a canonical `/64` prefix. A kernel that cannot perform the requested
+family lookup fails closed rather than reporting absence. Mainline Linux
+exposes unconditional `DELPDP` but no compare-delete primitive, so exact removal
+is built on a cross-process recovery authority instead; see the next section.
 
-Readback/classified-install/exact-removal capabilities are reported separately
-through `pdp_context_reconciliation_capabilities`; they are not inferred from
-packet-processing fields in `GtpuProbe`. The mock implements the full stateful
+### Linux PDP restart recovery authority
+
+`LinuxGtpuDataplaneBackend::recover_pdp_context_exact` is the supported
+durable-reconciliation primitive for the process-loss case: the kernel-GTP PDP
+context and the GTP device that owns it both survive the writer, and an
+ePDG-style consumer must prove either exact removal or exact absence of a
+durable descriptor before protocol egress. Mainline Linux has no atomic
+compare-delete, so the SDK supplies the missing cross-process writer authority
+and the authoritative readback that together make exact removal safe.
+
+Bind the authority before exposing the backend or creating a recoverable
+device:
+
+```rust
+let backend = LinuxGtpuDataplaneBackend::new()
+    .with_pdp_recovery_root("/var/lib/my-service/gtp-recovery")?;
+```
+
+`with_pdp_recovery_root` returns `Result`, validates an absolute non-root path,
+and records one non-rebindable root in state shared by every existing and future
+backend clone. Repeating the same binding is allowed; attempting to bind a
+different root fails. Every cooperating process that can write the same GTP
+devices must bind the same root. Once it is bound, device creation/removal,
+ordinary PDP installation/removal, classified installation, and restart
+recovery all acquire cross-process `flock` authority. Topology mutations take
+the topology lease; operations against a live device then take its per-device
+lease in that fixed order. This fences replacement as well as PDP mutation
+rather than protecting only the final recovery transaction.
+
+The root, every ancestor, and the filesystem providing `flock` are trusted,
+stable security infrastructure. Do not use a path whose components can be
+renamed, replaced, or pre-created by an untrusted principal, such as an
+unhardened world-writable `/tmp`. A privileged writer that mutates GTP state
+without these locks, or a principal that controls the root or its ancestors, is
+outside the supported coordination model; the SDK makes no safety or liveness
+claim in their presence.
+
+For each new kernel device incarnation, generate a cryptographically
+unpredictable, nonzero `PdpDeviceIncarnation` and durably persist it with the
+device's recovery descriptors before performing the create effect. Never reuse
+an incarnation. Create the device through
+`create_recoverable_device(request, incarnation)`, which stamps and verifies the
+incarnation in the kernel link's `IFLA_IFALIAS` while holding topology
+authority. It first proves the requested name absent, and reconciles an
+ambiguous create acknowledgement before publishing the verified link. It uses
+`IFLA_GTP_CREATE_SOCKETS`, so the netdevice rather than the creating process
+owns the GTP sockets and a retained link remains serviceable after process
+loss. The supported recoverable profile is intentionally limited to
+`0.0.0.0:2152` with no userspace-socket fallback; the kernel also reserves its
+standard GTPv0 port 3386. Consequently only one wildcard kernel-owned GTP
+device can own those ports in a network namespace at a time. A kernel without
+`IFLA_GTP_CREATE_SOCKETS` support rejects creation rather than weakening the
+contract. Ordinary `create_device` retains its userspace-FD socket and custom
+bind-address/port behavior, but does not establish the identity needed for
+later exact restart recovery.
+
+The published `opc-pdp-recovery-v2` alias attests this kernel-owned socket
+profile as well as the incarnation. A legacy `v1` alias can name a link whose
+userspace socket was detached when its creator exited, so retained acquisition
+and exact recovery fail closed for it. There is no in-place adoption or alias
+upgrade: drain/remove the legacy link and create a fresh recoverable device
+with a newly minted incarnation. Process loss before the method returns can
+still leave an unstamped link; exact recovery classifies that as structural
+repair and never treats it as owned PDP state.
+
+Build `PdpRestartRecoveryRequest` from the durably recorded device name and
+ifindex, incarnation, complete expected PDP context, and
+`PdpRestartRecoveryProof::previous_writer_stopped()`. Under the topology and
+per-device locks, `recover_pdp_context_exact` proves that the name still
+resolves to the expected ifindex and that the live kernel `IFLA_IFALIAS`
+contains the expected incarnation. A replaced, renamed, unstamped, or removed
+device returns `RepairRequired(DeviceIdentityChanged)` without touching its PDP
+state. A concurrent lock owner returns retryable
+`Indeterminate(AuthorityUnavailable)`.
+
+After proving the device incarnation, recovery takes stable `GETPDP` readbacks
+on both selector axes before admitting the unconditional `DELPDP`. Unknown
+attributes and any flagged attribute type in a `GETPDP` reply fail closed as
+structurally unrepresentable state; they are never ignored to authorize a
+delete. Recovery then classifies:
+
+- `Removed` — the resident context matched the complete expected identity, an
+  admitted `DELPDP` ran, and the post-mutation readback proves both axes absent.
+- `AlreadyAbsent` — both selector axes were already authoritatively absent; no
+  mutation occurred. Re-running after a confirmed removal is idempotent.
+- `Conflict(_)` — valid resident state occupies a selector but differs from the
+  expected identity; it is never touched. Diagnostics carry only occupied axes
+  and differing field names, never values.
+- `Indeterminate(_)` — state changed during observation, evidence was incomplete,
+  or the final mutation could not be confirmed; retry the exact request.
+- `RepairRequired(_)` — a structural precondition (for example a stale device
+  identity) failed closed; retrying the identical request cannot succeed without
+  repair.
+
+The kernel API still cannot compare-and-delete, so the admission boundary is the
+authoritative dual-axis readback immediately before `DELPDP`, held under the
+two-level authority. Dropping the returned future does not cancel its detached
+blocking worker: the worker retains both locks until the transaction finishes.
+A concurrent retry is therefore fenced (and may report authority unavailable),
+and a later retry re-reads the converged state, making confirmed removal
+idempotent as `AlreadyAbsent`. Process exit releases `flock`, allowing the next
+retry to reclassify state safely.
+
+The trait method
+`GtpuDataplaneBackend::remove_pdp_context_exact(GtpPdpContext)` remains
+`UnsupportedFeature` on Linux, and its `exact_removal` capability remains
+`Missing`, even when a recovery root is bound. Its request has no durable device
+incarnation and therefore cannot authorize restart cleanup. Linux callers must
+use the authority-bearing
+`GtpuDataplaneBackend::recover_pdp_context_exact(PdpRestartRecoveryRequest)`
+method, which is also exposed on the concrete Linux backend; without a bound
+root, that method is also unsupported. `Debug` output for the request and every
+outcome redacts TEIDs, addresses, and device identity.
+
+Readback/classified-install/generationless-exact-removal capabilities are
+reported through `pdp_context_reconciliation_capabilities`; authority-bearing
+Linux restart recovery is reported separately through
+`pdp_restart_recovery_capability`. They are not inferred from packet-processing
+fields in `GtpuProbe`. The mock implements the full stateful
 contract for default and marked contexts, exposes `MockPdpContextFault` for
 corrupt, transitional, and changing-readback tests, and records the additive
 calls separately through `pdp_context_reconciliation_operations`. The original
@@ -237,6 +584,134 @@ capability, and permission errors remain errors, while ACK-uncertain or partial
 mutation failures are re-read and returned as exact, conflict, or indeterminate
 state. Product policy decides which stale context it owns, coordinates drain,
 and sequences route/XFRM/session changes.
+
+### Linux live-writer exact PDP removal authority
+
+`LinuxGtpuDataplaneBackend::remove_pdp_context_exact_live_writer` is the
+same-process replacement companion of restart recovery. A subscriber-session
+replacement must remove the prior session's kernel-GTP PDP context with exact
+authority before the replacement dataplane can be proven converged, and during
+that ordered teardown the cooperating writer is still live: the product
+process, its network namespace, the durable device incarnation, and its
+Recovery claim all remain live. Supplying
+`PdpRestartRecoveryProof::previous_writer_stopped()` there would assert
+something false, and the unconditional lifecycle `remove_pdp_context` cannot
+prove exact dual-selector identity, so neither can safely satisfy a
+convergence or Recovery mutation proof.
+
+After binding the recovery root, call
+`GtpuDataplaneBackend::acquire_pdp_live_writer_proof` on the same concrete
+backend that will perform removal (or through its trait object). Acquisition
+is the caller's explicit attestation that it is the current cooperating writer
+and owns the live mutation namespace; it never claims that a prior writer
+stopped. It returns one affine, opaque `PdpLiveWriterProof` bound to the exact
+configured root and the current worker thread's network-namespace identity.
+Move that proof into `PdpLiveWriterRemovalRequest`; it cannot be cloned or statically
+constructed. Build the request from the live writer's device name and ifindex,
+the device's non-reusable incarnation, the complete expected PDP context, and
+the acquired proof. The removal checks the proof's root and namespace again,
+under the operation guard, before any link/netlink read or mutation. A stale,
+wrong-root, or wrong-namespace proof returns retryable
+`Indeterminate(AuthorityUnavailable)` with no netlink activity.
+
+The removal serializes under the same topology and per-device `flock` writer
+gates as every other cooperating mutation, proves the kernel-bound incarnation
+exactly as restart recovery does, and then runs the identical dual-selector
+exact-removal transaction:
+authoritative `GETPDP` readbacks on both axes before admitting the
+unconditional `DELPDP`, and classification from the post-mutation readback
+rather than from the delete's own acknowledgement. The classified outcomes are
+the same `Removed` / `AlreadyAbsent` / `Conflict(_)` / `Indeterminate(_)` /
+`RepairRequired(_)` family, with identical meanings.
+
+The live-writer authority is distinct from restart recovery and does not
+weaken it: the two request families carry different proof types that cannot
+substitute for each other, they report independent capabilities
+(`pdp_live_writer_removal_capability` versus
+`pdp_restart_recovery_capability`), and the generationless
+`remove_pdp_context_exact` trait method remains `UnsupportedFeature` with a
+`Missing` capability even after a root is bound. Dropping the returned future
+does not cancel the detached blocking worker: it retains both writer
+authorities until the transaction reaches its terminal classified result, so
+a concurrent cooperating mutation cannot overlap it and a later retry
+re-reads the converged state.
+
+### Linux retained device identity acquisition
+
+`LinuxGtpuDataplaneBackend::acquire_retained_device_identity` is the
+identity-bearing, mutation-free companion of the restart-recovery primitive.
+An ePDG-style consumer that stops after creating a shared recoverable device
+but before admitting any PDP effect can restart to find the device retained by
+the kernel with no effect-possible PDP descriptor. The consumer must clear
+provably unpolled work without an adapter call, then choose between serving
+reuse and fresh creation. `create_recoverable_device` correctly refuses a
+retained device, `resolve_device` proves only name and ifindex, and
+`recover_pdp_context_exact` proves the incarnation only as part of a
+PDP-context recovery request that may remove an exact resident context. This
+primitive closes that gap without a compatibility path, name-only fallback, or
+any device mutation.
+
+Build `RetainedDeviceIdentityRequest` from the durably recorded device name,
+the optional exact ifindex, the non-reusable `PdpDeviceIncarnation` minted
+before the create effect, and
+`PdpRestartRecoveryProof::previous_writer_stopped()`. Pass `None` for the
+ifindex while the durable record is still prepared: this includes process loss
+after `create_recoverable_device` created and stamped the link but before its
+result was durably published. Pass `Some(ifindex)` only after that exact result
+was committed. The recovery root must already be bound.
+
+Under shared topology authority, a prepared acquisition performs an
+authoritative read-only `RTM_GETLINK` lookup by name, acquires the discovered
+per-device authority, then re-proves the exact name, ifindex, and kernel
+`IFLA_IFALIAS` incarnation by ifindex. An active-record acquisition takes its
+committed per-device authority directly and proves that exact link; if the
+ifindex is absent, it also proves whether the name is absent or occupied by a
+replacement. Resource or transport errors never become `Absent`, and
+contradictory or malformed netlink evidence fails closed. The operation never
+reads, installs, or deletes a PDP context and never mutates the device.
+
+Only the `v2` alias written by the kernel-owned recoverable creation path can
+authorize `Retained`. A `v1` userspace-socket alias is a conflicting identity,
+even when its name, ifindex, and incarnation bytes otherwise match, because
+link identity alone cannot prove that its GTP socket survived process loss.
+
+`RetainedDeviceIdentityAcquisition::outcome()` returns a typed, value-free
+classification:
+
+- `Retained` — the exact name, ifindex, and kernel-bound incarnation were all
+  proven live. `retained_device()` or `into_retained_device()` returns the
+  exact `GtpDevice`; a prepared caller must durably publish its discovered
+  ifindex before serving reuse.
+- `Absent` — the recorded name is authoritatively absent under topology
+  authority and, when supplied, the exact expected ifindex is absent too. One
+  fresh `create_recoverable_device` call with a newly minted incarnation is
+  the supported next step; no name-only adoption occurs.
+- `Conflict(ReplacementIdentity)` — the name is occupied by a different
+  ifindex, or the name and ifindex are occupied with a different kernel-bound
+  identity (including a renamed expected-ifindex link and foreign or malformed
+  alias content). The live state is left untouched; the durable record must be
+  reconciled against the replacement.
+- `Indeterminate(AuthorityUnavailable)` — a concurrent cooperating writer
+  holds the topology or per-device authority; retry the identical request.
+- `RepairRequired(Unstamped)` — a link matching the expected name and ifindex
+  carries no incarnation stamp: it was never published as recoverable (for
+  example, process loss interrupted provisioning before publication). Retrying
+  cannot succeed without repair.
+
+Renamed, removed, unstamped, malformed-alias, and unrepresentable states are
+all structurally distinct from transient authority unavailability:
+unrepresentable link evidence fails closed as an error rather than any
+classification. Because the operation never mutates, an idempotent retry
+returns the same classified identity state while live state is unchanged.
+
+Dropping the returned future does not cancel its detached blocking worker: the
+worker retains every acquired writer authority until the classification
+finishes, so a retry cannot overlap an admitted acquisition (it may observe
+authority unavailable) and later re-reads the unchanged state. The acquisition
+does not extend the writer authorities past its return; subsequent device and
+PDP mutations are fenced independently by the existing lease hierarchy.
+Request, acquisition, and outcome diagnostics are redaction-safe: they expose
+no device identity, incarnation, endpoint, TEID, packet, or descriptor values.
 
 ### Downlink outer-envelope validation
 
@@ -274,14 +749,18 @@ pending checksum is rejected even if its current bytes happen to satisfy the
 final checksum equation. The program never repairs or trusts an unfinished
 checksum.
 
-After UDP/2152 identifies a candidate, every malformed declaration or
-unverified checksum increments the existing bounded `downlink_malformed`
-counter and drops before TEID/PDR lookup, decapsulation, or inner-destination
-validation. Addresses, TEIDs, lengths, checksum values, and payload bytes are
-not emitted. Non-UDP traffic, other UDP ports, and structurally valid
-non-G-PDU GTP-U control traffic retain their pass-through behavior. Outer
-IPv4 fragments also pass to the stack unchanged; the complete contract for
-them is defined in [Downlink outer-fragment handling](#downlink-outer-fragment-handling).
+After UDP/2152 and an accessible mandatory GTP-U header identify a candidate,
+classification separates pass-only control traffic from G-PDU decapsulation.
+Non-G-PDU traffic passes unchanged to the kernel and local typed control
+consumer, which own checksum completion and message validation; it cannot
+reach TEID/PDR lookup, decapsulation, or datapath mutation. Every malformed
+G-PDU declaration or unverified checksum increments the existing bounded
+`downlink_malformed` counter and drops before TEID/PDR lookup, decapsulation,
+or inner-destination validation. Addresses, TEIDs, lengths, checksum values,
+and payload bytes are not emitted. Non-UDP traffic and other UDP ports also
+retain their pass-through behavior. Outer IPv4 fragments pass to the stack
+unchanged; the complete contract for them is defined in
+[Downlink outer-fragment handling](#downlink-outer-fragment-handling).
 
 The privileged proof covers a legal zero `CHECKSUM_NONE` omission, non-zero
 software-verified bytes, authenticated zero and non-zero
@@ -292,7 +771,9 @@ publishes checksum metadata and forwards the current UDP packet into the real
 tc hook. Every partial form fails before PDR/decap counters, while both legal
 zero cases decapsulate only after the exact checksum bytes are restored. A
 boundary mismatch with trusted metadata proves metadata never bypasses
-structural validation.
+structural validation. A separate Echo Response fixture proves that an
+offload-owned control datagram reaches the local socket unchanged without
+moving malformed, unknown-TEID, or decapsulation counters.
 
 ### Downlink endpoint provenance
 
@@ -912,7 +1393,7 @@ loop {
 ```
 
 The first authorized mutation publishes a checksummed proof map bound to the
-namespace hash, canonical graph device/inode, all 21 exact map IDs, populated
+namespace hash, canonical graph device/inode, all 25 exact map IDs, populated
 state authorization, and the proof map's own kernel ID. Normal create/adopt
 fences on that reserved proof. Every surviving map and the proof remain open by
 FD during cleanup. An ordinary unlink or final directory-removal failure
@@ -934,6 +1415,138 @@ fence a privileged external actor that ignores the SDK boundary. The
 maintenance window must therefore still exclude out-of-band bpffs and tc
 mutation. Product-owned writer shutdown, session drain, traffic gating,
 finalizer retry policy, and replacement provisioning remain downstream.
+
+#### Cleanup-only retained graph recovery authority
+
+`EbpfGtpuDataplaneBackend::acquire_cleanup_only_recovery` is the supported
+durable-reconciliation primitive for the complementary process-loss case: the
+original writer is gone but the interface (and therefore its ifindex) and the
+retained pin graph both survive. It takes ownership of the exact retained
+current-schema graph and fences the forwarding tc hooks so the consumer can
+read back and remove stale PDP contexts without reactivating the stale graph.
+Product code must not manipulate those pins or hooks directly.
+
+This primitive occupies the gap between the ordinary lifecycle and orphaned
+recovery:
+
+- `create_device`/`resolve_device` both reach program attachment, so they
+  re-enable forwarding the instant retained entries exist — before the consumer
+  has had a chance to remove stale contexts. Cleanup-only acquisition never
+  attaches or reattaches the forwarding hooks before cleanup is complete.
+- `recover_orphaned_current_ebpf_graph` deletes the whole graph and requires
+  the old interface namespace to be gone. Cleanup-only acquisition never
+  deletes the graph and requires the interface to still resolve to the expected
+  ifindex.
+
+Before granting authority the backend proves the expected name/ifindex pair,
+then performs a complete read-only inventory and ABI/capacity validation of all
+25 current map pins before binding CONFIG or any other typed map. Only the exact
+current PMTU-v5 graph is accepted: cleanup acquisition never creates a missing
+pin, migrates an older schema, or advances a schema marker. A canonical nonzero
+endpoint is then compared with the caller's configured local S2b-U address. The
+independent grouped authority must still be uninitialized: `GTPU_CONFIG6` and
+`GTPU_SCHEMA6` must both be all-zero and all four grouped hash maps must be
+empty. A committed, populated, or malformed grouped state is refused as
+`NotCurrentSchema`; this legacy IPv4 recovery path never adopts grouped
+authority. Identity and retained pin/config/schema structural refusals happen
+before graph mutation. Acquisition then holds the host-global namespace lease,
+fences any retained live hook it owns, and recovers interrupted current-schema
+commit records with forwarding disabled. Stable malformed legacy PDP content
+found during that recovery is also `NotCurrentSchema`, but may be diagnosed only
+after the safety fence or partial recovery; kernel/map observation and mutation
+failures remain retryable `IndeterminateState`. If a later fencing step becomes
+indeterminate after an earlier hook was detached, no authority is granted and
+the exact request must be retried to re-observe and converge the fence.
+
+While authority is held, the ordinary
+`GtpuDataplaneBackend::read_pdp_context` and
+`GtpuDataplaneBackend::remove_pdp_context_exact` boundaries operate against a
+cleanup-safe datapath posture: every named pin still identifies the held map and
+both forwarding hooks are authoritatively absent. Classified installation,
+ordinary non-exact removal, and unrelated datapath mutation remain denied in
+cleanup-only mode even if a hook reappears out of band. Reconciliation
+capabilities therefore advertise exact readback and exact removal independently
+from classified installation, which remains unavailable while fenced.
+`activate_cleanup_recovery` is the sole explicit step that reattaches the
+forwarding hooks and returns the device to normal management.
+
+Acquisition returns an affine, supervised completion handle. Awaiting it drives
+the bounded acquisition on an owned blocking worker; dropping the observing
+future cannot cancel that worker, which converges the graph state under the
+namespace lease and operation lock regardless. A retry therefore never overlaps
+the same graph: it either observes the converged cleanup-managed state
+(idempotently `Acquired`) or is refused while the prior acquisition still holds
+the lease. An unexpected panic in the acquisition is caught and reported as
+retryable `IndeterminateState` so the handle never hangs; the affected backend
+then fails closed while its operation lock is poisoned, and recovery proceeds
+on a fresh backend instance, which re-validates from kernel state.
+
+```rust,no_run
+use opc_gtpu_dataplane::{
+    CurrentEbpfGraphWriterProof, EbpfGtpuDataplaneBackend, GtpDevice, GtpPdpContext,
+    PdpContextLocalTeidSelector, PdpContextReadback, PdpContextRemovalOutcome,
+    PdpContextSelector, RetainedGraphCleanupClassification, RetainedGraphCleanupRequest,
+};
+use std::net::Ipv4Addr;
+
+# async fn reconcile(
+#     backend: &EbpfGtpuDataplaneBackend,
+#     device: GtpDevice,
+#     local_endpoint: Ipv4Addr,
+#     stale: GtpPdpContext,
+# ) -> Result<(), Box<dyn std::error::Error>> {
+let request = RetainedGraphCleanupRequest::new(
+    device.clone(),
+    local_endpoint,
+    CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+);
+loop {
+    match backend.acquire_cleanup_only_recovery(request.clone()).await? {
+        RetainedGraphCleanupClassification::Acquired => break,
+        RetainedGraphCleanupClassification::AlreadyAbsent => return Ok(()),
+        RetainedGraphCleanupClassification::Refused(reason) if reason.is_retryable() => {
+            // Back off and retry the exact request.
+        }
+        RetainedGraphCleanupClassification::Refused(reason) => {
+            return Err(std::io::Error::other(format!(
+                "cleanup-only recovery refused: {reason:?}",
+            ))
+            .into());
+        }
+        _ => return Err(std::io::Error::other("unknown cleanup outcome").into()),
+    }
+}
+
+// Forwarding stays disabled while stale contexts are reconciled.
+let selector = PdpContextSelector::LocalTeid(
+    PdpContextLocalTeidSelector::from_context(&stale).expect("local TEID selector"),
+);
+if backend.read_pdp_context(selector).await? == PdpContextReadback::Present(stale.clone()) {
+    assert_eq!(
+        backend.remove_pdp_context_exact(stale).await?,
+        PdpContextRemovalOutcome::Removed
+    );
+}
+
+// The sole step that reattaches forwarding.
+backend.activate_cleanup_recovery(&device).await?;
+# Ok(())
+# }
+```
+
+Refusals deliberately separate ownership/configuration conflicts
+(`InterfaceIdentityChanged`, `LocalEndpointMismatch`, `ManagedAttachment`),
+retryable indeterminate evidence (`ActiveOwner`, `IndeterminateState`), and
+structural repairs (`NotCurrentSchema`, `IdentityMismatch`); `is_retryable`
+reports which are safe to retry with the exact request. The request, the
+completion handle, and every diagnostic redact interface, endpoint, TEID, and
+subscriber values.
+
+Cleanup-only authority is retained until explicit activation or until the
+backend is dropped; dropping the handle alone never reattaches forwarding and
+never releases the fence. Grouped (dual-stack) attachments are not covered by
+this legacy IPv4 primitive and are explicitly refused when their independent
+authority is initialized or populated.
 
 #### Drained v2 teardown for current-schema reprovisioning
 
@@ -1120,6 +1733,15 @@ rolling handoff must therefore stop the old writer before the new writer adopts
 the interface. Privileged processes that bypass this lease remain outside the
 supported mutation model.
 
+Selector-namespace effects additionally take a bounded `flock` on a distinct,
+persistent operation-lock inode derived from the same opaque namespace hash.
+This lets each durable effect release its critical section without releasing
+the process-lifetime writer lease. The original control-directory inode remains
+the lifetime lease so cooperating older and newer SDK writers contend on the
+same upgrade-compatible safety boundary. Its exact sibling component is the
+64-byte lowercase namespace hash followed by `-operation-v1`; the dot-free
+component is valid on bpffs, which reserves names containing a dot.
+
 The runtime takes both tc links out of Aya loader ownership, so dropping an old
 loader cannot detach a static filter that an external actor subsequently
 placed at the same priority/handle. `remove_device` preflights both live hooks
@@ -1299,8 +1921,54 @@ with a boot identity if a baseline has to outlive the host.
 
 ### Grouped dual-stack eBPF contract
 
-The public grouped-session API is additive. Existing `GtpuProbe` fields and
-legacy v5 map-key bytes are unchanged. The current eBPF backend opts in only
+#### Selector namespace admission
+
+Products open `GtpuSessionSelectorNamespaceAuthority` only through
+`open_protected`, using an SDK-owned `EncryptingSessionBackend` or
+`RemoteSealingSessionBackend` around the durable store, then call
+`reconcile_fresh` rather than constructing a grouped reconcile request. The
+SDK derives the ledger key from that sealed payload boundary, the explicit
+tenant/NF storage scope, and the stable device; products cannot select a raw
+namespace key or assert their own protection boundary. It creates the private
+request around an opaque, affine `GtpuSessionSelectorAdmission`, binding the
+stable device namespace, exact group ID, canonical complete set of uplink
+`(family, PAA, mark)` and downlink `(outer family, inner family, local TEID)`
+selector atoms, and a nonzero authority generation. `Fresh` is not a public
+assertion and no public constructor can replay or cross-bind an admission.
+
+`GtpuSessionSelectorNamespaceAuthority` owns this transition over the
+SDK-protected `SessionStore` boundary. The store persists the entire opaque,
+versioned ledger as one durable multiprocess compare-and-swap record, sealed
+before reaching its underlying adapter. It includes all atom claims, group/set
+bindings, permanent tombstones, the authority generation, and committed
+device/key/capacity configuration, so the ordinary sequential session-store
+batch API is not sufficient. The supplied
+`InMemoryGtpuSessionSelectorNamespaceStore` is only a deterministic
+conformance model, not a production authority. On ambiguous durable
+completion, the coordinator reads back the exact mutation fingerprint; if it
+is not exact, it fails closed. A durable adapter retains a Retiring or Poisoned
+state for unresolved external teardown. Retire the authority claim before
+dataplane removal and require an SDK/backend-qualified drain/RCU receipt before
+reissuing a retired selector set. Product assertions do not qualify.
+Diagnostics expose only bounded state classifications,
+never selector, subscriber, or digest values.
+
+Each process admits a bounded queue of selector operations but polls exactly
+one worker per protected storage-scope commitment from durable lease
+acquisition through release. This is part of the fence: a same-owner
+`SessionStore` acquire is replica recovery and replaces the prior credential,
+so concurrent local workers must never mint overlapping backend windows.
+Dropping an operation observer, including `open_protected`, does not cancel
+the owned worker or release that gate. Across processes, every replica must
+use the stable, replica-unique `OwnerId` required by the session-store
+contract; reusing one owner identity in multiple live processes is not a
+supported concurrency model.
+
+The backend trait expansion is additive, and existing `GtpuProbe` fields and
+legacy v5 map-key bytes are unchanged. The grouped-session construction
+migration is deliberately not additive: public `Fresh` assertion and public
+request construction are removed, so callers must use the protected
+coordinator. The current eBPF backend opts in only
 after the live attachment proves its exact schema, configuration, named map
 identities, tc programs, and held namespace lease. The async, fallible
 `gtpu_ip_family_capabilities` query accepts a
@@ -1485,6 +2153,6 @@ rustup target add x86_64-unknown-freebsd
 cargo clippy -p opc-gtpu-dataplane --all-targets --target x86_64-unknown-freebsd -- -D warnings
 sudo modprobe gtp
 sudo modprobe wireguard
-sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture'
+sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture --test-threads=1'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture'
 ```
