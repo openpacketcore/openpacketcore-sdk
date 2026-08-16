@@ -494,7 +494,7 @@ impl fmt::Debug for S2bCreateSessionRequest<'_> {
 }
 
 /// Input for building an accepted S2b Production Profile v1 Create Session Response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S2bCreateSessionAcceptedResponse<'a> {
     /// GTPv2-C sequence number.
     pub sequence_number: u32,
@@ -517,8 +517,21 @@ pub struct S2bCreateSessionAcceptedResponse<'a> {
     pub additional_ies: Vec<TypedIe<'a>>,
 }
 
+impl fmt::Debug for S2bCreateSessionAcceptedResponse<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bCreateSessionAcceptedResponse")
+            .field("sequence_number", &self.sequence_number)
+            .field("response_teid_present", &true)
+            .field("pgw_control_f_teid_present", &true)
+            .field("bearer_context_present", &true)
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
+}
+
 /// Input for building a rejected S2b Production Profile v1 Create Session Response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S2bCreateSessionRejectedResponse<'a> {
     /// GTPv2-C sequence number.
     pub sequence_number: u32,
@@ -530,6 +543,18 @@ pub struct S2bCreateSessionRejectedResponse<'a> {
     ///
     /// Additional F-TEIDs cannot introduce a non-S2b interface role.
     pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+impl fmt::Debug for S2bCreateSessionRejectedResponse<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bCreateSessionRejectedResponse")
+            .field("sequence_number", &self.sequence_number)
+            .field("response_teid_present", &true)
+            .field("cause", &self.cause)
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
 }
 
 /// Legacy bearer-context-shaped Modify Bearer input.

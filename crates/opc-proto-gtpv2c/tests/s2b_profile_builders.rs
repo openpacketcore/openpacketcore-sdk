@@ -6,14 +6,15 @@ use opc_proto_gtpv2c::{
     s2b_ue_ipsec_tunnel_update_request, s2b_update_bearer_request, s2b_update_bearer_response,
     AccessPointName, AggregateMaximumBitRate, BearerContext, Cause, CauseValue, EpsBearerId,
     FullyQualifiedTeid, MessageDirection, PdnAddressAllocation, PdnType, PdnTypeValue, PlmnId,
-    RatType, RatTypeValue, Recovery, S2bCreateSessionAcceptedResponse, S2bCreateSessionContext,
-    S2bCreateSessionIdentity, S2bCreateSessionRejectedResponse, S2bCreateSessionRequest,
-    S2bDeleteSessionContext, S2bDeleteSessionRequest, S2bDeleteSessionResponse, S2bMessage,
-    S2bModifyBearerResponse, S2bProfileBuildError, S2bUeEndpoint, S2bUeIpsecTunnelUpdateEndpoint,
-    S2bUeIpsecTunnelUpdateRequest, S2bUpdateBearerRequest, S2bUpdateBearerRequestContext,
-    S2bUpdateBearerResponse, S2bUpdateBearerResult, SelectionMode, SelectionModeValue,
-    ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_F_TEID, IE_TYPE_PDN_TYPE,
-    INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    RatType, RatTypeValue, RawIe, Recovery, S2bCreateSessionAcceptedResponse,
+    S2bCreateSessionContext, S2bCreateSessionIdentity, S2bCreateSessionRejectedResponse,
+    S2bCreateSessionRequest, S2bDeleteSessionContext, S2bDeleteSessionRequest,
+    S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerResponse, S2bProfileBuildError,
+    S2bUeEndpoint, S2bUeIpsecTunnelUpdateEndpoint, S2bUeIpsecTunnelUpdateRequest,
+    S2bUpdateBearerRequest, S2bUpdateBearerRequestContext, S2bUpdateBearerResponse,
+    S2bUpdateBearerResult, SelectionMode, SelectionModeValue, ServingNetwork, TbcdDigits, TypedIe,
+    TypedIeValue, IE_TYPE_F_TEID, IE_TYPE_PDN_TYPE, INTERFACE_TYPE_S2B_PGW_GTP_C,
+    INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{DecodeContext, DecodeErrorCode, Encode, EncodeContext, ValidationLevel};
 
@@ -244,6 +245,43 @@ fn create_session_response_builders_project_stable_summaries() {
     };
     assert_eq!(rejected_summary.response_teid, 0x5566_7788);
     assert_eq!(rejected_summary.cause, CauseValue::InvalidMessageFormat);
+}
+
+#[test]
+fn create_session_response_builder_inputs_have_value_free_debug() {
+    const PRIVATE_VALUE: &[u8] = b"builder-private-sentinel";
+    let private_ie = || TypedIe {
+        instance: 0,
+        value: TypedIeValue::Raw(RawIe {
+            ie_type: 250,
+            instance: 0,
+            spare: 0,
+            value: PRIVATE_VALUE,
+        }),
+    };
+
+    let accepted = S2bCreateSessionAcceptedResponse {
+        sequence_number: 0x010203,
+        response_teid: 0xf1e2_d3c4,
+        pgw_control_f_teid: pgw_control_f_teid(0xa1b2_c3d4),
+        bearer_context: accepted_bearer_context(5, 0x91a2_b3c4),
+        additional_ies: vec![private_ie()],
+    };
+    assert_eq!(
+        format!("{accepted:?}"),
+        "S2bCreateSessionAcceptedResponse { sequence_number: 66051, response_teid_present: true, pgw_control_f_teid_present: true, bearer_context_present: true, additional_ie_count: 1 }"
+    );
+
+    let rejected = S2bCreateSessionRejectedResponse {
+        sequence_number: 0x040506,
+        response_teid: 0xe1d2_c3b4,
+        cause: CauseValue::SystemFailure,
+        additional_ies: vec![private_ie()],
+    };
+    assert_eq!(
+        format!("{rejected:?}"),
+        "S2bCreateSessionRejectedResponse { sequence_number: 263430, response_teid_present: true, cause: SystemFailure, additional_ie_count: 1 }"
+    );
 }
 
 #[test]
