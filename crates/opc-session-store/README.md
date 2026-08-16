@@ -213,9 +213,10 @@ independent HA placement.
   `RestoreBlockReason`, summaries, page-size constants, and
   `summarize_restore_records`. Durable SQLite scans seek over the existing
   composite primary key, examine at most 4,096 live candidates plus one
-  lookahead per page, cap combined payloads at 4 MiB, retained page bytes at
-  8 MiB, and examined key/filter metadata at 8 MiB, and stop after 2,000,000
-  SQLite VM steps or 1 second of SQLite work. One absolute restore deadline
+  lookahead per page, cap combined **stored** payloads at 4 MiB + 64 KiB,
+  retained page bytes at 8 MiB, and examined key/filter metadata at 8 MiB,
+  and stop after 2,000,000 SQLite VM steps or 1 second of SQLite work. One
+  absolute restore deadline
   begins at the public entry point and covers the Openraft barrier/apply path,
   worker admission, asynchronous connection admission, SQLite progress, and
   task join. Each backend admits exactly one blocking restore worker, and the
@@ -238,6 +239,11 @@ independent HA placement.
   remains below 2 KiB and fits the legacy adapter's minimum frame.
   Exact response sizing returns typed `RestoreScanResponseTooLarge` without a
   partial frame unless peers negotiated a sufficient frame (up to 16 MiB).
+  The local stored-page ceiling is intentionally independent of session-net
+  v5's fixed 2,096,128-byte frame-safe wire payload ceiling: local SQLite
+  restore can recover its advertised 4 MiB + 64 KiB stored record limit,
+  including sealing-envelope overhead, but an oversized local page is never
+  transportable as a v5 page.
 - `opc-session-net` protocol v5 can transport only the durable opaque restore
   page profile. Compatibility offset cursors from `FakeSessionBackend` are
   local test evidence and are rejected by both remote client and server; this
@@ -251,7 +257,7 @@ independent HA placement.
   `max_value_bytes`, and
   size-bearing store errors; checked conversion at both domain boundaries; and
   independent 256-batch, 1,024-restore, 65,536-log, and 65,536-rebuild limits.
-  Its profile pins wire-schema revision 6, error-set revision 9,
+  Its profile pins wire-schema revision 7, error-set revision 9,
   `max_restore_scan_examined_rows = 4096`,
   `max_restore_scan_page_retained_bytes = 8388608`,
   `max_restore_scan_examined_metadata_bytes = 8388608`, `min_frame_size = 8192`,
@@ -263,8 +269,9 @@ independent HA placement.
   request IDs, when present, use the canonical lowercase hyphenated 36-byte UUID encoding.
   Revision 2 added exact directional frame negotiation. Revision 3 replaces
   revision 2's inspectable cursor fields with the confidential authenticated
-  token, adds the page cursor profile, and pins the 4 MiB payload plus 4,096
-  examined-candidate bounds. Error-set revision 3 carries typed restore
+  token, adds the page cursor profile, and originally pins the restore payload
+  plus 4,096 examined-candidate bounds. Wire-schema revision 7 corrects that
+  payload fence to a worst-case-JSON-safe 2,096,128 bytes. Error-set revision 3 carries typed restore
   stale-cursor, work-budget, and direct-CAS idempotency outcomes; revision 4
   adds the replication-log range, page-limit, and compacted-cursor outcomes;
   revision 5 adds the non-CAS backend and lease ambiguity outcomes; revision 6
@@ -326,19 +333,22 @@ independent HA placement.
   fleet upgrade.
 - Every protocol-v5 response and watch item is fully bounded-encoded before its
   length prefix is emitted. Common non-pageable and complete-page successes use
-  one bounded encode with no sizing preflight. If a complete pageable response
-  is too large, that direct attempt emits no prefix; bounded logarithmic sizing
-  probes and the final encode reuse the same absolute deadline established
-  before the first encode/probe. Lazy exact-length boxed chunks are not
+  one bounded encode with no sizing preflight. If a replication-log page is too
+  large, that direct attempt emits no prefix; bounded logarithmic sizing probes
+  and the final encode reuse the same absolute deadline established before the
+  first encode/probe. Restore pages are validated as whole backend results and
+  are never transport-shaped. Lazy exact-length boxed chunks are not
   coalesced and retained
   encoded-JSON byte storage stays within the frame limit. Chunk metadata and
   allocator slab/RSS overhead are separate. Deadline and server-abort
   cancellation are checked cooperatively between synchronous serializer
   writes/chunks, and the same deadline continues through prefix, payload, and
   flush.
-  Get/CAS records and positional batches are never truncated;
-  restore/log pages may return only a complete cursor/sequence-preserving
-  prefix; watch cannot skip an oversized sequence. A small SDK-owned,
+  Get/CAS records and positional batches are never truncated. Restore backends
+  may independently return shorter cursor-correct pages under their own
+  budgets, while replication-log pages may return only a complete
+  sequence-preserving prefix. The transport never trims or rewrites restore
+  pages/cursors; watch cannot skip an oversized sequence. A small SDK-owned,
   redaction-safe fallback is used when representable, otherwise the connection
   closes fail-closed. Slow-reader timeout releases the connection slot.
 - Transport capabilities advertise
@@ -1022,8 +1032,10 @@ fail closed.
 This is a compatibility boundary. The public error enums gain variants, so
 external exhaustive matches must add arms. Protocol v4 introduced the TTL
 fixed-width DTOs in error revision 1; current v5 error revision 9 retains those
-encodings and adds bounded expiry-preflight and topology-authority outcomes. An error-revision-8 or
-older peer is not admitted. Before upgrading a store created by an older SDK, audit
+encodings and adds bounded expiry-preflight and topology-authority outcomes. The
+exact direct v5 profile is wire-schema revision 7/error-set revision 9; every
+non-current direct profile combination (including error revision 8 or older) is
+not admitted. Before upgrading a store created by an older SDK, audit
 its persisted replication log for TTL-bearing
 operations above 365 days. Such legacy entries now fail closed during replay or
 rebuild; the SDK does not silently clamp or rewrite them. Replicated
@@ -1100,8 +1112,12 @@ entries. The negotiated frame limit remains a separate encoded-byte bound.
 Outbound sizing and emitted encoding use capped buffers and emit no prefix when
 the result cannot fit. Batch results retain exact positional cardinality and are
 never shortened. Replication-log results may expose only the largest complete
-contiguous prefix; restore pages may expose only a complete cursor
-prefix. An over-limit watch entry is not skipped because doing so would hide a
+contiguous prefix. Restore backends may independently return a shorter
+cursor-correct page under their count, payload, or work budgets, but the
+transport validates that complete page against the fixed wire cap and negotiated
+frame and never trims or rewrites it. An oversize restore page returns typed
+`RestoreScanResponseTooLarge` when representable or closes. An over-limit watch
+entry is not skipped because doing so would hide a
 sequence gap; the stream terminates after a representable fixed error or by
 closing the connection. Rejected owned operation trees continue to be
 dismantled iteratively.

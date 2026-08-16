@@ -35,7 +35,7 @@ use crate::{
     replication_watch::{prepare_watch_registration, ReplicationWatcher},
     restore::{
         compare_restore_records, restore_record_retained_bytes, RestoreScanCursor, RestoreScanPage,
-        RestoreScanRequest, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+        RestoreScanRequest, RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES,
         RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
     },
     ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
@@ -892,10 +892,10 @@ impl SessionBackend for FakeSessionBackend {
             let next_payload_bytes = payload_bytes
                 .checked_add(record.payload.len())
                 .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
-            if next_payload_bytes > RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES {
+            if next_payload_bytes > RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES {
                 if records.is_empty() {
                     return Err(StoreError::RestoreScanResponseTooLarge {
-                        max_bytes: RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+                        max_bytes: RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES,
                     });
                 }
                 has_more = true;

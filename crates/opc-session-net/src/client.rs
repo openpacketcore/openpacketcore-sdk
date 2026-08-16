@@ -43,8 +43,9 @@ use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
     compare_and_set_result_matches_key, conservative_payload_budget, get_result_matches_key,
     read_frame, read_response_frame, session_op_results_match_expectations,
-    validate_request_payload_limit, validate_request_profile, write_frame_bounded_until,
-    BootstrapHello, BootstrapRequest, BootstrapResponse, ContractProfile, Request, Response,
+    validate_request_payload_limit, validate_request_profile,
+    validate_restore_scan_wire_payload_bytes, write_frame_bounded_until, BootstrapHello,
+    BootstrapRequest, BootstrapResponse, ContractProfile, Request, Response,
     RestoreScanWireRequest, CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, DEFAULT_MAX_FRAME_SIZE,
     MAX_HANDSHAKE_FRAME_SIZE, MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES,
     MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE, SESSION_NET_ALPN,
@@ -2323,6 +2324,16 @@ impl SessionBackend for RemoteSessionBackend {
                     return Err(StoreError::CapabilityNotSupported(
                         "legacy_remote_restore_scan".to_string(),
                     ));
+                }
+                if let Err(error) = validate_restore_scan_wire_payload_bytes(&page.records) {
+                    self.discard_connection().await;
+                    self.clear_cached_capabilities();
+                    tracing::warn!(
+                        target = %self.target,
+                        failure = store_error_kind(&error),
+                        "remote restore scan response exceeded the wire payload limit"
+                    );
+                    return Err(error);
                 }
                 if let Err(error) = page.validate_for_request(&request) {
                     self.discard_connection().await;

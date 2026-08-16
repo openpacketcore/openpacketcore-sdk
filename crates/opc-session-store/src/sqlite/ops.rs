@@ -20,12 +20,13 @@ use crate::{
     restore::{
         restore_record_retained_bytes_from_lengths, RestoreScanCursor, RestoreScanPage,
         RestoreScanRequest, RestoreScanScope, RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES,
-        RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
-        RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES, RESTORE_SCAN_MAX_SQLITE_VM_STEPS,
-        RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
+        RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE, RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
+        RESTORE_SCAN_MAX_SQLITE_VM_STEPS, RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
     },
     ttl::{checked_session_deadline, validate_stored_record_expiry_at},
 };
+
+use super::RestoreScanValidationProfile;
 
 const RESTORE_SCAN_SQLITE_PROGRESS_INTERVAL: i32 = 1_000;
 const RESTORE_SCAN_TENANT_MAX_BYTES: usize = 128;
@@ -119,6 +120,28 @@ pub(crate) fn persisted_owner_id(value: String) -> Result<OwnerId, StoreError> {
 pub(crate) fn persisted_u64(value: i64) -> Result<u64, StoreError> {
     u64::try_from(value)
         .map_err(|_| StoreError::Serialization("persisted session integer is negative".to_string()))
+}
+
+pub(crate) fn persisted_session_key(
+    tenant_str: String,
+    nf_kind_str: String,
+    key_type_str: String,
+    stable_id: Vec<u8>,
+) -> Result<SessionKey, StoreError> {
+    let tenant = opc_types::TenantId::new(tenant_str)
+        .map_err(|err| StoreError::Serialization(err.to_string()))?;
+    let nf_kind = opc_types::NetworkFunctionKind::new(nf_kind_str)
+        .map_err(|err| StoreError::Serialization(err.to_string()))?;
+    let key_type = SessionKeyType::from_str(&key_type_str).map_err(StoreError::Serialization)?;
+    let stable_id = crate::StableId::try_from(stable_id).map_err(|_| {
+        StoreError::Serialization("persisted stable session identifier is invalid".into())
+    })?;
+    Ok(SessionKey {
+        tenant,
+        nf_kind,
+        key_type,
+        stable_id,
+    })
 }
 
 pub(crate) fn sqlite_u64(value: u64) -> Result<i64, StoreError> {
@@ -777,7 +800,7 @@ pub(crate) fn scan_restore_records_sync(
     now: Timestamp,
     cancellation: Arc<AtomicBool>,
     operation_deadline: std::time::Instant,
-    prune_expired: bool,
+    profile: RestoreScanValidationProfile,
 ) -> Result<RestoreScanPage, StoreError> {
     request.validate()?;
     let _progress_guard =
@@ -785,7 +808,7 @@ pub(crate) fn scan_restore_records_sync(
     if cancellation.load(Ordering::Acquire) {
         return Err(StoreError::RestoreScanWorkBudgetExceeded);
     }
-    if prune_expired {
+    if profile.is_standalone() {
         prune_sync(conn, now)?;
     }
     let (backend_epoch, snapshot_revision, cursor_key) = read_restore_scan_state_sync(conn)?;
@@ -863,10 +886,17 @@ pub(crate) fn scan_restore_records_sync(
         let previous_last_examined_key = last_examined_key.clone();
 
         if candidate.matches_scope(&request.scope) {
-            if row_budget.payload_bytes > RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES {
+            let max_payload_bytes = profile.max_payload_bytes();
+            if row_budget.payload_bytes > max_payload_bytes {
+                if profile == RestoreScanValidationProfile::Consensus {
+                    return Err(StoreError::PayloadTooLarge {
+                        actual: row_budget.payload_bytes,
+                        max: max_payload_bytes,
+                    });
+                }
                 if examined_count == 0 && candidates.is_empty() {
                     return Err(StoreError::RestoreScanResponseTooLarge {
-                        max_bytes: RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+                        max_bytes: max_payload_bytes,
                     });
                 }
                 has_more = true;
@@ -875,7 +905,7 @@ pub(crate) fn scan_restore_records_sync(
             let next_payload_bytes = payload_bytes
                 .checked_add(row_budget.payload_bytes)
                 .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
-            if next_payload_bytes > RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES {
+            if next_payload_bytes > max_payload_bytes {
                 has_more = true;
                 break;
             }
@@ -940,7 +970,9 @@ pub(crate) fn scan_restore_records_sync(
         if cancellation.load(Ordering::Acquire) || std::time::Instant::now() >= operation_deadline {
             return Err(StoreError::RestoreScanWorkBudgetExceeded);
         }
-        records.push(candidate.load_record(conn)?);
+        let record = candidate.load_record(conn)?;
+        profile.validate_record(&record)?;
+        records.push(record);
     }
 
     if cancellation.load(Ordering::Acquire) {
@@ -991,12 +1023,7 @@ pub(crate) fn stored_record_from_row(
     payload_bytes: Vec<u8>,
     encoding: i64,
 ) -> Result<StoredSessionRecord, StoreError> {
-    let tenant = opc_types::TenantId::new(tenant_str)
-        .map_err(|err| StoreError::Serialization(err.to_string()))?;
-    let nf_kind = opc_types::NetworkFunctionKind::new(nf_kind_str)
-        .map_err(|err| StoreError::Serialization(err.to_string()))?;
-    let key_type =
-        crate::SessionKeyType::from_str(&key_type_str).map_err(StoreError::Serialization)?;
+    let key = persisted_session_key(tenant_str, nf_kind_str, key_type_str, stable_id)?;
     let owner = persisted_owner_id(owner_str)?;
     let state_class = state_class_from_str(&state_class_str)?;
     let state_type = StateType::new(state_type_str).map_err(StoreError::Serialization)?;
@@ -1010,14 +1037,7 @@ pub(crate) fn stored_record_from_row(
     let payload = payload_from_row(payload_bytes, encoding)?;
 
     Ok(StoredSessionRecord {
-        key: SessionKey {
-            tenant,
-            nf_kind,
-            key_type,
-            stable_id: crate::StableId::try_from(stable_id).map_err(|_| {
-                StoreError::Serialization("persisted stable session identifier is invalid".into())
-            })?,
-        },
+        key,
         generation: Generation::new(persisted_u64(generation)?),
         owner,
         fence: FenceToken::new(persisted_u64(fence)?),

@@ -1887,6 +1887,9 @@ where
         self.inner.restore_scan_cursor_profile()
     }
 
+    /// The returned value limit describes the envelope bytes accepted by the
+    /// inner store. It is not a plaintext admission promise: local and remote
+    /// sealing add variable, authenticated envelope metadata before dispatch.
     async fn capabilities(&self) -> BackendCapabilities {
         self.inner.capabilities().await
     }
@@ -2331,6 +2334,9 @@ where
         self.inner.restore_scan_cursor_profile()
     }
 
+    /// The returned value limit describes the sealed bytes accepted by the
+    /// inner store. Remote providers choose envelope metadata, so it must not
+    /// be interpreted as an equal plaintext payload limit.
     async fn capabilities(&self) -> BackendCapabilities {
         self.inner.capabilities().await
     }

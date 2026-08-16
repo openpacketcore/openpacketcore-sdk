@@ -1817,7 +1817,7 @@ mod tests {
     fn sealed_cas_entry(
         index: u64,
         request_byte: u8,
-        opaque_bytes: usize,
+        payload_bytes: usize,
     ) -> Entry<SessionRaftTypeConfig> {
         let key = key();
         let owner = OwnerId::new("replica-a").expect("owner");
@@ -1840,7 +1840,12 @@ mod tests {
             expires_at: None,
             payload: EncryptedSessionPayload::new([]),
         };
+        let envelope_overhead = test_envelope(&record, &[]).len();
+        let opaque_bytes = payload_bytes
+            .checked_sub(envelope_overhead)
+            .expect("payload length exceeds envelope overhead");
         let sealed = test_envelope(&record, &vec![request_byte; opaque_bytes]);
+        assert_eq!(sealed.len(), payload_bytes);
         record.payload =
             EncryptedSessionPayload::try_envelope(sealed).expect("structurally valid envelope");
         normal_entry(
@@ -1901,11 +1906,7 @@ mod tests {
             initial_membership_entry(),
             sealed_cas_entry(1, 11, 600 * 1024),
             sealed_cas_entry(2, 12, 600 * 1024),
-            sealed_cas_entry(
-                3,
-                13,
-                opc_consensus::DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES + 64 * 1024,
-            ),
+            sealed_cas_entry(3, 13, crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES),
         ];
         {
             let conn = log_store.core.conn.lock().await;
