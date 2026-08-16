@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::NamedTempFile;
 
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, Generation, HandoverEnvelope,
@@ -681,8 +680,11 @@ async fn test_competing_transaction_rejected() {
 
 #[tokio::test]
 async fn test_durable_sqlite_restart() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
+    let directory = tempfile::tempdir().unwrap();
+    // `SqliteSessionBackend::open` may bootstrap authority only for a pathname
+    // it creates itself. A pre-created `NamedTempFile` is deliberately treated
+    // as untrusted persisted state, even when it is empty.
+    let path = directory.path().join("handover.sqlite");
 
     let tx = HandoverTxId::new();
     let key = test_key(b"durable-key");

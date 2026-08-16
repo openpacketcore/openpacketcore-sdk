@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use opc_types::Timestamp;
 
 use crate::{
-    error::LeaseError,
+    error::{LeaseError, StoreError},
     model::{FenceToken, OwnerId, SessionKey},
 };
 
@@ -99,6 +99,25 @@ impl LeaseGuard {
     pub fn credential_id(&self) -> u64 {
         self.credential_id
     }
+}
+
+/// Validate the self-contained invariants of a lease credential.
+///
+/// This deliberately does not consult stored lease state. Callers that admit
+/// replicated commands use it to reject impossible guards before they enter a
+/// log, while stateful lease ownership and expiry checks remain backend work.
+pub(crate) fn validate_lease_guard_profile(lease: &LeaseGuard) -> Result<(), StoreError> {
+    if lease.fence().get() == 0
+        || lease.credential_id() == 0
+        || i64::try_from(lease.fence().get()).is_err()
+        || i64::try_from(lease.credential_id()).is_err()
+        || lease.acquired_at() > lease.expires_at()
+    {
+        return Err(StoreError::InvalidKey(
+            "lease guard relationships are invalid".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Lease manager for single-owner session mutation.

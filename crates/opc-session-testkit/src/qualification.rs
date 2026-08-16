@@ -1263,9 +1263,40 @@ pub struct SessionHaQualificationProfile {
     pub topology: QualificationTopology,
     pub protocol: QualificationProtocol,
     pub consensus_timing: QualificationConsensusTiming,
-    pub bounds: QualificationBounds,
+    pub bounds: QualificationBoundsV6,
     pub provisional_test_thresholds: QualificationThresholds,
     pub evidence: QualificationEvidenceRequirements,
+}
+
+/// Frozen v2 inventory used only as the baseline for additive v4/v5 profiles.
+///
+/// Its bounds intentionally remain the exact historical shape. Current v6
+/// authority must not make new required fields appear in frozen documents.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenSessionHaQualificationProfileV2 {
+    schema_version: String,
+    profile_id: String,
+    maturity: String,
+    qualification_complete: bool,
+    workspace: QualificationWorkspace,
+    source_build_gate: QualificationSourceBuildGate,
+    artifacts: Vec<QualificationArtifact>,
+    platforms: Vec<QualificationPlatform>,
+    topology: QualificationTopology,
+    protocol: QualificationProtocol,
+    consensus_timing: QualificationConsensusTiming,
+    bounds: QualificationBounds,
+    provisional_test_thresholds: QualificationThresholds,
+    evidence: QualificationEvidenceRequirements,
+}
+
+fn frozen_v2_baseline_is_exact(profile: &FrozenSessionHaQualificationProfileV2) -> bool {
+    profile.schema_version == "opc-session-ha-profile/v2"
+        && profile.profile_id == "opc-session-openraft-ha/v2"
+        && profile.maturity == "experimental"
+        && !profile.qualification_complete
+        && profile.evidence.required_topologies == [3, 5]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1399,6 +1430,28 @@ pub struct QualificationBounds {
     pub max_restore_sqlite_work_millis: u64,
 }
 
+/// Current v6 resource bounds, including exact local and consensus value caps.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationBoundsV6 {
+    pub operation_timeout_millis: u64,
+    pub max_session_ttl_seconds: u64,
+    pub max_stable_id_bytes: usize,
+    pub max_replication_transaction_id_bytes: usize,
+    pub max_replication_operation_depth: usize,
+    pub max_replication_operations_per_entry: usize,
+    pub max_replication_log_page_entries: usize,
+    pub max_watch_backlog_entries: usize,
+    pub max_restore_page_records: usize,
+    pub max_restore_page_payload_bytes: usize,
+    pub max_restore_examined_rows: usize,
+    pub max_restore_sqlite_work_millis: u64,
+    /// Exact standalone SQLite stored-envelope ceiling.
+    pub local_stored_value_cap_bytes: usize,
+    /// Exact SQLite consensus-adapter stored-value ceiling.
+    pub consensus_stored_value_cap_bytes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationThresholds {
@@ -1486,10 +1539,11 @@ impl SessionHaCandidateQualificationProfileV4 {
         {
             return Err(QualificationCandidateContractError::UnsupportedClaim);
         }
-        let baseline: SessionHaQualificationProfile =
+        let baseline: FrozenSessionHaQualificationProfileV2 =
             serde_json::from_str(FROZEN_SESSION_HA_PROFILE_V2_JSON)
                 .map_err(|_| QualificationCandidateContractError::InvalidProfile)?;
-        if self.workspace != baseline.workspace
+        if !frozen_v2_baseline_is_exact(&baseline)
+            || self.workspace != baseline.workspace
             || self.source_build_gate != baseline.source_build_gate
             || self.artifacts != baseline.artifacts
             || self.platforms != baseline.platforms
@@ -1625,10 +1679,11 @@ impl SessionHaCandidateQualificationProfileV5 {
         {
             return Err(QualificationCandidateContractError::UnsupportedClaim);
         }
-        let baseline: SessionHaQualificationProfile =
+        let baseline: FrozenSessionHaQualificationProfileV2 =
             serde_json::from_str(FROZEN_SESSION_HA_PROFILE_V2_JSON)
                 .map_err(|_| QualificationCandidateContractError::InvalidProfile)?;
-        if self.workspace != baseline.workspace
+        if !frozen_v2_baseline_is_exact(&baseline)
+            || self.workspace != baseline.workspace
             || self.source_build_gate != baseline.source_build_gate
             || self.artifacts != baseline.artifacts
             || self.platforms != baseline.platforms

@@ -22,6 +22,7 @@ use opc_consensus::{
     LinearizableReadBarrierError, LinearizableReadLease, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
+use opc_key::{KeyProvider, RemoteSealProvider, Zeroizing};
 use opc_types::Timestamp;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -34,12 +35,17 @@ use super::raft_adapter::{
 };
 use super::storage::{self, SessionConsensusStorageError};
 use super::{
-    SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusIdentity,
-    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpcFamily,
-    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionMutationIntent, SessionMutationOutcome, SessionRaft, SessionRaftTypeConfig,
-    SessionTopologyMemberBinding, SESSION_CONSENSUS_SCHEMA_VERSION,
+    types::{
+        command_admission_cutover_logical_time, is_command_admission_cutover_request,
+        validate_mutation_intent_profile,
+    },
+    DurableSessionConsensusCommand, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
+    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusRequestId, SessionConsensusResponse,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionMutationIntent, SessionMutationOutcome, SessionRaft,
+    SessionRaftTypeConfig, SessionTopologyMemberBinding,
+    SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::backend::{
     record_expiry_preflights, validate_record_expiry_preflights_at,
@@ -52,7 +58,8 @@ use crate::capability::{BackendCapabilities, SessionStorePlatformProfile};
 use crate::clock::{Clock, SystemClock};
 use crate::consumer::{
     consumer_request_commitment, derive_consumer_consensus_request_id,
-    derive_consumer_request_binding_id, SessionConsumerAuthorizationManifest,
+    derive_consumer_request_binding_id, validate_compare_and_set_profile,
+    validate_consumer_operation_profile, SessionConsumerAuthorizationManifest,
     SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerIdentity,
     SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
     SessionConsumerRequest, SessionConsumerResponse, SessionConsumerScope,
@@ -66,7 +73,7 @@ use crate::readiness::{
     FixedQuorumReadinessReport, FixedQuorumTrafficAuthority, PlacementResiliencePolicy,
     PlacementResilienceReport, ReplicaReadinessObservation, ReplicaReadinessOutcome,
 };
-use crate::record::StoredSessionRecord;
+use crate::record::{SessionPayloadEncoding, StoredSessionRecord};
 use crate::restore::{RestoreScanPage, RestoreScanRequest};
 use crate::sqlite::SqliteSessionBackend;
 use crate::topology::{QuorumTopologyMode, QuorumTopologySummary, ValidatedQuorumTopology};
@@ -100,7 +107,6 @@ const TOPOLOGY_TLS_BINDING_DOMAIN: &[u8] =
     b"openpacketcore/session-store/topology-tls-binding/v1\0";
 const TOPOLOGY_BACKING_BINDING_DOMAIN: &[u8] =
     b"openpacketcore/session-store/topology-backing-binding/v1\0";
-
 fn topology_node_bindings(
     topology: &ValidatedQuorumTopology,
 ) -> BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding> {
@@ -165,6 +171,10 @@ pub enum ConsensusSessionStoreOpenError {
     /// handling and are unsupported on this platform.
     #[error("fixed durable quorum is unsupported on this platform")]
     FixedQuorumUnsupportedPlatform,
+    /// Dynamic consensus snapshots require Linux descriptor-pinned SQLite
+    /// handling and are unsupported on this platform.
+    #[error("dynamic session consensus is unsupported on this platform")]
+    DynamicConsensusUnsupportedPlatform,
     /// The fixed SDK Openraft runtime profile was invalid.
     #[error("session consensus runtime configuration is invalid")]
     InvalidRuntimeConfiguration,
@@ -212,6 +222,9 @@ impl From<SessionConsensusStorageError> for ConsensusSessionStoreOpenError {
             | SessionConsensusStorageError::SchemaVersionMismatch
             | SessionConsensusStorageError::InvalidIdentity => Self::DurableIdentityMismatch,
             SessionConsensusStorageError::BackendUnavailable => Self::StorageUnavailable,
+            SessionConsensusStorageError::DynamicConsensusUnsupportedPlatform => {
+                Self::DynamicConsensusUnsupportedPlatform
+            }
         }
     }
 }
@@ -226,6 +239,11 @@ impl From<SessionRaftAdapterError> for ConsensusSessionStoreOpenError {
 struct ForwardMutationRequest {
     request_id: SessionConsensusRequestId,
     intent: SessionMutationIntent,
+    /// The exact active authority identity held by the sender while it waits
+    /// for and accepts this reply. A stable storage identity is intentionally
+    /// insufficient: a dynamic membership transition can replace authority
+    /// without changing durable storage.
+    authority_identity: SessionConsensusIdentity,
     /// The exact consumer scope whose check must remain valid through leader
     /// admission. Ordinary in-process store callers carry no consumer scope.
     required_consumer_scope: ForwardConsumerScope,
@@ -260,7 +278,7 @@ impl ForwardConsumerScope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ForwardRequest {
-    Mutation(ForwardMutationRequest),
+    Mutation(Box<ForwardMutationRequest>),
     RecordExpiryPreflight {
         preflights: BoundedRecordExpiryPreflights,
         /// The consumer scope that must remain valid through the leader's
@@ -337,12 +355,69 @@ impl<'de> Deserialize<'de> for BoundedRecordExpiryPreflights {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ForwardMutationReply {
-    Applied(Box<SessionConsensusResponse>),
+    /// A leader response bound to the exact forwarded request.
+    Applied {
+        request_id: SessionConsensusRequestId,
+        authority_identity: SessionConsensusIdentity,
+        semantic_intent_commitment: [u8; 32],
+        response: Box<SessionConsensusResponse>,
+    },
     RecordExpiryPreflight(Result<(), StoreError>),
     NotLeader {
         leader: Option<SessionConsensusNodeId>,
     },
     Unavailable,
+}
+
+/// Bind a private forwarded mutation reply to its exact semantic request.
+///
+/// The commitment deliberately covers the unwrapped intent, durable storage
+/// identity, exact active authority identity, and required consumer scope. It
+/// excludes only the request ID, which is echoed independently so callers must verify
+/// both values.  JSON is already the canonical serialization used for
+/// consensus digests in this crate; the explicit domain prevents cross-use.
+fn forward_mutation_semantic_commitment(
+    storage_identity: SessionConsensusIdentity,
+    request: &ForwardMutationRequest,
+) -> Result<[u8; 32], StoreError> {
+    let encoded = serde_json::to_vec(&(
+        storage_identity,
+        request.authority_identity,
+        &request.required_consumer_scope,
+        &request.intent,
+    ))
+    .map_err(|_| StoreError::Serialization("forward mutation commitment encoding failed".into()))?;
+    let mut digest = Sha256::new();
+    digest.update(b"openpacketcore/session-store/forward-mutation-intent/v1\0");
+    digest.update(encoded);
+    Ok(digest.finalize().into())
+}
+
+fn forwarded_applied_reply_bound(
+    request_id: SessionConsensusRequestId,
+    authority_identity: SessionConsensusIdentity,
+    semantic_intent_commitment: [u8; 32],
+    response: SessionConsensusResponse,
+) -> ForwardMutationReply {
+    ForwardMutationReply::Applied {
+        request_id,
+        authority_identity,
+        semantic_intent_commitment,
+        response: Box::new(response),
+    }
+}
+
+fn forwarded_applied_reply_matches_request(
+    storage_identity: SessionConsensusIdentity,
+    request: &ForwardMutationRequest,
+    reply_request_id: SessionConsensusRequestId,
+    reply_authority_identity: SessionConsensusIdentity,
+    semantic_intent_commitment: [u8; 32],
+) -> bool {
+    reply_request_id == request.request_id
+        && reply_authority_identity == request.authority_identity
+        && forward_mutation_semantic_commitment(storage_identity, request).ok()
+            == Some(semantic_intent_commitment)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,6 +430,36 @@ enum ConsensusPeerCallFailure {
 struct LocalProposalAuthority {
     origin: SessionConsensusNodeId,
     allows_operator_recovery: bool,
+}
+
+/// Local proposal completion carries a caller-supplied topology permit back
+/// to the forwarding admission. Direct and received paths discard it at their
+/// own boundary, while the outer forwarder retains it through reply checks.
+struct LocalLeaderApplyResult {
+    reply: ForwardMutationReply,
+    operation_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+struct LocalProposalCompletion {
+    reply: ForwardMutationReply,
+    operation_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ForwardReplyAcceptanceProbe {
+    reply_received: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+fn local_proposal_completion(
+    reply: ForwardMutationReply,
+    operation_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+) -> LocalProposalCompletion {
+    LocalProposalCompletion {
+        reply,
+        operation_guard: Some(operation_guard),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,6 +532,113 @@ pub struct ConsensusSessionStore {
 #[derive(Clone)]
 pub struct ConsensusSessionConsumerService {
     store: ConsensusSessionStore,
+    ingress_authentication: ConsumerIngressAuthentication,
+}
+
+/// Provider-backed verification kept exclusively at the stateless consumer
+/// ingress. Consensus commands contain only ciphertext and never retain this
+/// adapter, so followers, replays, snapshots, and durable recovery cannot
+/// contact a key provider or observe plaintext.
+#[derive(Clone)]
+enum ConsumerIngressAuthentication {
+    Unconfigured,
+    Configured {
+        authenticator: Arc<dyn ConsumerIngressAuthenticator>,
+        backend_namespace: Arc<str>,
+    },
+}
+
+#[async_trait]
+trait ConsumerIngressAuthenticator: Send + Sync {
+    async fn authenticate(
+        &self,
+        record: &StoredSessionRecord,
+        backend_namespace: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConsumerAuthenticationError>;
+}
+
+enum ConsumerAuthenticationError {
+    Rejected(StoreError),
+    TimedOut,
+}
+
+struct KeyProviderConsumerIngressAuthenticator<P> {
+    provider: Arc<P>,
+}
+
+#[async_trait]
+impl<P> ConsumerIngressAuthenticator for KeyProviderConsumerIngressAuthenticator<P>
+where
+    P: KeyProvider + 'static,
+{
+    async fn authenticate(
+        &self,
+        record: &StoredSessionRecord,
+        backend_namespace: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConsumerAuthenticationError> {
+        if record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
+            return Err(ConsumerAuthenticationError::Rejected(StoreError::Crypto(
+                "consumer payload is not an envelope".into(),
+            )));
+        }
+        let plaintext: Zeroizing<Vec<u8>> = tokio::time::timeout_at(
+            deadline,
+            record.payload.decrypt(
+                self.provider.as_ref(),
+                &record.key,
+                &record.state_type,
+                record.generation,
+                record.fence,
+                backend_namespace,
+            ),
+        )
+        .await
+        .map_err(|_| ConsumerAuthenticationError::TimedOut)?
+        .map_err(ConsumerAuthenticationError::Rejected)?;
+        drop(plaintext);
+        Ok(())
+    }
+}
+
+struct RemoteSealConsumerIngressAuthenticator<S> {
+    provider: Arc<S>,
+}
+
+#[async_trait]
+impl<S> ConsumerIngressAuthenticator for RemoteSealConsumerIngressAuthenticator<S>
+where
+    S: RemoteSealProvider + 'static,
+{
+    async fn authenticate(
+        &self,
+        record: &StoredSessionRecord,
+        backend_namespace: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConsumerAuthenticationError> {
+        if record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
+            return Err(ConsumerAuthenticationError::Rejected(StoreError::Crypto(
+                "consumer payload is not an envelope".into(),
+            )));
+        }
+        let plaintext: Zeroizing<Vec<u8>> = tokio::time::timeout_at(
+            deadline,
+            record.payload.remote_unseal(
+                self.provider.as_ref(),
+                &record.key,
+                &record.state_type,
+                record.generation,
+                record.fence,
+                backend_namespace,
+            ),
+        )
+        .await
+        .map_err(|_| ConsumerAuthenticationError::TimedOut)?
+        .map_err(ConsumerAuthenticationError::Rejected)?;
+        drop(plaintext);
+        Ok(())
+    }
 }
 
 impl fmt::Debug for ConsensusSessionConsumerService {
@@ -646,6 +858,13 @@ impl ConsensusSessionStore {
         clock: Arc<dyn Clock>,
         operation_timeout: Duration,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        // Dynamic snapshots use the same descriptor-pinned installation
+        // guarantee as fixed durable quorum. Fail before constructing the
+        // network or touching consensus schema/snapshot paths on platforms
+        // where that primitive is unavailable.
+        if !cfg!(target_os = "linux") {
+            return Err(ConsensusSessionStoreOpenError::DynamicConsensusUnsupportedPlatform);
+        }
         if operation_timeout.is_zero() || operation_timeout > Duration::from_secs(60) {
             return Err(ConsensusSessionStoreOpenError::InvalidRuntimeConfiguration);
         }
@@ -768,16 +987,87 @@ impl ConsensusSessionStore {
         })
     }
 
+    /// Stop this Openraft node and wait for its engine tasks to release the
+    /// durable storage handles. Call this before reopening the same SQLite
+    /// database in the current process.
+    pub async fn shutdown(&self) -> Result<(), StoreError> {
+        // Terminally revoke routing before awaiting engine shutdown. Every
+        // clone shares this directory state, so no concurrent transition can
+        // re-stage a route while Openraft is draining.
+        let routes = self
+            .inner
+            .peer_directory
+            .clear_routes_after_shutdown()
+            .map_err(|_| consensus_unavailable());
+        let result = self
+            .inner
+            .raft
+            .shutdown()
+            .await
+            .map_err(|_| consensus_unavailable());
+        result.and(routes)
+    }
+
     /// Build the typed least-authority service for authenticated stateless
     /// application consumers.
     ///
     /// The returned service is not a consensus RPC handler and cannot be used
     /// to add a local member, access SQLite/snapshot state, or dispatch raw
     /// replication/rebuild commands. Its caller must authenticate and
-    /// authorize each [`SessionConsumerIdentity`] before calling it.
+    /// authorize each [`SessionConsumerIdentity`] before calling it. This
+    /// source-compatible constructor intentionally rejects every CAS-bearing
+    /// request: callers that submit ciphertext must use one of the provider
+    /// constructors below.
     pub fn consumer_service(&self) -> ConsensusSessionConsumerService {
         ConsensusSessionConsumerService {
             store: self.clone(),
+            ingress_authentication: ConsumerIngressAuthentication::Unconfigured,
+        }
+    }
+
+    /// Build a consumer service that verifies each submitted CAS envelope
+    /// using the exact historical local key selected by its envelope key ID.
+    ///
+    /// `backend_namespace` is part of the record AAD and therefore must be
+    /// the exact namespace used when the consumer encrypted the record.
+    /// This provider is retained only by the ingress service and is never
+    /// passed to consensus replication or durable recovery components.
+    pub fn consumer_service_with_key_provider<P>(
+        &self,
+        provider: Arc<P>,
+        backend_namespace: impl Into<Arc<str>>,
+    ) -> ConsensusSessionConsumerService
+    where
+        P: KeyProvider + 'static,
+    {
+        ConsensusSessionConsumerService {
+            store: self.clone(),
+            ingress_authentication: ConsumerIngressAuthentication::Configured {
+                authenticator: Arc::new(KeyProviderConsumerIngressAuthenticator { provider }),
+                backend_namespace: backend_namespace.into(),
+            },
+        }
+    }
+
+    /// Build a consumer service that verifies each submitted CAS envelope
+    /// through a remote-seal provider using the envelope's exact key ID.
+    ///
+    /// `backend_namespace` is authenticated AAD and must match the namespace
+    /// used to seal the incoming record. The provider is ingress-only.
+    pub fn consumer_service_with_remote_seal_provider<S>(
+        &self,
+        provider: Arc<S>,
+        backend_namespace: impl Into<Arc<str>>,
+    ) -> ConsensusSessionConsumerService
+    where
+        S: RemoteSealProvider + 'static,
+    {
+        ConsensusSessionConsumerService {
+            store: self.clone(),
+            ingress_authentication: ConsumerIngressAuthentication::Configured {
+                authenticator: Arc::new(RemoteSealConsumerIngressAuthenticator { provider }),
+                backend_namespace: backend_namespace.into(),
+            },
         }
     }
 
@@ -1161,6 +1451,32 @@ impl ConsensusSessionStore {
             .peer_directory
             .current_scope()
             .map_err(|_| consensus_unavailable())
+    }
+
+    /// Pin one dynamic topology epoch from forwarding request construction
+    /// through reply acceptance. The retained read guard prevents a topology
+    /// writer from replacing that authority in the middle of the exchange.
+    async fn admit_forward_mutation_authority_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<
+        (
+            SessionConsensusIdentity,
+            tokio::sync::OwnedRwLockReadGuard<()>,
+        ),
+        StoreError,
+    > {
+        let operation_gate = self.inner.topology_coordinator.operation_gate();
+        let operation_guard = tokio::time::timeout_at(deadline, operation_gate.read_owned())
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        let (identity, members) = self.current_scope()?;
+        if !members.contains(&self.inner.local_node_id) {
+            return Err(consensus_unavailable());
+        }
+        Ok((identity, operation_guard))
     }
 
     fn current_member_count(&self) -> Option<usize> {
@@ -1991,15 +2307,87 @@ impl ConsensusSessionStore {
         self.require_application_traffic_authority_before(deadline)
             .await?;
         validate_consensus_intent(&intent)?;
+        if intent_requires_command_admission_cutover(&intent) {
+            self.ensure_command_admission_cutover_before(deadline)
+                .await?;
+        }
+        self.submit_request_after_cutover_before(
+            request_id,
+            intent,
+            required_consumer_scope,
+            deadline,
+        )
+        .await
+    }
+
+    /// Submit a request after the caller has already established application
+    /// authority, validated its intent, and (when required) committed command
+    /// admission cutover. Keeping this raw path separate prevents the
+    /// cutover's idempotent proposal from recursively requesting itself.
+    async fn submit_request_after_cutover_before(
+        &self,
+        request_id: SessionConsensusRequestId,
+        intent: SessionMutationIntent,
+        required_consumer_scope: Option<SessionConsensusIdentity>,
+        deadline: tokio::time::Instant,
+    ) -> Result<SessionConsensusResponse, StoreError> {
+        let (authority_identity, authority_guard) = self
+            .admit_forward_mutation_authority_before(deadline)
+            .await?;
+        self.submit_request_after_cutover_from_admission_before(
+            request_id,
+            intent,
+            required_consumer_scope,
+            authority_identity,
+            authority_guard,
+            deadline,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn submit_request_after_cutover_from_admission_before(
+        &self,
+        request_id: SessionConsensusRequestId,
+        intent: SessionMutationIntent,
+        required_consumer_scope: Option<SessionConsensusIdentity>,
+        authority_identity: SessionConsensusIdentity,
+        authority_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+        deadline: tokio::time::Instant,
+        #[cfg(test)] reply_acceptance_probe: Option<ForwardReplyAcceptanceProbe>,
+    ) -> Result<SessionConsensusResponse, StoreError> {
+        let mut authority_guard = Some(authority_guard);
         let request = ForwardMutationRequest {
             request_id,
             intent,
+            authority_identity,
             required_consumer_scope: ForwardConsumerScope::from_optional(required_consumer_scope),
         };
         let mut preferred = None;
         let mut outcome_may_be_unavailable = false;
 
         loop {
+            // A local leader can consume the transferred guard while waiting
+            // for an already-admitted proposal to settle. If that attempt
+            // instead reports a new leader, re-establish the forwarding
+            // admission before issuing any retry.
+            if authority_guard.is_none() {
+                let operation_gate = self.inner.topology_coordinator.operation_gate();
+                authority_guard = Some(
+                    tokio::time::timeout_at(deadline, operation_gate.read_owned())
+                        .await
+                        .map_err(|_| consensus_unavailable())?,
+                );
+                self.require_application_traffic_authority_before(deadline)
+                    .await?;
+                if self
+                    .current_scope()
+                    .map_or(true, |(identity, _)| identity != request.authority_identity)
+                {
+                    return Err(consensus_unavailable());
+                }
+            }
             let leader = match preferred.take() {
                 Some(leader) => leader,
                 None => match self.wait_for_known_leader(deadline).await {
@@ -2011,14 +2399,29 @@ impl ConsensusSessionStore {
                 },
             };
             let reply = if leader == self.inner.local_node_id {
-                self.apply_on_local_leader(request.clone(), self.inner.local_node_id, deadline)
-                    .await
+                // The forwarder already owns this read permit. Re-acquiring
+                // Tokio's fair gate here can self-deadlock if a topology
+                // writer queued after the forwarder: the nested reader waits
+                // behind that writer while the writer waits for this permit.
+                // Transfer it only to the local proposal path; direct and
+                // received forwarding still take their own admission below.
+                let operation_guard = authority_guard.take().ok_or_else(consensus_unavailable)?;
+                let local = self
+                    .apply_on_local_leader_with_operation_guard(
+                        request.clone(),
+                        self.inner.local_node_id,
+                        deadline,
+                        operation_guard,
+                    )
+                    .await;
+                authority_guard = local.operation_guard;
+                local.reply
             } else {
                 match self
                     .call_peer::<_, ForwardMutationReply>(
                         leader,
                         SessionConsensusRpcFamily::ForwardMutation,
-                        &ForwardRequest::Mutation(request.clone()),
+                        &ForwardRequest::Mutation(Box::new(request.clone())),
                         deadline,
                     )
                     .await
@@ -2051,12 +2454,36 @@ impl ConsensusSessionStore {
                 }
             };
             match reply {
-                ForwardMutationReply::Applied(response) => {
+                ForwardMutationReply::Applied {
+                    request_id,
+                    authority_identity,
+                    semantic_intent_commitment,
+                    response,
+                } => {
+                    if !forwarded_applied_reply_matches_request(
+                        self.inner.storage_identity,
+                        &request,
+                        request_id,
+                        authority_identity,
+                        semantic_intent_commitment,
+                    ) || self.current_scope().map_or(true, |(current_identity, _)| {
+                        current_identity != request.authority_identity
+                    }) {
+                        return Err(consensus_outcome_unavailable(&request.intent));
+                    }
                     if committed_response_matches_intent(&request.intent, &response) {
+                        #[cfg(test)]
+                        if let Some(probe) = &reply_acceptance_probe {
+                            probe.reply_received.notify_one();
+                            probe.release.notified().await;
+                        }
                         if self
                             .require_application_traffic_authority_before(deadline)
                             .await
                             .is_err()
+                            || self.current_scope().map_or(true, |(current_identity, _)| {
+                                current_identity != request.authority_identity
+                            })
                         {
                             return Err(consensus_outcome_unavailable(&request.intent));
                         }
@@ -2101,6 +2528,83 @@ impl ConsensusSessionStore {
                     return Err(consensus_outcome_unavailable(&request.intent));
                 }
             }
+        }
+    }
+
+    /// Commit (or recover the idempotent receipt for) the SDK-internal
+    /// command-admission cutover before a current leader submits a user
+    /// mutation. This intent is never reachable through the consumer API.
+    async fn ensure_command_admission_cutover_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        if self
+            .inner
+            .backend
+            .consensus_command_admission_cutover_committed(self.inner.storage_identity)
+            .await?
+        {
+            return Ok(());
+        }
+        let response = self
+            .submit_request_after_cutover_before(
+                SessionConsensusRequestId::from_bytes(
+                    SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID,
+                ),
+                SessionMutationIntent::AdvanceLogicalTime,
+                None,
+                deadline,
+            )
+            .await?;
+        match response.result? {
+            SessionMutationOutcome::Unit => Ok(()),
+            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+        }
+    }
+
+    /// Establish the same marker while the store is deliberately fenced for
+    /// operator recovery. This path uses the recovery quorum authority rather
+    /// than reopening ordinary application traffic.
+    async fn ensure_command_admission_cutover_for_operator_recovery_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), OperatorRecoveryCommitError> {
+        if self
+            .inner
+            .backend
+            .consensus_command_admission_cutover_committed(self.inner.storage_identity)
+            .await
+            .map_err(|_| OperatorRecoveryCommitError::Unavailable)?
+        {
+            return Ok(());
+        }
+        let reply = self
+            .apply_on_local_leader_inner(
+                ForwardMutationRequest {
+                    request_id: SessionConsensusRequestId::from_bytes(
+                        SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID,
+                    ),
+                    intent: SessionMutationIntent::AdvanceLogicalTime,
+                    authority_identity: self
+                        .current_scope()
+                        .map_err(|_| OperatorRecoveryCommitError::Unavailable)?
+                        .0,
+                    required_consumer_scope: ForwardConsumerScope::Internal,
+                },
+                self.inner.local_node_id,
+                deadline,
+                true,
+                None,
+            )
+            .await
+            .reply;
+        match reply {
+            ForwardMutationReply::Applied { response, .. }
+                if matches!(response.result, Ok(SessionMutationOutcome::Unit)) =>
+            {
+                Ok(())
+            }
+            _ => Err(OperatorRecoveryCommitError::Unavailable),
         }
     }
 
@@ -2181,7 +2685,7 @@ impl ConsensusSessionStore {
                 ForwardMutationReply::Unavailable => {
                     self.wait_for_route_refresh(leader, deadline).await?;
                 }
-                ForwardMutationReply::Applied(_) => {
+                ForwardMutationReply::Applied { .. } => {
                     return Err(consensus_unavailable());
                 }
             }
@@ -2194,7 +2698,19 @@ impl ConsensusSessionStore {
         origin: SessionConsensusNodeId,
         deadline: tokio::time::Instant,
     ) -> ForwardMutationReply {
-        self.apply_on_local_leader_inner(request, origin, deadline, false)
+        self.apply_on_local_leader_inner(request, origin, deadline, false, None)
+            .await
+            .reply
+    }
+
+    async fn apply_on_local_leader_with_operation_guard(
+        &self,
+        request: ForwardMutationRequest,
+        origin: SessionConsensusNodeId,
+        deadline: tokio::time::Instant,
+        operation_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    ) -> LocalLeaderApplyResult {
+        self.apply_on_local_leader_inner(request, origin, deadline, false, Some(operation_guard))
             .await
     }
 
@@ -2204,24 +2720,59 @@ impl ConsensusSessionStore {
         origin: SessionConsensusNodeId,
         deadline: tokio::time::Instant,
         allow_operator_recovery: bool,
-    ) -> ForwardMutationReply {
+        operation_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> LocalLeaderApplyResult {
+        let reply_commitment =
+            match forward_mutation_semantic_commitment(self.inner.storage_identity, &request) {
+                Ok(commitment) => commitment,
+                Err(_) => {
+                    return LocalLeaderApplyResult {
+                        reply: ForwardMutationReply::Unavailable,
+                        operation_guard,
+                    };
+                }
+            };
+        let reply_request_id = request.request_id;
+        let reply_authority_identity = request.authority_identity;
+        let applied = |response| {
+            forwarded_applied_reply_bound(
+                reply_request_id,
+                reply_authority_identity,
+                reply_commitment,
+                response,
+            )
+        };
+        // Reject malformed, unsupported, or unsealed caller-authored intent
+        // before waiting on topology or proposal authority. This boundary is
+        // state independent and must remain ahead of every durable admission
+        // path, including an uninitialized local leader.
         if let Err(error) =
             validate_consensus_intent_with_recovery(&request.intent, allow_operator_recovery)
         {
-            return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
-                error,
-            )));
+            return LocalLeaderApplyResult {
+                reply: applied(SessionConsensusResponse::rejected(error)),
+                operation_guard,
+            };
         }
         // Membership changes take the exclusive side of this gate. Holding a
         // shared guard through the definitive proposal result lets the
         // transition driver drain every already-admitted application write
         // before it commits learner-ready/fencing evidence.
-        let operation_gate = self.inner.topology_coordinator.operation_gate();
-        let operation_guard =
-            match tokio::time::timeout_at(deadline, operation_gate.read_owned()).await {
-                Ok(guard) => guard,
-                Err(_) => return ForwardMutationReply::Unavailable,
-            };
+        let operation_guard = match operation_guard {
+            Some(guard) => guard,
+            None => {
+                let operation_gate = self.inner.topology_coordinator.operation_gate();
+                match tokio::time::timeout_at(deadline, operation_gate.read_owned()).await {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return LocalLeaderApplyResult {
+                            reply: ForwardMutationReply::Unavailable,
+                            operation_guard: None,
+                        };
+                    }
+                }
+            }
+        };
         let initial_authority = if allow_operator_recovery {
             self.require_durable_fixed_quorum_admission_before(deadline)
                 .await
@@ -2230,7 +2781,19 @@ impl ConsensusSessionStore {
                 .await
         };
         if initial_authority.is_err() {
-            return ForwardMutationReply::Unavailable;
+            return LocalLeaderApplyResult {
+                reply: ForwardMutationReply::Unavailable,
+                operation_guard: Some(operation_guard),
+            };
+        }
+        // This must happen beneath the leader's topology gate. The transport
+        // envelope is checked before dispatch, but an authority transition can
+        // occur between that check and this proposal admission.
+        if !self.current_application_scope_matches(origin, request.authority_identity) {
+            return LocalLeaderApplyResult {
+                reply: ForwardMutationReply::Unavailable,
+                operation_guard: Some(operation_guard),
+            };
         }
         if request
             .required_consumer_scope
@@ -2240,9 +2803,12 @@ impl ConsensusSessionStore {
                     .map_or(true, |(current_scope, _)| current_scope != *required_scope)
             })
         {
-            return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
-                StoreError::TopologyAuthorityRevoked,
-            )));
+            return LocalLeaderApplyResult {
+                reply: applied(SessionConsensusResponse::rejected(
+                    StoreError::TopologyAuthorityRevoked,
+                )),
+                operation_guard: Some(operation_guard),
+            };
         }
         let proposal_permit = match tokio::time::timeout_at(
             deadline,
@@ -2251,7 +2817,12 @@ impl ConsensusSessionStore {
         .await
         {
             Ok(Ok(permit)) => permit,
-            Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
+            Ok(Err(_)) | Err(_) => {
+                return LocalLeaderApplyResult {
+                    reply: ForwardMutationReply::Unavailable,
+                    operation_guard: Some(operation_guard),
+                };
+            }
         };
 
         match self
@@ -2269,33 +2840,62 @@ impl ConsensusSessionStore {
                         .await
                 };
                 if authority.is_err() {
-                    return ForwardMutationReply::Unavailable;
+                    return LocalLeaderApplyResult {
+                        reply: ForwardMutationReply::Unavailable,
+                        operation_guard: Some(operation_guard),
+                    };
                 }
             }
             EnsureLinearizableOutcome::Retry { leader_hint } => {
-                return ForwardMutationReply::NotLeader {
-                    leader: leader_hint,
+                return LocalLeaderApplyResult {
+                    reply: ForwardMutationReply::NotLeader {
+                        leader: leader_hint,
+                    },
+                    operation_guard: Some(operation_guard),
                 };
             }
             EnsureLinearizableOutcome::Unavailable => {
-                return ForwardMutationReply::Unavailable;
+                return LocalLeaderApplyResult {
+                    reply: ForwardMutationReply::Unavailable,
+                    operation_guard: Some(operation_guard),
+                };
             }
-            _ => return ForwardMutationReply::Unavailable,
+            _ => {
+                return LocalLeaderApplyResult {
+                    reply: ForwardMutationReply::Unavailable,
+                    operation_guard: Some(operation_guard),
+                };
+            }
         }
 
-        let logical_time = match tokio::time::timeout_at(
-            deadline,
-            self.inner
-                .backend
-                .consensus_logical_time(self.inner.storage_identity),
-        )
-        .await
-        {
-            Ok(Ok(persisted)) => persisted.map_or_else(
-                || self.inner.clock.now_utc(),
-                |persisted| persisted.max(self.inner.clock.now_utc()),
-            ),
-            Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
+        // Every retry of the fixed cutover request must encode byte-identical
+        // command semantics. In particular, a leader change or clock advance
+        // cannot turn the marker into an idempotency conflict (or make a
+        // follower reject the repeated entry before apply).
+        let admission_cutover =
+            is_command_admission_cutover_request(request.request_id, &request.intent);
+        let logical_time = if admission_cutover {
+            command_admission_cutover_logical_time()
+        } else {
+            match tokio::time::timeout_at(
+                deadline,
+                self.inner
+                    .backend
+                    .consensus_logical_time(self.inner.storage_identity),
+            )
+            .await
+            {
+                Ok(Ok(persisted)) => persisted.map_or_else(
+                    || self.inner.clock.now_utc(),
+                    |persisted| persisted.max(self.inner.clock.now_utc()),
+                ),
+                Ok(Err(_)) | Err(_) => {
+                    return LocalLeaderApplyResult {
+                        reply: ForwardMutationReply::Unavailable,
+                        operation_guard: Some(operation_guard),
+                    };
+                }
+            }
         };
         if !allow_operator_recovery
             && self
@@ -2303,20 +2903,28 @@ impl ConsensusSessionStore {
                 .await
                 .is_err()
         {
-            return ForwardMutationReply::Unavailable;
+            return LocalLeaderApplyResult {
+                reply: ForwardMutationReply::Unavailable,
+                operation_guard: Some(operation_guard),
+            };
         }
-        self.propose_on_local_leader(
-            request,
-            LocalProposalAuthority {
-                origin,
-                allows_operator_recovery: allow_operator_recovery,
-            },
-            logical_time,
-            proposal_permit,
-            operation_guard,
-            deadline,
-        )
-        .await
+        let completion = self
+            .propose_on_local_leader(
+                request,
+                LocalProposalAuthority {
+                    origin,
+                    allows_operator_recovery: allow_operator_recovery,
+                },
+                logical_time,
+                proposal_permit,
+                operation_guard,
+                deadline,
+            )
+            .await;
+        LocalLeaderApplyResult {
+            reply: completion.reply,
+            operation_guard: completion.operation_guard,
+        }
     }
 
     async fn propose_on_local_leader(
@@ -2327,43 +2935,75 @@ impl ConsensusSessionStore {
         proposal_permit: tokio::sync::OwnedSemaphorePermit,
         operation_guard: tokio::sync::OwnedRwLockReadGuard<()>,
         deadline: tokio::time::Instant,
-    ) -> ForwardMutationReply {
+    ) -> LocalProposalCompletion {
         let outcome_unavailable = consensus_outcome_unavailable(&request.intent);
+        let reply_request_id = request.request_id;
+        let reply_authority_identity = request.authority_identity;
+        let reply_commitment =
+            match forward_mutation_semantic_commitment(self.inner.storage_identity, &request) {
+                Ok(commitment) => commitment,
+                Err(_) => {
+                    return local_proposal_completion(
+                        ForwardMutationReply::Unavailable,
+                        operation_guard,
+                    );
+                }
+            };
         let Ok((identity, _)) = self.current_scope() else {
-            return ForwardMutationReply::Unavailable;
+            return local_proposal_completion(ForwardMutationReply::Unavailable, operation_guard);
         };
+        if identity != request.authority_identity
+            || !self.current_application_scope_matches(authority.origin, request.authority_identity)
+        {
+            return local_proposal_completion(ForwardMutationReply::Unavailable, operation_guard);
+        }
+        let admission_cutover =
+            is_command_admission_cutover_request(request.request_id, &request.intent);
         let intent = match request.intent {
             intent @ SessionMutationIntent::FinalizeOperatorRecovery { .. }
                 if authority.allows_operator_recovery =>
             {
                 intent
             }
+            intent if admission_cutover => intent,
             mutation => SessionMutationIntent::Authorized {
                 origin: authority.origin,
                 authority_identity: identity,
                 mutation: Box::new(mutation),
             },
         };
-        let command = super::SessionConsensusCommand {
+        let command = DurableSessionConsensusCommand::current(super::SessionConsensusCommand {
             schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
             identity: self.inner.storage_identity,
             request_id: request.request_id,
             logical_time,
             intent,
-        };
+        });
         if let Err(error) = validate_consensus_command_preproposal(&command) {
-            return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
-                error,
-            )));
+            return local_proposal_completion(
+                forwarded_applied_reply_bound(
+                    reply_request_id,
+                    reply_authority_identity,
+                    reply_commitment,
+                    SessionConsensusResponse::rejected(error),
+                ),
+                operation_guard,
+            );
         }
         if encode_bounded(&command).is_err() {
             let max = self.inner.backend.consensus_capabilities().max_value_bytes;
-            return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
-                StoreError::PayloadTooLarge {
-                    actual: max.saturating_add(1),
-                    max,
-                },
-            )));
+            return local_proposal_completion(
+                forwarded_applied_reply_bound(
+                    reply_request_id,
+                    reply_authority_identity,
+                    reply_commitment,
+                    SessionConsensusResponse::rejected(StoreError::PayloadTooLarge {
+                        actual: max.saturating_add(1),
+                        max,
+                    }),
+                ),
+                operation_guard,
+            );
         }
 
         if !authority.allows_operator_recovery
@@ -2372,7 +3012,7 @@ impl ConsensusSessionStore {
                 .await
                 .is_err()
         {
-            return ForwardMutationReply::Unavailable;
+            return local_proposal_completion(ForwardMutationReply::Unavailable, operation_guard);
         }
 
         // Split Openraft's enqueue and result phases explicitly. Once
@@ -2383,8 +3023,18 @@ impl ConsensusSessionStore {
         let response =
             match tokio::time::timeout_at(deadline, self.inner.raft.client_write_ff(command)).await
             {
-                Err(_) => return ForwardMutationReply::Unavailable,
-                Ok(Err(_)) => return ForwardMutationReply::Unavailable,
+                Err(_) => {
+                    return local_proposal_completion(
+                        ForwardMutationReply::Unavailable,
+                        operation_guard,
+                    );
+                }
+                Ok(Err(_)) => {
+                    return local_proposal_completion(
+                        ForwardMutationReply::Unavailable,
+                        operation_guard,
+                    );
+                }
                 Ok(Ok(response)) => response,
             };
         // Once Openraft returns the receiver, the proposal is accepted by its
@@ -2396,29 +3046,48 @@ impl ConsensusSessionStore {
         let timeout_outcome_unavailable = outcome_unavailable.clone();
         tokio::spawn(async move {
             let reply = match response.await {
-                Err(_) => ForwardMutationReply::Applied(Box::new(
+                Err(_) => forwarded_applied_reply_bound(
+                    reply_request_id,
+                    reply_authority_identity,
+                    reply_commitment,
                     SessionConsensusResponse::rejected(outcome_unavailable.clone()),
-                )),
-                Ok(Ok(response)) => ForwardMutationReply::Applied(Box::new(response.data)),
+                ),
+                Ok(Ok(response)) => forwarded_applied_reply_bound(
+                    reply_request_id,
+                    reply_authority_identity,
+                    reply_commitment,
+                    response.data,
+                ),
                 Ok(Err(ClientWriteError::ForwardToLeader(forward))) => {
                     ForwardMutationReply::NotLeader {
                         leader: forward.leader_id,
                     }
                 }
                 Ok(Err(ClientWriteError::ChangeMembershipError(_))) => {
-                    ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
-                        outcome_unavailable,
-                    )))
+                    forwarded_applied_reply_bound(
+                        reply_request_id,
+                        reply_authority_identity,
+                        reply_commitment,
+                        SessionConsensusResponse::rejected(outcome_unavailable),
+                    )
                 }
             };
-            let _ = completion_tx.send(reply);
+            let _ = completion_tx.send(local_proposal_completion(reply, operation_guard));
             drop(proposal_permit);
-            drop(operation_guard);
         });
         match tokio::time::timeout_at(deadline, completion_rx).await {
-            Err(_) | Ok(Err(_)) => ForwardMutationReply::Applied(Box::new(
-                SessionConsensusResponse::rejected(timeout_outcome_unavailable),
-            )),
+            Err(_) | Ok(Err(_)) => LocalProposalCompletion {
+                reply: forwarded_applied_reply_bound(
+                    reply_request_id,
+                    reply_authority_identity,
+                    reply_commitment,
+                    SessionConsensusResponse::rejected(timeout_outcome_unavailable),
+                ),
+                // A timeout/cancelled receiver leaves the detached sender as
+                // the sole guard owner; it releases the permit only after the
+                // Raft result settles.
+                operation_guard: None,
+            },
             Ok(Ok(reply)) => reply,
         }
     }
@@ -2429,6 +3098,24 @@ impl ConsensusSessionStore {
         required_consumer_scope: ForwardConsumerScope,
         origin: SessionConsensusNodeId,
         deadline: tokio::time::Instant,
+    ) -> ForwardMutationReply {
+        self.preflight_record_expiry_on_local_leader_inner(
+            preflights,
+            required_consumer_scope,
+            origin,
+            deadline,
+            false,
+        )
+        .await
+    }
+
+    async fn preflight_record_expiry_on_local_leader_inner(
+        &self,
+        preflights: Vec<RecordExpiryPreflight>,
+        required_consumer_scope: ForwardConsumerScope,
+        origin: SessionConsensusNodeId,
+        deadline: tokio::time::Instant,
+        admission_cutover_confirmed: bool,
     ) -> ForwardMutationReply {
         if let Err(error) = validate_record_expiry_preflights_profile(&preflights) {
             return ForwardMutationReply::RecordExpiryPreflight(Err(error));
@@ -2544,12 +3231,41 @@ impl ConsensusSessionStore {
             return ForwardMutationReply::Unavailable;
         }
 
+        if !admission_cutover_confirmed {
+            // All absolute-expiry checks above have now succeeded, so the
+            // durable cutover marker cannot turn malformed caller input into
+            // a log/state mutation. Release the gate and permit before the
+            // nested idempotent proposal to avoid self-queuing behind this
+            // leader preflight.
+            drop(proposal_permit);
+            drop(operation_guard);
+            if self
+                .ensure_command_admission_cutover_before(deadline)
+                .await
+                .is_err()
+            {
+                return ForwardMutationReply::Unavailable;
+            }
+            return Box::pin(self.preflight_record_expiry_on_local_leader_inner(
+                preflights,
+                required_consumer_scope,
+                origin,
+                deadline,
+                true,
+            ))
+            .await;
+        }
+
         let intent = SessionMutationIntent::AdvanceLogicalTime;
         let reply = self
             .propose_on_local_leader(
                 ForwardMutationRequest {
                     request_id: SessionConsensusRequestId::new(),
                     intent: intent.clone(),
+                    authority_identity: match self.current_scope() {
+                        Ok((identity, _)) => identity,
+                        Err(_) => return ForwardMutationReply::Unavailable,
+                    },
                     required_consumer_scope,
                 },
                 LocalProposalAuthority {
@@ -2561,11 +3277,14 @@ impl ConsensusSessionStore {
                 operation_guard,
                 deadline,
             )
-            .await;
+            .await
+            .reply;
         match reply {
-            ForwardMutationReply::Applied(response) => ForwardMutationReply::RecordExpiryPreflight(
-                validate_committed_record_expiry_preflight(&preflights, &intent, &response),
-            ),
+            ForwardMutationReply::Applied { response, .. } => {
+                ForwardMutationReply::RecordExpiryPreflight(
+                    validate_committed_record_expiry_preflight(&preflights, &intent, &response),
+                )
+            }
             other => other,
         }
     }
@@ -2578,19 +3297,21 @@ impl ConsensusSessionStore {
         fence_high_water: u64,
         credential_high_water: u64,
     ) -> Result<(), OperatorRecoveryCommitError> {
+        if recovery_epoch == 0 || plan_digest == [0; 32] {
+            return Err(OperatorRecoveryCommitError::Rejected);
+        }
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or(OperatorRecoveryCommitError::Unavailable)?;
         self.require_durable_fixed_quorum_admission_before(deadline)
             .await
             .map_err(|_| OperatorRecoveryCommitError::Unavailable)?;
-        if recovery_epoch == 0 {
-            return Err(OperatorRecoveryCommitError::Rejected);
-        }
         let metrics = self.inner.raft.metrics();
         if metrics.borrow().current_leader != Some(self.inner.local_node_id) {
             return Err(OperatorRecoveryCommitError::NotLocalLeader);
         }
+        self.ensure_command_admission_cutover_for_operator_recovery_before(deadline)
+            .await?;
         let reply = self
             .apply_on_local_leader_inner(
                 ForwardMutationRequest {
@@ -2601,15 +3322,21 @@ impl ConsensusSessionStore {
                         fence_high_water,
                         credential_high_water,
                     },
+                    authority_identity: self
+                        .current_scope()
+                        .map_err(|_| OperatorRecoveryCommitError::Unavailable)?
+                        .0,
                     required_consumer_scope: ForwardConsumerScope::Internal,
                 },
                 self.inner.local_node_id,
                 deadline,
                 true,
+                None,
             )
-            .await;
+            .await
+            .reply;
         match reply {
-            ForwardMutationReply::Applied(response) => match response.result {
+            ForwardMutationReply::Applied { response, .. } => match response.result {
                 Ok(SessionMutationOutcome::Unit) => Ok(()),
                 Err(StoreError::InvalidKey(reason))
                     if reason == "operator_recovery_epoch_rejected" =>
@@ -3075,6 +3802,30 @@ fn consensus_outcome_unavailable(intent: &SessionMutationIntent) -> StoreError {
     }
 }
 
+fn intent_requires_command_admission_cutover(intent: &SessionMutationIntent) -> bool {
+    matches!(
+        intent,
+        SessionMutationIntent::AdvanceLogicalTime
+            | SessionMutationIntent::CompareAndSet(_)
+            | SessionMutationIntent::DeleteFenced(_)
+            | SessionMutationIntent::RefreshTtl { .. }
+            | SessionMutationIntent::AcquireLease { .. }
+            | SessionMutationIntent::RenewLease { .. }
+            | SessionMutationIntent::ReleaseLease(_)
+            | SessionMutationIntent::BindConsumerRequest { .. }
+            | SessionMutationIntent::ReadConsumerRecord { .. }
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn command_admission_cutover_time_is_canonical() {
+    assert_eq!(
+        command_admission_cutover_logical_time(),
+        Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH)
+    );
+}
+
 fn validate_committed_record_expiry_preflight(
     preflights: &[RecordExpiryPreflight],
     intent: &SessionMutationIntent,
@@ -3291,7 +4042,7 @@ fn validate_consensus_intent(intent: &SessionMutationIntent) -> Result<(), Store
 }
 
 fn validate_consensus_command_preproposal(
-    command: &super::SessionConsensusCommand,
+    command: &DurableSessionConsensusCommand,
 ) -> Result<(), StoreError> {
     let intent = match &command.intent {
         SessionMutationIntent::Authorized { mutation, .. } => {
@@ -3304,11 +4055,18 @@ fn validate_consensus_command_preproposal(
         }
         intent => intent,
     };
+    let uses_cutover_request_id =
+        command.request_id.as_bytes() == &SESSION_CONSENSUS_COMMAND_ADMISSION_CUTOVER_REQUEST_ID;
+    if uses_cutover_request_id && !command.is_command_admission_cutover() {
+        return Err(StoreError::CapabilityNotSupported(
+            "command_admission_cutover_is_not_canonical".into(),
+        ));
+    }
+    validate_mutation_intent_profile(intent)?;
     if let SessionMutationIntent::CompareAndSet(op) = intent {
-        validate_stored_record_expiry_at(&op.new_record, command.logical_time)?;
         validate_sealed_payload(op)?;
     }
-    Ok(())
+    validate_mutation_intent_at(intent, command.logical_time)
 }
 
 fn validate_consensus_intent_with_recovery(
@@ -3337,6 +4095,7 @@ fn validate_consensus_intent_with_recovery(
             "topology_transition_requires_local_coordinator_authority".into(),
         ));
     }
+    validate_mutation_intent_profile(intent)?;
     if let SessionMutationIntent::CompareAndSet(op) = intent {
         validate_sealed_payload(op)?;
     }
@@ -3346,10 +4105,30 @@ fn validate_consensus_intent_with_recovery(
 fn validate_consensus_batch(ops: &[SessionOp]) -> Result<(), StoreError> {
     for op in ops {
         if let SessionOp::CompareAndSet(op) = op {
+            validate_compare_and_set_profile(op)?;
             validate_sealed_payload(op)?;
+        } else {
+            op.validate_ttls()?;
         }
     }
     Ok(())
+}
+
+/// Validate an unwrapped consensus mutation without reading state or assigning
+/// time. This mirrors the consumer's whole-operation boundary so malformed
+/// forwarded input cannot acquire a durable consumer-request binding.
+/// Revalidate caller-authored absolute expiry at the immutable leader logical
+/// time embedded in a proposed command.
+fn validate_mutation_intent_at(
+    intent: &SessionMutationIntent,
+    logical_time: Timestamp,
+) -> Result<(), StoreError> {
+    match intent {
+        SessionMutationIntent::CompareAndSet(op) => {
+            validate_stored_record_expiry_at(&op.new_record, logical_time)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn validate_sealed_payload(op: &CompareAndSet) -> Result<(), StoreError> {
@@ -3357,6 +4136,7 @@ fn validate_sealed_payload(op: &CompareAndSet) -> Result<(), StoreError> {
 }
 
 fn validate_consumer_operation(operation: &SessionConsumerOperation) -> Result<(), StoreError> {
+    validate_consumer_operation_profile(operation)?;
     match operation {
         SessionConsumerOperation::CompareAndSet { op } => validate_sealed_payload(op),
         SessionConsumerOperation::Batch { ops } => validate_consensus_batch(ops),
@@ -3432,7 +4212,7 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                 let reply = match forwarded {
                     ForwardRequest::Mutation(request) => {
                         self.store
-                            .apply_on_local_leader(request, authenticated_sender, deadline)
+                            .apply_on_local_leader(*request, authenticated_sender, deadline)
                             .await
                     }
                     ForwardRequest::RecordExpiryPreflight {
@@ -3508,6 +4288,54 @@ impl ConsensusSessionConsumerService {
         tokio::time::Instant::now()
             .checked_add(self.store.inner.operation_timeout)
             .ok_or(SessionConsumerRejection::Unavailable)
+    }
+
+    /// Authenticate every incoming CAS ciphertext before this request can
+    /// acquire a consumer scope, bind its durable request ID, or enter a
+    /// Raft proposal. The record is checked with its own key and immutable
+    /// header so the envelope's provider mode, historical key ID, keyed key
+    /// digest, namespace, AAD, and AEAD tag are all verified by the record
+    /// cryptographic boundary.
+    async fn authenticate_consumer_operation(
+        &self,
+        operation: &SessionConsumerOperation,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConsumerAuthenticationError> {
+        match operation {
+            SessionConsumerOperation::CompareAndSet { op } => {
+                self.authenticate_consumer_record(&op.new_record, deadline)
+                    .await
+            }
+            SessionConsumerOperation::Batch { ops } => {
+                for op in ops {
+                    if let SessionOp::CompareAndSet(op) = op {
+                        self.authenticate_consumer_record(&op.new_record, deadline)
+                            .await?;
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn authenticate_consumer_record(
+        &self,
+        record: &StoredSessionRecord,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConsumerAuthenticationError> {
+        let ConsumerIngressAuthentication::Configured {
+            authenticator,
+            backend_namespace,
+        } = &self.ingress_authentication
+        else {
+            return Err(ConsumerAuthenticationError::Rejected(StoreError::Crypto(
+                "consumer CAS ingress authentication is not configured".into(),
+            )));
+        };
+        authenticator
+            .authenticate(record, backend_namespace, deadline)
+            .await
     }
 
     async fn bind_consumer_request(
@@ -3689,6 +4517,24 @@ fn consumer_batch_response_is_admitted(max_payload_bytes: usize, ops: &[SessionO
 }
 
 impl ConsensusSessionConsumerService {
+    async fn preflight_consumer_mutation_expiry(
+        &self,
+        scope: SessionConsumerScope,
+        operation: &SessionConsumerOperation,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        let preflights = match operation {
+            SessionConsumerOperation::CompareAndSet { op } => {
+                vec![RecordExpiryPreflight::from_record(&op.new_record)]
+            }
+            SessionConsumerOperation::Batch { ops } => record_expiry_preflights(ops)?,
+            _ => return Ok(()),
+        };
+        self.store
+            .consumer_preflight_record_expiry(scope, &preflights, deadline)
+            .await
+    }
+
     async fn execute_batch(
         &self,
         identity: &SessionConsumerIdentity,
@@ -3703,22 +4549,6 @@ impl ConsensusSessionConsumerService {
                 SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
             };
         }
-        let preflights = match record_expiry_preflights(&ops) {
-            Ok(preflights) => preflights,
-            Err(_) => {
-                return SessionConsumerResponse::Rejected(
-                    SessionConsumerRejection::MalformedRequest,
-                )
-            }
-        };
-        if let Err(error) = self
-            .store
-            .consumer_preflight_record_expiry(request.scope(), &preflights, deadline)
-            .await
-        {
-            return SessionConsumerResponse::Batch(Err(SessionConsumerStoreError::from(error)));
-        }
-
         let mut results = Vec::with_capacity(ops.len());
         for (index, op) in ops.into_iter().enumerate() {
             let slot = match u16::try_from(index + 1) {
@@ -3726,7 +4556,7 @@ impl ConsensusSessionConsumerService {
                 Err(_) => {
                     return SessionConsumerResponse::Rejected(
                         SessionConsumerRejection::MalformedRequest,
-                    )
+                    );
                 }
             };
             let response = match op {
@@ -3853,6 +4683,20 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
         if let Err(error) = validate_consumer_operation(&operation) {
             return Self::semantic_validation_response(&operation, error);
         }
+        match tokio::time::timeout_at(
+            deadline,
+            self.authenticate_consumer_operation(&operation, deadline),
+        )
+        .await
+        {
+            Err(_) | Ok(Err(ConsumerAuthenticationError::TimedOut)) => {
+                return SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable);
+            }
+            Ok(Err(ConsumerAuthenticationError::Rejected(error))) => {
+                return Self::semantic_validation_response(&operation, error);
+            }
+            Ok(Ok(())) => {}
+        }
         let admission = match self
             .store
             .admit_consumer_scope(request.scope(), deadline)
@@ -3873,6 +4717,12 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                         SessionConsumerStoreError::PayloadTooLarge,
                     ));
                 }
+            }
+            if let Err(error) = self
+                .preflight_consumer_mutation_expiry(request.scope(), &operation, deadline)
+                .await
+            {
+                return Self::semantic_validation_response(&operation, error);
             }
             if let Err(error) = self
                 .bind_consumer_request(identity, &request, deadline)
@@ -4405,6 +5255,7 @@ impl SessionLeaseManager for ConsensusSessionStore {
 
 #[cfg(test)]
 mod membership_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex;
 
     use bytes::Bytes;
@@ -4415,7 +5266,8 @@ mod membership_tests {
     };
     use opc_crypto::CryptoEnvelopeV1;
     use opc_key::{
-        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
+        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyError, KeyHandle, KeyId, KeyPurpose,
+        MemoryKeyProvider, MemoryRemoteSealProvider, SessionAad, Zeroizing, AEAD_TAG_LEN,
         AES_256_GCM_SIV_NONCE_LEN,
     };
 
@@ -4449,6 +5301,36 @@ mod membership_tests {
     impl Clock for MutableClock {
         fn now_utc(&self) -> Timestamp {
             *self.0.lock().expect("clock lock")
+        }
+    }
+
+    struct CountingKeyProvider {
+        inner: Arc<MemoryKeyProvider>,
+        historical_lookups: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl KeyProvider for CountingKeyProvider {
+        async fn get_active_key(
+            &self,
+            purpose: KeyPurpose,
+            tenant: &TenantId,
+        ) -> Result<KeyHandle, KeyError> {
+            self.inner.get_active_key(purpose, tenant).await
+        }
+
+        async fn get_key_by_id(&self, key_id: &KeyId) -> Result<KeyHandle, KeyError> {
+            self.historical_lookups
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.get_key_by_id(key_id).await
+        }
+
+        async fn rotate_key(
+            &self,
+            purpose: KeyPurpose,
+            tenant: &TenantId,
+        ) -> Result<KeyId, KeyError> {
+            self.inner.rotate_key(purpose, tenant).await
         }
     }
 
@@ -4487,6 +5369,40 @@ mod membership_tests {
         .expect("singleton topology")
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn dynamic_consensus_rejects_unsupported_platform_before_durable_initialization() {
+        let topology = singleton_topology();
+        let directory = tempfile::tempdir().expect("dynamic platform test directory");
+        let database_path = directory.path().join("dynamic.sqlite");
+        let snapshot_path = directory.path().join("snapshots");
+        let backend = SqliteSessionBackend::open(&database_path).expect("standalone SQLite");
+
+        let result =
+            ConsensusSessionStore::open(topology, backend, &snapshot_path, BTreeMap::new()).await;
+        assert!(matches!(
+            result,
+            Err(ConsensusSessionStoreOpenError::DynamicConsensusUnsupportedPlatform)
+        ));
+        assert!(
+            !snapshot_path.exists(),
+            "unsupported dynamic consensus must not create its snapshot directory"
+        );
+
+        let connection = rusqlite::Connection::open(database_path).expect("open SQLite database");
+        let durable_raft_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query consensus schema");
+        assert_eq!(
+            durable_raft_rows, 0,
+            "unsupported dynamic consensus must fail before durable Raft initialization"
+        );
+    }
+
     fn forged_operator_recovery_intent(seed: u8) -> SessionMutationIntent {
         SessionMutationIntent::FinalizeOperatorRecovery {
             recovery_epoch: 1,
@@ -4494,6 +5410,191 @@ mod membership_tests {
             fence_high_water: 7,
             credential_high_water: 9,
         }
+    }
+
+    #[test]
+    fn forwarded_applied_reply_requires_exact_request_intent_scope_and_authority_binding() {
+        let storage_identity = singleton_topology()
+            .consensus_identity()
+            .expect("consensus identity");
+        let request = ForwardMutationRequest {
+            request_id: SessionConsensusRequestId::from_bytes([1; 16]),
+            intent: SessionMutationIntent::AdvanceLogicalTime,
+            authority_identity: storage_identity,
+            required_consumer_scope: ForwardConsumerScope::Internal,
+        };
+        let commitment = forward_mutation_semantic_commitment(storage_identity, &request)
+            .expect("forward commitment");
+        assert!(forwarded_applied_reply_matches_request(
+            storage_identity,
+            &request,
+            request.request_id,
+            request.authority_identity,
+            commitment,
+        ));
+        let rejected = forwarded_applied_reply_bound(
+            request.request_id,
+            request.authority_identity,
+            commitment,
+            SessionConsensusResponse::rejected(StoreError::PayloadTooLarge { actual: 1, max: 0 }),
+        );
+        let ForwardMutationReply::Applied {
+            request_id,
+            authority_identity,
+            semantic_intent_commitment,
+            response,
+        } = rejected
+        else {
+            panic!("preproposal rejection must carry the forward binding");
+        };
+        assert!(matches!(
+            response.result,
+            Err(StoreError::PayloadTooLarge { .. })
+        ));
+
+        let different_request_id = ForwardMutationRequest {
+            request_id: SessionConsensusRequestId::from_bytes([2; 16]),
+            ..request.clone()
+        };
+        assert!(
+            !forwarded_applied_reply_matches_request(
+                storage_identity,
+                &different_request_id,
+                request_id,
+                authority_identity,
+                semantic_intent_commitment,
+            ),
+            "a preproposal rejection for one request ID cannot confirm another request with the same intent"
+        );
+
+        let different_intent = ForwardMutationRequest {
+            intent: SessionMutationIntent::BindConsumerRequest {
+                request_commitment: [3; 32],
+            },
+            ..request.clone()
+        };
+        assert!(
+            !forwarded_applied_reply_matches_request(
+                storage_identity,
+                &different_intent,
+                request.request_id,
+                request.authority_identity,
+                commitment,
+            ),
+            "a Unit-shaped response cannot cross-bind distinct semantic intents"
+        );
+
+        let key = SessionKey {
+            tenant: TenantId::new("forward-same-key").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"forward-same-key")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let acquired_at = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let expires_at =
+            checked_session_deadline(acquired_at, Duration::from_secs(60)).expect("lease deadline");
+        let lease = LeaseGuard::new(
+            key,
+            OwnerId::new("forward-same-key-owner").expect("owner"),
+            FenceToken::new(7),
+            acquired_at,
+            expires_at,
+            9,
+        );
+        let same_key_request = ForwardMutationRequest {
+            request_id: SessionConsensusRequestId::from_bytes([4; 16]),
+            intent: SessionMutationIntent::DeleteFenced(lease.clone()),
+            authority_identity: storage_identity,
+            required_consumer_scope: ForwardConsumerScope::Internal,
+        };
+        let same_key_commitment =
+            forward_mutation_semantic_commitment(storage_identity, &same_key_request)
+                .expect("same-key forward commitment");
+        let different_same_key_intent = ForwardMutationRequest {
+            intent: SessionMutationIntent::RefreshTtl {
+                lease: lease.clone(),
+                ttl: Duration::from_secs(60),
+            },
+            ..same_key_request.clone()
+        };
+        assert!(
+            !forwarded_applied_reply_matches_request(
+                storage_identity,
+                &different_same_key_intent,
+                same_key_request.request_id,
+                same_key_request.authority_identity,
+                same_key_commitment,
+            ),
+            "a reply for one fenced operation cannot acknowledge another intent on the same key"
+        );
+
+        let stale_lease = LeaseGuard::new(
+            lease.key().clone(),
+            lease.owner().clone(),
+            lease.fence(),
+            acquired_at,
+            Timestamp::from_offset_datetime(
+                expires_at
+                    .as_offset_datetime()
+                    .checked_sub(time::Duration::nanoseconds(1))
+                    .expect("stale lease deadline"),
+            ),
+            lease.credential_id(),
+        );
+        let stale_expiry_request = ForwardMutationRequest {
+            intent: SessionMutationIntent::DeleteFenced(stale_lease),
+            ..same_key_request.clone()
+        };
+        assert!(
+            !forwarded_applied_reply_matches_request(
+                storage_identity,
+                &stale_expiry_request,
+                same_key_request.request_id,
+                same_key_request.authority_identity,
+                same_key_commitment,
+            ),
+            "a reply bound to one persisted lease deadline cannot acknowledge stale expiry metadata"
+        );
+
+        let successor_authority = SessionConsensusIdentity::new(
+            storage_identity.cluster_id(),
+            storage_identity.configuration_id(),
+            SessionConsensusConfigurationEpoch::new(
+                storage_identity.configuration_epoch().get() + 1,
+            )
+            .expect("successor authority epoch"),
+        );
+        let different_authority = ForwardMutationRequest {
+            authority_identity: successor_authority,
+            ..request.clone()
+        };
+        assert!(
+            !forwarded_applied_reply_matches_request(
+                storage_identity,
+                &different_authority,
+                request.request_id,
+                authority_identity,
+                commitment,
+            ),
+            "a delayed reply from the prior active authority cannot cross a topology transition, even for the same request, intent, and internal scope"
+        );
+
+        let different_scope = ForwardMutationRequest {
+            required_consumer_scope: ForwardConsumerScope::Consumer(Box::new(storage_identity)),
+            ..request
+        };
+        assert!(
+            !forwarded_applied_reply_matches_request(
+                storage_identity,
+                &different_scope,
+                different_scope.request_id,
+                different_scope.authority_identity,
+                commitment,
+            ),
+            "a consumer-scoped request cannot accept an internal reply"
+        );
     }
 
     fn durable_recovery_epoch(
@@ -4713,16 +5814,7 @@ mod membership_tests {
             expires_at,
             9,
         );
-        let record = |key: SessionKey| StoredSessionRecord {
-            key,
-            generation: Generation::new(1),
-            owner: owner_a.clone(),
-            fence: lease_a.fence(),
-            state_class: StateClass::AuthoritativeSession,
-            state_type: StateType::new("forward-response-binding").expect("state type"),
-            expires_at: None,
-            payload: EncryptedSessionPayload::new(Bytes::from_static(b"payload")),
-        };
+        let record = |key: SessionKey| consumer_record_with_payload_len(&key, &lease_a, 64 * 1024);
         let cas = CompareAndSet {
             key: key_a.clone(),
             lease: lease_a.clone(),
@@ -4789,7 +5881,9 @@ mod membership_tests {
             intent: SessionMutationIntent::CompareAndSet(Box::new(invalid_cas)),
         };
         assert_eq!(
-            validate_consensus_command_preproposal(&invalid_command),
+            validate_consensus_command_preproposal(&DurableSessionConsensusCommand::current(
+                invalid_command,
+            )),
             Err(StoreError::InvalidRecordExpiry)
         );
         assert!(!committed_response_matches_intent(
@@ -4966,7 +6060,9 @@ mod membership_tests {
         };
 
         assert_eq!(
-            validate_consensus_command_preproposal(&command),
+            validate_consensus_command_preproposal(&DurableSessionConsensusCommand::current(
+                command
+            )),
             Err(StoreError::PayloadTooLarge {
                 actual: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 1,
                 max: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
@@ -5030,8 +6126,44 @@ mod membership_tests {
             },
         };
         assert!(matches!(
-            validate_consensus_command_preproposal(&command),
+            validate_consensus_command_preproposal(&DurableSessionConsensusCommand::current(
+                command
+            )),
             Err(StoreError::CapabilityNotSupported(_))
+        ));
+    }
+
+    #[test]
+    fn preproposal_rejects_forged_lease_guard_profile() {
+        let logical_time = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let key = SessionKey {
+            tenant: TenantId::new("forged-preproposal-guard").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"forged-preproposal-guard")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let command = crate::consensus::SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: singleton_topology()
+                .consensus_identity()
+                .expect("consensus topology identity"),
+            request_id: SessionConsensusRequestId::new(),
+            logical_time,
+            intent: SessionMutationIntent::DeleteFenced(LeaseGuard::new(
+                key,
+                OwnerId::new("forged-preproposal-owner").expect("owner"),
+                FenceToken::new(0),
+                logical_time,
+                logical_time,
+                1,
+            )),
+        };
+
+        assert!(matches!(
+            validate_consensus_command_preproposal(&DurableSessionConsensusCommand::current(command)),
+            Err(StoreError::InvalidKey(reason)) if reason == "lease guard relationships are invalid"
         ));
     }
 
@@ -5257,10 +6389,448 @@ mod membership_tests {
         (directory, store, scope, identity, key, lease)
     }
 
+    fn consumer_boundary_key_provider(key: &SessionKey) -> Arc<MemoryKeyProvider> {
+        let provider = Arc::new(MemoryKeyProvider::new());
+        provider
+            .insert_active_key(
+                KeyId::new("consumer-boundary-key").expect("key ID"),
+                KeyPurpose::Session,
+                key.tenant.clone(),
+                Zeroizing::new([0x5a; 32]),
+            )
+            .expect("install consumer boundary key");
+        provider
+    }
+
+    async fn sealed_consumer_record(
+        provider: &MemoryKeyProvider,
+        key: &SessionKey,
+        lease: &LeaseGuard,
+        generation: Generation,
+    ) -> StoredSessionRecord {
+        let mut record = StoredSessionRecord {
+            key: key.clone(),
+            generation,
+            owner: lease.owner().clone(),
+            fence: lease.fence(),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("consumer-boundary"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(b"authenticated consumer payload"),
+        };
+        record.payload =
+            EncryptedSessionPayload::encrypt(provider, &record, "consumer-boundary-backend")
+                .await
+                .expect("seal consumer record");
+        record
+    }
+
+    fn consumer_boundary_remote_provider(
+        key: &SessionKey,
+        secret: u8,
+    ) -> Arc<MemoryRemoteSealProvider> {
+        Arc::new(MemoryRemoteSealProvider::new(
+            KeyId::new("consumer-boundary-remote-key").expect("remote key ID"),
+            KeyPurpose::Session,
+            key.tenant.clone(),
+            Zeroizing::new([secret; 32]),
+        ))
+    }
+
+    async fn sealed_remote_consumer_record(
+        provider: &MemoryRemoteSealProvider,
+        key: &SessionKey,
+        lease: &LeaseGuard,
+        generation: Generation,
+    ) -> StoredSessionRecord {
+        let mut record = StoredSessionRecord {
+            key: key.clone(),
+            generation,
+            owner: lease.owner().clone(),
+            fence: lease.fence(),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("consumer-boundary"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(b"authenticated remote consumer payload"),
+        };
+        record.payload =
+            EncryptedSessionPayload::remote_seal(provider, &record, "consumer-boundary-backend")
+                .await
+                .expect("seal remote consumer record");
+        record
+    }
+
+    #[tokio::test]
+    async fn remote_consumer_ingress_binds_provider_keyed_digest_before_request_binding() {
+        let (_directory, store, scope, identity, key, lease) = consumer_boundary_store().await;
+        let provider = consumer_boundary_remote_provider(&key, 0x5a);
+        let record =
+            sealed_remote_consumer_record(&provider, &key, &lease, Generation::new(1)).await;
+        let request_id = crate::SessionConsumerRequestId::from_bytes([0xb1; 16]);
+        let wrong_provider = consumer_boundary_remote_provider(&key, 0x6b);
+        let rejected = store
+            .consumer_service_with_remote_seal_provider(wrong_provider, "consumer-boundary-backend")
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation: None,
+                            new_record: record.clone(),
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            rejected,
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+        );
+        assert_eq!(store.get(&key).await.expect("rejected request state"), None);
+
+        let mut tag_tampered = record.clone();
+        let mut encoded = tag_tampered.payload.as_bytes().to_vec();
+        *encoded.last_mut().expect("remote envelope has tag") ^= 0x01;
+        tag_tampered.payload = EncryptedSessionPayload::try_envelope(encoded)
+            .expect("tag tampering preserves the envelope wire shape");
+        let rejected_tag = store
+            .consumer_service_with_remote_seal_provider(
+                Arc::clone(&provider),
+                "consumer-boundary-backend",
+            )
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation: None,
+                            new_record: tag_tampered,
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            rejected_tag,
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+        );
+        assert_eq!(store.get(&key).await.expect("tag rejection state"), None);
+
+        let accepted = store
+            .consumer_service_with_remote_seal_provider(
+                Arc::clone(&provider),
+                "consumer-boundary-backend",
+            )
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease,
+                            expected_generation: None,
+                            new_record: record,
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            accepted,
+            SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success)),
+            "a rejected keyed-digest check must not bind the durable request ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_consumer_batch_authenticates_namespace_before_raft_and_retries_same_id() {
+        let (_directory, store, scope, identity, key, lease) = consumer_boundary_store().await;
+        let provider = consumer_boundary_remote_provider(&key, 0x5a);
+        let record =
+            sealed_remote_consumer_record(&provider, &key, &lease, Generation::new(1)).await;
+        let request_id = crate::SessionConsumerRequestId::from_bytes([0xb2; 16]);
+        let operation = || SessionConsumerOperation::Batch {
+            ops: vec![SessionOp::CompareAndSet(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: None,
+                new_record: record.clone(),
+            })],
+        };
+        let rejected = store
+            .consumer_service_with_remote_seal_provider(Arc::clone(&provider), "wrong-namespace")
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(scope, request_id, operation()),
+            )
+            .await;
+        assert_eq!(
+            rejected,
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+        );
+        assert_eq!(store.get(&key).await.expect("rejected batch state"), None);
+
+        let accepted = store
+            .consumer_service_with_remote_seal_provider(provider, "consumer-boundary-backend")
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(scope, request_id, operation()),
+            )
+            .await;
+        assert_eq!(
+            accepted,
+            SessionConsumerResponse::Batch(Ok(vec![SessionConsumerBatchResult::CompareAndSet(
+                Ok(CompareAndSetResult::Success)
+            )]))
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_cas_authentication_is_ingress_only_and_fail_closed() {
+        let (_directory, store, scope, identity, key, lease) = consumer_boundary_store().await;
+        let provider = consumer_boundary_key_provider(&key);
+        let record = sealed_consumer_record(&provider, &key, &lease, Generation::new(1)).await;
+        let request_id = crate::SessionConsumerRequestId::from_bytes([0xa1; 16]);
+
+        let raw = store.consumer_service();
+        let rejected = raw
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation: None,
+                            new_record: record.clone(),
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            rejected,
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+        );
+        assert_eq!(
+            store.get(&key).await.expect("raw rejection state read"),
+            None
+        );
+        provider
+            .rotate_key(KeyPurpose::Session, &key.tenant)
+            .await
+            .expect("rotate active key while retaining historical envelope key");
+
+        let counting = Arc::new(CountingKeyProvider {
+            inner: Arc::clone(&provider),
+            historical_lookups: AtomicUsize::new(0),
+        });
+        let authenticated = store
+            .consumer_service_with_key_provider(Arc::clone(&counting), "consumer-boundary-backend");
+        let accepted = authenticated
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation: None,
+                            new_record: record,
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            accepted,
+            SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success))
+        );
+        assert_eq!(counting.historical_lookups.load(AtomicOrdering::Relaxed), 1);
+        let _ = store.get(&key).await.expect("post-apply state read");
+        assert_eq!(
+            counting.historical_lookups.load(AtomicOrdering::Relaxed),
+            1,
+            "deterministic reads and applied state never invoke ingress providers"
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_cas_authentication_rejects_wrong_aad_namespace_and_late_batch_slot() {
+        let (_directory, store, scope, identity, key, lease) = consumer_boundary_store().await;
+        let provider = consumer_boundary_key_provider(&key);
+        let sealed = sealed_consumer_record(&provider, &key, &lease, Generation::new(1)).await;
+        let wrong_namespace = store.consumer_service_with_key_provider(
+            Arc::clone(&provider),
+            "different-consumer-namespace",
+        );
+        let request_id = crate::SessionConsumerRequestId::from_bytes([0xa2; 16]);
+        let rejected = wrong_namespace
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation: None,
+                            new_record: sealed.clone(),
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            rejected,
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+        );
+
+        let authenticated = store
+            .consumer_service_with_key_provider(Arc::clone(&provider), "consumer-boundary-backend");
+        let dummy_tag = authenticated
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    crate::SessionConsumerRequestId::from_bytes([0xa4; 16]),
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation: None,
+                            new_record: consumer_record_with_payload_len(&key, &lease, 64 * 1024),
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            dummy_tag,
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest),
+            "a canonical envelope shape with a dummy tag must not reach consensus"
+        );
+        let accepted = authenticated
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation: None,
+                            new_record: sealed.clone(),
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            accepted,
+            SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success)),
+            "wrong namespace must not bind the consumer request ID"
+        );
+
+        let second_key = SessionKey {
+            tenant: key.tenant.clone(),
+            nf_kind: key.nf_kind.clone(),
+            key_type: key.key_type.clone(),
+            stable_id: Bytes::from_static(b"consumer-boundary-second")
+                .try_into()
+                .expect("second stable ID"),
+        };
+        let second_lease = store
+            .acquire(
+                &second_key,
+                OwnerId::new("consumer-boundary-second-owner").expect("second owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("second lease");
+        let mut forged =
+            sealed_consumer_record(&provider, &second_key, &second_lease, Generation::new(1)).await;
+        forged.payload = sealed.payload.clone();
+        let batch_request_id = crate::SessionConsumerRequestId::from_bytes([0xa3; 16]);
+        let rejected_batch = authenticated
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    batch_request_id,
+                    SessionConsumerOperation::Batch {
+                        ops: vec![
+                            SessionOp::Get {
+                                key: second_key.clone(),
+                            },
+                            SessionOp::CompareAndSet(CompareAndSet {
+                                key: second_key.clone(),
+                                lease: second_lease.clone(),
+                                expected_generation: None,
+                                new_record: forged,
+                            }),
+                        ],
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            rejected_batch,
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+        );
+        let corrected_batch = authenticated
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    batch_request_id,
+                    SessionConsumerOperation::Batch {
+                        ops: vec![SessionOp::CompareAndSet(CompareAndSet {
+                            key: second_key.clone(),
+                            lease: second_lease.clone(),
+                            expected_generation: None,
+                            new_record: sealed_consumer_record(
+                                &provider,
+                                &second_key,
+                                &second_lease,
+                                Generation::new(1),
+                            )
+                            .await,
+                        })],
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            corrected_batch,
+            SessionConsumerResponse::Batch(Ok(vec![SessionConsumerBatchResult::CompareAndSet(
+                Ok(CompareAndSetResult::Success)
+            ),]))
+        );
+    }
+
     #[tokio::test]
     async fn oversized_consumer_cas_does_not_bind_request_id() {
         let (_directory, store, scope, identity, key, lease) = consumer_boundary_store().await;
-        let service = store.consumer_service();
+        let provider = consumer_boundary_key_provider(&key);
+        let service = store
+            .consumer_service_with_key_provider(Arc::clone(&provider), "consumer-boundary-backend");
         let request_id = crate::SessionConsumerRequestId::from_bytes([0x91; 16]);
         let oversized = CompareAndSet {
             key: key.clone(),
@@ -5276,11 +6846,7 @@ mod membership_tests {
             key: key.clone(),
             lease: lease.clone(),
             expected_generation: None,
-            new_record: consumer_record_with_payload_len(
-                &key,
-                &lease,
-                crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
-            ),
+            new_record: sealed_consumer_record(&provider, &key, &lease, Generation::new(1)).await,
         };
         let invalid = service
             .execute(
@@ -5319,7 +6885,9 @@ mod membership_tests {
     #[tokio::test]
     async fn oversized_consumer_batch_does_not_bind_request_id() {
         let (_directory, store, scope, identity, key, lease) = consumer_boundary_store().await;
-        let service = store.consumer_service();
+        let provider = consumer_boundary_key_provider(&key);
+        let service = store
+            .consumer_service_with_key_provider(Arc::clone(&provider), "consumer-boundary-backend");
         let request_id = crate::SessionConsumerRequestId::from_bytes([0x92; 16]);
         let oversized = SessionOp::CompareAndSet(CompareAndSet {
             key: key.clone(),
@@ -5335,11 +6903,7 @@ mod membership_tests {
             key: key.clone(),
             lease: lease.clone(),
             expected_generation: None,
-            new_record: consumer_record_with_payload_len(
-                &key,
-                &lease,
-                crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
-            ),
+            new_record: sealed_consumer_record(&provider, &key, &lease, Generation::new(1)).await,
         });
         let invalid = service
             .execute(
@@ -5372,6 +6936,287 @@ mod membership_tests {
             SessionConsumerResponse::Batch(Ok(vec![SessionConsumerBatchResult::CompareAndSet(
                 Ok(CompareAndSetResult::Success)
             ),]))
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_consumer_cas_relationship_and_absolute_expiry_do_not_bind_request_id() {
+        let (_directory, store, scope, identity, key, lease) = consumer_boundary_store().await;
+        let provider = consumer_boundary_key_provider(&key);
+        let service = store
+            .consumer_service_with_key_provider(Arc::clone(&provider), "consumer-boundary-backend");
+
+        let request_id = crate::SessionConsumerRequestId::from_bytes([0x93; 16]);
+        let mut owner_mismatch = consumer_record_with_payload_len(&key, &lease, 64 * 1024);
+        owner_mismatch.owner = OwnerId::new("different-owner").expect("different owner");
+        let malformed = service
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation: None,
+                            new_record: owner_mismatch,
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            malformed,
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+        );
+        let corrected = service
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation: None,
+                            new_record: sealed_consumer_record(
+                                &provider,
+                                &key,
+                                &lease,
+                                Generation::new(1),
+                            )
+                            .await,
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            corrected,
+            SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success)),
+            "a corrected same-ID retry proves the malformed relationship created no binding"
+        );
+
+        let expiry_request_id = crate::SessionConsumerRequestId::from_bytes([0x94; 16]);
+        let mut expired_too_far = consumer_record_with_payload_len(&key, &lease, 64 * 1024);
+        expired_too_far.expires_at = Some(Timestamp::from_offset_datetime(
+            Timestamp::now_utc()
+                .as_offset_datetime()
+                .checked_add(time::Duration::days(366))
+                .expect("representable test expiry"),
+        ));
+        let invalid_expiry = service
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    expiry_request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation: Some(Generation::new(1)),
+                            new_record: expired_too_far,
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            invalid_expiry,
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+        );
+        let corrected_expiry_record =
+            sealed_consumer_record(&provider, &key, &lease, Generation::new(2)).await;
+        let corrected_expiry = service
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    expiry_request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation: Some(Generation::new(1)),
+                            new_record: corrected_expiry_record,
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            corrected_expiry,
+            SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success)),
+            "invalid absolute expiry must not bind a request ID before authority preflight"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_consumer_cas_key_relation_does_not_bind_request_id() {
+        let (_directory, store, scope, identity, key, lease) = consumer_boundary_store().await;
+        let provider = consumer_boundary_key_provider(&key);
+        let service = store
+            .consumer_service_with_key_provider(Arc::clone(&provider), "consumer-boundary-backend");
+        let other_key = SessionKey {
+            tenant: key.tenant.clone(),
+            nf_kind: key.nf_kind.clone(),
+            key_type: key.key_type.clone(),
+            stable_id: Bytes::from_static(b"consumer-boundary-key-mismatch")
+                .try_into()
+                .expect("other stable ID"),
+        };
+        let other_lease = store
+            .acquire(
+                &other_key,
+                OwnerId::new("consumer-boundary-key-mismatch-owner").expect("other owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("other lease");
+        let authenticated_other_record =
+            sealed_consumer_record(&provider, &other_key, &other_lease, Generation::new(1)).await;
+        let request_id = crate::SessionConsumerRequestId::from_bytes([0x97; 16]);
+
+        let malformed = service
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation: None,
+                            new_record: authenticated_other_record,
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            malformed,
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+        );
+        assert_eq!(store.get(&key).await.expect("malformed key state"), None);
+
+        let corrected = service
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(CompareAndSet {
+                            key: key.clone(),
+                            lease: lease.clone(),
+                            expected_generation: None,
+                            new_record: sealed_consumer_record(
+                                &provider,
+                                &key,
+                                &lease,
+                                Generation::new(1),
+                            )
+                            .await,
+                        }),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            corrected,
+            SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success)),
+            "a corrected same-ID retry proves the malformed key relation created no binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_late_batch_slot_and_ttl_do_not_bind_request_id_or_run_earlier_slot() {
+        let (_directory, store, scope, identity, key, lease) = consumer_boundary_store().await;
+        let service = store.consumer_service();
+        let request_id = crate::SessionConsumerRequestId::from_bytes([0x95; 16]);
+        let mut fence_mismatch = consumer_record_with_payload_len(&key, &lease, 64 * 1024);
+        fence_mismatch.fence = FenceToken::new(lease.fence().get() + 1);
+        let malformed = service
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::Batch {
+                        ops: vec![
+                            SessionOp::Get { key: key.clone() },
+                            SessionOp::CompareAndSet(CompareAndSet {
+                                key: key.clone(),
+                                lease: lease.clone(),
+                                expected_generation: None,
+                                new_record: fence_mismatch,
+                            }),
+                        ],
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            malformed,
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+        );
+        let corrected = service
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::Batch {
+                        ops: vec![SessionOp::Get { key: key.clone() }],
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            corrected,
+            SessionConsumerResponse::Batch(Ok(vec![SessionConsumerBatchResult::Get(Ok(None))])),
+            "the early read did not receive a durable slot receipt before late validation failed"
+        );
+
+        let ttl_request_id = crate::SessionConsumerRequestId::from_bytes([0x96; 16]);
+        let invalid_ttl = service
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    ttl_request_id,
+                    SessionConsumerOperation::RefreshTtl {
+                        lease: lease.clone(),
+                        ttl: crate::MAX_SESSION_TTL + Duration::from_secs(1),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            invalid_ttl,
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+        );
+        let corrected_ttl = service
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    ttl_request_id,
+                    SessionConsumerOperation::RefreshTtl {
+                        lease,
+                        ttl: Duration::from_secs(1),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            corrected_ttl,
+            SessionConsumerResponse::RefreshTtl(Err(SessionConsumerStoreError::NotFound)),
+            "a corrected TTL request is not a durable request-ID conflict"
         );
     }
 
@@ -5414,6 +7259,7 @@ mod membership_tests {
                 ForwardMutationRequest {
                     request_id: SessionConsensusRequestId::new(),
                     intent: SessionMutationIntent::AdvanceLogicalTime,
+                    authority_identity: store.inner.storage_identity,
                     required_consumer_scope: ForwardConsumerScope::Internal,
                 },
                 store.inner.local_node_id,
@@ -5432,6 +7278,7 @@ mod membership_tests {
                             .expect("singleton authority identity"),
                         mutation: Box::new(SessionMutationIntent::AdvanceLogicalTime),
                     },
+                    authority_identity: store.inner.storage_identity,
                     required_consumer_scope: ForwardConsumerScope::Internal,
                 },
                 store.inner.local_node_id,
@@ -5440,7 +7287,7 @@ mod membership_tests {
             .await;
         assert!(matches!(
             invalid_internal_authority,
-            ForwardMutationReply::Applied(response)
+            ForwardMutationReply::Applied { response, .. }
                 if matches!(response.result, Err(StoreError::CapabilityNotSupported(_)))
         ));
         assert_eq!(
@@ -5555,6 +7402,7 @@ mod membership_tests {
                 ForwardMutationRequest {
                     request_id: SessionConsensusRequestId::new(),
                     intent: SessionMutationIntent::AdvanceLogicalTime,
+                    authority_identity: current,
                     required_consumer_scope: ForwardConsumerScope::Consumer(Box::new(stale_scope)),
                 },
                 store.inner.local_node_id,
@@ -5563,9 +7411,98 @@ mod membership_tests {
             .await;
         assert!(matches!(
             response,
-            ForwardMutationReply::Applied(response)
+            ForwardMutationReply::Applied { response, .. }
                 if response.result == Err(StoreError::TopologyAuthorityRevoked)
         ));
+    }
+
+    #[tokio::test]
+    async fn local_forward_proposal_reuses_outer_gate_behind_queued_writer() {
+        let directory = tempfile::tempdir().expect("local forward gate directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("local forward gate backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open local forward gate store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize local forward gate store");
+
+        let cutover_deadline = tokio::time::Instant::now() + store.inner.operation_timeout;
+        store
+            .ensure_command_admission_cutover_before(cutover_deadline)
+            .await
+            .expect("commit command admission cutover before direct forward test");
+
+        let deadline = tokio::time::Instant::now() + store.inner.operation_timeout;
+        let (authority_identity, outer_guard) = store
+            .admit_forward_mutation_authority_before(deadline)
+            .await
+            .expect("admit local forward request");
+        let gate = store.inner.topology_coordinator.operation_gate();
+        let writer_started = Arc::new(tokio::sync::Notify::new());
+        let writer_notice = Arc::clone(&writer_started);
+        let writer_gate = gate.clone();
+        let writer_acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_acquired_notice = Arc::clone(&writer_acquired);
+        let writer = tokio::spawn(async move {
+            writer_notice.notify_one();
+            let guard = writer_gate.write_owned().await;
+            // Membership transitions take this exclusive gate before their
+            // identity-changing durable prepare/commit work. A queued writer
+            // must not enter it until the forwarded reply is accepted.
+            writer_acquired_notice.store(true, std::sync::atomic::Ordering::Release);
+            drop(guard);
+        });
+        writer_started.notified().await;
+        tokio::task::yield_now().await;
+        assert!(
+            gate.try_read().is_err(),
+            "the queued writer must make a nested reader wait"
+        );
+
+        let acceptance_probe = ForwardReplyAcceptanceProbe {
+            reply_received: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let forward_store = store.clone();
+        let forward_probe = acceptance_probe.clone();
+        let mut forwarded = tokio::spawn(async move {
+            forward_store
+                .submit_request_after_cutover_from_admission_before(
+                    SessionConsensusRequestId::new(),
+                    SessionMutationIntent::AdvanceLogicalTime,
+                    None,
+                    authority_identity,
+                    outer_guard,
+                    deadline,
+                    Some(forward_probe),
+                )
+                .await
+        });
+        tokio::select! {
+            () = acceptance_probe.reply_received.notified() => {}
+            result = &mut forwarded => {
+                let _ = result;
+                panic!("local forward returned before reply-acceptance probe");
+            }
+        }
+        assert!(
+            !writer_acquired.load(std::sync::atomic::Ordering::Acquire),
+            "the topology writer remains blocked until reply acceptance finishes"
+        );
+        acceptance_probe.release.notify_one();
+        forwarded
+            .await
+            .expect("forward task joins")
+            .expect("local proposal accepted");
+        writer.await.expect("queued writer releases after proposal");
     }
 
     #[tokio::test]
@@ -5732,11 +7669,14 @@ mod membership_tests {
             durable_recovery_epoch(&database, store.inner.storage_identity),
             0
         );
-        let payload = encode_bounded(&ForwardRequest::Mutation(ForwardMutationRequest {
-            request_id: SessionConsensusRequestId::new(),
-            intent: forged_operator_recovery_intent(0xB2),
-            required_consumer_scope: ForwardConsumerScope::Internal,
-        }))
+        let payload = encode_bounded(&ForwardRequest::Mutation(Box::new(
+            ForwardMutationRequest {
+                request_id: SessionConsensusRequestId::new(),
+                intent: forged_operator_recovery_intent(0xB2),
+                authority_identity: store.inner.storage_identity,
+                required_consumer_scope: ForwardConsumerScope::Internal,
+            },
+        )))
         .expect("encode forged forwarded recovery request");
         let request = SessionConsensusWireRequest::try_new(
             store.inner.storage_identity,
@@ -5755,7 +7695,7 @@ mod membership_tests {
             decode_bounded(&payload).expect("decode forwarded rejection");
         assert!(matches!(
             reply,
-            ForwardMutationReply::Applied(response)
+            ForwardMutationReply::Applied { response, .. }
                 if matches!(
                     &response.result,
                     Err(StoreError::CapabilityNotSupported(reason))

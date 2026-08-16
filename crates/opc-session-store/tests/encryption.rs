@@ -3,18 +3,18 @@ use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
-    EncryptedPayload, EnvelopeAad, KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose,
-    MemoryKeyProvider, MemoryRemoteSealProvider, RemoteSealProvider, Zeroizing,
+    serialize_bound_aad, EncryptedPayload, EnvelopeAad, KeyError, KeyHandle, KeyId, KeyProvider,
+    KeyPurpose, MemoryKeyProvider, MemoryRemoteSealProvider, RemoteSealProvider, Zeroizing,
     AES_256_GCM_SIV_KEY_LEN,
 };
 use opc_session_store::{
     checked_session_deadline, BackendCapabilities, Clock, CompareAndSet, CompareAndSetResult,
     EncryptedSessionPayload, EncryptingSessionBackend, FakeSessionBackend, FenceToken, Generation,
     LeaseGuard, OwnerId, RemoteSealingSessionBackend, ReplicationEntry, ReplicationOp,
-    RestoreScanRequest, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-    SessionOpResult, SessionPayloadEncoding, StateClass, StateType, StoreError,
-    StoredSessionRecord, MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
-    MAX_SESSION_TTL,
+    RestoreScanPage, RestoreScanRequest, SessionBackend, SessionKey, SessionKeyType,
+    SessionLeaseManager, SessionOp, SessionOpResult, SessionPayloadEncoding, StateClass, StateType,
+    StoreError, StoredSessionRecord, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    MAX_REPLICATION_OPERATION_DEPTH, MAX_SESSION_TTL,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use std::{
@@ -91,6 +91,12 @@ fn test_record(
         expires_at: None,
         payload: EncryptedSessionPayload::new(Bytes::from_static(b"plain-session")),
     }
+}
+
+fn capabilities_with_value_limit(max_value_bytes: usize) -> BackendCapabilities {
+    let mut capabilities = BackendCapabilities::all_enabled();
+    capabilities.max_value_bytes = max_value_bytes;
+    capabilities
 }
 
 fn far_future_record(mut record: StoredSessionRecord) -> StoredSessionRecord {
@@ -477,6 +483,45 @@ impl FailOnCallRemoteSealProvider {
 
 #[async_trait]
 impl RemoteSealProvider for FailOnCallRemoteSealProvider {
+    fn capabilities(&self) -> opc_key::RemoteSealCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn active_keyed_digest(
+        &self,
+        domain: &[u8],
+        input: &[u8],
+    ) -> Result<opc_key::RemoteSealActiveKeyedDigest, KeyError> {
+        if self.fail_this_call() {
+            return Err(KeyError::Unavailable);
+        }
+        self.inner.active_keyed_digest(domain, input).await
+    }
+
+    async fn keyed_digest(
+        &self,
+        key_id: &KeyId,
+        domain: &[u8],
+        input: &[u8],
+    ) -> Result<[u8; 32], KeyError> {
+        if self.fail_this_call() {
+            return Err(KeyError::Unavailable);
+        }
+        self.inner.keyed_digest(key_id, domain, input).await
+    }
+
+    async fn seal_with_key_id(
+        &self,
+        key_id: &KeyId,
+        aad: &EnvelopeAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedPayload, KeyError> {
+        if self.fail_this_call() {
+            return Err(KeyError::Unavailable);
+        }
+        self.inner.seal_with_key_id(key_id, aad, plaintext).await
+    }
+
     async fn seal(
         &self,
         aad: &EnvelopeAad,
@@ -1220,6 +1265,39 @@ impl CountingRemoteSealProvider {
 
 #[async_trait]
 impl RemoteSealProvider for CountingRemoteSealProvider {
+    fn capabilities(&self) -> opc_key::RemoteSealCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn active_keyed_digest(
+        &self,
+        domain: &[u8],
+        input: &[u8],
+    ) -> Result<opc_key::RemoteSealActiveKeyedDigest, KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.active_keyed_digest(domain, input).await
+    }
+
+    async fn keyed_digest(
+        &self,
+        key_id: &KeyId,
+        domain: &[u8],
+        input: &[u8],
+    ) -> Result<[u8; 32], KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.keyed_digest(key_id, domain, input).await
+    }
+
+    async fn seal_with_key_id(
+        &self,
+        key_id: &KeyId,
+        aad: &EnvelopeAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedPayload, KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.seal_with_key_id(key_id, aad, plaintext).await
+    }
+
     async fn seal(
         &self,
         aad: &EnvelopeAad,
@@ -1237,6 +1315,195 @@ impl RemoteSealProvider for CountingRemoteSealProvider {
     ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.unseal(key_id, aad, ciphertext_and_tag).await
+    }
+}
+
+struct ExpandingRemoteSealProvider {
+    plaintext: Vec<u8>,
+    unseal_calls: AtomicUsize,
+    digest_provider: Arc<MemoryRemoteSealProvider>,
+}
+
+struct WrongLengthSealProvider {
+    inner: Arc<MemoryRemoteSealProvider>,
+    oversized: bool,
+}
+
+impl WrongLengthSealProvider {
+    fn new(oversized: bool) -> Self {
+        Self {
+            inner: test_remote_seal_provider(),
+            oversized,
+        }
+    }
+}
+
+#[async_trait]
+impl RemoteSealProvider for WrongLengthSealProvider {
+    fn capabilities(&self) -> opc_key::RemoteSealCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn active_keyed_digest(
+        &self,
+        domain: &[u8],
+        input: &[u8],
+    ) -> Result<opc_key::RemoteSealActiveKeyedDigest, KeyError> {
+        self.inner.active_keyed_digest(domain, input).await
+    }
+
+    async fn keyed_digest(
+        &self,
+        key_id: &KeyId,
+        domain: &[u8],
+        input: &[u8],
+    ) -> Result<[u8; 32], KeyError> {
+        self.inner.keyed_digest(key_id, domain, input).await
+    }
+
+    async fn seal_with_key_id(
+        &self,
+        key_id: &KeyId,
+        aad: &EnvelopeAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedPayload, KeyError> {
+        let ciphertext_len = plaintext
+            .len()
+            .checked_add(opc_key::AEAD_TAG_LEN)
+            .and_then(|len| {
+                if self.oversized {
+                    len.checked_add(1)
+                } else {
+                    len.checked_sub(1)
+                }
+            })
+            .ok_or(KeyError::Unavailable)?;
+        Ok(EncryptedPayload {
+            aad: serialize_bound_aad(aad, key_id)?,
+            ciphertext_and_tag: vec![0xA5; ciphertext_len],
+        })
+    }
+
+    async fn seal(
+        &self,
+        _aad: &EnvelopeAad,
+        _plaintext: &[u8],
+    ) -> Result<EncryptedPayload, KeyError> {
+        Err(KeyError::Unavailable)
+    }
+
+    async fn unseal(
+        &self,
+        key_id: &KeyId,
+        aad: &EnvelopeAad,
+        ciphertext_and_tag: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+        self.inner.unseal(key_id, aad, ciphertext_and_tag).await
+    }
+}
+
+impl ExpandingRemoteSealProvider {
+    fn new(plaintext: Vec<u8>) -> Self {
+        Self {
+            plaintext,
+            unseal_calls: AtomicUsize::new(0),
+            digest_provider: test_remote_seal_provider(),
+        }
+    }
+
+    fn unseal_calls(&self) -> usize {
+        self.unseal_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl RemoteSealProvider for ExpandingRemoteSealProvider {
+    fn capabilities(&self) -> opc_key::RemoteSealCapabilities {
+        opc_key::RemoteSealCapabilities {
+            max_seal_plaintext_bytes: 5 * 1024 * 1024,
+            max_unseal_output_bytes: 5 * 1024 * 1024,
+            max_round_trip_plaintext_bytes: 5 * 1024 * 1024,
+            max_ciphertext_expansion_bytes: opc_key::AEAD_TAG_LEN,
+            max_key_id_bytes: 512,
+        }
+    }
+
+    async fn keyed_digest(
+        &self,
+        key_id: &KeyId,
+        domain: &[u8],
+        input: &[u8],
+    ) -> Result<[u8; 32], KeyError> {
+        self.digest_provider
+            .keyed_digest(key_id, domain, input)
+            .await
+    }
+
+    async fn seal(
+        &self,
+        _aad: &EnvelopeAad,
+        _plaintext: &[u8],
+    ) -> Result<EncryptedPayload, KeyError> {
+        Err(KeyError::Unavailable)
+    }
+
+    async fn unseal(
+        &self,
+        _key_id: &KeyId,
+        _aad: &EnvelopeAad,
+        _ciphertext_and_tag: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+        self.unseal_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Zeroizing::new(self.plaintext.clone()))
+    }
+}
+
+struct RestorePageBackend {
+    capabilities: BackendCapabilities,
+    page: RestoreScanPage,
+}
+
+#[async_trait]
+impl SessionBackend for RestorePageBackend {
+    async fn capabilities(&self) -> BackendCapabilities {
+        self.capabilities
+    }
+
+    async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend get".into(),
+        ))
+    }
+
+    async fn compare_and_set(&self, _op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend compare_and_set".into(),
+        ))
+    }
+
+    async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend delete_fenced".into(),
+        ))
+    }
+
+    async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend refresh_ttl".into(),
+        ))
+    }
+
+    async fn batch(&self, _ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "test backend batch".into(),
+        ))
+    }
+
+    async fn scan_restore_records(
+        &self,
+        _request: RestoreScanRequest,
+    ) -> Result<RestoreScanPage, StoreError> {
+        Ok(self.page.clone())
     }
 }
 
@@ -1628,6 +1895,450 @@ async fn remote_sealing_session_backend_round_trips_compare_and_set_get_and_batc
         .expect("restore scan");
     assert_eq!(scan_page.loaded_count, 1);
     assert_eq!(scan_page.records[0].payload.as_bytes(), &batch_payload);
+}
+
+#[tokio::test]
+async fn sealing_wrappers_advertise_and_enforce_exact_plaintext_capacity() {
+    // Keep this at SQLite's production stored-envelope limit: 4 MiB + 64 KiB.
+    // The record metadata below drives the AAD to its legal serialized width.
+    let stored_limit = 4_259_840;
+    let max_tenant = TenantId::new("t".repeat(128)).expect("maximum tenant");
+    let key = SessionKey {
+        tenant: max_tenant.clone(),
+        nf_kind: NetworkFunctionKind::new("n".repeat(64)).expect("maximum NF kind"),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from_static(b"capacity-boundary")
+            .try_into()
+            .expect("stable ID"),
+    };
+    // StateType accepts controls other than NUL. U+0001 consumes one UTF-8
+    // byte but six canonical JSON bytes (`\\u0001`) in the bound AAD.
+    let escaped_state_type = StateType::new("\u{0001}".repeat(StateType::MAX_BYTES))
+        .expect("maximally escaped state type");
+    let max_key_id =
+        KeyId::new("k".repeat(opc_key::REMOTE_SEAL_MAX_KEY_ID_BYTES)).expect("maximum key ID");
+
+    let local_inner = Arc::new(FakeSessionBackend::with_capabilities(
+        capabilities_with_value_limit(stored_limit),
+    ));
+    let local_memory = Arc::new(MemoryKeyProvider::new());
+    local_memory
+        .insert_active_key(
+            max_key_id.clone(),
+            KeyPurpose::Session,
+            max_tenant.clone(),
+            Zeroizing::new([0x22; AES_256_GCM_SIV_KEY_LEN]),
+        )
+        .expect("install maximum local key");
+    let local_provider = Arc::new(CountingKeyProvider::new(Arc::clone(&local_memory)));
+    let local = EncryptingSessionBackend::new(
+        Arc::clone(&local_inner),
+        Arc::clone(&local_provider),
+        "cap-a",
+    );
+    let lease = local
+        .acquire(
+            &key,
+            OwnerId::new("capacity-local").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("lease");
+    let local_limit = local.capabilities().await.max_value_bytes;
+    assert!(local_limit < stored_limit);
+    let local_boundary_record = |payload_len| StoredSessionRecord {
+        key: key.clone(),
+        generation: Generation::new(u64::MAX),
+        owner: lease.owner().clone(),
+        fence: FenceToken::new(u64::MAX),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: escaped_state_type.clone(),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new(vec![0x11; payload_len]),
+    };
+    assert_eq!(
+        EncryptedSessionPayload::encrypt(
+            local_memory.as_ref(),
+            &local_boundary_record(local_limit),
+            "cap-a",
+        )
+        .await
+        .expect("seal exact worst-case local envelope")
+        .len(),
+        stored_limit,
+        "the advertised local plaintext limit must fill the stored-envelope cap exactly"
+    );
+    assert_eq!(
+        EncryptedSessionPayload::encrypt(
+            local_memory.as_ref(),
+            &local_boundary_record(local_limit + 1),
+            "cap-a",
+        )
+        .await
+        .expect("seal one-over worst-case local envelope")
+        .len(),
+        stored_limit + 1
+    );
+    local
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: StoredSessionRecord {
+                payload: EncryptedSessionPayload::new(vec![0x11; local_limit]),
+                state_type: escaped_state_type.clone(),
+                ..test_record(key.clone(), 1, &lease)
+            },
+        })
+        .await
+        .expect("local exact capacity");
+    let local_calls_before = local_provider.calls();
+    assert!(local_calls_before > 0, "exact local boundary seals");
+    assert!(matches!(
+        local
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: Some(Generation::new(1)),
+                new_record: StoredSessionRecord {
+                    payload: EncryptedSessionPayload::new(vec![0x11; local_limit + 1]),
+                    state_type: escaped_state_type.clone(),
+                    ..test_record(key.clone(), 2, &lease)
+                },
+            })
+            .await,
+        Err(StoreError::PayloadTooLarge { actual, max }) if actual == local_limit + 1 && max == local_limit
+    ));
+    assert_eq!(
+        local_calls_before,
+        local_provider.calls(),
+        "reject before local provider work"
+    );
+
+    // The advertised limit governs new caller writes.  Before wrappers
+    // reserved the worst-case AAD width, a record with narrower metadata could
+    // validly use more plaintext while its encoded envelope still fit the raw
+    // store.  Such retained records must remain readable after upgrade.
+    let legacy_local_len = local_limit + 1;
+    let mut legacy_local = test_record(key.clone(), 2, &lease);
+    legacy_local.payload = EncryptedSessionPayload::new(vec![0x31; legacy_local_len]);
+    legacy_local.payload = EncryptedSessionPayload::encrypt(
+        local_memory.as_ref(),
+        &legacy_local,
+        "cap-a",
+    )
+    .await
+    .expect("seal retained local record with actual metadata overhead");
+    assert!(legacy_local.payload.len() <= stored_limit);
+    assert_eq!(
+        local_inner
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: Some(Generation::new(1)),
+                new_record: legacy_local,
+            })
+            .await
+            .expect("store retained local envelope"),
+        CompareAndSetResult::Success
+    );
+    assert_eq!(
+        local
+            .get(&key)
+            .await
+            .expect("read retained local envelope")
+            .expect("retained local record")
+            .payload
+            .len(),
+        legacy_local_len
+    );
+
+    let remote_inner = Arc::new(FakeSessionBackend::with_capabilities(
+        capabilities_with_value_limit(stored_limit),
+    ));
+    let remote_memory = Arc::new(MemoryRemoteSealProvider::new(
+        max_key_id,
+        KeyPurpose::Session,
+        max_tenant,
+        Zeroizing::new([0x33; AES_256_GCM_SIV_KEY_LEN]),
+    ));
+    let remote_provider = Arc::new(CountingRemoteSealProvider::new(Arc::clone(&remote_memory)));
+    let remote = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_inner),
+        Arc::clone(&remote_provider),
+        "cap-a",
+    );
+    let remote_key = SessionKey {
+        stable_id: Bytes::from_static(b"remote-capacity-boundary")
+            .try_into()
+            .expect("stable ID"),
+        ..key.clone()
+    };
+    let remote_lease = remote
+        .acquire(
+            &remote_key,
+            OwnerId::new("capacity-remote").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("lease");
+    let remote_limit = remote.capabilities().await.max_value_bytes;
+    assert!(remote_limit < stored_limit);
+    let remote_boundary_record = |payload_len| StoredSessionRecord {
+        key: remote_key.clone(),
+        generation: Generation::new(u64::MAX),
+        owner: remote_lease.owner().clone(),
+        fence: FenceToken::new(u64::MAX),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: escaped_state_type.clone(),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new(vec![0x22; payload_len]),
+    };
+    assert_eq!(
+        EncryptedSessionPayload::remote_seal(
+            remote_memory.as_ref(),
+            &remote_boundary_record(remote_limit),
+            "cap-a",
+        )
+        .await
+        .expect("seal exact worst-case remote envelope")
+        .len(),
+        stored_limit,
+        "the advertised remote plaintext limit must fill the stored-envelope cap exactly"
+    );
+    assert_eq!(
+        EncryptedSessionPayload::remote_seal(
+            remote_memory.as_ref(),
+            &remote_boundary_record(remote_limit + 1),
+            "cap-a",
+        )
+        .await
+        .expect("seal one-over worst-case remote envelope")
+        .len(),
+        stored_limit + 1
+    );
+    remote
+        .compare_and_set(CompareAndSet {
+            key: remote_key.clone(),
+            lease: remote_lease.clone(),
+            expected_generation: None,
+            new_record: StoredSessionRecord {
+                payload: EncryptedSessionPayload::new(vec![0x22; remote_limit]),
+                state_type: escaped_state_type.clone(),
+                ..test_record(remote_key.clone(), 1, &remote_lease)
+            },
+        })
+        .await
+        .expect("remote exact capacity");
+    let calls_before = remote_provider.calls();
+    assert!(matches!(
+        remote
+            .compare_and_set(CompareAndSet {
+                key: remote_key.clone(),
+                lease: remote_lease.clone(),
+                expected_generation: Some(Generation::new(1)),
+                new_record: StoredSessionRecord {
+                    payload: EncryptedSessionPayload::new(vec![0x22; remote_limit + 1]),
+                    state_type: escaped_state_type,
+                    ..test_record(remote_key.clone(), 2, &remote_lease)
+                },
+            })
+            .await,
+        Err(StoreError::PayloadTooLarge { actual, max }) if actual == remote_limit + 1 && max == remote_limit
+    ));
+    assert_eq!(
+        calls_before,
+        remote_provider.calls(),
+        "reject before remote seal"
+    );
+
+    let legacy_remote_len = remote_limit + 1;
+    let mut legacy_remote = test_record(remote_key.clone(), 2, &remote_lease);
+    legacy_remote.payload = EncryptedSessionPayload::new(vec![0x42; legacy_remote_len]);
+    legacy_remote.payload = EncryptedSessionPayload::remote_seal(
+        remote_memory.as_ref(),
+        &legacy_remote,
+        "cap-a",
+    )
+    .await
+    .expect("seal retained remote record with actual metadata overhead");
+    assert!(legacy_remote.payload.len() <= stored_limit);
+    assert_eq!(
+        remote_inner
+            .compare_and_set(CompareAndSet {
+                key: remote_key.clone(),
+                lease: remote_lease,
+                expected_generation: Some(Generation::new(1)),
+                new_record: legacy_remote,
+            })
+            .await
+            .expect("store retained remote envelope"),
+        CompareAndSetResult::Success
+    );
+    assert_eq!(
+        remote
+            .get(&remote_key)
+            .await
+            .expect("read retained remote envelope")
+            .expect("retained remote record")
+            .payload
+            .len(),
+        legacy_remote_len
+    );
+}
+
+async fn sealed_remote_restore_records(count: usize) -> Vec<StoredSessionRecord> {
+    let inner = Arc::new(FakeSessionBackend::with_capabilities(
+        capabilities_with_value_limit(5 * 1024 * 1024),
+    ));
+    let backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&inner),
+        test_remote_seal_provider(),
+        "restore-expansion",
+    );
+    for ordinal in 0..count {
+        let key = SessionKey {
+            stable_id: Bytes::from(format!("restore-expand-{ordinal}"))
+                .try_into()
+                .expect("stable ID"),
+            ..test_key()
+        };
+        let lease = backend
+            .acquire(
+                &key,
+                OwnerId::new(format!("restore-owner-{ordinal}")).expect("owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("lease");
+        backend
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: None,
+                new_record: test_record(key, 1, &lease),
+            })
+            .await
+            .expect("seed envelope");
+    }
+    inner
+        .scan_restore_records(RestoreScanRequest::all(count + 1))
+        .await
+        .expect("stored restore page")
+        .records
+}
+
+#[tokio::test]
+async fn remote_restore_rejects_invalid_inner_page_without_provider_calls() {
+    let provider = Arc::new(ExpandingRemoteSealProvider::new(vec![0xA5; 32]));
+    let inner = Arc::new(RestorePageBackend {
+        capabilities: capabilities_with_value_limit(4 * 1024),
+        page: RestoreScanPage {
+            records: Vec::new(),
+            loaded_count: 1,
+            excluded_count: 0,
+            next_cursor: None,
+            cursor_profile: opc_session_store::RestoreScanCursorProfile::LegacyCompatibility,
+            complete: true,
+        },
+    });
+    let backend = RemoteSealingSessionBackend::new(inner, Arc::clone(&provider), "restore-bad");
+
+    assert!(matches!(
+        backend
+            .scan_restore_records(RestoreScanRequest::all(1))
+            .await,
+        Err(StoreError::InvalidRestoreScanResponse(_))
+    ));
+    assert_eq!(0, provider.unseal_calls());
+}
+
+#[tokio::test]
+async fn remote_restore_rejects_wrong_length_provider_output() {
+    let records = sealed_remote_restore_records(1).await;
+    let provider = Arc::new(ExpandingRemoteSealProvider::new(vec![0xA5; 4 * 1024]));
+    let inner = Arc::new(RestorePageBackend {
+        capabilities: capabilities_with_value_limit(4 * 1024),
+        page: RestoreScanPage::new(records, 0, None),
+    });
+    let backend =
+        RemoteSealingSessionBackend::new(inner, Arc::clone(&provider), "restore-expansion");
+
+    assert!(matches!(
+        backend
+            .scan_restore_records(RestoreScanRequest::all(1))
+            .await,
+        Err(StoreError::Crypto(_))
+    ));
+    assert_eq!(1, provider.unseal_calls());
+}
+
+#[tokio::test]
+async fn remote_restore_rejects_wrong_length_provider_output_without_cursor_rewrite() {
+    let records = sealed_remote_restore_records(2).await;
+    let provider = Arc::new(ExpandingRemoteSealProvider::new(vec![
+        0xA5;
+        3 * 1024 * 1024
+    ]));
+    let inner = Arc::new(RestorePageBackend {
+        capabilities: capabilities_with_value_limit(5 * 1024 * 1024),
+        page: RestoreScanPage::new(records, 0, None),
+    });
+    let backend =
+        RemoteSealingSessionBackend::new(inner, Arc::clone(&provider), "restore-expansion");
+
+    assert!(matches!(
+        backend
+            .scan_restore_records(RestoreScanRequest::all(2))
+            .await,
+        Err(StoreError::Crypto(_))
+    ));
+    assert_eq!(1, provider.unseal_calls());
+    assert!(matches!(
+        backend
+            .scan_restore_records(RestoreScanRequest::all(2))
+            .await,
+        Err(StoreError::Crypto(_))
+    ));
+    assert_eq!(
+        2,
+        provider.unseal_calls(),
+        "failed restore must not trim or advance the inner cursor"
+    );
+}
+
+#[tokio::test]
+async fn remote_seal_rejects_wrong_length_provider_output_before_durable_write() {
+    for oversized in [false, true] {
+        let inner = Arc::new(FakeSessionBackend::new());
+        let provider = Arc::new(WrongLengthSealProvider::new(oversized));
+        let backend = RemoteSealingSessionBackend::new(inner.clone(), provider, "wrong-length");
+        let key = test_key();
+        let lease = backend
+            .acquire(
+                &key,
+                OwnerId::new("wrong-length-owner").expect("owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("lease");
+
+        assert!(matches!(
+            backend
+                .compare_and_set(CompareAndSet {
+                    key: key.clone(),
+                    lease: lease.clone(),
+                    expected_generation: None,
+                    new_record: test_record(key.clone(), 1, &lease),
+                })
+                .await,
+            Err(StoreError::Crypto(_))
+        ));
+        assert!(
+            inner.get(&key).await.expect("raw get").is_none(),
+            "wrong-length remote seal must not reach durable storage"
+        );
+    }
 }
 
 #[tokio::test]

@@ -1,11 +1,11 @@
 use opc_types::Timestamp;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::str::FromStr;
 use std::time::Duration;
 
 use super::ops::{
     current_fence_sync, format_rfc3339_normalized, insert_or_replace_fence_sync,
-    persisted_owner_id, persisted_u64, prune_sync, sqlite_u64, timestamp_unix_millis,
+    parse_persisted_rfc3339_normalized, persisted_owner_id, persisted_u64, prune_sync, sqlite_u64,
+    timestamp_unix_millis,
 };
 use crate::{
     error::LeaseError,
@@ -58,7 +58,7 @@ pub(crate) fn acquire_sync(
         let stored_owner = persisted_owner_id(owner_str)
             .map_err(|_| LeaseError::Backend("persisted session owner is invalid".to_string()))?;
         if active != 0 && stored_owner != owner {
-            let guard_expires_at = Timestamp::from_str(guard_expires_at_str.as_str())
+            let guard_expires_at = parse_persisted_rfc3339_normalized(&guard_expires_at_str)
                 .map_err(|e| LeaseError::Backend(e.to_string()))?;
             if guard_expires_at > now {
                 return Err(LeaseError::AlreadyHeld);
@@ -232,7 +232,7 @@ pub(crate) fn renew_sync(
         return Err(LeaseError::AlreadyHeld);
     }
 
-    let guard_expires_at = Timestamp::from_str(guard_expires_at_str.as_str())
+    let guard_expires_at = parse_persisted_rfc3339_normalized(&guard_expires_at_str)
         .map_err(|e| LeaseError::Backend(e.to_string()))?;
 
     if persisted_u64(fence).map_err(|error| LeaseError::Backend(error.to_string()))?
@@ -339,7 +339,7 @@ pub(crate) fn release_sync(
         return Err(LeaseError::AlreadyHeld);
     }
 
-    let guard_expires_at = Timestamp::from_str(guard_expires_at_str.as_str())
+    let guard_expires_at = parse_persisted_rfc3339_normalized(&guard_expires_at_str)
         .map_err(|e| LeaseError::Backend(e.to_string()))?;
 
     if persisted_u64(fence).map_err(|error| LeaseError::Backend(error.to_string()))?

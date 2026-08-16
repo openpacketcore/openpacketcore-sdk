@@ -219,7 +219,7 @@ async fn sqlite_checks_signed_query_and_entry_boundaries() {
 }
 
 #[tokio::test]
-async fn sqlite_rejects_legacy_negative_sequence_rows() {
+async fn sqlite_rejects_incomplete_legacy_schema_before_negative_sequence_validation() {
     let file = NamedTempFile::new().expect("temporary SQLite file");
     let conn = rusqlite::Connection::open(file.path()).expect("open raw SQLite database");
     conn.execute_batch(
@@ -235,25 +235,75 @@ async fn sqlite_rejects_legacy_negative_sequence_rows() {
         "#,
     )
     .expect("create legacy corrupt replication row");
+    let schema_before = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'session_replication_log'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read legacy schema");
+    let row_before = conn
+        .query_row(
+            "SELECT sequence, tx_id, entry_json, timestamp FROM session_replication_log",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .expect("read legacy row");
     drop(conn);
 
-    let backend = SqliteSessionBackend::open(file.path()).expect("open legacy SQLite database");
+    let error = match SqliteSessionBackend::open(file.path()) {
+        Err(error) => error,
+        Ok(_) => panic!("incomplete legacy schema must fail closed at open"),
+    };
     assert_eq!(
-        backend
-            .max_replication_sequence()
-            .await
-            .expect_err("negative persisted sequence must fail closed"),
-        StoreError::InvalidReplicationSequence
+        error,
+        StoreError::Serialization("persisted session schema is invalid".into())
+    );
+
+    let conn = rusqlite::Connection::open(file.path()).expect("reopen raw SQLite database");
+    assert_eq!(
+        conn.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'session_replication_log'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read retained legacy schema"),
+        schema_before,
+        "strict open must not complete or rewrite the incomplete schema"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT sequence, tx_id, entry_json, timestamp FROM session_replication_log",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .expect("read retained legacy row"),
+        row_before,
+        "strict open must not rewrite the negative legacy row"
     );
 }
 
 #[tokio::test]
 async fn sqlite_rejects_row_and_payload_sequence_disagreement() {
-    let file = NamedTempFile::new().expect("temporary SQLite file");
+    let directory = tempfile::tempdir().expect("temporary SQLite directory");
+    let path = directory.path().join("sessions.sqlite");
     let first = entry(1, "first");
     {
-        let backend =
-            SqliteSessionBackend::open(file.path()).expect("create file-backed SQLite backend");
+        let backend = SqliteSessionBackend::open(&path).expect("create file-backed SQLite backend");
         backend
             .replicate_entry(first.clone())
             .await
@@ -264,7 +314,7 @@ async fn sqlite_rejects_row_and_payload_sequence_disagreement() {
         sequence: 2,
         ..first
     };
-    let conn = rusqlite::Connection::open(file.path()).expect("reopen raw SQLite database");
+    let conn = rusqlite::Connection::open(&path).expect("reopen raw SQLite database");
     conn.execute(
         "UPDATE session_replication_log SET entry_json = ?1 WHERE sequence = 1",
         [serde_json::to_string(&forged).expect("serialize forged entry")],
@@ -272,12 +322,11 @@ async fn sqlite_rejects_row_and_payload_sequence_disagreement() {
     .expect("forge mismatched replication payload");
     drop(conn);
 
-    let backend = SqliteSessionBackend::open(file.path()).expect("reopen SQLite backend");
     assert_eq!(
-        backend
-            .get_replication_log(1, 1)
-            .await
-            .expect_err("row key and payload sequence must agree"),
-        StoreError::InvalidReplicationSequence
+        match SqliteSessionBackend::open(&path) {
+            Ok(_) => panic!("row key and payload sequence must reject during construction"),
+            Err(error) => error,
+        },
+        StoreError::Serialization("persisted standalone session state is invalid".into())
     );
 }

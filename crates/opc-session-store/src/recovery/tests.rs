@@ -28,8 +28,9 @@ use super::sqlite::{
 use super::*;
 use crate::capability::BackendCapabilities;
 use crate::consensus::{
-    SessionConsensusClusterId, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-    SessionRaftTypeConfig,
+    DurableSessionConsensusCommand, SessionConsensusClusterId, SessionConsensusCommand,
+    SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId, SessionConsensusRequestId,
+    SessionMutationIntent, SessionRaftTypeConfig, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::sqlite::consensus;
 use crate::topology::{
@@ -316,6 +317,63 @@ fn create_legacy_replica(root: &Path, id: ReplicaId, fence: u64) -> RecoveryRepl
     RecoveryReplica::new_bound(id, backing, identity(), database, snapshots)
 }
 
+fn convert_to_immediate_predecessor(
+    replica: &RecoveryReplica,
+    members: &BTreeSet<SessionConsensusNodeId>,
+    request_byte: u8,
+) {
+    let conn = Connection::open(&replica.database_path).expect("open predecessor fixture");
+    let root = [0xA4; 32];
+    let fence_high =
+        consensus::observed_fence_high_water_sync(&conn).expect("fixture fence high-water");
+    let credential_high = consensus::observed_credential_high_water_sync(&conn)
+        .expect("fixture credential high-water");
+    consensus::claim_legacy_checkpoint_sync(
+        &conn,
+        identity(),
+        members,
+        root,
+        1,
+        root,
+        fence_high,
+        credential_high,
+        0,
+        0,
+        None,
+    )
+    .expect("claim predecessor fixture");
+    assert_eq!(
+        consensus::finalize_operator_recovery_sync(
+            &conn,
+            identity(),
+            1,
+            root,
+            fence_high,
+            credential_high,
+        )
+        .expect("finalize predecessor fixture"),
+        consensus::OperatorRecoveryApply::Applied
+    );
+    consensus::downgrade_to_immediate_predecessor_fixture_sync(&conn)
+        .expect("install exact predecessor schema");
+    conn.execute(
+        "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, response_json) VALUES (?1, 7, ?2, ?3)",
+        params![
+            [request_byte; 16].as_slice(),
+            [request_byte.wrapping_add(1); 32].as_slice(),
+            br#"null"#.as_slice(),
+        ],
+    )
+    .expect("insert untrusted predecessor outcome");
+    conn.execute(
+        "UPDATE consensus_machine SET application_sequence = 1, last_digest = ?1 WHERE singleton = 1",
+        [[0xC3_u8; 32].as_slice()],
+    )
+    .expect("model nonempty predecessor application history");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("checkpoint predecessor fixture");
+}
+
 fn sealed_recovery_record(payload_len: usize) -> StoredSessionRecord {
     let mut record = StoredSessionRecord {
         key: SessionKey {
@@ -372,6 +430,22 @@ fn sealed_recovery_record(payload_len: usize) -> StoredSessionRecord {
     record
 }
 
+fn recovery_expiry_reference() -> Timestamp {
+    Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("fixed recovery timestamp"),
+    )
+}
+
+fn persist_recovery_record(replica: &RecoveryReplica, record: &StoredSessionRecord) {
+    let conn = Connection::open(&replica.database_path).expect("open recovery record database");
+    crate::sqlite::ops::insert_or_replace_record_sync(&conn, record)
+        .expect("persist recovery record");
+    crate::sqlite::ops::insert_or_replace_fence_sync(&conn, &record.key, record.fence.get())
+        .expect("persist recovery record fence");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("checkpoint recovery record");
+}
+
 fn private_tempdir() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("private temporary directory");
     #[cfg(unix)]
@@ -404,7 +478,14 @@ fn assert_tree_does_not_contain(root: &Path, needle: &[u8]) {
 }
 
 fn insert_legacy_empty_replication(replica: &RecoveryReplica, sequence: u64) {
-    let timestamp = Timestamp::now_utc();
+    insert_legacy_empty_replication_at(replica, sequence, Timestamp::now_utc());
+}
+
+fn insert_legacy_empty_replication_at(
+    replica: &RecoveryReplica,
+    sequence: u64,
+    timestamp: Timestamp,
+) {
     let entry = ReplicationEntry {
         sequence,
         tx_id: format!("legacy-recovery-{sequence}")
@@ -702,7 +783,7 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
             crate::sqlite::ops::read_restore_scan_state_sync(&target)
                 .expect("read recovered restore incarnation");
         restore_incarnations.insert((restore_epoch, *restore_key));
-        assert_eq!(objects.len(), 21);
+        assert_eq!(objects.len(), 22);
         assert!(objects.iter().all(|(kind, _)| kind == "table"));
     }
     assert_eq!(restore_incarnations.len(), replicas.len());
@@ -739,6 +820,178 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
             .expect("idempotent resume")
             .state(),
         RecoveryExecutionState::AwaitingEpochCommit
+    );
+}
+
+#[test]
+fn exact_immediate_predecessor_recovery_discards_legacy_replay_outcomes() {
+    let temp = tempfile::tempdir().expect("predecessor root");
+    let backup = private_tempdir();
+    let ids = [
+        replica_id("predecessor-source-a"),
+        replica_id("predecessor-target-b"),
+        replica_id("predecessor-target-c"),
+    ];
+    let members = node_set(&ids);
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 7),
+        create_legacy_replica(temp.path(), ids[1].clone(), 19),
+        create_legacy_replica(temp.path(), ids[2].clone(), 31),
+    ];
+    for (index, replica) in replicas.iter().enumerate() {
+        convert_to_immediate_predecessor(replica, &members, 0x81 + index as u8);
+    }
+
+    let manager = recovery(AllowRecovery);
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            members,
+            &replicas,
+            &ids[0],
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        )
+        .expect("exact predecessor is an explicit recovery candidate");
+    assert!(plan
+        .body
+        .evidence
+        .iter()
+        .all(|evidence| evidence.format == RecoveryReplicaFormat::ImmediatePredecessor));
+    let confirmation = RecoveryConfirmation::legacy(
+        &plan,
+        RecoveryConfirmation::required_legacy_acknowledgement(),
+    );
+    assert_eq!(
+        manager
+            .execute(
+                &context(),
+                &plan,
+                &confirmation,
+                &replicas,
+                backup.path(),
+                RecoveryLimits::default(),
+            )
+            .expect("execute explicit predecessor reset")
+            .state(),
+        RecoveryExecutionState::AwaitingEpochCommit
+    );
+
+    for replica in &replicas {
+        let conn = Connection::open(&replica.database_path).expect("open reset replica");
+        let (application_sequence, watch_sequence): (i64, i64) = conn
+            .query_row(
+                "SELECT application_sequence, watch_sequence FROM consensus_machine WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read reset machine");
+        let outcome_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_request_outcomes",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count reset receipts");
+        let admission: (i64, i64) = conn
+            .query_row(
+                "SELECT admission_revision, cutover_committed FROM consensus_command_admission WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read reset admission");
+        assert_eq!(application_sequence, 0);
+        assert_eq!(watch_sequence, 0);
+        assert_eq!(
+            outcome_count, 0,
+            "no old request ID can suppress a new command"
+        );
+        assert_eq!(admission, (1, 0));
+        assert_eq!(
+            consensus::observed_fence_high_water_sync(&conn).expect("preserved fence high-water"),
+            7,
+            "the selected checkpoint's fence authority survives the receipt reset"
+        );
+    }
+}
+
+#[test]
+fn recovery_rejects_partial_immediate_predecessor_schema() {
+    let temp = tempfile::tempdir().expect("partial predecessor root");
+    let ids = [
+        replica_id("partial-predecessor-a"),
+        replica_id("partial-predecessor-b"),
+        replica_id("partial-predecessor-c"),
+    ];
+    let members = node_set(&ids);
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 1),
+        create_legacy_replica(temp.path(), ids[1].clone(), 2),
+        create_legacy_replica(temp.path(), ids[2].clone(), 3),
+    ];
+    for (index, replica) in replicas.iter().enumerate() {
+        convert_to_immediate_predecessor(replica, &members, 0x91 + index as u8);
+    }
+    Connection::open(&replicas[1].database_path)
+        .expect("open partial predecessor")
+        .execute_batch("DROP TABLE consensus_membership_history")
+        .expect("remove required predecessor table");
+
+    let manager = recovery(AllowRecovery);
+    assert_eq!(
+        manager.plan(
+            &context(),
+            identity(),
+            members,
+            &replicas,
+            &ids[0],
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        ),
+        Err(RecoveryError::CorruptReplica),
+        "a partial predecessor inventory cannot become recovery authority"
+    );
+}
+
+#[test]
+fn recovery_rejects_wildcard_shaped_extra_predecessor_object() {
+    let temp = tempfile::tempdir().expect("extra-object predecessor root");
+    let ids = [
+        replica_id("extra-predecessor-a"),
+        replica_id("extra-predecessor-b"),
+        replica_id("extra-predecessor-c"),
+    ];
+    let members = node_set(&ids);
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 1),
+        create_legacy_replica(temp.path(), ids[1].clone(), 2),
+        create_legacy_replica(temp.path(), ids[2].clone(), 3),
+    ];
+    for (index, replica) in replicas.iter().enumerate() {
+        convert_to_immediate_predecessor(replica, &members, 0xA1 + index as u8);
+    }
+    Connection::open(&replicas[1].database_path)
+        .expect("open predecessor with extra object")
+        .execute_batch("CREATE TABLE sqlitex (value INTEGER NOT NULL)")
+        .expect("add wildcard-shaped extra object");
+
+    let manager = recovery(AllowRecovery);
+    assert_eq!(
+        manager.plan(
+            &context(),
+            identity(),
+            members,
+            &replicas,
+            &ids[0],
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        ),
+        Err(RecoveryError::CorruptReplica),
+        "an extra object whose name matches a SQL LIKE wildcard must not escape the exact manifest"
     );
 }
 
@@ -1176,7 +1429,11 @@ fn campaign_preserves_fleet_maxima_and_preflights_sqlite_successors() {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("read converted maxima");
-        assert_eq!((application, watch), (5, 5));
+        assert_eq!(
+            (application, watch),
+            (0, 5),
+            "legacy replay outcomes are deliberately discarded, so recovery starts a fresh receipt chain"
+        );
         assert_eq!(
             consensus::read_operator_recovery_sync(&conn, identity())
                 .expect("read converted recovery state")
@@ -1323,6 +1580,200 @@ fn current_recovery_inspection_enforces_the_consensus_payload_cap() {
 }
 
 #[test]
+fn current_recovery_uses_machine_time_for_record_expiry_and_rejects_absent_authority() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let ids = [
+        replica_id("current-expiry-replica-a"),
+        replica_id("current-expiry-replica-b"),
+        replica_id("current-expiry-replica-c"),
+    ];
+    let replica = create_legacy_replica(temp.path(), ids[0].clone(), 3);
+    let members = node_set(&ids);
+    let leader = *members.iter().next().expect("member");
+    claim_current_replica(
+        &replica,
+        &members,
+        LogId::new(CommittedLeaderId::new(1, leader), 0),
+    );
+    let reference = recovery_expiry_reference();
+    let maximum = crate::checked_session_deadline(reference, crate::MAX_SESSION_TTL)
+        .expect("exact maximum recovery deadline");
+    let maximum_plus_one = Timestamp::from_offset_datetime(
+        maximum
+            .as_offset_datetime()
+            .checked_add(time::Duration::nanoseconds(1))
+            .expect("one nanosecond beyond maximum"),
+    );
+    append_legacy_receipt_entry(
+        &replica,
+        LogId::new(CommittedLeaderId::new(1, leader), 1),
+        0xE1,
+        reference,
+    );
+
+    let mut record = sealed_recovery_record(512);
+    record.expires_at = Some(maximum);
+    persist_recovery_record(&replica, &record);
+    let first = inspect_replica(InspectionInput {
+        key: &integrity_key(),
+        replica: &replica,
+        identity: identity(),
+        expected_members: &members,
+        limits: RecoveryLimits::default(),
+    })
+    .expect("exact maximum deadline is accepted against machine time");
+    let second = inspect_replica(InspectionInput {
+        key: &integrity_key(),
+        replica: &replica,
+        identity: identity(),
+        expected_members: &members,
+        limits: RecoveryLimits::default(),
+    })
+    .expect("recovery inspection is deterministic with fixed machine time");
+    assert_eq!(first, second);
+
+    record.expires_at = Some(maximum_plus_one);
+    persist_recovery_record(&replica, &record);
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        }),
+        Err(RecoveryError::CorruptReplica),
+        "one nanosecond beyond the persisted-time maximum must fail closed"
+    );
+
+    record.expires_at = Some(maximum);
+    persist_recovery_record(&replica, &record);
+    Connection::open(&replica.database_path)
+        .expect("open current expiry database")
+        .execute(
+            "UPDATE consensus_machine SET logical_time = NULL WHERE singleton = 1",
+            [],
+        )
+        .expect("remove machine time authority");
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        }),
+        Err(RecoveryError::CorruptReplica),
+        "a finite deadline without persisted machine time must fail closed"
+    );
+
+    record.expires_at = None;
+    record.state_class = StateClass::EphemeralProcedure;
+    persist_recovery_record(&replica, &record);
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        }),
+        Err(RecoveryError::CorruptReplica),
+        "the time-independent ephemeral-procedure profile must always be enforced"
+    );
+}
+
+#[test]
+fn legacy_recovery_uses_final_replication_time_for_record_expiry() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let ids = [
+        replica_id("legacy-expiry-replica-a"),
+        replica_id("legacy-expiry-replica-b"),
+        replica_id("legacy-expiry-replica-c"),
+    ];
+    let replica = create_legacy_replica(temp.path(), ids[0].clone(), 3);
+    let members = node_set(&ids);
+    let reference = recovery_expiry_reference();
+    let maximum = crate::checked_session_deadline(reference, crate::MAX_SESSION_TTL)
+        .expect("exact maximum recovery deadline");
+    let maximum_plus_one = Timestamp::from_offset_datetime(
+        maximum
+            .as_offset_datetime()
+            .checked_add(time::Duration::nanoseconds(1))
+            .expect("one nanosecond beyond maximum"),
+    );
+    insert_legacy_empty_replication_at(&replica, 1, reference);
+
+    let mut record = sealed_recovery_record(512);
+    record.expires_at = Some(maximum);
+    persist_recovery_record(&replica, &record);
+    let first = inspect_replica(InspectionInput {
+        key: &integrity_key(),
+        replica: &replica,
+        identity: identity(),
+        expected_members: &members,
+        limits: RecoveryLimits::default(),
+    })
+    .expect("exact maximum deadline is accepted against final replication time");
+    let second = inspect_replica(InspectionInput {
+        key: &integrity_key(),
+        replica: &replica,
+        identity: identity(),
+        expected_members: &members,
+        limits: RecoveryLimits::default(),
+    })
+    .expect("legacy recovery inspection is deterministic with fixed replication time");
+    assert_eq!(first, second);
+
+    record.expires_at = Some(maximum_plus_one);
+    persist_recovery_record(&replica, &record);
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        }),
+        Err(RecoveryError::CorruptReplica),
+        "one nanosecond beyond the final replication-time maximum must fail closed"
+    );
+
+    record.expires_at = Some(maximum);
+    persist_recovery_record(&replica, &record);
+    Connection::open(&replica.database_path)
+        .expect("open legacy expiry database")
+        .execute("DELETE FROM session_replication_log", [])
+        .expect("remove replication time authority");
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        }),
+        Err(RecoveryError::CorruptReplica),
+        "a finite legacy deadline without replication time authority must fail closed"
+    );
+
+    record.expires_at = None;
+    record.state_class = StateClass::EphemeralProcedure;
+    persist_recovery_record(&replica, &record);
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        }),
+        Err(RecoveryError::CorruptReplica),
+        "legacy recovery must enforce the ephemeral-procedure profile without time authority"
+    );
+}
+
+#[test]
 fn current_recovery_rejects_a_regressed_lease_allocator() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let ids = [
@@ -1406,16 +1857,40 @@ fn claim_current_replica(
     members: &BTreeSet<SessionConsensusNodeId>,
     log_id: LogId<SessionConsensusNodeId>,
 ) {
+    claim_current_replica_with_finalization(replica, members, log_id, true);
+}
+
+fn claim_pending_current_replica(
+    replica: &RecoveryReplica,
+    members: &BTreeSet<SessionConsensusNodeId>,
+    log_id: LogId<SessionConsensusNodeId>,
+) {
+    claim_current_replica_with_finalization(replica, members, log_id, false);
+}
+
+fn claim_current_replica_with_finalization(
+    replica: &RecoveryReplica,
+    members: &BTreeSet<SessionConsensusNodeId>,
+    log_id: LogId<SessionConsensusNodeId>,
+    finalize: bool,
+) {
     let conn = Connection::open(&replica.database_path).expect("open replica for claim");
+    let fence_high =
+        consensus::observed_fence_high_water_sync(&conn).expect("fixture fence high-water");
+    let credential_high = consensus::observed_credential_high_water_sync(&conn)
+        .expect("fixture credential high-water");
     consensus::claim_legacy_checkpoint_sync(
         &conn,
         identity(),
         members,
-        [0x55; 32],
+        [0x66; 32],
         1,
         [0x66; 32],
+        fence_high,
+        credential_high,
         0,
         0,
+        None,
     )
     .expect("claim legacy checkpoint");
     let membership = Membership::new(vec![members.clone()], members.clone());
@@ -1434,20 +1909,55 @@ fn claim_current_replica(
         vec![entry],
     )
     .expect("apply membership entry");
-    assert_eq!(
-        consensus::finalize_operator_recovery_sync(
-            &conn,
-            identity(),
-            1,
-            [0x66; 32],
-            consensus::observed_fence_high_water_sync(&conn).expect("fence high-water"),
-            consensus::observed_credential_high_water_sync(&conn).expect("credential high-water"),
-        )
-        .expect("finalize claimed current replica"),
-        consensus::OperatorRecoveryApply::Applied
-    );
+    if finalize {
+        assert_eq!(
+            consensus::finalize_operator_recovery_sync(
+                &conn,
+                identity(),
+                1,
+                [0x66; 32],
+                fence_high,
+                credential_high,
+            )
+            .expect("finalize claimed current replica"),
+            consensus::OperatorRecoveryApply::Applied
+        );
+    }
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("checkpoint current replica");
+}
+
+fn append_legacy_receipt_entry(
+    replica: &RecoveryReplica,
+    log_id: LogId<SessionConsensusNodeId>,
+    request_byte: u8,
+    logical_time: Timestamp,
+) {
+    let conn = Connection::open(&replica.database_path).expect("open receipt replica");
+    let entry = Entry {
+        log_id,
+        payload: EntryPayload::Normal(DurableSessionConsensusCommand::legacy(
+            SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes([request_byte; 16]),
+                logical_time,
+                intent: SessionMutationIntent::AdvanceLogicalTime,
+            },
+        )),
+    };
+    consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+        .expect("append receipt entry");
+    consensus::save_committed_sync(&conn, identity(), Some(log_id)).expect("commit receipt entry");
+    consensus::apply_entries_sync(
+        &conn,
+        identity(),
+        &BackendCapabilities::all_enabled(),
+        vec![entry],
+    )
+    .expect("apply receipt entry");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint receipt entry");
 }
 
 #[test]
@@ -1466,13 +1976,9 @@ fn planning_rejects_any_pending_recovery_workflow() {
     let members = node_set(&ids);
     let leader = *members.iter().next().expect("leader");
     let log_id = LogId::new(CommittedLeaderId::new(3, leader), 0);
-    for replica in &replicas {
-        claim_current_replica(replica, &members, log_id);
-    }
-    let conn = Connection::open(&replicas[1].database_path).expect("open pending replica");
-    consensus::mark_operator_recovery_pending_sync(&conn, identity(), 2, [0x91; 32])
-        .expect("mark different recovery pending");
-    drop(conn);
+    claim_current_replica(&replicas[0], &members, log_id);
+    claim_pending_current_replica(&replicas[1], &members, log_id);
+    claim_current_replica(&replicas[2], &members, log_id);
 
     let manager = recovery(AllowRecovery);
     assert_eq!(
@@ -1497,7 +2003,10 @@ fn planning_rejects_untrusted_legacy_schema_objects() {
             "trigger",
             "CREATE TRIGGER hostile_trigger AFTER UPDATE ON key_fences BEGIN DELETE FROM leases; END;",
         ),
-        ("view", "CREATE VIEW hostile_view AS SELECT * FROM session_records;"),
+        (
+            "view",
+            "CREATE VIEW hostile_view AS SELECT * FROM session_records;",
+        ),
         ("table", "CREATE TABLE hostile_table (secret BLOB);"),
     ] {
         let temp = tempfile::tempdir().expect("schema test root");
@@ -1808,6 +2317,65 @@ fn planning_accepts_the_supported_operator_recovery_cursor_migration() {
         .expect("the exact supported operator recovery migration remains recoverable");
 }
 
+#[test]
+fn planning_rejects_ambiguous_operator_recovery_digest_authority() {
+    for (case, mutation) in [
+        (
+            "pristine-epoch-with-plan",
+            "UPDATE consensus_operator_recovery SET recovery_epoch = 0, last_plan_digest = CAST(X'01' || zeroblob(31) AS BLOB) WHERE singleton = 1",
+        ),
+        (
+            "recovered-epoch-without-plan",
+            "UPDATE consensus_operator_recovery SET recovery_epoch = 1, last_plan_digest = zeroblob(32) WHERE singleton = 1",
+        ),
+        (
+            "pending-workflow-without-plan",
+            "UPDATE consensus_operator_recovery SET pending_epoch = 1, pending_plan_digest = zeroblob(32) WHERE singleton = 1",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("current recovery test root");
+        let ids = [
+            replica_id(&format!("ambiguous-recovery-{case}-a")),
+            replica_id(&format!("ambiguous-recovery-{case}-b")),
+            replica_id(&format!("ambiguous-recovery-{case}-c")),
+        ];
+        let replicas = ids
+            .iter()
+            .cloned()
+            .map(|id| create_legacy_replica(temp.path(), id, 7))
+            .collect::<Vec<_>>();
+        let members = node_set(&ids);
+        let leader = *members.iter().next().expect("leader");
+        let log_id = LogId::new(CommittedLeaderId::new(3, leader), 0);
+        for replica in &replicas {
+            claim_current_replica(replica, &members, log_id);
+        }
+        let conn = Connection::open(&replicas[0].database_path).expect("open current replica");
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow corrupt recovery fixture");
+        conn.execute(mutation, [])
+            .unwrap_or_else(|error| panic!("inject {case} recovery corruption: {error}"));
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint corrupt recovery fixture");
+        drop(conn);
+
+        assert_eq!(
+            recovery(AllowRecovery).plan(
+                &context(),
+                identity(),
+                members,
+                &replicas,
+                &ids[0],
+                &ids[1..],
+                RecoveryDecisionBasis::VerifiedCommittedMajority,
+                RecoveryLimits::default(),
+            ),
+            Err(RecoveryError::CorruptReplica),
+            "case {case} must reject during recovery inspection"
+        );
+    }
+}
+
 #[tokio::test]
 async fn three_way_current_fork_requires_and_uses_majority_committed_checkpoint() {
     let temp = tempfile::tempdir().expect("temporary directory");
@@ -1924,12 +2492,95 @@ async fn three_way_current_fork_requires_and_uses_majority_committed_checkpoint(
     );
     assert_eq!(repaired.pending_plan_digest(), Some(plan.plan_digest()));
     assert_eq!(repaired.fence_high_water(), 7);
-    let recovered_backend =
-        SqliteSessionBackend::open(&replicas[2].database_path).expect("open recovered target");
-    assert!(recovered_backend
-        .consensus_operator_recovery_pending(identity())
-        .await
-        .expect("read target recovery gate"));
+    let recovered = Connection::open(&replicas[2].database_path)
+        .expect("open recovered target recovery authority");
+    assert!(
+        consensus::read_operator_recovery_sync(&recovered, identity())
+            .expect("read target recovery gate")
+            .pending_epoch
+            .is_some()
+    );
+}
+
+#[test]
+fn verified_majority_recovery_preserves_the_authoritative_receipt_chain_length() {
+    let temp = tempfile::tempdir().expect("receipt-chain recovery root");
+    let backup = private_tempdir();
+    let ids = [
+        replica_id("receipt-majority-a"),
+        replica_id("receipt-majority-b"),
+        replica_id("receipt-minority-c"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 7),
+        create_legacy_replica(temp.path(), ids[1].clone(), 7),
+        create_legacy_replica(temp.path(), ids[2].clone(), 19),
+    ];
+    let members = node_set(&ids);
+    let majority_leader = *members.iter().next().expect("majority leader");
+    let minority_leader = *members.iter().nth(1).expect("minority leader");
+    let majority_membership = LogId::new(CommittedLeaderId::new(3, majority_leader), 0);
+    let minority_membership = LogId::new(CommittedLeaderId::new(4, minority_leader), 0);
+    claim_current_replica(&replicas[0], &members, majority_membership);
+    claim_current_replica(&replicas[1], &members, majority_membership);
+    claim_current_replica(&replicas[2], &members, minority_membership);
+
+    let majority_time = Timestamp::now_utc();
+    let majority_receipt = LogId::new(CommittedLeaderId::new(3, majority_leader), 1);
+    append_legacy_receipt_entry(&replicas[0], majority_receipt, 0x61, majority_time);
+    append_legacy_receipt_entry(&replicas[1], majority_receipt, 0x61, majority_time);
+    let minority_first = LogId::new(CommittedLeaderId::new(4, minority_leader), 1);
+    let minority_second = LogId::new(CommittedLeaderId::new(4, minority_leader), 2);
+    append_legacy_receipt_entry(&replicas[2], minority_first, 0x71, Timestamp::now_utc());
+    append_legacy_receipt_entry(&replicas[2], minority_second, 0x72, Timestamp::now_utc());
+
+    let manager = recovery(AllowRecovery);
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            members.clone(),
+            &replicas,
+            &ids[0],
+            &ids[2..],
+            RecoveryDecisionBasis::VerifiedCommittedMajority,
+            RecoveryLimits::default(),
+        )
+        .expect("majority receipt branch is authoritative");
+    assert_eq!(plan.application_sequence_high_water(), 1);
+    let confirmation = RecoveryConfirmation::verified(&plan);
+    manager
+        .execute(
+            &context(),
+            &plan,
+            &confirmation,
+            &replicas,
+            backup.path(),
+            RecoveryLimits::default(),
+        )
+        .expect("repair divergent longer receipt branch");
+
+    let majority = Connection::open(&replicas[0].database_path).expect("open majority replica");
+    let target = Connection::open(&replicas[2].database_path).expect("open repaired target");
+    let receipt_count = |conn: &Connection| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM consensus_request_outcomes",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count receipt chain")
+    };
+    let machine_head = |conn: &Connection| {
+        conn.query_row(
+            "SELECT application_sequence, last_digest FROM consensus_machine WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .expect("read receipt chain head")
+    };
+    assert_eq!(receipt_count(&majority), 1);
+    assert_eq!(receipt_count(&target), receipt_count(&majority));
+    assert_eq!(machine_head(&target), machine_head(&majority));
 }
 
 #[test]
@@ -2164,21 +2815,26 @@ async fn legacy_log_tail_is_quarantined_cleared_and_old_cursors_fail_closed() {
             .expect("count cleared legacy log");
         let state = consensus::read_operator_recovery_sync(&conn, identity())
             .expect("read recovery cursor state");
+        let max_replication_sequence: i64 = conn
+            .query_row(
+                r#"
+                SELECT MAX(machine.watch_sequence, recovery.watch_cursor_invalidation_floor)
+                FROM consensus_machine AS machine
+                JOIN consensus_operator_recovery AS recovery
+                  ON recovery.singleton = machine.singleton
+                WHERE machine.singleton = 1
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .expect("read preserved replication high-water");
         assert_eq!(log_rows, 0);
         assert_eq!(state.watch_cursor_invalidation_floor, 1);
-        drop(conn);
-
-        let backend =
-            SqliteSessionBackend::open(&replica.database_path).expect("open recovered backend");
-        assert_eq!(
-            backend
-                .consensus_max_replication_sequence()
-                .await
-                .expect("read preserved application high-water"),
-            1
-        );
+        assert_eq!(max_replication_sequence, 1);
         assert!(matches!(
-            backend.consensus_get_replication_log(1, 16).await,
+            crate::ReplicationLogRange::try_new(1, 16).and_then(|range| {
+                range.ensure_not_compacted(state.watch_cursor_invalidation_floor)
+            }),
             Err(crate::StoreError::ReplicationLogCursorCompacted { resume_from: 2 })
         ));
     }
@@ -2350,6 +3006,10 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
             RecoveryLimits::default(),
         )
         .expect("whole-fleet campaign plan");
+    assert!(
+        plan.application_sequence_high_water() > 0,
+        "the selected standalone checkpoint carries a nonzero legacy application sequence"
+    );
     let confirmation = RecoveryConfirmation::legacy(
         &plan,
         RecoveryConfirmation::required_legacy_acknowledgement(),
@@ -2364,6 +3024,36 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
             RecoveryLimits::default(),
         )
         .expect("install whole-fleet campaign checkpoint");
+    for replica in &replicas {
+        let conn = Connection::open(&replica.database_path).expect("open staged campaign voter");
+        let application_sequence: i64 = conn
+            .query_row(
+                "SELECT application_sequence FROM consensus_machine WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read fresh recovery chain sequence");
+        let outcomes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_request_outcomes",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count recovery receipts");
+        let cutover: i64 = conn
+            .query_row(
+                "SELECT cutover_committed FROM consensus_command_admission WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read staged recovery admission");
+        assert_eq!(application_sequence, 0);
+        assert_eq!(outcomes, 0, "no legacy request ID survives the reset");
+        assert_eq!(
+            cutover, 0,
+            "a real cutover receipt must precede finalization"
+        );
+    }
     let plaintext_canary = b"legacy-recovery-plaintext-canary";
     for replica in &replicas {
         let database = std::fs::read(&replica.database_path).expect("read recovered database");
@@ -2495,6 +3185,67 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
         assert!(report.is_ready());
     }
 
+    // The authenticated recovery root is intentionally not a synthetic
+    // application receipt.  A real replicated cutover marker must therefore
+    // be the first current-admission evidence and must precede finalization
+    // on every voter.
+    for replica in &replicas {
+        let conn = Connection::open(&replica.database_path).expect("open finalized campaign voter");
+        let (activation, cutover): (i64, i64) = conn
+            .query_row(
+                "SELECT strict_activation_index, cutover_committed FROM consensus_command_admission WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read finalized recovery admission");
+        assert_eq!(cutover, 1, "finalized voter must durably cut over");
+        assert!(activation > 0, "cutover marker must have a committed index");
+        let rows = conn
+            .prepare("SELECT command_json, response_json FROM consensus_request_outcomes")
+            .expect("prepare finalized receipt scan")
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .expect("scan finalized receipts")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect finalized receipts");
+        let mut marker_index = None;
+        let mut finalize_index = None;
+        for (command, response) in rows {
+            let command: crate::consensus::DurableSessionConsensusCommand =
+                serde_json::from_slice(&command).expect("decode finalized command");
+            let response: crate::consensus::SessionConsensusResponse =
+                serde_json::from_slice(&response).expect("decode finalized response");
+            if command.is_command_admission_cutover() {
+                marker_index = Some(response.raft_log_index);
+                continue;
+            }
+            match command.intent {
+                crate::consensus::SessionMutationIntent::FinalizeOperatorRecovery {
+                    recovery_epoch,
+                    plan_digest,
+                    ..
+                } if recovery_epoch == plan.next_recovery_epoch()
+                    && plan_digest == plan.plan_digest().as_bytes() =>
+                {
+                    finalize_index = Some(response.raft_log_index);
+                }
+                _ => {}
+            }
+        }
+        let marker_index = marker_index.expect("finalized voter has fixed cutover receipt");
+        assert_eq!(
+            activation,
+            i64::try_from(marker_index + 1).expect("marker activation index fits SQLite"),
+            "admission activation must be derived from the marker receipt"
+        );
+        assert!(
+            marker_index
+                < finalize_index.expect("finalized voter has recovery-finalization receipt"),
+            "cutover receipt must precede recovery finalization"
+        );
+    }
+
     let recovered = EncryptingSessionBackend::new(
         Arc::new(stores[0].clone()),
         provider,
@@ -2609,20 +3360,23 @@ async fn recovery_epoch_is_durable_idempotent_and_invalidates_old_credentials() 
     let ids = [replica_id("epoch-a"), replica_id("epoch-b")];
     let members = node_set(&ids);
     let conn = Connection::open(&database).expect("open recovery database");
+    let fence_high = consensus::observed_fence_high_water_sync(&conn).expect("fence high-water");
+    let credential_high =
+        consensus::observed_credential_high_water_sync(&conn).expect("credential high-water");
     consensus::claim_legacy_checkpoint_sync(
         &conn,
         identity(),
         &members,
-        [0x21; 32],
+        [0x31; 32],
         1,
         [0x31; 32],
+        fence_high,
+        credential_high,
         0,
         0,
+        None,
     )
     .expect("claim legacy state");
-    let fence_high = consensus::observed_fence_high_water_sync(&conn).expect("fence high-water");
-    let credential_high =
-        consensus::observed_credential_high_water_sync(&conn).expect("credential high-water");
     assert_eq!(
         consensus::finalize_operator_recovery_sync(
             &conn,
@@ -2732,6 +3486,17 @@ async fn finalization_failpoints_resume_before_after_epoch_and_rejoin() {
     );
     let plan = sealed_test_plan(&manager, store_identity, node);
     let confirmation = RecoveryConfirmation::verified(&plan);
+    let pending = Connection::open(&database).expect("open pending recovery database");
+    consensus::mark_operator_recovery_pending_sync(
+        &pending,
+        store_identity,
+        plan.next_recovery_epoch(),
+        plan.plan_digest().as_bytes(),
+        plan.fence_high_water(),
+        plan.credential_high_water(),
+    )
+    .expect("record exact pending recovery tuple");
+    drop(pending);
     prepare_test_workflow(
         &manager.integrity_key,
         &plan,

@@ -166,11 +166,12 @@ cap of 128 rather than that planning estimate.
 
 The election range is `[5,000 ms, 8,000 ms)`, the session/config operation
 default is 10,000 ms, and listener idle/handler ceilings are 30,000 ms.
-The exact consensus contract is transport/wire-schema revision 4 and error-set
-revision 6. Revision 4 makes the forwarded consumer scope explicit, so a peer
-cannot silently downgrade a consumer-scoped operation to an internal call;
-error revision 6 binds that semantic boundary into the exact profile. Revision
-3/error revision 5 or older peers fail before dispatch;
+The exact consensus contract is transport/wire-schema revision 5 and error-set
+revision 6. Revision 5 binds every forwarded mutation reply to its exact
+request ID, semantic intent, authority identity, and consumer scope, so a peer
+cannot replay a valid reply for another operation; error revision 6 binds that
+semantic boundary into the exact profile. Revision 4/error revision 5 or older
+peers fail before dispatch;
 upgrade every consensus member together while traffic and writers are drained.
 This is not a rolling mixed-profile transition.
 
@@ -324,9 +325,9 @@ mutation or rebuild authority beside Openraft.
   authenticated `next_cursor` until `complete`. The transport validates the
   entire backend page against the fixed wire-payload cap and effective frame;
   it never trims or rewrites the page or cursor. An oversize page returns
-  `RestoreScanResponseTooLarge` when that error is representable, allowing the
-  caller to retry from the same cursor with a smaller record limit, or closes
-  the connection. The wire omits redundant `loaded_count`
+  `RestoreScanResponseTooLarge` when that error is representable; the SDK does
+  not retry it, so the caller can retry from the same cursor with a smaller
+  record limit, or the connection closes. The wire omits redundant `loaded_count`
   and `complete` values and recomputes both from records and cursor.
 - `SessionBackend::probe_replication_head` performs a fresh, deadline-bounded
   wire request. It does not consult the client's capability cache and reports

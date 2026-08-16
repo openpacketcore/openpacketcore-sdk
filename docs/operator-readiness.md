@@ -776,11 +776,16 @@ verify new writes use it and both key epochs remain readable, and retain the new
 ID while any artifact depends on it. A pre-change binary cannot safely read
 mixed-key state: binary rollback is safe only before publishing the new ID, or
 after a complete rewrap/artifact proof returns all dependencies to one key.
-Otherwise restore a coherent pre-publication checkpoint. The
-`RemoteSealProvider::unseal(&KeyId, ...)` source-API change requires custom
-providers and callers to upgrade together. Envelope, session-net, Openraft, and
-KMS framing/schema are unchanged; decrypt request contents now select the
-historical envelope ID.
+Otherwise restore a coherent pre-publication checkpoint. The remote provider
+capability/keyed-digest/exact-key-seal contract requires custom providers and
+callers to upgrade together. Durable envelopes, session-net, and Openraft are
+unchanged by this KMS schema change. The KMS remote-seal JSON schema now requires
+`derive_keyed_digest` for an exact key ID and canonical domain/input fields;
+encrypt, decrypt, and digest success responses use one strict field inventory,
+so the KMS service must be upgraded before the SDK client. Its 65,536-byte
+response-body limit, excluding the four-byte length prefix, yields an exact
+32,663-byte guaranteed round-trip plaintext cap, not the local 4,259,840-byte
+stored-envelope profile.
 
 ### Session consensus transport and identity
 
@@ -1090,8 +1095,9 @@ Production completeness comes only from scanning the barrier-confirmed local
 Openraft-applied state. The transport validates the entire returned page
 against the fixed wire-payload cap and effective frame; it never trims or
 rewrites the page or cursor. An oversize page returns
-`RestoreScanResponseTooLarge` when representable and is retried from the same
-cursor with a smaller record limit, or closes the connection.
+`RestoreScanResponseTooLarge` when representable; the SDK does not retry it.
+The caller may retry the same cursor with a smaller record limit when that
+request is representable, or the connection closes.
 
 Wire-schema revision 3 retains revision 2's negotiated response budget and
 adds the AES-256-GCM-SIV snapshot-bound cursor, explicit durable-page profile,
@@ -1201,9 +1207,33 @@ transition also requires the coordinated stop/upgrade/start above.
 source break for external struct literals/destructuring and must be updated in
 that same transition.
 
-Opening an existing SQLite store adds only the 32-byte
-`restore_scan_state.cursor_key` metadata field and does not backfill session
-records. Verify that O(1) migration on every replica before traffic admission.
+Opening an existing standalone SQLite store performs the O(1) cursor-key
+migration only when the complete six-table manifest exactly matches the frozen
+predecessor: the current `session_records`, `leases`, `key_fences`,
+`lease_globals`, and `session_replication_log` layouts plus the legacy
+three-column `restore_scan_state`. Before changing anything, existing-file
+admission performs exactly one complete persisted-state validation pass,
+costing O(records + replication-log entries). It rejects partial, mixed,
+missing, extra, or malformed authority without creating or repairing it. For
+the exact predecessor, one transaction adds and populates the nonzero 32-byte
+`restore_scan_state.cursor_key`, then reclassifies the exact current schema and
+validates only the migrated restore row/key rather than rescanning unchanged
+session, replication-log, or lease authority; it rolls back on any failure, and
+session records are not backfilled. SQLite's reviewed nullable `ALTER TABLE`
+form is accepted on restart only with one valid populated key. Verify this
+bounded migration on every replica before traffic admission.
+
+Portable file-backed standalone SQLite requires its immediate parent database
+namespace to be a real, non-symlink/non-reparse, service-owned or otherwise
+trusted namespace controlled by the service identity. Leaf symlink/reparse and
+nonregular shapes are rejected, as is Unix hardlink ambiguity where safely
+representable, without claiming universal cross-platform inode binding. Actors
+able to rename within that namespace can replace the `db-wal`, `db-shm`, and
+`db-journal` family, so hostile or same-UID same-directory replacement is
+outside the constructor guarantee. Linux `/proc/self/fd` descriptor pinning is
+only for SDK-controlled dynamic-consensus snapshot staging with journaling
+disabled, never general/live-WAL standalone SQLite; standalone remains
+portable, and dynamic snapshot staging retains its separate source boundary.
 A consensus snapshot created before revision 3 lacks the cursor key and is not
 an installable revision-3 repair source; after the coordinated upgrade, take
 and validate a fresh coherent snapshot before declaring rollback/recovery
@@ -1442,9 +1472,10 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
   `probe_durable_readiness` uses an Openraft linearizable barrier and local-apply
   wait, not bind or cached capability evidence; only attested topology plus
   `probe_production_durable_readiness` may gate production traffic. Its exact
-  profile uses transport/wire-schema revision 4
-  and error-set revision 6, including the explicit forwarded-consumer scope
-  boundary. Revision-3/error-revision-5-or-older peers fail before dispatch and all
+  profile uses transport/wire-schema revision 5
+  and error-set revision 6, including exact forwarded-reply binding to the
+  request ID, semantic intent, authority identity, and consumer scope.
+  Revision-4/error-revision-5-or-older peers fail before dispatch and all
   consensus members must be upgraded together while traffic is drained.
 - **Fault Coverage**: Tests cover concurrent pristine formation, cross-node
   lease/CAS visibility, follower linearizable reads, partition-bounded failure

@@ -13,6 +13,7 @@ use opc_session_net::{
     SESSION_CONSENSUS_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_ALPN,
     SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
+use opc_session_store::sqlite::{SQLITE_CONSENSUS_MAX_VALUE_BYTES, SQLITE_SESSION_MAX_VALUE_BYTES};
 use opc_session_store::{
     DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, MAX_REPLICATION_LOG_PAGE_ENTRIES,
     MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
@@ -721,6 +722,14 @@ fn current_v6_profile_matches_its_declared_consensus_and_store_contract() {
     );
     assert_eq!(profile.bounds.max_stable_id_bytes, STABLE_ID_MAX_BYTES);
     assert_eq!(
+        profile.bounds.local_stored_value_cap_bytes,
+        SQLITE_SESSION_MAX_VALUE_BYTES
+    );
+    assert_eq!(
+        profile.bounds.consensus_stored_value_cap_bytes,
+        SQLITE_CONSENSUS_MAX_VALUE_BYTES
+    );
+    assert_eq!(
         profile.bounds.max_replication_transaction_id_bytes,
         REPLICATION_TX_ID_MAX_BYTES
     );
@@ -1209,6 +1218,13 @@ fn schemas_prevent_premature_production_or_tls_rotation_claims() {
         serde_json::from_str(SESSION_HA_PROFILE_SCHEMA_JSON).expect("profile schema JSON");
     let mut profile: Value = serde_json::from_str(SESSION_HA_PROFILE_JSON).expect("profile JSON");
     profile["maturity"] = "production".into();
+    assert!(validate_structural_schema(&profile_schema, &profile).is_err());
+    profile["maturity"] = "experimental".into();
+    profile["bounds"]["local_stored_value_cap_bytes"] = (SQLITE_SESSION_MAX_VALUE_BYTES + 1).into();
+    assert!(validate_structural_schema(&profile_schema, &profile).is_err());
+    profile["bounds"]["local_stored_value_cap_bytes"] = SQLITE_SESSION_MAX_VALUE_BYTES.into();
+    profile["bounds"]["consensus_stored_value_cap_bytes"] =
+        (SQLITE_CONSENSUS_MAX_VALUE_BYTES + 1).into();
     assert!(validate_structural_schema(&profile_schema, &profile).is_err());
 
     let evidence_schema: Value =

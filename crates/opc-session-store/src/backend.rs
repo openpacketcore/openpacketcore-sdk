@@ -11,7 +11,11 @@ use std::{fmt, future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures_util::future::join_all;
-use opc_key::{KeyProvider, RemoteSealProvider};
+use opc_key::{
+    serialize_bound_aad, EnvelopeAad, KeyId, KeyProvider, RemoteSealCapabilities,
+    RemoteSealProvider, SessionAad, AEAD_TAG_LEN, AES_256_GCM_SIV_NONCE_LEN,
+    REMOTE_SEAL_MAX_KEY_ID_BYTES,
+};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use sha2::{Digest, Sha256};
 
@@ -19,7 +23,7 @@ use crate::{
     capability::BackendCapabilities,
     error::{LeaseError, StoreError},
     lease::{LeaseGuard, SessionLeaseManager},
-    model::{FenceToken, Generation, OwnerId, SessionKey},
+    model::{FenceToken, Generation, OwnerId, SessionKey, StateType},
     record::{EncryptedSessionPayload, StoredSessionRecord},
     restore::{RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest},
     topology::{ReplicaId, ReplicaTlsIdentity},
@@ -35,6 +39,66 @@ use crate::{
 /// fan-out cannot grow memory without bound. Consumers should resume from the
 /// last processed sequence.
 pub const WATCH_CHANNEL_CAPACITY: usize = 64;
+
+// RFC 001's fixed envelope header is magic (4), version (2), algorithm (2),
+// key-id length (2), nonce length (2), and AAD length (4).  The remainder is
+// exact configured/session metadata plus the provider's declared expansion.
+const CRYPTO_ENVELOPE_V1_HEADER_BYTES: usize = 16;
+const SESSION_AAD_MAX_TENANT_BYTES: usize = 128;
+const SESSION_AAD_MAX_NF_KIND_BYTES: usize = 64;
+const SESSION_AAD_MAX_DIGEST_HEX_BYTES: usize = 64;
+const SESSION_AAD_MAX_STATE_TYPE_BYTES: usize = StateType::MAX_BYTES;
+
+fn session_envelope_overhead(
+    backend_namespace: &str,
+    key_id_bytes: usize,
+    nonce_bytes: usize,
+    ciphertext_expansion_bytes: usize,
+) -> Option<usize> {
+    if key_id_bytes == 0 || key_id_bytes > REMOTE_SEAL_MAX_KEY_ID_BYTES {
+        return None;
+    }
+    let tenant = TenantId::new("t".repeat(SESSION_AAD_MAX_TENANT_BYTES)).ok()?;
+    // Tenant, NF kind, digest, and key ID are restricted to JSON-safe ASCII
+    // representations. StateType deliberately permits every non-NUL UTF-8
+    // value, so use U+0001 here: serde_json canonically emits each one as the
+    // six-byte `\\u0001` escape. Serializing this whole representative AAD
+    // keeps the reservation correct if canonical field spelling changes.
+    let session = SessionAad::new(
+        "n".repeat(SESSION_AAD_MAX_NF_KIND_BYTES),
+        "0".repeat(SESSION_AAD_MAX_DIGEST_HEX_BYTES),
+        "\u{0001}".repeat(SESSION_AAD_MAX_STATE_TYPE_BYTES),
+        u64::MAX,
+        u64::MAX,
+        backend_namespace,
+    )
+    .ok()?;
+    let aad = EnvelopeAad::session(tenant, 1, session);
+    let key_id = KeyId::new("k".repeat(key_id_bytes)).ok()?;
+    let aad_bytes = serialize_bound_aad(&aad, &key_id).ok()?.len();
+    CRYPTO_ENVELOPE_V1_HEADER_BYTES
+        .checked_add(key_id_bytes)?
+        .checked_add(nonce_bytes)?
+        .checked_add(aad_bytes)?
+        .checked_add(ciphertext_expansion_bytes)
+}
+
+fn plaintext_capacity_for_stored_envelopes(
+    stored_envelope_bytes: usize,
+    backend_namespace: &str,
+    key_id_bytes: usize,
+    nonce_bytes: usize,
+    ciphertext_expansion_bytes: usize,
+) -> usize {
+    session_envelope_overhead(
+        backend_namespace,
+        key_id_bytes,
+        nonce_bytes,
+        ciphertext_expansion_bytes,
+    )
+    .and_then(|overhead| stored_envelope_bytes.checked_sub(overhead))
+    .unwrap_or(0)
+}
 
 /// Maximum number of already-applied entries retained by one newly-created
 /// replication watch.
@@ -1228,6 +1292,16 @@ pub trait SessionBackend: Send + Sync {
     /// Return the capability declaration for this backend.
     async fn capabilities(&self) -> BackendCapabilities;
 
+    /// Largest stored envelope accepted by the persistence boundary.
+    ///
+    /// This non-wire composition hook separates the inner representation from
+    /// [`BackendCapabilities::max_value_bytes`], which a sealing wrapper
+    /// exposes as caller plaintext capacity.  Raw backends use their declared
+    /// value unchanged; wrappers forward this method to the actual store.
+    async fn stored_envelope_max_value_bytes(&self) -> usize {
+        self.capabilities().await.max_value_bytes
+    }
+
     /// Current absolute-expiry authority time for direct local mutation.
     ///
     /// Standalone adapters with an injected clock return `Some`. Forwarding
@@ -1762,16 +1836,51 @@ where
     B: SessionBackend + ?Sized,
     P: KeyProvider + ?Sized,
 {
+    async fn plaintext_capacity(&self) -> usize {
+        let stored = self.inner.stored_envelope_max_value_bytes().await;
+        plaintext_capacity_for_stored_envelopes(
+            stored,
+            self.backend_namespace(),
+            REMOTE_SEAL_MAX_KEY_ID_BYTES,
+            AES_256_GCM_SIV_NONCE_LEN,
+            AEAD_TAG_LEN,
+        )
+    }
+
+    async fn ensure_plaintext_capacity(&self, payload_len: usize) -> Result<(), StoreError> {
+        let max = self.plaintext_capacity().await;
+        if payload_len > max {
+            return Err(StoreError::PayloadTooLarge {
+                actual: payload_len,
+                max,
+            });
+        }
+        Ok(())
+    }
+
+    async fn ensure_stored_capacity(&self, payload_len: usize) -> Result<(), StoreError> {
+        let max = self.inner.stored_envelope_max_value_bytes().await;
+        if payload_len > max {
+            return Err(StoreError::PayloadTooLarge {
+                actual: payload_len,
+                max,
+            });
+        }
+        Ok(())
+    }
+
     async fn encrypt_record(
         &self,
         mut record: StoredSessionRecord,
     ) -> Result<StoredSessionRecord, StoreError> {
+        self.ensure_plaintext_capacity(record.payload.len()).await?;
         record.payload = EncryptedSessionPayload::encrypt(
             self.provider.as_ref(),
             &record,
             self.backend_namespace(),
         )
         .await?;
+        self.ensure_stored_capacity(record.payload.len()).await?;
         Ok(record)
     }
 
@@ -1887,11 +1996,16 @@ where
         self.inner.restore_scan_cursor_profile()
     }
 
-    /// The returned value limit describes the envelope bytes accepted by the
-    /// inner store. It is not a plaintext admission promise: local and remote
-    /// sealing add variable, authenticated envelope metadata before dispatch.
+    /// The returned value limit is the exact caller plaintext capacity after
+    /// reserving the largest valid configured RFC 003 envelope.
     async fn capabilities(&self) -> BackendCapabilities {
-        self.inner.capabilities().await
+        let mut capabilities = self.inner.capabilities().await;
+        capabilities.max_value_bytes = self.plaintext_capacity().await;
+        capabilities
+    }
+
+    async fn stored_envelope_max_value_bytes(&self) -> usize {
+        self.inner.stored_envelope_max_value_bytes().await
     }
 
     fn record_expiry_reference(&self) -> Option<Timestamp> {
@@ -2024,13 +2138,28 @@ where
         &self,
         request: RestoreScanRequest,
     ) -> Result<RestoreScanPage, StoreError> {
-        let mut page = self.inner.scan_restore_records(request).await?;
+        let mut page = self.inner.scan_restore_records(request.clone()).await?;
+        page.validate_for_request(&request)?;
         let mut decrypted = Vec::with_capacity(page.records.len());
+        let mut payload_bytes = 0_usize;
         for record in page.records {
-            decrypted.push(self.decrypt_record(record).await?);
+            let record = self.decrypt_record(record).await?;
+            payload_bytes = payload_bytes
+                .checked_add(record.payload.len())
+                .ok_or_else(|| {
+                    StoreError::InvalidRestoreScanResponse(
+                        "restore scan transformed payload byte count overflowed".to_string(),
+                    )
+                })?;
+            if payload_bytes > crate::restore::RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES {
+                return Err(StoreError::InvalidRestoreScanResponse(
+                    "restore scan transformed payloads exceeded the page limit".to_string(),
+                ));
+            }
+            decrypted.push(record);
         }
         page.records = decrypted;
-        page.loaded_count = page.records.len();
+        page.validate_for_request(&request)?;
         Ok(page)
     }
 
@@ -2186,10 +2315,11 @@ where
 /// they share the record/AAD metadata shape, but key custody differs and a
 /// record written in one mode is not required to decrypt in the other.
 ///
-/// Remote seal adds one KMS round-trip per seal (for example, each checkpoint,
-/// normally off the hot path) and one KMS round-trip per unseal (each restored
-/// session during failover), adding KMS latency and a KMS availability
-/// dependency to restore.
+/// Version 2 remote sealing makes one provider call to bind the active key and
+/// one to seal (for example, per checkpoint, normally off the hot path).
+/// Version 2 unsealing similarly makes a keyed-digest call and an unseal call
+/// per restored session; legacy version 1 unsealing needs only the unseal call.
+/// This adds KMS latency and a KMS availability dependency to restore.
 #[derive(Clone)]
 pub struct RemoteSealingSessionBackend<B: ?Sized, S: ?Sized> {
     inner: Arc<B>,
@@ -2224,16 +2354,60 @@ where
     B: SessionBackend + ?Sized,
     S: RemoteSealProvider + ?Sized,
 {
+    fn provider_capabilities(&self) -> RemoteSealCapabilities {
+        self.provider.capabilities()
+    }
+
+    async fn plaintext_capacity(&self) -> usize {
+        let provider = self.provider_capabilities();
+        if !provider.is_usable() {
+            return 0;
+        }
+        let stored = self.inner.stored_envelope_max_value_bytes().await;
+        let envelope_capacity = plaintext_capacity_for_stored_envelopes(
+            stored,
+            self.backend_namespace(),
+            provider.max_key_id_bytes,
+            0,
+            provider.max_ciphertext_expansion_bytes,
+        );
+        envelope_capacity.min(provider.max_round_trip_plaintext_bytes)
+    }
+
+    async fn ensure_plaintext_capacity(&self, payload_len: usize) -> Result<(), StoreError> {
+        let max = self.plaintext_capacity().await;
+        if payload_len > max {
+            return Err(StoreError::PayloadTooLarge {
+                actual: payload_len,
+                max,
+            });
+        }
+        Ok(())
+    }
+
+    async fn ensure_stored_capacity(&self, payload_len: usize) -> Result<(), StoreError> {
+        let max = self.inner.stored_envelope_max_value_bytes().await;
+        if payload_len > max {
+            return Err(StoreError::PayloadTooLarge {
+                actual: payload_len,
+                max,
+            });
+        }
+        Ok(())
+    }
+
     async fn seal_record(
         &self,
         mut record: StoredSessionRecord,
     ) -> Result<StoredSessionRecord, StoreError> {
+        self.ensure_plaintext_capacity(record.payload.len()).await?;
         record.payload = EncryptedSessionPayload::remote_seal(
             self.provider.as_ref(),
             &record,
             self.backend_namespace(),
         )
         .await?;
+        self.ensure_stored_capacity(record.payload.len()).await?;
         Ok(record)
     }
 
@@ -2334,11 +2508,16 @@ where
         self.inner.restore_scan_cursor_profile()
     }
 
-    /// The returned value limit describes the sealed bytes accepted by the
-    /// inner store. Remote providers choose envelope metadata, so it must not
-    /// be interpreted as an equal plaintext payload limit.
+    /// The returned value limit is the exact caller plaintext capacity after
+    /// both the provider's round-trip limit and RFC 003 envelope expansion.
     async fn capabilities(&self) -> BackendCapabilities {
-        self.inner.capabilities().await
+        let mut capabilities = self.inner.capabilities().await;
+        capabilities.max_value_bytes = self.plaintext_capacity().await;
+        capabilities
+    }
+
+    async fn stored_envelope_max_value_bytes(&self) -> usize {
+        self.inner.stored_envelope_max_value_bytes().await
     }
 
     fn record_expiry_reference(&self) -> Option<Timestamp> {
@@ -2471,13 +2650,28 @@ where
         &self,
         request: RestoreScanRequest,
     ) -> Result<RestoreScanPage, StoreError> {
-        let mut page = self.inner.scan_restore_records(request).await?;
+        let mut page = self.inner.scan_restore_records(request.clone()).await?;
+        page.validate_for_request(&request)?;
         let mut unsealed = Vec::with_capacity(page.records.len());
+        let mut payload_bytes = 0_usize;
         for record in page.records {
-            unsealed.push(self.unseal_record(record).await?);
+            let record = self.unseal_record(record).await?;
+            payload_bytes = payload_bytes
+                .checked_add(record.payload.len())
+                .ok_or_else(|| {
+                    StoreError::InvalidRestoreScanResponse(
+                        "restore scan transformed payload byte count overflowed".to_string(),
+                    )
+                })?;
+            if payload_bytes > crate::restore::RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES {
+                return Err(StoreError::InvalidRestoreScanResponse(
+                    "restore scan transformed payloads exceeded the page limit".to_string(),
+                ));
+            }
+            unsealed.push(record);
         }
         page.records = unsealed;
-        page.loaded_count = page.records.len();
+        page.validate_for_request(&request)?;
         Ok(page)
     }
 

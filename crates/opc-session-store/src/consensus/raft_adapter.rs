@@ -145,6 +145,10 @@ struct SessionRaftPeerDirectoryState {
     terminal: Option<SessionRaftPeerTransitionTerminal>,
     last_applied_membership: Option<StoredMembership<SessionConsensusNodeId, EmptyNode>>,
     engine_admission_suspended: bool,
+    /// Once shutdown starts this directory can never be re-admitted. Keeping
+    /// this terminal bit in the same state lock as every route mutation makes
+    /// clearing and rejecting a concurrent restage one atomic transition.
+    stopping: bool,
 }
 
 /// Bounded peer routing shared by all Openraft clients created for one node.
@@ -159,9 +163,29 @@ pub(crate) struct SessionRaftPeerDirectory {
     local_node_id: SessionConsensusNodeId,
     state: Arc<RwLock<SessionRaftPeerDirectoryState>>,
     membership_apply_fence: Arc<tokio::sync::RwLock<()>>,
+    #[cfg(test)]
+    snapshot_observation_probe_armed: Arc<AtomicBool>,
+    #[cfg(test)]
+    snapshot_observation_probe_blocked: Arc<AtomicBool>,
+    #[cfg(test)]
+    snapshot_observation_probe_reached: Arc<AtomicBool>,
 }
 
 impl SessionRaftPeerDirectory {
+    /// Release every transport-owned peer handle after the local engine has
+    /// stopped. Besides preventing post-shutdown routing, this breaks adapter
+    /// cycles in in-process transports whose handlers retain the target store.
+    pub(crate) fn clear_routes_after_shutdown(&self) -> Result<(), SessionRaftAdapterError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        state.stopping = true;
+        state.active.clear();
+        state.staged = None;
+        Ok(())
+    }
+
     fn try_new(
         identity: SessionConsensusIdentity,
         local_node_id: SessionConsensusNodeId,
@@ -185,8 +209,15 @@ impl SessionRaftPeerDirectory {
                 terminal: None,
                 last_applied_membership: None,
                 engine_admission_suspended: false,
+                stopping: false,
             })),
             membership_apply_fence: Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
+            snapshot_observation_probe_armed: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            snapshot_observation_probe_blocked: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            snapshot_observation_probe_reached: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -209,8 +240,15 @@ impl SessionRaftPeerDirectory {
                 terminal: None,
                 last_applied_membership: None,
                 engine_admission_suspended: false,
+                stopping: false,
             })),
             membership_apply_fence: Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
+            snapshot_observation_probe_armed: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            snapshot_observation_probe_blocked: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            snapshot_observation_probe_reached: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -241,6 +279,9 @@ impl SessionRaftPeerDirectory {
             .state
             .write()
             .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        if state.stopping {
+            return Err(SessionRaftAdapterError::PeerDirectoryUnavailable);
+        }
         validate_peer_transition_scope(state.current_identity, expected_epoch, desired_identity)?;
         if state.current_members == desired_members {
             return Err(SessionRaftAdapterError::InvalidPeerTransitionScope);
@@ -315,6 +356,9 @@ impl SessionRaftPeerDirectory {
             .state
             .write()
             .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        if state.stopping {
+            return Err(SessionRaftAdapterError::PeerDirectoryUnavailable);
+        }
         if state.terminal.as_ref().is_some_and(|terminal| {
             terminal.transition_id == transition_id
                 && terminal.request_digest == request_digest
@@ -352,6 +396,9 @@ impl SessionRaftPeerDirectory {
             .state
             .write()
             .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        if state.stopping {
+            return Err(SessionRaftAdapterError::PeerDirectoryUnavailable);
+        }
         if state.terminal.as_ref().is_some_and(|terminal| {
             terminal.transition_id == transition_id
                 && terminal.request_digest == request_digest
@@ -385,6 +432,9 @@ impl SessionRaftPeerDirectory {
             .state
             .write()
             .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        if state.stopping {
+            return Err(SessionRaftAdapterError::PeerDirectoryUnavailable);
+        }
         if let Some(terminal) = state.terminal.as_ref() {
             if terminal.transition_id == transition_id
                 && terminal.request_digest == request_digest
@@ -440,6 +490,9 @@ impl SessionRaftPeerDirectory {
             .state
             .write()
             .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        if state.stopping {
+            return Err(SessionRaftAdapterError::PeerDirectoryUnavailable);
+        }
         if let Some(terminal) = state.terminal.as_ref() {
             if terminal.transition_id == transition_id
                 && terminal.request_digest == request_digest
@@ -486,7 +539,7 @@ impl SessionRaftPeerDirectory {
             .state
             .read()
             .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
-        if state.engine_admission_suspended {
+        if state.stopping || state.engine_admission_suspended {
             return Ok(None);
         }
         let active = state.active.get(&target);
@@ -515,7 +568,8 @@ impl SessionRaftPeerDirectory {
         family: SessionConsensusRpcFamily,
     ) -> bool {
         self.state.read().is_ok_and(|state| {
-            !state.engine_admission_suspended
+            !state.stopping
+                && !state.engine_admission_suspended
                 && ((state.current_members.contains(&self.local_node_id)
                     && state.active.get(&sender).is_some_and(|route| {
                         route.identity == identity && route.peer.node_id() == sender
@@ -537,6 +591,9 @@ impl SessionRaftPeerDirectory {
             .state
             .read()
             .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        if state.stopping {
+            return Err(SessionRaftAdapterError::PeerDirectoryUnavailable);
+        }
         Ok((state.current_identity, state.current_members.clone()))
     }
 
@@ -550,6 +607,9 @@ impl SessionRaftPeerDirectory {
             .state
             .read()
             .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        if state.stopping {
+            return Err(SessionRaftAdapterError::PeerDirectoryUnavailable);
+        }
         let peers = state
             .current_members
             .iter()
@@ -578,6 +638,9 @@ impl SessionRaftPeerDirectory {
             .state
             .read()
             .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        if state.stopping {
+            return Err(SessionRaftAdapterError::PeerDirectoryUnavailable);
+        }
         if !state.current_members.contains(&self.local_node_id)
             || !state.current_members.contains(&target)
         {
@@ -611,6 +674,9 @@ impl SessionRaftPeerDirectory {
             .state
             .write()
             .map_err(|_| SessionRaftAdapterError::PeerDirectoryUnavailable)?;
+        if state.stopping {
+            return Err(SessionRaftAdapterError::PeerDirectoryUnavailable);
+        }
         state.last_applied_membership = Some(membership.clone());
         state.engine_admission_suspended = membership.log_id().is_some()
             && is_uniform_membership_different_from(
@@ -618,7 +684,49 @@ impl SessionRaftPeerDirectory {
                 &state.current_members,
             );
         promote_applied_uniform_membership(&mut state);
+        #[cfg(test)]
+        self.probe_snapshot_observation_fence_for_test();
         Ok(())
+    }
+
+    /// Arm a one-shot probe for the observation that follows a committed
+    /// snapshot install. It verifies that a predecessor RPC read permit cannot
+    /// enter before the membership writer releases.
+    #[cfg(test)]
+    fn arm_snapshot_observation_fence_probe_for_test(&self) {
+        self.snapshot_observation_probe_blocked
+            .store(false, Ordering::Release);
+        self.snapshot_observation_probe_reached
+            .store(false, Ordering::Release);
+        self.snapshot_observation_probe_armed
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn snapshot_observation_fence_probe_result_for_test(&self) -> Option<bool> {
+        self.snapshot_observation_probe_reached
+            .load(Ordering::Acquire)
+            .then(|| {
+                self.snapshot_observation_probe_blocked
+                    .load(Ordering::Acquire)
+            })
+    }
+
+    #[cfg(test)]
+    fn probe_snapshot_observation_fence_for_test(&self) {
+        if self
+            .snapshot_observation_probe_armed
+            .swap(false, Ordering::AcqRel)
+        {
+            // This is the same fence used by inbound predecessor RPCs. The
+            // probe runs after successor routing is observed but before the
+            // state-machine releases its writer guard.
+            let blocked = self.membership_apply_fence.try_read().is_err();
+            self.snapshot_observation_probe_blocked
+                .store(blocked, Ordering::Release);
+            self.snapshot_observation_probe_reached
+                .store(true, Ordering::Release);
+        }
     }
 
     /// Serialize one durable membership apply against per-RPC engine
@@ -1349,10 +1457,10 @@ mod tests {
 
     use super::*;
     use crate::consensus::{
-        storage, SessionConsensusClusterId, SessionConsensusCommand,
-        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-        SessionConsensusRequestId, SessionMutationIntent, SessionTopologyMemberBinding,
-        SESSION_CONSENSUS_SCHEMA_VERSION,
+        storage, DurableSessionConsensusCommand, SessionConsensusClusterId,
+        SessionConsensusCommand, SessionConsensusConfigurationEpoch,
+        SessionConsensusConfigurationId, SessionConsensusRequestId, SessionMutationIntent,
+        SessionTopologyMemberBinding, SESSION_CONSENSUS_SCHEMA_VERSION,
     };
     use crate::sqlite::SqliteSessionBackend;
 
@@ -1562,13 +1670,16 @@ mod tests {
     ) -> Entry<SessionRaftTypeConfig> {
         Entry {
             log_id: LogId::new(CommittedLeaderId::new(1, leader), index),
-            payload: EntryPayload::Normal(SessionConsensusCommand {
-                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
-                identity,
-                request_id: SessionConsensusRequestId::from_bytes([request_seed; 16]),
-                logical_time: Timestamp::from_str("2026-07-21T00:00:00Z").expect("test timestamp"),
-                intent,
-            }),
+            payload: EntryPayload::Normal(DurableSessionConsensusCommand::legacy(
+                SessionConsensusCommand {
+                    schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                    identity,
+                    request_id: SessionConsensusRequestId::from_bytes([request_seed; 16]),
+                    logical_time: Timestamp::from_str("2026-07-21T00:00:00Z")
+                        .expect("test timestamp"),
+                    intent,
+                },
+            )),
         }
     }
 
@@ -1951,6 +2062,9 @@ mod tests {
 
         let target = real_follower_fixture().await;
         apply_through_joint(&target).await;
+        target
+            .directory
+            .arm_snapshot_observation_fence_probe_for_test();
         let held_predecessor_rpc = target.directory.begin_engine_rpc().await;
         let final_chunk = InstallSnapshotRequest {
             vote: Vote::new_committed(1, target.leader),
@@ -1977,10 +2091,16 @@ mod tests {
             target.current
         );
         drop(held_predecessor_rpc);
-        let response = tokio::time::timeout(Duration::from_secs(5), &mut install)
-            .await
-            .expect("final snapshot does not self-deadlock")
-            .expect("snapshot handler task remains live");
+        let response = match tokio::time::timeout(Duration::from_secs(5), &mut install).await {
+            Ok(response) => response.expect("snapshot handler task remains live"),
+            Err(error) => panic!(
+                "final snapshot does not self-deadlock: {error}; observation_probe={:?}; scope={:?}",
+                target
+                    .directory
+                    .snapshot_observation_fence_probe_result_for_test(),
+                target.directory.current_scope()
+            ),
+        };
         let _ = decode_snapshot_response(response);
         target
             .raft
@@ -1991,6 +2111,13 @@ mod tests {
             )
             .await
             .expect("snapshot target reaches desired uniform");
+        assert_eq!(
+            Some(true),
+            target
+                .directory
+                .snapshot_observation_fence_probe_result_for_test(),
+            "committed snapshot observation must keep predecessor read permits blocked until the writer releases"
+        );
         assert_eq!(
             target
                 .directory
@@ -3296,6 +3423,56 @@ mod tests {
             Ok(2),
             "a candidate absent from current membership must not claim current scope"
         );
+    }
+
+    #[test]
+    fn shutdown_terminally_revokes_routes_and_rejects_clone_restage() {
+        let local = node_id(1);
+        let target = node_id(2);
+        let current = identity(0xd1);
+        let desired = successor_identity(current, 0xd2);
+        let current_members = BTreeSet::from([local, target]);
+        let directory = SessionRaftPeerDirectory::try_new(
+            current,
+            local,
+            current_members.clone(),
+            scope_peers(local, &current_members, current),
+        )
+        .expect("initial routes");
+        let concurrent_clone = directory.clone();
+
+        directory
+            .clear_routes_after_shutdown()
+            .expect("terminal shutdown clear");
+
+        assert!(directory.current_scope().is_err());
+        assert!(directory.current_peers().is_err());
+        assert!(directory.resolve_application(target).is_err());
+        assert!(directory
+            .resolve_engine_for(target, SessionConsensusRpcFamily::AppendEntries)
+            .expect("terminal engine resolution")
+            .is_none());
+        assert!(!directory.authorizes_engine(
+            target,
+            current,
+            SessionConsensusRpcFamily::AppendEntries,
+        ));
+        assert!(concurrent_clone
+            .stage(
+                transition_id(0xd3),
+                transition_digest(0xd3),
+                current.configuration_epoch(),
+                desired,
+                current_members.clone(),
+                scope_peers(local, &current_members, desired),
+            )
+            .is_err());
+        assert!(concurrent_clone
+            .observe_applied_membership(&stored_membership(
+                vec![current_members.clone()],
+                current_members,
+            ))
+            .is_err());
     }
 
     #[tokio::test]

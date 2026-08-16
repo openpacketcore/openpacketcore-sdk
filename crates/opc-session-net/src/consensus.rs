@@ -4652,7 +4652,10 @@ mod tests {
 
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         let mut previous_profile = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
-        previous_profile.error_set_revision = 1;
+        // The immediately preceding v4 profile had error-set revision 5.
+        // It must be rejected during bootstrap, before request dispatch.
+        previous_profile.wire_schema_revision = 4;
+        previous_profile.error_set_revision = 5;
         let nonce = uuid::Uuid::new_v4();
         write_frame(
             &mut stream,

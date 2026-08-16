@@ -715,7 +715,7 @@ async fn sqlite_restore_rejects_legacy_stable_id_above_production_width() {
 }
 
 #[tokio::test]
-async fn sqlite_existing_store_gets_only_the_bounded_cursor_key_migration() {
+async fn sqlite_existing_store_without_authority_is_rejected_without_migration() {
     let directory = tempfile::tempdir().expect("legacy restore directory");
     let path = directory.path().join("session.sqlite");
     let raw = rusqlite::Connection::open(&path).expect("raw legacy sqlite");
@@ -764,34 +764,113 @@ async fn sqlite_existing_store_gets_only_the_bounded_cursor_key_migration() {
     }
     drop(raw);
 
-    let backend = opc_session_store::SqliteSessionBackend::open(&path)
-        .expect("open and migrate existing store");
-    let first = backend
-        .scan_restore_records(RestoreScanRequest::all(1))
-        .await
-        .expect("scan migrated store");
-    assert!(first.next_cursor.is_some());
-    drop(backend);
-
     let raw = rusqlite::Connection::open(&path).expect("inspect migrated sqlite");
-    let cursor_key_len: i64 = raw
-        .query_row(
-            "SELECT length(cursor_key) FROM restore_scan_state WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .expect("cursor key is persisted");
-    assert_eq!(cursor_key_len, 32);
-    let record_columns = raw
-        .prepare("PRAGMA table_info(session_records)")
-        .expect("record schema")
-        .query_map([], |row| row.get::<_, String>(1))
-        .expect("record columns")
+    let schema_before = raw
+        .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .expect("schema query")
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("read schema")
         .collect::<Result<Vec<_>, _>>()
-        .expect("read record columns");
-    assert!(!record_columns
-        .iter()
-        .any(|name| name == "restore_order_key"));
+        .expect("collect schema");
+    let restore_before = raw
+        .query_row(
+            "SELECT singleton, epoch, revision FROM restore_scan_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .expect("read restore metadata");
+    let records_before = raw
+        .prepare(
+            "SELECT tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding FROM session_records ORDER BY stable_id",
+        )
+        .expect("records query")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Vec<u8>>(10)?,
+                row.get::<_, i64>(11)?,
+            ))
+        })
+        .expect("read records")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect records");
+    drop(raw);
+
+    let error = opc_session_store::SqliteSessionBackend::open(&path)
+        .err()
+        .expect("existing store without authority must be rejected");
+    assert_eq!(
+        error,
+        StoreError::Serialization("persisted session schema is invalid".into())
+    );
+
+    let raw = rusqlite::Connection::open(&path).expect("inspect rejected sqlite");
+    let schema_after = raw
+        .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .expect("schema query")
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("read schema")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect schema");
+    let restore_after = raw
+        .query_row(
+            "SELECT singleton, epoch, revision FROM restore_scan_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .expect("read restore metadata");
+    let records_after = raw
+        .prepare(
+            "SELECT tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding FROM session_records ORDER BY stable_id",
+        )
+        .expect("records query")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Vec<u8>>(10)?,
+                row.get::<_, i64>(11)?,
+            ))
+        })
+        .expect("read records")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect records");
+    assert_eq!(schema_after, schema_before);
+    assert_eq!(restore_after, restore_before);
+    assert_eq!(records_after, records_before);
 }
 
 #[tokio::test]

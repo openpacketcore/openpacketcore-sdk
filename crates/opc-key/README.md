@@ -19,9 +19,10 @@ provider that declares non-exportable custody.
 - `MemoryKeyProvider` is the in-process provider for tests and local fixtures.
 - `KmsKeyProvider` talks to a Unix-socket or TLS/TCP JSON KMS endpoint using
   length-prefixed requests.
-- `RemoteSealProvider` delegates encryption to KMS/HKMS and receives the
-  validated envelope key ID on unseal so historical reads never substitute the
-  current active key.
+- `RemoteSealProvider` declares exact seal/unseal/round-trip and expansion
+  bounds, derives the provider-keyed session digest under an exact active or
+  historical key ID, and delegates AEAD to KMS/HKMS. Historical reads never
+  substitute the current active key.
 - `KeyCustodyModule` composes `CryptoModule` evidence and
   `RemoteSealProvider` operations on one exact object.
 - `install_key_custody_module` admits that object once per process and returns
@@ -128,11 +129,13 @@ non-canonical, or context-mismatched output fails with a fieldless stable code.
   custody.
 - `KmsKeyProvider` redacts errors and requires TLS for TCP endpoints. Unix
   sockets are accepted for local KMS deployments.
-- Existing `KeyProvider`, `KeyHandle`, `KmsRemoteSealProvider`,
-  `MemoryRemoteSealProvider`, and custom `RemoteSealProvider` implementations
-  remain source- and wire-compatible. They are explicitly unadmitted unless
-  the consumer composes the same object as a `KeyCustodyModule`; direct values
-  cannot construct or impersonate `AdmittedKeyCustody`.
+- `RemoteSealProvider` defaults its new capability, keyed-digest, and
+  exact-key-seal methods to an unusable fail-closed implementation. Custom
+  providers must explicitly publish truthful limits and implement those
+  methods before they can protect session records. They remain explicitly
+  unadmitted unless the consumer composes the same object as a
+  `KeyCustodyModule`; direct values cannot construct or impersonate
+  `AdmittedKeyCustody`.
 - An admitted provider must explicitly satisfy both `sealed_key_storage` and
   `zeroization`. Provider `NotFound` and `Unavailable` outcomes keep their
   existing public meaning; all other provider context is collapsed to a
@@ -142,13 +145,24 @@ non-canonical, or context-mismatched output fails with a fieldless stable code.
   Every unseal calls KMS/HKMS with the exact validated envelope key ID. KMS/HKMS
   owns retention and revocation; the SDK provides no retirement API or
   enforcement gate and cannot prevent an external retirement.
-- `RemoteSealProvider::unseal` now takes `&KeyId`. Custom provider
-  implementations and callers must upgrade together before publishing a new
-  active ID. `KmsRemoteSealProvider::key_id()` is replaced by
-  `material_controller()`, `publish_active_key()`, and `material_epoch()`;
-  `MemoryRemoteSealProvider::key_id()` is replaced by async
-  `active_key_id()`. Durable envelopes and KMS framing/schema are unchanged;
-  decrypt request contents now select the historical envelope ID.
+- `RemoteSealProvider::unseal` takes `&KeyId`. Custom provider implementations
+  and callers must upgrade together before publishing a new active ID.
+  `KmsRemoteSealProvider::key_id()` is replaced by `material_controller()`,
+  `publish_active_key()`, and `material_epoch()`;
+  `MemoryRemoteSealProvider::key_id()` is replaced by async `active_key_id()`.
+  Durable envelopes are unchanged. The KMS remote-seal JSON contract now also
+  requires `derive_keyed_digest`, with the exact key ID, domain in `aad_hex`,
+  input in `plaintext_hex`, and a canonical 32-byte `keyed_digest_hex` success.
+  Encrypt/decrypt/digest successes use one strict canonical response inventory,
+  so KMS clients and servers must upgrade together.
+- The KMS response body remains capped at 65,536 bytes, excluding its four-byte
+  length prefix. Hex encoding and the canonical response inventory make 32,663 bytes the exact guaranteed
+  round-trip plaintext limit; equality succeeds and equality plus one fails
+  before provider I/O. This provider therefore does not advertise the local
+  4,259,840-byte stored-envelope profile.
+- Remote AEAD responses must expand plaintext by exactly the 16-byte tag, and
+  unseal must return exactly `ciphertext_len - 16`; an upper bound alone is not
+  sufficient authority to persist or restore an envelope.
 - `SessionAad` rejects NUL-containing fields; config AAD rejects blank principal
   and store kind values.
 

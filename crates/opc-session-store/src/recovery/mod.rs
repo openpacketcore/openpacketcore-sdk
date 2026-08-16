@@ -473,6 +473,9 @@ impl Default for RecoveryLimits {
 pub enum RecoveryReplicaFormat {
     /// Current Openraft-owned SQLite state.
     Openraft,
+    /// The one reviewed Openraft predecessor schema, whose legacy replay
+    /// outcomes are intentionally discarded at an operator recovery reset.
+    ImmediatePredecessor,
     /// Pre-Openraft standalone/custom replication state with no commit proof.
     LegacyUnproven,
 }
@@ -491,6 +494,8 @@ pub struct RecoveryReplicaEvidence {
     recovery_epoch: u64,
     pending_recovery_epoch: Option<u64>,
     pending_plan_digest: Option<RecoveryDigest>,
+    pending_fence_high_water: Option<u64>,
+    pending_credential_high_water: Option<u64>,
     watch_cursor_invalidation_floor: u64,
     application_sequence: u64,
     watch_sequence: u64,
@@ -542,6 +547,16 @@ impl RecoveryReplicaEvidence {
     /// Pending exact plan digest, when recovery is incomplete.
     pub const fn pending_plan_digest(&self) -> Option<RecoveryDigest> {
         self.pending_plan_digest
+    }
+
+    /// Fence high-water bound into an incomplete exact recovery plan.
+    pub const fn pending_fence_high_water(&self) -> Option<u64> {
+        self.pending_fence_high_water
+    }
+
+    /// Credential high-water bound into an incomplete exact recovery plan.
+    pub const fn pending_credential_high_water(&self) -> Option<u64> {
+        self.pending_credential_high_water
     }
 
     /// Highest pre-recovery application-journal cursor invalidated by reset.
@@ -690,7 +705,11 @@ impl RecoveryPlan {
         self.body.credential_high_water
     }
 
-    /// Highest application sequence preserved across the admitted fleet.
+    /// Application sequence retained by the selected recovery basis.
+    ///
+    /// Verified-majority recovery preserves the selected source's exact
+    /// sequence; the legacy unverified basis preserves the admitted fleet's
+    /// maximum sequence.
     pub const fn application_sequence_high_water(&self) -> u64 {
         self.body.application_sequence_high_water
     }
@@ -1038,10 +1057,13 @@ where
                 }
             }
             RecoveryDecisionBasis::ExplicitLegacyCheckpoint => {
-                if source_evidence.format != RecoveryReplicaFormat::LegacyUnproven
-                    || evidence
-                        .iter()
-                        .any(|item| item.format != RecoveryReplicaFormat::LegacyUnproven)
+                if !matches!(
+                    source_evidence.format,
+                    RecoveryReplicaFormat::LegacyUnproven
+                        | RecoveryReplicaFormat::ImmediatePredecessor
+                ) || evidence
+                    .iter()
+                    .any(|item| item.format != source_evidence.format)
                 {
                     return Err(RecoveryError::InvalidRequest);
                 }
@@ -1063,11 +1085,22 @@ where
         let next_recovery_epoch = max_recovery_epoch
             .checked_add(1)
             .ok_or(RecoveryError::InvalidRequest)?;
-        let application_sequence_high_water = evidence
-            .iter()
-            .map(RecoveryReplicaEvidence::application_sequence)
-            .max()
-            .unwrap_or(0);
+        // A verified-majority reset retains the selected committed source
+        // branch, including its receipt chain.  Its machine sequence must
+        // therefore remain that source's exact sequence: a divergent
+        // minority can legitimately have a longer, non-authoritative chain.
+        // Legacy checkpoints discard receipts entirely and retain their fleet
+        // maximum only as evidence for the reset workflow.
+        let application_sequence_high_water = match basis {
+            RecoveryDecisionBasis::VerifiedCommittedMajority => {
+                source_evidence.application_sequence
+            }
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint => evidence
+                .iter()
+                .map(RecoveryReplicaEvidence::application_sequence)
+                .max()
+                .unwrap_or(0),
+        };
         let watch_sequence_high_water = evidence
             .iter()
             .map(RecoveryReplicaEvidence::watch_sequence)

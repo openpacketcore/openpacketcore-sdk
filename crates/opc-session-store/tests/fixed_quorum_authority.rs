@@ -403,6 +403,12 @@ async fn open_fixed_cluster(
     (directory, database_paths, stores)
 }
 
+async fn shutdown_fixed_cluster(stores: &[ConsensusSessionStore]) {
+    for store in stores {
+        store.shutdown().await.expect("shut down fixed voter");
+    }
+}
+
 async fn open_fixed_cluster_with_members(
     members: Vec<QuorumReplicaDescriptor>,
     placement_policy: PlacementResiliencePolicy,
@@ -485,6 +491,15 @@ async fn open_fixed_cluster_with_paths(
     let (database_paths, stores, paths) =
         open_fixed_cluster_in_with_paths(directory.path(), member_count, placement_policy).await;
     (directory, database_paths, stores, paths)
+}
+
+fn activate_fixed_recovery_latch(database_path: &std::path::Path) -> rusqlite::Result<()> {
+    let connection = rusqlite::Connection::open(database_path)?;
+    connection.execute(
+        "UPDATE consensus_operator_recovery SET pending_epoch = recovery_epoch + 1, pending_plan_digest = CAST(X'01' || zeroblob(31) AS BLOB), pending_fence_high_water = 0, pending_credential_high_water = 0 WHERE singleton = 1",
+        [],
+    )?;
+    Ok(())
 }
 
 async fn open_fixed_cluster_in(
@@ -946,8 +961,8 @@ async fn file_backed_fixed_five_voter_quorum_reaches_granted_authority() {
 async fn initialized_fixed_three_voter_cluster_reopens_with_durable_authority_and_rpc_readiness() {
     let (directory, _database_paths, stores) =
         open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    shutdown_fixed_cluster(&stores).await;
     drop(stores);
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let (_database_paths, reopened) = open_fixed_cluster_in(
         directory.path(),
@@ -982,6 +997,7 @@ async fn fixed_durable_quorum_reopen_rejects_placement_policy_mismatch() {
         ),
     ] {
         let (directory, database_paths, stores) = open_fixed_cluster(3, initial).await;
+        shutdown_fixed_cluster(&stores).await;
         drop(stores);
         let members = fixed_members(3);
         let topology = fixed_topology_for_local(0, members, reopened).expect("reopen topology");
@@ -1488,17 +1504,8 @@ async fn fixed_recovery_latch_terminates_an_idle_generic_watch_without_an_event(
         .await
         .expect("open idle generic watch before recovery latch activation");
 
-    let connection =
-        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
-    connection
-        .execute(
-            "UPDATE consensus_operator_recovery \
-             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
-             WHERE singleton = 1",
-            [],
-        )
+    activate_fixed_recovery_latch(&database_paths[0])
         .expect("activate durable fixed recovery latch");
-    drop(connection);
 
     let item = tokio::time::timeout(Duration::from_secs(1), watch.next())
         .await
@@ -1546,17 +1553,8 @@ async fn fixed_recovery_latch_during_readiness_barrier_never_grants_traffic() {
         "the detector must hold readiness inside its quorum barrier"
     );
 
-    let connection =
-        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
-    connection
-        .execute(
-            "UPDATE consensus_operator_recovery \
-             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
-             WHERE singleton = 1",
-            [],
-        )
+    activate_fixed_recovery_latch(&database_paths[0])
         .expect("activate durable fixed recovery latch during readiness barrier");
-    drop(connection);
     for target in 1..3 {
         paths
             .get(&(0, target))
@@ -1604,17 +1602,8 @@ async fn fixed_recovery_latch_during_ordinary_read_barrier_never_returns_data() 
         "the detector must hold the ordinary read inside its quorum barrier"
     );
 
-    let connection =
-        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
-    connection
-        .execute(
-            "UPDATE consensus_operator_recovery \
-             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
-             WHERE singleton = 1",
-            [],
-        )
+    activate_fixed_recovery_latch(&database_paths[0])
         .expect("activate durable fixed recovery latch during ordinary read barrier");
-    drop(connection);
     for target in 1..3 {
         paths
             .get(&(0, target))
@@ -1668,17 +1657,8 @@ async fn fixed_recovery_latch_during_mutation_barrier_never_admits_new_lease() {
         "the detector must hold the mutation inside its quorum barrier"
     );
 
-    let connection =
-        rusqlite::Connection::open(&database_paths[0]).expect("open fixed voter database");
-    connection
-        .execute(
-            "UPDATE consensus_operator_recovery \
-             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
-             WHERE singleton = 1",
-            [],
-        )
+    activate_fixed_recovery_latch(&database_paths[0])
         .expect("activate durable fixed recovery latch during mutation barrier");
-    drop(connection);
     for target in 1..3 {
         paths
             .get(&(0, target))
@@ -1772,6 +1752,7 @@ async fn fixed_authority_profile_persists_across_reopen_and_rejects_profile_chan
     )
     .await
     .expect("open fixed store");
+    fixed_store.shutdown().await.expect("shut down fixed store");
     drop(fixed_store);
     let fixed_reopened = ConsensusSessionStore::open_fixed_durable_quorum(
         fixed.clone(),
@@ -1781,6 +1762,10 @@ async fn fixed_authority_profile_persists_across_reopen_and_rejects_profile_chan
     )
     .await
     .expect("reopen fixed store with its persisted authority profile");
+    fixed_reopened
+        .shutdown()
+        .await
+        .expect("shut down reopened fixed store");
     drop(fixed_reopened);
     let fixed_as_dynamic = ConsensusSessionStore::open(
         dynamic.clone(),
@@ -1802,6 +1787,10 @@ async fn fixed_authority_profile_persists_across_reopen_and_rejects_profile_chan
     )
     .await
     .expect("open dynamic store");
+    dynamic_store
+        .shutdown()
+        .await
+        .expect("shut down dynamic store");
     drop(dynamic_store);
     let dynamic_as_fixed = ConsensusSessionStore::open_fixed_durable_quorum(
         fixed.clone(),

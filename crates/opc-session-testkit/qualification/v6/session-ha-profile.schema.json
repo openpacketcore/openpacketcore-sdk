@@ -181,8 +181,8 @@
       ],
       "properties": {
         "consensus_alpn": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "transport_revision": { "type": "integer", "minimum": 1 },
-        "wire_schema_revision": { "type": "integer", "minimum": 1 },
+        "transport_revision": { "const": 5 },
+        "wire_schema_revision": { "const": 5 },
         "error_set_revision": { "type": "integer", "minimum": 1 },
         "consensus_schema_version": { "type": "integer", "minimum": 1 },
         "min_frame_bytes": { "type": "integer", "minimum": 1 },
@@ -294,7 +294,9 @@
         "max_restore_page_records",
         "max_restore_page_payload_bytes",
         "max_restore_examined_rows",
-        "max_restore_sqlite_work_millis"
+        "max_restore_sqlite_work_millis",
+        "local_stored_value_cap_bytes",
+        "consensus_stored_value_cap_bytes"
       ],
       "properties": {
         "operation_timeout_millis": { "const": 10000 },
@@ -308,7 +310,9 @@
         "max_restore_page_records": { "type": "integer", "minimum": 1 },
         "max_restore_page_payload_bytes": { "type": "integer", "minimum": 1 },
         "max_restore_examined_rows": { "type": "integer", "minimum": 1 },
-        "max_restore_sqlite_work_millis": { "type": "integer", "minimum": 1 }
+        "max_restore_sqlite_work_millis": { "type": "integer", "minimum": 1 },
+        "local_stored_value_cap_bytes": { "const": 4259840 },
+        "consensus_stored_value_cap_bytes": { "const": 1048576 }
       }
     },
     "provisional_test_thresholds": {
