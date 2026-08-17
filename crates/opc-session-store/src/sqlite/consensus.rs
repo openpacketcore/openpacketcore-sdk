@@ -1191,6 +1191,9 @@ impl SqliteConsensusCore {
         authority_profile: ConsensusAuthorityProfile,
         fixed_placement_policy: Option<PlacementResiliencePolicy>,
     ) -> Result<Self, SessionConsensusStorageError> {
+        if !cfg!(target_os = "linux") {
+            return Err(SessionConsensusStorageError::UnsupportedPlatform);
+        }
         validate_member_set(&expected_members, false)
             .map_err(|_| SessionConsensusStorageError::InvalidIdentity)?;
         validate_member_bindings(&expected_members, &expected_bindings)

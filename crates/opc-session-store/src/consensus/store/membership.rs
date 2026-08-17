@@ -1186,6 +1186,7 @@ impl ConsensusSessionStore {
         snapshot_dir: impl Into<PathBuf>,
         desired_peers: SessionTopologyTransitionPeers,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::require_dynamic_consensus_platform()?;
         let SessionTopologyCandidateBootstrap {
             storage_anchor,
             current_topology,

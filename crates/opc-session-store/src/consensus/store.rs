@@ -454,6 +454,14 @@ impl fmt::Debug for ConsensusSessionStore {
 }
 
 impl ConsensusSessionStore {
+    fn require_dynamic_consensus_platform() -> Result<(), ConsensusSessionStoreOpenError> {
+        if cfg!(target_os = "linux") {
+            Ok(())
+        } else {
+            Err(ConsensusSessionStoreOpenError::DynamicConsensusUnsupportedPlatform)
+        }
+    }
+
     /// Start one durable Openraft node without yet forming pristine membership.
     ///
     /// `topology` contains only immutable member descriptors. `backend` is this
@@ -468,6 +476,7 @@ impl ConsensusSessionStore {
         snapshot_dir: impl Into<PathBuf>,
         peers: BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::require_dynamic_consensus_platform()?;
         Self::open_with_clock(
             topology,
             backend,
@@ -634,6 +643,7 @@ impl ConsensusSessionStore {
         peers: BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
         operation_timeout: Duration,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::require_dynamic_consensus_platform()?;
         Self::open_with_clock(
             topology,
             backend,
@@ -657,6 +667,7 @@ impl ConsensusSessionStore {
         clock: Arc<dyn Clock>,
         operation_timeout: Duration,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::require_dynamic_consensus_platform()?;
         if operation_timeout.is_zero() || operation_timeout > Duration::from_secs(60) {
             return Err(ConsensusSessionStoreOpenError::InvalidRuntimeConfiguration);
         }
