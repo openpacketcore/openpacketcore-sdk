@@ -14,10 +14,14 @@ build-environment override was used.
   `0ffb7faed75914d3e99f8f9f1a287fbb6cb14aa7`
 - Landed #684/main dependency tree:
   `189d22525fe6feb3f895ca5e5c922d2a6319e0a6`
-- Last published #696 checkpoint before this hardening pass:
-  `25c41eade3ac3aa4155fc2f1987ed620c33fc3ab` (tree
-  `5105fc89f5fd87dc06a6af541a2ea5d2369381c4`). The next published
-  checkpoint records the exact head/tree for the evidence below.
+- Store-hardening preservation checkpoint:
+  `fbf0f55429103efbbebad009db0231b57af754fd` (tree
+  `8b1bad3dcd5088d9e097476adde988c454019d22`), followed by the
+  formatting-only `bd8580c868610ea71eaf34ca1c582dc54b5d1458` (tree
+  `147bcb134ae7df1bd348d33c777e56c8c65d1599`). Exact-head audit then
+  found that the first removal mutation below had accidentally remained in
+  both published commits; the current source restores the typed outcome and
+  the restoration digest pinned below before any #695 integration.
 - Included before #695: generic `opc-session-store` model, consensus admission,
   SQLite apply/persistence/recovery, snapshots, documentation, and tests.
 - Excluded before #695 publishes: `opc-session-net`, any wire revision, and all
@@ -170,15 +174,15 @@ were then checked against the values captured before the mutation sequence:
 They are rerun once more after #695 integration at the final exact head; this
 pre-integration evidence is intentionally not the final merge gate.
 
-## Current working-tree requalification plan
+## Restored mutation integrity and final requalification plan
 
 The historical mutation results above are retained evidence, not a substitute
-for the final current-head qualification. Before the store-only checkpoint,
-and again after the normal #695/origin-main integration, run one mutation at a
-time, immediately restore it, and verify the source digest before starting the
-next mutation. This plan has been prepared against the current uncommitted
-store-only tree; it is deliberately recorded as a plan until those commands
-have actually run.
+for the final current-head qualification. Exact-head review of the preservation
+checkpoint detected that the OutcomeUnknown mutation itself had been retained;
+it was restored before continuing. The resulting source digests match the
+pre-mutation restoration baseline. After the normal #695/origin-main
+integration, run one mutation at a time, immediately restore it, and verify
+these source digests before starting the next mutation.
 
 ```text
 4e090668dd34cfe70564787f4e43980b94fd9e698a0ae50542692ccd1b94107b  crates/opc-session-store/src/sqlite/consensus.rs
@@ -309,10 +313,11 @@ Update/RefreshTtl/Delete without renewing the lease or creating a record,
 fence, application sequence, or watch effect.
 
 These are retained historical store-side gates, not the final exact-head
-verification. The hardened pre-#695 checkpoint is being rerun under the same
-commands before publication, and every gate is rerun after the normal #695
-merge together with workspace CI and least-authority consumer transport
-evidence.
+verification. The hardened pre-#695 work was published early for durability;
+its exact heavy-gate rerun remains pending behind the active #695/urgent shared
+build queue. Every gate, including all five restored mutations, is rerun after
+the normal #695 merge together with workspace CI and least-authority consumer
+transport evidence.
 
 ## Published-#684 recovery compatibility
 
