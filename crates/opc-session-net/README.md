@@ -245,7 +245,9 @@ mutation or rebuild authority beside Openraft.
 mutual TLS with the unchanged `opc-session-consumer/1` ALPN and exact consumer
 transport revision 2. Revision 1 will not fall back or interoperate. The
 unreleased SDK requires one coordinated, drained client/listener cutover; there
-is no dual mode. This does not add `RemoteSessionBackend` or any
+is no dual mode. Revision-2 private JSON DTO bytes are canonical; reordered or
+otherwise noncanonical encodings, aliases, omissions, and unknown fields fail
+closed. This does not add `RemoteSessionBackend` or any
 consensus/replication/snapshot/rebuild/membership/admin authority, and it
 explicitly excludes #696 atomic transition and product composition.
 
@@ -266,6 +268,10 @@ delay: the lifecycle backoff floor (50 ms by default) plus bounded jitter of
 at most 25 ms, clipped to its logical deadline. The existing 5-second idle,
 10-second operation, 16 MiB frame, 256-server-connection, and TLS lifecycle
 bounds remain in force; shutdown drain is at most 5 seconds.
+One constant pool-wide maintenance task (not one task per lane or subscriber)
+physically retires cached lanes at the earliest idle/lifecycle deadline and on
+an accepted material-epoch or explicit-generation change. A rejected
+same-epoch material publication retains the authenticated lane.
 
 Only `NotTransmitted` may be automatically retried, and only with the identical
 request ID and body. Anything possibly written is `OutcomeUnknown`, evicts the

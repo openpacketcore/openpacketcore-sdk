@@ -437,7 +437,9 @@ visible unless a separate approved storage layer protects them.
 boundary. It retains the `opc-session-consumer/1` ALPN and advances the exact
 consumer transport revision from 1 to 2. There is no fallback, dual mode, or
 mixed-revision path: clients and listeners must be drained and cut over
-coordinately. This boundary remains separate from consensus and the quarantined
+coordinately. Revision-2 private JSON DTO bytes are canonical; reordered or
+otherwise noncanonical encodings, aliases, omissions, and unknown fields fail
+closed. This boundary remains separate from consensus and the quarantined
 legacy backend protocol; it exposes no `RemoteSessionBackend`, consensus,
 replication, snapshot, rebuild, membership, or admin API, and does not include
 #696 atomic transition or product composition.
@@ -455,6 +457,11 @@ between-attempt delay: the lifecycle backoff floor (50 ms by default) plus at
 most 25 ms jitter, clipped to its logical deadline. Existing 5-second idle,
 10-second operation, 16 MiB frame, 256 listener-connection, and TLS lifecycle
 bounds are retained; consumer shutdown drain is at most 5 seconds.
+Exactly one pool-wide maintenance task autonomously removes cached lanes at the
+earliest idle/lifecycle deadline and after an accepted material-epoch or
+explicit-generation change; its cardinality does not scale with lanes,
+subscribers, or records. A rejected same-epoch publication does not retire a
+healthy lane.
 
 Only `NotTransmitted` may automatically retry, with an identical request ID and
 body. A possibly written call is `OutcomeUnknown`, evicts its lane, and is never

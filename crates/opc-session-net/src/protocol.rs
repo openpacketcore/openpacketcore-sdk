@@ -3550,7 +3550,18 @@ where
         writer.flush().await.map_err(ProtocolError::Io)
     };
     match tokio::time::timeout_at(deadline, write).await {
-        Ok(result) => result.map_err(FrameWriteError::MayHaveWritten),
+        Ok(result) => {
+            let result = result.map_err(FrameWriteError::MayHaveWritten)?;
+            // Tokio polls the inner write before its deadline future. A task
+            // resumed at or after the absolute boundary must not publish a
+            // late success; the prefix may already have crossed the transport
+            // boundary, so retain the conservative MayHaveWritten class.
+            if tokio::time::Instant::now() >= deadline {
+                Err(FrameWriteError::MayHaveWritten(write_timeout_error()))
+            } else {
+                Ok(result)
+            }
+        }
         Err(_elapsed) => Err(FrameWriteError::MayHaveWritten(write_timeout_error())),
     }
 }
@@ -3847,7 +3858,7 @@ where
         .map_err(ProtocolError::Serialization)
 }
 
-async fn read_authenticated_frame_payload_within<R>(
+pub(crate) async fn read_authenticated_frame_payload_within<R>(
     reader: &mut R,
     max_frame_size: usize,
     timeout: std::time::Duration,
@@ -3858,10 +3869,24 @@ where
     let deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .ok_or(ProtocolError::InvalidWireValue)?;
+    read_authenticated_frame_payload_until(reader, max_frame_size, deadline).await
+}
+
+pub(crate) async fn read_authenticated_frame_payload_until<R>(
+    reader: &mut R,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+) -> Result<Option<Vec<u8>>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut len_bytes = [0_u8; 4];
     match tokio::time::timeout_at(deadline, reader.read_exact(&mut len_bytes[..1])).await {
         Ok(result) => {
             result.map_err(ProtocolError::Io)?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(active_frame_timeout_error());
+            }
         }
         Err(_) => return Ok(None),
     }
@@ -3887,13 +3912,20 @@ where
     match tokio::time::timeout_at(deadline, reader.read_exact(bytes)).await {
         Ok(result) => {
             result.map_err(ProtocolError::Io)?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(active_frame_timeout_error());
+            }
             Ok(())
         }
-        Err(_) => Err(ProtocolError::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timed out reading active frame from peer",
-        ))),
+        Err(_) => Err(active_frame_timeout_error()),
     }
+}
+
+fn active_frame_timeout_error() -> ProtocolError {
+    ProtocolError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out reading active frame from peer",
+    ))
 }
 
 /// Post-authentication request decoder that distinguishes a no-byte idle
@@ -5553,6 +5585,47 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct LateReadyWriteState {
+        flush_waiting: AtomicBool,
+        flush_ready: AtomicBool,
+    }
+
+    struct LateReadyWriter {
+        bytes: Vec<u8>,
+        state: std::sync::Arc<LateReadyWriteState>,
+    }
+
+    impl tokio::io::AsyncWrite for LateReadyWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.bytes.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.state.flush_waiting.store(true, Ordering::Release);
+            if self.state.flush_ready.load(Ordering::Acquire) {
+                std::task::Poll::Ready(Ok(()))
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
     #[tokio::test]
     async fn bounded_storage_and_counter_stop_cooperatively_with_distinct_errors() {
         let storage_cancellation = AtomicBool::new(false);
@@ -5646,6 +5719,41 @@ mod tests {
             .expect_err("unrepresentable relative deadline must fail without panicking");
         assert!(matches!(error, ProtocolError::InvalidWireValue));
         assert!(writer.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_at_bounded_write_deadline_is_never_success() {
+        let state = std::sync::Arc::new(LateReadyWriteState::default());
+        let mut writer = LateReadyWriter {
+            bytes: Vec::new(),
+            state: std::sync::Arc::clone(&state),
+        };
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(10))
+            .expect("test deadline");
+        let classified = {
+            let write = write_frame_bounded_until_classified(
+                &mut writer,
+                &Response::WatchStream,
+                MIN_NEGOTIATED_FRAME_SIZE,
+                deadline,
+            );
+            tokio::pin!(write);
+            assert!(futures_util::poll!(&mut write).is_pending());
+            assert!(state.flush_waiting.load(Ordering::Acquire));
+
+            tokio::time::advance(Duration::from_millis(10)).await;
+            state.flush_ready.store(true, Ordering::Release);
+            write
+                .await
+                .expect_err("a write completing at its boundary must stay ambiguous")
+        };
+        assert!(matches!(
+            classified,
+            FrameWriteError::MayHaveWritten(ProtocolError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(!writer.bytes.is_empty(), "the write boundary was crossed");
     }
 
     #[tokio::test]

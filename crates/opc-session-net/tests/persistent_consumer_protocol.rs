@@ -21,6 +21,7 @@ use opc_session_store::{
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::SpiffeId;
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -194,11 +195,54 @@ where
     writer.flush().await.expect("flush frame");
 }
 
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "body", rename_all = "snake_case")]
+enum CanonicalConsumerWireResponse {
+    HelloAck(CanonicalConsumerHelloAck),
+    Response(CanonicalConsumerCallResponse),
+}
+
+#[derive(Serialize)]
+struct CanonicalConsumerHelloAck {
+    transport_revision: u16,
+    scope: SessionConsumerScope,
+}
+
+#[derive(Serialize)]
+struct CanonicalConsumerCallResponse {
+    // Keep this as a JSON scalar so the zero-correlation adversary can reach
+    // the production decoder instead of being rejected by the fixture.
+    correlation: Value,
+    response: SessionConsumerResponse,
+}
+
+fn canonical_response_payload(value: &Value) -> Vec<u8> {
+    let response = match value["kind"].as_str() {
+        Some("hello_ack") => CanonicalConsumerWireResponse::HelloAck(CanonicalConsumerHelloAck {
+            transport_revision: serde_json::from_value(value["body"]["transport_revision"].clone())
+                .expect("HelloAck revision"),
+            scope: serde_json::from_value(value["body"]["scope"].clone()).expect("HelloAck scope"),
+        }),
+        Some("response") => {
+            CanonicalConsumerWireResponse::Response(CanonicalConsumerCallResponse {
+                correlation: value["body"]["correlation"].clone(),
+                response: serde_json::from_value(value["body"]["response"].clone())
+                    .expect("typed consumer response"),
+            })
+        }
+        other => panic!("unsupported test response kind: {other:?}"),
+    };
+    serde_json::to_vec(&response).expect("test JSON encodes")
+}
+
 async fn write_value<W>(writer: &mut W, value: &Value)
 where
     W: AsyncWrite + Unpin,
 {
-    let payload = serde_json::to_vec(value).expect("test JSON encodes");
+    // The revision-2 transport owns canonical private DTO bytes. Build those
+    // bytes from typed public body values so each adversary reaches the exact
+    // correlation/frame condition it intends to test.
+    let payload = canonical_response_payload(value);
     assert!(
         payload.len() <= MAX_NEGOTIATED_FRAME_SIZE,
         "test frame stays capped"
@@ -350,10 +394,9 @@ async fn malformed_trailing_and_oversized_response_frames_fail_closed() {
             match case {
                 "malformed" => write_payload(&mut tls, br#"{"#).await,
                 "trailing" => {
-                    let mut payload = serde_json::to_vec(&capability_response(
+                    let mut payload = canonical_response_payload(&capability_response(
                         call["body"]["correlation"].clone(),
-                    ))
-                    .expect("response encodes");
+                    ));
                     payload.extend_from_slice(br#"{}"#);
                     write_payload(&mut tls, &payload).await;
                 }

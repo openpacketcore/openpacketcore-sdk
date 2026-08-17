@@ -61,6 +61,21 @@ impl RotatableClientMaterial {
             opc_tls::TlsMaterialAvailability::Ready
         );
     }
+
+    pub(crate) fn publish_rejected_update(&self) {
+        let previous = self.config.material_status().epoch();
+        self.source.send_replace(None);
+        let current = self.config.material_status();
+        assert_eq!(
+            current.epoch(),
+            previous,
+            "a rejected test publication must retain the admitted epoch"
+        );
+        assert_eq!(
+            current.availability(),
+            opc_tls::TlsMaterialAvailability::RetainingLastGood
+        );
+    }
 }
 
 impl RotatableServerMaterial {

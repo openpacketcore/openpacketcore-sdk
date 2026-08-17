@@ -1058,7 +1058,9 @@ closed until those campaigns pass.
 Its mutual-TLS ALPN remains `opc-session-consumer/1`, while its exact transport
 revision advances from 1 to 2 with no fallback or dual mode. Drain consumer
 clients and listeners for one coordinated cutover; revision-1 and revision-2
-consumer peers must never coexist. This does not admit the legacy
+consumer peers must never coexist. Revision-2 private JSON DTO bytes are
+canonical; reordered or otherwise noncanonical encodings, aliases, omissions,
+and unknown fields fail closed. This does not admit the legacy
 `RemoteSessionBackend` surface or consensus, replication, snapshot, rebuild,
 membership, or admin authority, and explicitly excludes #696 atomic transition
 and product composition.
@@ -1076,6 +1078,11 @@ re-establishment, one between-attempt lifecycle backoff floor (50 ms by default)
 plus at most 25 ms jitter clipped to the logical deadline, 5-second shutdown
 drain, and the existing 5-second idle, 10-second operation, 16 MiB frame, 256
 listener-connection, and TLS lifecycle bounds.
+Verify that each logical pool owns one maintenance task which autonomously
+closes cached lanes at the earliest idle/lifecycle deadline and on accepted
+material-epoch or explicit-generation changes. The task count must not scale
+with lanes or subscribers, and a rejected same-epoch material publication must
+retain healthy authenticated capacity.
 
 Only `NotTransmitted` may automatically retry, with the same request ID and
 body. A possibly written call is `OutcomeUnknown`: evict its lane and never

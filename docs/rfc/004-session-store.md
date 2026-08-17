@@ -1609,7 +1609,9 @@ fallback, negotiate a common revision, or multiplex either other protocol as
 equivalent consumer authority. Revision 1 and revision 2 do not interoperate.
 Because this SDK is unreleased, deployments MUST drain consumer clients and
 listeners, then make one coordinated revision-2 cutover; fallback, dual-mode,
-and mixed-revision consumer operation are unsupported.
+and mixed-revision consumer operation are unsupported. Revision-2 private JSON
+DTO bytes are canonical; reordered or otherwise noncanonical encodings,
+aliases, omissions, and unknown fields MUST fail closed.
 
 The consumer listener authenticates the peer from the live mTLS connection and
 authorizes it only through the store-issued current-member manifest and the
@@ -1665,6 +1667,12 @@ clipped to the logical deadline. Reauthentication, material
 changes, certificate expiry, idle retirement, cancellation, malformed frames,
 EOF, or an uncertain stream position terminate the connection/watch and release
 its transport task slot; they do not create another request on that connection.
+"Material changes" here means an accepted material-epoch change; a rejected
+publication that retains the admitted epoch MUST NOT interrupt an active frame
+or healthy watch. Each logical request pool MUST use exactly one maintenance
+task to remove cached lanes autonomously at the earliest idle/lifecycle
+deadline and on accepted epoch or explicit-generation changes. Maintenance
+task/table cardinality MUST NOT scale with lanes, subscribers, or records.
 
 The caller owns the request ID for every mutation or lease operation. Only a
 failure classified as `NotTransmitted` may be automatically retried, and then
