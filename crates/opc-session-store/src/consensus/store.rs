@@ -3322,7 +3322,9 @@ fn unsupported_fenced_transition() -> StoreError {
 fn consensus_outcome_unavailable(intent: &SessionMutationIntent) -> StoreError {
     match intent {
         SessionMutationIntent::CompareAndSet(_) => StoreError::CasIdempotencyOutcomeUnavailable,
-        SessionMutationIntent::FencedTransition(_) => StoreError::BackendOperationOutcomeUnavailable,
+        SessionMutationIntent::FencedTransition(_) => {
+            StoreError::BackendOperationOutcomeUnavailable
+        }
         _ => StoreError::BackendOperationOutcomeUnavailable,
     }
 }
