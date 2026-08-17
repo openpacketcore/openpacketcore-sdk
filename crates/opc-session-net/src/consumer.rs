@@ -122,6 +122,62 @@ fn consumer_wire_frame_size(size: usize) -> Result<u32, ProtocolError> {
     u32::try_from(size).map_err(|_| ProtocolError::InvalidWireValue)
 }
 
+// Return true only when the JSON arrays for encrypted payload bytes alone
+// exceed the complete negotiated request-frame budget. The exact bounded
+// encoder remains authoritative for every other request. This lower bound is
+// allocation-free and prevents an obviously oversized mutation from spending
+// its operation budget materializing a frame that cannot be transmitted.
+// Payload contents are inspected only to count their one-, two-, or
+// three-digit JSON width; they are never retained or exposed.
+fn consumer_payload_fragments_exceed_frame(
+    request: &SessionConsumerRequest,
+    max_frame_size: usize,
+) -> bool {
+    fn debit_payload(remaining: &mut usize, payload: &[u8]) -> bool {
+        // `[0,0]` needs at least two bytes per element plus one byte shared by
+        // the opening bracket and the final closing bracket. Account this
+        // content-independent floor before scanning any values, so extremely
+        // large payloads reject in constant time.
+        let Some(base) = payload
+            .len()
+            .checked_mul(2)
+            .and_then(|size| size.checked_add(1))
+        else {
+            return true;
+        };
+        let Some(after_base) = remaining.checked_sub(base) else {
+            return true;
+        };
+        *remaining = after_base;
+
+        // Decimal JSON adds one byte for values >= 10 and another for values
+        // >= 100. Stop as soon as the payload-only lower bound crosses the
+        // whole-frame budget.
+        for byte in payload {
+            let extra = usize::from(*byte >= 10) + usize::from(*byte >= 100);
+            let Some(after_extra) = remaining.checked_sub(extra) else {
+                return true;
+            };
+            *remaining = after_extra;
+        }
+        false
+    }
+
+    let mut remaining = max_frame_size;
+    match request.operation() {
+        SessionConsumerOperation::CompareAndSet { op } => {
+            debit_payload(&mut remaining, op.new_record.payload.as_bytes())
+        }
+        SessionConsumerOperation::Batch { ops } => ops.iter().any(|operation| match operation {
+            SessionOp::CompareAndSet(op) => {
+                debit_payload(&mut remaining, op.new_record.payload.as_bytes())
+            }
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
 fn valid_consumer_operation_timeout(timeout: Duration) -> bool {
     !timeout.is_zero() && timeout <= DEFAULT_CONSUMER_OPERATION_TIMEOUT
 }
@@ -2926,6 +2982,11 @@ impl StatelessSessionConsumerClient {
         if !connection.current(&self.tls_config, &self.reauthentication) {
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Unavailable,
+            ));
+        }
+        if consumer_payload_fragments_exceed_frame(request, connection.request_frame_size) {
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Protocol,
             ));
         }
         let correlation = connection
@@ -7608,7 +7669,8 @@ mod tests {
 
     use super::{
         classify_call_write_error, complete_before_deadline, consumer_fresh_admission_is_current,
-        consumer_response_fits, consumer_watch_error_is_legal, decode_consumer_frame_payload,
+        consumer_payload_fragments_exceed_frame, consumer_response_fits,
+        consumer_watch_error_is_legal, decode_consumer_frame_payload,
         ensure_pre_request_budget_remaining, exact_correlation, lease_error_matches_operation,
         lease_response, mutation_response, persistent_execute_error,
         publish_monotonic_shutdown_phase, queued_consumer_watch_stream,
@@ -8312,6 +8374,64 @@ mod tests {
                 "a complete {rejection:?} rejection proves the lease mutation was not dispatched"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn payload_fragment_preflight_is_an_exact_safe_lower_bound() {
+        let key = SessionKey {
+            tenant: TenantId::new("consumer-payload-preflight").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"consumer-payload-preflight")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let owner = OwnerId::new("consumer-payload-owner").expect("test owner");
+        let lease = FakeSessionBackend::new()
+            .acquire(&key, owner.clone(), Duration::from_secs(30))
+            .await
+            .expect("test lease");
+        let payload = [0, 9, 10, 99, 100, 255];
+        let op = CompareAndSet {
+            key: key.clone(),
+            lease,
+            expected_generation: None,
+            new_record: StoredSessionRecord {
+                key,
+                generation: Generation::new(1),
+                owner,
+                fence: FenceToken::new(1),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::from_static("consumer-payload-preflight"),
+                expires_at: None,
+                payload: EncryptedSessionPayload::new(&payload),
+            },
+        };
+        let single = SessionConsumerRequest::new(
+            scope(),
+            SessionConsumerRequestId::new(),
+            SessionConsumerOperation::CompareAndSet {
+                op: Box::new(op.clone()),
+            },
+        );
+
+        // `[0,9,10,99,100,255]` is exactly 19 bytes. Equality is retained for
+        // the exact frame encoder; one byte below is provably impossible.
+        assert!(!consumer_payload_fragments_exceed_frame(&single, 19));
+        assert!(consumer_payload_fragments_exceed_frame(&single, 18));
+
+        let batch = SessionConsumerRequest::new(
+            scope(),
+            SessionConsumerRequestId::new(),
+            SessionConsumerOperation::Batch {
+                ops: vec![
+                    SessionOp::CompareAndSet(op.clone()),
+                    SessionOp::CompareAndSet(op),
+                ],
+            },
+        );
+        assert!(!consumer_payload_fragments_exceed_frame(&batch, 38));
+        assert!(consumer_payload_fragments_exceed_frame(&batch, 37));
     }
 
     #[tokio::test]

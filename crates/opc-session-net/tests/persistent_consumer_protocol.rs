@@ -658,12 +658,22 @@ async fn negotiated_reduced_request_cap_rejects_a_large_mutation_before_transmis
     );
 
     let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
-    assert!(matches!(
-        client.execute(&request).await,
+    match client.execute(&request).await {
         Err(PersistentSessionConsumerExecuteError::NotTransmitted {
-            cause: SessionConsumerClientError::Protocol
-        })
-    ));
+            cause: SessionConsumerClientError::Protocol,
+        }) => {}
+        Err(PersistentSessionConsumerExecuteError::NotTransmitted { cause }) => {
+            panic!("oversized request had unexpected not-transmitted class: {cause:?}")
+        }
+        Err(PersistentSessionConsumerExecuteError::ReadUnavailable { cause }) => {
+            panic!("oversized mutation had unexpected read-only class: {cause:?}")
+        }
+        Err(PersistentSessionConsumerExecuteError::OutcomeUnknown { .. }) => {
+            panic!("oversized request crossed the transport boundary")
+        }
+        Err(_) => panic!("oversized request had an unknown future error class"),
+        Ok(_) => panic!("oversized request unexpectedly received a response"),
+    }
     let diagnostics = client.diagnostics().await;
     assert_eq!(diagnostics.setup_successes, 1);
     assert_eq!(diagnostics.failures, 1);
