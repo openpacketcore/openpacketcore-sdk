@@ -18,10 +18,14 @@ use opc_session_net::{
     SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
-    BackendCapabilities, OwnerId, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-    SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerOperation,
+    BackendCapabilities, CompareAndSet, CompareAndSetResult, EncryptedSessionPayload,
+    FakeSessionBackend, FenceToken, Generation, OwnerId, RestoreScanCursor,
+    RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, RestoreScanScope,
+    SessionConsensusClusterId, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+    SessionConsensusIdentity, SessionConsumerBatchResult, SessionConsumerOperation,
     SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
-    SessionConsumerResponse, SessionConsumerScope, SessionKey, SessionKeyType,
+    SessionConsumerResponse, SessionConsumerScope, SessionKey, SessionKeyType, SessionLeaseManager,
+    SessionOp, StateClass, StateType, StoredSessionRecord,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
@@ -124,6 +128,41 @@ fn mutation_request(
             owner: OwnerId::new("protocol-boundary-owner").expect("test owner"),
             ttl: Duration::from_secs(30),
         },
+    )
+}
+
+fn semantic_key(stable_id: &'static [u8]) -> SessionKey {
+    SessionKey {
+        tenant: TenantId::new("semantic-boundary").expect("test tenant"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from_static(stable_id)
+            .try_into()
+            .expect("bounded test stable ID"),
+    }
+}
+
+fn semantic_record(key: SessionKey, owner: OwnerId, fence: FenceToken) -> StoredSessionRecord {
+    StoredSessionRecord {
+        key,
+        generation: Generation::new(1),
+        owner,
+        fence,
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("persistent-semantic-test"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new(b"opaque-test-payload"),
+    }
+}
+
+fn semantic_request(
+    operation: SessionConsumerOperation,
+    request_byte: u8,
+) -> SessionConsumerRequest {
+    SessionConsumerRequest::new(
+        scope(1),
+        SessionConsumerRequestId::from_bytes([request_byte; 16]),
+        operation,
     )
 }
 
@@ -411,6 +450,57 @@ fn assert_typed_protocol_error(
     assert!(!rendered.contains(client_spiffe));
 }
 
+async fn assert_malicious_semantic_response_is_unconfirmed(
+    case: &str,
+    request: SessionConsumerRequest,
+    response: SessionConsumerResponse,
+) {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe(&format!("semantic-{case}-server"));
+    let client_spiffe = spiffe(&format!("semantic-{case}-client"));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind malicious listener");
+    let address = listener.local_addr().expect("listener address");
+    let authenticated = pki.server_config(&server_spiffe);
+    let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+    let expected_request = serde_json::to_value(&request).expect("request encodes");
+    let server = tokio::spawn(async move {
+        let (mut tls, call) =
+            accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+        assert_eq!(
+            call["body"]["request"], expected_request,
+            "the malicious response is bound to the exact tested request"
+        );
+        let response = json!({
+            "kind": "response",
+            "body": {
+                "correlation": call["body"]["correlation"].clone(),
+                "response": serde_json::to_value(response).expect("semantic response encodes"),
+            },
+        });
+        write_value(&mut tls, &response).await;
+    });
+    let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+    let request_id = request.request_id();
+    assert!(matches!(
+        client.execute(&request).await,
+        Err(PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id: returned })
+            if returned == request_id
+    ));
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(
+        diagnostics.successes, 0,
+        "malformed peer data is never a success"
+    );
+    assert_eq!(
+        diagnostics.reconnects, 1,
+        "the poisoned lane is never recycled"
+    );
+    client.shutdown().await;
+    server.await.expect("malicious server");
+}
+
 #[tokio::test]
 async fn hello_ack_revision_and_scope_mismatches_fail_closed_without_a_call() {
     for wrong in ["revision", "scope"] {
@@ -445,7 +535,7 @@ async fn hello_ack_revision_and_scope_mismatches_fail_closed_without_a_call() {
 }
 
 #[tokio::test]
-async fn partial_hello_ack_expires_at_the_authenticated_idle_bound() {
+async fn partial_hello_ack_expires_at_the_configured_setup_bound() {
     for boundary in ["prefix", "payload"] {
         let pki = TestPki::new();
         let server_spiffe = spiffe(&format!("partial-hello-ack-{boundary}-server"));
@@ -461,7 +551,10 @@ async fn partial_hello_ack_expires_at_the_authenticated_idle_bound() {
             let hello = read_value(&mut tls).await;
             assert_eq!(hello["kind"], "hello", "client starts with consumer Hello");
             write_partial_frame(&mut tls, boundary).await;
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            // Hello is authenticated setup rather than an idle lane. Keep the
+            // peer silent past the fixture's 500ms setup cap, independently
+            // of its much shorter active-frame idle timeout.
+            tokio::time::sleep(Duration::from_millis(750)).await;
         });
         let client = persistent_client_with_short_active_frame_idle(
             &pki,
@@ -471,9 +564,9 @@ async fn partial_hello_ack_expires_at_the_authenticated_idle_bound() {
             scope(1),
         );
         assert_eq!(
-            tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, client.capabilities())
+            tokio::time::timeout(Duration::from_secs(1), client.capabilities())
                 .await
-                .expect("partial HelloAck obeys the short authenticated idle bound"),
+                .expect("partial HelloAck obeys the configured setup bound"),
             Err(SessionConsumerClientError::Deadline)
         );
         let diagnostics = client.diagnostics().await;
@@ -524,6 +617,268 @@ async fn zero_future_and_wrong_variant_responses_fail_closed() {
         assert_typed_protocol_error(client.capabilities().await, &server_spiffe, &client_spiffe);
         server.await.expect("malicious server");
     }
+}
+
+#[tokio::test]
+async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_the_lane() {
+    let requested_key = semantic_key(b"requested-key");
+    let wrong_key = semantic_key(b"wrong-key");
+    let owner = OwnerId::new("semantic-owner").expect("test owner");
+    let wrong_owner = OwnerId::new("wrong-semantic-owner").expect("test owner");
+
+    assert_malicious_semantic_response_is_unconfirmed(
+        "get-key",
+        semantic_request(
+            SessionConsumerOperation::Get {
+                key: requested_key.clone(),
+            },
+            1,
+        ),
+        SessionConsumerResponse::Get(Ok(Some(semantic_record(
+            wrong_key.clone(),
+            owner.clone(),
+            FenceToken::new(1),
+        )))),
+    )
+    .await;
+    assert_malicious_semantic_response_is_unconfirmed(
+        "get-ambiguity",
+        semantic_request(
+            SessionConsumerOperation::Get {
+                key: requested_key.clone(),
+            },
+            2,
+        ),
+        SessionConsumerResponse::Get(Err(
+            opc_session_store::SessionConsumerStoreError::OutcomeUnavailable,
+        )),
+    )
+    .await;
+
+    let backend = FakeSessionBackend::new();
+    let lease = backend
+        .acquire(&requested_key, owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("test lease");
+    let cas = CompareAndSet {
+        key: requested_key.clone(),
+        lease: lease.clone(),
+        expected_generation: None,
+        new_record: semantic_record(requested_key.clone(), owner.clone(), lease.fence()),
+    };
+    assert_malicious_semantic_response_is_unconfirmed(
+        "cas-conflict-key",
+        semantic_request(
+            SessionConsumerOperation::CompareAndSet { op: Box::new(cas) },
+            3,
+        ),
+        SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Conflict {
+            current: Some(semantic_record(
+                wrong_key.clone(),
+                owner.clone(),
+                FenceToken::new(1),
+            )),
+        })),
+    )
+    .await;
+
+    let wrong_lease = backend
+        .acquire(&wrong_key, wrong_owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("wrong-key test lease");
+    assert_malicious_semantic_response_is_unconfirmed(
+        "acquire-key-owner",
+        semantic_request(
+            SessionConsumerOperation::AcquireLease {
+                key: requested_key.clone(),
+                owner: owner.clone(),
+                ttl: Duration::from_secs(30),
+            },
+            4,
+        ),
+        SessionConsumerResponse::AcquireLease(Ok(wrong_lease)),
+    )
+    .await;
+
+    let mut forged_renewal = serde_json::to_value(&lease).expect("lease encodes");
+    forged_renewal["key"] = serde_json::to_value(&wrong_key).expect("wrong key encodes");
+    forged_renewal["owner"] = serde_json::to_value(&wrong_owner).expect("wrong owner encodes");
+    forged_renewal["fence"] = json!(lease.fence().get() + 1);
+    forged_renewal["credential_id"] = json!(lease.credential_id() + 1);
+    let forged_renewal = serde_json::from_value(forged_renewal).expect("forged lease decodes");
+    assert_malicious_semantic_response_is_unconfirmed(
+        "renew-key-owner-fence-credential",
+        semantic_request(
+            SessionConsumerOperation::RenewLease {
+                lease: lease.clone(),
+                ttl: Duration::from_secs(30),
+            },
+            5,
+        ),
+        SessionConsumerResponse::RenewLease(Ok(forged_renewal)),
+    )
+    .await;
+
+    assert_malicious_semantic_response_is_unconfirmed(
+        "batch-empty",
+        semantic_request(
+            SessionConsumerOperation::Batch {
+                ops: vec![SessionOp::Get {
+                    key: requested_key.clone(),
+                }],
+            },
+            6,
+        ),
+        SessionConsumerResponse::Batch(Ok(Vec::new())),
+    )
+    .await;
+    assert_malicious_semantic_response_is_unconfirmed(
+        "batch-read-ambiguity",
+        semantic_request(
+            SessionConsumerOperation::Batch {
+                ops: vec![SessionOp::Get {
+                    key: requested_key.clone(),
+                }],
+            },
+            7,
+        ),
+        SessionConsumerResponse::Batch(Err(
+            opc_session_store::SessionConsumerStoreError::OutcomeUnavailable,
+        )),
+    )
+    .await;
+    assert_malicious_semantic_response_is_unconfirmed(
+        "batch-reordered",
+        semantic_request(
+            SessionConsumerOperation::Batch {
+                ops: vec![
+                    SessionOp::Get {
+                        key: requested_key.clone(),
+                    },
+                    SessionOp::Get {
+                        key: wrong_key.clone(),
+                    },
+                ],
+            },
+            8,
+        ),
+        SessionConsumerResponse::Batch(Ok(vec![
+            SessionConsumerBatchResult::Get(Ok(Some(semantic_record(
+                wrong_key.clone(),
+                owner.clone(),
+                FenceToken::new(1),
+            )))),
+            SessionConsumerBatchResult::Get(Ok(Some(semantic_record(
+                requested_key.clone(),
+                owner.clone(),
+                FenceToken::new(1),
+            )))),
+        ])),
+    )
+    .await;
+    assert_malicious_semantic_response_is_unconfirmed(
+        "batch-wrong-variant",
+        semantic_request(
+            SessionConsumerOperation::Batch {
+                ops: vec![SessionOp::Get {
+                    key: requested_key.clone(),
+                }],
+            },
+            9,
+        ),
+        SessionConsumerResponse::Batch(Ok(vec![SessionConsumerBatchResult::CompareAndSet(Ok(
+            CompareAndSetResult::Success,
+        ))])),
+    )
+    .await;
+    assert_malicious_semantic_response_is_unconfirmed(
+        "batch-wrong-key",
+        semantic_request(
+            SessionConsumerOperation::Batch {
+                ops: vec![SessionOp::Get {
+                    key: requested_key.clone(),
+                }],
+            },
+            10,
+        ),
+        SessionConsumerResponse::Batch(Ok(vec![SessionConsumerBatchResult::Get(Ok(Some(
+            semantic_record(wrong_key.clone(), owner.clone(), FenceToken::new(1)),
+        )))])),
+    )
+    .await;
+
+    let mut wrong_cursor_page =
+        RestoreScanPage::new(Vec::new(), 1, Some(RestoreScanCursor::from_offset(1)));
+    wrong_cursor_page.cursor_profile = RestoreScanCursorProfile::DurableOpaqueV1;
+    assert_malicious_semantic_response_is_unconfirmed(
+        "restore-cursor",
+        semantic_request(
+            SessionConsumerOperation::ScanRestoreRecords {
+                request: RestoreScanRequest::all(1),
+            },
+            11,
+        ),
+        SessionConsumerResponse::ScanRestoreRecords(Ok(wrong_cursor_page)),
+    )
+    .await;
+
+    let mut wrong_scope = RestoreScanScope::all();
+    wrong_scope.tenant = Some(TenantId::new("requested-tenant").expect("test tenant"));
+    let mut wrong_scope_page = RestoreScanPage::new(
+        vec![semantic_record(
+            wrong_key.clone(),
+            owner.clone(),
+            FenceToken::new(1),
+        )],
+        0,
+        None,
+    );
+    wrong_scope_page.cursor_profile = RestoreScanCursorProfile::DurableOpaqueV1;
+    assert_malicious_semantic_response_is_unconfirmed(
+        "restore-scope",
+        semantic_request(
+            SessionConsumerOperation::ScanRestoreRecords {
+                request: RestoreScanRequest {
+                    scope: wrong_scope,
+                    cursor: None,
+                    limit: 1,
+                },
+            },
+            12,
+        ),
+        SessionConsumerResponse::ScanRestoreRecords(Ok(wrong_scope_page)),
+    )
+    .await;
+
+    let record = semantic_record(requested_key.clone(), owner.clone(), FenceToken::new(1));
+    let mut duplicate_record_page = RestoreScanPage::new(vec![record.clone(), record], 0, None);
+    duplicate_record_page.cursor_profile = RestoreScanCursorProfile::DurableOpaqueV1;
+    assert_malicious_semantic_response_is_unconfirmed(
+        "restore-record",
+        semantic_request(
+            SessionConsumerOperation::ScanRestoreRecords {
+                request: RestoreScanRequest::all(2),
+            },
+            13,
+        ),
+        SessionConsumerResponse::ScanRestoreRecords(Ok(duplicate_record_page)),
+    )
+    .await;
+
+    let mut wrong_page = RestoreScanPage::new(Vec::new(), 0, None);
+    wrong_page.cursor_profile = RestoreScanCursorProfile::DurableOpaqueV1;
+    wrong_page.loaded_count = 1;
+    assert_malicious_semantic_response_is_unconfirmed(
+        "restore-page",
+        semantic_request(
+            SessionConsumerOperation::ScanRestoreRecords {
+                request: RestoreScanRequest::all(1),
+            },
+            14,
+        ),
+        SessionConsumerResponse::ScanRestoreRecords(Ok(wrong_page)),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -992,4 +1347,109 @@ async fn duplicate_response_poisons_lane_and_next_call_uses_a_new_connection() {
         "one protocol poison records one reconnect, not an implicit retry loop"
     );
     server.await.expect("malicious server");
+}
+
+#[tokio::test]
+async fn scope_rejection_retires_the_lane_and_resolves_a_fresh_authority() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("scope-transition-server");
+    let client_spiffe = spiffe("scope-transition-client");
+    let first_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stale-authority listener");
+    let first_address = first_listener
+        .local_addr()
+        .expect("stale authority address");
+    let second_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fresh-authority listener");
+    let second_address = second_listener
+        .local_addr()
+        .expect("fresh authority address");
+    let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+    let first_authenticated = pki.server_config(&server_spiffe);
+    let second_authenticated = pki.server_config(&server_spiffe);
+    let first_client = expected_client.clone();
+    let first_server = tokio::spawn(async move {
+        let (mut tls, call) =
+            accept_hello_and_call(&first_listener, &first_authenticated, &first_client).await;
+        write_value(
+            &mut tls,
+            &rejected_response(
+                call["body"]["correlation"].clone(),
+                SessionConsumerRejection::ScopeMismatch,
+            ),
+        )
+        .await;
+        match tokio::time::timeout(Duration::from_millis(150), tls.read_u8()).await {
+            Err(_) | Ok(Err(_)) => {}
+            Ok(Ok(_)) => {
+                panic!("a scope rejection retires the lane instead of sending another call")
+            }
+        }
+    });
+    let second_server = tokio::spawn(async move {
+        let (mut tls, call) =
+            accept_hello_and_call(&second_listener, &second_authenticated, &expected_client).await;
+        assert_eq!(
+            call["body"]["request"]["operation"]["operation"], "capabilities",
+            "the caller, not the pool, makes the later fresh-authority request"
+        );
+        write_value(
+            &mut tls,
+            &capability_response(call["body"]["correlation"].clone()),
+        )
+        .await;
+    });
+    let resolver_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = Arc::clone(&resolver_calls);
+    let resolver: RemoteAddrResolver = Arc::new(move || {
+        let address = if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            first_address
+        } else {
+            second_address
+        };
+        Box::pin(async move { Ok(address) })
+    });
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(first_address.ip().into()),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope(1),
+        pki.client_config(&client_spiffe),
+    )
+    .with_operation_timeout(Duration::from_secs(1));
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        stateless,
+        PersistentSessionConsumerConfig::try_new(
+            1,
+            0,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(1_500),
+            2,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("one-lane fail-fast config"),
+    )
+    .expect("persistent client");
+
+    assert_eq!(
+        client.capabilities().await,
+        Err(SessionConsumerClientError::Scope),
+        "the first typed authority rejection remains visible to the caller"
+    );
+    assert_eq!(
+        client.capabilities().await,
+        Ok(BackendCapabilities::all_enabled()),
+        "the later caller resolves and authenticates a replacement authority"
+    );
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.setup_successes, 2);
+    assert_eq!(diagnostics.reconnects, 1);
+    assert_eq!(resolver_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    client.shutdown().await;
+    first_server.await.expect("stale-authority server");
+    second_server.await.expect("fresh-authority server");
 }

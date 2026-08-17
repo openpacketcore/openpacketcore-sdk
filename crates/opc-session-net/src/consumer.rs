@@ -43,9 +43,12 @@ use crate::lifecycle::{
     SessionReauthenticationControl,
 };
 use crate::protocol::{
-    read_authenticated_frame_payload_until, read_frame_payload, write_frame_bounded_until,
-    write_frame_bounded_until_classified, write_frame_bounded_until_classified_with_progress,
-    FrameWriteError, FrameWriteProgress, MAX_NEGOTIATED_FRAME_SIZE,
+    bounded_session_op_expectations, compare_and_set_result_matches_key, get_result_matches_key,
+    read_authenticated_frame_payload_until, read_frame_payload,
+    session_op_results_match_expectations, validate_restore_scan_wire_payload_bytes,
+    write_frame_bounded_until, write_frame_bounded_until_classified,
+    write_frame_bounded_until_classified_with_progress, FrameWriteError, FrameWriteProgress,
+    MAX_NEGOTIATED_FRAME_SIZE,
 };
 
 /// Dedicated ALPN for authenticated session-quorum consumers.
@@ -1017,6 +1020,143 @@ fn response_matches_operation(
     )
 }
 
+/// `OutcomeUnavailable` is meaningful only for operation families whose
+/// outcome can be ambiguous. A read-like response carrying it would be a
+/// cross-family semantic response from an authenticated peer, even though its
+/// outer response variant is correct.
+fn store_error_matches_operation(
+    operation: &SessionConsumerOperation,
+    error: SessionConsumerStoreError,
+) -> bool {
+    !matches!(error, SessionConsumerStoreError::OutcomeUnavailable)
+        || matches!(
+            operation,
+            SessionConsumerOperation::DeleteFenced { .. }
+                | SessionConsumerOperation::RefreshTtl { .. }
+        )
+        || matches!(
+            operation,
+            SessionConsumerOperation::Batch { ops }
+                if ops.iter().any(|op| !matches!(op, SessionOp::Get { .. }))
+        )
+}
+
+fn store_result_matches_operation<T>(
+    operation: &SessionConsumerOperation,
+    result: &Result<T, SessionConsumerStoreError>,
+) -> bool {
+    result
+        .as_ref()
+        .err()
+        .is_none_or(|error| store_error_matches_operation(operation, *error))
+}
+
+/// Verify that an authenticated response is bound to the complete typed
+/// operation that produced it, not merely to its response family.  This is
+/// deliberately performed before a retained lane is returned to the pool, so
+/// a malicious peer cannot turn a cross-key value or mismatched batch slot
+/// into an application-visible success.
+fn response_matches_request(
+    request: &SessionConsumerRequest,
+    response: &SessionConsumerResponse,
+) -> bool {
+    if !response_matches_operation(
+        ConsumerOperationKind::from_operation(request.operation()),
+        response,
+    ) {
+        return false;
+    }
+
+    match (request.operation(), response) {
+        (SessionConsumerOperation::Get { key }, SessionConsumerResponse::Get(result)) => {
+            get_result_matches_key(
+                key,
+                &result
+                    .clone()
+                    .map_err(SessionConsumerStoreError::into_store_error),
+            ) && store_result_matches_operation(request.operation(), result)
+        }
+        (
+            SessionConsumerOperation::CompareAndSet { op },
+            SessionConsumerResponse::CompareAndSet(result),
+        ) => {
+            compare_and_set_result_matches_key(
+                &op.key,
+                &result
+                    .clone()
+                    .map_err(SessionConsumerStoreError::into_store_error),
+            ) && store_result_matches_operation(request.operation(), result)
+        }
+        (
+            SessionConsumerOperation::PreflightRecordExpiry { .. },
+            SessionConsumerResponse::PreflightRecordExpiry(result),
+        ) => store_result_matches_operation(request.operation(), result),
+        (
+            SessionConsumerOperation::DeleteFenced { .. },
+            SessionConsumerResponse::DeleteFenced(result),
+        )
+        | (
+            SessionConsumerOperation::RefreshTtl { .. },
+            SessionConsumerResponse::RefreshTtl(result),
+        ) => store_result_matches_operation(request.operation(), result),
+        (SessionConsumerOperation::Batch { ops }, SessionConsumerResponse::Batch(Ok(results))) => {
+            bounded_session_op_expectations(ops)
+                .as_ref()
+                .is_ok_and(|expected| {
+                    let results = results
+                        .iter()
+                        .cloned()
+                        .map(session_consumer_batch_result_into_store)
+                        .collect::<Vec<_>>();
+                    session_op_results_match_expectations(expected, &results)
+                })
+        }
+        (SessionConsumerOperation::Batch { .. }, SessionConsumerResponse::Batch(Err(error))) => {
+            store_error_matches_operation(request.operation(), *error)
+        }
+        (
+            SessionConsumerOperation::ScanRestoreRecords { request },
+            SessionConsumerResponse::ScanRestoreRecords(Ok(page)),
+        ) => {
+            page.cursor_profile == opc_session_store::RestoreScanCursorProfile::DurableOpaqueV1
+                && validate_restore_scan_wire_payload_bytes(&page.records).is_ok()
+                && page.validate_for_request(request).is_ok()
+        }
+        (
+            SessionConsumerOperation::ScanRestoreRecords { .. },
+            SessionConsumerResponse::ScanRestoreRecords(result),
+        ) => store_result_matches_operation(request.operation(), result),
+        (
+            SessionConsumerOperation::AcquireLease { key, owner, .. },
+            SessionConsumerResponse::AcquireLease(Ok(lease)),
+        ) => lease.key() == key && lease.owner() == owner,
+        (
+            SessionConsumerOperation::RenewLease { lease, .. },
+            SessionConsumerResponse::RenewLease(Ok(renewed)),
+        ) => {
+            renewed.key() == lease.key()
+                && renewed.owner() == lease.owner()
+                && renewed.fence() == lease.fence()
+                && renewed.credential_id() == lease.credential_id()
+        }
+        _ => true,
+    }
+}
+
+/// A typed scope or authorization rejection is a valid response to expose to
+/// the caller, but proves this authenticated lane is no longer authorized for
+/// the application's current authority.  It must not be republished into the
+/// idle pool; the next independent call will resolve and authenticate a fresh
+/// lane.  Malformed-request and unavailable rejections remain request-local.
+fn response_retires_connection_authority(response: &SessionConsumerResponse) -> bool {
+    matches!(
+        response,
+        SessionConsumerResponse::Rejected(
+            SessionConsumerRejection::ScopeMismatch | SessionConsumerRejection::Unauthorized
+        )
+    )
+}
+
 /// Decode the fixed consumer revision without accepting a shared DTO's
 /// forward-compatible unknown fields. The consumer transport owns an exact
 /// wire contract, while its application DTOs are intentionally shared with
@@ -1691,12 +1831,6 @@ impl StatelessSessionConsumerClient {
             handshake.directed_lifecycle_edge_key(b"consumer", peer.spiffe_id());
         let (mut reader, mut writer) = tokio::io::split(tls);
         record_setup_phase_attempt(setup_counters, ConsumerSetupPhase::Hello);
-        // The server starts its between-frame timeout after HelloAck. Stamp
-        // from before our Hello write and never extend beyond the protocol's
-        // fixed five-second idle ceiling, making this conservatively earlier.
-        let idle_deadline = tokio::time::Instant::now()
-            .checked_add(self.idle_timeout.min(DEFAULT_CONSUMER_IDLE_TIMEOUT))
-            .ok_or(SessionConsumerClientError::Protocol)?;
         let hello = ConsumerWireRequest::Hello(ConsumerHello {
             transport_revision: SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
             scope: self.scope,
@@ -1713,7 +1847,12 @@ impl StatelessSessionConsumerClient {
             record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
             pre_request_error(error, pre_request_budget_active)
         })?;
-        let ack_deadline = pre_request_deadline.min(idle_deadline);
+        // The authenticated Hello exchange is bounded by the caller's setup
+        // deadline, not by a lane's idle lifetime.  An idle lane does not
+        // exist until the completed connection is published to the pool;
+        // applying the short between-call timeout here can reject a slow but
+        // valid authenticated setup before prewarm has a chance to publish it.
+        let ack_deadline = pre_request_deadline;
         let ack = read_authenticated_consumer_frame_until::<_, ConsumerWireResponse>(
             &mut reader,
             MAX_NEGOTIATED_FRAME_SIZE,
@@ -1788,7 +1927,10 @@ impl StatelessSessionConsumerClient {
             rotation_edge_key,
             next_correlation: NonZeroU32::MIN,
             calls: 0,
-            idle_deadline,
+            // A fresh lane is not idle yet. `return_idle` stamps the actual
+            // bounded idle deadline at successful publication; direct calls
+            // stamp their active-response deadline before writing.
+            idle_deadline: pre_request_deadline,
             _physical_admission: Some(physical_admission),
         };
         if !connection.current(&self.tls_config, &self.reauthentication) {
@@ -1839,7 +1981,6 @@ impl StatelessSessionConsumerClient {
         let correlation = connection
             .take_correlation()
             .map_err(SessionConsumerCallError::BeforeCallWrite)?;
-        let operation = ConsumerOperationKind::from_operation(request.operation());
         let outbound = BorrowedConsumerWireRequest::Call(BorrowedConsumerCall {
             correlation,
             request,
@@ -2002,7 +2143,7 @@ impl StatelessSessionConsumerClient {
                 correlation: received,
                 response,
             }) if exact_correlation(correlation, received).is_ok()
-                && response_matches_operation(operation, response.as_ref()) =>
+                && response_matches_request(request, response.as_ref()) =>
             {
                 Ok(*response)
             }
@@ -4468,7 +4609,9 @@ impl PersistentSessionConsumerClient {
                 .await;
             match result {
                 Ok(response) => {
-                    connection.return_idle();
+                    if !response_retires_connection_authority(&response) {
+                        connection.return_idle();
+                    }
                     return Ok(response);
                 }
                 Err(SessionConsumerCallError::BeforeCallWrite(error))
