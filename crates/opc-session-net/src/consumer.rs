@@ -1031,7 +1031,8 @@ fn store_error_matches_operation(
     !matches!(error, SessionConsumerStoreError::OutcomeUnavailable)
         || matches!(
             operation,
-            SessionConsumerOperation::DeleteFenced { .. }
+            SessionConsumerOperation::CompareAndSet { .. }
+                | SessionConsumerOperation::DeleteFenced { .. }
                 | SessionConsumerOperation::RefreshTtl { .. }
         )
         || matches!(
@@ -2224,8 +2225,8 @@ impl StatelessSessionConsumerClient {
             .await?
         {
             SessionConsumerResponse::Capabilities(capabilities) => Ok(capabilities),
-            SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch) => {
-                Err(SessionConsumerClientError::Scope)
+            SessionConsumerResponse::Rejected(rejection) => {
+                Err(consumer_rejection_into_client_error(rejection))
             }
             _ => Err(SessionConsumerClientError::Protocol),
         }
@@ -3722,7 +3723,7 @@ impl PersistentSessionConsumerPool {
         })
     }
 
-    fn record_error(&self, error: SessionConsumerClientError, may_have_sent: bool) {
+    fn record_failure(&self, error: SessionConsumerClientError) {
         counter_increment(&self.counters.failures);
         match error {
             SessionConsumerClientError::Authentication => {
@@ -3745,6 +3746,10 @@ impl PersistentSessionConsumerPool {
             }
             SessionConsumerClientError::Unavailable => {}
         }
+    }
+
+    fn record_error(&self, error: SessionConsumerClientError, may_have_sent: bool) {
+        self.record_failure(error);
         if may_have_sent {
             counter_increment(&self.counters.outcome_unknown);
         } else {
@@ -4213,7 +4218,12 @@ impl PersistentSessionConsumerClient {
         let result = self.execute_admitted(request, started, deadline).await;
         match result {
             Ok(response) => {
-                counter_increment(&self.pool.counters.successes);
+                if let SessionConsumerResponse::Rejected(rejection) = &response {
+                    self.pool
+                        .record_failure(consumer_rejection_into_client_error(*rejection));
+                } else {
+                    counter_increment(&self.pool.counters.successes);
+                }
                 Ok(response)
             }
             Err(error) => {
@@ -4236,8 +4246,8 @@ impl PersistentSessionConsumerClient {
             .await?
         {
             SessionConsumerResponse::Capabilities(value) => Ok(value),
-            SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch) => {
-                Err(SessionConsumerClientError::Scope)
+            SessionConsumerResponse::Rejected(rejection) => {
+                Err(consumer_rejection_into_client_error(rejection))
             }
             _ => Err(SessionConsumerClientError::Protocol),
         }
@@ -5029,8 +5039,10 @@ impl SessionQuorumConsumerServer {
         self
     }
 
-    /// Set the bootstrap and active-frame idle deadline, capped at five
-    /// seconds by listener validation.
+    /// Set the active authenticated-frame idle deadline, capped at five
+    /// seconds by listener validation. TLS and the value-free Hello/HelloAck
+    /// bootstrap use the separately configured operation deadline, because a
+    /// lane does not become idle until that exchange succeeds.
     #[must_use]
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
@@ -5220,7 +5232,11 @@ async fn handle_server_connection(
         .map_err(|_| ProtocolError::Authentication)?;
     let acceptor =
         tokio_rustls::TlsAcceptor::from(consumer_server_tls_config(handshake.rustls_config()));
-    let tls = tokio::time::timeout(idle_timeout, acceptor.accept(stream))
+    // An idle authenticated lane does not exist until the HelloAck is sent.
+    // Bound TLS and the value-free bootstrap with the listener's finite
+    // operation deadline, rather than applying a short active-frame idle
+    // interval to slow but valid authenticated setup.
+    let tls = tokio::time::timeout(operation_timeout, acceptor.accept(stream))
         .await
         .map_err(|_| {
             ProtocolError::Io(io::Error::new(
@@ -5243,7 +5259,7 @@ async fn handle_server_connection(
     let hello = read_consumer_frame_within::<_, ConsumerWireRequest>(
         &mut reader,
         max_frame_size,
-        idle_timeout,
+        operation_timeout,
     )
     .await?;
     let ConsumerWireRequest::Hello(hello) = hello else {
@@ -5257,7 +5273,7 @@ async fn handle_server_connection(
             &mut writer,
             ConsumerWireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch),
             max_frame_size,
-            idle_timeout,
+            operation_timeout,
         )
         .await;
         return Err(ProtocolError::UnexpectedResponse);
@@ -5315,7 +5331,7 @@ async fn handle_server_connection(
             scope: authorizer.scope(),
         }),
         max_frame_size,
-        idle_timeout,
+        operation_timeout,
     )
     .await?;
     let mut expected_correlation = NonZeroU32::MIN;

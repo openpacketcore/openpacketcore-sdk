@@ -19,7 +19,8 @@ use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBu
 use opc_session_net::{
     ConnectionLifecyclePolicy, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
     PersistentSessionConsumerExecuteError, RemoteAddrResolver, SessionConsumerAuthorizer,
-    SessionQuorumConsumerServer, StatelessSessionConsumerClient,
+    SessionQuorumConsumerServer, StatelessSessionConsumerClient, SESSION_QUORUM_CONSUMER_ALPN,
+    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     BackendCapabilities, ConsensusSessionStore, OwnerId, QuorumReplicaDescriptor,
@@ -32,7 +33,21 @@ use opc_session_store::{
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::watch;
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", content = "body", rename_all = "snake_case")]
+enum CanonicalConsumerBootstrapRequest {
+    Hello(CanonicalConsumerHello),
+}
+
+#[derive(serde::Serialize)]
+struct CanonicalConsumerHello {
+    transport_revision: u16,
+    scope: SessionConsumerScope,
+}
 
 struct TestPki {
     ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
@@ -563,6 +578,75 @@ async fn expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call() 
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
 
     client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn server_active_idle_timeout_starts_only_after_authenticated_hello() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("server-bootstrap-idle-server");
+    let client_spiffe = spiffe("server-bootstrap-idle-client");
+    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let service = Arc::new(RecordingConsumer::default());
+    let (handle, address) =
+        SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
+            .with_idle_timeout(Duration::from_millis(20))
+            .with_operation_timeout(Duration::from_millis(500))
+            .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+            .await
+            .expect("start short active-idle listener");
+
+    let mut tls_config = pki
+        .client_config(&client_spiffe)
+        .rustls_config()
+        .as_ref()
+        .clone();
+    tls_config.alpn_protocols = vec![SESSION_QUORUM_CONSUMER_ALPN.to_vec()];
+    let tcp = TcpStream::connect(address)
+        .await
+        .expect("connect authenticated raw consumer");
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(tls_config))
+        .connect(
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            tcp,
+        )
+        .await
+        .expect("complete authenticated TLS before delayed Hello");
+
+    // This exceeds the active lane idle interval, but the server must still
+    // accept the authenticated value-free bootstrap within its operation cap.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let payload = serde_json::to_vec(&CanonicalConsumerBootstrapRequest::Hello(
+        CanonicalConsumerHello {
+            transport_revision: SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+            scope,
+        },
+    ))
+    .expect("canonical Hello JSON encodes");
+    let length = u32::try_from(payload.len()).expect("Hello frame length");
+    tls.write_all(&length.to_be_bytes())
+        .await
+        .expect("write delayed Hello length");
+    tls.write_all(&payload)
+        .await
+        .expect("write delayed Hello payload");
+    tls.flush().await.expect("flush delayed Hello");
+    let mut length = [0_u8; 4];
+    tls.read_exact(&mut length)
+        .await
+        .expect("HelloAck length after delayed authenticated setup");
+    let mut payload = vec![0_u8; usize::try_from(u32::from_be_bytes(length)).expect("frame size")];
+    tls.read_exact(&mut payload)
+        .await
+        .expect("HelloAck payload after delayed authenticated setup");
+    let response: serde_json::Value = serde_json::from_slice(&payload).expect("HelloAck JSON");
+    assert_eq!(response["kind"], "hello_ack");
+    assert_eq!(
+        response["body"]["scope"],
+        serde_json::to_value(scope).expect("scope JSON")
+    );
+
+    drop(tls);
     handle.abort_and_wait().await;
 }
 

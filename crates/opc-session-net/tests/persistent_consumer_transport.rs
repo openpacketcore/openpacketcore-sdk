@@ -100,6 +100,7 @@ struct ControlledConsumer {
     watch_entry: Mutex<Option<SessionConsumerChange>>,
     watch_entry_limit: AtomicUsize,
     watch_emitted: Arc<AtomicUsize>,
+    watch_emitted_notify: Arc<Notify>,
     watch_blocked: Arc<AtomicBool>,
     watch_released: Arc<Notify>,
     watch_stays_open: AtomicBool,
@@ -167,6 +168,16 @@ impl ControlledConsumer {
             .watch_entry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entry);
+    }
+
+    async fn wait_for_watch_emissions(&self, expected: usize) {
+        loop {
+            let notified = self.watch_emitted_notify.notified();
+            if self.watch_emitted.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -237,23 +248,29 @@ impl SessionQuorumConsumer for ControlledConsumer {
         let entry_limit = self.watch_entry_limit.load(Ordering::SeqCst);
         let emitted = Arc::clone(&self.watch_emitted);
         if entry_limit == 0 {
+            let emitted_notify = Arc::clone(&self.watch_emitted_notify);
             Ok(stream::iter(start_sequence..)
                 .map(move |sequence| {
                     emitted.fetch_add(1, Ordering::SeqCst);
+                    emitted_notify.notify_waiters();
                     Ok::<_, SessionConsumerStoreError>(watch_change_at_sequence(&entry, sequence))
                 })
                 .boxed())
         } else if self.watch_stays_open.load(Ordering::SeqCst) {
+            let emitted_notify = Arc::clone(&self.watch_emitted_notify);
             Ok(stream::once(async move {
                 emitted.fetch_add(1, Ordering::SeqCst);
+                emitted_notify.notify_waiters();
                 Ok::<_, SessionConsumerStoreError>(watch_change_at_sequence(&entry, start_sequence))
             })
             .chain(stream::pending())
             .boxed())
         } else {
+            let emitted_notify = Arc::clone(&self.watch_emitted_notify);
             Ok(stream::iter(start_sequence..)
                 .map(move |sequence| {
                     emitted.fetch_add(1, Ordering::SeqCst);
+                    emitted_notify.notify_waiters();
                     Ok::<_, SessionConsumerStoreError>(watch_change_at_sequence(&entry, sequence))
                 })
                 .take(entry_limit)
@@ -653,7 +670,7 @@ async fn persistent_pools_derived_from_one_stateless_lineage_share_physical_admi
     assert_eq!(
         second_pool.prewarm().await,
         Err(SessionConsumerClientError::Overloaded),
-        "a second pool from one stateless clone lineage cannot start a seventeenth connection"
+        "a second pool from one stateless clone lineage cannot exceed its fixed physical cap"
     );
     assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
     full_pool.shutdown().await;
@@ -1476,26 +1493,32 @@ async fn rotation_releases_an_unpolled_full_small_item_watch_queue() {
     );
 
     let stale_watch = client.open_watch(0).await.expect("open queued watch");
-    let pressure_deadline = Instant::now() + Duration::from_secs(1);
-    let mut previous = 0;
-    let mut unchanged_samples = 0;
-    loop {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let emitted = service.watch_emitted.load(Ordering::SeqCst);
-        unchanged_samples = if emitted > WATCH_QUEUE_ITEMS && emitted == previous {
-            unchanged_samples + 1
-        } else {
-            0
-        };
-        if unchanged_samples >= 3 {
-            break;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        // Wait on the producer's exact emission edge rather than repeatedly
+        // sleeping while i686 is still scheduling authenticated watch setup.
+        service
+            .wait_for_watch_emissions(WATCH_QUEUE_ITEMS + 1)
+            .await;
+        let mut unchanged_samples = 0;
+        loop {
+            match tokio::time::timeout(
+                Duration::from_millis(10),
+                service.watch_emitted_notify.notified(),
+            )
+            .await
+            {
+                Ok(()) => unchanged_samples = 0,
+                Err(_) => {
+                    unchanged_samples += 1;
+                    if unchanged_samples >= 3 {
+                        break;
+                    }
+                }
+            }
         }
-        assert!(
-            Instant::now() < pressure_deadline,
-            "the unpolled watch did not fill its fixed 64-item queue"
-        );
-        previous = emitted;
-    }
+    })
+    .await
+    .expect("the unpolled watch fills its fixed 64-item queue before rotation");
     assert_eq!(client.diagnostics().await.watch_active, 1);
 
     // Do not poll or drop `stale_watch`: the physical reader, not caller
@@ -2006,6 +2029,7 @@ async fn consumer_listener_rejects_unbounded_config_and_reaps_a_tls_blackhole() 
         SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
             .with_max_connections(1)
             .with_idle_timeout(Duration::from_millis(100))
+            .with_operation_timeout(Duration::from_millis(100))
             .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
             .await
             .expect("start bounded listener");

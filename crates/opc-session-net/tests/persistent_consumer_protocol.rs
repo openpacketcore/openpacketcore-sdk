@@ -14,8 +14,8 @@ use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBu
 use opc_session_net::{
     PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
     PersistentSessionConsumerExecuteError, RemoteAddrResolver, SessionConsumerClientError,
-    StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
-    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+    SessionConsumerMutationError, StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE,
+    SESSION_QUORUM_CONSUMER_ALPN, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     BackendCapabilities, CompareAndSet, CompareAndSetResult, EncryptedSessionPayload,
@@ -882,6 +882,87 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
 }
 
 #[tokio::test]
+async fn authenticated_cas_outcome_unavailable_is_typed_unknown_without_poisoning_the_lane() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("cas-outcome-unavailable-server");
+    let client_spiffe = spiffe("cas-outcome-unavailable-client");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind malicious listener");
+    let address = listener.local_addr().expect("listener address");
+    let authenticated = pki.server_config(&server_spiffe);
+    let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+    let server = tokio::spawn(async move {
+        let (mut tls, first) =
+            accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+        assert_eq!(
+            first["body"]["request"]["operation"]["operation"],
+            "compare_and_set"
+        );
+        let response = json!({
+            "kind": "response",
+            "body": {
+                "correlation": first["body"]["correlation"].clone(),
+                "response": serde_json::to_value(SessionConsumerResponse::CompareAndSet(Err(
+                    opc_session_store::SessionConsumerStoreError::OutcomeUnavailable,
+                )))
+                .expect("CAS ambiguity response encodes"),
+            },
+        });
+        write_value(&mut tls, &response).await;
+        let second = read_value(&mut tls).await;
+        assert_eq!(
+            second["body"]["request"]["operation"]["operation"], "capabilities",
+            "a typed CAS ambiguity does not poison a valid authenticated lane"
+        );
+        write_value(
+            &mut tls,
+            &capability_response(second["body"]["correlation"].clone()),
+        )
+        .await;
+    });
+    let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+    let backend = FakeSessionBackend::new();
+    let key = semantic_key(b"cas-outcome-unavailable-key");
+    let lease = backend
+        .acquire(
+            &key,
+            OwnerId::new("cas-outcome-unavailable-owner").expect("test owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("test lease");
+    let request_id = SessionConsumerRequestId::new();
+    let op = CompareAndSet {
+        key,
+        lease,
+        expected_generation: None,
+        new_record: semantic_record(
+            semantic_key(b"cas-outcome-unavailable-key"),
+            OwnerId::new("cas-outcome-unavailable-owner").expect("test owner"),
+            FenceToken::new(1),
+        ),
+    };
+
+    assert!(matches!(
+        client.compare_and_set_with_id(request_id, op).await,
+        Err(SessionConsumerMutationError::OutcomeUnknown { request_id: returned })
+            if returned == request_id
+    ));
+    assert_eq!(
+        client.capabilities().await,
+        Ok(BackendCapabilities::all_enabled())
+    );
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.setup_successes, 1);
+    assert_eq!(diagnostics.reconnects, 0);
+    assert_eq!(diagnostics.successes, 2);
+    assert_eq!(diagnostics.outcome_unknown, 0);
+    client.shutdown().await;
+    server.await.expect("malicious server");
+}
+
+#[tokio::test]
 async fn malformed_trailing_and_oversized_response_frames_fail_closed() {
     for case in ["malformed", "trailing", "oversized"] {
         let pki = TestPki::new();
@@ -1448,8 +1529,238 @@ async fn scope_rejection_retires_the_lane_and_resolves_a_fresh_authority() {
     let diagnostics = client.diagnostics().await;
     assert_eq!(diagnostics.setup_successes, 2);
     assert_eq!(diagnostics.reconnects, 1);
+    assert_eq!(diagnostics.failures, 1);
+    assert_eq!(diagnostics.scope, 1);
+    assert_eq!(diagnostics.successes, 1);
+    assert_eq!(diagnostics.not_transmitted, 0);
+    assert_eq!(diagnostics.outcome_unknown, 0);
     assert_eq!(resolver_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     client.shutdown().await;
     first_server.await.expect("stale-authority server");
     second_server.await.expect("fresh-authority server");
+}
+
+#[tokio::test]
+async fn authenticated_unary_rejections_are_typed_counted_and_reuse_only_safe_lanes() {
+    for (case, rejection, expected) in [
+        (
+            "unavailable",
+            SessionConsumerRejection::Unavailable,
+            SessionConsumerClientError::Unavailable,
+        ),
+        (
+            "malformed",
+            SessionConsumerRejection::MalformedRequest,
+            SessionConsumerClientError::Protocol,
+        ),
+    ] {
+        let pki = TestPki::new();
+        let server_spiffe = spiffe(&format!("{case}-rejection-server"));
+        let client_spiffe = spiffe(&format!("{case}-rejection-client"));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind malicious listener");
+        let address = listener.local_addr().expect("listener address");
+        let authenticated = pki.server_config(&server_spiffe);
+        let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+        let server = tokio::spawn(async move {
+            let (mut tls, first) =
+                accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+            write_value(
+                &mut tls,
+                &rejected_response(first["body"]["correlation"].clone(), rejection),
+            )
+            .await;
+            let second = read_value(&mut tls).await;
+            assert_eq!(
+                second["body"]["request"]["operation"]["operation"], "capabilities",
+                "ordinary request rejection retains the authenticated lane"
+            );
+            write_value(
+                &mut tls,
+                &capability_response(second["body"]["correlation"].clone()),
+            )
+            .await;
+        });
+        let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+
+        assert_eq!(client.capabilities().await, Err(expected));
+        assert_eq!(
+            client.capabilities().await,
+            Ok(BackendCapabilities::all_enabled())
+        );
+        let diagnostics = client.diagnostics().await;
+        assert_eq!(diagnostics.setup_successes, 1);
+        assert_eq!(diagnostics.reconnects, 0);
+        assert_eq!(diagnostics.failures, 1);
+        assert_eq!(diagnostics.successes, 1);
+        assert_eq!(diagnostics.not_transmitted, 0);
+        assert_eq!(diagnostics.outcome_unknown, 0);
+        match expected {
+            SessionConsumerClientError::Unavailable => assert_eq!(diagnostics.deadline, 0),
+            SessionConsumerClientError::Protocol => assert_eq!(diagnostics.protocol, 1),
+            _ => unreachable!("fixed ordinary rejection cases"),
+        }
+        client.shutdown().await;
+        server.await.expect("malicious server");
+    }
+}
+
+#[tokio::test]
+async fn unauthorized_rejection_retires_the_lane_and_resolves_a_fresh_authority() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("unauthorized-transition-server");
+    let client_spiffe = spiffe("unauthorized-transition-client");
+    let first_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stale-authority listener");
+    let first_address = first_listener
+        .local_addr()
+        .expect("stale authority address");
+    let second_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fresh-authority listener");
+    let second_address = second_listener
+        .local_addr()
+        .expect("fresh authority address");
+    let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+    let first_authenticated = pki.server_config(&server_spiffe);
+    let second_authenticated = pki.server_config(&server_spiffe);
+    let first_client = expected_client.clone();
+    let first_server = tokio::spawn(async move {
+        let (mut tls, call) =
+            accept_hello_and_call(&first_listener, &first_authenticated, &first_client).await;
+        write_value(
+            &mut tls,
+            &rejected_response(
+                call["body"]["correlation"].clone(),
+                SessionConsumerRejection::Unauthorized,
+            ),
+        )
+        .await;
+        match tokio::time::timeout(Duration::from_millis(150), tls.read_u8()).await {
+            Err(_) | Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("an unauthorized rejection retires the stale authority lane"),
+        }
+    });
+    let second_server = tokio::spawn(async move {
+        let (mut tls, call) =
+            accept_hello_and_call(&second_listener, &second_authenticated, &expected_client).await;
+        write_value(
+            &mut tls,
+            &capability_response(call["body"]["correlation"].clone()),
+        )
+        .await;
+    });
+    let resolver_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = Arc::clone(&resolver_calls);
+    let resolver: RemoteAddrResolver = Arc::new(move || {
+        let address = if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            first_address
+        } else {
+            second_address
+        };
+        Box::pin(async move { Ok(address) })
+    });
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(first_address.ip().into()),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope(1),
+        pki.client_config(&client_spiffe),
+    )
+    .with_operation_timeout(Duration::from_secs(1));
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        stateless,
+        PersistentSessionConsumerConfig::try_new(
+            1,
+            0,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(1_500),
+            2,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("one-lane fail-fast config"),
+    )
+    .expect("persistent client");
+
+    assert_eq!(
+        client.capabilities().await,
+        Err(SessionConsumerClientError::Authentication)
+    );
+    assert_eq!(
+        client.capabilities().await,
+        Ok(BackendCapabilities::all_enabled())
+    );
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.setup_successes, 2);
+    assert_eq!(diagnostics.reconnects, 1);
+    assert_eq!(diagnostics.failures, 1);
+    assert_eq!(diagnostics.authentication, 1);
+    assert_eq!(diagnostics.successes, 1);
+    assert_eq!(diagnostics.not_transmitted, 0);
+    assert_eq!(diagnostics.outcome_unknown, 0);
+    assert_eq!(resolver_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    client.shutdown().await;
+    first_server.await.expect("stale-authority server");
+    second_server.await.expect("fresh-authority server");
+}
+
+#[tokio::test]
+async fn stateless_capabilities_classifies_every_authenticated_rejection() {
+    for (case, rejection, expected) in [
+        (
+            "scope",
+            SessionConsumerRejection::ScopeMismatch,
+            SessionConsumerClientError::Scope,
+        ),
+        (
+            "unauthorized",
+            SessionConsumerRejection::Unauthorized,
+            SessionConsumerClientError::Authentication,
+        ),
+        (
+            "unavailable",
+            SessionConsumerRejection::Unavailable,
+            SessionConsumerClientError::Unavailable,
+        ),
+        (
+            "malformed",
+            SessionConsumerRejection::MalformedRequest,
+            SessionConsumerClientError::Protocol,
+        ),
+    ] {
+        let pki = TestPki::new();
+        let server_spiffe = spiffe(&format!("stateless-{case}-rejection-server"));
+        let client_spiffe = spiffe(&format!("stateless-{case}-rejection-client"));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind malicious listener");
+        let address = listener.local_addr().expect("listener address");
+        let authenticated = pki.server_config(&server_spiffe);
+        let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+        let server = tokio::spawn(async move {
+            let (mut tls, call) =
+                accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+            write_value(
+                &mut tls,
+                &rejected_response(call["body"]["correlation"].clone(), rejection),
+            )
+            .await;
+        });
+        let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+        let client = StatelessSessionConsumerClient::new_with_resolver(
+            resolver,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+            scope(1),
+            pki.client_config(&client_spiffe),
+        )
+        .with_operation_timeout(Duration::from_secs(1));
+
+        assert_eq!(client.capabilities().await, Err(expected));
+        server.await.expect("malicious server");
+    }
 }
