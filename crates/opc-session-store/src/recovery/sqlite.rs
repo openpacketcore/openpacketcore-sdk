@@ -384,6 +384,8 @@ fn inspect_current(
     budget.check()?;
     preflight_current_tables(conn, budget)?;
     validate_exact_recovery_schema(conn, false)?;
+    let receipt_ledger_layout = consensus::fenced_transition_receipt_ledger_layout_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
     let (schema_version, cluster, configuration, epoch): (i64, Vec<u8>, Vec<u8>, i64) = conn
         .query_row(
             "SELECT schema_version, cluster_id, configuration_id, configuration_epoch FROM consensus_identity WHERE singleton = 1",
@@ -423,7 +425,7 @@ fn inspect_current(
         .map_err(|_| RecoveryError::CorruptReplica)?;
     validate_consensus_sealed_records(conn, budget)?;
     validate_legacy_lease_state(conn, budget)?;
-    if table_exists(conn, "consensus_fenced_transition_receipts")? {
+    if receipt_ledger_layout == consensus::FencedTransitionReceiptLedgerLayout::Activated {
         consensus::validate_fenced_transition_receipts_sync(conn, storage_identity)
             .map_err(|_| RecoveryError::CorruptReplica)?;
     }
@@ -469,6 +471,7 @@ fn inspect_current(
         &paths.snapshots,
         budget,
         recovery.recovery_epoch,
+        recovery.last_plan_digest,
         recovery.pending_epoch,
         recovery.pending_plan_digest,
         recovery.watch_cursor_invalidation_floor,
@@ -556,6 +559,8 @@ fn preflight_current_tables(
             }
             FencedReceiptCommitmentColumns::Both => {
                 preflight_fenced_transition_receipt_count(conn)?;
+                consensus::validate_fenced_transition_receipt_storage_bounds_sync(conn)
+                    .map_err(|_| RecoveryError::CorruptReplica)?;
                 let cap = i64::try_from(FENCED_TRANSITION_MAX_HISTORY_ENTRIES)
                     .map_err(|_| RecoveryError::CorruptReplica)?;
                 let query = "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(payload_digest), length(retained_until), length(binding_digest), COALESCE(length(response_json), 0), COALESCE(length(response_digest), 0))), 0), COALESCE(SUM(length(request_id) + length(payload_digest) + length(retained_until) + length(binding_digest) + COALESCE(length(response_json), 0) + COALESCE(length(response_digest), 0)), 0) FROM (SELECT request_id, payload_digest, retained_until, binding_digest, response_json, response_digest FROM consensus_fenced_transition_receipts LIMIT ?1)";
@@ -731,6 +736,7 @@ fn committed_branch_digest(
     snapshot_dir: &Path,
     budget: &mut InspectionBudget,
     recovery_epoch: u64,
+    last_plan_digest: [u8; 32],
     pending_epoch: Option<u64>,
     pending_plan_digest: Option<[u8; 32]>,
     watch_cursor_invalidation_floor: u64,
@@ -741,6 +747,7 @@ fn committed_branch_digest(
     hasher.update(identity.configuration_id().as_bytes());
     hasher.update(identity.configuration_epoch().get().to_be_bytes());
     hasher.update(recovery_epoch.to_be_bytes());
+    hasher.update(last_plan_digest);
     hasher.update(watch_cursor_invalidation_floor.to_be_bytes());
     match (pending_epoch, pending_plan_digest) {
         (Some(epoch), Some(digest)) => {
@@ -827,6 +834,8 @@ fn hash_current_checkpoint(
     if table_exists(conn, "consensus_fenced_transition_receipts")?
         && preflight_fenced_transition_receipt_count(conn)? != 0
     {
+        consensus::validate_fenced_transition_receipt_storage_bounds_sync(conn)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
         hash_query_rows_with_identity(
             conn,
             fenced_receipts_query,
@@ -1121,6 +1130,15 @@ fn validate_exact_recovery_schema(
     conn: &Connection,
     require_recovery_table: bool,
 ) -> Result<(), RecoveryError> {
+    if consensus::fenced_transition_receipt_ledger_layout_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?
+        == consensus::FencedTransitionReceiptLedgerLayout::Published684
+    {
+        // The classifier compared the complete released manifest.  Its absent
+        // ledger is canonically an empty ledger for recovery hashing, while a
+        // marker-bearing database can never take this path.
+        return Ok(());
+    }
     let has_restore_scan_state = validate_restore_scan_schema_if_present(conn)?;
     let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
         .map_err(|_| RecoveryError::DatabaseUnavailable)?;
@@ -1618,8 +1636,12 @@ fn validate_pre_acquisition_lease_state(
         let fence =
             consensus::checked_positive_u64(fence).map_err(|_| RecoveryError::CorruptReplica)?;
         ops::persisted_owner_id(owner).map_err(|_| RecoveryError::CorruptReplica)?;
-        let guard_expires_at =
-            Timestamp::from_str(&guard_expires_at).map_err(|_| RecoveryError::CorruptReplica)?;
+        let guard_expires_at_raw = guard_expires_at;
+        let guard_expires_at = Timestamp::from_str(&guard_expires_at_raw)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        if ops::format_rfc3339_normalized(guard_expires_at) != guard_expires_at_raw {
+            return Err(RecoveryError::CorruptReplica);
+        }
         if acquired_at.is_some_and(|acquired_at| {
             ops::persisted_normalized_timestamp(Some(acquired_at))
                 .is_none_or(|acquired_at| acquired_at > guard_expires_at)
@@ -2912,6 +2934,8 @@ fn stage_source(
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| RecoveryError::FileOperationFailed)?;
             let storage_identity = consensus::read_storage_identity_sync(&tx)
+                .map_err(|_| RecoveryError::CorruptReplica)?;
+            consensus::activate_fenced_transition_receipt_ledger_sync(&tx, storage_identity)
                 .map_err(|_| RecoveryError::CorruptReplica)?;
             let committed: Option<i64> = tx
                 .query_row(
@@ -4377,15 +4401,21 @@ mod terminal_history_digest_tests {
             .expect("insert storage identity");
         }
         missing_ledger
-            .execute_batch("DROP TABLE consensus_fenced_transition_receipts")
-            .expect("remove additive receipt ledger");
+            .execute_batch(
+                r#"
+                DROP TABLE consensus_fenced_transition_receipts;
+                ALTER TABLE consensus_identity
+                DROP COLUMN fenced_transition_receipt_ledger_activated;
+                "#,
+            )
+            .expect("restore published #684 receipt shape");
         populated_ledger
             .execute(
                 "INSERT INTO consensus_fenced_transition_receipts (request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, 1, ?2, ?3, ?4, NULL, NULL)",
                 rusqlite::params![
                     [0x53_u8; 16].as_slice(),
                     [0x54_u8; 32].as_slice(),
-                    "2026-08-17T00:00:00Z",
+                    "2026-08-17T00:00:00.000000000Z",
                     [0x55_u8; 32].as_slice(),
                 ],
             )
@@ -4434,7 +4464,7 @@ mod terminal_history_digest_tests {
                 .execute(rusqlite::params![
                     request_id.as_slice(),
                     [0x56_u8; 32].as_slice(),
-                    "2026-08-17T00:00:00Z",
+                    "2026-08-17T00:00:00.000000000Z",
                     [0x57_u8; 32].as_slice(),
                 ])
                 .expect("insert receipt fixture");
@@ -4451,6 +4481,78 @@ mod terminal_history_digest_tests {
             hash_current_checkpoint(&conn, &mut budget, &mut hasher),
             Err(RecoveryError::CorruptReplica)
         ));
+    }
+
+    #[test]
+    fn recovery_rejects_receipt_specific_widths_before_hashing_values() {
+        let conn = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .expect("canonical database");
+        consensus::install_recovery_validation_schema_sync(&conn, false)
+            .expect("install consensus schema");
+        conn.execute(
+            "INSERT INTO consensus_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch) VALUES (1, ?1, ?2, ?3, 1)",
+            rusqlite::params![
+                i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
+                [0x61_u8; 32].as_slice(),
+                [0x62_u8; 32].as_slice(),
+            ],
+        )
+        .expect("insert storage identity");
+        conn.execute(
+            "INSERT INTO consensus_fenced_transition_receipts (request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, 1, ?2, ?3, ?4, NULL, NULL)",
+            rusqlite::params![
+                [0x63_u8; 16].as_slice(),
+                [0x64_u8; 32].as_slice(),
+                "2026-08-17T00:00:00.000000000Z",
+                [0x65_u8; 32].as_slice(),
+            ],
+        )
+        .expect("insert receipt fixture");
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow corrupt receipt widths");
+
+        for corruption in ["retention-one-over", "response-one-over"] {
+            match corruption {
+                "retention-one-over" => conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET retained_until = ?1",
+                    ["0".repeat(
+                        consensus::FENCED_TRANSITION_RECEIPT_TIMESTAMP_BYTES + 1,
+                    )],
+                ),
+                "response-one-over" => conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET response_json = ?1, response_digest = ?2",
+                    rusqlite::params![
+                        vec![
+                            0x66_u8;
+                            consensus::FENCED_TRANSITION_RECEIPT_MAX_RESPONSE_BYTES + 1
+                        ],
+                        [0x67_u8; 32].as_slice(),
+                    ],
+                ),
+                _ => unreachable!("fixed corruption fixture"),
+            }
+            .expect("inject corrupt receipt width");
+
+            let budget = InspectionBudget::new(RecoveryLimits::default());
+            assert!(matches!(
+                preflight_current_tables(&conn, &budget),
+                Err(RecoveryError::CorruptReplica)
+            ));
+            let mut budget = InspectionBudget::new(RecoveryLimits::default());
+            let mut hasher = Sha256::new();
+            assert!(matches!(
+                hash_current_checkpoint(&conn, &mut budget, &mut hasher),
+                Err(RecoveryError::CorruptReplica)
+            ));
+
+            conn.execute(
+                "UPDATE consensus_fenced_transition_receipts SET retained_until = ?1, response_json = NULL, response_digest = NULL",
+                ["2026-08-17T00:00:00.000000000Z"],
+            )
+            .expect("restore canonical receipt widths");
+        }
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore receipt constraints");
     }
 }
 
@@ -4502,6 +4604,15 @@ mod lease_acquired_at_recovery_tests {
         let conn = SqliteSessionBackend::canonical_schema_connection().expect("schema");
         consensus::install_recovery_validation_schema_sync(&conn, false)
             .expect("consensus recovery schema");
+        conn.execute(
+            "INSERT INTO consensus_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch) VALUES (1, ?1, ?2, ?3, 1)",
+            rusqlite::params![
+                i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
+                [0x71_u8; 32].as_slice(),
+                [0x72_u8; 32].as_slice(),
+            ],
+        )
+        .expect("insert active schema identity");
         conn.execute_batch("ALTER TABLE leases DROP COLUMN acquired_at")
             .expect("form exact pre-acquisition layout");
         validate_exact_recovery_schema(&conn, false)
@@ -4511,6 +4622,40 @@ mod lease_acquired_at_recovery_tests {
             .expect("form near-miss layout");
         assert!(matches!(
             validate_exact_recovery_schema(&conn, false),
+            Err(RecoveryError::CorruptReplica)
+        ));
+    }
+
+    #[test]
+    fn pre_acquisition_recovery_rejects_noncanonical_guard_expiry() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("source.sqlite");
+        let destination = directory.path().join("destination.sqlite");
+        source_with_lease(&source);
+        let conn = Connection::open(&source).expect("source connection");
+        conn.execute_batch("ALTER TABLE leases DROP COLUMN acquired_at")
+            .expect("form pre-acquisition source schema");
+        let canonical_guard_expiry: String = conn
+            .query_row("SELECT guard_expires_at FROM leases", [], |row| row.get(0))
+            .expect("read canonical guard expiry");
+        let noncanonical_guard_expiry = canonical_guard_expiry
+            .strip_suffix(".000000000Z")
+            .map(|prefix| format!("{prefix}Z"))
+            .expect("fixture uses normalized guard expiry");
+        conn.execute(
+            "UPDATE leases SET guard_expires_at = ?1",
+            [noncanonical_guard_expiry],
+        )
+        .expect("inject noncanonical guard expiry");
+        let mut budget = InspectionBudget::new(RecoveryLimits::default());
+        assert!(matches!(
+            validate_legacy_lease_state(&conn, &mut budget),
+            Err(RecoveryError::CorruptReplica)
+        ));
+        drop(conn);
+
+        assert!(matches!(
+            convert_legacy_checkpoint(&source, &destination, RecoveryLimits::default()),
             Err(RecoveryError::CorruptReplica)
         ));
     }

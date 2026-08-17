@@ -124,8 +124,6 @@ pub enum SessionMutationIntent {
         /// Requested bounded TTL.
         ttl: std::time::Duration,
     },
-    /// Atomically acquire or renew one exact fence and mutate the same record.
-    FencedTransition(Box<FencedTransitionRequest>),
     /// Release an existing lease.
     ReleaseLease(LeaseGuard),
     /// SDK-internal quorum-durable binding of a caller-owned consumer request
@@ -219,6 +217,8 @@ pub enum SessionMutationIntent {
         /// intents are rejected by the state machine.
         mutation: Box<SessionMutationIntent>,
     },
+    /// Atomically acquire or renew one exact fence and mutate the same record.
+    FencedTransition(Box<FencedTransitionRequest>),
 }
 
 impl fmt::Debug for SessionMutationIntent {
@@ -284,10 +284,10 @@ pub enum SessionMutationOutcome {
     ConsumerRecord(Option<StoredSessionRecord>),
     /// Lease allocated or renewed by the committed command.
     Lease(LeaseGuard),
-    /// Result of one atomic single-record fenced transition.
-    FencedTransition(FencedTransitionOutcome),
     /// Mutation completed without a value result.
     Unit,
+    /// Result of one atomic single-record fenced transition.
+    FencedTransition(FencedTransitionOutcome),
 }
 
 impl fmt::Debug for SessionMutationOutcome {
@@ -371,6 +371,9 @@ impl<T> SessionConsensusRpc<T> {
 
 #[cfg(test)]
 mod tests {
+    use serde::de::DeserializeOwned;
+    use serde::{Deserialize, Serialize};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -382,6 +385,339 @@ mod tests {
         FencedTransitionRequestId, Generation, OwnerId, SessionKeyType, StableId, StateClass,
         StateType, STABLE_ID_MAX_BYTES,
     };
+
+    #[derive(Clone, Serialize, Deserialize)]
+    enum LegacySessionMutationIntent684 {
+        AdvanceLogicalTime,
+        CompareAndSet(Box<CompareAndSet>),
+        DeleteFenced(LeaseGuard),
+        RefreshTtl {
+            lease: LeaseGuard,
+            ttl: Duration,
+        },
+        AcquireLease {
+            key: SessionKey,
+            owner: OwnerId,
+            ttl: Duration,
+        },
+        RenewLease {
+            lease: LeaseGuard,
+            ttl: Duration,
+        },
+        ReleaseLease(LeaseGuard),
+        BindConsumerRequest {
+            request_commitment: [u8; 32],
+        },
+        ReadConsumerRecord {
+            key: SessionKey,
+        },
+        FinalizeOperatorRecovery {
+            recovery_epoch: u64,
+            plan_digest: [u8; 32],
+            fence_high_water: u64,
+            credential_high_water: u64,
+        },
+        PrepareTopologyTransition {
+            transition_id: [u8; 16],
+            request_digest: [u8; 32],
+            desired_identity: SessionConsensusIdentity,
+            desired_members: BTreeSet<SessionConsensusNodeId>,
+            desired_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+        },
+        MarkTopologyLearnersReady {
+            transition_id: [u8; 16],
+            request_digest: [u8; 32],
+        },
+        FenceTopologyAuthority {
+            transition_id: [u8; 16],
+            request_digest: [u8; 32],
+        },
+        AbortTopologyTransition {
+            transition_id: [u8; 16],
+            request_digest: [u8; 32],
+        },
+        FinalizeTopologyTransition {
+            transition_id: [u8; 16],
+            request_digest: [u8; 32],
+        },
+        Authorized {
+            origin: SessionConsensusNodeId,
+            authority_identity: SessionConsensusIdentity,
+            mutation: Box<LegacySessionMutationIntent684>,
+        },
+    }
+
+    #[derive(Clone, Serialize, Deserialize)]
+    enum LegacySessionMutationOutcome684 {
+        CompareAndSet(CompareAndSetResult),
+        ConsumerRecord(Option<StoredSessionRecord>),
+        Lease(LeaseGuard),
+        Unit,
+    }
+
+    fn assert_postcard_cross_decode<T, U>(label: &str, current: T, legacy: U)
+    where
+        T: Serialize + DeserializeOwned,
+        U: Serialize + DeserializeOwned,
+    {
+        let current_bytes =
+            opc_consensus::encode_bounded(&current).expect("current postcard encoding");
+        let legacy_bytes =
+            opc_consensus::encode_bounded(&legacy).expect("legacy postcard encoding");
+        assert_eq!(current_bytes, legacy_bytes, "{label}: encoding changed");
+        opc_consensus::decode_bounded::<U>(&current_bytes).expect("legacy decode of current bytes");
+        opc_consensus::decode_bounded::<T>(&legacy_bytes).expect("current decode of legacy bytes");
+    }
+
+    fn legacy_key() -> SessionKey {
+        SessionKey {
+            tenant: TenantId::from_static("legacy-postcard"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: StableId::new(Bytes::from_static(b"legacy-key")).expect("stable ID"),
+        }
+    }
+
+    fn legacy_time(seconds: i64) -> opc_types::Timestamp {
+        opc_types::Timestamp::from_offset_datetime(
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds),
+        )
+    }
+
+    fn legacy_lease(key: SessionKey, owner: OwnerId) -> LeaseGuard {
+        LeaseGuard::new(
+            key,
+            owner,
+            FenceToken::new(7),
+            legacy_time(1),
+            legacy_time(61),
+            9,
+        )
+    }
+
+    fn legacy_record(key: SessionKey, owner: OwnerId) -> StoredSessionRecord {
+        StoredSessionRecord {
+            key,
+            generation: Generation::new(3),
+            owner,
+            fence: FenceToken::new(7),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("legacy-state"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(b"legacy-payload"),
+        }
+    }
+
+    fn legacy_identity() -> SessionConsensusIdentity {
+        SessionConsensusIdentity::new(
+            SessionConsensusClusterId::new("legacy-cluster").expect("cluster"),
+            SessionConsensusConfigurationId::from_bytes([0x41; 32]),
+            SessionConsensusConfigurationEpoch::new(2).expect("epoch"),
+        )
+    }
+
+    #[test]
+    fn schema_v1_legacy_intent_and_outcome_postcard_parity() {
+        let key = legacy_key();
+        let owner = OwnerId::new("legacy-owner").expect("owner");
+        let lease = legacy_lease(key.clone(), owner.clone());
+        let record = legacy_record(key.clone(), owner.clone());
+        let cas = CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: Some(Generation::new(2)),
+            new_record: record.clone(),
+        };
+        let identity = legacy_identity();
+        let node = SessionConsensusNodeId::new(1).expect("node");
+        let mut members = BTreeSet::new();
+        members.insert(node);
+        let mut bindings = BTreeMap::new();
+        bindings.insert(
+            node,
+            SessionTopologyMemberBinding::new([1; 32], [2; 32], [3; 32], [4; 32]),
+        );
+
+        assert_postcard_cross_decode(
+            "AdvanceLogicalTime",
+            SessionMutationIntent::AdvanceLogicalTime,
+            LegacySessionMutationIntent684::AdvanceLogicalTime,
+        );
+        assert_postcard_cross_decode(
+            "CompareAndSet",
+            SessionMutationIntent::CompareAndSet(Box::new(cas.clone())),
+            LegacySessionMutationIntent684::CompareAndSet(Box::new(cas)),
+        );
+        assert_postcard_cross_decode(
+            "DeleteFenced",
+            SessionMutationIntent::DeleteFenced(lease.clone()),
+            LegacySessionMutationIntent684::DeleteFenced(lease.clone()),
+        );
+        assert_postcard_cross_decode(
+            "RefreshTtl",
+            SessionMutationIntent::RefreshTtl {
+                lease: lease.clone(),
+                ttl: Duration::from_secs(20),
+            },
+            LegacySessionMutationIntent684::RefreshTtl {
+                lease: lease.clone(),
+                ttl: Duration::from_secs(20),
+            },
+        );
+        assert_postcard_cross_decode(
+            "AcquireLease",
+            SessionMutationIntent::AcquireLease {
+                key: key.clone(),
+                owner: owner.clone(),
+                ttl: Duration::from_secs(20),
+            },
+            LegacySessionMutationIntent684::AcquireLease {
+                key: key.clone(),
+                owner: owner.clone(),
+                ttl: Duration::from_secs(20),
+            },
+        );
+        assert_postcard_cross_decode(
+            "RenewLease",
+            SessionMutationIntent::RenewLease {
+                lease: lease.clone(),
+                ttl: Duration::from_secs(20),
+            },
+            LegacySessionMutationIntent684::RenewLease {
+                lease: lease.clone(),
+                ttl: Duration::from_secs(20),
+            },
+        );
+        assert_postcard_cross_decode(
+            "ReleaseLease",
+            SessionMutationIntent::ReleaseLease(lease.clone()),
+            LegacySessionMutationIntent684::ReleaseLease(lease.clone()),
+        );
+        assert_postcard_cross_decode(
+            "BindConsumerRequest",
+            SessionMutationIntent::BindConsumerRequest {
+                request_commitment: [5; 32],
+            },
+            LegacySessionMutationIntent684::BindConsumerRequest {
+                request_commitment: [5; 32],
+            },
+        );
+        assert_postcard_cross_decode(
+            "ReadConsumerRecord",
+            SessionMutationIntent::ReadConsumerRecord { key: key.clone() },
+            LegacySessionMutationIntent684::ReadConsumerRecord { key: key.clone() },
+        );
+        assert_postcard_cross_decode(
+            "FinalizeOperatorRecovery",
+            SessionMutationIntent::FinalizeOperatorRecovery {
+                recovery_epoch: 4,
+                plan_digest: [6; 32],
+                fence_high_water: 7,
+                credential_high_water: 8,
+            },
+            LegacySessionMutationIntent684::FinalizeOperatorRecovery {
+                recovery_epoch: 4,
+                plan_digest: [6; 32],
+                fence_high_water: 7,
+                credential_high_water: 8,
+            },
+        );
+        assert_postcard_cross_decode(
+            "PrepareTopologyTransition",
+            SessionMutationIntent::PrepareTopologyTransition {
+                transition_id: [9; 16],
+                request_digest: [10; 32],
+                desired_identity: identity,
+                desired_members: members.clone(),
+                desired_bindings: bindings.clone(),
+            },
+            LegacySessionMutationIntent684::PrepareTopologyTransition {
+                transition_id: [9; 16],
+                request_digest: [10; 32],
+                desired_identity: identity,
+                desired_members: members,
+                desired_bindings: bindings,
+            },
+        );
+        assert_postcard_cross_decode(
+            "MarkTopologyLearnersReady",
+            SessionMutationIntent::MarkTopologyLearnersReady {
+                transition_id: [11; 16],
+                request_digest: [12; 32],
+            },
+            LegacySessionMutationIntent684::MarkTopologyLearnersReady {
+                transition_id: [11; 16],
+                request_digest: [12; 32],
+            },
+        );
+        assert_postcard_cross_decode(
+            "FenceTopologyAuthority",
+            SessionMutationIntent::FenceTopologyAuthority {
+                transition_id: [13; 16],
+                request_digest: [14; 32],
+            },
+            LegacySessionMutationIntent684::FenceTopologyAuthority {
+                transition_id: [13; 16],
+                request_digest: [14; 32],
+            },
+        );
+        assert_postcard_cross_decode(
+            "AbortTopologyTransition",
+            SessionMutationIntent::AbortTopologyTransition {
+                transition_id: [15; 16],
+                request_digest: [16; 32],
+            },
+            LegacySessionMutationIntent684::AbortTopologyTransition {
+                transition_id: [15; 16],
+                request_digest: [16; 32],
+            },
+        );
+        assert_postcard_cross_decode(
+            "FinalizeTopologyTransition",
+            SessionMutationIntent::FinalizeTopologyTransition {
+                transition_id: [17; 16],
+                request_digest: [18; 32],
+            },
+            LegacySessionMutationIntent684::FinalizeTopologyTransition {
+                transition_id: [17; 16],
+                request_digest: [18; 32],
+            },
+        );
+        assert_postcard_cross_decode(
+            "Authorized",
+            SessionMutationIntent::Authorized {
+                origin: node,
+                authority_identity: identity,
+                mutation: Box::new(SessionMutationIntent::AdvanceLogicalTime),
+            },
+            LegacySessionMutationIntent684::Authorized {
+                origin: node,
+                authority_identity: identity,
+                mutation: Box::new(LegacySessionMutationIntent684::AdvanceLogicalTime),
+            },
+        );
+
+        assert_postcard_cross_decode(
+            "Outcome::CompareAndSet",
+            SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Success),
+            LegacySessionMutationOutcome684::CompareAndSet(CompareAndSetResult::Success),
+        );
+        assert_postcard_cross_decode(
+            "Outcome::ConsumerRecord",
+            SessionMutationOutcome::ConsumerRecord(None),
+            LegacySessionMutationOutcome684::ConsumerRecord(None),
+        );
+        assert_postcard_cross_decode(
+            "Outcome::Lease",
+            SessionMutationOutcome::Lease(lease),
+            LegacySessionMutationOutcome684::Lease(legacy_lease(key, owner)),
+        );
+        assert_postcard_cross_decode(
+            "Outcome::Unit",
+            SessionMutationOutcome::Unit,
+            LegacySessionMutationOutcome684::Unit,
+        );
+    }
 
     #[test]
     fn consensus_intent_serde_enforces_stable_id_before_admission() {

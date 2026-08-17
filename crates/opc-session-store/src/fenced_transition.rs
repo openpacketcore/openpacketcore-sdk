@@ -601,12 +601,23 @@ impl FencedTransitionOutcome {
     }
 
     pub(crate) fn validate(&self) -> Result<(), StoreError> {
+        let maximum_lease_expiry =
+            checked_session_deadline(self.recorded_at, crate::MAX_SESSION_TTL).ok();
         if self.lease.fence().get() == 0
             || self.lease.credential_id() == 0
+            || self.lease.acquired_at() > self.recorded_at
             || self.lease.expires_at() <= self.recorded_at
+            || maximum_lease_expiry.is_some_and(|maximum| self.lease.expires_at() > maximum)
             || self.retained_until <= self.recorded_at
         {
             return Err(StoreError::Serialization(INVALID_TRANSITION_OUTCOME.into()));
+        }
+        if let FencedTransitionMutationResult::TtlRefreshed { expires_at } = self.mutation {
+            if expires_at <= self.recorded_at
+                || maximum_lease_expiry.is_some_and(|maximum| expires_at > maximum)
+            {
+                return Err(StoreError::Serialization(INVALID_TRANSITION_OUTCOME.into()));
+            }
         }
         let maximum_retained_until =
             checked_session_deadline(self.recorded_at, FENCED_TRANSITION_OUTCOME_RETENTION)
@@ -977,6 +988,82 @@ mod tests {
             invalid.validate(),
             Err(StoreError::Serialization(_))
         ));
+    }
+
+    #[test]
+    fn outcome_time_envelopes_accept_exact_maximum_and_reject_one_over() {
+        let recorded_at = timestamp(10);
+        let exact_maximum = checked_session_deadline(recorded_at, crate::MAX_SESSION_TTL)
+            .expect("maximum outcome deadline");
+        let one_over = Timestamp::from_offset_datetime(
+            exact_maximum
+                .as_offset_datetime()
+                .checked_add(time::Duration::nanoseconds(1))
+                .expect("one-over outcome deadline"),
+        );
+        let retained_until =
+            checked_session_deadline(recorded_at, FENCED_TRANSITION_OUTCOME_RETENTION)
+                .expect("retention deadline");
+        let make_outcome = |acquired_at, lease_expires_at, mutation| FencedTransitionOutcome {
+            lease: LeaseGuard::new(
+                key(),
+                OwnerId::new("owner-a").expect("owner"),
+                FenceToken::new(8),
+                acquired_at,
+                lease_expires_at,
+                1,
+            ),
+            committed_generation: Generation::new(1),
+            mutation,
+            recorded_at,
+            retained_until,
+        };
+
+        assert!(make_outcome(
+            recorded_at,
+            exact_maximum,
+            FencedTransitionMutationResult::TtlRefreshed {
+                expires_at: exact_maximum,
+            },
+        )
+        .validate()
+        .is_ok());
+        for invalid in [
+            make_outcome(
+                recorded_at,
+                one_over,
+                FencedTransitionMutationResult::Created,
+            ),
+            make_outcome(
+                recorded_at,
+                exact_maximum,
+                FencedTransitionMutationResult::TtlRefreshed {
+                    expires_at: one_over,
+                },
+            ),
+            make_outcome(
+                Timestamp::from_offset_datetime(
+                    recorded_at
+                        .as_offset_datetime()
+                        .checked_add(time::Duration::nanoseconds(1))
+                        .expect("future acquisition"),
+                ),
+                exact_maximum,
+                FencedTransitionMutationResult::Created,
+            ),
+            make_outcome(
+                recorded_at,
+                exact_maximum,
+                FencedTransitionMutationResult::TtlRefreshed {
+                    expires_at: recorded_at,
+                },
+            ),
+        ] {
+            assert!(matches!(
+                invalid.validate(),
+                Err(StoreError::Serialization(_))
+            ));
+        }
     }
 
     #[test]

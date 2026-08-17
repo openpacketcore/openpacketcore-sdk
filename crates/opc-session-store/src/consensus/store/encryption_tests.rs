@@ -1104,6 +1104,7 @@ impl RemoteSealProvider for CountingRemoteSealProvider {
 
 #[tokio::test]
 async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
     let cluster = RemoteRotationCluster::start().await;
     let partition = cluster.observed_follower_partition();
     let lagging_applied = cluster.stores[partition.lagging_follower]

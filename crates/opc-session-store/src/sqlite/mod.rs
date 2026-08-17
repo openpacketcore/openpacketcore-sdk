@@ -2117,6 +2117,7 @@ mod consensus_readiness_deadline_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn readiness_recovery_and_barrier_share_one_complete_operation_deadline() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let snapshots = tempfile::tempdir().expect("snapshot directory");
         let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite backend");
         let apply_gate = Arc::clone(&backend.consensus_apply_gate);

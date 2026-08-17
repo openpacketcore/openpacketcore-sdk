@@ -26,6 +26,21 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+static CONSENSUS_TIMING_TEST_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Serialize unit tests whose bounded Raft deadlines are themselves the
+/// assertion while the default-parallel library suite performs heavy SQLite
+/// snapshot and recovery work in the same process.
+#[cfg(test)]
+pub(crate) async fn acquire_consensus_timing_test_permit() -> tokio::sync::SemaphorePermit<'static>
+{
+    CONSENSUS_TIMING_TEST_PERMIT
+        .acquire()
+        .await
+        .expect("consensus timing test permit remains open")
+}
+
 pub use opc_types::Timestamp;
 
 pub mod backend;

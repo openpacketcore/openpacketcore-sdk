@@ -1642,7 +1642,7 @@ fn current_recovery_inspection_rejects_partial_receipt_commitment_schema() {
 }
 
 #[test]
-fn current_recovery_inspection_accepts_empty_and_rejects_populated_precommitment_receipt_table() {
+fn current_recovery_inspection_rejects_empty_and_populated_precommitment_receipt_table() {
     for populated in [false, true] {
         let temp = tempfile::tempdir().expect("temporary directory");
         let (replica, members) = current_receipt_inspection_fixture(temp.path());
@@ -1671,11 +1671,11 @@ fn current_recovery_inspection_accepts_empty_and_rejects_populated_precommitment
             expected_members: &members,
             limits: RecoveryLimits::default(),
         });
-        if populated {
-            assert_eq!(inspected, Err(RecoveryError::CorruptReplica));
-        } else {
-            assert!(inspected.is_ok());
-        }
+        assert_eq!(
+            inspected,
+            Err(RecoveryError::CorruptReplica),
+            "populated={populated}",
+        );
     }
 }
 
@@ -1750,9 +1750,12 @@ fn current_recovery_inspection_accepts_pre_ledger_replica() {
     let (replica, members) = current_receipt_inspection_fixture(temp.path());
     let conn = Connection::open(&replica.database_path).expect("open current replica");
     conn.execute_batch(
-        "DROP TABLE consensus_fenced_transition_receipts; PRAGMA wal_checkpoint(TRUNCATE);",
+        "DROP TABLE consensus_fenced_transition_receipts;
+         ALTER TABLE consensus_identity
+         DROP COLUMN fenced_transition_receipt_ledger_activated;
+         PRAGMA wal_checkpoint(TRUNCATE);",
     )
-    .expect("remove additive receipt ledger");
+    .expect("restore the exact published #684 receipt shape");
     drop(conn);
 
     inspect_replica(InspectionInput {
@@ -2658,6 +2661,7 @@ async fn legacy_log_tail_is_quarantined_cleared_and_old_cursors_fail_closed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
     let temp = tempfile::tempdir().expect("temporary directory");
     let backup = private_tempdir();
     let ids = [

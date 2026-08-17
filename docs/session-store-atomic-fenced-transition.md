@@ -22,10 +22,14 @@ user mutation again.
 
 Only a store that proves `AtomicFencedTransitionCapability::V1` for the exact
 current consensus voter scope may advertise or execute this primitive.
-Unsupported, unavailable, restarted, downgraded, or mixed members MUST fail
-closed with `StoreError::CapabilityNotSupported("atomic_fenced_transition_v1")`
-or the applicable availability error. Legacy capability bits are insufficient
-evidence.
+Each transition proposal obtains a fresh point-in-time proof instead of using a
+capability cache. A voter that is unsupported, incompatible, mixed-version, or
+unreachable while that proof is collected makes admission fail closed with
+`StoreError::CapabilityNotSupported("atomic_fenced_transition_v1")` or the
+applicable availability error. Once all voters have answered and the exact
+scope has been rechecked, the proposal uses ordinary Raft quorum fault
+tolerance; a later process crash cannot retroactively invalidate completed
+admission. Legacy capability bits are insufficient evidence.
 
 ## Lease and mutation rules
 
@@ -49,6 +53,18 @@ not derive or trust a caller-supplied timestamp. Such a legacy guard remains
 safe to expire or be superseded, but renew, release, and fenced mutation fail
 closed as stale until authority is reacquired. New acquisition, replication,
 snapshot, and recovery paths preserve the exact normalized timestamp.
+The exact published #684 database and snapshot shapes also have no fenced
+receipt ledger; their bounded compatibility path introduces it empty and sets
+a one-way local activation marker in the same transaction. After activation,
+a missing, weak, partial, or malformed receipt ledger is corruption and is
+never reconstructed. Main-database open and read-only recovery accept no other
+markerless layout. Snapshot installation additionally recognizes the exact
+older Dynamic-consensus snapshot manifest that predates the #684 authority
+columns, lease-acquisition timestamp, and fenced receipt ledger. That exception
+is attached-snapshot-only, requires every historical schema product to match
+exactly, and supplies only the same empty predecessor ledger classification; it
+cannot reopen an old main database, weaken Fixed authority, or erase a local
+receipt binding. Every near-miss or hybrid markerless layout fails closed.
 
 The mutation is exactly one of the following:
 
@@ -105,14 +121,17 @@ or durable apply:
   exactly 1,048,576 bytes and rejects 1,048,577 bytes at follower admission
   and state-machine apply. More generally, callers must honor the selected
   consensus backend's advertised `BackendCapabilities::max_value_bytes`.
-- The complete encoded consensus RPC payload is bounded by
-  `SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES` (2 MiB): exactly 2 MiB is accepted
-  by the envelope boundary and 2 MiB plus one byte is rejected. This transport
-  envelope cap is not an entitlement to a record payload of that size.
+- The encoded inner payload of each consensus RPC request and successful
+  response is bounded by `SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES` (2 MiB):
+  exactly 2 MiB is accepted by the wire boundary and 2 MiB plus one byte is
+  rejected. This transport payload cap is not an entitlement to a record
+  payload of that size.
 - A serialized public outcome is at most
-  `FENCED_TRANSITION_MAX_OUTCOME_BYTES` (16 KiB); a larger result is rejected.
-  The outcome's payload-free shape makes that response bound independent of
-  the record payload.
+  `FENCED_TRANSITION_MAX_OUTCOME_BYTES` (16 KiB): the byte ceiling is inclusive
+  at 16,384 and rejects 16,385. Every valid current typed outcome remains
+  strictly below that ceiling under the public field bounds, and its
+  payload-free shape makes the response bound independent of the record
+  payload.
 
 ## Idempotency, retention, and uncertainty
 
@@ -183,6 +202,10 @@ respectively:
 - `NotFound` when no binding existed at that status barrier.
 
 `NotFound` is not proof that an earlier delayed proposal cannot commit later.
+Only an explicit submission of the identical ID and complete body is
+idempotency-safe: it may create the first binding, replay or expire an existing
+binding, or return an absorbing unbound rejection. The SDK does not
+automatically resubmit after a possibly delivered forwarding write.
 If `fenced_transition` returns `StoreError::FencedTransitionOutcomeUnknown`,
 the caller MUST retain the exact ID and canonical body and use the bounded,
 exact status operation. `HistoryFull` and `RetentionExhausted` are definitive
@@ -203,24 +226,41 @@ binding commitment. Reopen, status, recovery, and snapshot installation verify
 these commitments and reject non-normalized timestamp text or a valid-shaped
 result substituted for the originally committed result.
 
+Snapshot installation also preserves monotonic local durability floors before
+replacing any state: consensus logical time, application sequence and digest,
+watch sequence and cursor-invalidation floor, recovery epoch and plan digest,
+and any pending recovery workflow. An exact published #684 snapshot may supply
+an empty ledger only when the activated destination ledger is still empty; it
+cannot erase a binding. Current snapshots must carry the activation marker and
+the complete bounded ledger, including compacted tombstones.
+
 ## Validation and diagnostics
 
-Time-independent structural checks run before proposal or provider work and at
-follower admission: request identity, same key, owner and fence binding,
-generation shape, positive TTL, record-expiry profile, sealing, and payload
-shape. The leader assigns an immutable command time but does not submit a
-separate logical-time preflight. State-machine apply first checks the durable
-receipt namespace; an exact receipt replay remains exact through finite
-record/lease input expiry and until receipt-retention equality. Only after a
-receipt miss do time-dependent new-execution checks run at that command time.
-Capability, membership, receipt, reopen, snapshot, and recovery validation
-fail closed at their own boundaries.
+Request construction and the public entry point run time-independent semantic
+checks before capability probing: nonzero request identity, same key, owner and
+fence binding, generation shape, positive and bounded TTL, and record-expiry
+profile. Sealed-record envelope, payload-shape, and backend payload-size checks
+then run at source admission before any `ForwardMutation` transmission and are
+repeated at leader preproposal, follower-log admission, and state-machine
+apply.
+
+The leader assigns an immutable command-time floor but does not submit a
+separate logical-time preflight. After current-scope authorization,
+state-machine apply checks the durable receipt namespace before new-execution
+validation; an exact receipt replay remains exact through finite record/lease
+input expiry and until receipt-retention equality. Only after a receipt miss,
+and after generic-collision and history-cap precedence, do time-dependent
+new-execution checks run at the effective committed admission time: the maximum
+of the previous committed logical time and the command-time floor. Capability,
+membership, receipt, reopen, snapshot, and recovery validation fail closed at
+their own boundaries.
 
 Diagnostics are intentionally bounded and non-identifying. Debug formatting,
 errors, logs, and metrics redact request, outcome, key, owner, and payload
-values. The authorized typed success response necessarily returns its requested
-`LeaseGuard` credential (key, owner, and fence) to its caller, but never the
-record payload. Validation errors use typed outcomes and SDK-controlled reason
+values. The authorized typed success response necessarily returns its complete
+committed `LeaseGuard` credential to its caller; that API value is not a
+diagnostic, and the response never returns the record payload. Validation
+errors use typed outcomes and SDK-controlled reason
 categories; the size error may report only the requested and maximum byte
 counts. Diagnostics do not expose opaque IDs, record payloads, keys, owners,
 timestamps, topology endpoints, or local storage details.

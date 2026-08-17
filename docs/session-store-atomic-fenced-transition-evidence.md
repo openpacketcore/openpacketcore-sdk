@@ -8,8 +8,16 @@ build-environment override was used.
 ## Revision and scope
 
 - Assigned branch: `feat/696-atomic-fenced-transition-wm-20260816`
-- Published stacked dependency head: `514f2a96d5bf36b8f3e40afccd03a5771655e218`
-- Published dependency tree: `d70b02830b87d99765a4a0eefe627df8f310c6e7`
+- Original published #684 dependency head:
+  `514f2a96d5bf36b8f3e40afccd03a5771655e218`
+- Landed #684/main dependency head:
+  `0ffb7faed75914d3e99f8f9f1a287fbb6cb14aa7`
+- Landed #684/main dependency tree:
+  `189d22525fe6feb3f895ca5e5c922d2a6319e0a6`
+- Last published #696 checkpoint before this hardening pass:
+  `25c41eade3ac3aa4155fc2f1987ed620c33fc3ab` (tree
+  `5105fc89f5fd87dc06a6af541a2ea5d2369381c4`). The next published
+  checkpoint records the exact head/tree for the evidence below.
 - Included before #695: generic `opc-session-store` model, consensus admission,
   SQLite apply/persistence/recovery, snapshots, documentation, and tests.
 - Excluded before #695 publishes: `opc-session-net`, any wire revision, and all
@@ -33,11 +41,26 @@ and competing-owner race boundary removed by the one-entry primitive.
 result: PASS (1 passed)
 ```
 
+`red_696_split_renew_then_cas_leaves_a_committed_intermediate_boundary`
+retains the corresponding existing-record proof. The legacy renewal durably
+extends the exact lease while the record remains at its old generation and
+payload; only a later CAS installs the successor. The two ordered application
+and watch entries expose the crash/race boundary independently of any internal
+logical-time entries that Raft may also commit.
+
+```text
+/srv/agents/agent-codex/.local/bin/opc-heavy cargo test --locked \
+  -p opc-session-store --test consensus_openraft \
+  red_696_split_renew_then_cas_leaves_a_committed_intermediate_boundary \
+  --all-features -- --exact
+result: PASS (1 passed)
+```
+
 ## Fix-removal mutation: OutcomeUnknown
 
 Mutation: remove the fenced-transition disjunct that converts a forwarded
 post-transmission failure into the typed unknown outcome. The exact regression
-then failed at `consensus_openraft.rs:3067` with
+then failed at the assertion
 `a possibly delivered transition returns typed ambiguity`. Restoring the
 disjunct made the same command pass.
 
@@ -54,9 +77,8 @@ restored result: PASS (1 passed)
 
 Mutation: weaken the renew-side record authorization from rejecting either an
 owner mismatch or a fence mismatch to rejecting only when both fields differ.
-The regression failed at `consensus_openraft.rs:2864` because a still-valid
-lease mutated a record whose owner alone differed. Restoring the disjunction
-made the exact test pass.
+The regression failed because a still-valid lease mutated a record whose owner
+alone differed. Restoring the disjunction made the exact test pass.
 
 ```text
 /srv/agents/agent-codex/.local/bin/opc-heavy cargo test --locked \
@@ -70,10 +92,9 @@ restored result: PASS (1 passed)
 ## Fix-removal mutation: expected generation
 
 Mutation: accept every present expected generation against every present
-record instead of requiring equality. The regression failed at
-`consensus_openraft.rs:2740` because the unexpected generation renewed the
-lease and replaced the record. Restoring exact equality made the same command
-pass.
+record instead of requiring equality. The regression failed because the
+unexpected generation renewed the lease and replaced the record. Restoring
+exact equality made the same command pass.
 
 ```text
 /srv/agents/agent-codex/.local/bin/opc-heavy cargo test --locked \
@@ -87,10 +108,10 @@ restored result: PASS (1 passed)
 ## Fix-removal mutation: durable complete-body binding
 
 Mutation: bypass the persisted request-digest mismatch branch during apply
-replay. The exact receipt regression failed closed at
-`sqlite/consensus.rs:11901` while processing the different-body request,
-instead of returning its committed `RequestConflict`. Restoring the digest
-comparison returned the typed no-effect conflict and made the test pass.
+replay. The exact receipt regression failed closed while processing the
+different-body request, instead of returning its committed `RequestConflict`.
+Restoring the digest comparison returned the typed no-effect conflict and made
+the test pass.
 
 ```text
 /srv/agents/agent-codex/.local/bin/opc-heavy cargo test --locked \
@@ -104,10 +125,9 @@ restored result: PASS (1 passed)
 ## Fix-removal mutation: follower request identity admission
 
 Mutation: bypass the follower-log equality check between the outer consensus
-request ID and the typed transition request ID. The regression failed at
-`sqlite/consensus.rs:13572` because the mismatched entry entered the follower
-log. Restoring the equality check made follower and apply admission reject the
-entry again.
+request ID and the typed transition request ID. The regression failed because
+the mismatched entry entered the follower log. Restoring the equality check
+made follower and apply admission reject the entry again.
 
 ```text
 /srv/agents/agent-codex/.local/bin/opc-heavy cargo test --locked \
@@ -135,55 +155,183 @@ semantics, while changing one canonical request field does.
 result: PASS (1 passed)
 ```
 
-## Verification completed before final hardening
+## Fresh pre-#695 mutation restoration boundary
 
-These runs established the initial coherent store implementation; every item
-is rerun after the retained-result, acquisition-time, and receipt-integrity
-hardening lands.
+All five mutations above were rerun on 2026-08-16 against this coherent
+pre-#695 working tree. Each exact test failed at its intended invariant and
+passed after the one-line mutation was restored. The restored source digests
+were then checked against the values captured before the mutation sequence:
 
 ```text
-cargo check --locked -p opc-session-store --all-targets --all-features
-result: PASS
-
-cargo test --locked -p opc-session-store --lib fenced_transition --all-features
-result: PASS (20 passed)
-
-cargo test --locked -p opc-session-store --lib fenced_ --all-features
-result: PASS (39 passed)
-
-cargo test --locked -p opc-session-store --test consensus_openraft \
-  fenced_transition --all-features
-result: PASS (15 passed)
+9d06760723aa22bb064d383077b36c2ce062199c8073ccb2c289c1d0c239f519  crates/opc-session-store/src/sqlite/consensus.rs
+26f4bc9d530f34573ecf3e6d0250131e41a9b660efde3e834e5105aadfc1f049  crates/opc-session-store/src/consensus/store.rs
 ```
 
-The 15-test three-voter filter includes the deterministic before-proposal,
-after-proposal/before-commit, after-commit/before-response, leader-transfer,
-capability-downgrade, exact replay, and no-auto-replay paths. It also proves
-that Acquire+Create and each Renew+Update/RefreshTtl/Delete operation consume
-one consensus entry and expose one ordered two-operation application/watch
-batch. The absent and exact-record-expiry matrix records `CasConflict` for
-Update/RefreshTtl/Delete without renewing the lease or creating a record,
-fence, application sequence, or watch effect.
+They are rerun once more after #695 integration at the final exact head; this
+pre-integration evidence is intentionally not the final merge gate.
+
+## Current working-tree requalification plan
+
+The historical mutation results above are retained evidence, not a substitute
+for the final current-head qualification. Before the store-only checkpoint,
+and again after the normal #695/origin-main integration, run one mutation at a
+time, immediately restore it, and verify the source digest before starting the
+next mutation. This plan has been prepared against the current uncommitted
+store-only tree; it is deliberately recorded as a plan until those commands
+have actually run.
+
+```text
+4e090668dd34cfe70564787f4e43980b94fd9e698a0ae50542692ccd1b94107b  crates/opc-session-store/src/sqlite/consensus.rs
+298dab3f94c9a182be3e667ce60f0cb61e7ce8cfcb475d440169b8562c795736  crates/opc-session-store/src/consensus/store.rs
+```
+
+The five one-line removal mutations and their exact regression commands are:
+
+1. In `consensus/store.rs`, map `FencedTransition` in
+   `consensus_outcome_unavailable` to the generic backend-outcome error;
+   `fenced_transition_does_not_auto_replay_after_forward_write_boundary` must
+   fail, then pass after restoring `FencedTransitionOutcomeUnknown`.
+2. In `sqlite/consensus.rs`, weaken the renew record identity check from
+   `owner != ... || fence != ...` to `owner != ... && fence != ...`;
+   `fenced_transition_renew_rejects_record_owner_or_fence_mismatch` must fail,
+   then pass after restoring `||`.
+3. In `sqlite/consensus.rs`, bypass the present-record equality guard in the
+   expected-generation match;
+   `fenced_transition_stale_fence_and_generation_rejections_leave_state_unchanged`
+   must fail, then pass after restoring exact equality.
+4. In `sqlite/consensus.rs`, bypass only the
+   `replay_fenced_transition_receipt_sync` body-digest mismatch branch;
+   `sqlite::consensus::tests::fenced_transition_receipt_replays_conflicts_and_expires_to_a_tombstone`
+   must fail, then pass after restoring the digest comparison.
+5. In `sqlite/consensus.rs`, bypass only the follower-log outer/inner request
+   ID equality check in `validate_normal_command`;
+   `sqlite::consensus::tests::fenced_transition_outer_request_id_mismatch_fails_follower_and_apply_admission`
+   must fail, then pass after restoring that equality check.
+
+Each command uses the exact `opc-heavy cargo test --locked -p
+opc-session-store --all-features` invocation already printed in its historical
+mutation section above, adding `--nocapture` only when diagnostic output is
+needed. No mutation may be retained for a second command, and a restored
+source digest mismatch is a hard stop rather than an opportunity to infer a
+passing restoration.
+
+## Current focused regressions after deterministic repairs
+
+These are current working-tree results from 2026-08-17; they are not the
+remaining aggregate, mutation, Clippy, package, workspace, or post-#695 gates.
+
+```text
+production_readiness_requires_fresh_authenticated_topology_and_accepts_refresh
+result: PASS (1 passed, 4.81s)
+
+lagging_replica_installs_compacted_snapshot_without_losing_committed_state
+result: PASS (1 passed, 57.49s)
+
+fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
+result: PASS (1 passed, 55.74s)
+
+committed_write_with_a_late_forward_result_is_typed_ambiguous_and_applied_once
+result: PASS (1 passed, 0.89s)
+
+cargo fmt --all --check && git diff --check
+result: PASS (wrapper exit 0)
+```
+
+The snapshot tests previously exceeded their five-minute command-batch bound
+because the durable append/apply path reconstructed two canonical in-memory
+SQLite schemas for every activated-ledger validation. The expected immutable
+normalized DDL forms are now initialized once with `OnceLock`; each durable
+call still reads and exactly validates the actual marker, `sqlite_master`
+definition, receipt table, and index.
+
+The readiness test now acquires its capacity-one fixture permit before minting
+its real monotonic-expiry evidence, so evidence cannot expire in the test
+queue. Its 250 ms test-only timer-dispatch tolerance is not a production
+timeout change: `timeout_at` selects the deadline event, but a host runtime
+cannot promise that the task is scheduled at the identical wall-clock instant.
+The test proves entry into the delayed peer path and sets 3 s/4 s injected
+faults for 1 s/2 s attestation budgets, leaving at least 1.75 s between the
+asserted upper bound and a completed peer response. Thus it still detects a
+barrier that waits for the peer or the 5 s operation deadline instead of the
+attestation deadline.
+
+## Independent store hardening evidence
+
+The current store-only hardening adds and exercises:
+
+- permanent bounded request/body and response commitments, including exact V1
+  request-digest parity and corruption/reopen rejection;
+- the 4096-entry absorbing history cap and exact 24-hour retention horizon;
+- a one-way receipt-ledger activation marker, exact markerless #684 migration,
+  exact enumeration of all 12 released lease/operator-recovery/restore schema
+  products, an attached-only exact pre-authority Dynamic snapshot exception,
+  and rejection of activated missing/weak/partial ledger, identity-marker, or
+  historical-hybrid state;
+- monotonic snapshot-install floors for logical/application/watch/recovery
+  state, including the application and recovery digest chains;
+- exact replay after snapshot installation without a second effect;
+- legacy postcard ordinal parity for every pre-#696 consensus intent, outcome,
+  and `StoreError` variant;
+- fixed non-identifying Debug output at command, response, store, transition,
+  and replication boundaries; and
+- inclusive 1 MiB record, 16 KiB public-outcome, and 2 MiB consensus-RPC
+  boundaries with one-over rejection.
+
+On 2026-08-16, before the subsequent activation/snapshot hardening and #695
+integration, a coherent store-only checkpoint passed:
 
 ```text
 /srv/agents/agent-codex/.local/bin/opc-heavy cargo test --locked \
-  -p opc-session-store --lib fenced_ --all-features
-result: PASS (49 passed)
+  -p opc-session-store --all-features
+result: PASS (complete package: all unit, integration, and doc tests)
+
+/srv/agents/agent-codex/.local/bin/opc-heavy cargo clippy --locked \
+  -p opc-session-store --all-targets --all-features -- -D warnings
+result: PASS
+
+/srv/agents/agent-codex/.local/bin/opc-heavy cargo fmt --all --check
+result: PASS
 
 /srv/agents/agent-codex/.local/bin/opc-heavy cargo test --locked \
   -p opc-session-store --test consensus_openraft \
   fenced_transition --all-features
-result: PASS (15 passed)
+result: PASS (17 passed)
 ```
+
+The 17-test three-voter filter includes deterministic before-proposal,
+after-proposal/before-commit, after-commit/before-response, leader-transfer,
+capability-downgrade, exact replay, no-auto-replay, expired-owner takeover,
+and snapshot-install replay paths. It also proves that Acquire+Create and each
+Renew+Update/RefreshTtl/Delete operation consume one consensus application
+entry and expose one ordered two-operation application/watch batch. The absent
+and exact-record-expiry matrix records `CasConflict` for
+Update/RefreshTtl/Delete without renewing the lease or creating a record,
+fence, application sequence, or watch effect.
+
+These are retained historical store-side gates, not the final exact-head
+verification. The hardened pre-#695 checkpoint is being rerun under the same
+commands before publication, and every gate is rerun after the normal #695
+merge together with workspace CI and least-authority consumer transport
+evidence.
 
 ## Published-#684 recovery compatibility
 
 The additive receipt commitments and persisted lease-acquisition timestamp
 remain compatible with the exact published #684 database and snapshot shapes.
 Read-only recovery projects the absent acquisition timestamp as an explicit
-non-authoritative `NULL`, and only its exact legacy path treats an absent or
-empty unpublished receipt table as an empty ledger. Normal runtime, follower,
-append, replay, and populated/partial legacy-ledger paths remain fail-closed.
+non-authoritative `NULL`. Only the exact markerless #684 manifest with no
+receipt table is accepted as an empty ledger. Read-only inspection does not
+mutate that source; writable open or staged recovery creates the exact empty
+ledger and one-way activation marker transactionally. A present empty weak or
+unpublished table, as well as any populated, partial, malformed, or activated
+missing-ledger layout, remains fail-closed.
+
+Snapshot installation has one narrower historical exception: the exact
+pre-authority Dynamic-consensus manifest is accepted only while attached as an
+incoming snapshot and only with every later artifact absent. The same file is
+rejected as a writable or read-only main database. Focused classifier evidence
+also retains the marker, receipt table/index, and `leases.acquired_at` one at a
+time and proves that each impossible hybrid is rejected.
 
 The pinpointed regression and the complete recovery matrix were rerun after
 fixing the recovery-only log projection:
@@ -197,13 +345,15 @@ result: PASS (1 passed)
 
 /srv/agents/agent-codex/.local/bin/opc-heavy cargo test --locked \
   -p opc-session-store --lib recovery:: --all-features
-result: PASS (38 passed)
+result: PASS (41 passed)
 ```
 
-The 38-test matrix includes exact pre-acquisition lease schema inspection,
-conversion, recovery planning, and digest equivalence; absent and empty legacy
-receipt-ledger acceptance; and rejection of populated, partial, oversized,
-prematurely compacted, malformed, or durable-floor-inconsistent receipts.
+The current 41-test recovery matrix (also covered by the complete
+package PASS above) includes exact pre-acquisition lease schema inspection,
+conversion, recovery planning, and digest equivalence; exact absent-ledger
+#684 acceptance; and rejection of present weak/empty, populated, partial,
+oversized, prematurely compacted, malformed, or durable-floor-inconsistent
+receipts.
 
 The final section will contain the exact post-integration store package, Clippy,
 format, documentation, workspace CI, hosted-check, and three-voter transport

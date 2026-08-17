@@ -486,13 +486,8 @@ impl fmt::Debug for ConsensusSessionConsumerService {
 }
 
 impl fmt::Debug for ConsensusSessionStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConsensusSessionStore")
-            .field("storage_identity", &self.inner.storage_identity)
-            .field("local_node_id", &self.inner.local_node_id)
-            .field("bootstrap_members", &self.inner.bootstrap_members.len())
-            .field("peer_directory", &self.inner.peer_directory)
-            .finish_non_exhaustive()
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConsensusSessionStore(<redacted>)")
     }
 }
 
@@ -883,10 +878,10 @@ impl ConsensusSessionStore {
     }
 
     /// Prove that every member in one exact admitted scope implements the
-    /// complete V1 log/apply/replay contract. Every proposal probes again: a
-    /// same-identity process restart or software downgrade must not inherit an
-    /// earlier process's proof. Remote probes run concurrently over the bounded
-    /// exact voter set so this adds one setup round trip, not one per voter.
+    /// complete V1 log/apply/replay contract at admission. Every proposal
+    /// probes again instead of inheriting a cached proof from an earlier
+    /// process lifetime. Remote probes run concurrently over the bounded exact
+    /// voter set so this adds one setup round trip, not one per voter.
     async fn require_fenced_transition_capability_before(
         &self,
         deadline: tokio::time::Instant,
@@ -3327,7 +3322,7 @@ fn unsupported_fenced_transition() -> StoreError {
 fn consensus_outcome_unavailable(intent: &SessionMutationIntent) -> StoreError {
     match intent {
         SessionMutationIntent::CompareAndSet(_) => StoreError::CasIdempotencyOutcomeUnavailable,
-        SessionMutationIntent::FencedTransition(_) => StoreError::FencedTransitionOutcomeUnknown,
+        SessionMutationIntent::FencedTransition(_) => StoreError::BackendOperationOutcomeUnavailable,
         _ => StoreError::BackendOperationOutcomeUnavailable,
     }
 }
@@ -4852,6 +4847,49 @@ mod membership_tests {
         .expect("singleton topology")
     }
 
+    #[tokio::test]
+    async fn consensus_session_store_debug_is_fixed_and_redacts_topology_identity() {
+        let directory = tempfile::tempdir().expect("debug canary directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("debug canary SQLite backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open debug canary store");
+        let node_ordinal = store.inner.local_node_id.get().to_string();
+        let configuration_epoch = store
+            .inner
+            .storage_identity
+            .configuration_epoch()
+            .get()
+            .to_string();
+
+        let rendered = format!("{store:?}");
+        assert!(
+            rendered == "ConsensusSessionStore(<redacted>)",
+            "consensus store Debug must remain fixed and redacted"
+        );
+        for canary in [
+            "storage_identity",
+            "ConsensusIdentity",
+            "local_node_id",
+            "ConsensusNodeId",
+            "configuration_epoch",
+            "peer_directory",
+            node_ordinal.as_str(),
+            configuration_epoch.as_str(),
+        ] {
+            assert!(
+                !rendered.contains(canary),
+                "consensus store Debug exposed a topology identity canary"
+            );
+        }
+    }
+
     fn forged_operator_recovery_intent(seed: u8) -> SessionMutationIntent {
         SessionMutationIntent::FinalizeOperatorRecovery {
             recovery_epoch: 1,
@@ -5813,6 +5851,7 @@ mod membership_tests {
 
     #[tokio::test]
     async fn oversized_consumer_batch_does_not_bind_request_id() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let (_directory, store, scope, identity, key, lease) = consumer_boundary_store().await;
         let service = store.consumer_service();
         let request_id = crate::SessionConsumerRequestId::from_bytes([0x92; 16]);
@@ -6065,6 +6104,7 @@ mod membership_tests {
 
     #[tokio::test]
     async fn typed_consumer_service_deduplicates_and_fences_competing_leases() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let directory = tempfile::tempdir().expect("consumer service directory");
         let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
             .expect("consumer service SQLite backend");
@@ -6275,6 +6315,7 @@ mod membership_tests {
 
     #[tokio::test]
     async fn committed_expiry_floor_is_idempotent_and_survives_leader_clock_rollback() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let directory = tempfile::tempdir().expect("expiry floor directory");
         let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
             .expect("expiry floor SQLite backend");
@@ -6364,6 +6405,7 @@ mod membership_tests {
 
     #[tokio::test]
     async fn watch_exposes_only_state_machine_applied_application_entries() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let directory = tempfile::tempdir().expect("watch commit gate directory");
         let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
             .expect("watch commit gate SQLite backend");

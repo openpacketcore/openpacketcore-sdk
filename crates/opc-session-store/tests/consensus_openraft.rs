@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use opc_consensus::{
     derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
-    DURABLE_CONSENSUS_TIMING_PROFILE,
+    DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
@@ -56,15 +56,20 @@ const SNAPSHOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const SNAPSHOT_COMMAND_BATCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SNAPSHOT_CATCH_UP_COMMANDS: usize = 4_300;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+// `timeout_at` bounds which protocol event wins, but a host runtime can only
+// observe its timer once it is scheduled. Keep this below half the deliberate
+// fault-gap so a delayed peer response can never satisfy this assertion.
+const ATTESTATION_PROBE_TIMER_DISPATCH_TOLERANCE: Duration = Duration::from_millis(250);
 const MAX_CAPTURED_CONSENSUS_PAYLOADS: usize = 4_096;
 // Keep the bounded election qualification from competing with the deliberately
 // expensive snapshot-compaction qualification under the parallel test harness.
 static ELECTION_AND_SNAPSHOT_TEST_PERMIT: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(1);
-// Cluster formation uses each fixture's selected operation budget. Serialize
-// only that setup phase so concurrent libtest fixtures cannot consume one
-// another's formation budget; test bodies remain concurrent.
-static CLUSTER_FORMATION_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+// Each fixture runs three in-process Raft voters with bounded election and
+// operation deadlines. Cap only these heavyweight fixtures so the default
+// parallel libtest scheduler cannot make unrelated clusters consume one
+// another's protocol budgets; non-cluster tests remain fully parallel.
+static CLUSTER_TEST_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 const ENCRYPTION_NAMESPACE: &str = "consensus-boundary-qualification";
 const PLAINTEXT_CANARY_BEFORE_ROTATION: &[u8] =
     b"opc-session-consensus-plaintext-canary-before-key-rotation";
@@ -81,7 +86,7 @@ struct AppendEntriesRequestDelay {
 #[derive(Clone)]
 struct LoopbackPeer {
     target: SessionConsensusNodeId,
-    handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
+    handler: Arc<StdRwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
     read_barrier_supported: Arc<AtomicBool>,
     forward_mutation_calls: Arc<AtomicUsize>,
@@ -92,6 +97,7 @@ struct LoopbackPeer {
     append_entries_request_delay: Arc<StdMutex<Option<AppendEntriesRequestDelay>>>,
     delayed_append_entries: Arc<AtomicUsize>,
     rpc_delay_millis: Arc<AtomicU64>,
+    delayed_calls: Arc<AtomicUsize>,
     captured_payloads: Arc<StdMutex<Vec<Bytes>>>,
 }
 
@@ -99,7 +105,7 @@ impl LoopbackPeer {
     fn new(target: SessionConsensusNodeId) -> Self {
         Self {
             target,
-            handler: Arc::new(tokio::sync::RwLock::new(None)),
+            handler: Arc::new(StdRwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
             read_barrier_supported: Arc::new(AtomicBool::new(true)),
             forward_mutation_calls: Arc::new(AtomicUsize::new(0)),
@@ -110,12 +116,20 @@ impl LoopbackPeer {
             append_entries_request_delay: Arc::new(StdMutex::new(None)),
             delayed_append_entries: Arc::new(AtomicUsize::new(0)),
             rpc_delay_millis: Arc::new(AtomicU64::new(0)),
+            delayed_calls: Arc::new(AtomicUsize::new(0)),
             captured_payloads: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
-    async fn install(&self, handler: Arc<dyn SessionConsensusRpcHandler>) {
-        *self.handler.write().await = Some(handler);
+    fn install(&self, handler: Arc<dyn SessionConsensusRpcHandler>) {
+        *self.handler.write().expect("consensus handler lock") = Some(handler);
+    }
+
+    fn clear_handler(&self) {
+        self.handler
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     fn set_enabled(&self, enabled: bool) {
@@ -190,6 +204,10 @@ impl LoopbackPeer {
 
     fn stop_delaying_calls(&self) {
         self.rpc_delay_millis.store(0, Ordering::SeqCst);
+    }
+
+    fn delayed_calls(&self) -> usize {
+        self.delayed_calls.load(Ordering::SeqCst)
     }
 
     fn clear_captured_payloads(&self) {
@@ -275,6 +293,7 @@ impl SessionConsensusPeer for LoopbackPeer {
 
         let rpc_delay = self.rpc_delay_millis.load(Ordering::SeqCst);
         if rpc_delay != 0 {
+            self.delayed_calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(rpc_delay)).await;
         }
 
@@ -308,7 +327,7 @@ impl SessionConsensusPeer for LoopbackPeer {
         let handler = self
             .handler
             .read()
-            .await
+            .expect("consensus handler lock")
             .clone()
             .ok_or(SessionConsensusPeerError::Unavailable)?;
         let sender = request.sender;
@@ -342,10 +361,21 @@ impl SessionConsensusPeer for LoopbackPeer {
 }
 
 struct TestCluster {
-    _directory: TempDir,
-    _backends: Vec<SqliteSessionBackend>,
-    stores: Vec<ConsensusSessionStore>,
     paths: BTreeMap<(usize, usize), Arc<LoopbackPeer>>,
+    stores: Vec<ConsensusSessionStore>,
+    _backends: Vec<SqliteSessionBackend>,
+    _directory: TempDir,
+    _test_permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl Drop for TestCluster {
+    fn drop(&mut self) {
+        // Break the test-only peer-handler/store cycles before the cluster
+        // resources and final concurrency permit are released.
+        for path in self.paths.values() {
+            path.clear_handler();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -365,6 +395,22 @@ impl Clock for MutableTestClock {
     fn now_utc(&self) -> opc_types::Timestamp {
         *self.0.lock().expect("test clock mutex")
     }
+}
+
+async fn commit_snapshot_triggering_commands(store: &ConsensusSessionStore) {
+    use futures_util::StreamExt;
+
+    // Retain the production 4,096-log snapshot threshold and commit every
+    // qualification command. Exercise only the SDK's fixed, bounded proposal
+    // admission capacity so per-call forwarding/readback latency does not turn
+    // this real-profile proof into a serial wall-clock race.
+    futures_util::stream::iter(0..SNAPSHOT_CATCH_UP_COMMANDS)
+        .map(|_| store.max_replication_sequence())
+        .buffer_unordered(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
+        .for_each(|result| async {
+            result.expect("advance committed logical time toward snapshot compaction");
+        })
+        .await;
 }
 
 impl TestCluster {
@@ -417,11 +463,30 @@ impl TestCluster {
         topologies: Vec<ValidatedQuorumTopology>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        assert_eq!(topologies.len(), MEMBER_COUNT);
-        let formation_permit = CLUSTER_FORMATION_PERMIT
+        let test_permit = Self::acquire_test_permit().await;
+        Self::start_with_topologies_and_clock_with_permit(
+            operation_timeout,
+            topologies,
+            clock,
+            test_permit,
+        )
+        .await
+    }
+
+    async fn acquire_test_permit() -> tokio::sync::SemaphorePermit<'static> {
+        CLUSTER_TEST_PERMIT
             .acquire()
             .await
-            .expect("cluster-formation permit remains available");
+            .expect("cluster-test permit remains available")
+    }
+
+    async fn start_with_topologies_and_clock_with_permit(
+        operation_timeout: Duration,
+        topologies: Vec<ValidatedQuorumTopology>,
+        clock: Arc<dyn Clock>,
+        test_permit: tokio::sync::SemaphorePermit<'static>,
+    ) -> Self {
+        assert_eq!(topologies.len(), MEMBER_COUNT);
         let directory = tempfile::tempdir().expect("create fleet directory");
         let backends = (0..MEMBER_COUNT)
             .map(|index| {
@@ -470,11 +535,20 @@ impl TestCluster {
             stores.push(store);
         }
 
-        for ((_, target), path) in &paths {
-            path.install(stores[*target].rpc_handler()).await;
+        let cluster = Self {
+            paths,
+            stores,
+            _backends: backends,
+            _directory: directory,
+            _test_permit: test_permit,
+        };
+
+        for ((_, target), path) in &cluster.paths {
+            path.install(cluster.stores[*target].rpc_handler());
         }
 
-        let initialize = stores
+        let initialize = cluster
+            .stores
             .iter()
             .map(ConsensusSessionStore::initialize_cluster)
             .collect::<Vec<_>>();
@@ -483,17 +557,10 @@ impl TestCluster {
             result.expect("initialize identical membership concurrently");
         }
 
-        let cluster = Self {
-            _directory: directory,
-            _backends: backends,
-            stores,
-            paths,
-        };
         cluster
             .wait_all_ready(CLUSTER_START_TIMEOUT)
             .await
             .expect("fresh cluster reaches durable readiness");
-        drop(formation_permit);
         cluster
     }
 
@@ -640,6 +707,18 @@ impl TestCluster {
         }
     }
 
+    fn delayed_calls(&self, source: usize) -> usize {
+        (0..MEMBER_COUNT)
+            .filter(|target| *target != source)
+            .map(|target| {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .delayed_calls()
+            })
+            .sum()
+    }
+
     fn delay_append_entries_for_request(
         &self,
         source: usize,
@@ -724,22 +803,20 @@ impl TestCluster {
             .set_read_barrier_supported(supported);
     }
 
-    async fn restart_same_node_id_with_old_read_barrier(&self, source: usize, target: usize) {
+    fn restart_same_node_id_with_old_read_barrier(&self, source: usize, target: usize) {
         self.paths
             .get(&(source, target))
             .expect("outbound path")
             .install(Arc::new(RejectReadBarrierHandler {
                 inner: self.stores[target].rpc_handler(),
-            }))
-            .await;
+            }));
     }
 
-    async fn restore_current_rpc_handler(&self, source: usize, target: usize) {
+    fn restore_current_rpc_handler(&self, source: usize, target: usize) {
         self.paths
             .get(&(source, target))
             .expect("outbound path")
-            .install(self.stores[target].rpc_handler())
-            .await;
+            .install(self.stores[target].rpc_handler());
     }
 
     fn clear_captured_payloads(&self) {
@@ -1418,6 +1495,10 @@ async fn production_readiness_requires_fresh_authenticated_topology_and_accepts_
     let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
     let identity = consensus_identity(&members);
     let collector = attestation_collector();
+    // The proof has a real monotonic expiry. Hold the fixture permit before
+    // minting it, otherwise another cluster can make valid evidence expire in
+    // the test queue before this fixture gets a chance to open it.
+    let test_permit = TestCluster::acquire_test_permit().await;
     let topologies = attested_topologies(
         &members,
         identity,
@@ -1428,7 +1509,13 @@ async fn production_readiness_requires_fresh_authenticated_topology_and_accepts_
         TopologyAttestationTime::from_unix_seconds(1_000),
     );
     let attestation_context = topologies[0].clone();
-    let cluster = TestCluster::start_with_topologies(Duration::from_secs(5), topologies).await;
+    let cluster = TestCluster::start_with_topologies_and_clock_with_permit(
+        Duration::from_secs(5),
+        topologies,
+        Arc::new(SystemClock),
+        test_permit,
+    )
+    .await;
     let store = &cluster.stores[0];
 
     assert_eq!(
@@ -1478,19 +1565,30 @@ async fn production_readiness_requires_fresh_authenticated_topology_and_accepts_
     );
 
     let (initial_leader, _, _) = cluster.observed_leader();
-    cluster.delay_calls(initial_leader, Duration::from_millis(1_500));
+    let initial_delayed_before = cluster.delayed_calls(initial_leader);
+    // The injected peer delay is much longer than the attestation deadline.
+    // This leaves a 1.75 s gap after the timer-dispatch tolerance, so a
+    // completed peer call cannot be mistaken for deadline enforcement.
+    cluster.delay_calls(initial_leader, Duration::from_secs(3));
+    let initial_attestation_budget = Duration::from_secs(1);
     let initial_probe_started = Instant::now();
     let initial_crossed_expiry = cluster.stores[initial_leader]
         .probe_production_durable_readiness_at(TopologyAttestationTime::from_unix_seconds(1_009))
         .await;
     let initial_elapsed = initial_probe_started.elapsed();
     cluster.stop_delaying_calls(initial_leader);
+    assert!(
+        cluster.delayed_calls(initial_leader) > initial_delayed_before,
+        "the attestation-bound probe must enter the delayed peer path"
+    );
     assert_eq!(
         initial_crossed_expiry.state(),
         DurableReadinessState::TopologyInvalid
     );
     assert!(
-        initial_elapsed >= Duration::from_millis(500) && initial_elapsed < Duration::from_secs(2),
+        initial_elapsed >= Duration::from_millis(500)
+            && initial_elapsed
+                < initial_attestation_budget + ATTESTATION_PROBE_TIMER_DISPATCH_TOLERANCE,
         "initial attestation deadline must bound the barrier; elapsed {initial_elapsed:?}"
     );
     cluster
@@ -1649,10 +1747,11 @@ async fn production_readiness_requires_fresh_authenticated_topology_and_accepts_
     );
 
     let wall_start = TopologyAttestationTime::now().expect("current attestation time");
+    let short_lived_attestation_budget = Duration::from_secs(2);
     let wall_expiry = TopologyAttestationTime::from_unix_seconds(
         wall_start
             .unix_seconds()
-            .checked_add(2)
+            .checked_add(short_lived_attestation_budget.as_secs())
             .expect("test wall-clock expiry"),
     );
     let short_lived = refreshed_attestation(
@@ -1664,19 +1763,28 @@ async fn production_readiness_requires_fresh_authenticated_topology_and_accepts_
         wall_expiry,
         wall_start,
     );
-    cluster.delay_calls(0, Duration::from_millis(2_500));
+    let short_lived_delayed_before = cluster.delayed_calls(0);
+    // As above, leave a gap substantially larger than scheduler dispatch so
+    // this verifies the attestation deadline rather than a peer response.
+    cluster.delay_calls(0, Duration::from_secs(4));
     let probe_started = Instant::now();
     let crossed_expiry = store
         .probe_production_durable_readiness_with_attestation_at(&short_lived, wall_start)
         .await;
     let elapsed = probe_started.elapsed();
     cluster.stop_delaying_calls(0);
+    assert!(
+        cluster.delayed_calls(0) > short_lived_delayed_before,
+        "the refreshed-attestation probe must enter the delayed peer path"
+    );
     assert_eq!(
         crossed_expiry.state(),
         DurableReadinessState::TopologyInvalid
     );
     assert!(
-        elapsed >= Duration::from_millis(500) && elapsed < Duration::from_secs(3),
+        elapsed >= Duration::from_millis(500)
+            && elapsed
+                < short_lived_attestation_budget + ATTESTATION_PROBE_TIMER_DISPATCH_TOLERANCE,
         "attestation deadline must bound the barrier; elapsed {elapsed:?}"
     );
     assert_eq!(
@@ -1767,6 +1875,7 @@ async fn deterministic_topology_is_visible_but_never_production_ready() {
     let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
     let identity = consensus_identity(&members);
     let collector = attestation_collector();
+    let test_permit = TestCluster::acquire_test_permit().await;
     let topologies = attested_topologies(
         &members,
         identity,
@@ -1776,7 +1885,13 @@ async fn deterministic_topology_is_visible_but_never_production_ready() {
         TopologyAttestationTime::from_unix_seconds(2_100),
         TopologyAttestationTime::from_unix_seconds(2_000),
     );
-    let cluster = TestCluster::start_with_topologies(OPERATION_TIMEOUT, topologies).await;
+    let cluster = TestCluster::start_with_topologies_and_clock_with_permit(
+        OPERATION_TIMEOUT,
+        topologies,
+        Arc::new(SystemClock),
+        test_permit,
+    )
+    .await;
     let store = &cluster.stores[0];
     let now = TopologyAttestationTime::from_unix_seconds(2_001);
 
@@ -2440,6 +2555,123 @@ async fn red_696_split_acquire_then_cas_leaves_a_committed_intermediate_boundary
 }
 
 #[tokio::test]
+async fn red_696_split_renew_then_cas_leaves_a_committed_intermediate_boundary() {
+    // Retained RED evidence for #696: legacy renewal and CAS are distinct
+    // consensus operations. A crash between them durably extends the lease
+    // while leaving the record at its old generation and payload.
+    use futures_util::StreamExt;
+
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let store = &cluster.stores[leader];
+    let key = session_key(b"red-696-split-renew-boundary");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe absent renewal key");
+    let (create, original) = fenced_acquire_create_request(
+        key.clone(),
+        owner("red-696-renew-owner"),
+        observation.current_fence(),
+        [0x91; 16],
+        Duration::from_secs(30),
+        b"sealed-red-696-renew-original",
+    );
+    let created = store
+        .fenced_transition(create)
+        .await
+        .expect("establish record before split renewal");
+
+    let before = store
+        .max_replication_sequence()
+        .await
+        .expect("read journal head before split renewal");
+    let before_log = store
+        .status()
+        .last_log_index
+        .expect("formed cluster has a durable log head");
+    let mut watch = store
+        .watch(before + 1)
+        .await
+        .expect("subscribe before split renewal");
+
+    let renewed = store
+        .renew(created.lease(), Duration::from_secs(60))
+        .await
+        .expect("commit split lease renewal");
+    assert_eq!(renewed.fence(), created.lease().fence());
+    assert!(renewed.expires_at() > created.lease().expires_at());
+    let after_renewal_log = store
+        .status()
+        .last_log_index
+        .expect("renewal has a durable log head");
+    assert!(
+        after_renewal_log > before_log,
+        "split renewal consumes at least one independent consensus entry"
+    );
+    assert!(
+        matches!(store.get(&key).await, Ok(Some(record)) if record == original),
+        "the intermediate boundary retains the old record generation and payload"
+    );
+    assert_eq!(
+        store
+            .max_replication_sequence()
+            .await
+            .expect("read journal head after split renewal"),
+        before + 1,
+        "the renewal is independently visible before CAS"
+    );
+
+    let successor = sealed_record(key.clone(), 2, &renewed, b"sealed-red-696-renew-successor");
+    assert_eq!(
+        store
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: renewed,
+                expected_generation: Some(Generation::new(1)),
+                new_record: successor.clone(),
+            })
+            .await
+            .expect("commit CAS after split renewal"),
+        CompareAndSetResult::Success
+    );
+    assert!(
+        store
+            .status()
+            .last_log_index
+            .expect("CAS has a durable log head")
+            > after_renewal_log,
+        "split CAS consumes a later, distinct consensus entry"
+    );
+    assert!(
+        matches!(store.get(&key).await, Ok(Some(record)) if record == successor),
+        "only the second entry installs the successor record"
+    );
+    assert_eq!(
+        store
+            .max_replication_sequence()
+            .await
+            .expect("read journal head after split CAS"),
+        before + 2,
+        "renewal and CAS occupy distinct application positions"
+    );
+
+    let renewal_entry = watch
+        .next()
+        .await
+        .expect("split renewal watch entry")
+        .expect("split renewal watch result");
+    let cas_entry = watch
+        .next()
+        .await
+        .expect("split CAS watch entry")
+        .expect("split CAS watch result");
+    assert!(matches!(renewal_entry.op, ReplicationOp::RenewLease { .. }));
+    assert!(matches!(cas_entry.op, ReplicationOp::CompareAndSet { .. }));
+    assert_eq!(renewal_entry.sequence + 1, cas_entry.sequence);
+}
+
+#[tokio::test]
 async fn fenced_transition_acquire_create_is_one_committed_application_and_watch_entry() {
     use futures_util::StreamExt;
 
@@ -2903,6 +3135,142 @@ async fn fenced_transition_renew_rejects_record_owner_or_fence_mismatch() {
             "the rejected renewal emits no watch effect"
         );
     }
+}
+
+#[tokio::test]
+async fn fenced_transition_expired_old_owner_races_new_owner_with_one_effect() {
+    use futures_util::StreamExt;
+
+    let admission_time = opc_types::Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("test timestamp"),
+    );
+    let clock = Arc::new(MutableTestClock::new(admission_time));
+    let cluster = TestCluster::start_with_clock(clock.clone()).await;
+    let key = session_key(b"fenced-transition-owner-takeover-race");
+    let old_owner = owner("fenced-transition-race-old-owner");
+    let new_owner = owner("fenced-transition-race-new-owner");
+    let observation = cluster.stores[0]
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe absent takeover key");
+    let (create, _) = fenced_acquire_create_request(
+        key.clone(),
+        old_owner.clone(),
+        observation.current_fence(),
+        [0x92; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-race-original",
+    );
+    let created = cluster.stores[0]
+        .fenced_transition(create)
+        .await
+        .expect("establish old-owner record");
+
+    let old_successor = sealed_transition_record(
+        key.clone(),
+        2,
+        &old_owner,
+        created.lease().fence(),
+        b"sealed-fenced-transition-race-old-successor",
+    );
+    let old_request = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0x93; 16]),
+        FencedTransitionLease::renew(created.lease().clone(), Duration::from_secs(60))
+            .expect("build old-owner renewal"),
+        FencedTransitionMutation::update(Generation::new(1), old_successor),
+    )
+    .expect("build old-owner transition");
+
+    let new_lease = FencedTransitionLease::acquire(
+        key.clone(),
+        new_owner.clone(),
+        created.lease().fence(),
+        Duration::from_secs(60),
+    )
+    .expect("build new-owner acquisition");
+    let new_record = sealed_transition_record(
+        key.clone(),
+        2,
+        &new_owner,
+        new_lease.committed_fence().expect("derive takeover fence"),
+        b"sealed-fenced-transition-race-new-successor",
+    );
+    let new_request = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0x94; 16]),
+        new_lease,
+        FencedTransitionMutation::update(Generation::new(1), new_record.clone()),
+    )
+    .expect("build new-owner transition");
+
+    clock.set(created.lease().expires_at());
+    let before = cluster.stores[0]
+        .max_replication_sequence()
+        .await
+        .expect("read head before owner race");
+    let mut watch = cluster.stores[0]
+        .watch(before + 1)
+        .await
+        .expect("subscribe before owner race");
+    let (old_result, new_result) = tokio::join!(
+        cluster.stores[0].fenced_transition(old_request.clone()),
+        cluster.stores[1].fenced_transition(new_request.clone()),
+    );
+
+    assert!(
+        matches!(
+            old_result,
+            Err(StoreError::LeaseExpired | StoreError::StaleFence)
+        ),
+        "the expired old owner loses regardless of proposal ordering"
+    );
+    let takeover = new_result.expect("the new owner wins the expired-lease race");
+    assert!(matches!(
+        takeover.mutation(),
+        FencedTransitionMutationResult::Updated
+    ));
+    assert_eq!(takeover.committed_generation(), Generation::new(2));
+    assert_eq!(takeover.lease().owner(), &new_owner);
+    assert!(
+        matches!(cluster.stores[2].get(&key).await, Ok(Some(record)) if record == new_record),
+        "every voter exposes only the new-owner record"
+    );
+    assert_eq!(
+        cluster.stores[0]
+            .max_replication_sequence()
+            .await
+            .expect("read head after owner race"),
+        before + 1,
+        "the concurrent race has exactly one application effect"
+    );
+    let watched = watch
+        .next()
+        .await
+        .expect("takeover watch entry")
+        .expect("takeover watch result");
+    assert!(
+        matches!(&watched.op, ReplicationOp::Batch { ops }
+            if matches!(ops.as_slice(), [ReplicationOp::AcquireLease { .. }, ReplicationOp::CompareAndSet { .. }])),
+        "only the atomic new-owner acquisition and update is observable"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), watch.next())
+            .await
+            .is_err(),
+        "the rejected old-owner transition emits no watch effect"
+    );
+    assert!(matches!(
+        cluster.stores[0]
+            .fenced_transition_status(&old_request)
+            .await,
+        Ok(FencedTransitionStatus::Recorded(result))
+            if matches!(result.as_ref(), Err(StoreError::LeaseExpired | StoreError::StaleFence))
+    ));
+    assert!(matches!(
+        cluster.stores[1]
+            .fenced_transition_status(&new_request)
+            .await,
+        Ok(FencedTransitionStatus::Recorded(result)) if result.as_ref().is_ok()
+    ));
 }
 
 #[tokio::test]
@@ -3629,9 +3997,7 @@ async fn fenced_transition_reprobes_after_same_node_id_restart_and_never_forward
     // This path previously completed the probe and the forwarded commit. Swap
     // the leader's handler on this same node-ID path for an old implementation
     // that rejects the probe: an earlier process's proof must not be cached.
-    cluster
-        .restart_same_node_id_with_old_read_barrier(source, leader)
-        .await;
+    cluster.restart_same_node_id_with_old_read_barrier(source, leader);
     let rejected = store.fenced_transition(rejected_request.clone()).await;
     assert!(
         matches!(
@@ -3647,7 +4013,7 @@ async fn fenced_transition_reprobes_after_same_node_id_restart_and_never_forward
         "the follower must establish fresh compatibility before forwarding"
     );
 
-    cluster.restore_current_rpc_handler(source, leader).await;
+    cluster.restore_current_rpc_handler(source, leader);
     assert!(
         matches!(
             store.fenced_transition_status(&rejected_request).await,
@@ -4353,12 +4719,7 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
     );
 
     tokio::time::timeout(SNAPSHOT_COMMAND_BATCH_TIMEOUT, async {
-        for _ in 0..SNAPSHOT_CATCH_UP_COMMANDS {
-            cluster.stores[1]
-                .max_replication_sequence()
-                .await
-                .expect("advance committed logical time toward snapshot compaction");
-        }
+        commit_snapshot_triggering_commands(&cluster.stores[1]).await;
     })
     .await
     .expect("snapshot command batch completes within its aggregate bound");
@@ -4414,6 +4775,192 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
         recovered_progress.state()
     );
     assert!(recovered_progress.local_applied_index() >= compacted.snapshot_index());
+}
+
+#[tokio::test]
+async fn fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect() {
+    use futures_util::StreamExt;
+
+    let _timing_permit = ELECTION_AND_SNAPSHOT_TEST_PERMIT
+        .acquire()
+        .await
+        .expect("qualification semaphore remains open");
+    let cluster =
+        TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+            .await;
+    let (lagging_leader, old_leader_id, old_term) = cluster.observed_leader();
+    let survivors = (0..MEMBER_COUNT)
+        .filter(|index| *index != lagging_leader)
+        .collect::<Vec<_>>();
+    let store = &cluster.stores[lagging_leader];
+    let key = session_key(b"fenced-transition-snapshot-install");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe transition before snapshot fault");
+    let (request, expected) = fenced_acquire_create_request(
+        key.clone(),
+        owner("fenced-transition-snapshot-owner"),
+        observation.current_fence(),
+        [0x64; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-snapshot",
+    );
+    let before = store
+        .max_replication_sequence()
+        .await
+        .expect("read application head before transition");
+    let mut transition_watch = cluster.stores[survivors[0]]
+        .watch(before + 1)
+        .await
+        .expect("subscribe surviving voter before transition");
+    let committed = store
+        .fenced_transition(request.clone())
+        .await
+        .expect("commit transition before snapshot fault");
+    let transition_log_index = store
+        .status()
+        .last_log_index
+        .expect("committed transition has a durable log index");
+    let watched = tokio::time::timeout(RECOVERY_TIMEOUT, transition_watch.next())
+        .await
+        .expect("committed transition watch entry arrives")
+        .expect("committed transition watch remains open")
+        .expect("committed transition watch entry succeeds");
+    assert!(
+        watched.sequence == before + 1
+            && matches!(&watched.op, ReplicationOp::Batch { ops }
+                if matches!(ops.as_slice(), [ReplicationOp::AcquireLease { .. }, ReplicationOp::CompareAndSet { .. }])),
+        "the pre-fault transition has one atomic watch effect"
+    );
+
+    let lagging_before = cluster.stores[lagging_leader]
+        .probe_durable_readiness()
+        .await
+        .recovery_progress()
+        .local_applied_index()
+        .expect("lagging leader initial applied index");
+    cluster.isolate(lagging_leader);
+    tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
+        loop {
+            let reports = futures_util::future::join_all(
+                survivors
+                    .iter()
+                    .map(|index| cluster.stores[*index].probe_durable_readiness()),
+            )
+            .await;
+            let statuses = survivors
+                .iter()
+                .map(|index| cluster.stores[*index].status())
+                .collect::<Vec<_>>();
+            if reports.iter().all(DurableReadinessReport::is_ready) {
+                if let Some(new_leader_id) = statuses.first().and_then(|status| status.leader_id) {
+                    let new_term = statuses.first().expect("survivor status").term;
+                    if new_leader_id != old_leader_id
+                        && new_term > old_term
+                        && statuses.iter().all(|status| {
+                            status.leader_id == Some(new_leader_id) && status.term == new_term
+                        })
+                    {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("surviving voters elect after the committed leader is lost");
+
+    tokio::time::timeout(SNAPSHOT_COMMAND_BATCH_TIMEOUT, async {
+        commit_snapshot_triggering_commands(&cluster.stores[survivors[0]]).await;
+    })
+    .await
+    .expect("snapshot command batch completes within its aggregate bound");
+
+    let compacted = tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
+        loop {
+            let progress = cluster.stores[survivors[0]]
+                .probe_durable_readiness()
+                .await
+                .recovery_progress();
+            if progress
+                .purged_index()
+                .is_some_and(|index| index > lagging_before)
+                && progress
+                    .snapshot_index()
+                    .is_some_and(|index| index >= transition_log_index)
+            {
+                break progress;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("surviving majority compacts the committed transition into a snapshot");
+
+    cluster.heal(lagging_leader);
+    cluster
+        .wait_all_ready(SNAPSHOT_RECOVERY_TIMEOUT)
+        .await
+        .expect("lagging former leader installs the compacted snapshot and rejoins");
+
+    let restored = &cluster.stores[lagging_leader];
+    assert!(
+        matches!(restored.get(&key).await, Ok(Some(record)) if record == expected),
+        "snapshot installation restores the committed fenced record"
+    );
+    assert!(
+        matches!(restored.fenced_transition_status(&request).await,
+            Ok(FencedTransitionStatus::Recorded(result))
+                if matches!(result.as_ref(), Ok(recorded) if recorded == &committed)),
+        "snapshot installation restores the exact request receipt"
+    );
+    let after_restore = restored
+        .max_replication_sequence()
+        .await
+        .expect("read restored application head");
+    assert_eq!(
+        before + 1,
+        after_restore,
+        "snapshot restoration retains exactly one application effect"
+    );
+    let mut no_second_watch = restored
+        .watch(after_restore + 1)
+        .await
+        .expect("subscribe after restored transition");
+    let replay = restored
+        .fenced_transition(request)
+        .await
+        .expect("replay exact transition after snapshot installation");
+    assert_eq!(
+        committed, replay,
+        "same-ID replay after snapshot installation returns the exact recorded outcome"
+    );
+    assert_eq!(
+        after_restore,
+        restored
+            .max_replication_sequence()
+            .await
+            .expect("read application head after restored replay"),
+        "same-ID replay after snapshot installation adds no application effect"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), no_second_watch.next())
+            .await
+            .is_err(),
+        "same-ID replay after snapshot installation emits no second watch effect"
+    );
+    let recovered_progress = restored.probe_durable_readiness().await.recovery_progress();
+    assert_eq!(
+        DurableRecoveryState::Synchronized,
+        recovered_progress.state(),
+        "restored voter reports synchronized recovery"
+    );
+    assert!(
+        recovered_progress.local_applied_index() >= compacted.snapshot_index(),
+        "restored voter applies at least the compacted snapshot index"
+    );
 }
 
 #[tokio::test]
