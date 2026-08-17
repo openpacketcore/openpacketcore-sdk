@@ -294,6 +294,20 @@ preserves physical-cap exhaustion as fail-fast `Overloaded` and records the
 bounded overload outcome; it does not relabel intentional load shedding as
 endpoint unavailability.
 
+A persistent watch keeps one isolated watch lease and one reader task across
+its bounded reconnect sequence. On authenticated retirement or a clean peer
+transport loss it closes the old socket, resolves again, completes a fresh
+mutual-TLS/Hello handshake, and resumes from the successor of the last item
+accepted by its bounded caller-visible queue. A disconnect before that
+boundary reuses the prior cursor. Duplicate, gap, mismatched-correlation,
+unknown-frame, malformed, partial-frame, and permanent store outcomes are
+ambiguous or invalid and therefore terminate fail-closed rather than replaying
+the cursor. Reconnect attempts use the configured finite setup-attempt and
+jitter bounds; shutdown, a closed caller stream, or exhausted recovery returns
+the fixed redaction-safe unavailable outcome. A decoded item blocked on the
+fixed local byte/item queue is also terminal: it has not crossed delivery and
+must release the isolated lease rather than reconnect behind a slow consumer.
+
 The configured complete operation timeout is validated strictly greater than
 zero and no greater than 10 seconds. The configured idle timeout is at most 5
 seconds and caps every active partial frame on client bootstrap, unary, and

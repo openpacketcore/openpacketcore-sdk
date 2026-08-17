@@ -146,6 +146,26 @@ fn try_send_consumer_watch_terminal(
     try_send_consumer_watch_item(sender, byte_budget, item, byte_count);
 }
 
+fn consumer_watch_transport_lost(error: &ProtocolError) -> bool {
+    matches!(
+        error,
+        ProtocolError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            )
+    )
+}
+
+enum ConsumerWatchRead {
+    Frame(Result<ConsumerWireResponse, ProtocolError>),
+    Idle,
+    Reconnect,
+}
+
 /// Redaction-safe construction or transport failure for a typed consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -2368,15 +2388,11 @@ impl StatelessSessionConsumerClient {
         Ok(correlation)
     }
 
-    async fn watch_with_counters(
+    async fn open_watch_connection_with_counters(
         &self,
         start_sequence: u64,
         setup_counters: Option<&PersistentConsumerCounters>,
-        persistent_runtime: Option<PersistentWatchRuntime>,
-    ) -> Result<
-        BoxStream<'static, Result<SessionConsumerChange, StoreError>>,
-        SessionConsumerClientError,
-    > {
+    ) -> Result<(ConsumerConnection, NonZeroU32), SessionConsumerClientError> {
         let started_at = tokio::time::Instant::now();
         let deadline = started_at
             .checked_add(self.operation_timeout)
@@ -2498,16 +2514,34 @@ impl StatelessSessionConsumerClient {
             _ => return Err(SessionConsumerClientError::Protocol),
         };
         match response {
-            SessionConsumerResponse::WatchOpened => {}
+            SessionConsumerResponse::WatchOpened => Ok((connection, correlation)),
             SessionConsumerResponse::Rejected(rejection) => {
-                return Err(consumer_rejection_into_client_error(rejection));
+                Err(consumer_rejection_into_client_error(rejection))
             }
-            _ => return Err(SessionConsumerClientError::Protocol),
+            _ => Err(SessionConsumerClientError::Protocol),
         }
+    }
+
+    async fn watch_with_counters(
+        &self,
+        start_sequence: u64,
+        setup_counters: Option<&PersistentConsumerCounters>,
+        persistent_runtime: Option<PersistentWatchRuntime>,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, StoreError>>,
+        SessionConsumerClientError,
+    > {
+        let (mut connection, mut correlation) = self
+            .open_watch_connection_with_counters(start_sequence, setup_counters)
+            .await?;
         let (tx, rx) = mpsc::channel(CONSUMER_WATCH_CHANNEL_CAPACITY);
         let byte_budget = Arc::new(Semaphore::new(CONSUMER_WATCH_CHANNEL_MAX_BYTES));
         let tls_config = self.tls_config.clone();
         let reauthentication = self.reauthentication.clone();
+        let reconnect_client = self.clone();
+        let persistent_pool = persistent_runtime
+            .as_ref()
+            .map(|runtime| Arc::clone(&runtime._lease.pool));
         let active_frame_timeout = self.idle_timeout.min(DEFAULT_CONSUMER_IDLE_TIMEOUT);
         tokio::spawn(async move {
             let mut force_shutdown = persistent_runtime
@@ -2523,18 +2557,76 @@ impl StatelessSessionConsumerClient {
                 .map(|runtime| &runtime._lease.pool.shutdown_phase);
             let mut reauthentication_changes = reauthentication.subscribe();
             let mut material_changes = Some(tls_config.subscribe_material_changes());
-            let rotation_edge_key = connection.rotation_edge_key;
+            let mut expected_sequence = start_sequence;
             'watch_reader: loop {
+                macro_rules! reconnect_or_terminal {
+                    () => {{
+                        // A full caller-visible item queue has already lost
+                        // the capacity required to make progress. Do not keep
+                        // the sole persistent watch lease alive reconnecting
+                        // behind an unpolled consumer.
+                        if tx.capacity() == 0 {
+                            try_send_consumer_watch_terminal(
+                                &tx,
+                                &byte_budget,
+                                "consumer watch unavailable",
+                            );
+                            return;
+                        }
+                        let Some(pool) = persistent_pool.as_ref() else {
+                            try_send_consumer_watch_terminal(
+                                &tx,
+                                &byte_budget,
+                                "consumer watch unavailable",
+                            );
+                            return;
+                        };
+                        // Release the old authenticated socket before the
+                        // replacement handshake: a single-slot peer can wait
+                        // for this EOF before accepting a new Watch request.
+                        drop(connection);
+                        match reconnect_persistent_consumer_watch(
+                            &reconnect_client,
+                            pool,
+                            expected_sequence,
+                            &tx,
+                        )
+                        .await
+                        {
+                            Ok(Some((reconnected, reconnected_correlation))) => {
+                                connection = reconnected;
+                                correlation = reconnected_correlation;
+                                continue 'watch_reader;
+                            }
+                            Ok(None) | Err(SessionConsumerClientError::ShuttingDown) => return,
+                            Err(_) => {
+                                try_send_consumer_watch_terminal(
+                                    &tx,
+                                    &byte_budget,
+                                    "consumer watch unavailable",
+                                );
+                                return;
+                            }
+                        }
+                    }};
+                }
+                macro_rules! terminate_stalled_watch {
+                    () => {{
+                        // Once a decoded item is blocked on local byte or
+                        // queue capacity, it has not crossed the delivery
+                        // boundary. Reconnecting would retain the fixed watch
+                        // lease behind a slow/unpolled caller, so fail closed
+                        // and release it instead.
+                        try_send_consumer_watch_terminal(
+                            &tx,
+                            &byte_budget,
+                            "consumer watch unavailable",
+                        );
+                        return;
+                    }};
+                }
                 if !connection.current(&tls_config, &reauthentication) {
-                    // Never wait behind already queued entries merely to
-                    // report retirement. An unpolled receiver must not retain
-                    // authenticated transport or fixed watch capacity.
-                    try_send_consumer_watch_terminal(
-                        &tx,
-                        &byte_budget,
-                        "consumer watch authentication retired",
-                    );
-                    return;
+                    reconnect_or_terminal!();
                 }
                 // A quiet, healthy watch is normal. Frame sizing still bounds
                 // any received item, while reauthentication, material
@@ -2552,82 +2644,101 @@ impl StatelessSessionConsumerClient {
                         );
                     tokio::pin!(response_read);
                     loop {
-                        let response = tokio::select! {
+                        let event = tokio::select! {
                             biased;
                             _ = wait_for_optional_forced_shutdown(&mut force_shutdown, force_shutdown_state) => return,
                             _ = tx.closed() => return,
-                            response = &mut response_read => Some(response),
+                            response = &mut response_read => match response {
+                                Ok(Some(response)) => ConsumerWatchRead::Frame(Ok(response)),
+                                Ok(None) => ConsumerWatchRead::Idle,
+                                Err(error) => ConsumerWatchRead::Frame(Err(error)),
+                            },
                             _ = tokio::time::sleep_until(connection.lifecycle.retire_at()) => {
                                 let _ = connection
                                     .lifecycle
                                     .retirement(tokio::time::Instant::now());
-                                try_send_consumer_watch_terminal(
-                                    &tx,
-                                    &byte_budget,
-                                    "consumer watch authentication retired",
-                                );
-                                return;
+                                ConsumerWatchRead::Reconnect
                             },
                             _ = reauthentication_changes.changed() => {
                                 if !consumer_connection_current(
                                     &mut connection.lifecycle,
                                     &tls_config,
                                     &reauthentication,
-                                    rotation_edge_key,
+                                    connection.rotation_edge_key,
                                 ) {
-                                    try_send_consumer_watch_terminal(
-                                        &tx,
-                                        &byte_budget,
-                                        "consumer watch authentication retired",
-                                    );
-                                    return;
+                                    ConsumerWatchRead::Reconnect
+                                } else {
+                                    continue;
                                 }
-                                None
                             },
                             _ = wait_consumer_material_change(&mut material_changes) => {
                                 if !consumer_connection_current(
                                     &mut connection.lifecycle,
                                     &tls_config,
                                     &reauthentication,
-                                    rotation_edge_key,
+                                    connection.rotation_edge_key,
                                 ) {
-                                    try_send_consumer_watch_terminal(
-                                        &tx,
-                                        &byte_budget,
-                                        "consumer watch authentication retired",
-                                    );
-                                    return;
+                                    ConsumerWatchRead::Reconnect
+                                } else {
+                                    continue;
                                 }
-                                None
                             },
                         };
-                        if let Some(response) = response {
-                            match response {
-                                Ok(Some(response)) => break Ok(response),
-                                Ok(None) => continue 'watch_reader,
-                                Err(error) => break Err(error),
+                        match event {
+                            ConsumerWatchRead::Frame(_) | ConsumerWatchRead::Reconnect => {
+                                break event
                             }
+                            ConsumerWatchRead::Idle => continue 'watch_reader,
                         }
                     }
                 };
+                if matches!(response, ConsumerWatchRead::Reconnect) {
+                    reconnect_or_terminal!();
+                }
+                let ConsumerWatchRead::Frame(response) = response else {
+                    unreachable!("idle reads continue the outer watch loop");
+                };
                 if !connection.current(&tls_config, &reauthentication) {
-                    try_send_consumer_watch_terminal(
-                        &tx,
-                        &byte_budget,
-                        "consumer watch authentication retired",
-                    );
-                    return;
+                    reconnect_or_terminal!();
                 }
                 let entry = match response {
                     Ok(ConsumerWireResponse::WatchEntry(ConsumerWatchEntry {
                         correlation: received,
                         entry,
-                    })) if exact_correlation(correlation, received).is_ok() => {
-                        (*entry).map_err(SessionConsumerStoreError::into_store_error)
+                    })) if exact_correlation(correlation, received).is_ok() => match *entry {
+                        Ok(entry) if entry.sequence() == expected_sequence => Ok(entry),
+                        Ok(_) => {
+                            try_send_consumer_watch_terminal(
+                                &tx,
+                                &byte_budget,
+                                "consumer watch protocol invalid",
+                            );
+                            return;
+                        }
+                        Err(error) => Err(error.into_store_error()),
+                    },
+                    Ok(_) => {
+                        // Correlation and frame-kind violations are ambiguous:
+                        // never replay a cursor after a peer could have mixed
+                        // two watch lifetimes.
+                        try_send_consumer_watch_terminal(
+                            &tx,
+                            &byte_budget,
+                            "consumer watch protocol invalid",
+                        );
+                        return;
                     }
-                    Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
-                        "consumer watch unavailable".into(),
-                    )),
+                    Err(error) if consumer_watch_transport_lost(&error) => {
+                        reconnect_or_terminal!();
+                    }
+                    Err(_) => {
+                        try_send_consumer_watch_terminal(
+                            &tx,
+                            &byte_budget,
+                            "consumer watch protocol invalid",
+                        );
+                        return;
+                    }
                 };
                 let entry = match serde_json::to_vec(&entry) {
                     Ok(encoded) if encoded.len() <= CONSUMER_WATCH_CHANNEL_MAX_BYTES => entry,
@@ -2668,26 +2779,16 @@ impl StatelessSessionConsumerClient {
                             let _ = connection
                                 .lifecycle
                                 .retirement(tokio::time::Instant::now());
-                            try_send_consumer_watch_terminal(
-                                &tx,
-                                &byte_budget,
-                                "consumer watch authentication retired",
-                            );
-                            return;
+                            terminate_stalled_watch!();
                         },
                         _ = reauthentication_changes.changed() => {
                             if !consumer_connection_current(
                                 &mut connection.lifecycle,
                                 &tls_config,
                                 &reauthentication,
-                                rotation_edge_key,
+                                connection.rotation_edge_key,
                             ) {
-                                try_send_consumer_watch_terminal(
-                                    &tx,
-                                    &byte_budget,
-                                    "consumer watch authentication retired",
-                                );
-                                return;
+                                terminate_stalled_watch!();
                             }
                             None
                         },
@@ -2696,14 +2797,9 @@ impl StatelessSessionConsumerClient {
                                 &mut connection.lifecycle,
                                 &tls_config,
                                 &reauthentication,
-                                rotation_edge_key,
+                                connection.rotation_edge_key,
                             ) {
-                                try_send_consumer_watch_terminal(
-                                    &tx,
-                                    &byte_budget,
-                                    "consumer watch authentication retired",
-                                );
-                                return;
+                                terminate_stalled_watch!();
                             }
                             None
                         },
@@ -2713,12 +2809,7 @@ impl StatelessSessionConsumerClient {
                     }
                 };
                 if !connection.current(&tls_config, &reauthentication) {
-                    try_send_consumer_watch_terminal(
-                        &tx,
-                        &byte_budget,
-                        "consumer watch authentication retired",
-                    );
-                    return;
+                    reconnect_or_terminal!();
                 }
                 let send = tx.send(QueuedConsumerWatchItem {
                     item: entry,
@@ -2734,26 +2825,16 @@ impl StatelessSessionConsumerClient {
                             let _ = connection
                                 .lifecycle
                                 .retirement(tokio::time::Instant::now());
-                            try_send_consumer_watch_terminal(
-                                &tx,
-                                &byte_budget,
-                                "consumer watch authentication retired",
-                            );
-                            return;
+                            terminate_stalled_watch!();
                         },
                         _ = reauthentication_changes.changed() => {
                             if !consumer_connection_current(
                                 &mut connection.lifecycle,
                                 &tls_config,
                                 &reauthentication,
-                                rotation_edge_key,
+                                connection.rotation_edge_key,
                             ) {
-                                try_send_consumer_watch_terminal(
-                                    &tx,
-                                    &byte_budget,
-                                    "consumer watch authentication retired",
-                                );
-                                return;
+                                terminate_stalled_watch!();
                             }
                             None
                         },
@@ -2762,14 +2843,9 @@ impl StatelessSessionConsumerClient {
                                 &mut connection.lifecycle,
                                 &tls_config,
                                 &reauthentication,
-                                rotation_edge_key,
+                                connection.rotation_edge_key,
                             ) {
-                                try_send_consumer_watch_terminal(
-                                    &tx,
-                                    &byte_budget,
-                                    "consumer watch authentication retired",
-                                );
-                                return;
+                                terminate_stalled_watch!();
                             }
                             None
                         },
@@ -2781,13 +2857,15 @@ impl StatelessSessionConsumerClient {
                 if sent.is_err() {
                     return;
                 }
-                if !connection.current(&tls_config, &reauthentication) {
-                    try_send_consumer_watch_terminal(
-                        &tx,
-                        &byte_budget,
-                        "consumer watch authentication retired",
-                    );
+                // The cursor advances only after this item has crossed the
+                // bounded stream queue. A loss before then replays it; a loss
+                // after then resumes at the exact checked successor.
+                let Some(next_sequence) = expected_sequence.checked_add(1) else {
                     return;
+                };
+                expected_sequence = next_sequence;
+                if !connection.current(&tls_config, &reauthentication) {
+                    reconnect_or_terminal!();
                 }
             }
         });
@@ -2799,6 +2877,60 @@ impl StatelessSessionConsumerClient {
 }
 
 impl StatelessSessionConsumer for StatelessSessionConsumerClient {}
+
+/// Reopen a persistent watch at the caller-visible cursor.  This is kept
+/// separate from the stateless client because a stateless watch deliberately
+/// has no pool-owned retry budget or shutdown authority.
+async fn reconnect_persistent_consumer_watch(
+    client: &StatelessSessionConsumerClient,
+    pool: &Arc<PersistentSessionConsumerPool>,
+    start_sequence: u64,
+    sender: &mpsc::Sender<QueuedConsumerWatchItem>,
+) -> Result<Option<(ConsumerConnection, NonZeroU32)>, SessionConsumerClientError> {
+    let mut shutdown = pool.shutdown_tx.subscribe();
+    let mut last_error = SessionConsumerClientError::Unavailable;
+    for attempt in 0..pool.config.connect_attempts {
+        if pool.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        counter_increment(&pool.counters.reconnects);
+        let open = client.open_watch_connection_with_counters(start_sequence, Some(&pool.counters));
+        tokio::pin!(open);
+        let result = tokio::select! {
+            biased;
+            _ = sender.closed() => return Ok(None),
+            _ = wait_for_forced_shutdown(&mut shutdown, &pool.shutdown_phase) => {
+                return Err(SessionConsumerClientError::ShuttingDown);
+            }
+            result = &mut open => result,
+        };
+        match result {
+            Ok(connection) if pool.phase() == PersistentShutdownPhase::Running => {
+                return Ok(Some(connection));
+            }
+            Ok(_) => return Err(SessionConsumerClientError::ShuttingDown),
+            Err(
+                error @ (SessionConsumerClientError::Unavailable
+                | SessionConsumerClientError::Deadline),
+            ) if attempt.saturating_add(1) < pool.config.connect_attempts => {
+                last_error = error;
+                let delay = pool.reconnect_delay();
+                if !delay.is_zero() {
+                    tokio::select! {
+                        biased;
+                        _ = sender.closed() => return Ok(None),
+                        _ = wait_for_forced_shutdown(&mut shutdown, &pool.shutdown_phase) => {
+                            return Err(SessionConsumerClientError::ShuttingDown);
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error)
+}
 
 #[derive(Default)]
 struct PersistentConsumerCounters {

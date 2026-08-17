@@ -97,3 +97,21 @@ opc-heavy cargo test --locked -p opc-session-net --all-features --test persisten
 Exact correlation matching was restored, after which the command passed and
 the poisoned lane was replaced with correlation 1 on a new authenticated
 connection.
+
+### Persistent-watch continuity fix coverage
+
+The retained `persistent_watch_reconnects_at_the_exact_delivered_cursor_after_endpoint_loss`
+fixture holds the first watch stream until its resolver has been switched to a
+replacement endpoint, then proves delivery of sequence 1 followed by exactly
+sequence 2 through a fresh resolver/TLS/Hello path. Its companion
+`persistent_watch_reconnects_after_authenticated_rotation` proves the same
+1-to-2 boundary after client reauthentication retires an otherwise healthy
+watch connection. Removing the persistent reader's reconnect path makes either
+fixture terminate after sequence 1; accepting a duplicate, gap, wrong
+correlation, unknown frame, or partial frame is intentionally not a recovery
+path and remains fail-closed. The focused restored command is:
+
+```text
+opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_transport persistent_watch_reconnects_at_the_exact_delivered_cursor_after_endpoint_loss -- --exact --test-threads=1
+opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_transport persistent_watch_reconnects_after_authenticated_rotation -- --exact --test-threads=1
+```
