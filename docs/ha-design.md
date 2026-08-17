@@ -444,9 +444,10 @@ cursor is an AES-256-GCM-SIV ciphertext that confidentially and
 authentically binds the composite seek key, backend epoch, record revision,
 logical time, scope, and progress. A modified, stale, or cross-scope cursor
 fails typed and restarts from page one. A server never fabricates a replacement
-cursor while fitting a wire frame; an encoded page that cannot fit returns
-`RestoreScanResponseTooLarge` so the caller can retry the same cursor with a
-smaller record limit.
+cursor while fitting a wire frame and never trims or rewrites records or the
+cursor. An encoded page that cannot fit returns
+`RestoreScanResponseTooLarge`. The SDK does not automatically retry or alter
+the limit; a caller may retry the same cursor with a smaller record limit.
 
 Every production participant is created with an opaque authenticated TLS
 config and a binding derived from one immutable `SessionReplicationManifest`.
@@ -547,7 +548,9 @@ backends may independently return shorter cursor-correct pages under their
 count, payload, or work budgets; transport validates each complete page against
 the fixed wire cap and negotiated frame and never trims or rewrites it.
 An oversize restore page returns typed `RestoreScanResponseTooLarge` when
-representable or closes. Replication-log reads return the largest complete
+representable or closes. The SDK does not automatically retry that page; a
+caller may retry the same cursor with a smaller record limit. Replication-log
+reads return the largest complete
 contiguous-sequence prefix that fits. Watch cannot skip an
 oversized entry; it emits a fixed SDK-owned error when representable and ends,
 or closes immediately. A fixed fallback that itself cannot fit also causes a

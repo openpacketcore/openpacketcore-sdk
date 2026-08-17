@@ -149,6 +149,10 @@ fn attestation_deadline_from_verification_start(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum ConsensusSessionStoreOpenError {
+    /// Dynamic consensus requires Linux descriptor-pinned SQLite handling and
+    /// is unsupported on this platform.
+    #[error("dynamic session consensus is unsupported on this platform")]
+    DynamicConsensusUnsupportedPlatform,
     /// The topology was not a consensus-scoped HA or consensus singleton.
     #[error("session consensus topology is invalid")]
     InvalidTopology,
@@ -210,6 +214,9 @@ pub(crate) enum OperatorRecoveryCommitError {
 impl From<SessionConsensusStorageError> for ConsensusSessionStoreOpenError {
     fn from(error: SessionConsensusStorageError) -> Self {
         match error {
+            SessionConsensusStorageError::UnsupportedPlatform => {
+                Self::DynamicConsensusUnsupportedPlatform
+            }
             SessionConsensusStorageError::RecoveryRequired
             | SessionConsensusStorageError::CorruptState => Self::RecoveryRequired,
             SessionConsensusStorageError::IdentityMismatch
@@ -490,18 +497,29 @@ impl fmt::Debug for ConsensusSessionStore {
 }
 
 impl ConsensusSessionStore {
+    fn require_dynamic_consensus_platform() -> Result<(), ConsensusSessionStoreOpenError> {
+        if cfg!(target_os = "linux") {
+            Ok(())
+        } else {
+            Err(ConsensusSessionStoreOpenError::DynamicConsensusUnsupportedPlatform)
+        }
+    }
+
     /// Start one durable Openraft node without yet forming pristine membership.
     ///
     /// `topology` contains only immutable member descriptors. `backend` is this
     /// node's sole local state-machine database; every remote member must be
     /// represented by exactly one consensus-only peer instead of a backend
-    /// adapter.
+    /// adapter. Dynamic consensus is Linux-only; other platforms return
+    /// [`ConsensusSessionStoreOpenError::DynamicConsensusUnsupportedPlatform`]
+    /// before creating consensus snapshot or database state.
     pub async fn open(
         topology: ValidatedQuorumTopology,
         backend: SqliteSessionBackend,
         snapshot_dir: impl Into<PathBuf>,
         peers: BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::require_dynamic_consensus_platform()?;
         Self::open_with_clock(
             topology,
             backend,
@@ -668,6 +686,7 @@ impl ConsensusSessionStore {
         peers: BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
         operation_timeout: Duration,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::require_dynamic_consensus_platform()?;
         Self::open_with_clock(
             topology,
             backend,
@@ -681,6 +700,8 @@ impl ConsensusSessionStore {
 
     /// Start a node with an injected logical-clock source and bounded complete
     /// operation deadline. Primarily useful for deterministic qualification.
+    /// On non-Linux platforms this fails before topology validation or any
+    /// consensus-owned filesystem or schema initialization.
     pub async fn open_with_clock(
         topology: ValidatedQuorumTopology,
         backend: SqliteSessionBackend,
@@ -689,6 +710,7 @@ impl ConsensusSessionStore {
         clock: Arc<dyn Clock>,
         operation_timeout: Duration,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::require_dynamic_consensus_platform()?;
         if operation_timeout.is_zero() || operation_timeout > Duration::from_secs(60) {
             return Err(ConsensusSessionStoreOpenError::InvalidRuntimeConfiguration);
         }

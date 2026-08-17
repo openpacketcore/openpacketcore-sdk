@@ -323,10 +323,11 @@ mutation or rebuild authority beside Openraft.
   examined-candidate budgets; callers continue from the confidential
   authenticated `next_cursor` until `complete`. The transport validates the
   entire backend page against the fixed wire-payload cap and effective frame;
-  it never trims or rewrites the page or cursor. An oversize page returns
-  `RestoreScanResponseTooLarge` when that error is representable, allowing the
-  caller to retry from the same cursor with a smaller record limit, or closes
-  the connection. The wire omits redundant `loaded_count`
+  it never trims or rewrites records or the cursor. An oversize page returns
+  `RestoreScanResponseTooLarge` when that error is representable, or closes
+  the connection. The SDK does not automatically retry or change the request
+  limit; a caller may retry the same cursor with a smaller record limit. The
+  wire omits redundant `loaded_count`
   and `complete` values and recomputes both from records and cursor.
 - `SessionBackend::probe_replication_head` performs a fresh, deadline-bounded
   wire request. It does not consult the client's capability cache and reports
@@ -363,7 +364,8 @@ mutation or rebuild authority beside Openraft.
   also enforces the finite 365-day horizon; production OpenRaft binds it to the
   leader-authored command time, never the client's or follower's wall clock.
 - If one record cannot fit, the call returns
-  `StoreError::RestoreScanResponseTooLarge` instead of retrying indefinitely.
+  `StoreError::RestoreScanResponseTooLarge`; the SDK does not automatically
+  retry it.
 - `listen(bind_addr).await` starts the listener and returns a server handle and
   bound address.
 - `ServerHandle::abort()` schedules non-blocking listener/connection
