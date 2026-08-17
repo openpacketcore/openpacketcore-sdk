@@ -170,6 +170,19 @@ impl ControlledConsumer {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entry);
     }
 
+    fn emit_watch_entries_then_pending(&self, entry: SessionConsumerChange, count: usize) {
+        assert!(
+            count > 0,
+            "pending watch fixture must emit at least one entry"
+        );
+        self.watch_entry_limit.store(count, Ordering::SeqCst);
+        self.watch_stays_open.store(true, Ordering::SeqCst);
+        *self
+            .watch_entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entry);
+    }
+
     async fn wait_for_watch_emissions(&self, expected: usize) {
         loop {
             let notified = self.watch_emitted_notify.notified();
@@ -258,13 +271,15 @@ impl SessionQuorumConsumer for ControlledConsumer {
                 .boxed())
         } else if self.watch_stays_open.load(Ordering::SeqCst) {
             let emitted_notify = Arc::clone(&self.watch_emitted_notify);
-            Ok(stream::once(async move {
-                emitted.fetch_add(1, Ordering::SeqCst);
-                emitted_notify.notify_waiters();
-                Ok::<_, SessionConsumerStoreError>(watch_change_at_sequence(&entry, start_sequence))
-            })
-            .chain(stream::pending())
-            .boxed())
+            Ok(stream::iter(start_sequence..)
+                .map(move |sequence| {
+                    emitted.fetch_add(1, Ordering::SeqCst);
+                    emitted_notify.notify_waiters();
+                    Ok::<_, SessionConsumerStoreError>(watch_change_at_sequence(&entry, sequence))
+                })
+                .take(entry_limit)
+                .chain(stream::pending())
+                .boxed())
         } else {
             let emitted_notify = Arc::clone(&self.watch_emitted_notify);
             Ok(stream::iter(start_sequence..)
@@ -369,6 +384,7 @@ fn assert_fixed_zero_diagnostics(diagnostics: PersistentSessionConsumerDiagnosti
             max_inflight: 0,
             watch_active: 0,
             max_watch_active: 0,
+            watch_buffered: 0,
             successes: 0,
             not_transmitted: 0,
             outcome_unknown: 0,
@@ -1471,7 +1487,10 @@ async fn rotation_releases_an_unpolled_full_small_item_watch_queue() {
     let client_spiffe = spiffe("watch-small-queue-client");
     let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
-    service.repeat_watch_entry(small_watch_change());
+    // Offer exactly the channel capacity and then remain healthy-but-quiet.
+    // That makes the local item queue the only possible backpressure point;
+    // a 65th producer pull is neither necessary nor portable on i686 TCP.
+    service.emit_watch_entries_then_pending(small_watch_change(), WATCH_QUEUE_ITEMS);
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
         pki.server_config(&server_spiffe),
@@ -1494,27 +1513,11 @@ async fn rotation_releases_an_unpolled_full_small_item_watch_queue() {
 
     let stale_watch = client.open_watch(0).await.expect("open queued watch");
     tokio::time::timeout(Duration::from_secs(1), async {
-        // Wait on the producer's exact emission edge rather than repeatedly
+        // Wait on the producer's exact finite emission edge rather than
         // sleeping while i686 is still scheduling authenticated watch setup.
-        service
-            .wait_for_watch_emissions(WATCH_QUEUE_ITEMS + 1)
-            .await;
-        let mut unchanged_samples = 0;
-        loop {
-            match tokio::time::timeout(
-                Duration::from_millis(10),
-                service.watch_emitted_notify.notified(),
-            )
-            .await
-            {
-                Ok(()) => unchanged_samples = 0,
-                Err(_) => {
-                    unchanged_samples += 1;
-                    if unchanged_samples >= 3 {
-                        break;
-                    }
-                }
-            }
+        service.wait_for_watch_emissions(WATCH_QUEUE_ITEMS).await;
+        while client.diagnostics().await.watch_buffered != WATCH_QUEUE_ITEMS as u64 {
+            tokio::task::yield_now().await;
         }
     })
     .await

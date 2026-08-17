@@ -109,10 +109,34 @@ fn valid_consumer_operation_timeout(timeout: Duration) -> bool {
 }
 
 struct QueuedConsumerWatchItem {
-    item: Result<SessionConsumerChange, StoreError>,
+    item: Option<Result<SessionConsumerChange, StoreError>>,
     // Retained for precisely as long as this item occupies the bounded local
     // queue. Dropping it returns its byte budget to the producer.
     _byte_permit: OwnedSemaphorePermit,
+    // The persistent pool is retained only while this item waits for caller
+    // delivery, so the diagnostic remains exact even when the stream drops.
+    watch_pool: Option<Arc<PersistentSessionConsumerPool>>,
+}
+
+impl QueuedConsumerWatchItem {
+    fn into_item(mut self) -> Result<SessionConsumerChange, StoreError> {
+        if let Some(pool) = self.watch_pool.take() {
+            pool.counters.watch_buffered.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.item
+            .take()
+            .expect("queued watch item is returned at most once")
+    }
+}
+
+impl Drop for QueuedConsumerWatchItem {
+    fn drop(&mut self) {
+        if self.item.is_some() {
+            if let Some(pool) = self.watch_pool.take() {
+                pool.counters.watch_buffered.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 fn consumer_watch_item_byte_count(item: &Result<SessionConsumerChange, StoreError>) -> Option<u32> {
@@ -126,28 +150,34 @@ fn consumer_watch_item_byte_count(item: &Result<SessionConsumerChange, StoreErro
 fn try_send_consumer_watch_item(
     sender: &mpsc::Sender<QueuedConsumerWatchItem>,
     byte_budget: &Arc<Semaphore>,
+    watch_pool: Option<&Arc<PersistentSessionConsumerPool>>,
     item: Result<SessionConsumerChange, StoreError>,
     byte_count: u32,
 ) {
     let Ok(permit) = Arc::clone(byte_budget).try_acquire_many_owned(byte_count) else {
         return;
     };
+    if let Some(pool) = watch_pool {
+        counter_increment(&pool.counters.watch_buffered);
+    }
     let _ = sender.try_send(QueuedConsumerWatchItem {
-        item,
+        item: Some(item),
         _byte_permit: permit,
+        watch_pool: watch_pool.cloned(),
     });
 }
 
 fn try_send_consumer_watch_terminal(
     sender: &mpsc::Sender<QueuedConsumerWatchItem>,
     byte_budget: &Arc<Semaphore>,
+    watch_pool: Option<&Arc<PersistentSessionConsumerPool>>,
     message: &'static str,
 ) {
     let item = Err(StoreError::BackendUnavailable(message.into()));
     let Some(byte_count) = consumer_watch_item_byte_count(&item) else {
         return;
     };
-    try_send_consumer_watch_item(sender, byte_budget, item, byte_count);
+    try_send_consumer_watch_item(sender, byte_budget, watch_pool, item, byte_count);
 }
 
 fn consumer_watch_transport_lost(error: &ProtocolError) -> bool {
@@ -442,6 +472,8 @@ pub struct PersistentSessionConsumerDiagnostics {
     pub max_inflight: u64,
     pub watch_active: u64,
     pub max_watch_active: u64,
+    /// Current caller-visible items held in bounded persistent-watch queues.
+    pub watch_buffered: u64,
     pub successes: u64,
     pub not_transmitted: u64,
     pub outcome_unknown: u64,
@@ -1130,7 +1162,11 @@ fn response_matches_request(
         (
             SessionConsumerOperation::AcquireLease { key, owner, .. },
             SessionConsumerResponse::AcquireLease(Ok(lease)),
-        ) => lease.key() == key && lease.owner() == owner,
+        ) => {
+            lease.key() == key
+                && lease.owner() == owner
+                && crate::protocol::validate_lease_profile(lease).is_ok()
+        }
         (
             SessionConsumerOperation::RenewLease { lease, .. },
             SessionConsumerResponse::RenewLease(Ok(renewed)),
@@ -1139,6 +1175,7 @@ fn response_matches_request(
                 && renewed.owner() == lease.owner()
                 && renewed.fence() == lease.fence()
                 && renewed.credential_id() == lease.credential_id()
+                && crate::protocol::validate_lease_profile(renewed).is_ok()
         }
         _ => true,
     }
@@ -2447,6 +2484,7 @@ impl StatelessSessionConsumerClient {
             .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))
     }
 
+    #[cfg(test)]
     async fn write_watch_call_on_connection(
         &self,
         connection: &mut ConsumerConnection,
@@ -2456,26 +2494,53 @@ impl StatelessSessionConsumerClient {
         reauthentication_changes: &mut watch::Receiver<u64>,
         material_changes: &mut Option<opc_tls::TlsMaterialStatusReceiver>,
     ) -> Result<NonZeroU32, SessionConsumerClientError> {
+        self.write_watch_call_on_connection_classified(
+            connection,
+            request,
+            pre_request_deadline,
+            pre_request_budget_active,
+            reauthentication_changes,
+            material_changes,
+        )
+        .await
+        .map_err(SessionConsumerCallError::into_client_error)
+    }
+
+    async fn write_watch_call_on_connection_classified(
+        &self,
+        connection: &mut ConsumerConnection,
+        request: &SessionConsumerRequest,
+        pre_request_deadline: tokio::time::Instant,
+        pre_request_budget_active: bool,
+        reauthentication_changes: &mut watch::Receiver<u64>,
+        material_changes: &mut Option<opc_tls::TlsMaterialStatusReceiver>,
+    ) -> Result<NonZeroU32, SessionConsumerCallError> {
         // The receivers are constructed before this check. A rotation between
         // connect's final check and subscription is visible in the synchronous
         // epoch snapshot; a later rotation is visible to the supervised write.
         if !connection.current(&self.tls_config, &self.reauthentication) {
-            return Err(SessionConsumerClientError::Unavailable);
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Unavailable,
+            ));
         }
         let rotation_edge_key = connection.rotation_edge_key;
-        let correlation = connection.take_correlation()?;
+        let correlation = connection
+            .take_correlation()
+            .map_err(SessionConsumerCallError::BeforeCallWrite)?;
         connection.idle_deadline = tokio::time::Instant::now()
             .checked_add(self.idle_timeout.min(DEFAULT_CONSUMER_IDLE_TIMEOUT))
-            .ok_or(SessionConsumerClientError::Protocol)?;
+            .ok_or(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Protocol,
+            ))?;
         let outbound = BorrowedConsumerWireRequest::Call(BorrowedConsumerCall {
             correlation,
             request,
         });
         {
             let lifecycle = &mut connection.lifecycle;
-            let initial_hard_deadline = lifecycle
-                .hard_deadline()
-                .map_err(|_| SessionConsumerClientError::Protocol)?;
+            let initial_hard_deadline = lifecycle.hard_deadline().map_err(|_| {
+                SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol)
+            })?;
             let write_deadline = pre_request_deadline.min(initial_hard_deadline);
             let write = write_frame_bounded_until_classified(
                 &mut connection.writer,
@@ -2485,9 +2550,9 @@ impl StatelessSessionConsumerClient {
             );
             tokio::pin!(write);
             loop {
-                let hard_deadline = lifecycle
-                    .hard_deadline()
-                    .map_err(|_| SessionConsumerClientError::Protocol)?;
+                let hard_deadline = lifecycle.hard_deadline().map_err(|_| {
+                    SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol)
+                })?;
                 let result = tokio::select! {
                     biased;
                     result = &mut write => {
@@ -2495,13 +2560,17 @@ impl StatelessSessionConsumerClient {
                             && tokio::time::Instant::now() >= hard_deadline
                         {
                             record_consumer_hard_overrun(lifecycle);
-                            return Err(SessionConsumerClientError::Deadline);
+                            return Err(SessionConsumerCallError::MayHaveSent(
+                                SessionConsumerClientError::Deadline,
+                            ));
                         }
                         Some(result)
                     },
                     _ = wait_for_shortened_deadline(hard_deadline, write_deadline) => {
                         record_consumer_hard_overrun(lifecycle);
-                        return Err(SessionConsumerClientError::Deadline);
+                        return Err(SessionConsumerCallError::MayHaveSent(
+                            SessionConsumerClientError::Deadline,
+                        ));
                     }
                     _ = reauthentication_changes.changed() => {
                         observe_consumer_rotation(
@@ -2525,14 +2594,8 @@ impl StatelessSessionConsumerClient {
                     }
                 };
                 if let Some(result) = result {
-                    result.map_err(|error| match error {
-                        FrameWriteError::BeforeWrite(error) => pre_request_error(
-                            SessionConsumerClientError::from(error),
-                            pre_request_budget_active,
-                        ),
-                        FrameWriteError::MayHaveWritten(error) => {
-                            SessionConsumerClientError::from(error)
-                        }
+                    result.map_err(|error| {
+                        classify_call_write_error(error, pre_request_budget_active)
                     })?;
                     break;
                 }
@@ -2542,7 +2605,9 @@ impl StatelessSessionConsumerClient {
         // poll. Never publish a watch admitted on a connection that is no
         // longer current, even though Watch itself has no mutation effect.
         if !connection.current(&self.tls_config, &self.reauthentication) {
-            return Err(SessionConsumerClientError::Unavailable);
+            return Err(SessionConsumerCallError::MayHaveSent(
+                SessionConsumerClientError::Unavailable,
+            ));
         }
         Ok(correlation)
     }
@@ -2552,10 +2617,20 @@ impl StatelessSessionConsumerClient {
         start_sequence: u64,
         setup_counters: Option<&PersistentConsumerCounters>,
     ) -> Result<(ConsumerConnection, NonZeroU32), SessionConsumerClientError> {
+        self.open_watch_connection_with_counters_classified(start_sequence, setup_counters)
+            .await
+            .map_err(SessionConsumerCallError::into_client_error)
+    }
+
+    async fn open_watch_connection_with_counters_classified(
+        &self,
+        start_sequence: u64,
+        setup_counters: Option<&PersistentConsumerCounters>,
+    ) -> Result<(ConsumerConnection, NonZeroU32), SessionConsumerCallError> {
         let started_at = tokio::time::Instant::now();
-        let deadline = started_at
-            .checked_add(self.operation_timeout)
-            .ok_or(SessionConsumerClientError::Protocol)?;
+        let deadline = started_at.checked_add(self.operation_timeout).ok_or(
+            SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol),
+        )?;
         let (pre_request_deadline, pre_request_budget_active) =
             self.pre_request_deadline(started_at, deadline);
         let mut connection = self
@@ -2565,16 +2640,18 @@ impl StatelessSessionConsumerClient {
                 setup_counters,
                 true,
             )
-            .await?;
+            .await
+            .map_err(SessionConsumerCallError::BeforeCallWrite)?;
         let mut reauthentication_changes = self.reauthentication.subscribe();
         let mut material_changes = Some(self.tls_config.subscribe_material_changes());
-        ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)?;
+        ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
+            .map_err(SessionConsumerCallError::BeforeCallWrite)?;
         let request = self.request(
             SessionConsumerRequestId::new(),
             SessionConsumerOperation::Watch { start_sequence },
         );
         let correlation = self
-            .write_watch_call_on_connection(
+            .write_watch_call_on_connection_classified(
                 &mut connection,
                 &request,
                 pre_request_deadline,
@@ -2602,11 +2679,11 @@ impl StatelessSessionConsumerClient {
                     )
                 {
                     let _ = connection.lifecycle.retirement(now);
-                    return Err(if now >= watch_response_deadline {
+                    return Err(SessionConsumerCallError::MayHaveSent(if now >= watch_response_deadline {
                         SessionConsumerClientError::Deadline
                     } else {
                         SessionConsumerClientError::Unavailable
-                    });
+                    }));
                 }
                 let response = tokio::select! {
                     biased;
@@ -2621,11 +2698,11 @@ impl StatelessSessionConsumerClient {
                             )
                         {
                             let _ = connection.lifecycle.retirement(now);
-                            return Err(if now >= watch_response_deadline {
+                            return Err(SessionConsumerCallError::MayHaveSent(if now >= watch_response_deadline {
                                 SessionConsumerClientError::Deadline
                             } else {
                                 SessionConsumerClientError::Unavailable
-                            });
+                            }));
                         }
                         Some(response)
                     },
@@ -2633,7 +2710,9 @@ impl StatelessSessionConsumerClient {
                         let _ = connection
                             .lifecycle
                             .retirement(tokio::time::Instant::now());
-                        return Err(SessionConsumerClientError::Unavailable);
+                        return Err(SessionConsumerCallError::MayHaveSent(
+                            SessionConsumerClientError::Unavailable,
+                        ));
                     }
                     _ = reauthentication_changes.changed() => {
                         if !consumer_connection_current(
@@ -2642,7 +2721,9 @@ impl StatelessSessionConsumerClient {
                             &self.reauthentication,
                             connection.rotation_edge_key,
                         ) {
-                            return Err(SessionConsumerClientError::Unavailable);
+                            return Err(SessionConsumerCallError::MayHaveSent(
+                                SessionConsumerClientError::Unavailable,
+                            ));
                         }
                         None
                     }
@@ -2653,7 +2734,9 @@ impl StatelessSessionConsumerClient {
                             &self.reauthentication,
                             connection.rotation_edge_key,
                         ) {
-                            return Err(SessionConsumerClientError::Unavailable);
+                            return Err(SessionConsumerCallError::MayHaveSent(
+                                SessionConsumerClientError::Unavailable,
+                            ));
                         }
                         None
                     }
@@ -2663,21 +2746,31 @@ impl StatelessSessionConsumerClient {
                 }
             }
         }
-        .map_err(SessionConsumerClientError::from)?
-        .ok_or(SessionConsumerClientError::Deadline)?;
+        .map_err(|error| SessionConsumerCallError::MayHaveSent(error.into()))?
+        .ok_or(SessionConsumerCallError::MayHaveSent(
+            SessionConsumerClientError::Deadline,
+        ))?;
         let response = match response {
             ConsumerWireResponse::Response(ConsumerCallResponse {
                 correlation: received,
                 response,
             }) if exact_correlation(correlation, received).is_ok() => *response,
-            _ => return Err(SessionConsumerClientError::Protocol),
+            _ => {
+                return Err(SessionConsumerCallError::MayHaveSent(
+                    SessionConsumerClientError::Protocol,
+                ))
+            }
         };
         match response {
             SessionConsumerResponse::WatchOpened => Ok((connection, correlation)),
             SessionConsumerResponse::Rejected(rejection) => {
-                Err(consumer_rejection_into_client_error(rejection))
+                Err(SessionConsumerCallError::MayHaveSent(
+                    consumer_rejection_into_client_error(rejection),
+                ))
             }
-            _ => Err(SessionConsumerClientError::Protocol),
+            _ => Err(SessionConsumerCallError::MayHaveSent(
+                SessionConsumerClientError::Protocol,
+            )),
         }
     }
 
@@ -2688,7 +2781,7 @@ impl StatelessSessionConsumerClient {
         persistent_runtime: Option<PersistentWatchRuntime>,
     ) -> Result<
         BoxStream<'static, Result<SessionConsumerChange, StoreError>>,
-        SessionConsumerClientError,
+        SessionConsumerCallError,
     > {
         // The typed store contract is an inclusive 1-based watch cursor: the
         // empty-head sentinel zero is exactly sequence one. Normalize once at
@@ -2696,7 +2789,7 @@ impl StatelessSessionConsumerClient {
         // retain the same checked caller-visible cursor.
         let start_sequence = normalized_consumer_watch_cursor(start_sequence);
         let (mut connection, mut correlation) = self
-            .open_watch_connection_with_counters(start_sequence, setup_counters)
+            .open_watch_connection_with_counters_classified(start_sequence, setup_counters)
             .await?;
         let (tx, rx) = mpsc::channel(CONSUMER_WATCH_CHANNEL_CAPACITY);
         let byte_budget = Arc::new(Semaphore::new(CONSUMER_WATCH_CHANNEL_MAX_BYTES));
@@ -2733,6 +2826,7 @@ impl StatelessSessionConsumerClient {
                             try_send_consumer_watch_terminal(
                                 &tx,
                                 &byte_budget,
+                                persistent_pool.as_ref(),
                                 "consumer watch unavailable",
                             );
                             return;
@@ -2741,6 +2835,7 @@ impl StatelessSessionConsumerClient {
                             try_send_consumer_watch_terminal(
                                 &tx,
                                 &byte_budget,
+                                persistent_pool.as_ref(),
                                 "consumer watch unavailable",
                             );
                             return;
@@ -2767,6 +2862,7 @@ impl StatelessSessionConsumerClient {
                                 try_send_consumer_watch_terminal(
                                     &tx,
                                     &byte_budget,
+                                    persistent_pool.as_ref(),
                                     "consumer watch unavailable",
                                 );
                                 return;
@@ -2784,6 +2880,7 @@ impl StatelessSessionConsumerClient {
                         try_send_consumer_watch_terminal(
                             &tx,
                             &byte_budget,
+                            persistent_pool.as_ref(),
                             "consumer watch unavailable",
                         );
                         return;
@@ -2875,6 +2972,7 @@ impl StatelessSessionConsumerClient {
                             try_send_consumer_watch_terminal(
                                 &tx,
                                 &byte_budget,
+                                persistent_pool.as_ref(),
                                 "consumer watch protocol invalid",
                             );
                             return;
@@ -2888,6 +2986,7 @@ impl StatelessSessionConsumerClient {
                         try_send_consumer_watch_terminal(
                             &tx,
                             &byte_budget,
+                            persistent_pool.as_ref(),
                             "consumer watch protocol invalid",
                         );
                         return;
@@ -2899,6 +2998,7 @@ impl StatelessSessionConsumerClient {
                         try_send_consumer_watch_terminal(
                             &tx,
                             &byte_budget,
+                            persistent_pool.as_ref(),
                             "consumer watch protocol invalid",
                         );
                         return;
@@ -2923,7 +3023,13 @@ impl StatelessSessionConsumerClient {
                 // Delivery is therefore best-effort and never waits for
                 // receiver capacity once this watch is known to be terminal.
                 if entry.is_err() {
-                    try_send_consumer_watch_item(&tx, &byte_budget, entry, byte_count);
+                    try_send_consumer_watch_item(
+                        &tx,
+                        &byte_budget,
+                        persistent_pool.as_ref(),
+                        entry,
+                        byte_count,
+                    );
                     return;
                 }
                 let acquire_permit = Arc::clone(&byte_budget).acquire_many_owned(byte_count);
@@ -2975,9 +3081,13 @@ impl StatelessSessionConsumerClient {
                 if !connection.current(&tls_config, &reauthentication) {
                     reconnect_or_terminal!();
                 }
+                if let Some(pool) = persistent_pool.as_ref() {
+                    counter_increment(&pool.counters.watch_buffered);
+                }
                 let send = tx.send(QueuedConsumerWatchItem {
-                    item: entry,
+                    item: Some(entry),
                     _byte_permit: permit,
+                    watch_pool: persistent_pool.clone(),
                 });
                 tokio::pin!(send);
                 let sent = loop {
@@ -3034,7 +3144,10 @@ impl StatelessSessionConsumerClient {
             }
         });
         Ok(stream::unfold(rx, |mut receiver| async move {
-            receiver.recv().await.map(|item| (item.item, receiver))
+            receiver
+                .recv()
+                .await
+                .map(|item| (item.into_item(), receiver))
         })
         .boxed())
     }
@@ -3123,6 +3236,7 @@ struct PersistentConsumerCounters {
     max_inflight: AtomicU64,
     watch_active: AtomicU64,
     max_watch_active: AtomicU64,
+    watch_buffered: AtomicU64,
     successes: AtomicU64,
     not_transmitted: AtomicU64,
     outcome_unknown: AtomicU64,
@@ -4026,6 +4140,7 @@ impl PersistentSessionConsumerPool {
             max_inflight: load(&self.counters.max_inflight),
             watch_active: load(&self.counters.watch_active),
             max_watch_active: load(&self.counters.max_watch_active),
+            watch_buffered: load(&self.counters.watch_buffered),
             successes: load(&self.counters.successes),
             not_transmitted: load(&self.counters.not_transmitted),
             outcome_unknown: load(&self.counters.outcome_unknown),
@@ -4189,16 +4304,22 @@ impl PersistentSessionConsumerClient {
                 SessionConsumerClientError::Deadline,
             ))?;
         if request.scope() != self.pool.client.scope {
+            self.pool
+                .record_error(SessionConsumerClientError::Scope, false);
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Scope,
             ));
         }
         if matches!(request.operation(), SessionConsumerOperation::Watch { .. }) {
+            self.pool
+                .record_error(SessionConsumerClientError::Protocol, false);
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Protocol,
             ));
         }
         if request.validate().is_err() {
+            self.pool
+                .record_error(SessionConsumerClientError::Protocol, false);
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Protocol,
             ));
@@ -4512,8 +4633,19 @@ impl PersistentSessionConsumerClient {
         }
         .map_err(|error| {
             counter_increment(&self.pool.counters.setup_failures);
-            self.pool.record_error(error, false);
-            error
+            match error {
+                SessionConsumerCallError::BeforeCallWrite(error) => {
+                    self.pool.record_error(error, false);
+                    error
+                }
+                // Watch setup has no store mutation to recover, but a
+                // completed call write proves it was not a local
+                // not-transmitted failure. Retain its typed diagnostics only.
+                SessionConsumerCallError::MayHaveSent(error) => {
+                    self.pool.record_failure(error);
+                    error
+                }
+            }
         })?;
         counter_increment(&self.pool.counters.setup_successes);
         if self.pool.phase() != PersistentShutdownPhase::Running {
@@ -6195,6 +6327,7 @@ mod tests {
         try_send_consumer_watch_item(
             &sender,
             &insufficient,
+            None,
             Err(StoreError::BackendUnavailable(
                 "consumer watch authentication retired".into(),
             )),
@@ -6207,12 +6340,12 @@ mod tests {
         assert_eq!(insufficient.available_permits(), insufficient_size);
 
         let exact = Arc::new(Semaphore::new(exact_size));
-        try_send_consumer_watch_item(&sender, &exact, item, byte_count);
+        try_send_consumer_watch_item(&sender, &exact, None, item, byte_count);
         assert_eq!(exact.available_permits(), 0);
         let queued = receiver
             .try_recv()
             .expect("an exact-size terminal item is admitted without waiting");
-        assert!(queued.item.is_err());
+        assert!(queued.item.as_ref().is_some_and(Result::is_err));
         drop(queued);
         assert_eq!(exact.available_permits(), exact_size);
     }

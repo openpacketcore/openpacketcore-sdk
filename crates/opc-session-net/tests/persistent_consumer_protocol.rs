@@ -700,6 +700,36 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
     )
     .await;
 
+    // These values decode successfully and are bound to the requested
+    // acquire, so this proves the consumer reuses the wire-level guard
+    // invariants instead of trusting authenticated peer data by shape alone.
+    for (case, field, value) in [
+        ("acquire-zero-fence", "fence", json!(0)),
+        ("acquire-zero-credential", "credential_id", json!(0)),
+        (
+            "acquire-reversed-lifetime",
+            "expires_at",
+            json!("1970-01-01T00:00:00Z"),
+        ),
+    ] {
+        let mut malformed = serde_json::to_value(&lease).expect("lease encodes");
+        malformed[field] = value;
+        let malformed = serde_json::from_value(malformed).expect("malformed lease decodes");
+        assert_malicious_semantic_response_is_unconfirmed(
+            case,
+            semantic_request(
+                SessionConsumerOperation::AcquireLease {
+                    key: requested_key.clone(),
+                    owner: owner.clone(),
+                    ttl: Duration::from_secs(30),
+                },
+                40,
+            ),
+            SessionConsumerResponse::AcquireLease(Ok(malformed)),
+        )
+        .await;
+    }
+
     let mut forged_renewal = serde_json::to_value(&lease).expect("lease encodes");
     forged_renewal["key"] = serde_json::to_value(&wrong_key).expect("wrong key encodes");
     forged_renewal["owner"] = serde_json::to_value(&wrong_owner).expect("wrong owner encodes");
@@ -718,6 +748,32 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
         SessionConsumerResponse::RenewLease(Ok(forged_renewal)),
     )
     .await;
+
+    for (case, field, value) in [
+        ("renew-zero-fence", "fence", json!(0)),
+        ("renew-zero-credential", "credential_id", json!(0)),
+        (
+            "renew-reversed-lifetime",
+            "expires_at",
+            json!("1970-01-01T00:00:00Z"),
+        ),
+    ] {
+        let mut malformed = serde_json::to_value(&lease).expect("lease encodes");
+        malformed[field] = value;
+        let malformed = serde_json::from_value(malformed).expect("malformed lease decodes");
+        assert_malicious_semantic_response_is_unconfirmed(
+            case,
+            semantic_request(
+                SessionConsumerOperation::RenewLease {
+                    lease: lease.clone(),
+                    ttl: Duration::from_secs(30),
+                },
+                50,
+            ),
+            SessionConsumerResponse::RenewLease(Ok(malformed)),
+        )
+        .await;
+    }
 
     assert_malicious_semantic_response_is_unconfirmed(
         "batch-empty",
@@ -879,6 +935,78 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
         SessionConsumerResponse::ScanRestoreRecords(Ok(wrong_page)),
     )
     .await;
+}
+
+#[tokio::test]
+async fn local_persistent_validation_failures_are_typed_and_counted_once_before_io() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("local-validation-server");
+    let client_spiffe = spiffe("local-validation-client");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind unused listener");
+    let client = persistent_client(
+        &pki,
+        listener.local_addr().expect("listener address"),
+        &server_spiffe,
+        &client_spiffe,
+        scope(2),
+    );
+
+    let wrong_scope = semantic_request(SessionConsumerOperation::Capabilities, 60);
+    assert!(matches!(
+        client.execute(&wrong_scope).await,
+        Err(PersistentSessionConsumerExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Scope
+        })
+    ));
+
+    let watch = SessionConsumerRequest::new(
+        scope(2),
+        SessionConsumerRequestId::from_bytes([61; 16]),
+        SessionConsumerOperation::Watch { start_sequence: 0 },
+    );
+    assert!(matches!(
+        client.execute(&watch).await,
+        Err(PersistentSessionConsumerExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Protocol
+        })
+    ));
+
+    let malformed = semantic_request(
+        SessionConsumerOperation::Batch {
+            ops: vec![
+                SessionOp::Get {
+                    key: semantic_key(b"local-oversized-batch"),
+                };
+                257
+            ],
+        },
+        62,
+    );
+    let malformed = SessionConsumerRequest::new(
+        scope(2),
+        malformed.request_id(),
+        malformed.operation().clone(),
+    );
+    assert!(matches!(
+        client.execute(&malformed).await,
+        Err(PersistentSessionConsumerExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Protocol
+        })
+    ));
+
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(
+        diagnostics.setup_attempts, 0,
+        "local failures never connect"
+    );
+    assert_eq!(diagnostics.failures, 3);
+    assert_eq!(diagnostics.scope, 1);
+    assert_eq!(diagnostics.protocol, 2);
+    assert_eq!(diagnostics.not_transmitted, 3);
+    assert_eq!(diagnostics.outcome_unknown, 0);
+    client.shutdown().await;
 }
 
 #[tokio::test]
@@ -1171,6 +1299,12 @@ async fn partial_initial_watch_open_response_releases_the_isolated_admission() {
         })
         .await
         .expect("initial watch-open failure releases its isolated physical admission");
+        let diagnostics = client.diagnostics().await;
+        assert_eq!(diagnostics.setup_failures, 1);
+        assert_eq!(diagnostics.failures, 1);
+        assert_eq!(diagnostics.deadline, 1);
+        assert_eq!(diagnostics.not_transmitted, 0);
+        assert_eq!(diagnostics.outcome_unknown, 0);
         let replacement = tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, client.open_watch(0))
             .await
             .expect("released watch admission establishes a fresh authenticated watch")
@@ -1236,6 +1370,8 @@ async fn correlated_watch_rejections_preserve_their_typed_setup_classification()
         assert_eq!(diagnostics.setup_failures, 1);
         assert_eq!(diagnostics.failures, 1);
         assert_eq!(diagnostics.watch_active, 0);
+        assert_eq!(diagnostics.not_transmitted, 0);
+        assert_eq!(diagnostics.outcome_unknown, 0);
         if rejection == SessionConsumerRejection::Unavailable {
             assert_eq!(
                 diagnostics.protocol, 0,

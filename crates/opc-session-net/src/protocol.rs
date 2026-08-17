@@ -806,7 +806,11 @@ pub(crate) fn validate_request_payload_limit(
     }
 }
 
-fn validate_lease_profile(lease: &LeaseGuard) -> Result<(), WireConversionError> {
+/// Enforce the structural invariants of a lease guard wherever it crosses the
+/// wire.  The consumer also uses this for successful lease responses: mTLS
+/// authenticates the peer, but does not make an impossible guard safe to hand
+/// to a caller.
+pub(crate) fn validate_lease_profile(lease: &LeaseGuard) -> Result<(), WireConversionError> {
     validate_session_key_profile(lease.key())?;
     if lease.fence().get() == 0 {
         return Err(WireConversionError(
