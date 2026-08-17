@@ -72,6 +72,12 @@ const PLAINTEXT_CANARY_AFTER_ROTATION: &[u8] =
     b"opc-session-consensus-plaintext-canary-after-key-rotation";
 const RAW_KEY_MATERIAL_CANARY: &[u8; AES_256_GCM_SIV_KEY_LEN] = &[0x5a; AES_256_GCM_SIV_KEY_LEN];
 
+#[derive(Clone, Copy)]
+struct AppendEntriesRequestDelay {
+    request_id: [u8; 16],
+    delay_millis: u64,
+}
+
 #[derive(Clone)]
 struct LoopbackPeer {
     target: SessionConsensusNodeId,
@@ -83,7 +89,7 @@ struct LoopbackPeer {
     dropped_forward_responses: Arc<AtomicUsize>,
     forward_response_delay_millis: Arc<AtomicU64>,
     delayed_forward_responses: Arc<AtomicUsize>,
-    append_entries_request_delay: Arc<StdMutex<Option<([u8; 16], u64)>>>,
+    append_entries_request_delay: Arc<StdMutex<Option<AppendEntriesRequestDelay>>>,
     delayed_append_entries: Arc<AtomicUsize>,
     rpc_delay_millis: Arc<AtomicU64>,
     captured_payloads: Arc<StdMutex<Vec<Bytes>>>,
@@ -158,10 +164,10 @@ impl LoopbackPeer {
         *self
             .append_entries_request_delay
             .lock()
-            .expect("append-entries request delay mutex") = Some((
+            .expect("append-entries request delay mutex") = Some(AppendEntriesRequestDelay {
             request_id,
-            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-        ));
+            delay_millis: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        });
     }
 
     fn stop_delaying_append_entries_for_request(&self) {
@@ -277,9 +283,9 @@ impl SessionConsensusPeer for LoopbackPeer {
                 .lock()
                 .expect("append-entries request delay mutex")
                 .as_ref()
-                .and_then(|(request_id, delay)| {
-                    contains_bytes(&request.payload, request_id)
-                        .then_some(Duration::from_millis(*delay))
+                .and_then(|delay| {
+                    contains_bytes(&request.payload, &delay.request_id)
+                        .then_some(Duration::from_millis(delay.delay_millis))
                 })
         } else {
             None
@@ -1291,9 +1297,8 @@ async fn assert_fenced_renewal_cas_conflict_has_no_effect(
     assert!(
         matches!(
             store.fenced_transition_status(&request).await,
-            Ok(FencedTransitionStatus::Recorded(Err(
-                StoreError::CasConflict
-            )))
+            Ok(FencedTransitionStatus::Recorded(result))
+                if matches!(result.as_ref(), Err(StoreError::CasConflict))
         ),
         "the durable request status retains the exact deterministic rejection"
     );
@@ -2615,7 +2620,8 @@ async fn fenced_transition_replay_and_status_bind_one_exact_request_body() {
     );
     assert!(
         matches!(store.fenced_transition_status(&request).await,
-            Ok(FencedTransitionStatus::Recorded(Ok(recorded))) if recorded == first),
+            Ok(FencedTransitionStatus::Recorded(result))
+                if matches!(result.as_ref(), Ok(recorded) if recorded == &first)),
         "status returns the exact recorded success"
     );
 
@@ -2704,9 +2710,8 @@ async fn fenced_transition_stale_fence_and_generation_rejections_leave_state_unc
     assert!(
         matches!(
             store.fenced_transition_status(&stale).await,
-            Ok(FencedTransitionStatus::Recorded(Err(
-                StoreError::StaleFence
-            )))
+            Ok(FencedTransitionStatus::Recorded(result))
+                if matches!(result.as_ref(), Err(StoreError::StaleFence))
         ),
         "status preserves the deterministic stale-fence result"
     );
@@ -2871,9 +2876,8 @@ async fn fenced_transition_renew_rejects_record_owner_or_fence_mismatch() {
         assert!(
             matches!(
                 store.fenced_transition_status(&renewal).await,
-                Ok(FencedTransitionStatus::Recorded(Err(
-                    StoreError::StaleFence
-                )))
+                Ok(FencedTransitionStatus::Recorded(result))
+                    if matches!(result.as_ref(), Err(StoreError::StaleFence))
             ),
             "the deterministic rejection retains its typed stale-fence outcome"
         );
@@ -3411,7 +3415,7 @@ async fn fenced_transition_ambiguous_forward_retry_recovers_exactly_one_effect()
             assert!(
                 matches!(
                     store.fenced_transition_status(&request).await,
-                    Ok(FencedTransitionStatus::Recorded(Ok(_)))
+                    Ok(FencedTransitionStatus::Recorded(result)) if result.as_ref().is_ok()
                 ),
                 "exact status resolves the ambiguous request"
             );
@@ -3490,7 +3494,7 @@ async fn fenced_transition_does_not_auto_replay_after_forward_write_boundary() {
             assert!(
                 matches!(
                     store.fenced_transition_status(&request).await,
-                    Ok(FencedTransitionStatus::Recorded(Ok(_)))
+                    Ok(FencedTransitionStatus::Recorded(result)) if result.as_ref().is_ok()
                 ),
                 "exact status resolves the retained request without replay"
             );
@@ -3763,23 +3767,25 @@ async fn fenced_transition_enqueued_without_quorum_recovers_one_effect_by_exact_
         .await
         .expect("resolve exact transition after recovery")
     {
-        FencedTransitionStatus::Recorded(Ok(recorded)) => {
-            let replay = store
-                .fenced_transition(request.clone())
-                .await
-                .expect("replay recorded transition after recovery");
-            assert!(
-                replay == recorded,
-                "exact replay returns the retained outcome"
-            );
-            recorded
-        }
+        FencedTransitionStatus::Recorded(result) => match *result {
+            Ok(recorded) => {
+                let replay = store
+                    .fenced_transition(request.clone())
+                    .await
+                    .expect("replay recorded transition after recovery");
+                assert!(
+                    replay == recorded,
+                    "exact replay returns the retained outcome"
+                );
+                recorded
+            }
+            Err(_) => panic!("recovery must retain or safely complete the exact transition"),
+        },
         FencedTransitionStatus::NotFound => store
             .fenced_transition(request.clone())
             .await
             .expect("safely complete an unrecorded transition after recovery"),
-        FencedTransitionStatus::Recorded(Err(_))
-        | FencedTransitionStatus::RequestConflict
+        FencedTransitionStatus::RequestConflict
         | FencedTransitionStatus::Expired
         | FencedTransitionStatus::HistoryFull
         | FencedTransitionStatus::RetentionExhausted => {
@@ -3898,7 +3904,8 @@ async fn fenced_transition_leader_transfer_preserves_exact_replay_on_surviving_v
         .await
         .expect("surviving voter resolves the exact committed result");
     assert!(
-        matches!(status, FencedTransitionStatus::Recorded(Ok(recorded)) if recorded == committed),
+        matches!(status, FencedTransitionStatus::Recorded(result)
+            if matches!(result.as_ref(), Ok(recorded) if recorded == &committed)),
         "leader transfer preserves the exact recorded result"
     );
     let unavailable_replay = survivor.fenced_transition(request.clone()).await;

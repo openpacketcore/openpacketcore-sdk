@@ -682,7 +682,12 @@ impl fmt::Debug for FencedTransitionObservation {
 pub enum FencedTransitionStatus {
     /// The exact success or deterministic no-effect error remains in its
     /// recovery window.
-    Recorded(Result<FencedTransitionOutcome, StoreError>),
+    ///
+    /// The result is heap allocated so this public status enum remains small
+    /// even though a successful outcome carries a complete lease credential.
+    /// `Box` is serialization-transparent, preserving the persisted wire
+    /// representation of this variant.
+    Recorded(Box<Result<FencedTransitionOutcome, StoreError>>),
     /// The identity is durably bound to a different canonical request body.
     RequestConflict,
     /// The identity/body binding exists but its exact-result window elapsed.
@@ -1042,7 +1047,9 @@ mod tests {
         assert_eq!(
             format!(
                 "{:?}",
-                FencedTransitionStatus::Recorded(Err(StoreError::InvalidKey("secret".into(),)))
+                FencedTransitionStatus::Recorded(Box::new(Err(StoreError::InvalidKey(
+                    "secret".into(),
+                ))))
             ),
             "FencedTransitionStatus(<redacted>)"
         );
@@ -1095,6 +1102,27 @@ mod tests {
                 "fenced transition result retention horizon is exhausted",
             ]
             .map(str::to_owned)
+        );
+    }
+
+    #[test]
+    fn status_recorded_result_is_compact_and_serialization_transparent() {
+        let status = FencedTransitionStatus::Recorded(Box::new(Err(StoreError::NotFound)));
+
+        assert!(
+            std::mem::size_of::<FencedTransitionStatus>()
+                < std::mem::size_of::<FencedTransitionOutcome>(),
+            "the status must not inline a complete outcome"
+        );
+        assert_eq!(
+            serde_json::to_string(&status).expect("serialize status"),
+            r#"{"Recorded":{"Err":"NotFound"}}"#,
+            "boxing must not change the externally tagged persisted status shape"
+        );
+        assert_eq!(
+            serde_json::from_str::<FencedTransitionStatus>(r#"{"Recorded":{"Err":"NotFound"}}"#,)
+                .expect("deserialize legacy recorded status"),
+            status,
         );
     }
 }

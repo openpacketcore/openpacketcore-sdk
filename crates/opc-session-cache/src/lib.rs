@@ -697,6 +697,11 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::CasConflict => "cas_conflict",
         StoreError::CasIdempotencyConflict => "cas_idempotency_conflict",
         StoreError::CasIdempotencyOutcomeUnavailable => "cas_idempotency_outcome_unavailable",
+        StoreError::FencedTransitionRequestConflict => "fenced_transition_request_conflict",
+        StoreError::FencedTransitionOutcomeUnknown => "fenced_transition_outcome_unknown",
+        StoreError::FencedTransitionRequestExpired => "fenced_transition_request_expired",
+        StoreError::FencedTransitionHistoryFull => "fenced_transition_history_full",
+        StoreError::FencedTransitionRetentionExhausted => "fenced_transition_retention_exhausted",
         StoreError::BackendOperationOutcomeUnavailable => "backend_operation_outcome_unavailable",
         StoreError::TopologyAuthorityRevoked => "topology_authority_revoked",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
@@ -756,6 +761,34 @@ mod tests {
             store_error_kind(&StoreError::TopologyAuthorityRevoked),
             "topology_authority_revoked"
         );
+    }
+
+    #[test]
+    fn fenced_transition_errors_have_distinct_redaction_safe_kinds() {
+        for (error, kind) in [
+            (
+                StoreError::FencedTransitionRequestConflict,
+                "fenced_transition_request_conflict",
+            ),
+            (
+                StoreError::FencedTransitionOutcomeUnknown,
+                "fenced_transition_outcome_unknown",
+            ),
+            (
+                StoreError::FencedTransitionRequestExpired,
+                "fenced_transition_request_expired",
+            ),
+            (
+                StoreError::FencedTransitionHistoryFull,
+                "fenced_transition_history_full",
+            ),
+            (
+                StoreError::FencedTransitionRetentionExhausted,
+                "fenced_transition_retention_exhausted",
+            ),
+        ] {
+            assert_eq!(store_error_kind(&error), kind);
+        }
     }
 
     struct ScriptedWatchBackend {

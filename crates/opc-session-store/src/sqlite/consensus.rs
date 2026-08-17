@@ -7372,9 +7372,9 @@ pub(crate) fn read_fenced_transition_status_sync(
         }
         return match receipt.response.expect("checked above").result {
             Ok(SessionMutationOutcome::FencedTransition(outcome)) => {
-                Ok(FencedTransitionStatus::Recorded(Ok(outcome)))
+                Ok(FencedTransitionStatus::Recorded(Box::new(Ok(outcome))))
             }
-            Err(error) => Ok(FencedTransitionStatus::Recorded(Err(error))),
+            Err(error) => Ok(FencedTransitionStatus::Recorded(Box::new(Err(error)))),
             Ok(_) => Err(StoreError::BackendUnavailable(
                 "fenced transition status is unavailable".into(),
             )),
@@ -12144,7 +12144,7 @@ mod tests {
         ));
         assert!(matches!(
             read_fenced_transition_status_sync(&conn, identity(), identity(), &request),
-            Ok(FencedTransitionStatus::Recorded(Ok(_)))
+            Ok(FencedTransitionStatus::Recorded(result)) if result.as_ref().is_ok()
         ));
     }
 
@@ -12398,9 +12398,8 @@ mod tests {
         );
         assert!(matches!(
             read_fenced_transition_status_sync(&conn, identity(), identity(), &rejected),
-            Ok(FencedTransitionStatus::Recorded(Err(
-                StoreError::StaleFence
-            )))
+            Ok(FencedTransitionStatus::Recorded(result))
+                if matches!(result.as_ref(), Err(StoreError::StaleFence))
         ));
     }
 
@@ -13048,7 +13047,9 @@ mod tests {
         );
         assert_eq!(
             read_fenced_transition_status_sync(&conn, storage_identity, storage_identity, &request),
-            Ok(FencedTransitionStatus::Recorded(Ok(recorded.clone()))),
+            Ok(FencedTransitionStatus::Recorded(Box::new(Ok(
+                recorded.clone()
+            )))),
             "the successor authority resolves the original durable result"
         );
         let sequence_before_replay = proposal_state_sync(&conn, storage_identity)
@@ -13769,7 +13770,7 @@ mod tests {
         .expect("install transition snapshot");
         assert!(matches!(
             read_fenced_transition_status_sync(&target_conn, identity(), identity(), &request,),
-            Ok(FencedTransitionStatus::Recorded(Ok(_)))
+            Ok(FencedTransitionStatus::Recorded(result)) if result.as_ref().is_ok()
         ));
         let replay = apply_entries_sync(
             &target_conn,
@@ -17949,9 +17950,8 @@ mod tests {
         );
         assert!(matches!(
             read_fenced_transition_status_sync(&conn, identity(), identity(), &request),
-            Ok(FencedTransitionStatus::Recorded(Err(
-                StoreError::TopologyAuthorityRevoked
-            )))
+            Ok(FencedTransitionStatus::Recorded(result))
+                if matches!(result.as_ref(), Err(StoreError::TopologyAuthorityRevoked))
         ));
     }
 

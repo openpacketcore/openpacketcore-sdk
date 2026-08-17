@@ -1343,9 +1343,15 @@ fn hash_legacy_state(
 ) -> Result<RecoveryDigest, RecoveryError> {
     let mut hasher = Sha256::new();
     hasher.update(LEGACY_BRANCH_DOMAIN);
-    for query in ["SELECT * FROM session_records ORDER BY tenant, nf_kind, key_type, stable_id"] {
-        hash_query_rows_with_identity(conn, query, query, budget, &mut hasher)?;
-    }
+    let session_records_query =
+        "SELECT * FROM session_records ORDER BY tenant, nf_kind, key_type, stable_id";
+    hash_query_rows_with_identity(
+        conn,
+        session_records_query,
+        session_records_query,
+        budget,
+        &mut hasher,
+    )?;
     hash_legacy_lease_rows(conn, budget, &mut hasher)?;
     for query in [
         "SELECT * FROM key_fences ORDER BY tenant, nf_kind, key_type, stable_id",
@@ -1363,9 +1369,15 @@ fn hash_logical_state(
 ) -> Result<RecoveryDigest, RecoveryError> {
     let mut hasher = Sha256::new();
     hasher.update(LOGICAL_STATE_DOMAIN);
-    for query in ["SELECT * FROM session_records ORDER BY tenant, nf_kind, key_type, stable_id"] {
-        hash_query_rows_with_identity(conn, query, query, budget, &mut hasher)?;
-    }
+    let session_records_query =
+        "SELECT * FROM session_records ORDER BY tenant, nf_kind, key_type, stable_id";
+    hash_query_rows_with_identity(
+        conn,
+        session_records_query,
+        session_records_query,
+        budget,
+        &mut hasher,
+    )?;
     hash_legacy_lease_rows(conn, budget, &mut hasher)?;
     for query in [
         "SELECT * FROM key_fences ORDER BY tenant, nf_kind, key_type, stable_id",
