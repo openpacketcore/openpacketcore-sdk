@@ -8404,7 +8404,7 @@ mod tests {
                 state_class: StateClass::AuthoritativeSession,
                 state_type: StateType::from_static("consumer-payload-preflight"),
                 expires_at: None,
-                payload: EncryptedSessionPayload::new(&payload),
+                payload: EncryptedSessionPayload::new(payload),
             },
         };
         let single = SessionConsumerRequest::new(
