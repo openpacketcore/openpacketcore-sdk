@@ -3551,7 +3551,7 @@ where
     };
     match tokio::time::timeout_at(deadline, write).await {
         Ok(result) => {
-            let result = result.map_err(FrameWriteError::MayHaveWritten)?;
+            result.map_err(FrameWriteError::MayHaveWritten)?;
             // Tokio polls the inner write before its deadline future. A task
             // resumed at or after the absolute boundary must not publish a
             // late success; the prefix may already have crossed the transport
@@ -3559,7 +3559,7 @@ where
             if tokio::time::Instant::now() >= deadline {
                 Err(FrameWriteError::MayHaveWritten(write_timeout_error()))
             } else {
-                Ok(result)
+                Ok(())
             }
         }
         Err(_elapsed) => Err(FrameWriteError::MayHaveWritten(write_timeout_error())),
