@@ -691,23 +691,24 @@ async fn persistent_pools_derived_from_one_stateless_lineage_share_physical_admi
         pki.client_config(&client_spiffe),
     )
     .with_operation_timeout(Duration::from_secs(2));
-    let full_pool = PersistentSessionConsumerClient::try_from_stateless(
-        stateless.clone(),
-        config(PHYSICAL_CAP, 0, 1),
-    )
-    .expect("full persistent pool");
+    let mut holding_pools = Vec::with_capacity(PHYSICAL_CAP);
+    for _ in 0..PHYSICAL_CAP {
+        let pool =
+            PersistentSessionConsumerClient::try_from_stateless(stateless.clone(), config(1, 0, 1))
+                .expect("holding persistent pool");
+        assert_eq!(
+            pool.prewarm()
+                .await
+                .expect("sequential prewarm reaches one physical lane")
+                .ready_request_connections,
+            1
+        );
+        holding_pools.push(pool);
+    }
     let second_pool =
         PersistentSessionConsumerClient::try_from_stateless(stateless, config(1, 0, 1))
             .expect("second persistent pool");
 
-    assert_eq!(
-        full_pool
-            .prewarm()
-            .await
-            .expect("first pool reaches the fixed physical cap")
-            .ready_request_connections,
-        PHYSICAL_CAP
-    );
     assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
     assert_eq!(service.calls.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -716,7 +717,11 @@ async fn persistent_pools_derived_from_one_stateless_lineage_share_physical_admi
         "a second pool from one stateless clone lineage cannot exceed its fixed physical cap"
     );
     assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
-    full_pool.shutdown().await;
+    holding_pools
+        .pop()
+        .expect("one holding pool")
+        .shutdown()
+        .await;
     assert_eq!(
         second_pool
             .prewarm()
@@ -727,6 +732,9 @@ async fn persistent_pools_derived_from_one_stateless_lineage_share_physical_admi
     );
     assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP + 1);
 
+    for pool in holding_pools {
+        pool.shutdown().await;
+    }
     second_pool.shutdown().await;
     proxy_task.abort();
     handle.abort_and_wait().await;
