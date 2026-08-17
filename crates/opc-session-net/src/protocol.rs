@@ -1370,7 +1370,7 @@ pub(crate) fn validate_restore_scan_wire_payload_bytes(
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct WireBackendCapabilities {
+pub(crate) struct WireBackendCapabilities {
     atomic_compare_and_set: bool,
     monotonic_fencing_token: bool,
     per_key_ttl: bool,

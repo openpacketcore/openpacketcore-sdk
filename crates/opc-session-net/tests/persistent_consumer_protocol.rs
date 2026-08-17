@@ -18,14 +18,17 @@ use opc_session_net::{
     SESSION_QUORUM_CONSUMER_ALPN, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
-    BackendCapabilities, CompareAndSet, CompareAndSetResult, EncryptedSessionPayload,
-    FakeSessionBackend, FenceToken, Generation, OwnerId, RestoreScanCursor,
-    RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, RestoreScanScope,
-    SessionConsensusClusterId, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-    SessionConsensusIdentity, SessionConsumerBatchResult, SessionConsumerLeaseError,
+    checked_session_deadline, BackendCapabilities, CompareAndSet, CompareAndSetResult,
+    EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, OwnerId,
+    RestoreScanCursor, RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest,
+    RestoreScanScope, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
+    SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
+    SessionConsumerChange, SessionConsumerLeaseError, SessionConsumerLeaseGrant,
     SessionConsumerOperation, SessionConsumerRejection, SessionConsumerRequest,
-    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope, SessionKey,
-    SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType, StoredSessionRecord,
+    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    StateClass, StateType, StoreError, StoredSessionRecord,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_TTL,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
@@ -33,6 +36,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 
 const SHORT_ACTIVE_FRAME_IDLE: Duration = Duration::from_millis(100);
 const SHORT_ACTIVE_FRAME_WAIT: Duration = Duration::from_millis(500);
@@ -327,12 +331,14 @@ where
 enum CanonicalConsumerWireResponse {
     HelloAck(CanonicalConsumerHelloAck),
     Response(CanonicalConsumerCallResponse),
+    WatchEntry(CanonicalConsumerWatchEntry),
 }
 
 #[derive(Serialize)]
 struct CanonicalConsumerHelloAck {
     transport_revision: u16,
     scope: SessionConsumerScope,
+    request_frame_size: u32,
 }
 
 #[derive(Serialize)]
@@ -343,18 +349,33 @@ struct CanonicalConsumerCallResponse {
     response: SessionConsumerResponse,
 }
 
+#[derive(Serialize)]
+struct CanonicalConsumerWatchEntry {
+    correlation: Value,
+    entry: Result<SessionConsumerChange, SessionConsumerStoreError>,
+}
+
 fn canonical_response_payload(value: &Value) -> Vec<u8> {
     let response = match value["kind"].as_str() {
         Some("hello_ack") => CanonicalConsumerWireResponse::HelloAck(CanonicalConsumerHelloAck {
             transport_revision: serde_json::from_value(value["body"]["transport_revision"].clone())
                 .expect("HelloAck revision"),
             scope: serde_json::from_value(value["body"]["scope"].clone()).expect("HelloAck scope"),
+            request_frame_size: serde_json::from_value(value["body"]["request_frame_size"].clone())
+                .expect("HelloAck request frame size"),
         }),
         Some("response") => {
             CanonicalConsumerWireResponse::Response(CanonicalConsumerCallResponse {
                 correlation: value["body"]["correlation"].clone(),
                 response: serde_json::from_value(value["body"]["response"].clone())
                     .expect("typed consumer response"),
+            })
+        }
+        Some("watch_entry") => {
+            CanonicalConsumerWireResponse::WatchEntry(CanonicalConsumerWatchEntry {
+                correlation: value["body"]["correlation"].clone(),
+                entry: serde_json::from_value(value["body"]["entry"].clone())
+                    .expect("typed watch entry"),
             })
         }
         _ => panic!("unsupported test response kind"),
@@ -383,6 +404,7 @@ fn hello_ack(hello: &Value) -> Value {
         "body": {
             "transport_revision": SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
             "scope": hello["body"]["scope"].clone(),
+            "request_frame_size": MAX_NEGOTIATED_FRAME_SIZE,
         },
     })
 }
@@ -406,6 +428,26 @@ fn watch_opened_response(correlation: Value) -> Value {
             "correlation": correlation,
             "response": serde_json::to_value(SessionConsumerResponse::WatchOpened)
                 .expect("watch-opened response encodes"),
+        },
+    })
+}
+
+fn watch_entry_response(correlation: Value, sequence: u64) -> Value {
+    let key = semantic_key(b"partial-frame-watch-entry");
+    let change: SessionConsumerChange = serde_json::from_value(json!({
+        "sequence": sequence,
+        "changes": [{
+            "key": serde_json::to_value(key).expect("watch key encodes"),
+            "kind": "RecordWritten",
+        }],
+    }))
+    .expect("synthetic watch change decodes");
+    json!({
+        "kind": "watch_entry",
+        "body": {
+            "correlation": correlation,
+            "entry": serde_json::to_value(Ok::<_, SessionConsumerStoreError>(change))
+                .expect("watch entry encodes"),
         },
     })
 }
@@ -483,11 +525,32 @@ async fn assert_malicious_semantic_response_is_unconfirmed(
     });
     let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
     let request_id = request.request_id();
-    assert!(matches!(
-        client.execute(&request).await,
-        Err(PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id: returned })
-            if returned == request_id
-    ));
+    let effectful = match request.operation() {
+        SessionConsumerOperation::Capabilities
+        | SessionConsumerOperation::Get { .. }
+        | SessionConsumerOperation::PreflightRecordExpiry { .. }
+        | SessionConsumerOperation::ScanRestoreRecords { .. }
+        | SessionConsumerOperation::Watch { .. } => false,
+        SessionConsumerOperation::Batch { ops } => ops
+            .iter()
+            .any(|operation| !matches!(operation, SessionOp::Get { .. })),
+        _ => true,
+    };
+    let result = client.execute(&request).await;
+    if effectful {
+        assert!(matches!(
+            result,
+            Err(PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id: returned })
+                if returned == request_id
+        ));
+    } else {
+        assert_eq!(
+            result,
+            Err(PersistentSessionConsumerExecuteError::ReadUnavailable {
+                cause: SessionConsumerClientError::Protocol,
+            })
+        );
+    }
     let diagnostics = client.diagnostics().await;
     assert_eq!(
         diagnostics.successes, 0,
@@ -532,6 +595,77 @@ async fn hello_ack_revision_and_scope_mismatches_fail_closed_without_a_call() {
         assert_typed_protocol_error(client.capabilities().await, &server_spiffe, &client_spiffe);
         server.await.expect("malicious server");
     }
+}
+
+#[tokio::test]
+async fn negotiated_reduced_request_cap_rejects_a_large_mutation_before_transmission() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("reduced-request-cap-server");
+    let client_spiffe = spiffe("reduced-request-cap-client");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind reduced-cap listener");
+    let address = listener.local_addr().expect("listener address");
+    let authenticated = pki.server_config(&server_spiffe);
+    let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+    let reduced_cap = MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES + 4 * 1024;
+    let server = tokio::spawn(async move {
+        let mut tls = accept_consumer_tls(&listener, &authenticated, &expected_client).await;
+        let hello = read_value(&mut tls).await;
+        let mut ack = hello_ack(&hello);
+        ack["body"]["request_frame_size"] = json!(reduced_cap);
+        write_value(&mut tls, &ack).await;
+        match tokio::time::timeout(Duration::from_millis(250), tls.read_u8()).await {
+            Err(_) | Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("an over-cap mutation must not write even a frame-prefix byte"),
+        }
+    });
+
+    let key = semantic_key(b"reduced-request-cap-key");
+    let owner = OwnerId::new("reduced-request-cap-owner").expect("test owner");
+    let lease = FakeSessionBackend::new()
+        .acquire(&key, owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("fixture lease");
+    let payload = vec![0_u8; 1024 * 1024];
+    let ops = (0..5)
+        .map(|_| {
+            SessionOp::CompareAndSet(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: None,
+                new_record: StoredSessionRecord {
+                    payload: EncryptedSessionPayload::new(&payload),
+                    ..semantic_record(key.clone(), owner.clone(), lease.fence())
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let request = semantic_request(SessionConsumerOperation::Batch { ops }, 66);
+    let request_bytes = serde_json::to_vec(&request).expect("large request encodes");
+    assert!(
+        request_bytes.len() > reduced_cap,
+        "fixture crosses the authenticated server-advertised request cap"
+    );
+    assert!(
+        request_bytes.len() < MAX_NEGOTIATED_FRAME_SIZE,
+        "fixture remains valid at the revision-wide frame cap"
+    );
+
+    let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+    assert!(matches!(
+        client.execute(&request).await,
+        Err(PersistentSessionConsumerExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Protocol
+        })
+    ));
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.setup_successes, 1);
+    assert_eq!(diagnostics.failures, 1);
+    assert_eq!(diagnostics.not_transmitted, 1);
+    assert_eq!(diagnostics.outcome_unknown, 0);
+    client.shutdown().await;
+    server.await.expect("reduced-cap server");
 }
 
 #[tokio::test]
@@ -696,7 +830,10 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
             },
             4,
         ),
-        SessionConsumerResponse::AcquireLease(Ok(wrong_lease)),
+        SessionConsumerResponse::AcquireLease(Ok(SessionConsumerLeaseGrant::new(
+            wrong_lease.clone(),
+            wrong_lease.acquired_at(),
+        ))),
     )
     .await;
     assert_malicious_semantic_response_is_unconfirmed(
@@ -712,6 +849,33 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
         SessionConsumerResponse::AcquireLease(Err(SessionConsumerLeaseError::Expired)),
     )
     .await;
+    for (case, requested_ttl) in [
+        ("acquire-shorter-ttl", Duration::from_secs(29)),
+        ("acquire-longer-ttl", Duration::from_secs(31)),
+    ] {
+        let mut wrong_ttl = serde_json::to_value(&lease).expect("lease encodes");
+        wrong_ttl["expires_at"] = serde_json::to_value(
+            checked_session_deadline(lease.acquired_at(), requested_ttl).expect("fixture deadline"),
+        )
+        .expect("deadline encodes");
+        let wrong_ttl = serde_json::from_value(wrong_ttl).expect("wrong-TTL lease decodes");
+        assert_malicious_semantic_response_is_unconfirmed(
+            case,
+            semantic_request(
+                SessionConsumerOperation::AcquireLease {
+                    key: requested_key.clone(),
+                    owner: owner.clone(),
+                    ttl: Duration::from_secs(30),
+                },
+                24,
+            ),
+            SessionConsumerResponse::AcquireLease(Ok(SessionConsumerLeaseGrant::new(
+                wrong_ttl,
+                lease.acquired_at(),
+            ))),
+        )
+        .await;
+    }
 
     // These values decode successfully and are bound to the requested
     // acquire, so this proves the consumer reuses the wire-level guard
@@ -738,7 +902,10 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
                 },
                 40,
             ),
-            SessionConsumerResponse::AcquireLease(Ok(malformed)),
+            SessionConsumerResponse::AcquireLease(Ok(SessionConsumerLeaseGrant::new(
+                malformed,
+                lease.acquired_at(),
+            ))),
         )
         .await;
     }
@@ -758,7 +925,25 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
             },
             5,
         ),
-        SessionConsumerResponse::RenewLease(Ok(forged_renewal)),
+        SessionConsumerResponse::RenewLease(Ok(SessionConsumerLeaseGrant::new(
+            forged_renewal,
+            lease.acquired_at(),
+        ))),
+    )
+    .await;
+    assert_malicious_semantic_response_is_unconfirmed(
+        "renew-unchanged-lifetime",
+        semantic_request(
+            SessionConsumerOperation::RenewLease {
+                lease: lease.clone(),
+                ttl: Duration::from_secs(30),
+            },
+            25,
+        ),
+        SessionConsumerResponse::RenewLease(Ok(SessionConsumerLeaseGrant::new(
+            lease.clone(),
+            lease.acquired_at(),
+        ))),
     )
     .await;
     assert_malicious_semantic_response_is_unconfirmed(
@@ -798,7 +983,10 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
                 },
                 50,
             ),
-            SessionConsumerResponse::RenewLease(Ok(malformed)),
+            SessionConsumerResponse::RenewLease(Ok(SessionConsumerLeaseGrant::new(
+                malformed,
+                lease.acquired_at(),
+            ))),
         )
         .await;
     }
@@ -1024,15 +1212,59 @@ async fn local_persistent_validation_failures_are_typed_and_counted_once_before_
         })
     ));
 
+    let invalid_ttl = MAX_SESSION_TTL + Duration::from_nanos(1);
+    let key = semantic_key(b"local-invalid-single-ttl");
+    let owner = OwnerId::new("local-invalid-single-ttl-owner").expect("test owner");
+    let lease = FakeSessionBackend::new()
+        .acquire(&key, owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("fixture lease");
+    for (request_byte, operation) in [
+        (
+            63,
+            SessionConsumerOperation::RefreshTtl {
+                lease: lease.clone(),
+                ttl: invalid_ttl,
+            },
+        ),
+        (
+            64,
+            SessionConsumerOperation::AcquireLease {
+                key: key.clone(),
+                owner,
+                ttl: invalid_ttl,
+            },
+        ),
+        (
+            65,
+            SessionConsumerOperation::RenewLease {
+                lease,
+                ttl: invalid_ttl,
+            },
+        ),
+    ] {
+        let malformed_ttl = SessionConsumerRequest::new(
+            scope(2),
+            SessionConsumerRequestId::from_bytes([request_byte; 16]),
+            operation,
+        );
+        assert!(matches!(
+            client.execute(&malformed_ttl).await,
+            Err(PersistentSessionConsumerExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol
+            })
+        ));
+    }
+
     let diagnostics = client.diagnostics().await;
     assert_eq!(
         diagnostics.setup_attempts, 0,
         "local failures never connect"
     );
-    assert_eq!(diagnostics.failures, 3);
+    assert_eq!(diagnostics.failures, 6);
     assert_eq!(diagnostics.scope, 1);
-    assert_eq!(diagnostics.protocol, 2);
-    assert_eq!(diagnostics.not_transmitted, 3);
+    assert_eq!(diagnostics.protocol, 5);
+    assert_eq!(diagnostics.not_transmitted, 6);
     assert_eq!(diagnostics.outcome_unknown, 0);
     client.shutdown().await;
 }
@@ -1101,7 +1333,7 @@ async fn authenticated_cas_outcome_unavailable_is_typed_unknown_without_poisonin
     };
 
     assert!(matches!(
-        client.compare_and_set_with_id(request_id, op).await,
+        client.compare_and_set_with_id(request_id, &op).await,
         Err(SessionConsumerMutationError::OutcomeUnknown { request_id: returned })
             if returned == request_id
     ));
@@ -1112,10 +1344,116 @@ async fn authenticated_cas_outcome_unavailable_is_typed_unknown_without_poisonin
     let diagnostics = client.diagnostics().await;
     assert_eq!(diagnostics.setup_successes, 1);
     assert_eq!(diagnostics.reconnects, 0);
-    assert_eq!(diagnostics.successes, 2);
-    assert_eq!(diagnostics.outcome_unknown, 0);
+    assert_eq!(diagnostics.successes, 1);
+    assert_eq!(diagnostics.failures, 1);
+    assert_eq!(diagnostics.outcome_unknown, 1);
     client.shutdown().await;
     server.await.expect("malicious server");
+}
+
+#[tokio::test]
+async fn batch_ambiguity_and_all_read_unavailability_use_one_canonical_outcome_rule() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("batch-outcome-rule-server");
+    let client_spiffe = spiffe("batch-outcome-rule-client");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind batch outcome listener");
+    let address = listener.local_addr().expect("listener address");
+    let authenticated = pki.server_config(&server_spiffe);
+    let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+    let server = tokio::spawn(async move {
+        let (mut tls, mutation) =
+            accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+        assert_eq!(
+            mutation["body"]["request"]["operation"]["operation"],
+            "batch"
+        );
+        write_value(
+            &mut tls,
+            &json!({
+                "kind": "response",
+                "body": {
+                    "correlation": mutation["body"]["correlation"].clone(),
+                    "response": serde_json::to_value(SessionConsumerResponse::Batch(Ok(vec![
+                        SessionConsumerBatchResult::CompareAndSet(Err(
+                            SessionConsumerStoreError::OutcomeUnavailable,
+                        )),
+                    ])))
+                    .expect("nested ambiguity encodes"),
+                },
+            }),
+        )
+        .await;
+
+        let read = read_value(&mut tls).await;
+        assert_eq!(read["body"]["correlation"], json!(2));
+        write_value(
+            &mut tls,
+            &json!({
+                "kind": "response",
+                "body": {
+                    "correlation": read["body"]["correlation"].clone(),
+                    "response": serde_json::to_value(SessionConsumerResponse::Batch(Err(
+                        SessionConsumerStoreError::Unavailable,
+                    )))
+                    .expect("all-read unavailability encodes"),
+                },
+            }),
+        )
+        .await;
+
+        let capability = read_value(&mut tls).await;
+        assert_eq!(capability["body"]["correlation"], json!(3));
+        write_value(
+            &mut tls,
+            &capability_response(capability["body"]["correlation"].clone()),
+        )
+        .await;
+    });
+
+    let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+    let key = semantic_key(b"batch-outcome-rule-key");
+    let owner = OwnerId::new("batch-outcome-rule-owner").expect("test owner");
+    let lease = FakeSessionBackend::new()
+        .acquire(&key, owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("fixture lease");
+    let mutation_id = SessionConsumerRequestId::new();
+    let mutation = SessionOp::CompareAndSet(CompareAndSet {
+        key: key.clone(),
+        lease,
+        expected_generation: None,
+        new_record: semantic_record(key.clone(), owner, FenceToken::new(1)),
+    });
+    assert!(matches!(
+        client.batch_with_id(mutation_id, &[mutation]).await,
+        Err(SessionConsumerMutationError::OutcomeUnknown { request_id })
+            if request_id == mutation_id
+    ));
+
+    let read_id = SessionConsumerRequestId::new();
+    assert!(matches!(
+        client
+            .batch_with_id(read_id, &[SessionOp::Get { key }])
+            .await,
+        Err(SessionConsumerMutationError::Store(
+            StoreError::BackendUnavailable(_)
+        ))
+    ));
+    assert_eq!(
+        client.capabilities().await,
+        Ok(BackendCapabilities::all_enabled()),
+        "both canonical typed outcomes leave the authenticated lane reusable"
+    );
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.setup_successes, 1);
+    assert_eq!(diagnostics.reconnects, 0);
+    assert_eq!(diagnostics.successes, 1);
+    assert_eq!(diagnostics.failures, 2);
+    assert_eq!(diagnostics.outcome_unknown, 1);
+    client.shutdown().await;
+    server.await.expect("batch outcome server");
 }
 
 #[tokio::test]
@@ -1165,6 +1503,159 @@ async fn authenticated_outer_lease_unknown_is_counted_as_a_failure_not_a_success
     assert_eq!(diagnostics.not_transmitted, 0);
     client.shutdown().await;
     server.await.expect("malicious server");
+}
+
+#[tokio::test]
+async fn cancelled_initial_watch_accounts_the_exact_call_write_boundary_once() {
+    // Cancellation while resolve is pending is proven locally
+    // NotTransmitted and terminalizes both setup and outcome accounting.
+    let pki = TestPki::new();
+    let resolve_started = Arc::new(Notify::new());
+    let resolver: RemoteAddrResolver = {
+        let resolve_started = Arc::clone(&resolve_started);
+        Arc::new(move || {
+            let resolve_started = Arc::clone(&resolve_started);
+            Box::pin(async move {
+                resolve_started.notify_one();
+                std::future::pending::<std::io::Result<SocketAddr>>().await
+            })
+        })
+    };
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(
+            "127.0.0.1"
+                .parse::<std::net::IpAddr>()
+                .expect("loopback IP")
+                .into(),
+        ),
+        SpiffeId::new(&spiffe("watch-cancel-before-server")).expect("server SPIFFE"),
+        scope(1),
+        pki.client_config(&spiffe("watch-cancel-before-client")),
+    )
+    .with_operation_timeout(Duration::from_secs(1));
+    let before = PersistentSessionConsumerClient::from_stateless(stateless);
+    let before_task = {
+        let before = before.clone();
+        tokio::spawn(async move { before.open_watch(0).await })
+    };
+    resolve_started.notified().await;
+    before_task.abort();
+    assert!(before_task.await.is_err(), "caller cancellation wins");
+    let diagnostics = before.diagnostics().await;
+    assert_eq!(diagnostics.setup_attempts, 1);
+    assert_eq!(diagnostics.setup_successes, 0);
+    assert_eq!(diagnostics.setup_failures, 1);
+    assert_eq!(diagnostics.failures, 1);
+    assert_eq!(diagnostics.not_transmitted, 1);
+    assert_eq!(diagnostics.outcome_unknown, 0);
+    assert_eq!(diagnostics.watch_active, 0);
+    before.shutdown().await;
+
+    // Cancellation after the authenticated Watch Call was completely read by
+    // the peer is never advertised as NotTransmitted. Watch is read-only, so
+    // it also never creates mutation-style outcome uncertainty.
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("watch-cancel-after-server");
+    let client_spiffe = spiffe("watch-cancel-after-client");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind watch cancellation listener");
+    let address = listener.local_addr().expect("listener address");
+    let authenticated = pki.server_config(&server_spiffe);
+    let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+    let call_received = Arc::new(Notify::new());
+    let server = {
+        let call_received = Arc::clone(&call_received);
+        tokio::spawn(async move {
+            let (mut tls, call) =
+                accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+            assert_eq!(call["body"]["request"]["operation"]["operation"], "watch");
+            call_received.notify_one();
+            let mut byte = [0_u8; 1];
+            match tls.read(&mut byte).await {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                result => panic!("cancelled setup must close the authenticated lane: {result:?}"),
+            }
+        })
+    };
+    let after = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+    let after_task = {
+        let after = after.clone();
+        tokio::spawn(async move { after.open_watch(0).await })
+    };
+    call_received.notified().await;
+    after_task.abort();
+    assert!(after_task.await.is_err(), "caller cancellation wins");
+    server.await.expect("watch cancellation server");
+    let diagnostics = after.diagnostics().await;
+    assert_eq!(diagnostics.setup_attempts, 1);
+    assert_eq!(diagnostics.setup_successes, 0);
+    assert_eq!(diagnostics.setup_failures, 1);
+    assert_eq!(diagnostics.failures, 1);
+    assert_eq!(diagnostics.not_transmitted, 0);
+    assert_eq!(diagnostics.outcome_unknown, 0);
+    assert_eq!(diagnostics.watch_active, 0);
+    after.shutdown().await;
+}
+
+#[tokio::test]
+async fn pending_request_setup_separates_logical_inflight_from_physical_active() {
+    let pki = TestPki::new();
+    let resolve_started = Arc::new(Notify::new());
+    let resolver: RemoteAddrResolver = {
+        let resolve_started = Arc::clone(&resolve_started);
+        Arc::new(move || {
+            let resolve_started = Arc::clone(&resolve_started);
+            Box::pin(async move {
+                resolve_started.notify_one();
+                std::future::pending::<std::io::Result<SocketAddr>>().await
+            })
+        })
+    };
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(
+            "127.0.0.1"
+                .parse::<std::net::IpAddr>()
+                .expect("loopback IP")
+                .into(),
+        ),
+        SpiffeId::new(&spiffe("physical-active-server")).expect("server SPIFFE"),
+        scope(1),
+        pki.client_config(&spiffe("physical-active-client")),
+    )
+    .with_operation_timeout(Duration::from_secs(1));
+    let client = PersistentSessionConsumerClient::from_stateless(stateless);
+    let request = {
+        let client = client.clone();
+        tokio::spawn(async move { client.capabilities().await })
+    };
+    resolve_started.notified().await;
+
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.inflight, 1, "one logical call is admitted");
+    assert_eq!(
+        diagnostics.active, 0,
+        "DNS setup has not published an authenticated physical lane"
+    );
+    assert_eq!(diagnostics.max_active, 0);
+    assert_eq!(diagnostics.setup_attempts, 1);
+    assert_eq!(diagnostics.setup_successes, 0);
+    assert_eq!(diagnostics.setup_failures, 0);
+
+    request.abort();
+    assert!(request.await.is_err(), "caller cancellation wins");
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.inflight, 0);
+    assert_eq!(diagnostics.active, 0);
+    assert_eq!(diagnostics.setup_attempts, 1);
+    assert_eq!(diagnostics.setup_successes, 0);
+    assert_eq!(diagnostics.setup_failures, 1);
+    assert_eq!(diagnostics.failures, 1);
+    assert_eq!(diagnostics.not_transmitted, 1);
+    client.shutdown().await;
 }
 
 #[tokio::test]
@@ -1507,6 +1998,143 @@ async fn partial_active_watch_frames_expire_and_release_the_isolated_slot() {
         drop(watch);
         client.shutdown().await;
         server.await.expect("malicious server");
+    }
+}
+
+#[tokio::test]
+#[allow(deprecated)] // Test-only SO_LINGER(0) is the deterministic TCP-reset adversary.
+async fn partial_watch_fin_and_reset_are_terminal_on_active_and_replacement_lanes() {
+    for boundary in ["prefix", "payload"] {
+        for loss in ["fin", "reset"] {
+            let pki = TestPki::new();
+            let server_spiffe = spiffe(&format!("partial-{boundary}-{loss}-active-server"));
+            let client_spiffe = spiffe(&format!("partial-{boundary}-{loss}-active-client"));
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind active truncation listener");
+            let address = listener.local_addr().expect("listener address");
+            let authenticated = pki.server_config(&server_spiffe);
+            let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+            let server = tokio::spawn(async move {
+                let (mut tls, call) =
+                    accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+                write_value(
+                    &mut tls,
+                    &watch_opened_response(call["body"]["correlation"].clone()),
+                )
+                .await;
+                write_partial_frame(&mut tls, boundary).await;
+                if loss == "reset" {
+                    tls.get_ref()
+                        .0
+                        .set_linger(Some(Duration::ZERO))
+                        .expect("force TCP reset after authenticated truncation");
+                }
+                drop(tls);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                        .await
+                        .is_err(),
+                    "a partial authenticated frame never opens a replacement Watch"
+                );
+            });
+            let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+            let mut watch = client.open_watch(0).await.expect("WatchOpened is admitted");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), watch.next())
+                    .await
+                    .expect("partial loss terminates promptly")
+                    .expect("partial loss emits one terminal result")
+                    .is_err(),
+                "truncation never becomes a valid watch entry"
+            );
+            assert!(
+                watch.next().await.is_none(),
+                "terminal result is emitted once"
+            );
+            assert_eq!(client.diagnostics().await.reconnects, 0);
+            client.shutdown().await;
+            server.await.expect("active truncation server");
+
+            let pki = TestPki::new();
+            let server_spiffe = spiffe(&format!("partial-{boundary}-{loss}-replacement-server"));
+            let client_spiffe = spiffe(&format!("partial-{boundary}-{loss}-replacement-client"));
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind replacement truncation listener");
+            let address = listener.local_addr().expect("listener address");
+            let authenticated = pki.server_config(&server_spiffe);
+            let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+            let server = tokio::spawn(async move {
+                let (mut first_tls, first) =
+                    accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+                let first_correlation = first["body"]["correlation"].clone();
+                write_value(
+                    &mut first_tls,
+                    &watch_opened_response(first_correlation.clone()),
+                )
+                .await;
+                write_value(&mut first_tls, &watch_entry_response(first_correlation, 1)).await;
+                drop(first_tls);
+
+                let (mut replacement_tls, replacement) =
+                    accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+                assert_eq!(
+                    replacement["body"]["request"]["operation"]["start_sequence"],
+                    json!(2),
+                    "replacement starts after the one caller-visible queued item"
+                );
+                write_value(
+                    &mut replacement_tls,
+                    &watch_opened_response(replacement["body"]["correlation"].clone()),
+                )
+                .await;
+                write_partial_frame(&mut replacement_tls, boundary).await;
+                if loss == "reset" {
+                    replacement_tls
+                        .get_ref()
+                        .0
+                        .set_linger(Some(Duration::ZERO))
+                        .expect("force replacement TCP reset after truncation");
+                }
+                drop(replacement_tls);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                        .await
+                        .is_err(),
+                    "a truncated replacement cannot begin a third Watch"
+                );
+            });
+            let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+            let mut watch = client.open_watch(1).await.expect("initial WatchOpened");
+            assert_eq!(
+                watch
+                    .next()
+                    .await
+                    .expect("first queued item")
+                    .expect("valid first item")
+                    .sequence(),
+                1
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), watch.next())
+                    .await
+                    .expect("replacement truncation terminates promptly")
+                    .expect("replacement truncation emits one terminal result")
+                    .is_err()
+            );
+            assert!(
+                watch.next().await.is_none(),
+                "terminal result is emitted once"
+            );
+            assert_eq!(
+                client.diagnostics().await.reconnects,
+                1,
+                "only the clean inter-frame loss opens a replacement"
+            );
+            client.shutdown().await;
+            server.await.expect("replacement truncation server");
+        }
     }
 }
 

@@ -44,13 +44,16 @@ use opc_session_testkit::qualification::{
     QualificationConnectionLifecycleConfig, QualificationConnectionLifecycleMetrics,
     QualificationConsensusRpcAvailability, QualificationMember, QualificationNodeCommand,
     QualificationNodeCommandKind, QualificationNodeConfig, QualificationNodeErrorCode,
-    QualificationNodeReply, QualificationPeerRouting, QualificationProjectedMtlsConfig,
-    QualificationProjectedSvidAvailability, QualificationProjectedSvidReason,
-    QualificationProjectedSvidStatus, QualificationReadinessCode,
+    QualificationNodeReply, QualificationPeerRouting, QualificationPersistentConsumerExecutionV7,
+    QualificationPersistentConsumerObservationsV7, QualificationPersistentConsumerPrivacyV7,
+    QualificationPersistentConsumerTopologyV7, QualificationPersistentConsumerWarmLatencyV7,
+    QualificationProjectedMtlsConfig, QualificationProjectedSvidAvailability,
+    QualificationProjectedSvidReason, QualificationProjectedSvidStatus, QualificationReadinessCode,
     QualificationSecurityMetricsSnapshot, QualificationTlsMaterialAvailability,
     QualificationTlsMaterialReason, QualificationTlsMaterialStatus, QualificationTrafficErrorClass,
     QualificationTrafficFailureCode, QualificationTrafficFailureStage, QualificationTrafficState,
-    QualificationTrafficStatus, QualificationTransportConfig, SessionHaQualificationProfileV7,
+    QualificationTrafficStatus, QualificationTransportConfig,
+    SessionHaPersistentConsumerEvidenceV7, SessionHaQualificationProfileV7,
     SessionMtlsCandidateCampaign, SessionMtlsCandidateEvidenceV2,
     SessionMtlsCandidateSourceTreeStatus, QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS,
     QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER, QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS,
@@ -58,6 +61,9 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
     QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE,
     QUALIFICATION_NODE_SCHEMA_VERSION, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+    QUALIFICATION_PERSISTENT_CONSUMER_MAX_P999_MICROS_V7,
+    QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7,
+    QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7,
     QUALIFICATION_RESOLVER_BACKOFF_LOWER_BOUNDS_MILLIS, QUALIFICATION_RESOLVER_PROOF_MILLIS,
     QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE, QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE,
     QUALIFICATION_RESOURCE_SAMPLE_MILLIS, QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB,
@@ -8198,7 +8204,7 @@ impl QualificationConsumerClient {
     ) -> Result<LeaseGuard, SessionConsumerLeaseMutationError> {
         match self {
             Self::Stateless(client) => client.acquire_with_id(request_id, key, owner, ttl).await,
-            Self::Persistent(client) => client.acquire_with_id(request_id, key, owner, ttl).await,
+            Self::Persistent(client) => client.acquire_with_id(request_id, &key, &owner, ttl).await,
         }
     }
 
@@ -8206,6 +8212,16 @@ impl QualificationConsumerClient {
         match self {
             Self::Stateless(_) => Ok(true),
             Self::Persistent(client) => Ok(client.prewarm().await?.ready),
+        }
+    }
+
+    async fn persistent_setup_and_reuse(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Stateless(_) => None,
+            Self::Persistent(client) => {
+                let diagnostics = client.diagnostics().await;
+                Some((diagnostics.setup_successes, diagnostics.reused))
+            }
         }
     }
 
@@ -8218,7 +8234,16 @@ impl QualificationConsumerClient {
     }
 }
 
-fn run_consumer_multiprocess_qualification(member_count: usize, mode: ConsumerQualificationMode) {
+struct PersistentConsumerRunMeasurements {
+    raw_samples_micros: Vec<u64>,
+    authenticated_setup_successes: u64,
+    warm_reused_calls: u64,
+}
+
+fn run_consumer_multiprocess_qualification(
+    member_count: usize,
+    mode: ConsumerQualificationMode,
+) -> Option<PersistentConsumerRunMeasurements> {
     let mut fleet = Fleet::start(member_count);
     let consumer_identities = (0..12).map(stateless_consumer_identity).collect::<Vec<_>>();
     let mut endpoints = Vec::with_capacity(member_count);
@@ -8295,6 +8320,70 @@ fn run_consumer_multiprocess_qualification(member_count: usize, mode: ConsumerQu
         .into_iter()
         .all(|result| result.is_ok())
     }));
+    let persistent_measurements = if matches!(mode, ConsumerQualificationMode::Persistent) {
+        let before = runtime.block_on(async {
+            futures_util::future::join_all(
+                clients
+                    .iter()
+                    .map(QualificationConsumerClient::persistent_setup_and_reuse),
+            )
+            .await
+        });
+        let setup_successes = before
+            .iter()
+            .flatten()
+            .map(|(setup, _)| *setup)
+            .sum::<u64>();
+        let reused_before = before
+            .iter()
+            .flatten()
+            .map(|(_, reused)| *reused)
+            .sum::<u64>();
+        assert!(
+            setup_successes >= 48,
+            "twelve persistent clients prewarm four authenticated lanes each"
+        );
+
+        let mut raw_samples_micros =
+            Vec::with_capacity(QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7);
+        for sample in 0..QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7 {
+            let started = Instant::now();
+            runtime
+                .block_on(clients[sample % clients.len()].capabilities())
+                .expect("warm persistent capability call");
+            raw_samples_micros.push(
+                u64::try_from(started.elapsed().as_micros())
+                    .expect("bounded warm-call duration fits u64"),
+            );
+        }
+        let after = runtime.block_on(async {
+            futures_util::future::join_all(
+                clients
+                    .iter()
+                    .map(QualificationConsumerClient::persistent_setup_and_reuse),
+            )
+            .await
+        });
+        let reused_after = after
+            .iter()
+            .flatten()
+            .map(|(_, reused)| *reused)
+            .sum::<u64>();
+        let warm_reused_calls = reused_after
+            .checked_sub(reused_before)
+            .expect("persistent reuse counter is monotonic");
+        assert_eq!(
+            warm_reused_calls, QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7 as u64,
+            "every measured warm call reuses authenticated capacity"
+        );
+        Some(PersistentConsumerRunMeasurements {
+            raw_samples_micros,
+            authenticated_setup_successes: setup_successes,
+            warm_reused_calls,
+        })
+    } else {
+        None
+    };
     for client in &clients {
         let diagnostic = format!("{client:?}");
         for forbidden in [
@@ -8577,53 +8666,213 @@ fn run_consumer_multiprocess_qualification(member_count: usize, mode: ConsumerQu
     }
     drop(identity_sources);
     fleet.shutdown();
+    persistent_measurements
 }
 
 fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
-    run_consumer_multiprocess_qualification(member_count, ConsumerQualificationMode::Stateless);
+    assert!(run_consumer_multiprocess_qualification(
+        member_count,
+        ConsumerQualificationMode::Stateless
+    )
+    .is_none());
 }
 
 fn assert_v7_persistent_consumer_evidence_binding() {
+    const PROFILE_SHA256: &str =
+        "sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592";
     assert_eq!(
         format!(
             "{:x}",
             Sha256::digest(SESSION_HA_PROFILE_V7_JSON.as_bytes())
         ),
-        "f3ff570a6d9f828ea31edd92c483a87774510210545d64af62336d6f9fcb35a1",
+        PROFILE_SHA256.trim_start_matches("sha256:"),
         "persistent multiprocess coverage must use the exact embedded v7 profile"
     );
 
     let evidence_schema: serde_json::Value =
         serde_json::from_str(SESSION_HA_EVIDENCE_V7_SCHEMA_JSON)
             .expect("v7 persistent-consumer evidence schema");
-    let binding =
-        &evidence_schema["properties"]["execution"]["properties"]["persistent_consumer_binding"];
     assert_eq!(
         evidence_schema["properties"]["execution"]["properties"]["profile_sha256"]["const"],
-        "sha256:f3ff570a6d9f828ea31edd92c483a87774510210545d64af62336d6f9fcb35a1"
-    );
-    assert_eq!(binding["additionalProperties"], false);
-    assert_eq!(
-        binding["required"],
-        serde_json::json!([
-            "client_type",
-            "consumer_profile_path",
-            "transport_revision",
-            "authenticated_route"
-        ])
+        PROFILE_SHA256
     );
     assert_eq!(
-        binding["properties"]["client_type"]["const"],
+        evidence_schema["properties"]["execution"]["properties"]["client_type"]["const"],
         "PersistentSessionConsumerClient"
     );
     assert_eq!(
-        binding["properties"]["consumer_profile_path"]["const"],
+        evidence_schema["properties"]["execution"]["properties"]["consumer_profile_path"]["const"],
         "protocol.persistent_consumer"
     );
-    assert_eq!(binding["properties"]["transport_revision"]["const"], 2);
     assert_eq!(
-        binding["properties"]["authenticated_route"]["const"],
-        "authenticated-mtls-persistent"
+        evidence_schema["properties"]["warm_latency"]["properties"]["raw_samples_micros"]
+            ["minItems"],
+        QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7
+    );
+}
+
+fn exact_git_value(arguments: &[&str]) -> String {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new("git")
+        .current_dir(workspace)
+        .args(arguments)
+        .output()
+        .expect("inspect exact qualification source");
+    assert!(output.status.success(), "git source inspection succeeds");
+    let value = String::from_utf8(output.stdout).expect("git output is UTF-8");
+    value.trim().to_owned()
+}
+
+fn nearest_rank_micros(samples: &[u64], numerator: usize, denominator: usize) -> u64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let index = samples
+        .len()
+        .saturating_mul(numerator)
+        .div_ceil(denominator)
+        .saturating_sub(1);
+    sorted[index]
+}
+
+fn structural_evidence_schema(mut schema: serde_json::Value) -> serde_json::Value {
+    match &mut schema {
+        serde_json::Value::Object(object) => {
+            for unsupported in ["maxItems", "maxLength", "maximum", "pattern", "uniqueItems"] {
+                object.remove(unsupported);
+            }
+            for value in object.values_mut() {
+                *value = structural_evidence_schema(value.take());
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                *value = structural_evidence_schema(value.take());
+            }
+        }
+        _ => {}
+    }
+    schema
+}
+
+fn emit_v7_persistent_consumer_evidence(
+    member_count: usize,
+    measurements: PersistentConsumerRunMeasurements,
+) {
+    const PROFILE_SHA256: &str =
+        "sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592";
+    let source_revision = exact_git_value(&["rev-parse", "HEAD^{commit}"]);
+    let source_tree = exact_git_value(&["rev-parse", "HEAD^{tree}"]);
+    let source_tree_status =
+        if exact_git_value(&["status", "--porcelain", "--untracked-files=no"]).is_empty() {
+            "clean"
+        } else {
+            "dirty_unqualified"
+        };
+    let p99_micros = nearest_rank_micros(&measurements.raw_samples_micros, 99, 100);
+    let p999_micros = nearest_rank_micros(&measurements.raw_samples_micros, 999, 1_000);
+    assert!(p99_micros <= QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7);
+    assert!(p999_micros <= QUALIFICATION_PERSISTENT_CONSUMER_MAX_P999_MICROS_V7);
+
+    let transcript = serde_json::json!({
+        "domain": "opc-session-ha/persistent-consumer-run/v1",
+        "source_revision": source_revision,
+        "source_tree": source_tree,
+        "members": member_count,
+        "authenticated_setup_successes": measurements.authenticated_setup_successes,
+        "warm_reused_calls": measurements.warm_reused_calls,
+        "raw_samples_micros": measurements.raw_samples_micros,
+        "exact_request_id_recovery": true,
+        "leader_loss_recovery": true,
+        "voter_loss_recovery": true,
+        "outcome_unknown_recovery": true
+    });
+    let transcript_sha256 = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&transcript).expect("bounded transcript encodes"))
+    );
+    let topology_coverage = if member_count == 3 {
+        "three_voter_latency"
+    } else {
+        "five_voter_composition"
+    };
+    let evidence = SessionHaPersistentConsumerEvidenceV7 {
+        schema_version: "opc-session-ha-evidence/v7".into(),
+        profile_id: "opc-session-openraft-ha/v7".into(),
+        experimental: true,
+        qualification_complete: false,
+        source_revision,
+        source_tree,
+        source_tree_status: source_tree_status.into(),
+        execution: QualificationPersistentConsumerExecutionV7 {
+            profile_sha256: PROFILE_SHA256.into(),
+            transcript_digest_domain: "opc-session-ha/persistent-consumer-run/v1".into(),
+            transcript_sha256,
+            client_type: "PersistentSessionConsumerClient".into(),
+            consumer_profile_path: "protocol.persistent_consumer".into(),
+            transport_revision: 2,
+            authenticated_route: "authenticated-mtls-persistent".into(),
+        },
+        topology: QualificationPersistentConsumerTopologyV7 {
+            members: member_count,
+            independent_processes: true,
+            transport_mode: "authenticated-mtls-persistent".into(),
+            configured_clients: 12,
+            prewarmed_clients: 12,
+        },
+        observations: QualificationPersistentConsumerObservationsV7 {
+            authenticated_setup_successes: measurements.authenticated_setup_successes,
+            warm_reused_calls: measurements.warm_reused_calls,
+            exact_request_id_recovery: true,
+            leader_loss_recovery: true,
+            voter_loss_recovery: true,
+            outcome_unknown_recovery: true,
+        },
+        warm_latency: QualificationPersistentConsumerWarmLatencyV7 {
+            methodology: "sequential-capabilities-round-robin-after-prewarm".into(),
+            clock: "std::time::Instant".into(),
+            sample_count: measurements.raw_samples_micros.len(),
+            raw_samples_micros: measurements.raw_samples_micros,
+            p99_micros,
+            p999_micros,
+            claim_boundary: "sdk-loopback-real-mtls-synthetic-not-epdg-production-slo".into(),
+        },
+        privacy: QualificationPersistentConsumerPrivacyV7 {
+            fixed_labels_only: true,
+            identifying_values_recorded: false,
+        },
+        coverage: [
+            "persistent_prewarm",
+            "warm_connection_reuse",
+            "real_mtls",
+            "multi_process",
+            "leader_loss",
+            "voter_loss",
+            topology_coverage,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        remaining_acceptance: [
+            "downstream_epdg_production_slo",
+            "deployed_kubernetes_platform_matrix",
+            "resource_soak",
+            "signed_release_bundle",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    };
+    evidence
+        .validate(PROFILE_SHA256)
+        .expect("typed persistent-consumer evidence validates");
+    let schema: serde_json::Value = serde_json::from_str(SESSION_HA_EVIDENCE_V7_SCHEMA_JSON)
+        .expect("v7 evidence schema parses");
+    let value = serde_json::to_value(&evidence).expect("v7 evidence encodes");
+    opc_schema_validate::validate(&structural_evidence_schema(schema), &value)
+        .expect("emitted persistent-consumer evidence satisfies the closed v7 schema");
+    println!(
+        "V7_PERSISTENT_CONSUMER_EVIDENCE {}",
+        serde_json::to_string(&evidence).expect("bounded evidence encodes")
     );
 }
 
@@ -8634,7 +8883,18 @@ fn run_persistent_consumer_multiprocess_qualification(member_count: usize) {
     assert_eq!(profile.schema_version, "opc-session-ha-profile/v7");
     assert_eq!(profile.profile_id, "opc-session-openraft-ha/v7");
     assert_eq!(profile.protocol.persistent_consumer.transport_revision, 2);
-    run_consumer_multiprocess_qualification(member_count, ConsumerQualificationMode::Persistent);
+    assert_eq!(
+        profile
+            .persistent_consumer_thresholds
+            .minimum_warm_call_samples,
+        QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7
+    );
+    let measurements = run_consumer_multiprocess_qualification(
+        member_count,
+        ConsumerQualificationMode::Persistent,
+    )
+    .expect("persistent run emits bounded measurements");
+    emit_v7_persistent_consumer_evidence(member_count, measurements);
 }
 
 #[test]

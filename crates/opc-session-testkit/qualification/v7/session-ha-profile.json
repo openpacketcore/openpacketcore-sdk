@@ -200,6 +200,12 @@
     "max_leader_restart_catchup_millis": 120000,
     "minimum_soak_seconds": 86400
   },
+  "persistent_consumer_thresholds": {
+    "minimum_warm_call_samples": 1000,
+    "max_warm_call_p99_micros": 25000,
+    "max_warm_call_p999_micros": 100000,
+    "real_mtls_latency_members": 3
+  },
   "evidence": {
     "schedule_schema": "session-ha-schedule.schema.json",
     "history_schema": "session-ha-history.schema.json",

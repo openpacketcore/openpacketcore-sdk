@@ -9,19 +9,13 @@
     "experimental",
     "qualification_complete",
     "source_revision",
+    "source_tree",
     "source_tree_status",
-    "artifact",
-    "environment",
     "execution",
     "topology",
-    "payload_protection",
-    "faults",
-    "leader_transition",
-    "history",
-    "checker",
-    "logs",
-    "metrics",
-    "results",
+    "observations",
+    "warm_latency",
+    "privacy",
     "coverage",
     "remaining_acceptance"
   ],
@@ -30,106 +24,38 @@
     "profile_id": { "const": "opc-session-openraft-ha/v7" },
     "experimental": { "const": true },
     "qualification_complete": { "const": false },
-    "source_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "source_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "source_tree": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
     "source_tree_status": { "enum": ["clean", "dirty_unqualified"] },
-    "artifact": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["name", "version", "sha256", "cargo_profile", "foundation_feature_overrides"],
-      "properties": {
-        "name": { "const": "opc-session-quorum-node" },
-        "version": { "type": "string", "minLength": 1, "maxLength": 32 },
-        "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-        "cargo_profile": { "enum": ["debug", "release"] },
-        "foundation_feature_overrides": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 1,
-          "uniqueItems": true,
-          "items": { "const": "opc-session-net/insecure-test" }
-        }
-      }
-    },
-    "environment": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "rustc_version",
-        "cargo_version",
-        "target",
-        "os",
-        "kernel",
-        "container_status",
-        "container_image_digest"
-      ],
-      "properties": {
-        "rustc_version": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "cargo_version": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "target": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "os": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "kernel": { "type": "string", "minLength": 1, "maxLength": 256 },
-        "container_status": { "enum": ["collected", "not_collected_in_foundation"] },
-        "container_image_digest": {
-          "oneOf": [
-            { "const": null },
-            { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
-          ]
-        }
-      },
-      "oneOf": [
-        {
-          "properties": {
-            "container_status": { "const": "collected" },
-            "container_image_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
-          }
-        },
-        {
-          "properties": {
-            "container_status": { "const": "not_collected_in_foundation" },
-            "container_image_digest": { "const": null }
-          }
-        }
-      ]
-    },
     "execution": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "random_seed",
-        "started_at_utc",
-        "completed_at_utc",
         "profile_sha256",
-        "persistent_consumer_binding",
-        "configuration_digest_domain",
-        "configuration_sha256",
-        "fault_schedule_digest_domain",
-        "fault_schedule_sha256"
+        "transcript_digest_domain",
+        "transcript_sha256",
+        "client_type",
+        "consumer_profile_path",
+        "transport_revision",
+        "authenticated_route"
       ],
       "properties": {
-        "random_seed": { "type": "integer", "minimum": 0 },
-        "started_at_utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
-        "completed_at_utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
-        "profile_sha256": { "const": "sha256:f3ff570a6d9f828ea31edd92c483a87774510210545d64af62336d6f9fcb35a1" },
-        "persistent_consumer_binding": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "client_type",
-            "consumer_profile_path",
-            "transport_revision",
-            "authenticated_route"
-          ],
-          "properties": {
-            "client_type": { "const": "PersistentSessionConsumerClient" },
-            "consumer_profile_path": { "const": "protocol.persistent_consumer" },
-            "transport_revision": { "const": 2 },
-            "authenticated_route": { "const": "authenticated-mtls-persistent" }
-          }
+        "profile_sha256": { "const": "sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592" },
+        "transcript_digest_domain": { "const": "opc-session-ha/persistent-consumer-run/v1" },
+        "transcript_sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
         },
-        "configuration_digest_domain": { "const": "opc-session-ha/configuration-set/v1" },
-        "configuration_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-        "fault_schedule_digest_domain": { "const": "opc-session-ha/fault-schedule-set/v1" },
-        "fault_schedule_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        "client_type": { "const": "PersistentSessionConsumerClient" },
+        "consumer_profile_path": { "const": "protocol.persistent_consumer" },
+        "transport_revision": { "const": 2 },
+        "authenticated_route": { "const": "authenticated-mtls-persistent" }
       }
     },
     "topology": {
@@ -138,238 +64,103 @@
       "required": [
         "members",
         "independent_processes",
-        "storage_identity_digest_domain",
-        "storage_identity_sha256",
         "transport_mode",
-        "counts_for_tls_rotation"
+        "configured_clients",
+        "prewarmed_clients"
       ],
       "properties": {
-        "members": { "oneOf": [{ "const": 3 }, { "const": 5 }] },
+        "members": { "enum": [3, 5] },
         "independent_processes": { "const": true },
-        "storage_identity_digest_domain": { "const": "opc-session-ha/storage-identity/v1" },
-        "storage_identity_sha256": {
-          "type": "array",
-          "minItems": 3,
-          "maxItems": 5,
-          "uniqueItems": true,
-          "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
-        },
-        "transport_mode": { "const": "loopback-plaintext-test-only" },
-        "counts_for_tls_rotation": { "const": false }
+        "transport_mode": { "const": "authenticated-mtls-persistent" },
+        "configured_clients": { "const": 12 },
+        "prewarmed_clients": { "const": 12 }
       }
     },
-    "payload_protection": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["mode", "synthetic_data_only", "counts_for_production_encryption"],
-      "properties": {
-        "mode": { "const": "fixed-memory-provider-synthetic-wrapper-only" },
-        "synthetic_data_only": { "const": true },
-        "counts_for_production_encryption": { "const": false }
-      }
-    },
-    "faults": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 128,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "kind",
-          "target_process",
-          "target_role",
-          "observed_node_id",
-          "observed_leader_id",
-          "observed_term",
-          "bounded"
-        ],
-        "properties": {
-          "kind": { "enum": ["process_stop", "process_restart"] },
-          "target_process": { "type": "string", "pattern": "^node-[0-4]$" },
-          "target_role": { "enum": ["follower", "leader"] },
-          "observed_node_id": { "type": "integer", "minimum": 1 },
-          "observed_leader_id": { "type": "integer", "minimum": 1 },
-          "observed_term": { "type": "integer", "minimum": 1 },
-          "bounded": { "const": true }
-        }
-      }
-    },
-    "leader_transition": {
+    "observations": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "old_leader_process",
-        "old_leader_node_id",
-        "old_term",
-        "new_leader_process",
-        "new_leader_node_id",
-        "new_term",
-        "failover_millis",
-        "old_leader_restart_catchup_millis"
+        "authenticated_setup_successes",
+        "warm_reused_calls",
+        "exact_request_id_recovery",
+        "leader_loss_recovery",
+        "voter_loss_recovery",
+        "outcome_unknown_recovery"
       ],
       "properties": {
-        "old_leader_process": { "type": "string", "pattern": "^node-[0-4]$" },
-        "old_leader_node_id": { "type": "integer", "minimum": 1 },
-        "old_term": { "type": "integer", "minimum": 1 },
-        "new_leader_process": { "type": "string", "pattern": "^node-[0-4]$" },
-        "new_leader_node_id": { "type": "integer", "minimum": 1 },
-        "new_term": { "type": "integer", "minimum": 2 },
-        "failover_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
-        "old_leader_restart_catchup_millis": { "type": "integer", "minimum": 0, "maximum": 120000 }
+        "authenticated_setup_successes": { "type": "integer", "minimum": 48 },
+        "warm_reused_calls": { "type": "integer", "minimum": 1000 },
+        "exact_request_id_recovery": { "const": true },
+        "leader_loss_recovery": { "const": true },
+        "voter_loss_recovery": { "const": true },
+        "outcome_unknown_recovery": { "const": true }
       }
     },
-    "history": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["schema_version", "schedule_schema_version", "schedule_sha256", "sha256"],
-      "properties": {
-        "schema_version": { "const": "opc-session-ha-history/v1" },
-        "schedule_schema_version": { "const": "opc-session-ha-schedule/v1" },
-        "schedule_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-        "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
-      }
-    },
-    "checker": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["name", "version", "sha256", "exit_code", "status", "output_sha256"],
-      "properties": {
-        "name": { "const": "check-session-ha-history.py" },
-        "version": { "const": "1" },
-        "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-        "exit_code": { "const": 0 },
-        "status": { "const": "pass" },
-        "output_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
-      }
-    },
-    "logs": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["collection_status", "digests"],
-      "properties": {
-        "collection_status": { "enum": ["collected", "not_collected_in_foundation"] },
-        "digests": {
-          "type": "array",
-          "maxItems": 64,
-          "uniqueItems": true,
-          "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
-        }
-      },
-      "oneOf": [
-        {
-          "properties": {
-            "collection_status": { "const": "collected" },
-            "digests": { "minItems": 1 }
-          }
-        },
-        {
-          "properties": {
-            "collection_status": { "const": "not_collected_in_foundation" },
-            "digests": { "maxItems": 0 }
-          }
-        }
-      ]
-    },
-    "metrics": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["collection_status", "digests"],
-      "properties": {
-        "collection_status": { "enum": ["collected", "not_collected_in_foundation"] },
-        "digests": {
-          "type": "array",
-          "maxItems": 64,
-          "uniqueItems": true,
-          "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
-        }
-      },
-      "oneOf": [
-        {
-          "properties": {
-            "collection_status": { "const": "collected" },
-            "digests": { "minItems": 1 }
-          }
-        },
-        {
-          "properties": {
-            "collection_status": { "const": "not_collected_in_foundation" },
-            "digests": { "maxItems": 0 }
-          }
-        }
-      ]
-    },
-    "results": {
+    "warm_latency": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "startup_millis",
-        "single_member_stop_service_continuity_millis",
-        "restart_catchup_millis",
-        "leader_failover_millis",
-        "leader_restart_catchup_millis",
-        "leader_outage_store_read_succeeded",
-        "acknowledged_write_loss",
-        "stale_owner_mutation_successes",
-        "history_checker_violations"
+        "methodology",
+        "clock",
+        "sample_count",
+        "raw_samples_micros",
+        "p99_micros",
+        "p999_micros",
+        "claim_boundary"
       ],
       "properties": {
-        "startup_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
-        "single_member_stop_service_continuity_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
-        "restart_catchup_millis": { "type": "integer", "minimum": 0, "maximum": 120000 },
-        "leader_failover_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
-        "leader_restart_catchup_millis": { "type": "integer", "minimum": 0, "maximum": 120000 },
-        "leader_outage_store_read_succeeded": { "const": true },
-        "acknowledged_write_loss": { "const": 0 },
-        "stale_owner_mutation_successes": { "const": 0 },
-        "history_checker_violations": { "const": 0 }
+        "methodology": { "const": "sequential-capabilities-round-robin-after-prewarm" },
+        "clock": { "const": "std::time::Instant" },
+        "sample_count": { "type": "integer", "minimum": 1000, "maximum": 2000 },
+        "raw_samples_micros": {
+          "type": "array",
+          "minItems": 1000,
+          "maxItems": 2000,
+          "items": { "type": "integer", "minimum": 0, "maximum": 10000000 }
+        },
+        "p99_micros": { "type": "integer", "minimum": 0, "maximum": 25000 },
+        "p999_micros": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "claim_boundary": { "const": "sdk-loopback-real-mtls-synthetic-not-epdg-production-slo" }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixed_labels_only", "identifying_values_recorded"],
+      "properties": {
+        "fixed_labels_only": { "const": true },
+        "identifying_values_recorded": { "const": false }
       }
     },
     "coverage": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 7,
+      "maxItems": 7,
       "uniqueItems": true,
       "items": {
         "enum": [
-          "schema_fixture",
-          "profile_inventory",
-          "independent_history_checker",
-          "lease_acquire_release",
-          "lease_expiry_reacquire",
-          "compare_and_set",
-          "linearizable_read",
-          "stale_fence_rejection",
+          "persistent_prewarm",
+          "warm_connection_reuse",
+          "real_mtls",
           "multi_process",
-          "real_tcp",
-          "persistent_sqlite",
-          "process_stop_restart",
-          "observed_leader_failover",
-          "three_node",
-          "five_node"
+          "three_voter_latency",
+          "five_voter_composition",
+          "leader_loss",
+          "voter_loss"
         ]
       }
     },
     "remaining_acceptance": {
       "type": "array",
       "minItems": 1,
+      "maxItems": 4,
       "uniqueItems": true,
       "items": {
         "enum": [
-          "tls_rotation_158_163_164",
-          "kubernetes_3_5_node",
-          "batch_history",
-          "watch_history",
-          "restore_history",
-          "readiness_continuous_gating",
-          "network_partition_faults",
-          "packet_faults",
-          "clock_skew",
-          "leader_follower_crash_matrix",
-          "crash_point_matrix",
-          "version_migration_rollback",
+          "downstream_epdg_production_slo",
+          "deployed_kubernetes_platform_matrix",
           "resource_soak",
-          "signed_release_bundle",
-          "distributed_hkms_payload_key_rotation"
+          "signed_release_bundle"
         ]
       }
     }

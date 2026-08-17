@@ -1283,6 +1283,191 @@ pub struct SessionHaQualificationProfile {
     pub evidence: QualificationEvidenceRequirements,
 }
 
+/// Executable real-mTLS warm-call thresholds for the revision-2 persistent
+/// consumer. These qualify only the SDK loopback harness, not a downstream
+/// ePDG deployment SLO.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationPersistentConsumerThresholdsV7 {
+    pub minimum_warm_call_samples: usize,
+    pub max_warm_call_p99_micros: u64,
+    pub max_warm_call_p999_micros: u64,
+    pub real_mtls_latency_members: usize,
+}
+
+/// Minimum real-mTLS warm calls retained by one v7 run record.
+pub const QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7: usize = 1_000;
+/// Maximum nearest-rank p99 accepted by the SDK loopback real-mTLS harness.
+pub const QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7: u64 = 25_000;
+/// Maximum nearest-rank p99.9 accepted by the SDK loopback real-mTLS harness.
+pub const QUALIFICATION_PERSISTENT_CONSUMER_MAX_P999_MICROS_V7: u64 = 100_000;
+
+/// Exact, source-bound v7 record emitted by the persistent consumer
+/// multiprocess harness. It intentionally contains only fixed-label numeric
+/// observations; endpoints, identities, request IDs, keys, owners, and
+/// payloads never enter the record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionHaPersistentConsumerEvidenceV7 {
+    pub schema_version: String,
+    pub profile_id: String,
+    pub experimental: bool,
+    pub qualification_complete: bool,
+    pub source_revision: String,
+    pub source_tree: String,
+    pub source_tree_status: String,
+    pub execution: QualificationPersistentConsumerExecutionV7,
+    pub topology: QualificationPersistentConsumerTopologyV7,
+    pub observations: QualificationPersistentConsumerObservationsV7,
+    pub warm_latency: QualificationPersistentConsumerWarmLatencyV7,
+    pub privacy: QualificationPersistentConsumerPrivacyV7,
+    pub coverage: Vec<String>,
+    pub remaining_acceptance: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationPersistentConsumerExecutionV7 {
+    pub profile_sha256: String,
+    pub transcript_digest_domain: String,
+    pub transcript_sha256: String,
+    pub client_type: String,
+    pub consumer_profile_path: String,
+    pub transport_revision: u16,
+    pub authenticated_route: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationPersistentConsumerTopologyV7 {
+    pub members: usize,
+    pub independent_processes: bool,
+    pub transport_mode: String,
+    pub configured_clients: usize,
+    pub prewarmed_clients: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationPersistentConsumerObservationsV7 {
+    pub authenticated_setup_successes: u64,
+    pub warm_reused_calls: u64,
+    pub exact_request_id_recovery: bool,
+    pub leader_loss_recovery: bool,
+    pub voter_loss_recovery: bool,
+    pub outcome_unknown_recovery: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationPersistentConsumerWarmLatencyV7 {
+    pub methodology: String,
+    pub clock: String,
+    pub sample_count: usize,
+    pub raw_samples_micros: Vec<u64>,
+    pub p99_micros: u64,
+    pub p999_micros: u64,
+    pub claim_boundary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationPersistentConsumerPrivacyV7 {
+    pub fixed_labels_only: bool,
+    pub identifying_values_recorded: bool,
+}
+
+impl SessionHaPersistentConsumerEvidenceV7 {
+    /// Validate semantic relationships JSON Schema cannot express, including
+    /// exact percentile recomputation and non-sentinel source provenance.
+    pub fn validate(&self, expected_profile_sha256: &str) -> Result<(), &'static str> {
+        fn exact_git_object(value: &str) -> bool {
+            value.len() == 40
+                && value != "0000000000000000000000000000000000000000"
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }
+        fn exact_sha256(value: &str) -> bool {
+            value.strip_prefix("sha256:").is_some_and(|digest| {
+                digest.len() == 64
+                    && digest != "0000000000000000000000000000000000000000000000000000000000000000"
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        }
+        fn nearest_rank(samples: &[u64], numerator: usize, denominator: usize) -> u64 {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            let rank = samples
+                .len()
+                .saturating_mul(numerator)
+                .div_ceil(denominator)
+                .saturating_sub(1);
+            sorted[rank]
+        }
+
+        if self.schema_version != "opc-session-ha-evidence/v7"
+            || self.profile_id != "opc-session-openraft-ha/v7"
+            || !self.experimental
+            || self.qualification_complete
+            || !exact_git_object(&self.source_revision)
+            || !exact_git_object(&self.source_tree)
+            || !matches!(
+                self.source_tree_status.as_str(),
+                "clean" | "dirty_unqualified"
+            )
+        {
+            return Err("invalid v7 source binding");
+        }
+        if self.execution.profile_sha256 != expected_profile_sha256
+            || self.execution.transcript_digest_domain
+                != "opc-session-ha/persistent-consumer-run/v1"
+            || !exact_sha256(&self.execution.transcript_sha256)
+            || self.execution.client_type != "PersistentSessionConsumerClient"
+            || self.execution.consumer_profile_path != "protocol.persistent_consumer"
+            || self.execution.transport_revision != 2
+            || self.execution.authenticated_route != "authenticated-mtls-persistent"
+        {
+            return Err("invalid v7 execution binding");
+        }
+        if !matches!(self.topology.members, 3 | 5)
+            || !self.topology.independent_processes
+            || self.topology.transport_mode != "authenticated-mtls-persistent"
+            || self.topology.configured_clients != 12
+            || self.topology.prewarmed_clients != 12
+            || self.observations.authenticated_setup_successes < 48
+            || self.observations.warm_reused_calls
+                < QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7 as u64
+            || !self.observations.exact_request_id_recovery
+            || !self.observations.leader_loss_recovery
+            || !self.observations.voter_loss_recovery
+            || !self.observations.outcome_unknown_recovery
+        {
+            return Err("invalid v7 persistent observations");
+        }
+        let latency = &self.warm_latency;
+        if latency.methodology != "sequential-capabilities-round-robin-after-prewarm"
+            || latency.clock != "std::time::Instant"
+            || latency.claim_boundary != "sdk-loopback-real-mtls-synthetic-not-epdg-production-slo"
+            || latency.sample_count != latency.raw_samples_micros.len()
+            || latency.sample_count < QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7
+            || latency.sample_count > 2_000
+            || nearest_rank(&latency.raw_samples_micros, 99, 100) != latency.p99_micros
+            || nearest_rank(&latency.raw_samples_micros, 999, 1_000) != latency.p999_micros
+            || latency.p99_micros > QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7
+            || latency.p999_micros > QUALIFICATION_PERSISTENT_CONSUMER_MAX_P999_MICROS_V7
+        {
+            return Err("invalid v7 warm latency evidence");
+        }
+        if !self.privacy.fixed_labels_only || self.privacy.identifying_values_recorded {
+            return Err("invalid v7 privacy binding");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationWorkspace {
@@ -1398,6 +1583,7 @@ pub struct SessionHaQualificationProfileV7 {
     pub consensus_timing: QualificationConsensusTiming,
     pub bounds: QualificationBounds,
     pub provisional_test_thresholds: QualificationThresholds,
+    pub persistent_consumer_thresholds: QualificationPersistentConsumerThresholdsV7,
     pub evidence: QualificationEvidenceRequirements,
 }
 

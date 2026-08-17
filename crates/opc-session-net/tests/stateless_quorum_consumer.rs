@@ -1170,6 +1170,7 @@ async fn malformed_and_oversized_consumer_frames_are_rejected_before_dispatch() 
         "body": {
             "transport_revision": SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION.wrapping_add(1),
             "scope": scope,
+            "response_frame_size": opc_session_net::MAX_NEGOTIATED_FRAME_SIZE,
         },
     }))
     .expect("wrong revision hello encodes");
@@ -1297,7 +1298,7 @@ async fn durable_consumer_request_ids_deduplicate_lease_races_and_fence_stale_ow
         "a retained consumer request ID must replay only its prior durable result"
     );
     let lease = match winner_response {
-        SessionConsumerResponse::AcquireLease(Ok(lease)) => lease,
+        SessionConsumerResponse::AcquireLease(Ok(grant)) => grant.into_guard(),
         _ => unreachable!("winner response is an acquired lease"),
     };
     let conflicting_reuse = SessionConsumerRequest::new(

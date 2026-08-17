@@ -17,6 +17,7 @@
     "consensus_timing",
     "bounds",
     "provisional_test_thresholds",
+    "persistent_consumer_thresholds",
     "evidence"
   ],
   "properties": {
@@ -363,6 +364,22 @@
         "max_leader_failover_millis": { "type": "integer", "minimum": 1 },
         "max_leader_restart_catchup_millis": { "type": "integer", "minimum": 1 },
         "minimum_soak_seconds": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "persistent_consumer_thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimum_warm_call_samples",
+        "max_warm_call_p99_micros",
+        "max_warm_call_p999_micros",
+        "real_mtls_latency_members"
+      ],
+      "properties": {
+        "minimum_warm_call_samples": { "const": 1000 },
+        "max_warm_call_p99_micros": { "const": 25000 },
+        "max_warm_call_p999_micros": { "const": 100000 },
+        "real_mtls_latency_members": { "const": 3 }
       }
     },
     "evidence": {

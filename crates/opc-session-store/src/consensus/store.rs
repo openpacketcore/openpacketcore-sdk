@@ -54,9 +54,10 @@ use crate::consumer::{
     consumer_request_commitment, derive_consumer_consensus_request_id,
     derive_consumer_request_binding_id, SessionConsumerAuthorizationManifest,
     SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerIdentity,
-    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionQuorumConsumer, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    SessionConsumerLeaseGrant, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerResponse,
+    SessionConsumerScope, SessionConsumerStoreError, SessionQuorumConsumer,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use crate::error::{LeaseError, StoreError};
 use crate::lease::{LeaseGuard, SessionLeaseManager};
@@ -3379,6 +3380,9 @@ fn validate_sealed_payload(op: &CompareAndSet) -> Result<(), StoreError> {
 }
 
 fn validate_consumer_operation(operation: &SessionConsumerOperation) -> Result<(), StoreError> {
+    operation
+        .validate()
+        .map_err(|_| StoreError::InvalidKey("consumer request rejected".into()))?;
     match operation {
         SessionConsumerOperation::CompareAndSet { op } => validate_sealed_payload(op),
         SessionConsumerOperation::Batch { ops } => validate_consensus_batch(ops),
@@ -3645,16 +3649,22 @@ impl ConsensusSessionConsumerService {
     }
 
     fn operation_mutates(operation: &SessionConsumerOperation) -> bool {
-        matches!(
-            operation,
+        match operation {
+            SessionConsumerOperation::Capabilities
+            | SessionConsumerOperation::Get { .. }
+            | SessionConsumerOperation::PreflightRecordExpiry { .. }
+            | SessionConsumerOperation::ScanRestoreRecords { .. }
+            | SessionConsumerOperation::Watch { .. } => false,
+            SessionConsumerOperation::Batch { ops } => ops
+                .iter()
+                .any(|operation| !matches!(operation, SessionOp::Get { .. })),
             SessionConsumerOperation::CompareAndSet { .. }
-                | SessionConsumerOperation::DeleteFenced { .. }
-                | SessionConsumerOperation::RefreshTtl { .. }
-                | SessionConsumerOperation::Batch { .. }
-                | SessionConsumerOperation::AcquireLease { .. }
-                | SessionConsumerOperation::RenewLease { .. }
-                | SessionConsumerOperation::ReleaseLease { .. }
-        )
+            | SessionConsumerOperation::DeleteFenced { .. }
+            | SessionConsumerOperation::RefreshTtl { .. }
+            | SessionConsumerOperation::AcquireLease { .. }
+            | SessionConsumerOperation::RenewLease { .. }
+            | SessionConsumerOperation::ReleaseLease { .. } => true,
+        }
     }
 
     /// Bound the response before binding or applying a batch request.
@@ -3718,6 +3728,9 @@ impl ConsensusSessionConsumerService {
         deadline: tokio::time::Instant,
         ops: Vec<SessionOp>,
     ) -> SessionConsumerResponse {
+        let contains_mutation = ops
+            .iter()
+            .any(|operation| !matches!(operation, SessionOp::Get { .. }));
         if let Err(error) = validate_consensus_batch(&ops) {
             return if matches!(error, StoreError::PayloadTooLarge { .. }) {
                 SessionConsumerResponse::Batch(Err(SessionConsumerStoreError::PayloadTooLarge))
@@ -3767,9 +3780,15 @@ impl ConsensusSessionConsumerService {
                             _ => Err(StoreError::BackendOperationOutcomeUnavailable),
                         });
                     if consumer_mutation_unknown(&result) {
-                        return SessionConsumerResponse::OutcomeUnknown(
-                            SessionConsumerOutcomeUnknown::Mutation,
-                        );
+                        return if contains_mutation {
+                            SessionConsumerResponse::OutcomeUnknown(
+                                SessionConsumerOutcomeUnknown::Mutation,
+                            )
+                        } else {
+                            SessionConsumerResponse::Batch(Err(
+                                SessionConsumerStoreError::Unavailable,
+                            ))
+                        };
                     }
                     SessionConsumerBatchResult::Get(result.map_err(SessionConsumerStoreError::from))
                 }
@@ -3988,9 +4007,15 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                             deadline,
                         )
                         .await
-                        .and_then(|response| match response.result? {
-                            SessionMutationOutcome::Lease(lease) => Ok(lease),
-                            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+                        .and_then(|response| {
+                            let authority_time =
+                                response.logical_time.ok_or_else(consensus_unavailable)?;
+                            match response.result? {
+                                SessionMutationOutcome::Lease(lease) => {
+                                    Ok(SessionConsumerLeaseGrant::new(lease, authority_time))
+                                }
+                                _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+                            }
                         })
                         .map_err(LeaseError::from);
                     if matches!(result, Err(LeaseError::OperationOutcomeUnavailable)) {
@@ -4013,9 +4038,15 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                             deadline,
                         )
                         .await
-                        .and_then(|response| match response.result? {
-                            SessionMutationOutcome::Lease(lease) => Ok(lease),
-                            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+                        .and_then(|response| {
+                            let authority_time =
+                                response.logical_time.ok_or_else(consensus_unavailable)?;
+                            match response.result? {
+                                SessionMutationOutcome::Lease(lease) => {
+                                    Ok(SessionConsumerLeaseGrant::new(lease, authority_time))
+                                }
+                                _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+                            }
                         })
                         .map_err(LeaseError::from);
                     if matches!(result, Err(LeaseError::OperationOutcomeUnavailable)) {
@@ -4079,10 +4110,13 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                         .map_err(SessionConsumerStoreError::from),
                 )
             }
+            SessionConsumerOperation::Batch { ops } => {
+                drop(admission);
+                self.execute_batch(identity, &request, deadline, ops).await
+            }
             SessionConsumerOperation::CompareAndSet { .. }
             | SessionConsumerOperation::DeleteFenced { .. }
             | SessionConsumerOperation::RefreshTtl { .. }
-            | SessionConsumerOperation::Batch { .. }
             | SessionConsumerOperation::AcquireLease { .. }
             | SessionConsumerOperation::RenewLease { .. }
             | SessionConsumerOperation::ReleaseLease { .. } => {

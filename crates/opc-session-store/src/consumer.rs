@@ -19,7 +19,7 @@ use crate::{
     BackendCapabilities, CompareAndSet, CompareAndSetResult, LeaseError, LeaseGuard, OwnerId,
     RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionConsensusIdentity,
     SessionConsensusRequestId, SessionKey, SessionOp, SessionOpResult, StoreError,
-    StoredSessionRecord, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    StoredSessionRecord, Timestamp, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
 };
 
 /// Maximum batch slots admitted by one consumer request.
@@ -303,14 +303,15 @@ impl SessionConsumerOperation {
             Self::ScanRestoreRecords { request } => request
                 .validate()
                 .map_err(|_| SessionConsumerRejection::MalformedRequest),
+            Self::RefreshTtl { ttl, .. }
+            | Self::AcquireLease { ttl, .. }
+            | Self::RenewLease { ttl, .. } => crate::validate_session_ttl(*ttl)
+                .map_err(|_| SessionConsumerRejection::MalformedRequest),
             Self::Capabilities
             | Self::Get { .. }
             | Self::CompareAndSet { .. }
             | Self::DeleteFenced { .. }
-            | Self::RefreshTtl { .. }
             | Self::Watch { .. }
-            | Self::AcquireLease { .. }
-            | Self::RenewLease { .. }
             | Self::ReleaseLease { .. } => Ok(()),
         }
     }
@@ -713,6 +714,50 @@ pub enum SessionConsumerBatchResult {
     RefreshTtl(Result<(), SessionConsumerStoreError>),
 }
 
+/// Successful lease authority returned across the consumer transport.
+///
+/// The committed authority time is carried separately from the guard because
+/// renewal preserves the guard's original acquisition timestamp. A client can
+/// therefore bind the returned expiry to the exact requested TTL without
+/// trusting peer-selected lifetime fields.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsumerLeaseGrant {
+    guard: LeaseGuard,
+    authority_time: Timestamp,
+}
+
+impl SessionConsumerLeaseGrant {
+    /// Construct a grant from a quorum-validated committed response.
+    pub fn new(guard: LeaseGuard, authority_time: Timestamp) -> Self {
+        Self {
+            guard,
+            authority_time,
+        }
+    }
+
+    /// Borrow the validated lease guard.
+    pub fn guard(&self) -> &LeaseGuard {
+        &self.guard
+    }
+
+    /// Return the committed logical time used to calculate the lease expiry.
+    pub const fn authority_time(&self) -> Timestamp {
+        self.authority_time
+    }
+
+    /// Consume the grant and return its guard.
+    pub fn into_guard(self) -> LeaseGuard {
+        self.guard
+    }
+}
+
+impl fmt::Debug for SessionConsumerLeaseGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerLeaseGrant(<redacted>)")
+    }
+}
+
 impl fmt::Debug for SessionConsumerBatchResult {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SessionConsumerBatchResult(<redacted>)")
@@ -748,9 +793,9 @@ pub enum SessionConsumerResponse {
     /// Watch admission result; entries follow as separately framed messages.
     WatchOpened,
     /// Lease acquisition result.
-    AcquireLease(Result<LeaseGuard, SessionConsumerLeaseError>),
+    AcquireLease(Result<SessionConsumerLeaseGrant, SessionConsumerLeaseError>),
     /// Lease renewal result.
-    RenewLease(Result<LeaseGuard, SessionConsumerLeaseError>),
+    RenewLease(Result<SessionConsumerLeaseGrant, SessionConsumerLeaseError>),
     /// Lease release result.
     ReleaseLease(Result<(), SessionConsumerLeaseError>),
     /// A mutation outcome is ambiguous and must never be automatically replayed.

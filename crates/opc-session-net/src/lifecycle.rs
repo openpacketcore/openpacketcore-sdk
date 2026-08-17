@@ -296,6 +296,7 @@ impl ReconnectGate {
         }
     }
 
+    #[cfg(any(feature = "legacy-session-net-compat", test))]
     pub(crate) async fn acquire(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,

@@ -19,8 +19,8 @@ use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBu
 use opc_session_net::{
     ConnectionLifecyclePolicy, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
     PersistentSessionConsumerExecuteError, RemoteAddrResolver, SessionConsumerAuthorizer,
-    SessionQuorumConsumerServer, StatelessSessionConsumerClient, SESSION_QUORUM_CONSUMER_ALPN,
-    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+    SessionQuorumConsumerServer, StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE,
+    SESSION_QUORUM_CONSUMER_ALPN, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     BackendCapabilities, ConsensusSessionStore, OwnerId, QuorumReplicaDescriptor,
@@ -47,6 +47,7 @@ enum CanonicalConsumerBootstrapRequest {
 struct CanonicalConsumerHello {
     transport_revision: u16,
     scope: SessionConsumerScope,
+    response_frame_size: u32,
 }
 
 struct TestPki {
@@ -478,6 +479,9 @@ async fn prewrite_retry_retains_one_request_and_postwrite_disconnect_is_unknown_
     assert_eq!(diagnostics.resolve_attempts, 2);
     assert_eq!(diagnostics.resolve_failures, 1);
     assert_eq!(diagnostics.tcp_attempts, 1);
+    assert_eq!(diagnostics.successes, 0);
+    assert_eq!(diagnostics.failures, 1);
+    assert_eq!(diagnostics.outcome_unknown, 1);
     assert!(
         service.requests() == vec![first_request],
         "the safe pre-write retry must dispatch one byte-identical request"
@@ -513,7 +517,10 @@ async fn prewrite_retry_retains_one_request_and_postwrite_disconnect_is_unknown_
         recorded.get(1) == Some(&postwrite),
         "the uncertain call must retain its exact request identity and body"
     );
-    assert_eq!(client.diagnostics().await.outcome_unknown, 1);
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.successes, 0);
+    assert_eq!(diagnostics.failures, 2);
+    assert_eq!(diagnostics.outcome_unknown, 2);
     client.shutdown().await;
 }
 
@@ -620,6 +627,8 @@ async fn server_active_idle_timeout_starts_only_after_authenticated_hello() {
         CanonicalConsumerHello {
             transport_revision: SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
             scope,
+            response_frame_size: u32::try_from(MAX_NEGOTIATED_FRAME_SIZE)
+                .expect("consumer frame cap fits u32"),
         },
     ))
     .expect("canonical Hello JSON encodes");
