@@ -514,7 +514,6 @@ async fn expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call() 
         pki.server_config(&server_spiffe),
         authorizer,
     )
-    .with_idle_timeout(Duration::from_millis(20))
     .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
     .await
     .expect("start short-idle listener");
@@ -541,11 +540,17 @@ async fn expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call() 
     let client = PersistentSessionConsumerClient::try_from_stateless(stateless, config(1))
         .expect("persistent client");
     client.prewarm().await.expect("prewarm one lane");
-    // Freeze and advance the contract's idle clock only after the
-    // authenticated lane is published. A real 20ms sleep races slow
-    // cross-target TLS setup before it has exercised idle replacement at all.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_millis(80)).await;
+    // The listener retains its normal bounded idle deadline. This fixture
+    // waits for the client's already-published lane to be reaped at its own
+    // 20 ms idle contract, so it tests local idle replacement rather than a
+    // race between cross-target TLS setup and a peer EOF.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.diagnostics().await.idle != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("client idle reaper retires the prewarmed lane");
     assert_eq!(
         client.capabilities().await,
         Ok(BackendCapabilities::all_enabled())
@@ -557,7 +562,6 @@ async fn expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call() 
     assert!(diagnostics.reconnects >= 1);
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
 
-    tokio::time::resume();
     client.shutdown().await;
     handle.abort_and_wait().await;
 }

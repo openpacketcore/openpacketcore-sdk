@@ -115,3 +115,37 @@ path and remains fail-closed. The focused restored command is:
 opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_transport persistent_watch_reconnects_at_the_exact_delivered_cursor_after_endpoint_loss -- --exact --test-threads=1
 opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_transport persistent_watch_reconnects_after_authenticated_rotation -- --exact --test-threads=1
 ```
+
+### Admission, cursor, and idle-replacement regressions
+
+The configured complete-operation deadline begins before a persistent caller
+waits for a request lane.  The retained
+`pool_admission_consumes_the_original_complete_operation_deadline` regression
+holds the only lane past that deadline and requires the queued call to return
+`NotTransmitted(Deadline)`: waiting for admission cannot add a second timeout
+window.  The fixed pool also preserves semaphore arrival order.  The retained
+`queued_lane_waiter_cannot_be_overtaken_by_late_callers` adversarial fixture
+queues one caller, starts repeated late callers, releases the held lane, and
+requires the already queued request to dispatch first.  Replacing the queued
+acquisition with a `try_acquire` path makes that assertion fail.
+
+The public watch cursor is inclusive and 1-based.  The consumer normalizes a
+zero cursor once, before its first wire request, to sequence 1; every reconnect
+then starts at the exact next undelivered sequence.  The test fixture no longer
+rewrites its emitted sequence to a caller-provided zero value, and retained
+`persistent_watch_zero_cursor_normalizes_to_the_first_committed_sequence`
+requires `open_watch(0)` to yield sequence 1.  Removing that boundary
+normalization makes the reader fail closed on a sequence gap rather than
+silently accepting a synthetic sequence zero.
+
+`expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call` uses a
+normal bounded server idle lifetime and waits for the client's own idle reaper
+to retire the prewarmed lane before the next logical call.  It therefore checks
+the production replacement contract without racing a paused-clock server EOF
+against authenticated prewarm.  The focused restored command passed one test
+on 2026-08-17; elapsed time is only a fixture guard, not a widened production
+timeout or an SLO claim:
+
+```text
+opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_boundaries expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call -- --exact --test-threads=1
+```

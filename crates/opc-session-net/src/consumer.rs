@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use futures_util::stream::{self, BoxStream, StreamExt};
+use futures_util::FutureExt;
 use opc_session_store::{
     session_consumer_batch_result_into_store, BackendCapabilities, CompareAndSet,
     CompareAndSetResult, LeaseError, LeaseGuard, OwnerId, RecordExpiryPreflight, RestoreScanPage,
@@ -158,6 +159,14 @@ fn consumer_watch_transport_lost(error: &ProtocolError) -> bool {
                     | std::io::ErrorKind::BrokenPipe
             )
     )
+}
+
+const fn normalized_consumer_watch_cursor(start_sequence: u64) -> u64 {
+    if start_sequence == 0 {
+        1
+    } else {
+        start_sequence
+    }
 }
 
 enum ConsumerWatchRead {
@@ -2531,6 +2540,11 @@ impl StatelessSessionConsumerClient {
         BoxStream<'static, Result<SessionConsumerChange, StoreError>>,
         SessionConsumerClientError,
     > {
+        // The typed store contract is an inclusive 1-based watch cursor: the
+        // empty-head sentinel zero is exactly sequence one. Normalize once at
+        // the consumer boundary so both the initial Watch and every reconnect
+        // retain the same checked caller-visible cursor.
+        let start_sequence = normalized_consumer_watch_cursor(start_sequence);
         let (mut connection, mut correlation) = self
             .open_watch_connection_with_counters(start_sequence, setup_counters)
             .await?;
@@ -3591,20 +3605,39 @@ impl PersistentSessionConsumerPool {
 
     async fn admit_call(
         &self,
+        started: tokio::time::Instant,
+        operation_deadline: tokio::time::Instant,
     ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), SessionConsumerClientError> {
         if self.phase() != PersistentShutdownPhase::Running {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
-        let started = tokio::time::Instant::now();
         // This immediate total-admission acquisition structurally bounds
-        // active plus queued caller futures. Tokio's lane semaphore supplies
-        // the fair bounded wait only after admission succeeds.
+        // active plus queued caller futures. Lane acquisition always joins
+        // Tokio's FIFO waiter queue; `try_acquire_owned` would let a late
+        // caller take a released permit ahead of an already queued caller.
         let pending = Arc::clone(&self.pending)
             .try_acquire_owned()
             .map_err(|_| SessionConsumerClientError::Overloaded)?;
-        let lane = match Arc::clone(&self.lanes).try_acquire_owned() {
-            Ok(lane) => lane,
-            Err(_) => {
+        let pool_wait_deadline = started
+            .checked_add(self.config.pool_wait_timeout)
+            .ok_or(SessionConsumerClientError::Overloaded)?;
+        let (wait_deadline, late_error) = if operation_deadline <= pool_wait_deadline {
+            (operation_deadline, SessionConsumerClientError::Deadline)
+        } else {
+            (pool_wait_deadline, SessionConsumerClientError::Overloaded)
+        };
+        if tokio::time::Instant::now() >= wait_deadline {
+            return Err(late_error);
+        }
+        let lane_wait = Arc::clone(&self.lanes).acquire_owned();
+        tokio::pin!(lane_wait);
+        let lane = match lane_wait.as_mut().now_or_never() {
+            Some(result) => complete_before_deadline(
+                result.map_err(|_| SessionConsumerClientError::ShuttingDown)?,
+                wait_deadline,
+                late_error,
+            )?,
+            None => {
                 let mut shutdown = self.shutdown_tx.subscribe();
                 if self.phase() != PersistentShutdownPhase::Running {
                     return Err(SessionConsumerClientError::ShuttingDown);
@@ -3630,31 +3663,22 @@ impl PersistentSessionConsumerPool {
                     slot,
                     started,
                 };
-                let wait_deadline = started
-                    .checked_add(self.config.pool_wait_timeout)
-                    .ok_or(SessionConsumerClientError::Overloaded)?;
                 let lane = tokio::select! {
                     biased;
                     _ = wait_for_shutdown(&mut shutdown) => {
                         Err(SessionConsumerClientError::ShuttingDown)
                     }
-                    lane = tokio::time::timeout_at(
-                        wait_deadline,
-                        Arc::clone(&self.lanes).acquire_owned(),
-                    ) => {
+                    lane = tokio::time::timeout_at(wait_deadline, &mut lane_wait) => {
                         lane.ok().and_then(Result::ok)
-                            .ok_or(SessionConsumerClientError::Overloaded)
+                            .ok_or(late_error)
                     }
                 };
                 drop(wait);
                 let lane = lane?;
-                // `timeout_at` polls the semaphore first. Do not admit a
-                // permit that became ready only after the fixed wait cap.
-                complete_before_deadline(
-                    lane,
-                    wait_deadline,
-                    SessionConsumerClientError::Overloaded,
-                )?
+                // `timeout_at` polls the semaphore first. Do not admit a permit
+                // that became ready only after either fixed wait cap or the
+                // original complete-operation deadline.
+                complete_before_deadline(lane, wait_deadline, late_error)?
             }
         };
         if self.phase() != PersistentShutdownPhase::Running {
@@ -3992,6 +4016,12 @@ impl PersistentSessionConsumerClient {
         &self,
         request: &SessionConsumerRequest,
     ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        let started = tokio::time::Instant::now();
+        let deadline = started
+            .checked_add(self.pool.client.operation_timeout)
+            .ok_or(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Deadline,
+            ))?;
         if request.scope() != self.pool.client.scope {
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Scope,
@@ -4007,15 +4037,19 @@ impl PersistentSessionConsumerClient {
                 SessionConsumerClientError::Protocol,
             ));
         }
-        let (_pending, _lane) = self.pool.admit_call().await.map_err(|error| {
-            self.pool.record_error(error, false);
-            SessionConsumerCallError::BeforeCallWrite(error)
-        })?;
+        let (_pending, _lane) = self
+            .pool
+            .admit_call(started, deadline)
+            .await
+            .map_err(|error| {
+                self.pool.record_error(error, false);
+                SessionConsumerCallError::BeforeCallWrite(error)
+            })?;
         let _activity = self.pool.register_call().map_err(|error| {
             self.pool.record_error(error, false);
             SessionConsumerCallError::BeforeCallWrite(error)
         })?;
-        let result = self.execute_admitted(request).await;
+        let result = self.execute_admitted(request, started, deadline).await;
         match result {
             Ok(response) => {
                 counter_increment(&self.pool.counters.successes);
@@ -4340,13 +4374,9 @@ impl PersistentSessionConsumerClient {
     async fn execute_admitted(
         &self,
         request: &SessionConsumerRequest,
+        started: tokio::time::Instant,
+        deadline: tokio::time::Instant,
     ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
-        let started = tokio::time::Instant::now();
-        let deadline = started
-            .checked_add(self.pool.client.operation_timeout)
-            .ok_or(SessionConsumerCallError::BeforeCallWrite(
-                SessionConsumerClientError::Deadline,
-            ))?;
         let (pre_request_deadline, pre_request_budget_active) =
             self.pool.client.pre_request_deadline(started, deadline);
         let mut shutdown = self.pool.shutdown_tx.subscribe();

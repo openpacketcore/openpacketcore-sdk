@@ -218,6 +218,11 @@ impl SessionQuorumConsumer for ControlledConsumer {
         let Some(entry) = entry else {
             return Ok(stream::pending().boxed());
         };
+        // Match the public store cursor contract: zero is the empty-head
+        // sentinel and therefore starts at inclusive sequence one. Do not
+        // rewrite a synthetic entry to sequence zero, which production
+        // backends can never emit.
+        let start_sequence = start_sequence.max(1);
         if self.watch_blocked.load(Ordering::SeqCst) {
             let watch_blocked = Arc::clone(&self.watch_blocked);
             let watch_released = Arc::clone(&self.watch_released);
@@ -909,6 +914,210 @@ async fn one_lane_dispatches_twelve_bounded_waiters_in_admission_order() {
     );
     assert_eq!(client.diagnostics().await.pool_wait_max, WAITERS as u64);
 
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn queued_lane_waiter_cannot_be_overtaken_by_late_callers() {
+    const LATE_CALLERS: usize = 16;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("no-barge-server");
+    let client_spiffe = spiffe("no-barge-client");
+    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    service.arm_blocks(1);
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let client = persistent_client(
+        &pki,
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        &server_spiffe,
+        &client_spiffe,
+        scope,
+        config(1, LATE_CALLERS + 1, 1),
+    );
+
+    let first_id = SessionConsumerRequestId::from_bytes([1; 16]);
+    let queued_id = SessionConsumerRequestId::from_bytes([2; 16]);
+    let first = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .execute(&SessionConsumerRequest::new(
+                    scope,
+                    first_id,
+                    SessionConsumerOperation::Capabilities,
+                ))
+                .await
+        })
+    };
+    service.wait_until_entered(1).await;
+    let queued = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .execute(&SessionConsumerRequest::new(
+                    scope,
+                    queued_id,
+                    SessionConsumerOperation::Capabilities,
+                ))
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.diagnostics().await.queued != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first late-sensitive caller reaches the FIFO lane queue");
+
+    let late = (0..LATE_CALLERS)
+        .map(|index| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let request_id = SessionConsumerRequestId::from_bytes(
+                    [u8::try_from(index + 3).expect("bounded late caller index"); 16],
+                );
+                client
+                    .execute(&SessionConsumerRequest::new(
+                        scope,
+                        request_id,
+                        SessionConsumerOperation::Capabilities,
+                    ))
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+    service.release();
+
+    assert!(first.await.expect("first caller task").is_ok());
+    assert!(queued.await.expect("queued caller task").is_ok());
+    for caller in late {
+        assert!(caller.await.expect("late caller task").is_ok());
+    }
+    assert_eq!(
+        service.request_order().get(1),
+        Some(&queued_id),
+        "a caller queued before release must dispatch before every late arrival"
+    );
+
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn pool_admission_consumes_the_original_complete_operation_deadline() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("admission-deadline-server");
+    let client_spiffe = spiffe("admission-deadline-client");
+    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    service.arm_blocks(1);
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    )
+    .with_operation_timeout(Duration::from_millis(240));
+    let client = PersistentSessionConsumerClient::try_from_stateless(stateless, config(1, 1, 1))
+        .expect("persistent client");
+    client.prewarm().await.expect("prewarm the sole lane");
+
+    let first = {
+        let client = client.clone();
+        tokio::spawn(async move { client.capabilities().await })
+    };
+    service.wait_until_entered(1).await;
+    let queued = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .execute(&SessionConsumerRequest::new(
+                    scope,
+                    SessionConsumerRequestId::from_bytes([3; 16]),
+                    SessionConsumerOperation::Capabilities,
+                ))
+                .await
+        })
+    };
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("the original operation deadline bounds lane admission")
+            .expect("queued caller task"),
+        Err(PersistentSessionConsumerExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Deadline,
+        })
+    );
+    assert_eq!(
+        service.calls.load(Ordering::SeqCst),
+        1,
+        "a lane-admission deadline cannot dispatch a second request"
+    );
+
+    service.release();
+    let _ = first.await.expect("first caller task");
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn persistent_watch_zero_cursor_normalizes_to_the_first_committed_sequence() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("zero-watch-server");
+    let client_spiffe = spiffe("zero-watch-client");
+    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    service.emit_watch_entries_then_close(small_watch_change_at(1), 1);
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let client = persistent_client(
+        &pki,
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        &server_spiffe,
+        &client_spiffe,
+        scope,
+        config(1, 0, 1),
+    );
+
+    let mut watch = client.open_watch(0).await.expect("open zero cursor watch");
+    let entry = tokio::time::timeout(Duration::from_secs(1), watch.next())
+        .await
+        .expect("the normalized first entry arrives")
+        .expect("watch remains open for the first entry")
+        .expect("zero cursor accepts sequence one");
+    assert_eq!(entry.sequence(), 1);
+
+    drop(watch);
     client.shutdown().await;
     handle.abort_and_wait().await;
 }
