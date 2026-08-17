@@ -398,9 +398,11 @@ fail closed even if an outer layer omitted validation.
 The new errors are public enum variants, so external exhaustive matches MUST be
 updated. Protocol v4 introduced their private fixed-width DTOs in error
 revision 1; current v5 error revision 9 retains those encodings and adds
-bounded expiry-preflight and topology-authority outcomes. An error-revision-8 or older decoder is rejected
-during the exact handshake;
-deployments MUST use the coordinated v5 rollout in §12.3.
+bounded expiry-preflight and topology-authority outcomes. The exact direct v5
+profile is wire-schema revision 7/error-set revision 9; every non-current direct
+profile combination (including error revision 8 or older) MUST be rejected
+during the exact handshake. Deployments MUST use the coordinated v5 rollout in
+§12.3.
 
 ### 7.2 Absolute Record Expiry Authority
 
@@ -767,6 +769,16 @@ crate, owns election, voting, log matching, commit, membership, snapshot
 coordination, and linearizable-read authority. The SDK state machine owns only
 deterministic session semantics.
 
+Public dynamic consensus construction, including membership-candidate
+construction, MUST be supported only on Linux. On every other platform it MUST
+return `DynamicConsensusUnsupportedPlatform` before topology or durable-state
+inspection and before creating a snapshot directory, consensus schema, or
+other consensus-owned filesystem state. The core initializer MUST independently
+return its typed `UnsupportedPlatform` storage error before those effects.
+Internal path-based snapshot helpers MUST NOT be treated as a portable
+consensus fallback. Standalone `SqliteSessionBackend` use remains
+cross-platform.
+
 HA topology admission MUST start from the complete descriptor set and one
 explicit logical self `ReplicaId`. It MUST bind a cluster ID, the exact
 order-independent configuration digest over the cluster, epoch, and complete
@@ -842,7 +854,8 @@ after the Openraft barrier and local apply. One absolute deadline MUST begin at
 the public restore entry and cover the barrier/apply path, blocking-worker and
 asynchronous connection admission, SQLite progress, and blocking-task join.
 Each page MUST examine no more than 4,096 live candidates plus one non-decoded
-lookahead, return no more than 1,024 records, 4 MiB of payload, or 8 MiB of
+lookahead, return no more than 1,024 records, an aggregate local 4 MiB + 64 KiB
+of stored-envelope payload, or 8 MiB of
 retained record/key/metadata/payload/cursor bytes, examine no more than 8 MiB
 of key/filter metadata, and obey the SQLite VM-step, wall-time, and cancellation
 budgets. Candidate/lookahead SQL MUST NOT select payload blobs; admitted
@@ -1052,8 +1065,9 @@ Serde boundary MUST delegate to private fixed-width v5 DTOs. `Hello` and
 `HelloAck` add an optional `contract_profile`; `HelloAck` also carries the
 server's optional `cas_idempotency_epoch`, and direct CAS carries an optional
 `idempotency_epoch`. Exhaustive Rust construction and matching MUST account for
-the new fields. The profile pins wire-schema revision 6 and error-set revision
-8; owner, custom-key, and state-type
+the new fields. The profile pins wire-schema revision 7 and error-set revision
+9; `max_restore_scan_page_payload_bytes = 2096128`; owner, custom-key, and
+state-type
 bounds of 128 UTF-8 bytes; `min_frame_size = 8192`;
 `max_frame_size = 16777216`;
 `stable_id_max_bytes = 64`; `replication_tx_id_max_bytes = 128`;
@@ -1127,10 +1141,12 @@ Every post-bootstrap response and watch item MUST be fully bounded-encoded into
 retained byte storage capped at the accepted response size before a length
 prefix is written.
 The common non-pageable and complete-page success path MUST perform one bounded
-encode without a separate sizing serialization. If the complete pageable
-response is oversized, that direct encode MUST emit no prefix; prefix selection
-MAY then perform bounded logarithmic sizing probes followed by one final bounded
-encode. No retained encoded-JSON byte storage may exceed the negotiated cap.
+encode without a separate sizing serialization. For a replication-log page, if
+the complete pageable response is oversized, that direct encode MUST emit no
+prefix; prefix selection MAY then perform bounded logarithmic sizing probes
+followed by one final bounded encode. Restore pages MUST be validated as whole
+backend results and MUST NOT be transport-shaped. No retained encoded-JSON byte
+storage may exceed the negotiated cap.
 The retained/requested encoded-JSON byte storage MUST remain no greater than the
 cap, including for non-power-of-two budgets. An implementation MUST NOT
 coalesce or create a temporary payload buffer when doing so would exceed that
@@ -1162,10 +1178,12 @@ Outbound behavior is family-specific:
 - Batch results MUST preserve exact request cardinality and order. They MUST NOT
   be truncated; an oversized complete result becomes one fixed batch error or a
   connection close.
-- Restore results MAY return a complete record prefix that fits, but
-  MUST preserve `next_cursor` and excluded-count semantics. A record MUST NOT be
-  split. When the first record cannot fit, the server MUST return the fixed
-  restore-size error if representable or close.
+- Restore backends MAY independently return a shorter cursor-correct page under
+  their count, payload, or work budgets. The transport MUST validate the entire
+  returned page against the fixed 2,096,128-byte wire-payload cap and the
+  negotiated frame; it MUST NOT trim or rewrite records or cursors. If the whole
+  page is oversized, the server MUST return typed
+  `RestoreScanResponseTooLarge` if representable or close.
 - Replication-log results MAY return only the largest complete contiguous entry
   prefix that fits. An entry MUST NOT be split, reordered, or skipped. If no
   requested entry fits, the server MUST use its fixed fallback or close.
@@ -1192,9 +1210,10 @@ fit maximum-profile metadata/envelopes but does not promise a non-zero
 application payload. Capability evidence remains descriptive and MUST NOT
 authorize quorum or traffic readiness.
 The 1 MiB default yields 130,048 payload bytes and the 16 MiB ceiling yields
-2,096,128. Advertising SQLite's full 1 MiB value limit requires at least
-8,396,800 frame bytes; 16 MiB is the recommended configured frame size for that
-profile. This is a per-frame limit, not aggregate admission: at the server's
+2,096,128. The wire ceiling is intentionally below standalone SQLite's local
+4 MiB + 64 KiB stored-envelope restore capacity, which is not a session-net
+wire capability. This is a per-frame limit, not aggregate admission: at the
+server's
 default 128 connection slots, simultaneous ceiling-sized encoded stores can
 retain about 2 GiB before chunk metadata, TLS, and runtime overhead. The
 aggregate scales with the configured connection limit. #143 owns aggregate
@@ -1307,7 +1326,7 @@ or traffic admission. A cache MUST be keyed by the exact profile and negotiated
 directional limits and cleared when a successful reconnect changes either
 limit. Callers MUST use fresh bounded quorum evidence.
 
-The transition to v5 wire-schema revision 6 and error-set revision 9 is a
+The transition to v5 wire-schema revision 7 and error-set revision 9 is a
 coordinated stop/upgrade/start boundary, not a rolling deployment. Operators
 MUST drain traffic and writers; run the #135 identity
 audit; inventory every retained record, replication log, snapshot, restore
@@ -1345,7 +1364,7 @@ across the independent `OPCH`/#135 boundary retains its checkpoint/reverse-
 migration requirement.
 
 That compatibility cutover is distinct from credential rotation. Only after
-every participant is admitted on the same revision-6 profile MAY operators use
+every participant is admitted on the same revision-7 profile MAY operators use
 material-epoch or explicit reauthentication to recycle connections without
 draining application traffic. The lifecycle MUST NOT be used to mix protocol
 profiles, negotiate a downgrade, or turn a binary rollback into a rolling
@@ -1559,7 +1578,8 @@ from checked `last_delivered_sequence + 1`. Cursor overflow, compaction or
 another permanent backend error, cancellation, and bounded slow-consumer
 failure MUST terminate explicitly rather than reconnect forever.
 
-This bootstrap behavior admits the already-frozen direct revision-6 variant and
+This bootstrap behavior was introduced for the then-frozen direct revision-6
+variant and is retained by the current revision-7 profile, alongside the
 existing consensus error value in their restricted bootstrap contexts. It
 changes no public API, direct or consensus profile revision, persisted
 SQLite/journal/snapshot format, Openraft commit authority, payload envelope,
@@ -1929,7 +1949,7 @@ fencing.
   fail-closed revision-1/revision-2 profile mismatch.
 - Exact-limit and one-byte-over outbound encoding for every response/watch
   family; no oversized allocation or emitted prefix on rejection; non-truncated
-  record/batch behavior; contiguous log and cursor-correct restore prefixes;
+  record/batch behavior; contiguous log and cursor-correct restore pages;
   fixed fallback redaction; and iterative consuming rejection of nested trees.
 - One absolute write deadline for prefix/payload/flush; authenticated slow-reader
   reaping; handler/connection-slot return to baseline; repeated reconnect bounds

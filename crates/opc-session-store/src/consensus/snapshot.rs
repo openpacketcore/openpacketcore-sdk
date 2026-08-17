@@ -20,8 +20,9 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteE
 ///
 /// On Linux this is deliberately based on the descriptor rather than its
 /// pathname, which makes it stable when a snapshot name is atomically
-/// replaced. Other platforms retain the handle wrapper for portable Dynamic
-/// snapshot transport; only Linux can use it as a SQLite descriptor binding.
+/// replaced. Other platforms retain this internal handle shape for cfg
+/// completeness, but public dynamic and fixed consensus initialization both
+/// fail closed before snapshot state is created.
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -318,6 +319,7 @@ impl AsyncSeek for SessionSnapshotFile {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::io::{Read as _, Write as _};
 
     #[cfg(target_os = "linux")]

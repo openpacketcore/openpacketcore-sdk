@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,7 +13,11 @@ use opc_config_model::{
 };
 use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
 use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
-use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
+use opc_crypto::CryptoEnvelopeV1;
+use opc_key::{
+    serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, KeyPurpose, MemoryKeyProvider,
+    SessionAad, Zeroizing, AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN,
+};
 use opc_mgmt_audit::{AuditError, AuditEvent, AuditOutcome, AuditSink};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use rusqlite::{params, types::Value, Connection};
@@ -310,6 +315,96 @@ fn create_legacy_replica(root: &Path, id: ReplicaId, fence: u64) -> RecoveryRepl
     let backing = ReplicaBackingIdentity::new(format!("recovery-backing-{}", id.as_str()))
         .expect("recovery backing identity");
     RecoveryReplica::new_bound(id, backing, identity(), database, snapshots)
+}
+
+fn sealed_recovery_record(payload_len: usize) -> StoredSessionRecord {
+    sealed_recovery_record_with_authority(
+        SessionKey {
+            tenant: TenantId::from_static("recovery-cap-tenant"),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"recovery-cap-session")
+                .try_into()
+                .expect("valid stable ID"),
+        },
+        OwnerId::new("recovery-cap-owner").expect("owner"),
+        crate::FenceToken::new(1),
+        payload_len,
+    )
+}
+
+fn sealed_recovery_record_with_authority(
+    key: SessionKey,
+    owner: OwnerId,
+    fence: crate::FenceToken,
+    payload_len: usize,
+) -> StoredSessionRecord {
+    let mut record = StoredSessionRecord {
+        key,
+        generation: Generation::new(1),
+        owner,
+        fence,
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("recovery-cap-state"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([]),
+    };
+    let key_id = KeyId::new("recovery-cap-test-key").expect("key ID");
+    let aad = EnvelopeAad::session(
+        record.key.tenant.clone(),
+        1,
+        SessionAad::new(
+            record.key.nf_kind.as_str(),
+            "recovery-cap-keyed-session-digest",
+            record.state_type.as_str(),
+            record.generation.get(),
+            record.fence.get(),
+            "recovery-cap-test-backend",
+        )
+        .expect("session AAD"),
+    );
+    let envelope = |opaque_len| CryptoEnvelopeV1 {
+        algorithm: AeadAlgorithm::Aes256GcmSiv,
+        key_id: key_id.clone(),
+        nonce: vec![0x42; AES_256_GCM_SIV_NONCE_LEN],
+        aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+        ciphertext_and_tag: {
+            let mut ciphertext_and_tag = vec![0xA5; opaque_len];
+            ciphertext_and_tag.extend_from_slice(&[0x5A; AEAD_TAG_LEN]);
+            ciphertext_and_tag
+        },
+    };
+    let envelope_overhead = envelope(0).encode().expect("empty envelope").len();
+    let encoded = envelope(
+        payload_len
+            .checked_sub(envelope_overhead)
+            .expect("payload length exceeds envelope overhead"),
+    )
+    .encode()
+    .expect("sized envelope");
+    assert_eq!(encoded.len(), payload_len);
+    record.payload = EncryptedSessionPayload::try_envelope(encoded).expect("valid envelope");
+    record
+}
+
+fn persist_valid_legacy_lease_record(conn: &Connection) {
+    let template = sealed_recovery_record(64 * 1024);
+    let lease = crate::sqlite::lease::acquire_sync(
+        conn,
+        &template.key,
+        template.owner,
+        Duration::from_secs(60),
+        Timestamp::from_str("2026-07-12T00:00:01Z").expect("fixture timestamp"),
+    )
+    .expect("valid legacy lease fixture");
+    let record = sealed_recovery_record_with_authority(
+        lease.key().clone(),
+        lease.owner().clone(),
+        lease.fence(),
+        64 * 1024,
+    );
+    crate::sqlite::ops::insert_or_replace_record_sync(conn, &record)
+        .expect("persist lease-backed recovery record");
 }
 
 fn private_tempdir() -> tempfile::TempDir {
@@ -796,8 +891,10 @@ async fn changed_source_stale_target_and_corrupt_backup_fail_closed() {
         .expect("legacy recovery plan");
     Connection::open(&replicas[0].database_path)
         .expect("open source")
-        .execute("UPDATE key_fences SET fence = 6", [])
-        .expect("change source");
+        .execute_batch(
+            "UPDATE key_fences SET fence = 6; UPDATE lease_globals SET val = 7 WHERE key = 'next_fence';",
+        )
+        .expect("change source coherently");
     let confirmation = RecoveryConfirmation::legacy(
         &plan,
         RecoveryConfirmation::required_legacy_acknowledgement(),
@@ -836,8 +933,10 @@ async fn changed_source_stale_target_and_corrupt_backup_fail_closed() {
 
     Connection::open(&replicas[0].database_path)
         .expect("restore source")
-        .execute("UPDATE key_fences SET fence = 5", [])
-        .expect("restore source");
+        .execute_batch(
+            "UPDATE key_fences SET fence = 5; UPDATE lease_globals SET val = 6 WHERE key = 'next_fence';",
+        )
+        .expect("restore source coherently");
     manager
         .execute(
             &context(),
@@ -1143,8 +1242,8 @@ fn campaign_preserves_fleet_maxima_and_preflights_sqlite_successors() {
         .expect("open exhausted fence")
         .execute("UPDATE key_fences SET fence = ?1", [i64::MAX])
         .expect("exhaust fence domain");
-    let overflow_plan = manager
-        .plan(
+    assert_eq!(
+        manager.plan(
             &context(),
             identity(),
             node_set(&overflow_ids),
@@ -1153,22 +1252,9 @@ fn campaign_preserves_fleet_maxima_and_preflights_sqlite_successors() {
             &overflow_ids,
             RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
             RecoveryLimits::default(),
-        )
-        .expect("overflow plan remains inspectable");
-    let overflow_confirmation = RecoveryConfirmation::legacy(
-        &overflow_plan,
-        RecoveryConfirmation::required_legacy_acknowledgement(),
-    );
-    assert_eq!(
-        manager.execute(
-            &context(),
-            &overflow_plan,
-            &overflow_confirmation,
-            &overflow_replicas,
-            overflow_backup.path(),
-            RecoveryLimits::default(),
         ),
-        Err(RecoveryError::WorkLimitExceeded)
+        Err(RecoveryError::CorruptReplica),
+        "an exhausted fence with no representable allocator successor is corrupt",
     );
     assert!(
         std::fs::read_dir(overflow_backup.path())
@@ -1227,6 +1313,161 @@ fn inspection_enforces_database_value_row_and_deadline_budgets() {
                 limits,
             }),
             Err(RecoveryError::WorkLimitExceeded)
+        );
+    }
+}
+
+#[test]
+fn current_recovery_inspection_enforces_the_consensus_payload_cap() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let ids = [
+        replica_id("current-cap-replica-a"),
+        replica_id("current-cap-replica-b"),
+        replica_id("current-cap-replica-c"),
+    ];
+    let replica = create_legacy_replica(temp.path(), ids[0].clone(), 3);
+    let members = node_set(&ids);
+    claim_current_replica(
+        &replica,
+        &members,
+        LogId::new(
+            CommittedLeaderId::new(1, *members.iter().next().expect("member")),
+            0,
+        ),
+    );
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    let oversized = sealed_recovery_record(1_048_577);
+    crate::sqlite::ops::insert_or_replace_record_sync(&conn, &oversized)
+        .expect("inject valid sealed record above the consensus cap");
+    crate::sqlite::ops::insert_or_replace_fence_sync(&conn, &oversized.key, oversized.fence.get())
+        .expect("persist the record fence");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint current replica");
+    drop(conn);
+
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        }),
+        Err(RecoveryError::CorruptReplica)
+    );
+}
+
+#[test]
+fn current_recovery_rejects_a_regressed_lease_allocator() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let ids = [
+        replica_id("current-allocator-replica-a"),
+        replica_id("current-allocator-replica-b"),
+        replica_id("current-allocator-replica-c"),
+    ];
+    let replica = create_legacy_replica(temp.path(), ids[0].clone(), 3);
+    let members = node_set(&ids);
+    claim_current_replica(
+        &replica,
+        &members,
+        LogId::new(
+            CommittedLeaderId::new(1, *members.iter().next().expect("member")),
+            0,
+        ),
+    );
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    conn.execute(
+        "UPDATE lease_globals SET val = 3 WHERE key = 'next_fence'",
+        [],
+    )
+    .expect("regress fence allocator");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint allocator mutation");
+    drop(conn);
+
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        }),
+        Err(RecoveryError::CorruptReplica)
+    );
+}
+
+#[test]
+fn legacy_recovery_rejects_a_regressed_lease_allocator() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let ids = [
+        replica_id("legacy-allocator-replica-a"),
+        replica_id("legacy-allocator-replica-b"),
+        replica_id("legacy-allocator-replica-c"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 3),
+        create_legacy_replica(temp.path(), ids[1].clone(), 4),
+        create_legacy_replica(temp.path(), ids[2].clone(), 5),
+    ];
+    let conn = Connection::open(&replicas[0].database_path).expect("open legacy replica");
+    conn.execute(
+        "UPDATE lease_globals SET val = 3 WHERE key = 'next_fence'",
+        [],
+    )
+    .expect("regress fence allocator");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint allocator mutation");
+    drop(conn);
+
+    let manager = recovery(AllowRecovery);
+    assert_eq!(
+        manager.plan(
+            &context(),
+            identity(),
+            node_set(&ids),
+            &replicas,
+            &ids[0],
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        ),
+        Err(RecoveryError::CorruptReplica)
+    );
+}
+
+#[test]
+fn recovery_inspection_rejects_invalid_legacy_lease_semantics() {
+    for (case, mutation) in [
+        (
+            "equal-fence-record-owner",
+            "UPDATE session_records SET owner = 'different-valid-owner'",
+        ),
+        (
+            "noncanonical-lease-timestamp",
+            "UPDATE leases SET guard_expires_at = '2026-07-12T00:01:01Z'",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let id = replica_id("legacy-semantic-replica");
+        let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+        let conn = Connection::open(&replica.database_path).expect("open legacy replica");
+        persist_valid_legacy_lease_record(&conn);
+        conn.execute_batch(mutation).expect("mutate legacy fixture");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint legacy mutation");
+        drop(conn);
+
+        assert_eq!(
+            inspect_replica(InspectionInput {
+                key: &integrity_key(),
+                replica: &replica,
+                identity: identity(),
+                expected_members: &node_set(&[id]),
+                limits: RecoveryLimits::default(),
+            }),
+            Err(RecoveryError::CorruptReplica),
+            "case {case}"
         );
     }
 }

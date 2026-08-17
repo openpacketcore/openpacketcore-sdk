@@ -9,7 +9,8 @@ use opc_session_net::{
     DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW,
     DEFAULT_ROTATION_JITTER, MAX_NEGOTIATED_FRAME_SIZE,
     MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION, MIN_SESSION_CONSENSUS_FRAME_SIZE,
-    SESSION_CONSENSUS_ALPN, SESSION_CONSENSUS_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_ALPN,
+    RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES, SESSION_CONSENSUS_ALPN,
+    SESSION_CONSENSUS_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_ALPN,
     SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
@@ -745,7 +746,11 @@ fn current_v6_profile_matches_its_declared_consensus_and_store_contract() {
     );
     assert_eq!(
         profile.bounds.max_restore_page_payload_bytes,
-        RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES
+        RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES
+    );
+    assert!(
+        RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES > profile.bounds.max_restore_page_payload_bytes,
+        "the local stored-envelope restore ceiling must retain headroom beyond the v5 wire page"
     );
     assert_eq!(
         profile.bounds.max_restore_examined_rows,

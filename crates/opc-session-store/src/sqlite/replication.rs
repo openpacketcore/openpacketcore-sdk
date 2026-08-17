@@ -62,7 +62,20 @@ pub(crate) fn hydrate_replication_entry(
 pub(crate) fn apply_replicated_op_sync(
     conn: &Connection,
     op: ReplicationOp,
-    _caps: &BackendCapabilities,
+    caps: &BackendCapabilities,
+    now: Timestamp,
+) -> Result<(), StoreError> {
+    // Keep this defense at the replay boundary as callers other than the
+    // public async adapter can invoke this synchronous helper directly.
+    // In particular, validate an entire nested batch before its first child
+    // can mutate the transaction.
+    validate_replication_payloads(&op, caps.max_value_bytes)?;
+    apply_validated_replicated_op_sync(conn, op, now)
+}
+
+fn apply_validated_replicated_op_sync(
+    conn: &Connection,
+    op: ReplicationOp,
     now: Timestamp,
 ) -> Result<(), StoreError> {
     match op {
@@ -363,11 +376,53 @@ pub(crate) fn apply_replicated_op_sync(
         }
         ReplicationOp::Batch { ops } => {
             for sub_op in ops {
-                apply_replicated_op_sync(conn, sub_op, _caps, now)?;
+                apply_validated_replicated_op_sync(conn, sub_op, now)?;
             }
             Ok(())
         }
     }
+}
+
+fn validate_replication_payload_len(
+    record: &crate::StoredSessionRecord,
+    max_value_bytes: usize,
+) -> Result<(), StoreError> {
+    if record.payload.len() > max_value_bytes {
+        return Err(StoreError::PayloadTooLarge {
+            actual: record.payload.len(),
+            max: max_value_bytes,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_replication_payloads(
+    root: &ReplicationOp,
+    max_value_bytes: usize,
+) -> Result<(), StoreError> {
+    // This preflight is shared by the public adapter, append/rebuild helpers,
+    // and the replay defense above. Structure is checked first so walking an
+    // untrusted tree stays bounded before we inspect every nested CAS.
+    root.validate_structure()?;
+
+    let mut pending = vec![root];
+    while let Some(op) = pending.pop() {
+        match op {
+            ReplicationOp::CompareAndSet {
+                key, new_record, ..
+            } => {
+                if new_record.key != *key {
+                    return Err(StoreError::InvalidKey(
+                        "compare-and-set key does not match record key".into(),
+                    ));
+                }
+                validate_replication_payload_len(new_record, max_value_bytes)?;
+            }
+            ReplicationOp::Batch { ops } => pending.extend(ops.iter()),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn replicate_entry_sync(
@@ -377,6 +432,7 @@ pub(crate) fn replicate_entry_sync(
     now: Timestamp,
 ) -> Result<bool, StoreError> {
     entry.validate()?;
+    validate_replication_payloads(&entry.op, caps.max_value_bytes)?;
     let sqlite_sequence = sqlite_replication_sequence(entry.sequence)?;
     let tx = super::standalone_transaction(conn)?;
 
@@ -467,6 +523,9 @@ pub(crate) fn rebuild_replication_state_sync(
     caps: &BackendCapabilities,
 ) -> Result<(), StoreError> {
     validate_replication_prefix(entries)?;
+    for entry in entries {
+        validate_replication_payloads(&entry.op, caps.max_value_bytes)?;
+    }
     let tx = super::standalone_transaction(conn)?;
 
     let removed_records = tx

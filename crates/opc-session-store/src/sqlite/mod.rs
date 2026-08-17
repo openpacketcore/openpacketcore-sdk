@@ -30,7 +30,7 @@ use crate::{
     error::{LeaseError, StoreError},
     lease::{LeaseGuard, SessionLeaseManager},
     model::{OwnerId, SessionKey},
-    record::StoredSessionRecord,
+    record::{SessionPayloadEncoding, StoredSessionRecord},
     replication_watch::{
         prepare_consumer_watch_registration, prepare_watch_registration, watch_backlog_query_limit,
         ConsumerReplicationWatcher, ReplicationWatcher,
@@ -45,13 +45,60 @@ pub(crate) mod lease;
 pub(crate) mod ops;
 pub(crate) mod replication;
 
-const SQLITE_SESSION_MAX_VALUE_BYTES: usize = 1_048_576;
+const SQLITE_SESSION_MAX_VALUE_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
+// Consensus retains its existing value profile until #683 raises the shared
+// command/RPC and consumer-response ceilings together. Advertising the raw
+// SQLite limit through that adapter would accept values its 2 MiB transport
+// cannot propose and would disable every record-bearing consumer batch.
+pub(crate) const SQLITE_CONSENSUS_MAX_VALUE_BYTES: usize = 1_048_576;
 const CONSENSUS_AUTHORITY_REQUIRED: &str = "consensus_authority_required";
 const RESTORE_SCAN_BLOCKING_WORKERS: usize = 1;
 const SQLITE_OPERATION_BLOCKING_WORKERS: usize = 1;
 const SQLITE_OPERATION_MAX_WORK: Duration = Duration::from_secs(2);
 const SQLITE_BUSY_TIMEOUT_MILLIS: u64 = 100;
 const SQLITE_OPERATION_PROGRESS_INTERVAL: i32 = 1_000;
+
+pub(crate) fn validate_consensus_record(record: &StoredSessionRecord) -> Result<(), StoreError> {
+    let actual = record.payload.len();
+    if actual > SQLITE_CONSENSUS_MAX_VALUE_BYTES {
+        return Err(StoreError::PayloadTooLarge {
+            actual,
+            max: SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+        });
+    }
+    if record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
+        return Err(StoreError::Crypto(
+            "session consensus requires a sealed payload".into(),
+        ));
+    }
+    record.payload.validate_envelope_for_record(record)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestoreScanValidationProfile {
+    Standalone,
+    Consensus,
+}
+
+impl RestoreScanValidationProfile {
+    const fn is_standalone(self) -> bool {
+        matches!(self, Self::Standalone)
+    }
+
+    const fn max_payload_bytes(self) -> usize {
+        match self {
+            Self::Standalone => crate::RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES,
+            Self::Consensus => SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+        }
+    }
+
+    fn validate_record(self, record: &StoredSessionRecord) -> Result<(), StoreError> {
+        match self {
+            Self::Standalone => Ok(()),
+            Self::Consensus => validate_consensus_record(record),
+        }
+    }
+}
 
 /// Begin one standalone operation while holding SQLite's write reservation.
 ///
@@ -565,7 +612,9 @@ impl SqliteSessionBackend {
 
     /// Capabilities consumed by the consensus adapter that owns this backend.
     pub(crate) const fn consensus_capabilities(&self) -> BackendCapabilities {
-        self.caps
+        let mut capabilities = self.caps;
+        capabilities.max_value_bytes = SQLITE_CONSENSUS_MAX_VALUE_BYTES;
+        capabilities
     }
 
     /// Whether consensus state is backed by a filesystem database.
@@ -660,6 +709,9 @@ impl SqliteSessionBackend {
                 .unchecked_transaction()
                 .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
             let result = ops::get_sync(&tx, &key, logical_time)?;
+            if let Some(record) = result.as_ref() {
+                validate_consensus_record(record)?;
+            }
             tx.commit()
                 .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
             Ok(result)
@@ -674,8 +726,13 @@ impl SqliteSessionBackend {
         logical_time: opc_types::Timestamp,
         deadline: tokio::time::Instant,
     ) -> Result<RestoreScanPage, StoreError> {
-        self.run_restore_scan(request, logical_time, deadline, false)
-            .await
+        self.run_restore_scan(
+            request,
+            logical_time,
+            deadline,
+            RestoreScanValidationProfile::Consensus,
+        )
+        .await
     }
 
     async fn run_restore_scan(
@@ -683,7 +740,7 @@ impl SqliteSessionBackend {
         request: RestoreScanRequest,
         logical_time: opc_types::Timestamp,
         deadline: tokio::time::Instant,
-        standalone: bool,
+        profile: RestoreScanValidationProfile,
     ) -> Result<RestoreScanPage, StoreError> {
         let cancellation = Arc::new(AtomicBool::new(false));
         // Admission happens before `spawn_blocking` and the owned permit stays
@@ -716,7 +773,7 @@ impl SqliteSessionBackend {
             if task_cancellation.load(Ordering::Acquire) {
                 return Some(Err(StoreError::RestoreScanWorkBudgetExceeded));
             }
-            let tx = if standalone {
+            let tx = if profile.is_standalone() {
                 match standalone_transaction(&conn) {
                     Ok(tx) => tx,
                     Err(error) => return Some(Err(error)),
@@ -736,7 +793,7 @@ impl SqliteSessionBackend {
                 logical_time,
                 Arc::clone(&task_cancellation),
                 operation_deadline,
-                standalone,
+                profile,
             ) {
                 Ok(result) => result,
                 Err(error) => return Some(Err(error)),
@@ -948,11 +1005,12 @@ impl SqliteSessionBackend {
                 let (stored_sequence, stored_tx_id, json) = item.map_err(|_| {
                     StoreError::BackendUnavailable("session store read failed".into())
                 })?;
-                result.push(replication::hydrate_replication_entry(
-                    stored_sequence,
-                    stored_tx_id,
-                    &json,
-                )?);
+                let entry =
+                    replication::hydrate_replication_entry(stored_sequence, stored_tx_id, &json)?;
+                consensus::validate_sealed_replication_op(&entry.op).map_err(|_| {
+                    StoreError::BackendUnavailable("session store read failed".into())
+                })?;
+                result.push(entry);
             }
             validate_replication_log_page_owned(start, limit, result)
         })
@@ -1047,6 +1105,17 @@ fn sqlite_capabilities() -> BackendCapabilities {
         restore_scan: true,
         max_value_bytes: SQLITE_SESSION_MAX_VALUE_BYTES,
     }
+}
+
+#[cfg(test)]
+#[test]
+fn consensus_value_cap_stays_below_unexpanded_transport_contract() {
+    let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite backend");
+    assert_eq!(
+        backend.consensus_capabilities().max_value_bytes,
+        SQLITE_CONSENSUS_MAX_VALUE_BYTES
+    );
+    assert!(backend.consensus_capabilities().max_value_bytes < SQLITE_SESSION_MAX_VALUE_BYTES);
 }
 
 fn sqlite_store_outcome_unavailable(kind: SqliteStoreWorkKind) -> StoreError {
@@ -1315,7 +1384,13 @@ impl SessionBackend for SqliteSessionBackend {
                 crate::RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
             ))
             .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
-        self.run_restore_scan(request, now, deadline, true).await
+        self.run_restore_scan(
+            request,
+            now,
+            deadline,
+            RestoreScanValidationProfile::Standalone,
+        )
+        .await
     }
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
@@ -1416,6 +1491,7 @@ impl SessionBackend for SqliteSessionBackend {
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
         let entry = entry.into_validated()?;
+        replication::validate_replication_payloads(&entry.op, self.caps.max_value_bytes)?;
         let worker_entry = entry.clone();
         let now = self.clock.now_utc();
         let caps = self.caps;
@@ -1438,6 +1514,9 @@ impl SessionBackend for SqliteSessionBackend {
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
         let entries = validate_replication_prefix_owned(entries)?;
+        for entry in &entries {
+            replication::validate_replication_payloads(&entry.op, self.caps.max_value_bytes)?;
+        }
         let caps = self.caps;
         self.run_store_sqlite_task(SqliteStoreWorkKind::Mutation, move |conn| {
             replication::rebuild_replication_state_sync(conn, &entries, &caps)
@@ -1827,7 +1906,7 @@ mod operation_lifetime_tests {
                         RestoreScanRequest::all(1),
                         restore_backend.clock.now_utc(),
                         deadline,
-                        true,
+                        RestoreScanValidationProfile::Standalone,
                     )
                     .await
             });
@@ -2012,7 +2091,7 @@ mod restore_cancellation_tests {
                     RestoreScanRequest::all(1),
                     backend.clock.now_utc(),
                     deadline,
-                    true,
+                    RestoreScanValidationProfile::Standalone,
                 )
                 .await
                 .expect_err("queued scan must stop at its absolute deadline");
@@ -2037,7 +2116,7 @@ mod restore_cancellation_tests {
                 RestoreScanRequest::all(1),
                 backend.clock.now_utc(),
                 deadline,
-                true,
+                RestoreScanValidationProfile::Standalone,
             )
             .await
             .expect_err("connection admission must stop at the operation deadline");

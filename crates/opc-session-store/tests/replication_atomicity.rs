@@ -4,8 +4,9 @@ use bytes::Bytes;
 use futures_util::{stream::BoxStream, StreamExt};
 use opc_session_store::{
     EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, OwnerId, ReplicationEntry,
-    ReplicationOp, SessionKey, SessionKeyType, SessionStoreBackend, SqliteSessionBackend,
-    StateClass, StateType, StoreError, StoredSessionRecord,
+    ReplicationOp, RestoreScanRequest, RestoreScanScope, SessionBackend, SessionKey,
+    SessionKeyType, SessionStoreBackend, SqliteSessionBackend, StateClass, StateType, StoreError,
+    StoredSessionRecord,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
@@ -117,6 +118,46 @@ fn lease_and_record_entry(
     )
 }
 
+fn cross_key_lease_and_record_entry(
+    sequence: u64,
+    op_key: SessionKey,
+    record_key: SessionKey,
+    owner: &OwnerId,
+    timestamp: Timestamp,
+) -> ReplicationEntry {
+    let fence = 2;
+    let credential_id = 2;
+    let mut compare_and_set = compare_and_set(
+        op_key.clone(),
+        owner,
+        fence,
+        credential_id,
+        1,
+        None,
+        timestamp,
+    );
+    let ReplicationOp::CompareAndSet { new_record, .. } = &mut compare_and_set else {
+        panic!("fixture is a compare-and-set");
+    };
+    new_record.key = record_key;
+
+    entry(
+        sequence,
+        "cross-key-rejected",
+        timestamp,
+        ReplicationOp::Batch {
+            ops: vec![ReplicationOp::Batch {
+                ops: vec![
+                    acquire(op_key, owner, fence, credential_id, timestamp),
+                    ReplicationOp::Batch {
+                        ops: vec![compare_and_set],
+                    },
+                ],
+            }],
+        },
+    )
+}
+
 async fn replication_snapshot<B>(backend: &B) -> (u64, Vec<ReplicationEntry>, (u64, u64))
 where
     B: SessionStoreBackend,
@@ -135,6 +176,42 @@ where
             .await
             .expect("read lease counters"),
     )
+}
+
+async fn restore_continuation<B>(backend: &B) -> RestoreScanRequest
+where
+    B: SessionStoreBackend,
+{
+    let first = backend
+        .scan_restore_records(RestoreScanRequest::all(1))
+        .await
+        .expect("read first restore page");
+    RestoreScanRequest {
+        scope: RestoreScanScope::all(),
+        cursor: Some(
+            first
+                .next_cursor
+                .expect("two-record fixture yields a continuation"),
+        ),
+        limit: 1,
+    }
+}
+
+async fn assert_restore_continuation_is_current<B>(
+    backend: &B,
+    request: RestoreScanRequest,
+    expected_key: &SessionKey,
+) where
+    B: SessionStoreBackend,
+{
+    let continued = backend
+        .scan_restore_records(request)
+        .await
+        .expect("failed replication leaves the restore revision unchanged");
+    assert_eq!(
+        continued.records.first().map(|record| &record.key),
+        Some(expected_key)
+    );
 }
 
 async fn next_watch_entry(
@@ -321,6 +398,85 @@ where
     assert_no_watch_entry(&mut watch).await;
 }
 
+async fn assert_sqlite_cross_key_replication_is_rejected_before_mutation(rebuild: bool) {
+    let backend = SqliteSessionBackend::in_memory().expect("SQLite backend");
+    let owner = OwnerId::new("owner-a").expect("owner");
+    let original_key = key(b"cross-key-original");
+    let sentinel_key = key(b"cross-key-sentinel");
+    let op_key = key(b"cross-key-op");
+    let record_key = key(b"cross-key-record");
+    let original = lease_and_record_entry(
+        1,
+        "cross-key-original",
+        original_key.clone(),
+        &owner,
+        1,
+        1,
+        timestamp(),
+    );
+    backend
+        .replicate_entry(original.clone())
+        .await
+        .expect("seed original state");
+    backend
+        .replicate_entry(lease_and_record_entry(
+            2,
+            "cross-key-sentinel",
+            sentinel_key.clone(),
+            &owner,
+            2,
+            2,
+            timestamp(),
+        ))
+        .await
+        .expect("seed restore continuation");
+    let restore_continuation = restore_continuation(&backend).await;
+    let before = replication_snapshot(&backend).await;
+    let original_record = backend
+        .get(&original_key)
+        .await
+        .expect("read original")
+        .expect("original record");
+    let mut watch = backend.watch(3).await.expect("watch cross-key rejection");
+
+    let rejected = cross_key_lease_and_record_entry(
+        if rebuild { 1 } else { 3 },
+        op_key.clone(),
+        record_key.clone(),
+        &owner,
+        timestamp(),
+    );
+    let result = if rebuild {
+        backend.rebuild_replication_state(vec![rejected]).await
+    } else {
+        backend.replicate_entry(rejected).await
+    };
+
+    assert_eq!(
+        result.expect_err("cross-key replicated CAS must fail closed"),
+        StoreError::InvalidKey("compare-and-set key does not match record key".into())
+    );
+    // The snapshots cover replication head/log, next lease/fence counters,
+    // and the opaque restore revision carried by the continuation.
+    assert_eq!(replication_snapshot(&backend).await, before);
+    assert_eq!(
+        backend.get(&original_key).await.expect("read original"),
+        Some(original_record)
+    );
+    assert!(backend
+        .get(&op_key)
+        .await
+        .expect("read rejected op key")
+        .is_none());
+    assert!(backend
+        .get(&record_key)
+        .await
+        .expect("read rejected record key")
+        .is_none());
+    assert_restore_continuation_is_current(&backend, restore_continuation, &sentinel_key).await;
+    assert_no_watch_entry(&mut watch).await;
+}
+
 async fn assert_successful_compound_append_is_ordered_and_single_event<B>(backend: B)
 where
     B: SessionStoreBackend,
@@ -397,6 +553,134 @@ where
     assert_no_watch_entry(&mut watch).await;
 }
 
+async fn assert_sqlite_oversized_replication_is_rejected_before_mutation(rebuild: bool) {
+    let backend = SqliteSessionBackend::in_memory().expect("SQLite backend");
+    let owner = OwnerId::new("owner-a").expect("owner");
+    let original_key = key(b"payload-bound-original");
+    let sentinel_key = key(b"payload-bound-sentinel");
+    let candidate_key = key(b"payload-bound-candidate");
+    let original = lease_and_record_entry(
+        1,
+        "payload-bound-original",
+        original_key.clone(),
+        &owner,
+        1,
+        1,
+        timestamp(),
+    );
+    backend
+        .replicate_entry(original.clone())
+        .await
+        .expect("seed original state");
+    backend
+        .replicate_entry(lease_and_record_entry(
+            2,
+            "payload-bound-sentinel",
+            sentinel_key.clone(),
+            &owner,
+            2,
+            2,
+            timestamp(),
+        ))
+        .await
+        .expect("seed restore continuation");
+    let restore_continuation = restore_continuation(&backend).await;
+    let before = replication_snapshot(&backend).await;
+    let original_record = backend
+        .get(&original_key)
+        .await
+        .expect("read original")
+        .expect("original record");
+    let mut watch = backend.watch(3).await.expect("watch oversized rejection");
+    let caps = backend.capabilities().await;
+    let candidate_timestamp = timestamp();
+    let mut oversized = lease_and_record_entry(
+        if rebuild { 1 } else { 3 },
+        "payload-bound-oversized",
+        candidate_key.clone(),
+        &owner,
+        2,
+        2,
+        candidate_timestamp,
+    );
+    let ReplicationOp::Batch { ops } = &mut oversized.op else {
+        panic!("fixture is a batch");
+    };
+    let Some(ReplicationOp::CompareAndSet { new_record, .. }) = ops.get_mut(1) else {
+        panic!("fixture contains a CAS");
+    };
+    new_record.payload =
+        EncryptedSessionPayload::new(Bytes::from(vec![0xAB; caps.max_value_bytes + 1]));
+
+    let result = if rebuild {
+        backend.rebuild_replication_state(vec![oversized]).await
+    } else {
+        backend.replicate_entry(oversized).await
+    };
+    assert_eq!(
+        result.expect_err("oversized replicated value must fail closed"),
+        StoreError::PayloadTooLarge {
+            actual: caps.max_value_bytes + 1,
+            max: caps.max_value_bytes,
+        }
+    );
+    assert_eq!(replication_snapshot(&backend).await, before);
+    assert_eq!(
+        backend.get(&original_key).await.expect("read original"),
+        Some(original_record)
+    );
+    assert!(backend
+        .get(&candidate_key)
+        .await
+        .expect("read rejected candidate")
+        .is_none());
+    assert_restore_continuation_is_current(&backend, restore_continuation, &sentinel_key).await;
+    assert_no_watch_entry(&mut watch).await;
+}
+
+async fn assert_sqlite_exact_replication_payload_is_accepted(rebuild: bool) {
+    let backend = SqliteSessionBackend::in_memory().expect("SQLite backend");
+    let owner = OwnerId::new("owner-a").expect("owner");
+    let candidate_key = key(b"payload-bound-exact");
+    let caps = backend.capabilities().await;
+    let mut exact = lease_and_record_entry(
+        1,
+        "payload-bound-exact",
+        candidate_key.clone(),
+        &owner,
+        1,
+        1,
+        timestamp(),
+    );
+    let ReplicationOp::Batch { ops } = &mut exact.op else {
+        panic!("fixture is a batch");
+    };
+    let Some(ReplicationOp::CompareAndSet { new_record, .. }) = ops.get_mut(1) else {
+        panic!("fixture contains a CAS");
+    };
+    new_record.payload =
+        EncryptedSessionPayload::new(Bytes::from(vec![0xAB; caps.max_value_bytes]));
+
+    if rebuild {
+        backend
+            .rebuild_replication_state(vec![exact])
+            .await
+            .expect("the advertised exact payload limit must rebuild");
+    } else {
+        backend
+            .replicate_entry(exact)
+            .await
+            .expect("the advertised exact payload limit must replicate");
+    }
+    let retained = backend
+        .get(&candidate_key)
+        .await
+        .expect("read exact-limit candidate")
+        .expect("exact-limit candidate");
+    assert_eq!(retained.payload.len(), caps.max_value_bytes);
+    assert_eq!(backend.max_replication_sequence().await.unwrap(), 1);
+}
+
 #[tokio::test]
 async fn fake_failed_compound_append_is_atomic() {
     assert_failed_compound_append_is_atomic(FakeSessionBackend::new()).await;
@@ -419,6 +703,16 @@ async fn fake_failed_rebuild_is_atomic() {
 async fn sqlite_failed_rebuild_is_atomic() {
     assert_failed_rebuild_is_atomic(SqliteSessionBackend::in_memory().expect("SQLite backend"))
         .await;
+}
+
+#[tokio::test]
+async fn sqlite_cross_key_replication_append_is_rejected_before_mutation() {
+    assert_sqlite_cross_key_replication_is_rejected_before_mutation(false).await;
+}
+
+#[tokio::test]
+async fn sqlite_cross_key_replication_rebuild_is_rejected_before_mutation() {
+    assert_sqlite_cross_key_replication_is_rejected_before_mutation(true).await;
 }
 
 #[tokio::test]
@@ -445,4 +739,24 @@ async fn sqlite_successful_rebuild_preserves_watch_subscription() {
         SqliteSessionBackend::in_memory().expect("SQLite backend"),
     )
     .await;
+}
+
+#[tokio::test]
+async fn sqlite_oversized_replication_append_is_rejected_before_mutation() {
+    assert_sqlite_oversized_replication_is_rejected_before_mutation(false).await;
+}
+
+#[tokio::test]
+async fn sqlite_oversized_replication_rebuild_is_rejected_before_mutation() {
+    assert_sqlite_oversized_replication_is_rejected_before_mutation(true).await;
+}
+
+#[tokio::test]
+async fn sqlite_exact_replication_payload_is_accepted() {
+    assert_sqlite_exact_replication_payload_is_accepted(false).await;
+}
+
+#[tokio::test]
+async fn sqlite_exact_replication_payload_rebuild_is_accepted() {
+    assert_sqlite_exact_replication_payload_is_accepted(true).await;
 }

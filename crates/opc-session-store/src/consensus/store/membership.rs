@@ -1178,12 +1178,15 @@ impl ConsensusSessionStore {
     /// RPC handler, bind the topology transport admission adapter, and leave
     /// cluster initialization to the existing voters. Only replicated learner
     /// catch-up followed by committed joint membership can admit voting.
+    /// Non-Linux platforms return the typed dynamic-consensus unsupported
+    /// error before inspecting or creating consensus durable state.
     pub async fn open_membership_candidate(
         bootstrap: SessionTopologyCandidateBootstrap,
         backend: SqliteSessionBackend,
         snapshot_dir: impl Into<PathBuf>,
         desired_peers: SessionTopologyTransitionPeers,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::require_dynamic_consensus_platform()?;
         let SessionTopologyCandidateBootstrap {
             storage_anchor,
             current_topology,

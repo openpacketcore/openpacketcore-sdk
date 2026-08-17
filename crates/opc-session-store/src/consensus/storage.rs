@@ -41,6 +41,9 @@ const SNAPSHOT_APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum SessionConsensusStorageError {
+    /// Durable consensus initialization is unsupported on this platform.
+    #[error("session consensus storage is unsupported on this platform")]
+    UnsupportedPlatform,
     /// Legacy session authority exists without a durable consensus identity.
     #[error("session consensus recovery is required before this database can join a cluster")]
     RecoveryRequired,
@@ -1387,11 +1390,12 @@ async fn seal_snapshot_database(
     Ok((snapshot, checksum, total))
 }
 
-/// Seal a Dynamic snapshot using the portable path-based SQLite image flow.
+/// Seal a Dynamic snapshot using the internal path-based SQLite image flow.
 ///
-/// Dynamic consensus intentionally retains the released cross-platform
-/// behavior. Fixed authority uses `seal_snapshot_database` above, whose
-/// descriptor pinning remains an additional Linux-only identity fence.
+/// Public dynamic consensus construction is Linux-only. This helper remains
+/// path-based within that boundary; it is not a portable consensus fallback.
+/// Fixed authority uses `seal_snapshot_database` above, whose descriptor
+/// pinning is an additional identity fence.
 async fn seal_snapshot_database_from_path(
     raw_path: &Path,
     output_path: &Path,
@@ -1817,7 +1821,7 @@ mod tests {
     fn sealed_cas_entry(
         index: u64,
         request_byte: u8,
-        opaque_bytes: usize,
+        payload_bytes: usize,
     ) -> Entry<SessionRaftTypeConfig> {
         let key = key();
         let owner = OwnerId::new("replica-a").expect("owner");
@@ -1840,7 +1844,12 @@ mod tests {
             expires_at: None,
             payload: EncryptedSessionPayload::new([]),
         };
+        let envelope_overhead = test_envelope(&record, &[]).len();
+        let opaque_bytes = payload_bytes
+            .checked_sub(envelope_overhead)
+            .expect("payload length exceeds envelope overhead");
         let sealed = test_envelope(&record, &vec![request_byte; opaque_bytes]);
+        assert_eq!(sealed.len(), payload_bytes);
         record.payload =
             EncryptedSessionPayload::try_envelope(sealed).expect("structurally valid envelope");
         normal_entry(
@@ -1901,11 +1910,7 @@ mod tests {
             initial_membership_entry(),
             sealed_cas_entry(1, 11, 600 * 1024),
             sealed_cas_entry(2, 12, 600 * 1024),
-            sealed_cas_entry(
-                3,
-                13,
-                opc_consensus::DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES + 64 * 1024,
-            ),
+            sealed_cas_entry(3, 13, crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES),
         ];
         {
             let conn = log_store.core.conn.lock().await;
