@@ -22,11 +22,12 @@ use futures_util::FutureExt;
 use opc_session_store::{
     session_consumer_batch_result_into_store, BackendCapabilities, CompareAndSet,
     CompareAndSetResult, LeaseError, LeaseGuard, OwnerId, RecordExpiryPreflight, RestoreScanPage,
-    RestoreScanRequest, SessionConsumerAuthorizationManifest, SessionConsumerChange,
-    SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
-    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionOp,
-    SessionOpResult, SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
+    RestoreScanRequest, SessionConsumerAuthorizationManifest, SessionConsumerBatchResult,
+    SessionConsumerChange, SessionConsumerIdentity, SessionConsumerLeaseError,
+    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+    SessionConsumerScope, SessionConsumerStoreError, SessionOp, SessionOpResult,
+    SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
     MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use opc_types::SpiffeId;
@@ -45,10 +46,9 @@ use crate::lifecycle::{
 use crate::protocol::{
     bounded_session_op_expectations, compare_and_set_result_matches_key, get_result_matches_key,
     read_authenticated_frame_payload_until, read_frame_payload,
-    session_op_results_match_expectations, validate_restore_scan_wire_payload_bytes,
-    write_frame_bounded_until, write_frame_bounded_until_classified,
-    write_frame_bounded_until_classified_with_progress, FrameWriteError, FrameWriteProgress,
-    MAX_NEGOTIATED_FRAME_SIZE,
+    validate_restore_scan_wire_payload_bytes, write_frame_bounded_until,
+    write_frame_bounded_until_classified, write_frame_bounded_until_classified_with_progress,
+    FrameWriteError, FrameWriteProgress, MAX_NEGOTIATED_FRAME_SIZE,
 };
 
 /// Dedicated ALPN for authenticated session-quorum consumers.
@@ -1052,26 +1052,219 @@ fn response_matches_operation(
     )
 }
 
-/// `OutcomeUnavailable` is meaningful only for operation families whose
-/// outcome can be ambiguous. A read-like response carrying it would be a
-/// cross-family semantic response from an authenticated peer, even though its
-/// outer response variant is correct.
+/// Check the closed, typed error against the operation that can actually
+/// produce it.  The wire error deliberately erases backend detail, so this is
+/// a conservative allow-list derived from the public consumer operation
+/// contracts. An authenticated peer cannot use a same-variant but impossible
+/// error to turn a stale or cross-family response into application success.
 fn store_error_matches_operation(
     operation: &SessionConsumerOperation,
     error: SessionConsumerStoreError,
 ) -> bool {
-    !matches!(error, SessionConsumerStoreError::OutcomeUnavailable)
-        || matches!(
-            operation,
-            SessionConsumerOperation::CompareAndSet { .. }
-                | SessionConsumerOperation::DeleteFenced { .. }
-                | SessionConsumerOperation::RefreshTtl { .. }
-        )
-        || matches!(
-            operation,
-            SessionConsumerOperation::Batch { ops }
-                if ops.iter().any(|op| !matches!(op, SessionOp::Get { .. }))
-        )
+    match operation {
+        SessionConsumerOperation::Get { .. } => matches!(
+            error,
+            SessionConsumerStoreError::StaleFence
+                | SessionConsumerStoreError::Unavailable
+                | SessionConsumerStoreError::ProtectedDataRejected
+        ),
+        SessionConsumerOperation::PreflightRecordExpiry { .. } => matches!(
+            error,
+            SessionConsumerStoreError::StaleFence
+                | SessionConsumerStoreError::Unavailable
+                | SessionConsumerStoreError::InvalidInput
+                | SessionConsumerStoreError::CapabilityNotSupported
+        ),
+        SessionConsumerOperation::CompareAndSet { .. } => matches!(
+            error,
+            SessionConsumerStoreError::NotFound
+                | SessionConsumerStoreError::StaleFence
+                | SessionConsumerStoreError::CasConflict
+                | SessionConsumerStoreError::RequestConflict
+                | SessionConsumerStoreError::OutcomeUnavailable
+                | SessionConsumerStoreError::Unavailable
+                | SessionConsumerStoreError::InvalidInput
+                | SessionConsumerStoreError::CapabilityNotSupported
+                | SessionConsumerStoreError::PayloadTooLarge
+                | SessionConsumerStoreError::LeaseUnavailable
+                | SessionConsumerStoreError::ProtectedDataRejected
+        ),
+        SessionConsumerOperation::DeleteFenced { .. } => matches!(
+            error,
+            SessionConsumerStoreError::NotFound
+                | SessionConsumerStoreError::StaleFence
+                | SessionConsumerStoreError::RequestConflict
+                | SessionConsumerStoreError::OutcomeUnavailable
+                | SessionConsumerStoreError::Unavailable
+                | SessionConsumerStoreError::InvalidInput
+                | SessionConsumerStoreError::CapabilityNotSupported
+                | SessionConsumerStoreError::LeaseUnavailable
+                | SessionConsumerStoreError::ProtectedDataRejected
+        ),
+        SessionConsumerOperation::RefreshTtl { .. } => matches!(
+            error,
+            SessionConsumerStoreError::NotFound
+                | SessionConsumerStoreError::StaleFence
+                | SessionConsumerStoreError::RequestConflict
+                | SessionConsumerStoreError::OutcomeUnavailable
+                | SessionConsumerStoreError::Unavailable
+                | SessionConsumerStoreError::InvalidInput
+                | SessionConsumerStoreError::CapabilityNotSupported
+                | SessionConsumerStoreError::InvalidTtl
+                | SessionConsumerStoreError::LeaseUnavailable
+                | SessionConsumerStoreError::ProtectedDataRejected
+        ),
+        // A whole-batch error is emitted only before slot execution (input,
+        // preflight, response admission, binding, or availability), never as
+        // a disguised result of one ordered slot.
+        SessionConsumerOperation::Batch { ops } => {
+            matches!(error, SessionConsumerStoreError::RequestConflict)
+                || (matches!(error, SessionConsumerStoreError::OutcomeUnavailable)
+                    && ops.iter().any(|op| !matches!(op, SessionOp::Get { .. })))
+                || matches!(
+                    error,
+                    SessionConsumerStoreError::StaleFence
+                        | SessionConsumerStoreError::Unavailable
+                        | SessionConsumerStoreError::InvalidInput
+                        | SessionConsumerStoreError::CapabilityNotSupported
+                        | SessionConsumerStoreError::InvalidTtl
+                        | SessionConsumerStoreError::PayloadTooLarge
+                        | SessionConsumerStoreError::ProtectedDataRejected
+                )
+        }
+        SessionConsumerOperation::ScanRestoreRecords { .. } => matches!(
+            error,
+            SessionConsumerStoreError::StaleFence
+                | SessionConsumerStoreError::Unavailable
+                | SessionConsumerStoreError::CapabilityNotSupported
+                | SessionConsumerStoreError::ProtectedDataRejected
+                | SessionConsumerStoreError::RestoreRejected
+                | SessionConsumerStoreError::RestoreCursorStale
+                | SessionConsumerStoreError::RestoreBudgetExceeded
+        ),
+        // Watch errors travel in WatchEntry frames, capabilities have no
+        // store-error body, and lease operations use their closed lease-error
+        // family below.
+        _ => false,
+    }
+}
+
+fn batch_slot_error_matches_operation(
+    operation: &SessionOp,
+    error: SessionConsumerStoreError,
+) -> bool {
+    match operation {
+        SessionOp::Get { .. } => matches!(
+            error,
+            SessionConsumerStoreError::StaleFence
+                | SessionConsumerStoreError::Unavailable
+                | SessionConsumerStoreError::ProtectedDataRejected
+        ),
+        SessionOp::CompareAndSet(op) => store_error_matches_operation(
+            &SessionConsumerOperation::CompareAndSet {
+                op: Box::new(op.clone()),
+            },
+            error,
+        ),
+        SessionOp::DeleteFenced { lease } => store_error_matches_operation(
+            &SessionConsumerOperation::DeleteFenced {
+                lease: lease.clone(),
+            },
+            error,
+        ),
+        SessionOp::RefreshTtl { lease, ttl } => store_error_matches_operation(
+            &SessionConsumerOperation::RefreshTtl {
+                lease: lease.clone(),
+                ttl: *ttl,
+            },
+            error,
+        ),
+    }
+}
+
+fn batch_results_match_request(ops: &[SessionOp], results: &[SessionConsumerBatchResult]) -> bool {
+    bounded_session_op_expectations(ops)
+        .as_ref()
+        .is_ok_and(|expected| {
+            expected.len() == results.len()
+                && ops
+                    .iter()
+                    .zip(results)
+                    .all(|(operation, result)| match (operation, result) {
+                        (SessionOp::Get { key }, SessionConsumerBatchResult::Get(result)) => {
+                            get_result_matches_key(
+                                key,
+                                &result
+                                    .clone()
+                                    .map_err(SessionConsumerStoreError::into_store_error),
+                            ) && result.as_ref().err().is_none_or(|error| {
+                                batch_slot_error_matches_operation(operation, *error)
+                            })
+                        }
+                        (
+                            SessionOp::CompareAndSet(op),
+                            SessionConsumerBatchResult::CompareAndSet(result),
+                        ) => {
+                            compare_and_set_result_matches_key(
+                                &op.key,
+                                &result
+                                    .clone()
+                                    .map_err(SessionConsumerStoreError::into_store_error),
+                            ) && result.as_ref().err().is_none_or(|error| {
+                                batch_slot_error_matches_operation(operation, *error)
+                            })
+                        }
+                        (
+                            SessionOp::DeleteFenced { .. },
+                            SessionConsumerBatchResult::DeleteFenced(result),
+                        )
+                        | (
+                            SessionOp::RefreshTtl { .. },
+                            SessionConsumerBatchResult::RefreshTtl(result),
+                        ) => result.as_ref().err().is_none_or(|error| {
+                            batch_slot_error_matches_operation(operation, *error)
+                        }),
+                        _ => false,
+                    })
+        })
+}
+
+fn lease_error_matches_operation(
+    operation: &SessionConsumerOperation,
+    error: SessionConsumerLeaseError,
+) -> bool {
+    match operation {
+        SessionConsumerOperation::AcquireLease { .. } => matches!(
+            error,
+            SessionConsumerLeaseError::RequestConflict
+                | SessionConsumerLeaseError::AlreadyHeld
+                | SessionConsumerLeaseError::StaleFence
+                | SessionConsumerLeaseError::InvalidTtl
+                | SessionConsumerLeaseError::OutcomeUnavailable
+                | SessionConsumerLeaseError::Unavailable
+        ),
+        SessionConsumerOperation::RenewLease { .. } => matches!(
+            error,
+            SessionConsumerLeaseError::RequestConflict
+                | SessionConsumerLeaseError::AlreadyHeld
+                | SessionConsumerLeaseError::Expired
+                | SessionConsumerLeaseError::StaleFence
+                | SessionConsumerLeaseError::NotFound
+                | SessionConsumerLeaseError::InvalidTtl
+                | SessionConsumerLeaseError::OutcomeUnavailable
+                | SessionConsumerLeaseError::Unavailable
+        ),
+        SessionConsumerOperation::ReleaseLease { .. } => matches!(
+            error,
+            SessionConsumerLeaseError::RequestConflict
+                | SessionConsumerLeaseError::AlreadyHeld
+                | SessionConsumerLeaseError::StaleFence
+                | SessionConsumerLeaseError::NotFound
+                | SessionConsumerLeaseError::OutcomeUnavailable
+                | SessionConsumerLeaseError::Unavailable
+        ),
+        _ => false,
+    }
 }
 
 fn store_result_matches_operation<T>(
@@ -1133,16 +1326,7 @@ fn response_matches_request(
             SessionConsumerResponse::RefreshTtl(result),
         ) => store_result_matches_operation(request.operation(), result),
         (SessionConsumerOperation::Batch { ops }, SessionConsumerResponse::Batch(Ok(results))) => {
-            bounded_session_op_expectations(ops)
-                .as_ref()
-                .is_ok_and(|expected| {
-                    let results = results
-                        .iter()
-                        .cloned()
-                        .map(session_consumer_batch_result_into_store)
-                        .collect::<Vec<_>>();
-                    session_op_results_match_expectations(expected, &results)
-                })
+            batch_results_match_request(ops, results)
         }
         (SessionConsumerOperation::Batch { .. }, SessionConsumerResponse::Batch(Err(error))) => {
             store_error_matches_operation(request.operation(), *error)
@@ -1168,6 +1352,10 @@ fn response_matches_request(
                 && crate::protocol::validate_lease_profile(lease).is_ok()
         }
         (
+            SessionConsumerOperation::AcquireLease { .. },
+            SessionConsumerResponse::AcquireLease(Err(error)),
+        ) => lease_error_matches_operation(request.operation(), *error),
+        (
             SessionConsumerOperation::RenewLease { lease, .. },
             SessionConsumerResponse::RenewLease(Ok(renewed)),
         ) => {
@@ -1177,20 +1365,31 @@ fn response_matches_request(
                 && renewed.credential_id() == lease.credential_id()
                 && crate::protocol::validate_lease_profile(renewed).is_ok()
         }
+        (
+            SessionConsumerOperation::RenewLease { .. },
+            SessionConsumerResponse::RenewLease(Err(error)),
+        ) => lease_error_matches_operation(request.operation(), *error),
+        (
+            SessionConsumerOperation::ReleaseLease { .. },
+            SessionConsumerResponse::ReleaseLease(Err(error)),
+        ) => lease_error_matches_operation(request.operation(), *error),
         _ => true,
     }
 }
 
-/// A typed scope or authorization rejection is a valid response to expose to
-/// the caller, but proves this authenticated lane is no longer authorized for
-/// the application's current authority.  It must not be republished into the
-/// idle pool; the next independent call will resolve and authenticate a fresh
-/// lane.  Malformed-request and unavailable rejections remain request-local.
+/// A typed authority or malformed-request rejection is a valid response to
+/// expose to the caller, but may be followed by peer-side lane retirement.
+/// It must not be republished into the idle pool; the next independent call
+/// will resolve and authenticate a fresh lane.  Unavailable remains
+/// request-local because the server keeps a healthy lane after that typed
+/// pre-dispatch rejection.
 fn response_retires_connection_authority(response: &SessionConsumerResponse) -> bool {
     matches!(
         response,
         SessionConsumerResponse::Rejected(
-            SessionConsumerRejection::ScopeMismatch | SessionConsumerRejection::Unauthorized
+            SessionConsumerRejection::ScopeMismatch
+                | SessionConsumerRejection::Unauthorized
+                | SessionConsumerRejection::MalformedRequest
         )
     )
 }
@@ -2967,7 +3166,7 @@ impl StatelessSessionConsumerClient {
                         correlation: received,
                         entry,
                     })) if exact_correlation(correlation, received).is_ok() => match *entry {
-                        Ok(entry) if entry.sequence() == expected_sequence => Ok(entry),
+                        Ok(entry) if entry.sequence() == expected_sequence => entry,
                         Ok(_) => {
                             try_send_consumer_watch_terminal(
                                 &tx,
@@ -2977,7 +3176,25 @@ impl StatelessSessionConsumerClient {
                             );
                             return;
                         }
-                        Err(error) => Err(error.into_store_error()),
+                        Err(error) => {
+                            // A typed watch error does not name a committed
+                            // change and therefore cannot consume
+                            // `expected_sequence`. Deliver it terminally: a
+                            // reconnect is permitted only after a successful
+                            // sequence-bearing entry crosses the queue.
+                            let entry = Err(error.into_store_error());
+                            let Some(byte_count) = consumer_watch_item_byte_count(&entry) else {
+                                return;
+                            };
+                            try_send_consumer_watch_item(
+                                &tx,
+                                &byte_budget,
+                                persistent_pool.as_ref(),
+                                entry,
+                                byte_count,
+                            );
+                            return;
+                        }
                     },
                     Ok(_) => {
                         // Correlation and frame-kind violations are ambiguous:
@@ -3004,34 +3221,50 @@ impl StatelessSessionConsumerClient {
                         return;
                     }
                 };
-                let entry = match serde_json::to_vec(&entry) {
-                    Ok(encoded) if encoded.len() <= CONSUMER_WATCH_CHANNEL_MAX_BYTES => entry,
-                    Ok(encoded) => Err(StoreError::PayloadTooLarge {
-                        actual: encoded.len(),
-                        max: CONSUMER_WATCH_CHANNEL_MAX_BYTES,
-                    }),
-                    Err(_) => Err(StoreError::BackendUnavailable(
-                        "consumer watch unavailable".into(),
-                    )),
+                match serde_json::to_vec(&entry) {
+                    Ok(encoded) if encoded.len() <= CONSUMER_WATCH_CHANNEL_MAX_BYTES => {
+                        drop(encoded);
+                    }
+                    // Local encoding and size failures do not consume a
+                    // committed sequence either. They are terminal rather
+                    // than a reason to reconnect from the successor.
+                    Ok(encoded) => {
+                        let entry = Err(StoreError::PayloadTooLarge {
+                            actual: encoded.len(),
+                            max: CONSUMER_WATCH_CHANNEL_MAX_BYTES,
+                        });
+                        let Some(byte_count) = consumer_watch_item_byte_count(&entry) else {
+                            return;
+                        };
+                        try_send_consumer_watch_item(
+                            &tx,
+                            &byte_budget,
+                            persistent_pool.as_ref(),
+                            entry,
+                            byte_count,
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        let entry = Err(StoreError::BackendUnavailable(
+                            "consumer watch unavailable".into(),
+                        ));
+                        let Some(byte_count) = consumer_watch_item_byte_count(&entry) else {
+                            return;
+                        };
+                        try_send_consumer_watch_item(
+                            &tx,
+                            &byte_budget,
+                            persistent_pool.as_ref(),
+                            entry,
+                            byte_count,
+                        );
+                        return;
+                    }
                 };
-                let Some(byte_count) = consumer_watch_item_byte_count(&entry) else {
+                let Some(byte_count) = consumer_watch_item_byte_count(&Ok(entry.clone())) else {
                     return;
                 };
-                // A terminal peer/protocol/local-encoding error must release
-                // the physical connection and isolated persistent watch slot
-                // even when an unpolled caller has filled the item queue.
-                // Delivery is therefore best-effort and never waits for
-                // receiver capacity once this watch is known to be terminal.
-                if entry.is_err() {
-                    try_send_consumer_watch_item(
-                        &tx,
-                        &byte_budget,
-                        persistent_pool.as_ref(),
-                        entry,
-                        byte_count,
-                    );
-                    return;
-                }
                 let acquire_permit = Arc::clone(&byte_budget).acquire_many_owned(byte_count);
                 tokio::pin!(acquire_permit);
                 let permit = loop {
@@ -3085,7 +3318,7 @@ impl StatelessSessionConsumerClient {
                     counter_increment(&pool.counters.watch_buffered);
                 }
                 let send = tx.send(QueuedConsumerWatchItem {
-                    item: Some(entry),
+                    item: Some(Ok(entry)),
                     _byte_permit: permit,
                     watch_pool: persistent_pool.clone(),
                 });
@@ -3171,25 +3404,41 @@ async fn reconnect_persistent_consumer_watch(
             return Err(SessionConsumerClientError::ShuttingDown);
         }
         counter_increment(&pool.counters.reconnects);
+        // A reconnect repeats the complete resolve/TLS/Hello/watch-open setup
+        // boundary. Account it exactly like the initial setup, but do not
+        // classify it as not-transmitted: this watch had already crossed its
+        // original call-write boundary before the transport was lost.
+        counter_increment(&pool.counters.setup_attempts);
         let open = client.open_watch_connection_with_counters(start_sequence, Some(&pool.counters));
         tokio::pin!(open);
         let result = tokio::select! {
             biased;
-            _ = sender.closed() => return Ok(None),
+            _ = sender.closed() => {
+                counter_increment(&pool.counters.setup_failures);
+                return Ok(None);
+            },
             _ = wait_for_forced_shutdown(&mut shutdown, &pool.shutdown_phase) => {
+                counter_increment(&pool.counters.setup_failures);
                 return Err(SessionConsumerClientError::ShuttingDown);
             }
             result = &mut open => result,
         };
         match result {
             Ok(connection) if pool.phase() == PersistentShutdownPhase::Running => {
+                counter_increment(&pool.counters.setup_successes);
                 return Ok(Some(connection));
             }
-            Ok(_) => return Err(SessionConsumerClientError::ShuttingDown),
+            Ok(_) => {
+                counter_increment(&pool.counters.setup_failures);
+                pool.record_failure(SessionConsumerClientError::ShuttingDown);
+                return Err(SessionConsumerClientError::ShuttingDown);
+            }
             Err(
                 error @ (SessionConsumerClientError::Unavailable
                 | SessionConsumerClientError::Deadline),
             ) if attempt.saturating_add(1) < pool.config.connect_attempts => {
+                counter_increment(&pool.counters.setup_failures);
+                pool.record_failure(error);
                 last_error = error;
                 let delay = pool.reconnect_delay();
                 if !delay.is_zero() {
@@ -3203,7 +3452,11 @@ async fn reconnect_persistent_consumer_watch(
                     }
                 }
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                counter_increment(&pool.counters.setup_failures);
+                pool.record_failure(error);
+                return Err(error);
+            }
         }
     }
     Err(last_error)
@@ -4339,11 +4592,21 @@ impl PersistentSessionConsumerClient {
         let result = self.execute_admitted(request, started, deadline).await;
         match result {
             Ok(response) => {
-                if let SessionConsumerResponse::Rejected(rejection) = &response {
-                    self.pool
-                        .record_failure(consumer_rejection_into_client_error(*rejection));
-                } else {
-                    counter_increment(&self.pool.counters.successes);
+                match &response {
+                    SessionConsumerResponse::Rejected(rejection) => self
+                        .pool
+                        .record_failure(consumer_rejection_into_client_error(*rejection)),
+                    SessionConsumerResponse::OutcomeUnknown(_) => {
+                        // The complete typed response proves the request left
+                        // this process, but not whether its mutation reached
+                        // the quorum. It is a failure, never a success.
+                        self.pool
+                            .record_failure(SessionConsumerClientError::Unavailable);
+                        counter_increment(&self.pool.counters.outcome_unknown);
+                    }
+                    _ => {
+                        counter_increment(&self.pool.counters.successes);
+                    }
                 }
                 Ok(response)
             }
@@ -5033,6 +5296,24 @@ fn rejection_into_store_error(rejection: SessionConsumerRejection) -> StoreError
     }
 }
 
+/// A complete typed rejection is proof that the server did not dispatch the
+/// lease mutation.  Preserve that known-safe boundary instead of turning a
+/// peer-declared rejection into an ambiguous lease loss.
+fn rejection_into_lease_error(rejection: SessionConsumerRejection) -> LeaseError {
+    match rejection {
+        SessionConsumerRejection::ScopeMismatch | SessionConsumerRejection::Unauthorized => {
+            // The caller's current authority is no longer usable.
+            LeaseError::StaleFence
+        }
+        SessionConsumerRejection::MalformedRequest => {
+            LeaseError::Backend("consumer request rejected".into())
+        }
+        SessionConsumerRejection::Unavailable => {
+            LeaseError::Backend("consumer quorum unavailable".into())
+        }
+    }
+}
+
 fn mutation_response<T>(
     request_id: SessionConsumerRequestId,
     response: Result<SessionConsumerResponse, SessionConsumerCallError>,
@@ -5076,9 +5357,8 @@ fn lease_response<T>(
         Err(SessionConsumerCallError::BeforeCallWrite(cause)) => {
             Err(SessionConsumerLeaseMutationError::NotTransmitted { cause })
         }
-        Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch))
-        | Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized)) => Err(
-            SessionConsumerLeaseMutationError::Lease(LeaseError::StaleFence),
+        Ok(SessionConsumerResponse::Rejected(rejection)) => Err(
+            SessionConsumerLeaseMutationError::Lease(rejection_into_lease_error(rejection)),
         ),
         Ok(response) => match expected(response) {
             Some(Ok(result)) => Ok(result),
@@ -6204,20 +6484,22 @@ mod tests {
     use super::{
         classify_call_write_error, complete_before_deadline, consumer_fresh_admission_is_current,
         consumer_response_fits, consumer_watch_item_byte_count, decode_consumer_frame_payload,
-        ensure_pre_request_budget_remaining, exact_correlation, lease_response, mutation_response,
-        persistent_execute_error, publish_monotonic_shutdown_phase,
-        read_authenticated_consumer_frame_within, response_matches_operation,
-        server_connection_current, try_send_consumer_watch_item, valid_consumer_operation_timeout,
-        wait_for_forced_shutdown, BorrowedConsumerCall, BorrowedConsumerCallResponse,
-        BorrowedConsumerWireRequest, BorrowedConsumerWireResponse, BoxStream, ConsumerCall,
-        ConsumerCallResponse, ConsumerConnection, ConsumerOperationKind, ConsumerWireRequest,
-        ConsumerWireResponse, PersistentCheckedOutConnection, PersistentSessionConsumerClient,
-        PersistentSessionConsumerConfig, PersistentSessionConsumerConfigError,
-        PersistentSessionConsumerExecuteError, PersistentShutdownPhase, QueuedConsumerWatchItem,
-        SessionConsumerAuthorizationError, SessionConsumerAuthorizer, SessionConsumerCallError,
-        SessionConsumerChange, SessionConsumerClientError, SessionConsumerIdentity,
-        SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionConsumerRejection,
-        SessionQuorumConsumer, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
+        ensure_pre_request_budget_remaining, exact_correlation, lease_error_matches_operation,
+        lease_response, mutation_response, persistent_execute_error,
+        publish_monotonic_shutdown_phase, read_authenticated_consumer_frame_within,
+        response_matches_operation, response_retires_connection_authority,
+        server_connection_current, store_error_matches_operation, try_send_consumer_watch_item,
+        valid_consumer_operation_timeout, wait_for_forced_shutdown, BorrowedConsumerCall,
+        BorrowedConsumerCallResponse, BorrowedConsumerWireRequest, BorrowedConsumerWireResponse,
+        BoxStream, ConsumerCall, ConsumerCallResponse, ConsumerConnection, ConsumerOperationKind,
+        ConsumerWireRequest, ConsumerWireResponse, PersistentCheckedOutConnection,
+        PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
+        PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
+        PersistentShutdownPhase, QueuedConsumerWatchItem, SessionConsumerAuthorizationError,
+        SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerChange,
+        SessionConsumerClientError, SessionConsumerIdentity, SessionConsumerLeaseMutationError,
+        SessionConsumerMutationError, SessionConsumerRejection, SessionQuorumConsumer,
+        SessionQuorumConsumerServer, StatelessSessionConsumerClient,
         DEFAULT_CONSUMER_OPERATION_TIMEOUT, DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
@@ -6232,12 +6514,14 @@ mod tests {
     };
     use bytes::Bytes;
     use opc_session_store::{
-        BackendCapabilities, EncryptedSessionPayload, FenceToken, Generation, OwnerId,
-        RestoreScanPage, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
+        BackendCapabilities, CompareAndSet, EncryptedSessionPayload, FakeSessionBackend,
+        FenceToken, Generation, OwnerId, RestoreScanPage, RestoreScanRequest,
+        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
         SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerLeaseError,
         SessionConsumerOperation, SessionConsumerRequest, SessionConsumerRequestId,
         SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionKey,
-        SessionKeyType, StateClass, StateType, StoreError, StoredSessionRecord,
+        SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType, StoreError,
+        StoredSessionRecord,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
     use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -6730,6 +7014,164 @@ mod tests {
                 "{family} has no automatic replay after a possible write"
             );
         }
+    }
+
+    #[test]
+    fn authority_and_malformed_rejections_have_explicit_lane_retirement_semantics() {
+        for rejection in [
+            SessionConsumerRejection::ScopeMismatch,
+            SessionConsumerRejection::Unauthorized,
+            SessionConsumerRejection::MalformedRequest,
+        ] {
+            assert!(response_retires_connection_authority(
+                &SessionConsumerResponse::Rejected(rejection)
+            ));
+        }
+        assert!(
+            !response_retires_connection_authority(&SessionConsumerResponse::Rejected(
+                SessionConsumerRejection::Unavailable,
+            )),
+            "pre-dispatch unavailability leaves the authenticated lane reusable"
+        );
+    }
+
+    #[test]
+    fn complete_lease_rejections_are_known_safe_not_outcome_unknown() {
+        let request_id = SessionConsumerRequestId::new();
+        for rejection in [
+            SessionConsumerRejection::ScopeMismatch,
+            SessionConsumerRejection::Unauthorized,
+            SessionConsumerRejection::MalformedRequest,
+            SessionConsumerRejection::Unavailable,
+        ] {
+            let outcome = lease_response::<()>(
+                request_id,
+                Ok(SessionConsumerResponse::Rejected(rejection)),
+                |_| None,
+            );
+            assert!(
+                matches!(outcome, Err(SessionConsumerLeaseMutationError::Lease(_))),
+                "a complete {rejection:?} rejection proves the lease mutation was not dispatched"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn official_consumer_error_families_remain_legal_and_cross_family_errors_do_not() {
+        let key = SessionKey {
+            tenant: TenantId::new("consumer-error-family").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"consumer-error-family")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let owner = OwnerId::new("consumer-error-owner").expect("test owner");
+        let backend = FakeSessionBackend::new();
+        let lease = backend
+            .acquire(&key, owner.clone(), Duration::from_secs(30))
+            .await
+            .expect("test lease");
+        let record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(1),
+            owner,
+            fence: lease.fence(),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("consumer-error-family"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(b"opaque-test-payload"),
+        };
+        let cas = CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: record,
+        };
+
+        for operation in [
+            SessionConsumerOperation::Get { key: key.clone() },
+            SessionConsumerOperation::PreflightRecordExpiry {
+                preflights: Vec::new(),
+            },
+            SessionConsumerOperation::ScanRestoreRecords {
+                request: RestoreScanRequest::all(1),
+            },
+        ] {
+            assert!(
+                store_error_matches_operation(&operation, SessionConsumerStoreError::StaleFence),
+                "a mid-operation topology authority revocation is an official typed response"
+            );
+        }
+        for operation in [
+            SessionConsumerOperation::CompareAndSet {
+                op: Box::new(cas.clone()),
+            },
+            SessionConsumerOperation::DeleteFenced {
+                lease: lease.clone(),
+            },
+            SessionConsumerOperation::RefreshTtl {
+                lease: lease.clone(),
+                ttl: Duration::from_secs(30),
+            },
+        ] {
+            assert!(
+                store_error_matches_operation(
+                    &operation,
+                    SessionConsumerStoreError::LeaseUnavailable,
+                ),
+                "an expired presented guard is an official typed fenced-mutation response"
+            );
+        }
+        for operation in [
+            SessionConsumerOperation::CompareAndSet { op: Box::new(cas) },
+            SessionConsumerOperation::DeleteFenced {
+                lease: lease.clone(),
+            },
+        ] {
+            assert!(store_error_matches_operation(
+                &operation,
+                SessionConsumerStoreError::NotFound,
+            ));
+        }
+        assert!(super::batch_slot_error_matches_operation(
+            &SessionOp::Get { key: key.clone() },
+            SessionConsumerStoreError::StaleFence,
+        ));
+        assert!(store_error_matches_operation(
+            &SessionConsumerOperation::Batch {
+                ops: vec![SessionOp::Get { key: key.clone() }],
+            },
+            SessionConsumerStoreError::StaleFence,
+        ));
+        assert!(lease_error_matches_operation(
+            &SessionConsumerOperation::RenewLease {
+                lease: lease.clone(),
+                ttl: Duration::from_secs(30),
+            },
+            SessionConsumerLeaseError::AlreadyHeld,
+        ));
+        assert!(lease_error_matches_operation(
+            &SessionConsumerOperation::AcquireLease {
+                key: key.clone(),
+                owner: OwnerId::new("consumer-error-owner").expect("test owner"),
+                ttl: Duration::from_secs(30),
+            },
+            SessionConsumerLeaseError::StaleFence,
+        ));
+
+        assert!(!store_error_matches_operation(
+            &SessionConsumerOperation::Get { key: key.clone() },
+            SessionConsumerStoreError::InvalidTtl,
+        ));
+        assert!(!lease_error_matches_operation(
+            &SessionConsumerOperation::AcquireLease {
+                key,
+                owner: OwnerId::new("consumer-error-owner").expect("test owner"),
+                ttl: Duration::from_secs(30),
+            },
+            SessionConsumerLeaseError::Expired,
+        ));
     }
 
     #[test]

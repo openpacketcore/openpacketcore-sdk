@@ -104,6 +104,8 @@ struct ControlledConsumer {
     watch_blocked: Arc<AtomicBool>,
     watch_released: Arc<Notify>,
     watch_stays_open: AtomicBool,
+    watch_error: Mutex<Option<SessionConsumerStoreError>>,
+    watch_starts: Mutex<Vec<u64>>,
 }
 
 impl ControlledConsumer {
@@ -183,6 +185,20 @@ impl ControlledConsumer {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entry);
     }
 
+    fn emit_terminal_watch_error(&self, error: SessionConsumerStoreError) {
+        *self
+            .watch_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+    }
+
+    fn watch_starts(&self) -> Vec<u64> {
+        self.watch_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     async fn wait_for_watch_emissions(&self, expected: usize) {
         loop {
             let notified = self.watch_emitted_notify.notified();
@@ -234,6 +250,17 @@ impl SessionQuorumConsumer for ControlledConsumer {
         BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
         SessionConsumerRejection,
     > {
+        self.watch_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(start_sequence);
+        if let Some(error) = *self
+            .watch_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Ok(stream::once(async move { Err(error) }).boxed());
+        }
         let entry = self
             .watch_entry
             .lock()
@@ -1548,6 +1575,131 @@ async fn rotation_releases_an_unpolled_full_small_item_watch_queue() {
 }
 
 #[tokio::test]
+async fn terminal_watch_error_and_eof_never_advance_the_persistent_cursor() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("watch-error-cursor-server");
+    let client_spiffe = spiffe("watch-error-cursor-client");
+    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    service.emit_terminal_watch_error(SessionConsumerStoreError::WatchCatchUpRequired);
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let client = persistent_client(
+        &pki,
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        &server_spiffe,
+        &client_spiffe,
+        scope,
+        config(1, 0, 1),
+    );
+
+    let mut watch = client.open_watch(0).await.expect("open watch");
+    assert_eq!(
+        watch.next().await.expect("terminal typed watch item"),
+        Err(opc_session_store::StoreError::ReplicationWatchCatchUpRequired),
+    );
+    assert!(watch.next().await.is_none(), "peer EOF remains terminal");
+    assert_eq!(client.diagnostics().await.reconnects, 0);
+
+    // The explicit next watch is a fresh caller decision. It still normalizes
+    // zero to the inclusive first sequence, proving the peer error did not
+    // consume or skip an authoritative change.
+    let replacement = client.open_watch(0).await.expect("fresh watch");
+    drop(replacement);
+    assert_eq!(service.watch_starts(), vec![1, 1]);
+
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn cancelled_watch_reconnect_has_one_terminal_setup_outcome() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("watch-reconnect-cancel-server");
+    let client_spiffe = spiffe("watch-reconnect-cancel-client");
+    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    service.emit_watch_entries_then_close(small_watch_change_at(1), 1);
+    let (handle, address) =
+        SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
+            .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+            .await
+            .expect("start consumer listener");
+
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let reconnect_started = Arc::new(Notify::new());
+    let resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        let reconnect_started = Arc::clone(&reconnect_started);
+        Arc::new(move || {
+            let attempt = resolutions.fetch_add(1, Ordering::SeqCst);
+            let reconnect_started = Arc::clone(&reconnect_started);
+            Box::pin(async move {
+                if attempt == 0 {
+                    Ok(address)
+                } else {
+                    reconnect_started.notify_one();
+                    std::future::pending::<std::io::Result<SocketAddr>>().await
+                }
+            })
+        })
+    };
+    let client = persistent_client(
+        &pki,
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        &server_spiffe,
+        &client_spiffe,
+        scope,
+        config(1, 0, 1),
+    );
+
+    let mut watch = client.open_watch(1).await.expect("open watch");
+    assert_eq!(
+        watch
+            .next()
+            .await
+            .expect("first watch item")
+            .expect("valid first watch item")
+            .sequence(),
+        1,
+    );
+    tokio::time::timeout(Duration::from_secs(1), reconnect_started.notified())
+        .await
+        .expect("replacement setup reaches the resolver");
+    drop(watch);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let diagnostics = client.diagnostics().await;
+            if diagnostics.watch_active == 0
+                && diagnostics.setup_attempts
+                    == diagnostics.setup_successes + diagnostics.setup_failures
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("stream cancellation terminates the in-flight replacement setup");
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.setup_attempts, 2);
+    assert_eq!(diagnostics.setup_successes, 1);
+    assert_eq!(diagnostics.setup_failures, 1);
+
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn persistent_watch_reconnects_at_the_exact_delivered_cursor_after_endpoint_loss() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("watch-reconnect-server");
@@ -1633,12 +1785,41 @@ async fn persistent_watch_reconnects_at_the_exact_delivered_cursor_after_endpoin
         resolutions.load(Ordering::SeqCst) >= 2,
         "a reconnect refreshes the endpoint resolver"
     );
+    // The replacement peer intentionally closes after sequence 2, so the
+    // reader may already be attempting the next bounded replacement when the
+    // caller receives that queued item. Closing the caller-visible stream is
+    // the exact terminal event for that in-flight setup; wait for it before
+    // asserting the completed-outcome accounting invariant.
+    drop(watch);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let diagnostics = client.diagnostics().await;
+            if diagnostics.watch_active == 0
+                && diagnostics.setup_attempts
+                    == diagnostics.setup_successes + diagnostics.setup_failures
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("closing the stream terminates any next replacement setup");
+    let diagnostics = client.diagnostics().await;
     assert!(
-        client.diagnostics().await.reconnects >= 1,
+        diagnostics.reconnects >= 1,
         "the bounded replacement is observable only as a fixed counter"
     );
+    assert_eq!(
+        diagnostics.setup_successes, 2,
+        "the initial watch and its exact replacement each complete one authenticated setup"
+    );
+    assert_eq!(
+        diagnostics.setup_attempts,
+        diagnostics.setup_successes + diagnostics.setup_failures,
+        "every completed sequential replacement setup has one terminal outcome"
+    );
 
-    drop(watch);
     client.shutdown().await;
     first_handle.abort_and_wait().await;
     second_handle.abort_and_wait().await;
