@@ -627,8 +627,13 @@ async fn negotiated_reduced_request_cap_rejects_a_large_mutation_before_transmis
         .acquire(&key, owner.clone(), Duration::from_secs(30))
         .await
         .expect("fixture lease");
-    let payload = vec![0_u8; 1024 * 1024];
-    let ops = (0..5)
+    // JSON renders 255 with three digits. Three 768-KiB payloads therefore
+    // cross the retained 8-MiB-plus-4-KiB negotiated cap with fewer than half
+    // the serializer elements of five 1-MiB zero payloads. This keeps the
+    // fixture about the negotiated byte boundary rather than racing the real
+    // one-second complete-operation budget on loaded and i686 CI runners.
+    let payload = vec![255_u8; 768 * 1024];
+    let ops = (0..3)
         .map(|_| {
             SessionOp::CompareAndSet(CompareAndSet {
                 key: key.clone(),
