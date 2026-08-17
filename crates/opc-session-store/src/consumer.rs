@@ -415,8 +415,17 @@ impl From<StoreError> for SessionConsumerStoreError {
             StoreError::NotFound => Self::NotFound,
             StoreError::StaleFence | StoreError::TopologyAuthorityRevoked => Self::StaleFence,
             StoreError::CasConflict => Self::CasConflict,
-            StoreError::CasIdempotencyConflict => Self::RequestConflict,
+            StoreError::CasIdempotencyConflict | StoreError::FencedTransitionRequestConflict => {
+                Self::RequestConflict
+            }
+            // Fenced-transition status is not yet a negotiated consumer wire
+            // operation. Preserve a fail-closed legacy response category
+            // instead of introducing an unversioned wire enum variant.
+            StoreError::FencedTransitionHistoryFull
+            | StoreError::FencedTransitionRetentionExhausted => Self::CapabilityNotSupported,
             StoreError::CasIdempotencyOutcomeUnavailable
+            | StoreError::FencedTransitionOutcomeUnknown
+            | StoreError::FencedTransitionRequestExpired
             | StoreError::BackendOperationOutcomeUnavailable => Self::OutcomeUnavailable,
             StoreError::BackendUnavailable(_) => Self::Unavailable,
             StoreError::CapabilityNotSupported(_) => Self::CapabilityNotSupported,

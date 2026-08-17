@@ -18,9 +18,11 @@ use opc_key::{
     AES_256_GCM_SIV_NONCE_LEN,
 };
 use opc_session_store::{
-    CompareAndSet, CompareAndSetResult, ConsensusSessionStore, DurableReadinessReport,
+    Clock, CompareAndSet, CompareAndSetResult, ConsensusSessionStore, DurableReadinessReport,
     DurableReadinessScope, DurableReadinessState, DurableRecoveryState, EncryptedSessionPayload,
-    EncryptingSessionBackend, Generation, LeaseError, ObservedPhysicalNodeIdentity, OwnerId,
+    EncryptingSessionBackend, FenceToken, FencedTransitionLease, FencedTransitionMutation,
+    FencedTransitionMutationResult, FencedTransitionRequest, FencedTransitionRequestId,
+    FencedTransitionStatus, Generation, LeaseError, ObservedPhysicalNodeIdentity, OwnerId,
     QuorumReplicaDescriptor, QuorumTopologyAttestor, QuorumTopologyConfig, ReplicaBackingIdentity,
     ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationOp,
     RestoreScanRequest, SessionBackend, SessionConsensusNodeId, SessionConsensusPeer,
@@ -75,10 +77,14 @@ struct LoopbackPeer {
     target: SessionConsensusNodeId,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
+    read_barrier_supported: Arc<AtomicBool>,
+    forward_mutation_calls: Arc<AtomicUsize>,
     forward_responses_to_drop: Arc<AtomicUsize>,
     dropped_forward_responses: Arc<AtomicUsize>,
     forward_response_delay_millis: Arc<AtomicU64>,
     delayed_forward_responses: Arc<AtomicUsize>,
+    append_entries_request_delay: Arc<StdMutex<Option<([u8; 16], u64)>>>,
+    delayed_append_entries: Arc<AtomicUsize>,
     rpc_delay_millis: Arc<AtomicU64>,
     captured_payloads: Arc<StdMutex<Vec<Bytes>>>,
 }
@@ -89,10 +95,14 @@ impl LoopbackPeer {
             target,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
+            read_barrier_supported: Arc::new(AtomicBool::new(true)),
+            forward_mutation_calls: Arc::new(AtomicUsize::new(0)),
             forward_responses_to_drop: Arc::new(AtomicUsize::new(0)),
             dropped_forward_responses: Arc::new(AtomicUsize::new(0)),
             forward_response_delay_millis: Arc::new(AtomicU64::new(0)),
             delayed_forward_responses: Arc::new(AtomicUsize::new(0)),
+            append_entries_request_delay: Arc::new(StdMutex::new(None)),
+            delayed_append_entries: Arc::new(AtomicUsize::new(0)),
             rpc_delay_millis: Arc::new(AtomicU64::new(0)),
             captured_payloads: Arc::new(StdMutex::new(Vec::new())),
         }
@@ -104,6 +114,15 @@ impl LoopbackPeer {
 
     fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    fn set_read_barrier_supported(&self, supported: bool) {
+        self.read_barrier_supported
+            .store(supported, Ordering::SeqCst);
+    }
+
+    fn forward_mutation_calls(&self) -> usize {
+        self.forward_mutation_calls.load(Ordering::SeqCst)
     }
 
     fn drop_forward_responses(&self, count: usize) {
@@ -133,6 +152,27 @@ impl LoopbackPeer {
 
     fn delayed_forward_responses(&self) -> usize {
         self.delayed_forward_responses.load(Ordering::SeqCst)
+    }
+
+    fn delay_append_entries_for_request(&self, request_id: [u8; 16], delay: Duration) {
+        *self
+            .append_entries_request_delay
+            .lock()
+            .expect("append-entries request delay mutex") = Some((
+            request_id,
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        ));
+    }
+
+    fn stop_delaying_append_entries_for_request(&self) {
+        *self
+            .append_entries_request_delay
+            .lock()
+            .expect("append-entries request delay mutex") = None;
+    }
+
+    fn delayed_append_entries(&self) -> usize {
+        self.delayed_append_entries.load(Ordering::SeqCst)
     }
 
     fn delay_calls(&self, delay: Duration) {
@@ -177,6 +217,34 @@ impl fmt::Debug for LoopbackPeer {
     }
 }
 
+/// Simulates a same-identity peer restarted with an older implementation that
+/// rejects the new capability probe while leaving the RPC identity unchanged.
+struct RejectReadBarrierHandler {
+    inner: Arc<dyn SessionConsensusRpcHandler>,
+}
+
+impl fmt::Debug for RejectReadBarrierHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RejectReadBarrierHandler(<redacted>)")
+    }
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for RejectReadBarrierHandler {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        if request.family == SessionConsensusRpcFamily::ReadBarrier {
+            return SessionConsensusWireResponse {
+                result: Err(SessionConsensusPeerError::Protocol),
+            };
+        }
+        self.inner.handle(authenticated_sender, request).await
+    }
+}
+
 #[async_trait]
 impl SessionConsensusPeer for LoopbackPeer {
     fn node_id(&self) -> SessionConsensusNodeId {
@@ -190,10 +258,35 @@ impl SessionConsensusPeer for LoopbackPeer {
         if !self.enabled.load(Ordering::SeqCst) {
             return Err(SessionConsensusPeerError::Unavailable);
         }
+        if request.family == SessionConsensusRpcFamily::ForwardMutation {
+            self.forward_mutation_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        if request.family == SessionConsensusRpcFamily::ReadBarrier
+            && !self.read_barrier_supported.load(Ordering::SeqCst)
+        {
+            return Err(SessionConsensusPeerError::Protocol);
+        }
 
         let rpc_delay = self.rpc_delay_millis.load(Ordering::SeqCst);
         if rpc_delay != 0 {
             tokio::time::sleep(Duration::from_millis(rpc_delay)).await;
+        }
+
+        let append_entries_delay = if request.family == SessionConsensusRpcFamily::AppendEntries {
+            self.append_entries_request_delay
+                .lock()
+                .expect("append-entries request delay mutex")
+                .as_ref()
+                .and_then(|(request_id, delay)| {
+                    contains_bytes(&request.payload, request_id)
+                        .then_some(Duration::from_millis(*delay))
+                })
+        } else {
+            None
+        };
+        if let Some(delay) = append_entries_delay {
+            self.delayed_append_entries.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
         }
 
         {
@@ -249,6 +342,25 @@ struct TestCluster {
     paths: BTreeMap<(usize, usize), Arc<LoopbackPeer>>,
 }
 
+#[derive(Debug)]
+struct MutableTestClock(StdMutex<opc_types::Timestamp>);
+
+impl MutableTestClock {
+    fn new(now: opc_types::Timestamp) -> Self {
+        Self(StdMutex::new(now))
+    }
+
+    fn set(&self, now: opc_types::Timestamp) {
+        *self.0.lock().expect("test clock mutex") = now;
+    }
+}
+
+impl Clock for MutableTestClock {
+    fn now_utc(&self) -> opc_types::Timestamp {
+        *self.0.lock().expect("test clock mutex")
+    }
+}
+
 impl TestCluster {
     async fn start() -> Self {
         Self::start_with_operation_timeout(OPERATION_TIMEOUT).await
@@ -270,9 +382,34 @@ impl TestCluster {
         Self::start_with_topologies(operation_timeout, topologies).await
     }
 
+    async fn start_with_clock(clock: Arc<dyn Clock>) -> Self {
+        let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
+        let identity = consensus_identity(&members);
+        let topologies = (0..MEMBER_COUNT)
+            .map(|index| {
+                ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                    replica_id(index),
+                    members.clone(),
+                    identity,
+                ))
+                .expect("validate consensus topology")
+            })
+            .collect::<Vec<_>>();
+        Self::start_with_topologies_and_clock(OPERATION_TIMEOUT, topologies, clock).await
+    }
+
     async fn start_with_topologies(
         operation_timeout: Duration,
         topologies: Vec<ValidatedQuorumTopology>,
+    ) -> Self {
+        Self::start_with_topologies_and_clock(operation_timeout, topologies, Arc::new(SystemClock))
+            .await
+    }
+
+    async fn start_with_topologies_and_clock(
+        operation_timeout: Duration,
+        topologies: Vec<ValidatedQuorumTopology>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         assert_eq!(topologies.len(), MEMBER_COUNT);
         let formation_permit = CLUSTER_FORMATION_PERMIT
@@ -319,7 +456,7 @@ impl TestCluster {
                 backends[index].clone(),
                 directory.path().join(format!("snapshots-{index}")),
                 peers,
-                Arc::new(SystemClock),
+                clock.clone(),
                 operation_timeout,
             )
             .await
@@ -497,6 +634,35 @@ impl TestCluster {
         }
     }
 
+    fn delay_append_entries_for_request(
+        &self,
+        source: usize,
+        request_id: [u8; 16],
+        delay: Duration,
+    ) -> usize {
+        let before = self.delayed_append_entries(source);
+        for target in 0..MEMBER_COUNT {
+            if source != target {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .delay_append_entries_for_request(request_id, delay);
+            }
+        }
+        before
+    }
+
+    fn stop_delaying_append_entries_for_request(&self, source: usize) {
+        for target in 0..MEMBER_COUNT {
+            if source != target {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .stop_delaying_append_entries_for_request();
+            }
+        }
+    }
+
     fn delayed_forward_responses(&self, source: usize) -> usize {
         (0..MEMBER_COUNT)
             .filter(|target| *target != source)
@@ -505,6 +671,18 @@ impl TestCluster {
                     .get(&(source, target))
                     .expect("outbound path")
                     .delayed_forward_responses()
+            })
+            .sum()
+    }
+
+    fn delayed_append_entries(&self, source: usize) -> usize {
+        (0..MEMBER_COUNT)
+            .filter(|target| *target != source)
+            .map(|target| {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .delayed_append_entries()
             })
             .sum()
     }
@@ -519,6 +697,43 @@ impl TestCluster {
                     .dropped_forward_responses()
             })
             .sum()
+    }
+
+    fn forward_mutation_calls(&self, source: usize) -> usize {
+        (0..MEMBER_COUNT)
+            .filter(|target| *target != source)
+            .map(|target| {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .forward_mutation_calls()
+            })
+            .sum()
+    }
+
+    fn set_read_barrier_supported(&self, source: usize, target: usize, supported: bool) {
+        self.paths
+            .get(&(source, target))
+            .expect("outbound path")
+            .set_read_barrier_supported(supported);
+    }
+
+    async fn restart_same_node_id_with_old_read_barrier(&self, source: usize, target: usize) {
+        self.paths
+            .get(&(source, target))
+            .expect("outbound path")
+            .install(Arc::new(RejectReadBarrierHandler {
+                inner: self.stores[target].rpc_handler(),
+            }))
+            .await;
+    }
+
+    async fn restore_current_rpc_handler(&self, source: usize, target: usize) {
+        self.paths
+            .get(&(source, target))
+            .expect("outbound path")
+            .install(self.stores[target].rpc_handler())
+            .await;
     }
 
     fn clear_captured_payloads(&self) {
@@ -978,6 +1193,134 @@ fn sealed_record(
     .expect("test envelope");
     record.payload = EncryptedSessionPayload::try_envelope(envelope).expect("valid envelope");
     record
+}
+
+fn sealed_transition_record(
+    key: SessionKey,
+    generation: u64,
+    owner: &OwnerId,
+    fence: FenceToken,
+    payload: &'static [u8],
+) -> StoredSessionRecord {
+    let mut record = StoredSessionRecord {
+        key,
+        generation: Generation::new(generation),
+        owner: owner.clone(),
+        fence,
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("consensus-test-session"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([]),
+    };
+    let key_id = KeyId::new("synthetic-consensus-test-key").expect("key ID");
+    let aad = EnvelopeAad::session(
+        record.key.tenant.clone(),
+        1,
+        SessionAad::new(
+            record.key.nf_kind.as_str(),
+            "synthetic-keyed-session-digest",
+            record.state_type.as_str(),
+            record.generation.get(),
+            record.fence.get(),
+            "synthetic-consensus-test-backend",
+        )
+        .expect("session AAD"),
+    );
+    let mut ciphertext_and_tag = payload.to_vec();
+    ciphertext_and_tag.extend_from_slice(&[0xA5; AEAD_TAG_LEN]);
+    let envelope = CryptoEnvelopeV1 {
+        algorithm: AeadAlgorithm::Aes256GcmSiv,
+        key_id: key_id.clone(),
+        nonce: vec![0x42; AES_256_GCM_SIV_NONCE_LEN],
+        aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+        ciphertext_and_tag,
+    }
+    .encode()
+    .expect("test envelope");
+    record.payload = EncryptedSessionPayload::try_envelope(envelope).expect("valid envelope");
+    record
+}
+
+fn fenced_acquire_create_request(
+    key: SessionKey,
+    owner: OwnerId,
+    expected_fence: FenceToken,
+    request_id: [u8; 16],
+    ttl: Duration,
+    payload: &'static [u8],
+) -> (FencedTransitionRequest, StoredSessionRecord) {
+    let lease = FencedTransitionLease::acquire(key.clone(), owner.clone(), expected_fence, ttl)
+        .expect("build acquire action");
+    let record = sealed_transition_record(
+        key,
+        1,
+        &owner,
+        lease.committed_fence().expect("derive committed fence"),
+        payload,
+    );
+    let request = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes(request_id),
+        lease,
+        FencedTransitionMutation::create(record.clone()),
+    )
+    .expect("build create transition");
+    (request, record)
+}
+
+async fn assert_fenced_renewal_cas_conflict_has_no_effect(
+    store: &ConsensusSessionStore,
+    key: &SessionKey,
+    request: FencedTransitionRequest,
+) {
+    let before = store
+        .max_replication_sequence()
+        .await
+        .expect("read replication head before rejected renewal");
+    let observation = store
+        .observe_fenced_transition(key)
+        .await
+        .expect("observe state before rejected renewal");
+
+    assert!(
+        matches!(
+            store.fenced_transition(request.clone()).await,
+            Err(StoreError::CasConflict)
+        ),
+        "a renew transition without a live expected record is a typed CAS conflict"
+    );
+    assert!(
+        matches!(
+            store.fenced_transition_status(&request).await,
+            Ok(FencedTransitionStatus::Recorded(Err(
+                StoreError::CasConflict
+            )))
+        ),
+        "the durable request status retains the exact deterministic rejection"
+    );
+    assert_eq!(
+        store
+            .observe_fenced_transition(key)
+            .await
+            .expect("observe state after rejected renewal"),
+        observation,
+        "a rejected renewal leaves the record view and fence floor unchanged"
+    );
+    assert_eq!(
+        store
+            .max_replication_sequence()
+            .await
+            .expect("read replication head after rejected renewal"),
+        before,
+        "a rejected renewal has no application or watch position"
+    );
+    assert!(
+        store
+            .get_replication_log(before + 1, 1)
+            .await
+            .expect("read watch journal after rejected renewal")
+            .is_empty(),
+        "a rejected renewal writes no watch entry"
+    );
 }
 
 async fn replication_logs(cluster: &TestCluster) -> Vec<Vec<opc_session_store::ReplicationEntry>> {
@@ -1943,6 +2286,1664 @@ async fn writes_leases_and_cas_converge_with_linearizable_reads() {
             if capability == "direct_rebuild_authority"
     ));
     assert_differing_replica_compaction_floors_never_union(&cluster).await;
+}
+
+#[tokio::test]
+async fn red_696_split_acquire_then_cas_leaves_a_committed_intermediate_boundary() {
+    // Retained RED evidence for #696: this passing test describes why composing
+    // acquire and CAS is insufficient for callers that require one atomic
+    // fenced transition. It is deliberately not an expected-failure test.
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let store = &cluster.stores[leader];
+    let key = session_key(b"red-696-split-boundary");
+    let persisted_record_count = || {
+        let connection = rusqlite::Connection::open(
+            cluster
+                ._directory
+                .path()
+                .join(format!("node-{leader}.sqlite")),
+        )
+        .expect("open temporary leader replica");
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM session_records WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4",
+                rusqlite::params![
+                    key.tenant.as_str(),
+                    key.nf_kind.as_str(),
+                    key.key_type.to_string(),
+                    key.stable_id.as_ref(),
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count persisted transition record")
+    };
+    let before = store
+        .max_replication_sequence()
+        .await
+        .expect("read journal head before split transition");
+    let mut watch = store
+        .watch(before + 1)
+        .await
+        .expect("subscribe before split transition");
+    let before_log = store
+        .status()
+        .last_log_index
+        .expect("formed cluster has a durable log head");
+
+    let lease = store
+        .acquire(&key, owner("red-696-owner"), Duration::from_secs(30))
+        .await
+        .expect("commit split lease acquisition");
+    let lease_fence = lease.fence();
+    let after_lease_log = store
+        .status()
+        .last_log_index
+        .expect("lease acquisition has a durable log head");
+    assert_eq!(
+        after_lease_log,
+        before_log + 1,
+        "split lease acquisition must consume its own consensus entry",
+    );
+
+    // A crash or competing actor at this point observes a durable new fence
+    // but no record. The first committed application/watch entry is therefore
+    // externally distinct from the later record mutation.
+    assert_eq!(
+        persisted_record_count(),
+        0,
+        "the record must remain absent after only the lease commit"
+    );
+
+    let record = sealed_record(key.clone(), 1, &lease, b"sealed-red-696-record");
+    assert!(
+        store
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease,
+                expected_generation: None,
+                new_record: record.clone(),
+            })
+            .await
+            .expect("commit split record mutation")
+            == CompareAndSetResult::Success,
+        "the second operation must apply the record mutation"
+    );
+    let after_record_log = store
+        .status()
+        .last_log_index
+        .expect("record mutation has a durable log head");
+    assert_eq!(
+        after_record_log,
+        after_lease_log + 1,
+        "split CAS must consume a second, distinct consensus entry",
+    );
+    assert_eq!(
+        persisted_record_count(),
+        1,
+        "only the second operation may make the record visible"
+    );
+    let after_record = store
+        .max_replication_sequence()
+        .await
+        .expect("read journal head after split record mutation");
+    assert!(
+        after_record == before + 2,
+        "the record mutation must occupy a second application position"
+    );
+    let lease_entry = store
+        .get_replication_log(before + 1, 1)
+        .await
+        .expect("read committed lease entry");
+    assert!(
+        matches!(lease_entry.as_slice(), [entry]
+            if matches!(&entry.op, ReplicationOp::AcquireLease { fence, .. } if *fence == lease_fence)),
+        "the first application entry must contain only the lease acquisition"
+    );
+    let record_entry = store
+        .get_replication_log(before + 2, 1)
+        .await
+        .expect("read committed record entry");
+    assert!(
+        matches!(record_entry.as_slice(), [entry] if matches!(&entry.op, ReplicationOp::CompareAndSet { .. })),
+        "the second application entry must contain only the record mutation"
+    );
+
+    use futures_util::StreamExt;
+    let first_watch = watch
+        .next()
+        .await
+        .expect("first split watch entry")
+        .expect("first split watch result");
+    let second_watch = watch
+        .next()
+        .await
+        .expect("second split watch entry")
+        .expect("second split watch result");
+    assert!(
+        matches!(first_watch.op, ReplicationOp::AcquireLease { .. }),
+        "the first watch entry must expose only the lease acquisition"
+    );
+    assert!(
+        matches!(second_watch.op, ReplicationOp::CompareAndSet { .. }),
+        "the second watch entry must expose only the record mutation"
+    );
+    assert!(
+        first_watch.sequence + 1 == second_watch.sequence,
+        "the split operations must produce distinct ordered watch entries"
+    );
+}
+
+#[tokio::test]
+async fn fenced_transition_acquire_create_is_one_committed_application_and_watch_entry() {
+    use futures_util::StreamExt;
+
+    let cluster = TestCluster::start().await;
+    let store = &cluster.stores[0];
+    let key = session_key(b"fenced-transition-atomic-create");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe absent transition key");
+    assert!(observation.record().is_none(), "fresh key has no record");
+
+    let (request, record) = fenced_acquire_create_request(
+        key.clone(),
+        owner("fenced-transition-owner"),
+        observation.current_fence(),
+        [0x11; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-create",
+    );
+    let before = store
+        .max_replication_sequence()
+        .await
+        .expect("read application head before transition");
+    let mut watch = store
+        .watch(before + 1)
+        .await
+        .expect("subscribe before transition");
+
+    let outcome = store
+        .fenced_transition(request.clone())
+        .await
+        .expect("commit atomic fenced transition");
+    assert!(
+        matches!(outcome.mutation(), FencedTransitionMutationResult::Created),
+        "transition reports record creation"
+    );
+    assert!(
+        outcome.committed_generation() == Generation::new(1),
+        "transition reports the created generation"
+    );
+    assert!(
+        outcome.lease().fence() == request.lease().committed_fence().expect("committed fence"),
+        "transition returns the acquired fence"
+    );
+    assert!(
+        matches!(store.get(&key).await, Ok(Some(committed)) if committed == record),
+        "record becomes visible with the lease at the same application boundary"
+    );
+    let after = store
+        .max_replication_sequence()
+        .await
+        .expect("read application head after transition");
+    assert!(
+        after == before + 1,
+        "transition occupies one application position"
+    );
+    let entries = store
+        .get_replication_log(before + 1, 1)
+        .await
+        .expect("read atomic transition entry");
+    assert!(
+        matches!(entries.as_slice(), [entry]
+            if matches!(&entry.op, ReplicationOp::Batch { ops }
+                if matches!(ops.as_slice(), [ReplicationOp::AcquireLease { .. }, ReplicationOp::CompareAndSet { .. }]))),
+        "one application entry contains both the lease and record effects"
+    );
+    let watched = watch
+        .next()
+        .await
+        .expect("atomic transition watch entry")
+        .expect("atomic transition watch result");
+    assert!(
+        watched.sequence == before + 1
+            && matches!(&watched.op, ReplicationOp::Batch { ops }
+                if matches!(ops.as_slice(), [ReplicationOp::AcquireLease { .. }, ReplicationOp::CompareAndSet { .. }])),
+        "one watch entry exposes the complete atomic transition"
+    );
+}
+
+#[tokio::test]
+async fn fenced_transition_with_finite_record_expiry_uses_one_consensus_entry() {
+    let cluster = TestCluster::start().await;
+    let (leader_index, _, _) = cluster.observed_leader();
+    let store = &cluster.stores[leader_index];
+    let key = session_key(b"fenced-transition-one-proposal");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe absent transition key");
+    let owner = owner("fenced-transition-one-proposal-owner");
+    let lease = FencedTransitionLease::acquire(
+        key.clone(),
+        owner.clone(),
+        observation.current_fence(),
+        Duration::from_secs(30),
+    )
+    .expect("build acquire action");
+    let mut record = sealed_transition_record(
+        key,
+        1,
+        &owner,
+        lease.committed_fence().expect("derive committed fence"),
+        b"sealed-fenced-transition-one-proposal",
+    );
+    record.expires_at = Some(opc_types::Timestamp::from_offset_datetime(
+        time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
+    ));
+    let request = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0x12; 16]),
+        lease,
+        FencedTransitionMutation::create(record),
+    )
+    .expect("build finite-expiry transition");
+    let before = store
+        .status()
+        .last_log_index
+        .expect("formed cluster has a durable log head");
+
+    store
+        .fenced_transition(request)
+        .await
+        .expect("commit finite-expiry transition");
+
+    let after = store
+        .status()
+        .last_log_index
+        .expect("committed transition has a durable log head");
+    assert_eq!(
+        after,
+        before + 1,
+        "finite record expiry must be admitted in the transition entry, not a separate logical-time preflight",
+    );
+}
+
+#[tokio::test]
+async fn fenced_transition_replay_and_status_bind_one_exact_request_body() {
+    let cluster = TestCluster::start().await;
+    let store = &cluster.stores[0];
+    let key = session_key(b"fenced-transition-replay");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe transition key");
+    let request_owner = owner("fenced-transition-owner");
+    let (request, _) = fenced_acquire_create_request(
+        key.clone(),
+        request_owner.clone(),
+        observation.current_fence(),
+        [0x12; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-replay",
+    );
+    let before = store
+        .max_replication_sequence()
+        .await
+        .expect("read application head before replay");
+    let first = store
+        .fenced_transition(request.clone())
+        .await
+        .expect("commit transition before replay");
+    let after_first = store
+        .max_replication_sequence()
+        .await
+        .expect("read application head after first submission");
+    let replay = store
+        .fenced_transition(request.clone())
+        .await
+        .expect("replay exact transition");
+    let after_replay = store
+        .max_replication_sequence()
+        .await
+        .expect("read application head after replay");
+    assert!(first == replay, "exact replay returns the recorded outcome");
+    assert!(
+        after_first == before + 1 && after_replay == after_first,
+        "exact replay has one application effect"
+    );
+    assert!(
+        matches!(store.fenced_transition_status(&request).await,
+            Ok(FencedTransitionStatus::Recorded(Ok(recorded))) if recorded == first),
+        "status returns the exact recorded success"
+    );
+
+    let (conflicting, _) = fenced_acquire_create_request(
+        key.clone(),
+        request_owner,
+        observation.current_fence(),
+        [0x12; 16],
+        Duration::from_secs(29),
+        b"sealed-fenced-transition-replay",
+    );
+    assert!(
+        matches!(
+            store.fenced_transition_status(&conflicting).await,
+            Ok(FencedTransitionStatus::RequestConflict)
+        ),
+        "same identity with another canonical body reports a conflict"
+    );
+    assert!(
+        matches!(
+            store.fenced_transition(conflicting).await,
+            Err(StoreError::FencedTransitionRequestConflict)
+        ),
+        "same identity with another canonical body has no effect"
+    );
+
+    let (unseen, _) = fenced_acquire_create_request(
+        key,
+        owner("fenced-transition-owner"),
+        observation.current_fence(),
+        [0x13; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-replay",
+    );
+    assert!(
+        matches!(
+            store.fenced_transition_status(&unseen).await,
+            Ok(FencedTransitionStatus::NotFound)
+        ),
+        "status distinguishes an unrecorded identity"
+    );
+}
+
+#[tokio::test]
+async fn fenced_transition_stale_fence_and_generation_rejections_leave_state_unchanged() {
+    let cluster = TestCluster::start().await;
+    let store = &cluster.stores[0];
+    let key = session_key(b"fenced-transition-rejections");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe transition key");
+    let request_owner = owner("fenced-transition-owner");
+    let (create, original) = fenced_acquire_create_request(
+        key.clone(),
+        request_owner.clone(),
+        observation.current_fence(),
+        [0x21; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-original",
+    );
+    let created = store
+        .fenced_transition(create)
+        .await
+        .expect("commit initial transition");
+    let after_create = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe committed transition");
+
+    let (stale, _) = fenced_acquire_create_request(
+        key.clone(),
+        request_owner.clone(),
+        observation.current_fence(),
+        [0x22; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-stale",
+    );
+    assert!(
+        matches!(
+            store.fenced_transition(stale.clone()).await,
+            Err(StoreError::StaleFence)
+        ),
+        "a stale observation is rejected before either effect"
+    );
+    assert!(
+        matches!(
+            store.fenced_transition_status(&stale).await,
+            Ok(FencedTransitionStatus::Recorded(Err(
+                StoreError::StaleFence
+            )))
+        ),
+        "status preserves the deterministic stale-fence result"
+    );
+    assert!(
+        matches!(store.get(&key).await, Ok(Some(record)) if record == original),
+        "stale admission preserves the record"
+    );
+    let after_stale = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe after stale rejection");
+    assert!(
+        after_stale.current_fence() == after_create.current_fence(),
+        "stale admission preserves the durable fence floor"
+    );
+
+    let unexpected = sealed_transition_record(
+        key.clone(),
+        8,
+        &request_owner,
+        created.lease().fence(),
+        b"sealed-fenced-transition-unexpected-generation",
+    );
+    let generation_request = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0x23; 16]),
+        FencedTransitionLease::renew(created.lease().clone(), Duration::from_secs(30))
+            .expect("build renewal action"),
+        FencedTransitionMutation::update(Generation::new(7), unexpected),
+    )
+    .expect("build unexpected-generation transition");
+    assert!(
+        matches!(
+            store.fenced_transition(generation_request).await,
+            Err(StoreError::CasConflict)
+        ),
+        "unexpected generation is rejected before renewal or replacement"
+    );
+    assert!(
+        matches!(store.get(&key).await, Ok(Some(record)) if record == original),
+        "generation rejection preserves the record"
+    );
+    let after_generation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe after generation rejection");
+    assert!(
+        after_generation.current_fence() == after_create.current_fence(),
+        "generation rejection preserves the durable fence floor"
+    );
+}
+
+#[tokio::test]
+async fn fenced_transition_renew_rejects_record_owner_or_fence_mismatch() {
+    use futures_util::StreamExt;
+
+    let cluster = TestCluster::start().await;
+    let store = &cluster.stores[0];
+    let key = session_key(b"fenced-transition-renew-owner-fence-mismatch");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe transition key");
+    let request_owner = owner("fenced-transition-current-owner");
+    let (create, original) = fenced_acquire_create_request(
+        key.clone(),
+        request_owner.clone(),
+        observation.current_fence(),
+        [0x24; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-owner-fence-original",
+    );
+    let created = store
+        .fenced_transition(create)
+        .await
+        .expect("commit initial transition");
+
+    // Mutate only the persisted record in every temporary replica. The lease
+    // rows remain intact, so each renewal request below is otherwise currently
+    // valid and may reach the record-ownership admission check.
+    for (request_id, mismatched_owner, mismatched_fence) in [
+        (
+            [0x25; 16],
+            owner("fenced-transition-unexpected-owner"),
+            created.lease().fence(),
+        ),
+        (
+            [0x26; 16],
+            request_owner.clone(),
+            FenceToken::new(created.lease().fence().get() + 1),
+        ),
+    ] {
+        let mismatched = sealed_transition_record(
+            key.clone(),
+            original.generation.get(),
+            &mismatched_owner,
+            mismatched_fence,
+            b"sealed-fenced-transition-owner-fence-original",
+        );
+        for index in 0..MEMBER_COUNT {
+            let connection = rusqlite::Connection::open(
+                cluster
+                    ._directory
+                    .path()
+                    .join(format!("node-{index}.sqlite")),
+            )
+            .expect("open temporary replica for owner/fence drift");
+            assert_eq!(
+                connection
+                    .execute(
+                        r#"
+                        UPDATE session_records
+                        SET owner = ?1, fence = ?2, payload = ?3, encoding = ?4
+                        WHERE tenant = ?5 AND nf_kind = ?6 AND key_type = ?7 AND stable_id = ?8
+                        "#,
+                        rusqlite::params![
+                            mismatched_owner.as_str(),
+                            mismatched_fence.get(),
+                            mismatched.payload.as_bytes(),
+                            2_i64,
+                            key.tenant.as_str(),
+                            key.nf_kind.as_str(),
+                            key.key_type.to_string(),
+                            key.stable_id.as_ref(),
+                        ],
+                    )
+                    .expect("inject record owner/fence drift"),
+                1,
+                "temporary fixture changes exactly the transition record"
+            );
+        }
+
+        let successor = sealed_transition_record(
+            key.clone(),
+            2,
+            &request_owner,
+            created.lease().fence(),
+            b"sealed-fenced-transition-owner-fence-successor",
+        );
+        let renewal = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes(request_id),
+            FencedTransitionLease::renew(created.lease().clone(), Duration::from_secs(30))
+                .expect("build still-valid renewal"),
+            FencedTransitionMutation::update(Generation::new(1), successor),
+        )
+        .expect("build renewal transition");
+        let before = store
+            .max_replication_sequence()
+            .await
+            .expect("read application head before owner/fence rejection");
+        let mut watch = store
+            .watch(before + 1)
+            .await
+            .expect("subscribe before owner/fence rejection");
+
+        assert!(
+            matches!(
+                store.fenced_transition(renewal.clone()).await,
+                Err(StoreError::StaleFence)
+            ),
+            "a valid renewal cannot mutate a record with a different owner or fence"
+        );
+        assert!(
+            matches!(
+                store.fenced_transition_status(&renewal).await,
+                Ok(FencedTransitionStatus::Recorded(Err(
+                    StoreError::StaleFence
+                )))
+            ),
+            "the deterministic rejection retains its typed stale-fence outcome"
+        );
+        assert!(
+            matches!(store.get(&key).await, Ok(Some(record))
+                if record == mismatched
+                    && record.generation == original.generation
+                    && record.payload == mismatched.payload),
+            "rejection preserves the mismatched stored record, generation, and payload"
+        );
+        assert_eq!(
+            store
+                .max_replication_sequence()
+                .await
+                .expect("read application head after owner/fence rejection"),
+            before,
+            "the rejected renewal has no second application effect"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), watch.next())
+                .await
+                .is_err(),
+            "the rejected renewal emits no watch effect"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fenced_transition_renew_update_refresh_ttl_and_delete_preserve_fence_rules() {
+    use futures_util::StreamExt;
+
+    let cluster = TestCluster::start().await;
+    let (leader_index, _, _) = cluster.observed_leader();
+    let store = &cluster.stores[leader_index];
+    let key = session_key(b"fenced-transition-mutation-variants");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe transition key");
+    let request_owner = owner("fenced-transition-owner");
+    let (create, _) = fenced_acquire_create_request(
+        key.clone(),
+        request_owner.clone(),
+        observation.current_fence(),
+        [0x31; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-v1",
+    );
+    let created = store
+        .fenced_transition(create)
+        .await
+        .expect("commit initial transition");
+    let updated_record = sealed_transition_record(
+        key.clone(),
+        2,
+        &request_owner,
+        created.lease().fence(),
+        b"sealed-fenced-transition-v2",
+    );
+    let update = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0x32; 16]),
+        FencedTransitionLease::renew(created.lease().clone(), Duration::from_secs(30))
+            .expect("build update renewal"),
+        FencedTransitionMutation::update(Generation::new(1), updated_record.clone()),
+    )
+    .expect("build update transition");
+    let before_update = store
+        .max_replication_sequence()
+        .await
+        .expect("read application head before renewal update");
+    let mut update_watch = store
+        .watch(before_update + 1)
+        .await
+        .expect("subscribe before renewal update");
+    let before_update_log = store
+        .status()
+        .last_log_index
+        .expect("read consensus head after subscribing before renewal update");
+    let updated = store
+        .fenced_transition(update)
+        .await
+        .expect("commit renewal and update");
+    let after_update_log = store
+        .status()
+        .last_log_index
+        .expect("read consensus head immediately after renewal update");
+    assert!(
+        matches!(updated.mutation(), FencedTransitionMutationResult::Updated)
+            && updated.committed_generation() == Generation::new(2)
+            && updated.lease().fence() == created.lease().fence(),
+        "renewal update retains the fence and advances the generation"
+    );
+    assert!(
+        matches!(store.get(&key).await, Ok(Some(record)) if record == updated_record),
+        "renewal update replaces the record"
+    );
+    assert_eq!(
+        store
+            .max_replication_sequence()
+            .await
+            .expect("read application head after renewal update"),
+        before_update + 1,
+        "renewal update consumes exactly one application and replication position"
+    );
+    assert_eq!(
+        after_update_log,
+        before_update_log + 1,
+        "renewal update consumes exactly one committed consensus position"
+    );
+    let update_entries = store
+        .get_replication_log(before_update + 1, 1)
+        .await
+        .expect("read renewal-update application entry");
+    assert!(
+        matches!(update_entries.as_slice(), [entry]
+            if matches!(&entry.op, ReplicationOp::Batch { ops }
+                if matches!(ops.as_slice(), [ReplicationOp::RenewLease { .. }, ReplicationOp::CompareAndSet { .. }]))),
+        "renewal update is one batch with exactly its lease renewal and record update"
+    );
+    let watched_update = update_watch
+        .next()
+        .await
+        .expect("renewal-update watch entry")
+        .expect("renewal-update watch result");
+    assert!(
+        watched_update.sequence == before_update + 1
+            && matches!(&watched_update.op, ReplicationOp::Batch { ops }
+                if matches!(ops.as_slice(), [ReplicationOp::RenewLease { .. }, ReplicationOp::CompareAndSet { .. }])),
+        "watch exposes renewal update as one complete batch with no intermediate effect"
+    );
+
+    let refresh = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0x33; 16]),
+        FencedTransitionLease::renew(updated.lease().clone(), Duration::from_secs(30))
+            .expect("build refresh renewal"),
+        FencedTransitionMutation::refresh_ttl(Generation::new(2), Duration::from_secs(30))
+            .expect("build refresh mutation"),
+    )
+    .expect("build refresh transition");
+    let before_refresh = store
+        .max_replication_sequence()
+        .await
+        .expect("read application head before renewal TTL refresh");
+    let mut refresh_watch = store
+        .watch(before_refresh + 1)
+        .await
+        .expect("subscribe before renewal TTL refresh");
+    let before_refresh_log = store
+        .status()
+        .last_log_index
+        .expect("read consensus head after subscribing before renewal TTL refresh");
+    let refreshed = store
+        .fenced_transition(refresh)
+        .await
+        .expect("commit renewal and TTL refresh");
+    let after_refresh_log = store
+        .status()
+        .last_log_index
+        .expect("read consensus head immediately after renewal TTL refresh");
+    let expires_at = match refreshed.mutation() {
+        FencedTransitionMutationResult::TtlRefreshed { expires_at } => expires_at,
+        _ => panic!("transition must report TTL refresh"),
+    };
+    assert!(
+        refreshed.lease().fence() == created.lease().fence(),
+        "TTL refresh preserves the fence"
+    );
+    assert!(
+        matches!(store.get(&key).await, Ok(Some(record)) if record.expires_at == Some(expires_at)),
+        "TTL refresh installs the recorded absolute expiry"
+    );
+    assert_eq!(
+        store
+            .max_replication_sequence()
+            .await
+            .expect("read application head after renewal TTL refresh"),
+        before_refresh + 1,
+        "renewal TTL refresh consumes exactly one application and replication position"
+    );
+    assert_eq!(
+        after_refresh_log,
+        before_refresh_log + 1,
+        "renewal TTL refresh consumes exactly one committed consensus position"
+    );
+    let refresh_entries = store
+        .get_replication_log(before_refresh + 1, 1)
+        .await
+        .expect("read renewal-TTL-refresh application entry");
+    assert!(
+        matches!(refresh_entries.as_slice(), [entry]
+            if matches!(&entry.op, ReplicationOp::Batch { ops }
+                if matches!(ops.as_slice(), [ReplicationOp::RenewLease { .. }, ReplicationOp::RefreshTtl { .. }]))),
+        "renewal TTL refresh is one batch with exactly its lease renewal and TTL mutation"
+    );
+    let watched_refresh = refresh_watch
+        .next()
+        .await
+        .expect("renewal-TTL-refresh watch entry")
+        .expect("renewal-TTL-refresh watch result");
+    assert!(
+        watched_refresh.sequence == before_refresh + 1
+            && matches!(&watched_refresh.op, ReplicationOp::Batch { ops }
+                if matches!(ops.as_slice(), [ReplicationOp::RenewLease { .. }, ReplicationOp::RefreshTtl { .. }])),
+        "watch exposes renewal TTL refresh as one complete batch with no intermediate effect"
+    );
+
+    let delete = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0x34; 16]),
+        FencedTransitionLease::renew(refreshed.lease().clone(), Duration::from_secs(30))
+            .expect("build delete renewal"),
+        FencedTransitionMutation::delete(Generation::new(2)),
+    )
+    .expect("build delete transition");
+    let before_delete = store
+        .max_replication_sequence()
+        .await
+        .expect("read application head before renewal delete");
+    let mut delete_watch = store
+        .watch(before_delete + 1)
+        .await
+        .expect("subscribe before renewal delete");
+    let before_delete_log = store
+        .status()
+        .last_log_index
+        .expect("read consensus head after subscribing before renewal delete");
+    let deleted = store
+        .fenced_transition(delete)
+        .await
+        .expect("commit renewal and delete");
+    let after_delete_log = store
+        .status()
+        .last_log_index
+        .expect("read consensus head immediately after renewal delete");
+    assert!(
+        matches!(deleted.mutation(), FencedTransitionMutationResult::Deleted)
+            && deleted.committed_generation() == Generation::new(2)
+            && deleted.lease().fence() == created.lease().fence(),
+        "renewal delete preserves the fence and reports the removed generation"
+    );
+    assert!(
+        matches!(store.get(&key).await, Ok(None)),
+        "delete removes the live record"
+    );
+    let after_delete = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe deleted transition key");
+    assert!(
+        after_delete.record().is_none() && after_delete.current_fence() == created.lease().fence(),
+        "delete retains the fence floor after removing the record"
+    );
+    assert_eq!(
+        store
+            .max_replication_sequence()
+            .await
+            .expect("read application head after renewal delete"),
+        before_delete + 1,
+        "renewal delete consumes exactly one application and replication position"
+    );
+    assert_eq!(
+        after_delete_log,
+        before_delete_log + 1,
+        "renewal delete consumes exactly one committed consensus position"
+    );
+    let delete_entries = store
+        .get_replication_log(before_delete + 1, 1)
+        .await
+        .expect("read renewal-delete application entry");
+    assert!(
+        matches!(delete_entries.as_slice(), [entry]
+            if matches!(&entry.op, ReplicationOp::Batch { ops }
+                if matches!(ops.as_slice(), [ReplicationOp::RenewLease { .. }, ReplicationOp::DeleteFenced { .. }]))),
+        "renewal delete is one batch with exactly its lease renewal and record deletion"
+    );
+    let watched_delete = delete_watch
+        .next()
+        .await
+        .expect("renewal-delete watch entry")
+        .expect("renewal-delete watch result");
+    assert!(
+        watched_delete.sequence == before_delete + 1
+            && matches!(&watched_delete.op, ReplicationOp::Batch { ops }
+                if matches!(ops.as_slice(), [ReplicationOp::RenewLease { .. }, ReplicationOp::DeleteFenced { .. }])),
+        "watch exposes renewal delete as one complete batch with no intermediate effect"
+    );
+}
+
+#[tokio::test]
+async fn fenced_transition_renew_rejects_absent_or_expired_records_without_effects() {
+    let admission_time = opc_types::Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("test timestamp"),
+    );
+    let clock = Arc::new(MutableTestClock::new(admission_time));
+    let cluster = TestCluster::start_with_clock(clock.clone()).await;
+    let store = &cluster.stores[0];
+    let request_owner = owner("fenced-transition-rejection-owner");
+
+    for (index, variant) in ["update", "refresh", "delete"].into_iter().enumerate() {
+        let key = session_key(format!("fenced-transition-absent-{variant}").as_bytes());
+        let lease = store
+            .acquire(&key, request_owner.clone(), Duration::from_secs(60))
+            .await
+            .expect("acquire lease for an absent-record renewal");
+        let successor = sealed_transition_record(
+            key.clone(),
+            2,
+            &request_owner,
+            lease.fence(),
+            b"sealed-fenced-transition-absent-successor",
+        );
+        let request = match variant {
+            "update" => FencedTransitionRequest::new(
+                FencedTransitionRequestId::from_bytes([0x70 + index as u8; 16]),
+                FencedTransitionLease::renew(lease.clone(), Duration::from_secs(120))
+                    .expect("build absent-record update renewal"),
+                FencedTransitionMutation::update(Generation::new(1), successor),
+            ),
+            "refresh" => FencedTransitionRequest::new(
+                FencedTransitionRequestId::from_bytes([0x70 + index as u8; 16]),
+                FencedTransitionLease::renew(lease.clone(), Duration::from_secs(120))
+                    .expect("build absent-record refresh renewal"),
+                FencedTransitionMutation::refresh_ttl(Generation::new(1), Duration::from_secs(30))
+                    .expect("build absent-record refresh mutation"),
+            ),
+            "delete" => FencedTransitionRequest::new(
+                FencedTransitionRequestId::from_bytes([0x70 + index as u8; 16]),
+                FencedTransitionLease::renew(lease.clone(), Duration::from_secs(120))
+                    .expect("build absent-record delete renewal"),
+                FencedTransitionMutation::delete(Generation::new(1)),
+            ),
+            _ => unreachable!("fixed mutation variant"),
+        }
+        .expect("build absent-record transition");
+        assert_fenced_renewal_cas_conflict_has_no_effect(store, &key, request).await;
+
+        // An incorrectly applied renewal would extend this guard to 120s.
+        // Advancing exactly to its original deadline proves no rejected
+        // transition renewed the lease, without a wall-clock delay.
+        clock.set(lease.expires_at());
+        let expiry_probe = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x73 + index as u8; 16]),
+            FencedTransitionLease::renew(lease, Duration::from_secs(30))
+                .expect("build expired absent-record renewal probe"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("build expired absent-record probe");
+        assert!(
+            matches!(
+                store.fenced_transition(expiry_probe).await,
+                Err(StoreError::LeaseExpired)
+            ),
+            "the rejected absent-record renewal did not extend its original lease"
+        );
+    }
+
+    for (index, variant) in ["update", "refresh", "delete"].into_iter().enumerate() {
+        let key = session_key(format!("fenced-transition-expired-{variant}").as_bytes());
+        let observation = store
+            .observe_fenced_transition(&key)
+            .await
+            .expect("observe expired-record test key");
+        let (create, _) = fenced_acquire_create_request(
+            key.clone(),
+            request_owner.clone(),
+            observation.current_fence(),
+            [0x80 + index as u8; 16],
+            Duration::from_secs(600),
+            b"sealed-fenced-transition-expired-original",
+        );
+        let created = store
+            .fenced_transition(create)
+            .await
+            .expect("commit record before deterministic expiry");
+        let establish_expiry = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x83 + index as u8; 16]),
+            FencedTransitionLease::renew(created.lease().clone(), Duration::from_secs(600))
+                .expect("build finite-expiry renewal"),
+            FencedTransitionMutation::refresh_ttl(Generation::new(1), Duration::from_secs(1))
+                .expect("build finite-expiry mutation"),
+        )
+        .expect("build finite-expiry transition");
+        let refreshed = store
+            .fenced_transition(establish_expiry)
+            .await
+            .expect("commit finite record expiry");
+        let record_expiry = match refreshed.mutation() {
+            FencedTransitionMutationResult::TtlRefreshed { expires_at } => expires_at,
+            _ => panic!("finite-expiry transition must report its deadline"),
+        };
+        clock.set(record_expiry);
+        assert!(
+            matches!(store.get(&key).await, Ok(None)),
+            "a finite record expiry equal to committed admission time is not live"
+        );
+
+        let successor = sealed_transition_record(
+            key.clone(),
+            2,
+            &request_owner,
+            refreshed.lease().fence(),
+            b"sealed-fenced-transition-expired-successor",
+        );
+        let request = match variant {
+            "update" => FencedTransitionRequest::new(
+                FencedTransitionRequestId::from_bytes([0x86 + index as u8; 16]),
+                FencedTransitionLease::renew(refreshed.lease().clone(), Duration::from_secs(120))
+                    .expect("build expired-record update renewal"),
+                FencedTransitionMutation::update(Generation::new(1), successor),
+            ),
+            "refresh" => FencedTransitionRequest::new(
+                FencedTransitionRequestId::from_bytes([0x86 + index as u8; 16]),
+                FencedTransitionLease::renew(refreshed.lease().clone(), Duration::from_secs(120))
+                    .expect("build expired-record refresh renewal"),
+                FencedTransitionMutation::refresh_ttl(Generation::new(1), Duration::from_secs(30))
+                    .expect("build expired-record refresh mutation"),
+            ),
+            "delete" => FencedTransitionRequest::new(
+                FencedTransitionRequestId::from_bytes([0x86 + index as u8; 16]),
+                FencedTransitionLease::renew(refreshed.lease().clone(), Duration::from_secs(120))
+                    .expect("build expired-record delete renewal"),
+                FencedTransitionMutation::delete(Generation::new(1)),
+            ),
+            _ => unreachable!("fixed mutation variant"),
+        }
+        .expect("build expired-record transition");
+        assert_fenced_renewal_cas_conflict_has_no_effect(store, &key, request).await;
+
+        // The finite record deadline is exactly the committed admission time.
+        // The lease remains live until this later original deadline, so this
+        // probe distinguishes a no-effect CAS conflict from a silent renewal.
+        clock.set(refreshed.lease().expires_at());
+        let expiry_probe = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x89 + index as u8; 16]),
+            FencedTransitionLease::renew(refreshed.lease().clone(), Duration::from_secs(30))
+                .expect("build expired-record renewal probe"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("build expired-record probe");
+        assert!(
+            matches!(
+                store.fenced_transition(expiry_probe).await,
+                Err(StoreError::LeaseExpired)
+            ),
+            "the rejected expired-record renewal did not extend its original lease"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fenced_transition_expired_lease_is_rejected_at_committed_admission() {
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let source = (leader + 1) % MEMBER_COUNT;
+    let store = &cluster.stores[source];
+    let key = session_key(b"fenced-transition-expired-admission");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe transition key");
+    let request_owner = owner("fenced-transition-owner");
+    let (create, original) = fenced_acquire_create_request(
+        key.clone(),
+        request_owner.clone(),
+        observation.current_fence(),
+        [0x41; 16],
+        Duration::from_millis(50),
+        b"sealed-fenced-transition-expiry",
+    );
+    let created = store
+        .fenced_transition(create)
+        .await
+        .expect("commit short-lived transition");
+    let expiry_request = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0x42; 16]),
+        FencedTransitionLease::renew(created.lease().clone(), Duration::from_secs(30))
+            .expect("build expired renewal"),
+        FencedTransitionMutation::delete(Generation::new(1)),
+    )
+    .expect("build expiry transition");
+    cluster.delay_calls(source, Duration::from_millis(200));
+    let result = store.fenced_transition(expiry_request).await;
+    cluster.stop_delaying_calls(source);
+    assert!(
+        matches!(result, Err(StoreError::LeaseExpired)),
+        "a lease expired before committed admission cannot mutate the record"
+    );
+    assert!(
+        matches!(store.get(&key).await, Ok(Some(record)) if record == original),
+        "expired admission leaves the stored record unchanged"
+    );
+    let after_expiry = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe after expired admission");
+    assert!(
+        after_expiry.current_fence() == created.lease().fence(),
+        "expired admission does not mint another fence"
+    );
+}
+
+#[tokio::test]
+async fn fenced_transition_ambiguous_forward_retry_recovers_exactly_one_effect() {
+    let cluster = TestCluster::start().await;
+
+    for source in 0..MEMBER_COUNT {
+        let store = &cluster.stores[source];
+        let key = session_key(format!("fenced-transition-ambiguous-{source}").as_bytes());
+        let observation = store
+            .observe_fenced_transition(&key)
+            .await
+            .expect("observe transition key");
+        let (request, record) = fenced_acquire_create_request(
+            key.clone(),
+            owner(format!("fenced-transition-owner-{source}")),
+            observation.current_fence(),
+            [0x50 + source as u8; 16],
+            Duration::from_secs(30),
+            b"sealed-fenced-transition-ambiguous",
+        );
+        let before = store
+            .max_replication_sequence()
+            .await
+            .expect("read application head before delayed response");
+        let delayed_before = cluster
+            .arm_forward_response_delay(source, OPERATION_TIMEOUT + Duration::from_millis(250));
+        let result = store.fenced_transition(request.clone()).await;
+        cluster.stop_forward_response_delay(source);
+        let response_was_delayed = cluster.delayed_forward_responses(source) > delayed_before;
+
+        if response_was_delayed {
+            assert!(
+                matches!(result, Err(StoreError::FencedTransitionOutcomeUnknown)),
+                "a delayed forwarded result is explicitly ambiguous"
+            );
+            assert!(
+                matches!(
+                    store.fenced_transition_status(&request).await,
+                    Ok(FencedTransitionStatus::Recorded(Ok(_)))
+                ),
+                "exact status resolves the ambiguous request"
+            );
+            let replay = store
+                .fenced_transition(request)
+                .await
+                .expect("replay exact ambiguous transition");
+            assert!(
+                matches!(replay.mutation(), FencedTransitionMutationResult::Created),
+                "exact replay returns the committed effect"
+            );
+            assert!(
+                matches!(store.get(&key).await, Ok(Some(committed)) if committed == record),
+                "ambiguous retry leaves the committed record intact"
+            );
+            let after = store
+                .max_replication_sequence()
+                .await
+                .expect("read application head after ambiguity recovery");
+            assert!(
+                after == before + 1,
+                "ambiguous retry has one application effect"
+            );
+            return;
+        }
+
+        assert!(
+            result.is_ok(),
+            "local leader transition completes without forwarding"
+        );
+    }
+
+    panic!("no forwarded transition path was exercised while delay was armed");
+}
+
+#[tokio::test]
+async fn fenced_transition_does_not_auto_replay_after_forward_write_boundary() {
+    let cluster = TestCluster::start().await;
+
+    for source in 0..MEMBER_COUNT {
+        let store = &cluster.stores[source];
+        let key = session_key(format!("fenced-transition-no-auto-replay-{source}").as_bytes());
+        let observation = store
+            .observe_fenced_transition(&key)
+            .await
+            .expect("observe transition key");
+        let (request, record) = fenced_acquire_create_request(
+            key.clone(),
+            owner(format!("fenced-transition-no-auto-replay-owner-{source}")),
+            observation.current_fence(),
+            [0x58 + source as u8; 16],
+            Duration::from_secs(30),
+            b"sealed-fenced-transition-no-auto-replay",
+        );
+        let before = store
+            .max_replication_sequence()
+            .await
+            .expect("read application head before response loss");
+        let forwards_before = cluster.forward_mutation_calls(source);
+        let dropped_before = cluster.arm_forward_response_loss(source, 1);
+
+        let result = store.fenced_transition(request.clone()).await;
+        cluster.stop_forward_response_loss(source);
+        let response_was_lost = cluster.dropped_forward_responses(source) > dropped_before;
+
+        if response_was_lost {
+            assert!(
+                matches!(result, Err(StoreError::FencedTransitionOutcomeUnknown)),
+                "a possibly delivered transition returns typed ambiguity"
+            );
+            assert_eq!(
+                cluster.forward_mutation_calls(source),
+                forwards_before + 1,
+                "the request must not be forwarded again after a possibly delivered write",
+            );
+            assert!(
+                matches!(
+                    store.fenced_transition_status(&request).await,
+                    Ok(FencedTransitionStatus::Recorded(Ok(_)))
+                ),
+                "exact status resolves the retained request without replay"
+            );
+            assert!(
+                matches!(store.get(&key).await, Ok(Some(committed)) if committed == record),
+                "the possibly delivered transition has one committed record effect"
+            );
+            assert_eq!(
+                store
+                    .max_replication_sequence()
+                    .await
+                    .expect("read application head after exact status"),
+                before + 1,
+                "status recovery must not create a second application effect",
+            );
+            return;
+        }
+
+        assert!(result.is_ok(), "local leader transition completes directly");
+    }
+
+    panic!("no forwarded transition path was exercised while response loss was armed");
+}
+
+#[tokio::test]
+async fn fenced_transition_preproposal_partition_leaves_no_receipt_or_fence() {
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let source = (leader + 1) % MEMBER_COUNT;
+    let store = &cluster.stores[source];
+    let key = session_key(b"fenced-transition-preproposal-partition");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe transition before partition");
+    let (request, _) = fenced_acquire_create_request(
+        key.clone(),
+        owner("fenced-transition-preproposal-owner"),
+        observation.current_fence(),
+        [0x61; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-preproposal",
+    );
+    let before = store
+        .max_replication_sequence()
+        .await
+        .expect("read application head before preproposal fault");
+
+    // The isolated follower cannot complete the fresh unanimous compatibility
+    // probe, so it fails before transmitting ForwardMutation to the leader.
+    cluster.isolate(source);
+    let rejected = store.fenced_transition(request.clone()).await;
+    assert!(
+        matches!(
+            rejected.as_ref(),
+            Err(StoreError::CapabilityNotSupported(capability))
+                if capability == "atomic_fenced_transition_v1"
+        ),
+        "a request stopped before transmission is a definite capability failure"
+    );
+
+    cluster.heal(source);
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("healed follower regains consensus authority");
+    assert!(
+        matches!(
+            store.fenced_transition_status(&request).await,
+            Ok(FencedTransitionStatus::NotFound)
+        ),
+        "a preproposal failure leaves no retained request result"
+    );
+    let after = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe key after preproposal failure");
+    assert!(
+        after.record().is_none() && after.current_fence() == observation.current_fence(),
+        "a preproposal failure leaves neither record nor fence effect"
+    );
+    assert!(
+        store
+            .max_replication_sequence()
+            .await
+            .expect("read application head after preproposal recovery")
+            == before,
+        "a preproposal failure has no application effect"
+    );
+}
+
+#[tokio::test]
+async fn fenced_transition_reprobes_after_same_node_id_restart_and_never_forwards() {
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let source = (leader + 1) % MEMBER_COUNT;
+    let store = &cluster.stores[source];
+
+    let first_key = session_key(b"fenced-transition-capability-proof-before-downgrade");
+    let first_observation = store
+        .observe_fenced_transition(&first_key)
+        .await
+        .expect("observe first transition key");
+    let (first_request, _) = fenced_acquire_create_request(
+        first_key,
+        owner("fenced-transition-capability-owner"),
+        first_observation.current_fence(),
+        [0x60; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-capability-before-downgrade",
+    );
+    store
+        .fenced_transition(first_request)
+        .await
+        .expect("establish a successful compatibility proof");
+
+    let rejected_key = session_key(b"fenced-transition-capability-after-downgrade");
+    let rejected_observation = store
+        .observe_fenced_transition(&rejected_key)
+        .await
+        .expect("observe rejected transition key before downgrade");
+    let (rejected_request, _) = fenced_acquire_create_request(
+        rejected_key.clone(),
+        owner("fenced-transition-capability-owner"),
+        rejected_observation.current_fence(),
+        [0x5f; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-capability-after-downgrade",
+    );
+    let forwards_before = cluster.forward_mutation_calls(source);
+
+    // This path previously completed the probe and the forwarded commit. Swap
+    // the leader's handler on this same node-ID path for an old implementation
+    // that rejects the probe: an earlier process's proof must not be cached.
+    cluster
+        .restart_same_node_id_with_old_read_barrier(source, leader)
+        .await;
+    let rejected = store.fenced_transition(rejected_request.clone()).await;
+    assert!(
+        matches!(
+            rejected,
+            Err(StoreError::CapabilityNotSupported(capability))
+                if capability == "atomic_fenced_transition_v1"
+        ),
+        "a fresh incompatible peer response fails closed"
+    );
+    assert_eq!(
+        cluster.forward_mutation_calls(source),
+        forwards_before,
+        "the follower must establish fresh compatibility before forwarding"
+    );
+
+    cluster.restore_current_rpc_handler(source, leader).await;
+    assert!(
+        matches!(
+            store.fenced_transition_status(&rejected_request).await,
+            Ok(FencedTransitionStatus::NotFound)
+        ),
+        "the rejected request leaves no durable receipt"
+    );
+    let after = store
+        .observe_fenced_transition(&rejected_key)
+        .await
+        .expect("observe rejected key after restoring compatibility");
+    assert!(
+        after.record().is_none() && after.current_fence() == rejected_observation.current_fence(),
+        "the rejected request leaves neither a record nor a fence effect"
+    );
+}
+
+#[tokio::test]
+async fn fenced_transition_new_follower_rejects_old_leader_before_forwarding() {
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let source = (leader + 1) % MEMBER_COUNT;
+    let store = &cluster.stores[source];
+    let key = session_key(b"fenced-transition-new-follower-old-leader");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("new follower observes transition key before leader downgrade");
+    let (request, _) = fenced_acquire_create_request(
+        key,
+        owner("fenced-transition-new-follower-owner"),
+        observation.current_fence(),
+        [0x5e; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-new-follower-old-leader",
+    );
+    let forwards_before = cluster.forward_mutation_calls(source);
+
+    // The source has not previously submitted this primitive. Its current
+    // leader now behaves as an old implementation, so local capability
+    // preflight must fail before the forwarding write boundary is crossed.
+    cluster.set_read_barrier_supported(source, leader, false);
+    let rejected = store.fenced_transition(request).await;
+    assert!(
+        matches!(
+            rejected.as_ref(),
+            Err(StoreError::CapabilityNotSupported(capability))
+                if capability == "atomic_fenced_transition_v1"
+        ),
+        "an unsupported leader is a definite preflight failure"
+    );
+    assert!(
+        !matches!(
+            rejected.as_ref(),
+            Err(StoreError::FencedTransitionOutcomeUnknown)
+        ),
+        "a preflight failure must never be reported as an ambiguous outcome"
+    );
+    assert_eq!(
+        cluster.forward_mutation_calls(source),
+        forwards_before,
+        "the new follower never sends ForwardMutation to the old leader"
+    );
+}
+
+#[tokio::test]
+async fn fenced_transition_enqueued_without_quorum_recovers_one_effect_by_exact_id() {
+    use futures_util::StreamExt;
+
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let store = &cluster.stores[leader];
+    let key = session_key(b"fenced-transition-enqueued-without-quorum");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe transition before proposal fault");
+    let (request, expected) = fenced_acquire_create_request(
+        key.clone(),
+        owner("fenced-transition-enqueued-owner"),
+        observation.current_fence(),
+        [0x62; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-enqueued",
+    );
+    let before = store
+        .max_replication_sequence()
+        .await
+        .expect("read application head before proposal fault");
+    let mut watch = store
+        .watch(before + 1)
+        .await
+        .expect("subscribe before proposal fault");
+    let delayed_before = cluster.delay_append_entries_for_request(
+        leader,
+        *request.request_id().as_bytes(),
+        OPERATION_TIMEOUT + Duration::from_millis(250),
+    );
+
+    let ambiguous = store.fenced_transition(request.clone()).await;
+    cluster.stop_delaying_append_entries_for_request(leader);
+    assert!(
+        cluster.delayed_append_entries(leader) > delayed_before,
+        "the accepted proposal reached the follower replication phase"
+    );
+    assert!(
+        matches!(ambiguous, Err(StoreError::FencedTransitionOutcomeUnknown)),
+        "an enqueued proposal without a quorum acknowledgement has an unknown outcome"
+    );
+
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("cluster recovers after delayed proposal replication");
+    let resolved = match store
+        .fenced_transition_status(&request)
+        .await
+        .expect("resolve exact transition after recovery")
+    {
+        FencedTransitionStatus::Recorded(Ok(recorded)) => {
+            let replay = store
+                .fenced_transition(request.clone())
+                .await
+                .expect("replay recorded transition after recovery");
+            assert!(
+                replay == recorded,
+                "exact replay returns the retained outcome"
+            );
+            recorded
+        }
+        FencedTransitionStatus::NotFound => store
+            .fenced_transition(request.clone())
+            .await
+            .expect("safely complete an unrecorded transition after recovery"),
+        FencedTransitionStatus::Recorded(Err(_))
+        | FencedTransitionStatus::RequestConflict
+        | FencedTransitionStatus::Expired
+        | FencedTransitionStatus::HistoryFull
+        | FencedTransitionStatus::RetentionExhausted => {
+            panic!("recovery must retain or safely complete the exact transition")
+        }
+    };
+    assert!(
+        matches!(resolved.mutation(), FencedTransitionMutationResult::Created),
+        "recovered transition reports its one create effect"
+    );
+    assert!(
+        matches!(store.get(&key).await, Ok(Some(record)) if record == expected),
+        "recovery leaves the expected record visible"
+    );
+    assert!(
+        store
+            .max_replication_sequence()
+            .await
+            .expect("read application head after ambiguity recovery")
+            == before + 1,
+        "the exact-ID recovery has one application effect"
+    );
+    let watched = tokio::time::timeout(RECOVERY_TIMEOUT, watch.next())
+        .await
+        .expect("one recovered watch entry arrives within the recovery bound")
+        .expect("recovered watch remains open")
+        .expect("recovered watch entry succeeds");
+    assert!(
+        watched.sequence == before + 1
+            && matches!(&watched.op, ReplicationOp::Batch { ops }
+                if matches!(ops.as_slice(), [ReplicationOp::AcquireLease { .. }, ReplicationOp::CompareAndSet { .. }])),
+        "the recovered request has one atomic watch effect"
+    );
+}
+
+#[tokio::test]
+async fn fenced_transition_leader_transfer_preserves_exact_replay_on_surviving_voter() {
+    use futures_util::StreamExt;
+
+    let _timing_permit = ELECTION_AND_SNAPSHOT_TEST_PERMIT
+        .acquire()
+        .await
+        .expect("qualification semaphore remains open");
+    let cluster = TestCluster::start().await;
+    let (old_leader, old_leader_id, old_term) = cluster.observed_leader();
+    let survivors = (0..MEMBER_COUNT)
+        .filter(|index| *index != old_leader)
+        .collect::<Vec<_>>();
+    let store = &cluster.stores[old_leader];
+    let key = session_key(b"fenced-transition-leader-transfer");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe transition before leader transfer");
+    let (request, expected) = fenced_acquire_create_request(
+        key.clone(),
+        owner("fenced-transition-transfer-owner"),
+        observation.current_fence(),
+        [0x63; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-transfer",
+    );
+    let before = store
+        .max_replication_sequence()
+        .await
+        .expect("read application head before committed transition");
+    let mut watch = cluster.stores[survivors[0]]
+        .watch(before + 1)
+        .await
+        .expect("subscribe surviving voter before transition");
+    let committed = store
+        .fenced_transition(request.clone())
+        .await
+        .expect("commit transition before leader transfer");
+    let watched = tokio::time::timeout(RECOVERY_TIMEOUT, watch.next())
+        .await
+        .expect("committed watch entry arrives within the recovery bound")
+        .expect("committed watch remains open")
+        .expect("committed watch entry succeeds");
+    assert!(
+        watched.sequence == before + 1
+            && matches!(&watched.op, ReplicationOp::Batch { ops }
+                if matches!(ops.as_slice(), [ReplicationOp::AcquireLease { .. }, ReplicationOp::CompareAndSet { .. }])),
+        "the committed transition has one atomic watch effect before failover"
+    );
+
+    cluster.isolate(old_leader);
+    let recovery_deadline = tokio::time::Instant::now() + RECOVERY_TIMEOUT;
+    let (new_leader_id, new_term) = tokio::time::timeout_at(recovery_deadline, async {
+        loop {
+            let statuses = survivors
+                .iter()
+                .map(|index| cluster.stores[*index].status())
+                .collect::<Vec<_>>();
+            if let Some(candidate) = statuses.first().and_then(|status| status.leader_id) {
+                let term = statuses.first().expect("survivor status").term;
+                if candidate != old_leader_id
+                    && term > old_term
+                    && statuses
+                        .iter()
+                        .all(|status| status.leader_id == Some(candidate) && status.term == term)
+                {
+                    break (candidate, term);
+                }
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("surviving voters elect a new leader");
+    assert!(new_leader_id != old_leader_id && new_term > old_term);
+
+    let survivor = &cluster.stores[survivors[0]];
+    let status = survivor
+        .fenced_transition_status(&request)
+        .await
+        .expect("surviving voter resolves the exact committed result");
+    assert!(
+        matches!(status, FencedTransitionStatus::Recorded(Ok(recorded)) if recorded == committed),
+        "leader transfer preserves the exact recorded result"
+    );
+    let unavailable_replay = survivor.fenced_transition(request.clone()).await;
+    assert!(
+        matches!(
+            unavailable_replay,
+            Err(StoreError::CapabilityNotSupported(capability))
+                if capability == "atomic_fenced_transition_v1"
+        ),
+        "a missing configured voter prevents a fresh whole-scope compatibility proof"
+    );
+    assert!(
+        survivor
+            .max_replication_sequence()
+            .await
+            .expect("read surviving application head after failed proof")
+            == before + 1,
+        "failed compatibility proof does not add an application effect"
+    );
+
+    cluster.heal(old_leader);
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("healed voter rejoins the exact compatible scope");
+    let replay = survivor
+        .fenced_transition(request)
+        .await
+        .expect("surviving voter replays after compatibility is re-established");
+    assert!(
+        replay == committed,
+        "exact replay survives leader transfer and voter recovery"
+    );
+    assert!(
+        matches!(survivor.get(&key).await, Ok(Some(record)) if record == expected),
+        "the surviving voter retains the committed record"
+    );
+    assert!(
+        survivor
+            .max_replication_sequence()
+            .await
+            .expect("read surviving application head after replay")
+            == before + 1,
+        "leader transfer and exact replay do not add a second application effect"
+    );
 }
 
 #[tokio::test]

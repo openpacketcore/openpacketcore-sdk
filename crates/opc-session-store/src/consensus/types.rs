@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::backend::{CompareAndSet, CompareAndSetResult};
 use crate::error::StoreError;
+use crate::fenced_transition::{FencedTransitionOutcome, FencedTransitionRequest};
 use crate::lease::LeaseGuard;
 use crate::model::{OwnerId, SessionKey};
 use crate::record::StoredSessionRecord;
@@ -88,7 +89,7 @@ impl fmt::Debug for SessionTopologyMemberBinding {
 /// Allocation of fences, credentials, effective logical time, application
 /// sequence, and the digest predecessor remains committed state-machine work
 /// and cannot be chosen by an authenticated follower.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionMutationIntent {
     /// Advance the persisted logical clock without changing session data.
     ///
@@ -123,6 +124,8 @@ pub enum SessionMutationIntent {
         /// Requested bounded TTL.
         ttl: std::time::Duration,
     },
+    /// Atomically acquire or renew one exact fence and mutate the same record.
+    FencedTransition(Box<FencedTransitionRequest>),
     /// Release an existing lease.
     ReleaseLease(LeaseGuard),
     /// SDK-internal quorum-durable binding of a caller-owned consumer request
@@ -218,8 +221,14 @@ pub enum SessionMutationIntent {
     },
 }
 
+impl fmt::Debug for SessionMutationIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionMutationIntent(<redacted>)")
+    }
+}
+
 /// Application command carried by one normal Openraft log entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionConsensusCommand {
     /// Exact durable command schema.
     pub schema_version: u16,
@@ -233,6 +242,12 @@ pub struct SessionConsensusCommand {
     pub logical_time: opc_types::Timestamp,
     /// High-level deterministic mutation.
     pub intent: SessionMutationIntent,
+}
+
+impl fmt::Debug for SessionConsensusCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsensusCommand(<redacted>)")
+    }
 }
 
 impl SessionConsensusCommand {
@@ -260,7 +275,7 @@ impl SessionConsensusCommand {
 
 /// Successful state-machine result returned after durable quorum commit and
 /// local application.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionMutationOutcome {
     /// Result of a compare-and-set command.
     CompareAndSet(CompareAndSetResult),
@@ -269,12 +284,20 @@ pub enum SessionMutationOutcome {
     ConsumerRecord(Option<StoredSessionRecord>),
     /// Lease allocated or renewed by the committed command.
     Lease(LeaseGuard),
+    /// Result of one atomic single-record fenced transition.
+    FencedTransition(FencedTransitionOutcome),
     /// Mutation completed without a value result.
     Unit,
 }
 
+impl fmt::Debug for SessionMutationOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionMutationOutcome(<redacted>)")
+    }
+}
+
 /// Persisted command outcome returned by Openraft client writes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionConsensusResponse {
     /// Deterministic state-machine result. Errors are persisted so an exact
     /// retry returns the original outcome after restart or leader failover.
@@ -289,6 +312,12 @@ pub struct SessionConsensusResponse {
     /// Original Openraft log index that durably applied this request.
     /// Followers use it to wait for their local state machine before reading.
     pub raft_log_index: u64,
+}
+
+impl fmt::Debug for SessionConsensusResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsensusResponse(<redacted>)")
+    }
 }
 
 impl SessionConsensusResponse {
@@ -306,7 +335,7 @@ impl SessionConsensusResponse {
 
 /// Typed in-process envelope used before conversion to the shared bounded wire
 /// request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionConsensusRpc<T> {
     /// Exact consensus schema.
     pub schema_version: u16,
@@ -316,6 +345,12 @@ pub struct SessionConsensusRpc<T> {
     pub sender: SessionConsensusNodeId,
     /// Private engine RPC or SDK-owned forwarded request.
     pub payload: T,
+}
+
+impl<T> fmt::Debug for SessionConsensusRpc<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsensusRpc(<redacted>)")
+    }
 }
 
 impl<T> SessionConsensusRpc<T> {
@@ -342,7 +377,11 @@ mod tests {
     use opc_types::{NetworkFunctionKind, TenantId};
 
     use super::*;
-    use crate::{OwnerId, SessionKeyType, StableId, STABLE_ID_MAX_BYTES};
+    use crate::{
+        EncryptedSessionPayload, FenceToken, FencedTransitionLease, FencedTransitionMutation,
+        FencedTransitionRequestId, Generation, OwnerId, SessionKeyType, StableId, StateClass,
+        StateType, STABLE_ID_MAX_BYTES,
+    };
 
     #[test]
     fn consensus_intent_serde_enforces_stable_id_before_admission() {
@@ -373,6 +412,94 @@ mod tests {
             if let Err(error) = decoded {
                 assert!(!error.to_string().contains("165"));
             }
+        }
+    }
+
+    #[test]
+    fn consensus_command_and_response_debug_are_non_identifying() {
+        let key = SessionKey {
+            tenant: TenantId::from_static("debug-secret-tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: StableId::new(Bytes::from_static(b"debug-secret-key")).expect("stable ID"),
+        };
+        let owner = OwnerId::new("debug-secret-owner").expect("owner");
+        let request = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0xA7; 16]),
+            FencedTransitionLease::acquire(
+                key.clone(),
+                owner.clone(),
+                FenceToken::new(0),
+                Duration::from_secs(60),
+            )
+            .expect("lease action"),
+            FencedTransitionMutation::create(StoredSessionRecord {
+                key,
+                generation: Generation::new(1),
+                owner,
+                fence: FenceToken::new(1),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::from_static("debug-secret-type"),
+                expires_at: None,
+                payload: EncryptedSessionPayload::new(b"debug-secret-payload"),
+            }),
+        )
+        .expect("transition request");
+        let logical_time = opc_types::Timestamp::from_offset_datetime(
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1_234_567),
+        );
+        let command = SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: SessionConsensusIdentity::new(
+                SessionConsensusClusterId::new("debug-secret-cluster").expect("cluster"),
+                SessionConsensusConfigurationId::from_bytes([0xA8; 32]),
+                SessionConsensusConfigurationEpoch::new(7).expect("epoch"),
+            ),
+            request_id: SessionConsensusRequestId::from_bytes([0xA7; 16]),
+            logical_time,
+            intent: SessionMutationIntent::FencedTransition(Box::new(request)),
+        };
+        let response = SessionConsensusResponse {
+            result: Err(StoreError::BackendUnavailable(
+                "debug-secret-diagnostic".into(),
+            )),
+            sequence: 9,
+            digest: Some(SessionConsensusEntryDigest::from_bytes([0xA9; 32])),
+            logical_time: Some(logical_time),
+            raft_log_index: 10,
+        };
+
+        assert_eq!(
+            format!("{command:?}"),
+            "SessionConsensusCommand(<redacted>)"
+        );
+        assert_eq!(
+            format!("{:?}", command.intent),
+            "SessionMutationIntent(<redacted>)"
+        );
+        assert_eq!(
+            format!("{response:?}"),
+            "SessionConsensusResponse(<redacted>)"
+        );
+        assert_eq!(
+            format!("{:?}", SessionMutationOutcome::Unit),
+            "SessionMutationOutcome(<redacted>)"
+        );
+        let rpc = SessionConsensusRpc::new(
+            command.identity,
+            SessionConsensusNodeId::new(3).expect("sender"),
+            b"debug-secret-rpc".to_vec(),
+        );
+        assert_eq!(format!("{rpc:?}"), "SessionConsensusRpc(<redacted>)");
+        for secret in [
+            "debug-secret",
+            "1234567",
+            "A7",
+            "A8",
+            "A9",
+            "ConsensusIdentity",
+        ] {
+            assert!(!format!("{command:?}{response:?}{rpc:?}").contains(secret));
         }
     }
 }

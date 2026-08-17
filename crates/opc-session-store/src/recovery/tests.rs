@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -702,8 +703,17 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
             crate::sqlite::ops::read_restore_scan_state_sync(&target)
                 .expect("read recovered restore incarnation");
         restore_incarnations.insert((restore_epoch, *restore_key));
-        assert_eq!(objects.len(), 21);
-        assert!(objects.iter().all(|(kind, _)| kind == "table"));
+        assert_eq!(objects.len(), 23);
+        assert!(objects.iter().any(|(kind, name)| {
+            kind == "table" && name == "consensus_fenced_transition_receipts"
+        }));
+        assert!(objects.iter().any(|(kind, name)| {
+            kind == "index" && name == "consensus_fenced_transition_receipts_due"
+        }));
+        assert!(objects.iter().all(|(kind, name)| {
+            kind == "table"
+                || (kind == "index" && name == "consensus_fenced_transition_receipts_due")
+        }));
     }
     assert_eq!(restore_incarnations.len(), replicas.len());
 
@@ -1448,6 +1458,353 @@ fn claim_current_replica(
     );
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("checkpoint current replica");
+}
+
+fn current_receipt_inspection_fixture(
+    root: &Path,
+) -> (RecoveryReplica, BTreeSet<SessionConsensusNodeId>) {
+    let id = replica_id("receipt-inspection-replica");
+    let replica = create_legacy_replica(root, id.clone(), 3);
+    let members = node_set(&[id]);
+    claim_current_replica(
+        &replica,
+        &members,
+        LogId::new(
+            CommittedLeaderId::new(1, *members.iter().next().expect("member")),
+            0,
+        ),
+    );
+    (replica, members)
+}
+
+fn receipt_inspection_timestamp() -> Timestamp {
+    Timestamp::from_str("2026-08-16T00:00:00Z").expect("fixed receipt timestamp")
+}
+
+fn insert_receipt_for_recovery_inspection(
+    conn: &Connection,
+    retained_until: Timestamp,
+    response_json: Option<&[u8]>,
+) {
+    let response_digest = [0xA4_u8; 32];
+    conn.execute(
+        "INSERT INTO consensus_fenced_transition_receipts (request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            [0xA1_u8; 16].as_slice(),
+            7_i64,
+            [0xA2_u8; 32].as_slice(),
+            crate::sqlite::ops::format_rfc3339_normalized(retained_until),
+            [0xA3_u8; 32].as_slice(),
+            response_json,
+            response_json.map(|_| response_digest.as_slice()),
+        ],
+    )
+    .expect("insert receipt fixture");
+}
+
+fn install_precommitment_fenced_receipt_table(conn: &Connection) {
+    conn.execute_batch(
+        r#"
+        DROP TABLE consensus_fenced_transition_receipts;
+        CREATE TABLE consensus_fenced_transition_receipts (
+            request_id BLOB PRIMARY KEY,
+            configuration_epoch INTEGER NOT NULL,
+            payload_digest BLOB NOT NULL,
+            retained_until TEXT NOT NULL,
+            response_json BLOB
+        );
+        "#,
+    )
+    .expect("install pre-commitment receipt table");
+}
+
+#[test]
+fn current_recovery_inspection_rejects_malformed_fenced_receipt_response_json() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (replica, members) = current_receipt_inspection_fixture(temp.path());
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    insert_receipt_for_recovery_inspection(&conn, receipt_inspection_timestamp(), Some(b"{"));
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint receipt mutation");
+    drop(conn);
+
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        }),
+        Err(RecoveryError::CorruptReplica)
+    );
+}
+
+#[test]
+fn current_recovery_inspection_rejects_partial_receipt_commitment_schema() {
+    for partial_column in ["binding_digest", "response_digest"] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let (replica, members) = current_receipt_inspection_fixture(temp.path());
+        let conn = Connection::open(&replica.database_path).expect("open current replica");
+        conn.execute_batch("DROP TABLE consensus_fenced_transition_receipts")
+            .expect("remove canonical receipt table");
+        let partial_schema = format!(
+            "CREATE TABLE consensus_fenced_transition_receipts (request_id BLOB PRIMARY KEY, configuration_epoch INTEGER, payload_digest BLOB, retained_until TEXT, {partial_column} BLOB, response_json BLOB)"
+        );
+        conn.execute_batch(&partial_schema)
+            .expect("install partial receipt schema");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint partial receipt schema");
+        drop(conn);
+
+        assert_eq!(
+            inspect_replica(InspectionInput {
+                key: &integrity_key(),
+                replica: &replica,
+                identity: identity(),
+                expected_members: &members,
+                limits: RecoveryLimits::default(),
+            }),
+            Err(RecoveryError::CorruptReplica),
+            "{partial_column}",
+        );
+    }
+}
+
+#[test]
+fn current_recovery_inspection_accepts_empty_and_rejects_populated_precommitment_receipt_table() {
+    for populated in [false, true] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let (replica, members) = current_receipt_inspection_fixture(temp.path());
+        let conn = Connection::open(&replica.database_path).expect("open current replica");
+        install_precommitment_fenced_receipt_table(&conn);
+        if populated {
+            conn.execute(
+                "INSERT INTO consensus_fenced_transition_receipts (request_id, configuration_epoch, payload_digest, retained_until, response_json) VALUES (?1, ?2, ?3, ?4, NULL)",
+                params![
+                    [0xA5_u8; 16].as_slice(),
+                    7_i64,
+                    [0xA6_u8; 32].as_slice(),
+                    crate::sqlite::ops::format_rfc3339_normalized(receipt_inspection_timestamp()),
+                ],
+            )
+            .expect("populate pre-commitment receipt table");
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint pre-commitment receipt table");
+        drop(conn);
+
+        let inspected = inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        });
+        if populated {
+            assert_eq!(inspected, Err(RecoveryError::CorruptReplica));
+        } else {
+            assert!(inspected.is_ok());
+        }
+    }
+}
+
+#[test]
+fn current_recovery_inspection_rejects_premature_fenced_receipt_tombstone() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (replica, members) = current_receipt_inspection_fixture(temp.path());
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    let logical_time = receipt_inspection_timestamp();
+    let retained_until =
+        crate::checked_session_deadline(logical_time, crate::FENCED_TRANSITION_OUTCOME_RETENTION)
+            .expect("receipt retention deadline");
+    conn.execute(
+        "UPDATE consensus_machine SET logical_time = ?1 WHERE singleton = 1",
+        [crate::sqlite::ops::format_rfc3339_normalized(logical_time)],
+    )
+    .expect("set durable machine time");
+    insert_receipt_for_recovery_inspection(&conn, retained_until, None);
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint receipt mutation");
+    drop(conn);
+
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        }),
+        Err(RecoveryError::CorruptReplica)
+    );
+}
+
+#[test]
+fn current_recovery_inspection_rejects_fenced_receipt_beyond_durable_floors() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (replica, members) = current_receipt_inspection_fixture(temp.path());
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    let logical_time = receipt_inspection_timestamp();
+    let retained_until =
+        crate::checked_session_deadline(logical_time, crate::FENCED_TRANSITION_OUTCOME_RETENTION)
+            .expect("receipt retention deadline");
+    let response = crate::SessionConsensusResponse {
+        result: Err(crate::StoreError::NotFound),
+        sequence: 1,
+        digest: Some(crate::SessionConsensusEntryDigest::from_bytes([0xA3; 32])),
+        logical_time: Some(logical_time),
+        raft_log_index: 1,
+    };
+    let response_json = serde_json::to_vec(&response).expect("encode receipt response");
+    insert_receipt_for_recovery_inspection(&conn, retained_until, Some(&response_json));
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint receipt mutation");
+    drop(conn);
+
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        }),
+        Err(RecoveryError::CorruptReplica)
+    );
+}
+
+#[test]
+fn current_recovery_inspection_accepts_pre_ledger_replica() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (replica, members) = current_receipt_inspection_fixture(temp.path());
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    conn.execute_batch(
+        "DROP TABLE consensus_fenced_transition_receipts; PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("remove additive receipt ledger");
+    drop(conn);
+
+    inspect_replica(InspectionInput {
+        key: &integrity_key(),
+        replica: &replica,
+        identity: identity(),
+        expected_members: &members,
+        limits: RecoveryLimits::default(),
+    })
+    .expect("read-only inspection accepts a pre-ledger replica");
+}
+
+#[test]
+fn current_recovery_inspection_normalizes_exact_pre_acquisition_lease_schema() {
+    for active in [false, true] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let (replica, members) = current_receipt_inspection_fixture(temp.path());
+        let conn = Connection::open(&replica.database_path).expect("open current replica");
+        if active {
+            let key = SessionKey {
+                tenant: TenantId::from_static("recovery-pre-acquired-at"),
+                nf_kind: NetworkFunctionKind::from_static("smf"),
+                key_type: SessionKeyType::PduSession,
+                stable_id: Bytes::from_static(b"recovery-pre-acquired-at")
+                    .try_into()
+                    .expect("valid stable ID"),
+            };
+            crate::sqlite::lease::acquire_sync(
+                &conn,
+                &key,
+                OwnerId::new("recovery-pre-acquired-at-owner").expect("owner"),
+                Duration::from_secs(300),
+                Timestamp::from_str("2027-01-01T00:00:00Z").expect("timestamp"),
+            )
+            .expect("insert active legacy lease");
+        }
+        conn.execute_batch(
+            "ALTER TABLE leases DROP COLUMN acquired_at; PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .expect("form exact pre-acquisition schema");
+        drop(conn);
+
+        let inspected = inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        })
+        .expect("read-only inspection accepts exact pre-acquisition schema");
+
+        drop(
+            SqliteSessionBackend::open(&replica.database_path)
+                .expect("writable migration adds non-authoritative marker"),
+        );
+        let migrated = inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        })
+        .expect("inspection accepts migrated schema");
+        assert_eq!(
+            inspected.branch_digest, migrated.branch_digest,
+            "active={active}"
+        );
+        assert_eq!(
+            inspected.logical_state_digest, migrated.logical_state_digest,
+            "active={active}"
+        );
+    }
+}
+
+#[test]
+fn current_recovery_plan_accepts_exact_pre_acquisition_lease_schema() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let ids = [
+        replica_id("pre-acquired-at-current-a"),
+        replica_id("pre-acquired-at-current-b"),
+        replica_id("pre-acquired-at-current-c"),
+    ];
+    let replicas = ids
+        .iter()
+        .cloned()
+        .map(|id| create_legacy_replica(temp.path(), id, 7))
+        .collect::<Vec<_>>();
+    let members = node_set(&ids);
+    let majority_log = LogId::new(
+        CommittedLeaderId::new(1, *members.first().expect("member")),
+        0,
+    );
+    let fork_log = LogId::new(
+        CommittedLeaderId::new(2, *members.iter().nth(1).expect("fork leader")),
+        0,
+    );
+    for (index, replica) in replicas.iter().enumerate() {
+        claim_current_replica(
+            replica,
+            &members,
+            if index == 2 { fork_log } else { majority_log },
+        );
+        Connection::open(&replica.database_path)
+            .expect("open current replica")
+            .execute_batch(
+                "ALTER TABLE leases DROP COLUMN acquired_at; PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("form exact pre-acquisition schema");
+    }
+
+    let _plan = recovery(AllowRecovery)
+        .plan(
+            &context(),
+            identity(),
+            members,
+            &replicas,
+            &ids[0],
+            &ids[2..],
+            RecoveryDecisionBasis::VerifiedCommittedMajority,
+            RecoveryLimits::default(),
+        )
+        .expect("recovery plan accepts matching legacy lease schemas");
 }
 
 #[test]

@@ -2,10 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use hmac::Mac;
 use opc_consensus::engine::LogId;
+use opc_types::Timestamp;
 use rusqlite::backup::Backup;
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -23,7 +25,8 @@ use crate::consensus::{
 };
 use crate::sqlite::{consensus, ops};
 use crate::{
-    ReplicationEntry, ReplicationTxId, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
+    ReplicationEntry, ReplicationTxId, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+    REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 
 const PATH_MAX_BYTES: usize = 4_096;
@@ -40,9 +43,44 @@ const FILE_IDENTITY_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file-ident
 const LOGICAL_STATE_DOMAIN: &[u8] = b"openpacketcore/session-recovery/logical-state/v1\0";
 const FILE_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file/v1\0";
 const WORKFLOW_VERSION: u16 = 2;
-// Six base SQLite objects plus fifteen bounded consensus/recovery objects.
-const MAX_CURRENT_SCHEMA_OBJECTS: usize = 21;
+// Six base SQLite objects plus sixteen bounded consensus/recovery tables.
+// The sole bounded receipt-ledger index is validated separately below.
+const MAX_CURRENT_SCHEMA_OBJECTS: usize = 22;
 const MAX_SCHEMA_SQL_BYTES: usize = 16_384;
+
+const LEGACY_LEASE_COLUMNS_WITH_ACQUIRED_AT: &[&str] = &[
+    "tenant",
+    "nf_kind",
+    "key_type",
+    "stable_id",
+    "active",
+    "credential_id",
+    "owner",
+    "fence",
+    "expires_at_unix_ms",
+    "guard_expires_at",
+    "acquired_at",
+];
+
+const LEGACY_LEASE_COLUMNS_BEFORE_ACQUIRED_AT: &[&str] = &[
+    "tenant",
+    "nf_kind",
+    "key_type",
+    "stable_id",
+    "active",
+    "credential_id",
+    "owner",
+    "fence",
+    "expires_at_unix_ms",
+    "guard_expires_at",
+];
+
+// Recovery digests are format commitments.  A pre-acquisition lease table is
+// read through the second query, but is labeled with the current query so a
+// writable migration that appends `NULL` has the identical digest.
+const LEASES_HASH_QUERY: &str =
+    "SELECT * FROM leases ORDER BY tenant, nf_kind, key_type, stable_id";
+const PRE_ACQUISITION_LEASES_HASH_QUERY: &str = "SELECT tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at, CAST(NULL AS TEXT) AS acquired_at FROM leases ORDER BY tenant, nf_kind, key_type, stable_id";
 
 pub(super) struct InspectionInput<'a> {
     pub(super) key: &'a RecoveryIntegrityKey,
@@ -385,6 +423,10 @@ fn inspect_current(
         .map_err(|_| RecoveryError::CorruptReplica)?;
     validate_consensus_sealed_records(conn, budget)?;
     validate_legacy_lease_state(conn, budget)?;
+    if table_exists(conn, "consensus_fenced_transition_receipts")? {
+        consensus::validate_fenced_transition_receipts_sync(conn, storage_identity)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+    }
     let committed = consensus::read_committed_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let applied = consensus::read_applied_sync(conn, storage_identity)
@@ -498,6 +540,48 @@ fn preflight_current_tables(
             return Err(RecoveryError::WorkLimitExceeded);
         }
     }
+    if table_exists(conn, "consensus_fenced_transition_receipts")? {
+        match fenced_receipt_commitment_columns(conn)? {
+            FencedReceiptCommitmentColumns::Neither => {
+                let has_rows: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM consensus_fenced_transition_receipts LIMIT 1)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| RecoveryError::CorruptReplica)?;
+                if has_rows {
+                    return Err(RecoveryError::CorruptReplica);
+                }
+            }
+            FencedReceiptCommitmentColumns::Both => {
+                preflight_fenced_transition_receipt_count(conn)?;
+                let cap = i64::try_from(FENCED_TRANSITION_MAX_HISTORY_ENTRIES)
+                    .map_err(|_| RecoveryError::CorruptReplica)?;
+                let query = "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(payload_digest), length(retained_until), length(binding_digest), COALESCE(length(response_json), 0), COALESCE(length(response_digest), 0))), 0), COALESCE(SUM(length(request_id) + length(payload_digest) + length(retained_until) + length(binding_digest) + COALESCE(length(response_json), 0) + COALESCE(length(response_digest), 0)), 0) FROM (SELECT request_id, payload_digest, retained_until, binding_digest, response_json, response_digest FROM consensus_fenced_transition_receipts LIMIT ?1)";
+                let (count, maximum, total): (i64, i64, i64) = conn
+                    .query_row(query, [cap], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .map_err(|error| inspection_sql_error(error, budget))?;
+                let count = u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
+                let maximum = u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?;
+                let total = u64::try_from(total).map_err(|_| RecoveryError::CorruptReplica)?;
+                total_bytes = total_bytes
+                    .checked_add(total)
+                    .ok_or(RecoveryError::WorkLimitExceeded)?;
+                if count > budget.limits.max_rows()
+                    || maximum > budget.limits.max_value_bytes()
+                    || total_bytes > budget.limits.max_total_value_bytes()
+                {
+                    return Err(RecoveryError::WorkLimitExceeded);
+                }
+            }
+            FencedReceiptCommitmentColumns::Partial => {
+                return Err(RecoveryError::CorruptReplica);
+            }
+        }
+    }
     if table_exists(conn, "consensus_operator_recovery")? {
         let (count, maximum, total): (i64, i64, i64) = conn
             .query_row(
@@ -585,6 +669,31 @@ fn preflight_current_tables(
     Ok(())
 }
 
+/// Probe no more than one row beyond the durable protocol limit before an
+/// aggregate or hash touches the lifetime fenced-transition receipt ledger.
+/// Recovery limits remain resource controls; they must not redefine this
+/// consensus-format bound.
+fn preflight_fenced_transition_receipt_count(conn: &Connection) -> Result<usize, RecoveryError> {
+    let limit = i64::try_from(
+        FENCED_TRANSITION_MAX_HISTORY_ENTRIES
+            .checked_add(1)
+            .ok_or(RecoveryError::CorruptReplica)?,
+    )
+    .map_err(|_| RecoveryError::CorruptReplica)?;
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (SELECT request_id FROM consensus_fenced_transition_receipts LIMIT ?1)",
+            [limit],
+            |row| row.get(0),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let count = usize::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
+    if count > FENCED_TRANSITION_MAX_HISTORY_ENTRIES {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    Ok(count)
+}
+
 fn validate_log_floors(
     committed: Option<&LogId<SessionConsensusNodeId>>,
     applied: Option<&LogId<SessionConsensusNodeId>>,
@@ -653,9 +762,14 @@ fn committed_branch_digest(
         .index
         .checked_add(1)
         .ok_or(RecoveryError::CorruptReplica)?;
-    let entries =
-        consensus::read_log_range_sync(conn, identity, committed.index, Some(end), Some(1))
-            .map_err(|_| RecoveryError::CorruptReplica)?;
+    let entries = consensus::read_log_range_for_recovery_sync(
+        conn,
+        identity,
+        committed.index,
+        Some(end),
+        Some(1),
+    )
+    .map_err(|_| RecoveryError::CorruptReplica)?;
     if let Some(entry) = entries.first() {
         if entry.log_id != *committed {
             return Err(RecoveryError::CorruptReplica);
@@ -693,9 +807,11 @@ fn hash_current_checkpoint(
     budget: &mut InspectionBudget,
     hasher: &mut Sha256,
 ) -> Result<(), RecoveryError> {
+    let records_query =
+        "SELECT * FROM session_records ORDER BY tenant, nf_kind, key_type, stable_id";
+    hash_query_rows_with_identity(conn, records_query, records_query, budget, hasher)?;
+    hash_legacy_lease_rows(conn, budget, hasher)?;
     for query in [
-        "SELECT * FROM session_records ORDER BY tenant, nf_kind, key_type, stable_id",
-        "SELECT * FROM leases ORDER BY tenant, nf_kind, key_type, stable_id",
         "SELECT * FROM key_fences ORDER BY tenant, nf_kind, key_type, stable_id",
         "SELECT * FROM lease_globals ORDER BY key",
         "SELECT * FROM session_replication_log ORDER BY sequence",
@@ -704,33 +820,28 @@ fn hash_current_checkpoint(
         "SELECT * FROM consensus_applied ORDER BY singleton",
         "SELECT * FROM consensus_request_outcomes ORDER BY request_id",
     ] {
-        hasher.update(
-            u64::try_from(query.len())
-                .map_err(|_| RecoveryError::WorkLimitExceeded)?
-                .to_be_bytes(),
-        );
-        hasher.update(query.as_bytes());
-        hash_query_rows(conn, query, budget, hasher)?;
+        hash_query_rows_with_identity(conn, query, query, budget, hasher)?;
+    }
+    let fenced_receipts_query =
+        "SELECT * FROM consensus_fenced_transition_receipts ORDER BY request_id";
+    if table_exists(conn, "consensus_fenced_transition_receipts")?
+        && preflight_fenced_transition_receipt_count(conn)? != 0
+    {
+        hash_query_rows_with_identity(
+            conn,
+            fenced_receipts_query,
+            fenced_receipts_query,
+            budget,
+            hasher,
+        )?;
     }
     if table_exists(conn, "consensus_membership_scope")? {
         let query = "SELECT * FROM consensus_membership_scope ORDER BY singleton";
-        hasher.update(
-            u64::try_from(query.len())
-                .map_err(|_| RecoveryError::WorkLimitExceeded)?
-                .to_be_bytes(),
-        );
-        hasher.update(query.as_bytes());
-        hash_query_rows(conn, query, budget, hasher)?;
+        hash_query_rows_with_identity(conn, query, query, budget, hasher)?;
     }
     if table_exists(conn, "consensus_membership_history")? {
         let query = "SELECT * FROM consensus_membership_history ORDER BY configuration_epoch";
-        hasher.update(
-            u64::try_from(query.len())
-                .map_err(|_| RecoveryError::WorkLimitExceeded)?
-                .to_be_bytes(),
-        );
-        hasher.update(query.as_bytes());
-        hash_query_rows(conn, query, budget, hasher)?;
+        hash_query_rows_with_identity(conn, query, query, budget, hasher)?;
     }
     let terminal_history_query = "SELECT * FROM consensus_membership_terminal_history ORDER BY transition_start_index, transition_id";
     hasher.update(
@@ -819,21 +930,7 @@ fn validate_legacy_schema(conn: &Connection) -> Result<(), RecoveryError> {
                 "encoding",
             ][..],
         ),
-        (
-            "leases",
-            &[
-                "tenant",
-                "nf_kind",
-                "key_type",
-                "stable_id",
-                "active",
-                "credential_id",
-                "owner",
-                "fence",
-                "expires_at_unix_ms",
-                "guard_expires_at",
-            ][..],
-        ),
+        ("leases", LEGACY_LEASE_COLUMNS_WITH_ACQUIRED_AT),
         (
             "key_fences",
             &["tenant", "nf_kind", "key_type", "stable_id", "fence"][..],
@@ -852,7 +949,11 @@ fn validate_legacy_schema(conn: &Connection) -> Result<(), RecoveryError> {
             .map_err(|_| RecoveryError::CorruptReplica)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| RecoveryError::CorruptReplica)?;
-        if observed != expected {
+        if (table == "leases"
+            && observed != LEGACY_LEASE_COLUMNS_WITH_ACQUIRED_AT
+            && observed != LEGACY_LEASE_COLUMNS_BEFORE_ACQUIRED_AT)
+            || (table != "leases" && observed != expected)
+        {
             return Err(RecoveryError::CorruptReplica);
         }
     }
@@ -887,6 +988,24 @@ fn validate_legacy_schema(conn: &Connection) -> Result<(), RecoveryError> {
         return Err(RecoveryError::CorruptReplica);
     }
     Ok(())
+}
+
+fn legacy_lease_has_acquired_at(conn: &Connection) -> Result<bool, RecoveryError> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(leases)")
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|_| RecoveryError::CorruptReplica)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if columns == LEGACY_LEASE_COLUMNS_WITH_ACQUIRED_AT {
+        Ok(true)
+    } else if columns == LEGACY_LEASE_COLUMNS_BEFORE_ACQUIRED_AT {
+        Ok(false)
+    } else {
+        Err(RecoveryError::CorruptReplica)
+    }
 }
 
 fn validate_restore_scan_schema_if_present(conn: &Connection) -> Result<bool, RecoveryError> {
@@ -1008,6 +1127,16 @@ fn validate_exact_recovery_schema(
     consensus::install_recovery_validation_schema_sync(&canonical, false)
         .map_err(|_| RecoveryError::DatabaseUnavailable)?;
     let mut expected = recovery_schema_manifest(&canonical)?;
+    let canonical_lease = expected
+        .remove("leases")
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
+    let legacy_canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    legacy_canonical
+        .execute_batch("ALTER TABLE leases DROP COLUMN acquired_at")
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    let pre_acquisition_timestamp_lease = schema_object_sql(&legacy_canonical, "leases")?
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
 
     let canonical_operator = expected
         .remove("consensus_operator_recovery")
@@ -1023,6 +1152,9 @@ fn validate_exact_recovery_schema(
         .ok_or(RecoveryError::DatabaseUnavailable)?;
     let canonical_candidate_bootstrap = expected
         .remove("consensus_candidate_bootstrap")
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
+    let canonical_fenced_receipts = expected
+        .remove("consensus_fenced_transition_receipts")
         .ok_or(RecoveryError::DatabaseUnavailable)?;
     expected
         .remove("restore_scan_state")
@@ -1044,6 +1176,14 @@ fn validate_exact_recovery_schema(
         .ok_or(RecoveryError::DatabaseUnavailable)?;
 
     let mut observed = recovery_schema_manifest(conn)?;
+    let observed_lease = observed
+        .remove("leases")
+        .ok_or(RecoveryError::CorruptReplica)?;
+    match (legacy_lease_has_acquired_at(conn)?, observed_lease) {
+        (true, sql) if sql == canonical_lease => {}
+        (false, sql) if sql == pre_acquisition_timestamp_lease => {}
+        _ => return Err(RecoveryError::CorruptReplica),
+    }
     match observed.remove("restore_scan_state") {
         Some(_) if has_restore_scan_state => {}
         None if has_restore_scan_state => return Err(RecoveryError::CorruptReplica),
@@ -1084,10 +1224,62 @@ fn validate_exact_recovery_schema(
         // transactionally on the next writable consensus open.
         None => {}
     }
+    match observed.remove("consensus_fenced_transition_receipts") {
+        Some(sql) if sql == canonical_fenced_receipts => {}
+        Some(_)
+            if fenced_receipt_commitment_columns(conn)?
+                == FencedReceiptCommitmentColumns::Neither =>
+        {
+            let has_rows: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM consensus_fenced_transition_receipts LIMIT 1)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| RecoveryError::CorruptReplica)?;
+            if has_rows {
+                return Err(RecoveryError::CorruptReplica);
+            }
+        }
+        Some(_) => return Err(RecoveryError::CorruptReplica),
+        // The receipt ledger is an additive tombstone table. Pre-ledger
+        // replicas are inspected as an empty ledger and upgrade on reopen.
+        None => {}
+    }
     if observed != expected {
         return Err(RecoveryError::CorruptReplica);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FencedReceiptCommitmentColumns {
+    Neither,
+    Both,
+    Partial,
+}
+
+fn fenced_receipt_commitment_columns(
+    conn: &Connection,
+) -> Result<FencedReceiptCommitmentColumns, RecoveryError> {
+    let mut statement = conn
+        .prepare("SELECT name FROM pragma_table_info('consensus_fenced_transition_receipts')")
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| RecoveryError::CorruptReplica)?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    Ok(
+        match (
+            columns.contains("binding_digest"),
+            columns.contains("response_digest"),
+        ) {
+            (false, false) => FencedReceiptCommitmentColumns::Neither,
+            (true, true) => FencedReceiptCommitmentColumns::Both,
+            _ => FencedReceiptCommitmentColumns::Partial,
+        },
+    )
 }
 
 fn recovery_schema_manifest(conn: &Connection) -> Result<BTreeMap<String, String>, RecoveryError> {
@@ -1114,6 +1306,15 @@ fn recovery_schema_manifest(conn: &Connection) -> Result<BTreeMap<String, String
             .get::<_, Option<String>>(2)
             .map_err(|_| RecoveryError::CorruptReplica)?
             .ok_or(RecoveryError::CorruptReplica)?;
+        if kind == "index" && name == "consensus_fenced_transition_receipts_due" {
+            let expected = normalize_schema_sql(
+                "CREATE INDEX consensus_fenced_transition_receipts_due ON consensus_fenced_transition_receipts (retained_until, request_id) WHERE response_json IS NOT NULL",
+            );
+            if normalize_schema_sql(&sql) != expected {
+                return Err(RecoveryError::CorruptReplica);
+            }
+            continue;
+        }
         if kind != "table"
             || name.len() > MAX_SCHEMA_SQL_BYTES
             || sql.len() > MAX_SCHEMA_SQL_BYTES
@@ -1142,20 +1343,16 @@ fn hash_legacy_state(
 ) -> Result<RecoveryDigest, RecoveryError> {
     let mut hasher = Sha256::new();
     hasher.update(LEGACY_BRANCH_DOMAIN);
+    for query in ["SELECT * FROM session_records ORDER BY tenant, nf_kind, key_type, stable_id"] {
+        hash_query_rows_with_identity(conn, query, query, budget, &mut hasher)?;
+    }
+    hash_legacy_lease_rows(conn, budget, &mut hasher)?;
     for query in [
-        "SELECT * FROM session_records ORDER BY tenant, nf_kind, key_type, stable_id",
-        "SELECT * FROM leases ORDER BY tenant, nf_kind, key_type, stable_id",
         "SELECT * FROM key_fences ORDER BY tenant, nf_kind, key_type, stable_id",
         "SELECT * FROM lease_globals ORDER BY key",
         "SELECT * FROM session_replication_log ORDER BY sequence",
     ] {
-        hasher.update(
-            u64::try_from(query.len())
-                .map_err(|_| RecoveryError::WorkLimitExceeded)?
-                .to_be_bytes(),
-        );
-        hasher.update(query.as_bytes());
-        hash_query_rows(conn, query, budget, &mut hasher)?;
+        hash_query_rows_with_identity(conn, query, query, budget, &mut hasher)?;
     }
     Ok(RecoveryDigest::from_bytes(hasher.finalize().into()))
 }
@@ -1166,21 +1363,46 @@ fn hash_logical_state(
 ) -> Result<RecoveryDigest, RecoveryError> {
     let mut hasher = Sha256::new();
     hasher.update(LOGICAL_STATE_DOMAIN);
+    for query in ["SELECT * FROM session_records ORDER BY tenant, nf_kind, key_type, stable_id"] {
+        hash_query_rows_with_identity(conn, query, query, budget, &mut hasher)?;
+    }
+    hash_legacy_lease_rows(conn, budget, &mut hasher)?;
     for query in [
-        "SELECT * FROM session_records ORDER BY tenant, nf_kind, key_type, stable_id",
-        "SELECT * FROM leases ORDER BY tenant, nf_kind, key_type, stable_id",
         "SELECT * FROM key_fences ORDER BY tenant, nf_kind, key_type, stable_id",
         "SELECT * FROM lease_globals ORDER BY key",
     ] {
-        hasher.update(
-            u64::try_from(query.len())
-                .map_err(|_| RecoveryError::WorkLimitExceeded)?
-                .to_be_bytes(),
-        );
-        hasher.update(query.as_bytes());
-        hash_query_rows(conn, query, budget, &mut hasher)?;
+        hash_query_rows_with_identity(conn, query, query, budget, &mut hasher)?;
     }
     Ok(RecoveryDigest::from_bytes(hasher.finalize().into()))
+}
+
+fn hash_query_rows_with_identity(
+    conn: &Connection,
+    identity_query: &str,
+    execution_query: &str,
+    budget: &mut InspectionBudget,
+    hasher: &mut Sha256,
+) -> Result<(), RecoveryError> {
+    hasher.update(
+        u64::try_from(identity_query.len())
+            .map_err(|_| RecoveryError::WorkLimitExceeded)?
+            .to_be_bytes(),
+    );
+    hasher.update(identity_query.as_bytes());
+    hash_query_rows(conn, execution_query, budget, hasher)
+}
+
+fn hash_legacy_lease_rows(
+    conn: &Connection,
+    budget: &mut InspectionBudget,
+    hasher: &mut Sha256,
+) -> Result<(), RecoveryError> {
+    let execution_query = if legacy_lease_has_acquired_at(conn)? {
+        LEASES_HASH_QUERY
+    } else {
+        PRE_ACQUISITION_LEASES_HASH_QUERY
+    };
+    hash_query_rows_with_identity(conn, LEASES_HASH_QUERY, execution_query, budget, hasher)
 }
 
 // Both current replicas and the legacy checkpoints admitted by this offline
@@ -1281,11 +1503,17 @@ fn validate_legacy_lease_state(
     conn: &Connection,
     budget: &mut InspectionBudget,
 ) -> Result<(), RecoveryError> {
+    let has_acquired_at = legacy_lease_has_acquired_at(conn)?;
     let mut row_count = 0_u64;
     let mut maximum_value_bytes = 0_u64;
     let mut total_value_bytes = 0_u64;
+    let leases_preflight = if has_acquired_at {
+        "SELECT COUNT(*), COALESCE(MAX(MAX(length(tenant), length(nf_kind), length(key_type), length(stable_id), length(owner), COALESCE(length(acquired_at), 0), length(guard_expires_at))), 0), COALESCE(SUM(length(tenant) + length(nf_kind) + length(key_type) + length(stable_id) + length(owner) + COALESCE(length(acquired_at), 0) + length(guard_expires_at)), 0) FROM leases"
+    } else {
+        "SELECT COUNT(*), COALESCE(MAX(MAX(length(tenant), length(nf_kind), length(key_type), length(stable_id), length(owner), length(guard_expires_at))), 0), COALESCE(SUM(length(tenant) + length(nf_kind) + length(key_type) + length(stable_id) + length(owner) + length(guard_expires_at)), 0) FROM leases"
+    };
     for query in [
-        "SELECT COUNT(*), COALESCE(MAX(MAX(length(tenant), length(nf_kind), length(key_type), length(stable_id), length(owner), length(guard_expires_at))), 0), COALESCE(SUM(length(tenant) + length(nf_kind) + length(key_type) + length(stable_id) + length(owner) + length(guard_expires_at)), 0) FROM leases",
+        leases_preflight,
         "SELECT COUNT(*), COALESCE(MAX(MAX(length(tenant), length(nf_kind), length(key_type), length(stable_id))), 0), COALESCE(SUM(length(tenant) + length(nf_kind) + length(key_type) + length(stable_id)), 0) FROM key_fences",
         "SELECT COUNT(*), COALESCE(MAX(length(key)), 0), COALESCE(SUM(length(key)), 0) FROM lease_globals",
     ] {
@@ -1305,14 +1533,182 @@ fn validate_legacy_lease_state(
             .ok_or(RecoveryError::WorkLimitExceeded)?;
     }
     budget.consume_table_scan(row_count, maximum_value_bytes, total_value_bytes)?;
-    consensus::validate_lease_state_sync(conn).map_err(|_| {
-        if budget.started.elapsed() >= budget.limits.max_duration() {
-            RecoveryError::WorkLimitExceeded
-        } else {
-            RecoveryError::CorruptReplica
-        }
-    })?;
+    if has_acquired_at {
+        consensus::validate_lease_state_sync(conn).map_err(|_| {
+            if budget.started.elapsed() >= budget.limits.max_duration() {
+                RecoveryError::WorkLimitExceeded
+            } else {
+                RecoveryError::CorruptReplica
+            }
+        })?;
+    } else {
+        validate_pre_acquisition_lease_state(conn, budget)?;
+    }
     budget.check()
+}
+
+/// Validate the exact pre-`acquired_at` table without mutating a query-only
+/// recovery connection.  The explicit `NULL` projection is the same
+/// non-authoritative marker a writable migration appends to each legacy row.
+fn validate_pre_acquisition_lease_state(
+    conn: &Connection,
+    budget: &InspectionBudget,
+) -> Result<(), RecoveryError> {
+    let mut maximum_fence = 0_u64;
+    let mut maximum_credential = 0_u64;
+    let mut lease_statement = conn
+        .prepare(
+            r#"
+            SELECT tenant, nf_kind, key_type, stable_id, active, credential_id,
+                   owner, fence, CAST(NULL AS TEXT), expires_at_unix_ms, guard_expires_at
+            FROM leases
+            "#,
+        )
+        .map_err(|error| inspection_sql_error(error, budget))?;
+    let leases = lease_statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        })
+        .map_err(|error| inspection_sql_error(error, budget))?;
+    for row in leases {
+        let (
+            tenant,
+            nf_kind,
+            key_type,
+            stable_id,
+            active,
+            credential,
+            owner,
+            fence,
+            acquired_at,
+            expires_at_unix_ms,
+            guard_expires_at,
+        ) = row.map_err(|error| inspection_sql_error(error, budget))?;
+        ops::persisted_session_key(tenant, nf_kind, key_type, stable_id)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        if !matches!(active, 0 | 1) {
+            return Err(RecoveryError::CorruptReplica);
+        }
+        let credential = consensus::checked_positive_u64(credential)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        let fence =
+            consensus::checked_positive_u64(fence).map_err(|_| RecoveryError::CorruptReplica)?;
+        ops::persisted_owner_id(owner).map_err(|_| RecoveryError::CorruptReplica)?;
+        let guard_expires_at =
+            Timestamp::from_str(&guard_expires_at).map_err(|_| RecoveryError::CorruptReplica)?;
+        if acquired_at.is_some_and(|acquired_at| {
+            ops::persisted_normalized_timestamp(Some(acquired_at))
+                .is_none_or(|acquired_at| acquired_at > guard_expires_at)
+        }) {
+            return Err(RecoveryError::CorruptReplica);
+        }
+        let guard_expires_at_unix_ms = ops::timestamp_unix_millis(guard_expires_at)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        if (active == 1 && expires_at_unix_ms != guard_expires_at_unix_ms)
+            || (active == 0 && expires_at_unix_ms < guard_expires_at_unix_ms)
+        {
+            return Err(RecoveryError::CorruptReplica);
+        }
+        maximum_fence = maximum_fence.max(fence);
+        maximum_credential = maximum_credential.max(credential);
+    }
+
+    let mut fence_statement = conn
+        .prepare("SELECT tenant, nf_kind, key_type, stable_id, fence FROM key_fences")
+        .map_err(|error| inspection_sql_error(error, budget))?;
+    let fences = fence_statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|error| inspection_sql_error(error, budget))?;
+    for row in fences {
+        let (tenant, nf_kind, key_type, stable_id, fence) =
+            row.map_err(|error| inspection_sql_error(error, budget))?;
+        ops::persisted_session_key(tenant, nf_kind, key_type, stable_id)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        maximum_fence = maximum_fence.max(
+            consensus::checked_positive_u64(fence).map_err(|_| RecoveryError::CorruptReplica)?,
+        );
+    }
+
+    let stale_or_missing_fence = conn
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM session_records AS record
+                LEFT JOIN key_fences AS fence
+                  ON fence.tenant = record.tenant
+                 AND fence.nf_kind = record.nf_kind
+                 AND fence.key_type = record.key_type
+                 AND fence.stable_id = record.stable_id
+                WHERE fence.fence IS NULL OR fence.fence < record.fence
+                UNION ALL
+                SELECT 1
+                FROM leases AS lease
+                LEFT JOIN key_fences AS fence
+                  ON fence.tenant = lease.tenant
+                 AND fence.nf_kind = lease.nf_kind
+                 AND fence.key_type = lease.key_type
+                 AND fence.stable_id = lease.stable_id
+                WHERE fence.fence IS NULL OR fence.fence != lease.fence
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| inspection_sql_error(error, budget))?;
+    if stale_or_missing_fence {
+        return Err(RecoveryError::CorruptReplica);
+    }
+
+    let mut next_fence = None;
+    let mut next_credential = None;
+    let mut globals_statement = conn
+        .prepare("SELECT key, val FROM lease_globals ORDER BY key")
+        .map_err(|error| inspection_sql_error(error, budget))?;
+    let globals = globals_statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| inspection_sql_error(error, budget))?;
+    for row in globals {
+        let (key, value) = row.map_err(|error| inspection_sql_error(error, budget))?;
+        let value =
+            consensus::checked_positive_u64(value).map_err(|_| RecoveryError::CorruptReplica)?;
+        let slot = match key.as_str() {
+            "next_fence" => &mut next_fence,
+            "next_credential_id" => &mut next_credential,
+            _ => return Err(RecoveryError::CorruptReplica),
+        };
+        if slot.replace(value).is_some() {
+            return Err(RecoveryError::CorruptReplica);
+        }
+    }
+    if next_fence.is_none_or(|next| next <= maximum_fence)
+        || next_credential.is_none_or(|next| next <= maximum_credential)
+    {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    Ok(())
 }
 
 fn validate_replication_sequence_domain(
@@ -2610,6 +3006,7 @@ fn convert_legacy_checkpoint(
     validate_legacy_lease_state(&source_conn, &mut source_budget)?;
     validate_replication_sequence_domain(&source_conn, &mut source_budget, 0)?;
     let before = hash_legacy_state(&source_conn, &mut source_budget)?;
+    let source_has_acquired_at = legacy_lease_has_acquired_at(&source_conn)?;
 
     drop(private_create_new(destination)?);
     drop(
@@ -2637,11 +3034,6 @@ fn convert_legacy_checkpoint(
             12,
         ),
         (
-            "leases",
-            "tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at",
-            10,
-        ),
-        (
             "key_fences",
             "tenant, nf_kind, key_type, stable_id, fence",
             5,
@@ -2655,6 +3047,7 @@ fn convert_legacy_checkpoint(
     ] {
         copy_exact_table(&source_conn, &tx, table, columns, column_count)?;
     }
+    copy_legacy_leases(&source_conn, &tx, source_has_acquired_at)?;
     tx.commit()
         .map_err(|_| RecoveryError::FileOperationFailed)?;
     destination_conn
@@ -2684,8 +3077,40 @@ fn copy_exact_table(
     columns: &str,
     column_count: usize,
 ) -> Result<(), RecoveryError> {
+    copy_projected_table(source, destination, table, columns, columns, column_count)
+}
+
+fn copy_legacy_leases(
+    source: &Connection,
+    destination: &rusqlite::Transaction<'_>,
+    source_has_acquired_at: bool,
+) -> Result<(), RecoveryError> {
+    let destination_columns = "tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, acquired_at, expires_at_unix_ms, guard_expires_at";
+    let source_columns = if source_has_acquired_at {
+        destination_columns
+    } else {
+        "tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, CAST(NULL AS TEXT) AS acquired_at, expires_at_unix_ms, guard_expires_at"
+    };
+    copy_projected_table(
+        source,
+        destination,
+        "leases",
+        source_columns,
+        destination_columns,
+        11,
+    )
+}
+
+fn copy_projected_table(
+    source: &Connection,
+    destination: &rusqlite::Transaction<'_>,
+    table: &str,
+    source_columns: &str,
+    destination_columns: &str,
+    column_count: usize,
+) -> Result<(), RecoveryError> {
     let mut statement = source
-        .prepare(&format!("SELECT {columns} FROM {table}"))
+        .prepare(&format!("SELECT {source_columns} FROM {table}"))
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let mut rows = statement
         .query([])
@@ -2694,7 +3119,7 @@ fn copy_exact_table(
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let insert = format!("INSERT INTO {table} ({columns}) VALUES ({placeholders})");
+    let insert = format!("INSERT INTO {table} ({destination_columns}) VALUES ({placeholders})");
     while let Some(row) = rows.next().map_err(|_| RecoveryError::CorruptReplica)? {
         let values = (0..column_count)
             .map(|column| row.get::<_, Value>(column))
@@ -3916,5 +4341,193 @@ mod terminal_history_digest_tests {
             current_checkpoint_digest(&without_history),
             "a pre-feature replica must match an explicitly empty terminal ledger"
         );
+    }
+
+    #[test]
+    fn empty_fenced_receipt_ledger_preserves_the_legacy_recovery_digest() {
+        let missing_ledger = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .expect("canonical database");
+        let empty_ledger = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .expect("canonical database");
+        let populated_ledger = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .expect("canonical database");
+        for conn in [&missing_ledger, &empty_ledger, &populated_ledger] {
+            consensus::install_recovery_validation_schema_sync(conn, false)
+                .expect("install consensus schema");
+            conn.execute(
+                "INSERT INTO consensus_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch) VALUES (1, ?1, ?2, ?3, 1)",
+                rusqlite::params![
+                    i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
+                    [0x51_u8; 32].as_slice(),
+                    [0x52_u8; 32].as_slice(),
+                ],
+            )
+            .expect("insert storage identity");
+        }
+        missing_ledger
+            .execute_batch("DROP TABLE consensus_fenced_transition_receipts")
+            .expect("remove additive receipt ledger");
+        populated_ledger
+            .execute(
+                "INSERT INTO consensus_fenced_transition_receipts (request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, 1, ?2, ?3, ?4, NULL, NULL)",
+                rusqlite::params![
+                    [0x53_u8; 16].as_slice(),
+                    [0x54_u8; 32].as_slice(),
+                    "2026-08-17T00:00:00Z",
+                    [0x55_u8; 32].as_slice(),
+                ],
+            )
+            .expect("insert retained request binding");
+
+        assert_eq!(
+            current_checkpoint_digest(&missing_ledger),
+            current_checkpoint_digest(&empty_ledger),
+            "a present-but-empty additive ledger must preserve the pre-ledger digest",
+        );
+        assert_ne!(
+            current_checkpoint_digest(&empty_ledger),
+            current_checkpoint_digest(&populated_ledger),
+            "a durable request binding must contribute to recovery branch evidence",
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_one_over_the_fenced_history_protocol_cap_before_hashing() {
+        let conn = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .expect("canonical database");
+        consensus::install_recovery_validation_schema_sync(&conn, false)
+            .expect("install consensus schema");
+        conn.execute(
+            "INSERT INTO consensus_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch) VALUES (1, ?1, ?2, ?3, 1)",
+            rusqlite::params![
+                i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
+                [0x57_u8; 32].as_slice(),
+                [0x58_u8; 32].as_slice(),
+            ],
+        )
+        .expect("insert storage identity");
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO consensus_fenced_transition_receipts (request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, 1, ?2, ?3, ?4, NULL, NULL)",
+            )
+            .expect("prepare receipt fixture");
+        for ordinal in 1..=FENCED_TRANSITION_MAX_HISTORY_ENTRIES + 1 {
+            let mut request_id = [0x55_u8; 16];
+            request_id[8..].copy_from_slice(
+                &u64::try_from(ordinal)
+                    .expect("fixture ordinal")
+                    .to_be_bytes(),
+            );
+            insert
+                .execute(rusqlite::params![
+                    request_id.as_slice(),
+                    [0x56_u8; 32].as_slice(),
+                    "2026-08-17T00:00:00Z",
+                    [0x57_u8; 32].as_slice(),
+                ])
+                .expect("insert receipt fixture");
+        }
+        drop(insert);
+
+        assert!(matches!(
+            preflight_fenced_transition_receipt_count(&conn),
+            Err(RecoveryError::CorruptReplica)
+        ));
+        let mut budget = InspectionBudget::new(RecoveryLimits::default());
+        let mut hasher = Sha256::new();
+        assert!(matches!(
+            hash_current_checkpoint(&conn, &mut budget, &mut hasher),
+            Err(RecoveryError::CorruptReplica)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod lease_acquired_at_recovery_tests {
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+
+    use super::*;
+    use crate::{OwnerId, SessionKey, SessionKeyType, SqliteSessionBackend};
+
+    fn key() -> SessionKey {
+        SessionKey {
+            tenant: TenantId::from_static("recovery-acquired-at-test"),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"recovery-acquired-at")
+                .try_into()
+                .expect("valid stable ID"),
+        }
+    }
+
+    fn timestamp(second: u8) -> Timestamp {
+        Timestamp::from_str(&format!("2027-01-01T00:00:{second:02}Z"))
+            .expect("valid fixture timestamp")
+    }
+
+    fn source_with_lease(path: &Path) -> String {
+        drop(SqliteSessionBackend::open(path).expect("source backend"));
+        let conn = Connection::open(path).expect("source connection");
+        let lease = crate::sqlite::lease::acquire_sync(
+            &conn,
+            &key(),
+            OwnerId::new("recovery-acquired-at-owner").expect("owner"),
+            Duration::from_secs(60),
+            timestamp(1),
+        )
+        .expect("source lease");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint source");
+        crate::sqlite::ops::format_rfc3339_normalized(lease.acquired_at())
+    }
+
+    #[test]
+    fn exact_recovery_schema_accepts_only_the_complete_pre_acquisition_layout() {
+        let conn = SqliteSessionBackend::canonical_schema_connection().expect("schema");
+        consensus::install_recovery_validation_schema_sync(&conn, false)
+            .expect("consensus recovery schema");
+        conn.execute_batch("ALTER TABLE leases DROP COLUMN acquired_at")
+            .expect("form exact pre-acquisition layout");
+        validate_exact_recovery_schema(&conn, false)
+            .expect("exact pre-acquisition schema is recovery-compatible");
+
+        conn.execute_batch("ALTER TABLE leases ADD COLUMN acquired_at_legacy TEXT")
+            .expect("form near-miss layout");
+        assert!(matches!(
+            validate_exact_recovery_schema(&conn, false),
+            Err(RecoveryError::CorruptReplica)
+        ));
+    }
+
+    #[test]
+    fn legacy_checkpoint_conversion_preserves_or_explicitly_marks_acquired_at() {
+        for legacy_schema in [false, true] {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let source = directory.path().join("source.sqlite");
+            let destination = directory.path().join("destination.sqlite");
+            let expected = source_with_lease(&source);
+            if legacy_schema {
+                Connection::open(&source)
+                    .expect("open source fixture")
+                    .execute_batch("ALTER TABLE leases DROP COLUMN acquired_at; PRAGMA wal_checkpoint(TRUNCATE);")
+                    .expect("form pre-acquisition source schema");
+            }
+
+            convert_legacy_checkpoint(&source, &destination, RecoveryLimits::default())
+                .expect("bounded legacy checkpoint conversion");
+            let destination = Connection::open(destination).expect("open converted checkpoint");
+            let acquired_at: Option<String> = destination
+                .query_row("SELECT acquired_at FROM leases", [], |row| row.get(0))
+                .expect("read converted acquisition timestamp");
+            assert_eq!(
+                acquired_at,
+                (!legacy_schema).then_some(expected),
+                "legacy_schema={legacy_schema}"
+            );
+        }
     }
 }

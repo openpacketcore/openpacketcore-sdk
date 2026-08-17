@@ -4,8 +4,8 @@ use std::str::FromStr;
 
 use super::ops::{
     advance_restore_scan_revision_sync, current_fence_sync, format_rfc3339_normalized, get_sync,
-    insert_or_replace_fence_sync, insert_or_replace_record_sync, persisted_owner_id, persisted_u64,
-    sqlite_u64, timestamp_unix_millis,
+    insert_or_replace_fence_sync, insert_or_replace_record_sync, persisted_normalized_timestamp,
+    persisted_owner_id, persisted_u64, sqlite_u64, timestamp_unix_millis,
 };
 use crate::{
     backend::{
@@ -271,8 +271,8 @@ fn apply_validated_replicated_op_sync(
             conn.execute(
                 r#"
                 INSERT OR REPLACE INTO leases (
-                    tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at
-                ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9)
+                    tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, acquired_at, expires_at_unix_ms, guard_expires_at
+                ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10)
                 "#,
                 params![
                     key.tenant.as_str(),
@@ -282,6 +282,7 @@ fn apply_validated_replicated_op_sync(
                     sqlite_u64(credential_id)?,
                     owner.as_str(),
                     sqlite_u64(fence.get())?,
+                    format_rfc3339_normalized(now),
                     expires_at_unix_ms,
                     format_rfc3339_normalized(expires_at),
                 ],
@@ -317,31 +318,64 @@ fn apply_validated_replicated_op_sync(
             ttl: _,
             expires_at,
         } => {
+            // A renew event carries no acquisition timestamp by design. It
+            // must preserve an already-authoritative value, never synthesize
+            // one for a migrated legacy row.
             let current_fence = current_fence_sync(conn, &key)?;
             if fence.get() < current_fence {
                 return Err(StoreError::StaleFence);
             }
+            let persisted_authority = conn
+                .query_row(
+                    r#"
+                    SELECT acquired_at, guard_expires_at
+                    FROM leases
+                    WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4
+                    "#,
+                    params![
+                        key.tenant.as_str(),
+                        key.nf_kind.as_str(),
+                        key.key_type.to_string(),
+                        key.stable_id.as_ref(),
+                    ],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            persisted_authority
+                .and_then(|(acquired_at, guard_expires_at)| {
+                    let guard_expires_at = persisted_normalized_timestamp(Some(guard_expires_at))?;
+                    persisted_normalized_timestamp(acquired_at)
+                        .filter(|acquired_at| *acquired_at <= guard_expires_at)
+                        .map(|_| ())
+                })
+                .ok_or(StoreError::StaleFence)?;
             let expires_at_unix_ms = timestamp_unix_millis(expires_at)?;
 
-            conn.execute(
-                r#"
-                INSERT OR REPLACE INTO leases (
-                    tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at
-                ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9)
+            let changed = conn
+                .execute(
+                    r#"
+                UPDATE leases
+                SET expires_at_unix_ms = ?1, guard_expires_at = ?2
+                WHERE tenant = ?3 AND nf_kind = ?4 AND key_type = ?5 AND stable_id = ?6
+                  AND active = 1 AND credential_id = ?7 AND owner = ?8 AND fence = ?9
                 "#,
-                params![
-                    key.tenant.as_str(),
-                    key.nf_kind.as_str(),
-                    key.key_type.to_string(),
-                    key.stable_id.as_ref(),
-                    sqlite_u64(credential_id)?,
-                    owner.as_str(),
-                    sqlite_u64(fence.get())?,
-                    expires_at_unix_ms,
-                    format_rfc3339_normalized(expires_at),
-                ],
-            )
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                    params![
+                        expires_at_unix_ms,
+                        format_rfc3339_normalized(expires_at),
+                        key.tenant.as_str(),
+                        key.nf_kind.as_str(),
+                        key.key_type.to_string(),
+                        key.stable_id.as_ref(),
+                        sqlite_u64(credential_id)?,
+                        owner.as_str(),
+                        sqlite_u64(fence.get())?,
+                    ],
+                )
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            if changed != 1 {
+                return Err(StoreError::StaleFence);
+            }
 
             insert_or_replace_fence_sync(conn, &key, fence.get())?;
             Ok(())

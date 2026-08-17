@@ -487,7 +487,7 @@ pub enum SessionOpResult {
 /// The Openraft state machine emits this application journal only after commit;
 /// caches, watches, and restore consumers use it as a domain cursor. It is not
 /// a second election or consensus log.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReplicationEntry {
     /// 1-based, gap-free committed application position. Local adapters reject
     /// entries that would create a gap or diverge from an already-applied
@@ -503,6 +503,12 @@ pub struct ReplicationEntry {
     /// ordering authority is `sequence`, never this timestamp — no wall-clock
     /// last-writer-wins.
     pub timestamp: Timestamp,
+}
+
+impl fmt::Debug for ReplicationEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReplicationEntry(<redacted>)")
+    }
 }
 
 impl ReplicationEntry {
@@ -875,7 +881,7 @@ pub fn validate_replication_page_owned(
 /// during replay: in particular the fence token (so a replica can reject
 /// stale-owner mutations exactly as the original backend would) and, for
 /// lease operations, the credential id that ties guards to lease entries.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReplicationOp {
     /// Replay of a fenced compare-and-set write.
     CompareAndSet {
@@ -970,6 +976,12 @@ pub enum ReplicationOp {
         /// Mutations in original submission order.
         ops: Vec<ReplicationOp>,
     },
+}
+
+impl fmt::Debug for ReplicationOp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReplicationOp(<redacted>)")
+    }
 }
 
 impl ReplicationOp {
@@ -1268,6 +1280,58 @@ pub trait SessionBackend: Send + Sync {
 
     /// Retrieve a record by key.
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError>;
+
+    /// Freshly observe one record together with its durable per-key fence.
+    ///
+    /// This is the preparation read for an atomic fenced acquire. Backends
+    /// must keep the default unless they can return both values from one
+    /// authority-consistent read without allocating the next fence.
+    async fn observe_fenced_transition(
+        &self,
+        _key: &SessionKey,
+    ) -> Result<crate::fenced_transition::FencedTransitionObservation, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_v1".into(),
+        ))
+    }
+
+    /// Advertise the exact atomic-transition contract supported end to end.
+    ///
+    /// This is separate from the legacy capability bitmap because independent
+    /// fencing, CAS, TTL, and batch bits cannot establish one combined
+    /// linearization point. Adapters fail closed unless they can prove the
+    /// exact version across every layer they traverse.
+    async fn fenced_transition_capability(
+        &self,
+    ) -> Result<Option<crate::fenced_transition::AtomicFencedTransitionCapability>, StoreError>
+    {
+        Ok(None)
+    }
+
+    /// Commit one exact-key lease acquire/renew and one same-record mutation
+    /// at a single durable linearization point.
+    ///
+    /// Independent CAS, fencing, batch, and TTL capabilities do not imply
+    /// this contract. Unsupported adapters fail closed by default.
+    async fn fenced_transition(
+        &self,
+        _request: crate::fenced_transition::FencedTransitionRequest,
+    ) -> Result<crate::fenced_transition::FencedTransitionOutcome, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_v1".into(),
+        ))
+    }
+
+    /// Read the exact retained result bound to a complete transition request.
+    /// Status is read-only and never replays the operation under another ID.
+    async fn fenced_transition_status(
+        &self,
+        _request: &crate::fenced_transition::FencedTransitionRequest,
+    ) -> Result<crate::fenced_transition::FencedTransitionStatus, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_v1".into(),
+        ))
+    }
 
     /// Atomically compare the current generation and write the new record if it
     /// matches. Implementations MUST require a current [`LeaseGuard`] and MUST

@@ -35,6 +35,7 @@ pub mod consensus;
 pub mod consumer;
 pub mod error;
 pub mod fake;
+pub mod fenced_transition;
 pub mod handover;
 mod hex;
 pub mod lease;
@@ -106,6 +107,14 @@ pub use consumer::{
 };
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;
+pub use fenced_transition::{
+    AtomicFencedTransitionCapability, FencedTransitionLease, FencedTransitionMutation,
+    FencedTransitionMutationResult, FencedTransitionObservation, FencedTransitionOutcome,
+    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus,
+    FENCED_TRANSITION_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_MAX_OUTCOME_BYTES,
+    FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_REQUEST_ID_BYTES,
+    FENCED_TRANSITION_SCHEMA_V1,
+};
 pub use handover::{
     HandoverEnvelope, HandoverEnvelopeDecodeError, HandoverEnvelopeFormat, HandoverError,
     HandoverManager, HandoverSessionRecord, HANDOVER_ENVELOPE_MAGIC, HANDOVER_ENVELOPE_VERSION,

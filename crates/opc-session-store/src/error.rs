@@ -38,6 +38,28 @@ pub enum StoreError {
     /// it must re-read authoritative state and re-derive any next mutation.
     #[error("compare-and-set idempotency outcome is unavailable")]
     CasIdempotencyOutcomeUnavailable,
+    /// A fenced-transition identity is already durably bound to another
+    /// canonical request body. Nothing was mutated.
+    #[error("fenced transition request identity was reused")]
+    FencedTransitionRequestConflict,
+    /// A fenced transition may have crossed its consensus proposal boundary,
+    /// but its exact result was not confirmed. Callers MUST use exact status
+    /// with the retained identity/body and MUST NOT replay under a new ID.
+    #[error("fenced transition outcome is unknown")]
+    FencedTransitionOutcomeUnknown,
+    /// The durable identity/body binding remains, but its exact-result
+    /// recovery window elapsed. Historical replay remains closed.
+    #[error("fenced transition result retention expired")]
+    FencedTransitionRequestExpired,
+    /// The permanent fenced-transition receipt ledger reached its fixed
+    /// protocol capacity. No request body was applied or durably bound.
+    #[error("fenced transition request history is full")]
+    FencedTransitionHistoryFull,
+    /// The committed logical clock is too close to its representable maximum
+    /// to retain a newly bound exact result for the protocol's full window.
+    /// The request remains unbound and no lease or record effect occurred.
+    #[error("fenced transition result retention horizon is exhausted")]
+    FencedTransitionRetentionExhausted,
     /// A non-CAS mutation may have crossed its externally visible effect
     /// boundary, but the adapter could not return a confirmed outcome before
     /// cancellation, disconnect, or its operation deadline. The caller MUST

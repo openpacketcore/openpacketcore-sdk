@@ -365,12 +365,14 @@ impl SqliteSessionBackend {
                 fence INTEGER NOT NULL,
                 expires_at_unix_ms INTEGER NOT NULL,
                 guard_expires_at TEXT NOT NULL,
+                acquired_at TEXT,
                 PRIMARY KEY (tenant, nf_kind, key_type, stable_id)
             );
             "#,
             [],
         )
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        migrate_lease_acquired_at_schema(&conn)?;
 
         // Create table for key fences
         conn.execute(
@@ -715,6 +717,66 @@ impl SqliteSessionBackend {
             tx.commit()
                 .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
             Ok(result)
+        })
+        .await
+    }
+
+    /// Read one live record and its durable per-key fence floor together.
+    ///
+    /// The caller owns the preceding consensus barrier. This local read is a
+    /// single SQLite transaction and never allocates a fence or prunes expiry.
+    pub(crate) async fn consensus_observe_fenced_transition_at(
+        &self,
+        key: &SessionKey,
+        logical_time: opc_types::Timestamp,
+    ) -> Result<crate::FencedTransitionObservation, StoreError> {
+        let key = key.clone();
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let record = ops::get_sync(&tx, &key, logical_time)?;
+            if let Some(record) = record.as_ref() {
+                validate_consensus_record(record)?;
+                if record.key != key {
+                    return Err(StoreError::Serialization(
+                        "fenced_transition_observation_invalid".into(),
+                    ));
+                }
+            }
+            let current_fence = crate::FenceToken::new(ops::current_fence_sync(&tx, &key)?);
+            let observation = crate::FencedTransitionObservation::new(record, current_fence)?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(observation)
+        })
+        .await
+    }
+
+    /// Read one exact fenced-transition receipt after a caller-owned barrier.
+    ///
+    /// The complete request is required so a reused identity can be reported
+    /// as a body conflict. This operation never mutates or compacts the ledger.
+    pub(crate) async fn consensus_fenced_transition_status(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        _authority_identity: crate::consensus::SessionConsensusIdentity,
+        request: &crate::FencedTransitionRequest,
+    ) -> Result<crate::FencedTransitionStatus, StoreError> {
+        let request = request.clone();
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let status = consensus::read_fenced_transition_status_sync(
+                &tx,
+                storage_identity,
+                storage_identity,
+                &request,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(status)
         })
         .await
     }
@@ -1140,6 +1202,61 @@ fn session_op_result_has_backend_unavailable(result: &SessionOpResult) -> bool {
         | SessionOpResult::RefreshTtl(Ok(())) => None,
     };
     matches!(error, Some(StoreError::BackendUnavailable(_)))
+}
+
+/// Add the durable lease-acquisition binding without minting history for
+/// already-issued credentials.
+///
+/// A pre-column row has no authoritative acquisition timestamp: lease TTLs
+/// record only an expiry, so deriving an acquisition instant from it would
+/// make caller-supplied guard metadata authoritative. SQLite fills the
+/// nullable column with `NULL` for those rows. The lease authority checks
+/// treat that value as a legacy, non-renewable/non-mutable marker while the
+/// existing expiry continues to bound its lifetime. New acquisitions always
+/// write a normalized timestamp.
+fn migrate_lease_acquired_at_schema(conn: &Connection) -> Result<(), StoreError> {
+    let mut statement = conn.prepare("PRAGMA table_info(leases)").map_err(|_| {
+        StoreError::BackendUnavailable("session lease schema is unavailable".into())
+    })?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(|_| StoreError::BackendUnavailable("session lease schema is unavailable".into()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            StoreError::BackendUnavailable("session lease schema is unavailable".into())
+        })?;
+
+    let acquired_at = columns
+        .iter()
+        .filter(|(name, ..)| name == "acquired_at")
+        .collect::<Vec<_>>();
+    match acquired_at.as_slice() {
+        [] => conn
+            .execute("ALTER TABLE leases ADD COLUMN acquired_at TEXT", [])
+            .map(|_| ())
+            .map_err(|_| {
+                StoreError::BackendUnavailable("session lease schema migration failed".into())
+            }),
+        [(_, column_type, not_null, default, primary_key)]
+            if column_type.eq_ignore_ascii_case("TEXT")
+                && *not_null == 0
+                && default.is_none()
+                && *primary_key == 0 =>
+        {
+            Ok(())
+        }
+        _ => Err(StoreError::BackendUnavailable(
+            "session lease authority schema is invalid".into(),
+        )),
+    }
 }
 
 fn apply_pragma_profile(conn: &Connection, in_memory: bool) -> Result<(), StoreError> {

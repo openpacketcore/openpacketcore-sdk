@@ -410,6 +410,21 @@ impl OwnedSessionMutationError {
             StoreError::CasIdempotencyOutcomeUnavailable => Self::StoreRejected {
                 code: "cas-idempotency-outcome-unavailable",
             },
+            StoreError::FencedTransitionRequestConflict => Self::StoreRejected {
+                code: "fenced-transition-request-conflict",
+            },
+            StoreError::FencedTransitionOutcomeUnknown => Self::StoreRejected {
+                code: "fenced-transition-outcome-unknown",
+            },
+            StoreError::FencedTransitionRequestExpired => Self::StoreRejected {
+                code: "fenced-transition-request-expired",
+            },
+            StoreError::FencedTransitionHistoryFull => Self::StoreRejected {
+                code: "fenced-transition-history-full",
+            },
+            StoreError::FencedTransitionRetentionExhausted => Self::StoreRejected {
+                code: "fenced-transition-retention-exhausted",
+            },
             StoreError::BackendOperationOutcomeUnavailable => Self::StoreRejected {
                 code: "backend-operation-outcome-unavailable",
             },
