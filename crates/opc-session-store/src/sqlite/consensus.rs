@@ -9434,6 +9434,40 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn core_rejects_unsupported_platform_before_durable_initialization() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let snapshot_dir = directory.path().join("must-not-exist");
+        let members = expected_members();
+        let error = match SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir.clone(),
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("unsupported platform must reject core initialization"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, SessionConsensusStorageError::UnsupportedPlatform);
+        assert!(
+            !snapshot_dir.exists(),
+            "unsupported initialization must not create a snapshot directory"
+        );
+        let conn = backend.conn.lock().await;
+        assert!(
+            !table_exists(&conn, "consensus_identity").expect("inspect consensus identity"),
+            "unsupported initialization must not create consensus schema state"
+        );
+    }
+
     #[tokio::test]
     async fn sealed_snapshot_validation_rejects_invalid_stable_ids_first() {
         for stable_id in [Vec::new(), vec![0x5a_u8; crate::STABLE_ID_MAX_BYTES + 1]] {
@@ -9721,6 +9755,22 @@ mod tests {
         .expect("advance fixture fence allocator");
     }
 
+    fn persist_valid_lease_backed_record_fixture(conn: &Connection) {
+        let lease = lease::acquire_sync(
+            conn,
+            &key(),
+            OwnerId::new("consensus-cap-owner").expect("owner"),
+            Duration::from_secs(60),
+            timestamp(1),
+        )
+        .expect("valid lease fixture");
+        let record = sealed_record_for_key(key(), 64 * 1024);
+        assert_eq!(&record.owner, lease.owner());
+        assert_eq!(record.fence, lease.fence());
+        ops::insert_or_replace_record_sync(conn, &record)
+            .expect("persist lease-backed record fixture");
+    }
+
     fn sealed_replication_cas(
         operation_key: SessionKey,
         record_key: SessionKey,
@@ -9754,7 +9804,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sealed_state_validation_rejects_malformed_legacy_lease_tables() {
+    async fn snapshot_validation_rejects_invalid_legacy_lease_semantics_and_tables() {
         for (case, mutation) in [
             ("lease-key", "UPDATE leases SET tenant = 'INVALID'"),
             ("lease-active", "UPDATE leases SET active = 2"),
@@ -9767,6 +9817,14 @@ mod tests {
             (
                 "lease-timestamp",
                 "UPDATE leases SET guard_expires_at = 'not-a-timestamp'",
+            ),
+            (
+                "lease-noncanonical-timestamp",
+                "UPDATE leases SET guard_expires_at = '2026-07-12T00:01:01Z'",
+            ),
+            (
+                "equal-fence-record-owner",
+                "UPDATE session_records SET owner = 'different-valid-owner'",
             ),
             ("fence-key", "UPDATE key_fences SET tenant = 'INVALID'"),
             ("fence-value", "UPDATE key_fences SET fence = 0"),
@@ -9798,14 +9856,7 @@ mod tests {
         ] {
             let backend = SqliteSessionBackend::in_memory().expect("backend");
             let conn = backend.conn.lock().await;
-            lease::acquire_sync(
-                &conn,
-                &key(),
-                OwnerId::new("legacy-lease-owner").expect("owner"),
-                Duration::from_secs(60),
-                timestamp(1),
-            )
-            .expect("valid lease fixture");
+            persist_valid_lease_backed_record_fixture(&conn);
             conn.execute_batch(mutation).expect("mutate lease fixture");
 
             let error = validate_sealed_state_sync(&conn)
@@ -10041,19 +10092,62 @@ mod tests {
     }
 
     #[test]
-    fn follower_log_admission_rejects_oversized_and_nested_authorized_records() {
-        let lease = crate::LeaseGuard::new(
-            key(),
-            OwnerId::new("consensus-cap-owner").expect("owner"),
-            crate::FenceToken::new(1),
-            timestamp(1),
-            timestamp(1),
-            1,
-        );
+    fn follower_log_admission_enforces_protected_payload_cap() {
+        for (payload_len, accepted) in [
+            (1_048_576, true),
+            (1_048_577, false),
+            (1_048_576 + 64 * 1024, false),
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+            let lease = crate::LeaseGuard::new(
+                key(),
+                OwnerId::new("consensus-cap-owner").expect("owner"),
+                crate::FenceToken::new(1),
+                timestamp(1),
+                timestamp(1),
+                1,
+            );
+            let entries = vec![
+                membership_entry(),
+                capped_cas_entry(
+                    1,
+                    [u8::try_from(payload_len % 256).expect("request byte"); 16],
+                    lease,
+                    None,
+                    crate::Generation::new(1),
+                    payload_len,
+                ),
+            ];
+            let result = append_logs_sync(&conn, identity(), &entries);
+            let persisted: i64 = conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row.get(0))
+                .expect("count persisted log entries");
+            if accepted {
+                result.expect("exact-cap entry must enter the follower log");
+                assert_eq!(persisted, 2);
+            } else {
+                let error = result.expect_err("oversized entry must not enter the follower log");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(
+                    persisted, 0,
+                    "the rejected append transaction must roll back"
+                );
+            }
+        }
+
         let oversized = capped_cas_entry(
             1,
             [0xD3; 16],
-            lease,
+            crate::LeaseGuard::new(
+                key(),
+                OwnerId::new("consensus-cap-owner").expect("owner"),
+                crate::FenceToken::new(1),
+                timestamp(1),
+                timestamp(1),
+                1,
+            ),
             None,
             crate::Generation::new(1),
             1_048_577,
@@ -10300,6 +10394,42 @@ mod tests {
         .expect_err("legacy claim must reject a regressed lease allocator");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(!table_exists(&conn, "consensus_identity").expect("inspect ownership table"));
+    }
+
+    #[tokio::test]
+    async fn legacy_claim_rejects_invalid_legacy_lease_semantics() {
+        for (case, mutation) in [
+            (
+                "equal-fence-record-owner",
+                "UPDATE session_records SET owner = 'different-valid-owner'",
+            ),
+            (
+                "noncanonical-lease-timestamp",
+                "UPDATE leases SET guard_expires_at = '2026-07-12T00:01:01Z'",
+            ),
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.lock().await;
+            persist_valid_lease_backed_record_fixture(&conn);
+            conn.execute_batch(mutation).expect("mutate legacy fixture");
+
+            let error = claim_legacy_checkpoint_sync(
+                &conn,
+                identity(),
+                &expected_members(),
+                [0x37; 32],
+                1,
+                [0x38; 32],
+                0,
+                0,
+            )
+            .expect_err("legacy claim must reject invalid lease semantics");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "case {case}");
+            assert!(
+                !table_exists(&conn, "consensus_identity").expect("inspect ownership table"),
+                "case {case} must not claim consensus ownership"
+            );
+        }
     }
 
     #[test]
@@ -10556,8 +10686,64 @@ mod tests {
         }
     }
 
+    fn persist_unvalidated_log_entry_fixture(
+        conn: &Connection,
+        entry: &Entry<SessionRaftTypeConfig>,
+    ) {
+        let (term, index) = validate_log_id(&entry.log_id).expect("fixture log ID");
+        conn.execute(
+            "INSERT INTO consensus_log (configuration_epoch, term, log_index, entry_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                epoch_i64(identity()).expect("fixture epoch"),
+                term,
+                index,
+                encode_json(entry).expect("fixture log encoding"),
+            ],
+        )
+        .expect("persist unvalidated log fixture");
+    }
+
     #[tokio::test]
-    async fn consensus_core_retains_the_capped_profile_across_reopen_and_apply() {
+    async fn persisted_log_replay_enforces_protected_payload_cap() {
+        for (payload_len, accepted) in [
+            (1_048_576, true),
+            (1_048_577, false),
+            (1_048_576 + 64 * 1024, false),
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.lock().await;
+            initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+            append_logs_sync(&conn, identity(), &[membership_entry()])
+                .expect("persist admitted membership");
+            let entry = capped_cas_entry(
+                1,
+                [u8::try_from(payload_len % 256).expect("request byte"); 16],
+                crate::LeaseGuard::new(
+                    key(),
+                    OwnerId::new("consensus-cap-owner").expect("owner"),
+                    crate::FenceToken::new(1),
+                    timestamp(1),
+                    timestamp(1),
+                    1,
+                ),
+                None,
+                crate::Generation::new(1),
+                payload_len,
+            );
+            persist_unvalidated_log_entry_fixture(&conn, &entry);
+
+            let replay = read_log_range_sync(&conn, identity(), 0, None, None);
+            if accepted {
+                assert_eq!(replay.expect("exact-cap replay").len(), 2);
+            } else {
+                let error = replay.expect_err("oversized persisted log entry must fail replay");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn consensus_core_enforces_protected_payload_cap_across_reopen_and_apply() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let snapshots = tempfile::tempdir().expect("snapshot directory");
         let members = expected_members();
@@ -10638,46 +10824,139 @@ mod tests {
             .expect("exact-cap record");
         let (_, before_revision, _) =
             ops::read_restore_scan_state_sync(&conn).expect("restore revision");
-
-        let rejected = apply_entries_sync(
-            &conn,
-            identity(),
-            &reopened.caps,
-            vec![capped_cas_entry(
-                3,
-                [0xA3; 16],
-                lease,
-                Some(crate::Generation::new(1)),
-                crate::Generation::new(2),
-                advertised.max_value_bytes + 1,
-            )],
-        )
-        .expect("oversized command returns a deterministic rejection");
-        assert!(matches!(
-            rejected.responses.as_slice(),
-            [SessionConsensusResponse {
-                result: Err(StoreError::PayloadTooLarge {
-                    actual: 1_048_577,
-                    max: 1_048_576,
-                }),
-                ..
-            }]
-        ));
-        assert_eq!(
-            before_record,
-            conn.query_row(
-                "SELECT generation, length(payload) FROM session_records",
+        let before_applied = read_applied_sync(&conn, identity()).expect("applied pointer");
+        let before_application_sequence: i64 = conn
+            .query_row(
+                "SELECT application_sequence FROM consensus_machine WHERE singleton = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
-            .expect("oversized command leaves record unchanged")
-        );
-        assert_eq!(
-            before_revision,
-            ops::read_restore_scan_state_sync(&conn)
-                .expect("restore revision after rejection")
-                .1
-        );
+            .expect("application sequence");
+        let before_outcomes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_request_outcomes",
+                [],
+                |row| row.get(0),
+            )
+            .expect("outcome count");
+
+        for (offset, payload_len) in [
+            advertised.max_value_bytes + 1,
+            advertised.max_value_bytes + 64 * 1024,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let error = apply_entries_sync(
+                &conn,
+                identity(),
+                &reopened.caps,
+                vec![capped_cas_entry(
+                    3 + u64::try_from(offset).expect("test offset"),
+                    [0xA3 + u8::try_from(offset).expect("request offset"); 16],
+                    lease.clone(),
+                    Some(crate::Generation::new(1)),
+                    crate::Generation::new(2),
+                    payload_len,
+                )],
+            )
+            .expect_err("oversized ordinary entry must fail before state-machine apply");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                before_record,
+                conn.query_row(
+                    "SELECT generation, length(payload) FROM session_records",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("oversized command leaves record unchanged")
+            );
+            assert_eq!(
+                before_revision,
+                ops::read_restore_scan_state_sync(&conn)
+                    .expect("restore revision after rejection")
+                    .1
+            );
+            assert_eq!(
+                before_applied,
+                read_applied_sync(&conn, identity()).expect("unchanged applied pointer")
+            );
+            assert_eq!(
+                before_application_sequence,
+                conn.query_row(
+                    "SELECT application_sequence FROM consensus_machine WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("unchanged application sequence")
+            );
+            assert_eq!(
+                before_outcomes,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM consensus_request_outcomes",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .expect("unchanged outcome count")
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fixed_reopen_rejects_persisted_log_above_protected_payload_cap() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let snapshots = tempfile::tempdir().expect("snapshot directory");
+        let members = BTreeSet::from([member(7), member(8), member(9)]);
+        let bindings = test_member_bindings(&members);
+        let snapshot_dir = snapshots.path().join("snapshots");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir.clone(),
+            identity(),
+            members.clone(),
+            bindings.clone(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            FIXED_TEST_PLACEMENT_POLICY,
+        )
+        .await
+        .expect("initialize fixed durable core");
+        drop(core);
+        {
+            let conn = backend.conn.lock().await;
+            let entry = capped_cas_entry(
+                0,
+                [0xA5; 16],
+                crate::LeaseGuard::new(
+                    key(),
+                    OwnerId::new("consensus-cap-owner").expect("owner"),
+                    crate::FenceToken::new(1),
+                    timestamp(0),
+                    timestamp(0),
+                    1,
+                ),
+                None,
+                crate::Generation::new(1),
+                1_048_577,
+            );
+            persist_unvalidated_log_entry_fixture(&conn, &entry);
+        }
+
+        let error = match SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members,
+            bindings,
+            ConsensusAuthorityProfile::FixedImmutable,
+            FIXED_TEST_PLACEMENT_POLICY,
+        )
+        .await
+        {
+            Ok(_) => panic!("fixed reopen must reject an oversized persisted log entry"),
+            Err(error) => error,
+        };
+        assert_eq!(error, SessionConsensusStorageError::CorruptState);
     }
 
     fn authorized_acquire_entry(

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -317,8 +318,8 @@ fn create_legacy_replica(root: &Path, id: ReplicaId, fence: u64) -> RecoveryRepl
 }
 
 fn sealed_recovery_record(payload_len: usize) -> StoredSessionRecord {
-    let mut record = StoredSessionRecord {
-        key: SessionKey {
+    sealed_recovery_record_with_authority(
+        SessionKey {
             tenant: TenantId::from_static("recovery-cap-tenant"),
             nf_kind: NetworkFunctionKind::from_static("smf"),
             key_type: SessionKeyType::PduSession,
@@ -326,9 +327,23 @@ fn sealed_recovery_record(payload_len: usize) -> StoredSessionRecord {
                 .try_into()
                 .expect("valid stable ID"),
         },
+        OwnerId::new("recovery-cap-owner").expect("owner"),
+        crate::FenceToken::new(1),
+        payload_len,
+    )
+}
+
+fn sealed_recovery_record_with_authority(
+    key: SessionKey,
+    owner: OwnerId,
+    fence: crate::FenceToken,
+    payload_len: usize,
+) -> StoredSessionRecord {
+    let mut record = StoredSessionRecord {
+        key,
         generation: Generation::new(1),
-        owner: OwnerId::new("recovery-cap-owner").expect("owner"),
-        fence: crate::FenceToken::new(1),
+        owner,
+        fence,
         state_class: StateClass::AuthoritativeSession,
         state_type: StateType::from_static("recovery-cap-state"),
         expires_at: None,
@@ -370,6 +385,26 @@ fn sealed_recovery_record(payload_len: usize) -> StoredSessionRecord {
     assert_eq!(encoded.len(), payload_len);
     record.payload = EncryptedSessionPayload::try_envelope(encoded).expect("valid envelope");
     record
+}
+
+fn persist_valid_legacy_lease_record(conn: &Connection) {
+    let template = sealed_recovery_record(64 * 1024);
+    let lease = crate::sqlite::lease::acquire_sync(
+        conn,
+        &template.key,
+        template.owner,
+        Duration::from_secs(60),
+        Timestamp::from_str("2026-07-12T00:00:01Z").expect("fixture timestamp"),
+    )
+    .expect("valid legacy lease fixture");
+    let record = sealed_recovery_record_with_authority(
+        lease.key().clone(),
+        lease.owner().clone(),
+        lease.fence(),
+        64 * 1024,
+    );
+    crate::sqlite::ops::insert_or_replace_record_sync(conn, &record)
+        .expect("persist lease-backed recovery record");
 }
 
 fn private_tempdir() -> tempfile::TempDir {
@@ -1399,6 +1434,42 @@ fn legacy_recovery_rejects_a_regressed_lease_allocator() {
         ),
         Err(RecoveryError::CorruptReplica)
     );
+}
+
+#[test]
+fn recovery_inspection_rejects_invalid_legacy_lease_semantics() {
+    for (case, mutation) in [
+        (
+            "equal-fence-record-owner",
+            "UPDATE session_records SET owner = 'different-valid-owner'",
+        ),
+        (
+            "noncanonical-lease-timestamp",
+            "UPDATE leases SET guard_expires_at = '2026-07-12T00:01:01Z'",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let id = replica_id("legacy-semantic-replica");
+        let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+        let conn = Connection::open(&replica.database_path).expect("open legacy replica");
+        persist_valid_legacy_lease_record(&conn);
+        conn.execute_batch(mutation).expect("mutate legacy fixture");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint legacy mutation");
+        drop(conn);
+
+        assert_eq!(
+            inspect_replica(InspectionInput {
+                key: &integrity_key(),
+                replica: &replica,
+                identity: identity(),
+                expected_members: &node_set(&[id]),
+                limits: RecoveryLimits::default(),
+            }),
+            Err(RecoveryError::CorruptReplica),
+            "case {case}"
+        );
+    }
 }
 
 fn claim_current_replica(

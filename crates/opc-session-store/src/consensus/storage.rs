@@ -41,6 +41,9 @@ const SNAPSHOT_APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum SessionConsensusStorageError {
+    /// Durable consensus initialization is unsupported on this platform.
+    #[error("session consensus storage is unsupported on this platform")]
+    UnsupportedPlatform,
     /// Legacy session authority exists without a durable consensus identity.
     #[error("session consensus recovery is required before this database can join a cluster")]
     RecoveryRequired,

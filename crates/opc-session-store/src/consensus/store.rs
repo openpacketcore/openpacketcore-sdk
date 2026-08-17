@@ -145,6 +145,10 @@ fn attestation_deadline_from_verification_start(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum ConsensusSessionStoreOpenError {
+    /// Dynamic consensus requires Linux descriptor-pinned SQLite handling and
+    /// is unsupported on this platform.
+    #[error("dynamic session consensus is unsupported on this platform")]
+    DynamicConsensusUnsupportedPlatform,
     /// The topology was not a consensus-scoped HA or consensus singleton.
     #[error("session consensus topology is invalid")]
     InvalidTopology,
@@ -206,6 +210,9 @@ pub(crate) enum OperatorRecoveryCommitError {
 impl From<SessionConsensusStorageError> for ConsensusSessionStoreOpenError {
     fn from(error: SessionConsensusStorageError) -> Self {
         match error {
+            SessionConsensusStorageError::UnsupportedPlatform => {
+                Self::DynamicConsensusUnsupportedPlatform
+            }
             SessionConsensusStorageError::RecoveryRequired
             | SessionConsensusStorageError::CorruptState => Self::RecoveryRequired,
             SessionConsensusStorageError::IdentityMismatch
