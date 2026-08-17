@@ -2461,24 +2461,17 @@ async fn consumer_listener_rejects_unbounded_config_and_reaps_a_tls_blackhole() 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     drop(occupied);
 
-    let (handle, address) =
-        SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
-            .with_max_connections(1)
-            .with_idle_timeout(Duration::from_millis(100))
-            .with_operation_timeout(Duration::from_millis(100))
-            .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
-            .await
-            .expect("start bounded listener");
-    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
-    let client = StatelessSessionConsumerClient::new_with_resolver(
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
-        pki.client_config(&client_spiffe),
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer.clone(),
     )
-    .with_operation_timeout(Duration::from_secs(1));
-
+    .with_max_connections(1)
+    .with_idle_timeout(Duration::from_millis(100))
+    .with_operation_timeout(Duration::from_millis(100))
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start bounded listener");
     let mut blackhole = tokio::net::TcpStream::connect(address)
         .await
         .expect("open silent unauthenticated connection");
@@ -2515,15 +2508,54 @@ async fn consumer_listener_rejects_unbounded_config_and_reaps_a_tls_blackhole() 
     .expect("the released listener permit accepts and closes the bounded probe")
     .expect("drain the fixed TLS rejection");
 
-    assert_eq!(
-        tokio::time::timeout_at(recovery_deadline, client.capabilities())
+    drop(blackhole);
+    handle.abort_and_wait().await;
+
+    // Keep the adversarial 100 ms setup bound above scoped to the blackhole
+    // reaper. A legitimate authenticated successor is a separate proof: its
+    // listener retains the fixed one-connection ceiling but gets the normal
+    // finite setup budget. The proxy connects upstream first and deliberately
+    // withholds the ClientHello for longer than the blackhole budget, sealing
+    // that these two independent bounds cannot accidentally be coupled again.
+    const AUTHENTICATED_SETUP_DELAY: Duration = Duration::from_millis(125);
+    let (authenticated_handle, authenticated_upstream) =
+        SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
+            .with_max_connections(1)
+            .with_operation_timeout(Duration::from_secs(1))
+            .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
             .await
-            .expect("the silent peer releases the sole listener permit"),
+            .expect("start authenticated successor listener");
+    let proxy_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind authenticated setup-delay proxy");
+    let proxy_address = proxy_listener.local_addr().expect("proxy address");
+    let proxy_task = tokio::spawn(async move {
+        let (mut downstream, _) = proxy_listener.accept().await.expect("accept client");
+        let mut upstream = tokio::net::TcpStream::connect(authenticated_upstream)
+            .await
+            .expect("connect successor listener before delaying ClientHello");
+        tokio::time::sleep(AUTHENTICATED_SETUP_DELAY).await;
+        let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+    });
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(proxy_address) }));
+    let client = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(proxy_address.ip().into()),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    )
+    .with_operation_timeout(Duration::from_secs(1));
+    let authenticated_deadline = tokio::time::Instant::now() + Duration::from_millis(750);
+    assert_eq!(
+        tokio::time::timeout_at(authenticated_deadline, client.capabilities())
+            .await
+            .expect("the separately bounded authenticated successor completes"),
         Ok(BackendCapabilities::all_enabled())
     );
 
-    drop(blackhole);
-    handle.abort_and_wait().await;
+    proxy_task.abort();
+    authenticated_handle.abort_and_wait().await;
 }
 
 #[tokio::test]
