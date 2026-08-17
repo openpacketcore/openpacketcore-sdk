@@ -1324,6 +1324,14 @@ impl ConsumerConnection {
         Ok(correlation)
     }
 
+    fn returnable_after_authenticated_work(&mut self) -> bool {
+        if self.calls >= MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION {
+            return false;
+        }
+        let now = tokio::time::Instant::now();
+        self.lifecycle.retirement(now).is_none()
+    }
+
     fn reusable(&mut self) -> bool {
         if self.calls >= MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION {
             return false;
@@ -3707,12 +3715,24 @@ impl PersistentSessionConsumerPool {
         if self.phase() != PersistentShutdownPhase::Running {
             return;
         }
-        if !connection.reusable()
+        // A returned lane must still be authenticated and within its absolute
+        // lifecycle, but its *previous* idle deadline belongs to setup or the
+        // completed call. Refresh the bounded idle lifetime before testing
+        // ordinary idle reuse, so slow authenticated setup cannot consume the
+        // lane's first idle interval.
+        if !connection.returnable_after_authenticated_work()
             || !connection.current(&self.client.tls_config, &self.client.reauthentication)
         {
             counter_increment(&self.counters.reconnects);
             return;
         }
+        // A lane is idle only once authenticated setup or the preceding call
+        // has completed and it is published back to the pool.  Starting this
+        // lifetime at connection establishment lets a slow, otherwise valid
+        // handshake expire before prewarm can publish the lane.
+        connection.idle_deadline = tokio::time::Instant::now()
+            .checked_add(self.client.idle_timeout.min(DEFAULT_CONSUMER_IDLE_TIMEOUT))
+            .expect("validated consumer idle timeout has a bounded deadline");
         let mut idle = self
             .idle
             .lock()
@@ -6267,6 +6287,7 @@ mod tests {
     async fn wait_for_idle_reaper_armed_deadline(
         client: &PersistentSessionConsumerClient,
         expected: tokio::time::Instant,
+        label: &str,
     ) {
         for _ in 0..32 {
             let actual = *client
@@ -6289,7 +6310,7 @@ mod tests {
         assert_eq!(
             actual,
             Some(expected),
-            "idle reaper did not arm the exact shortened lifecycle deadline"
+            "idle reaper did not arm the exact shortened lifecycle deadline ({label})"
         );
     }
 
@@ -7113,6 +7134,7 @@ mod tests {
             .await;
         let control = SessionReauthenticationControl::new();
         let (stateless, material) = stateless_test_client(control.clone());
+        let stateless = stateless.with_idle_timeout(Duration::from_millis(100));
         let persistent = PersistentSessionConsumerClient::from_stateless(stateless);
 
         let idle_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
@@ -7122,6 +7144,7 @@ mod tests {
             Box::new(tokio::io::sink()),
         );
         persistent.pool.return_idle(connection);
+        let idle_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         wait_for_raw_idle_count(&persistent, 1).await;
         assert!(
             persistent
@@ -7133,7 +7156,7 @@ mod tests {
                 .is_some(),
             "one pool-wide idle reaper is started lazily"
         );
-        wait_for_idle_reaper_armed_deadline(&persistent, idle_deadline).await;
+        wait_for_idle_reaper_armed_deadline(&persistent, idle_deadline, "first idle").await;
         tokio::time::advance(Duration::from_millis(99)).await;
         tokio::task::yield_now().await;
         wait_for_raw_idle_count(&persistent, 1).await;
@@ -7144,6 +7167,27 @@ mod tests {
             Some(RetirementReason::IdleTimeout)
         );
         assert_eq!(idle_lifecycle.recorded_retirement_count(), 1);
+
+        // Keep the rotation test independent from the short local-idle
+        // contract above: material retirement must remain its own earliest
+        // boundary, rather than being hidden by an intentionally tiny idle
+        // timeout.
+        let rotation_policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        )
+        .expect("bounded test rotation policy");
+        let rotation_stateless = persistent
+            .pool
+            .client
+            .clone()
+            .with_idle_timeout(Duration::from_secs(5))
+            .with_connection_lifecycle(rotation_policy);
+        persistent.shutdown().await;
+        let persistent = PersistentSessionConsumerClient::from_stateless(rotation_stateless);
 
         let (connection, material_lifecycle) = synthetic_consumer_connection(
             &persistent.pool.client,
@@ -7198,7 +7242,8 @@ mod tests {
             material_rotated_at + material_jitter,
             "the idle lane uses its stable authenticated edge jitter"
         );
-        wait_for_idle_reaper_armed_deadline(&persistent, scheduled_retire_at).await;
+        wait_for_idle_reaper_armed_deadline(&persistent, scheduled_retire_at, "material rotation")
+            .await;
         wait_for_raw_idle_count(&persistent, 1).await;
         assert_eq!(material_lifecycle.recorded_retirement_count(), 0);
         tokio::time::advance(
@@ -7250,6 +7295,82 @@ mod tests {
                 .is_none(),
             "shutdown aborts the constant maintenance task"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn returned_idle_lifetime_starts_at_publication_and_resets() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let control = SessionReauthenticationControl::new();
+        let (stateless, _material) = stateless_test_client(control);
+        let persistent = PersistentSessionConsumerClient::from_stateless(
+            stateless.with_idle_timeout(Duration::from_millis(100)),
+        );
+
+        // This simulates a connection whose authenticated setup completed
+        // after its initial active-frame deadline. The elapsed setup interval
+        // is not idle time, so publication must start a full bounded lifetime.
+        let (connection, lifecycle) = synthetic_consumer_connection(
+            &persistent.pool.client,
+            tokio::time::Instant::now() + Duration::from_millis(1),
+            Box::new(tokio::io::sink()),
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let first_publication_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        persistent.pool.return_idle(connection);
+        wait_for_raw_idle_count(&persistent, 1).await;
+        assert_eq!(
+            persistent
+                .pool
+                .idle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .front()
+                .expect("authenticated lane is published idle")
+                .idle_deadline,
+            first_publication_deadline,
+            "idle expiry begins at authenticated idle publication"
+        );
+
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        let checked_out = persistent
+            .pool
+            .take_idle()
+            .expect("the lane remains reusable before the published deadline");
+        // The reaper cannot retire a checked-out lane, even after the former
+        // idle deadline passes. Returning it starts a new bounded interval.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(lifecycle.recorded_retirement_count(), 0);
+        let second_publication_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        persistent.pool.return_idle(checked_out);
+        wait_for_raw_idle_count(&persistent, 1).await;
+        assert_eq!(
+            persistent
+                .pool
+                .idle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .front()
+                .expect("returned lane is published idle")
+                .idle_deadline,
+            second_publication_deadline,
+            "each authenticated return resets the bounded idle lifetime"
+        );
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        wait_for_raw_idle_count(&persistent, 1).await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_for_raw_idle_count(&persistent, 0).await;
+        assert_eq!(
+            lifecycle.recorded_retirement_reason(),
+            Some(RetirementReason::IdleTimeout)
+        );
+        assert_eq!(lifecycle.recorded_retirement_count(), 1);
+
+        persistent.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]
