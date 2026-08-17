@@ -42,6 +42,7 @@ use opc_session_testkit::qualification::{
     SessionMtlsCandidateEvidenceError, SessionMtlsCandidateEvidenceV2,
     QUALIFICATION_PERSISTENT_CONSUMER_MAX_P999_MICROS_V7,
     QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7,
+    QUALIFICATION_PERSISTENT_CONSUMER_MAX_SAMPLE_MICROS_V7,
     QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7, SESSION_HA_EVIDENCE_V6_SCHEMA_JSON,
     SESSION_HA_EVIDENCE_V7_SCHEMA_JSON, SESSION_HA_HISTORY_SCHEMA_JSON, SESSION_HA_PROFILE_V6_JSON,
     SESSION_HA_PROFILE_V6_SCHEMA_JSON, SESSION_HA_PROFILE_V7_JSON,
@@ -150,7 +151,7 @@ fn assert_canonical_invalid_input(output: &Output) {
 fn structural_schema_for_lightweight_validator(mut schema: Value) -> Value {
     match &mut schema {
         Value::Object(object) => {
-            for unsupported in ["maxItems", "maxLength", "maximum", "pattern", "uniqueItems"] {
+            for unsupported in ["maxItems", "maxLength", "pattern", "uniqueItems"] {
                 object.remove(unsupported);
             }
             for value in object.values_mut() {
@@ -1088,6 +1089,90 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
     typed_v7
         .validate("sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592")
         .expect("fixture satisfies computed v7 evidence relationships");
+
+    for (label, mut changed) in [
+        ("source", typed_v7.clone()),
+        ("topology", typed_v7.clone()),
+        ("observations", typed_v7.clone()),
+        ("latency", typed_v7.clone()),
+        ("coverage", typed_v7.clone()),
+        ("remaining", typed_v7.clone()),
+    ] {
+        match label {
+            "source" => changed.source_tree.replace_range(..1, "3"),
+            "topology" => changed.topology.configured_clients = 11,
+            "observations" => changed.observations.warm_reused_calls += 1,
+            "latency" => changed.warm_latency.raw_samples_micros[0] += 1,
+            "coverage" => changed.coverage.swap(0, 1),
+            "remaining" => changed.remaining_acceptance.swap(0, 1),
+            _ => unreachable!(),
+        }
+        assert!(
+            changed
+                .validate("sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592")
+                .is_err(),
+            "{label} mutation with the retained transcript digest must reject"
+        );
+    }
+
+    let mut wrong_topology_claim = typed_v7.clone();
+    wrong_topology_claim.topology.members = 5;
+    wrong_topology_claim.execution.transcript_sha256 = wrong_topology_claim
+        .canonical_transcript_sha256()
+        .expect("mutated transcript remains encodable");
+    assert!(wrong_topology_claim
+        .validate("sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592")
+        .is_err());
+    assert!(validate_structural_schema(
+        &v7_evidence_schema,
+        &serde_json::to_value(&wrong_topology_claim).expect("wrong topology encodes"),
+    )
+    .is_err());
+
+    let mut reordered_coverage = typed_v7.clone();
+    reordered_coverage.coverage.swap(0, 1);
+    reordered_coverage.execution.transcript_sha256 = reordered_coverage
+        .canonical_transcript_sha256()
+        .expect("reordered transcript remains encodable");
+    assert!(reordered_coverage
+        .validate("sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592")
+        .is_err());
+    assert!(validate_structural_schema(
+        &v7_evidence_schema,
+        &serde_json::to_value(&reordered_coverage).expect("reordered coverage encodes"),
+    )
+    .is_err());
+
+    let mut missing_remaining = v7_evidence.clone();
+    missing_remaining["remaining_acceptance"]
+        .as_array_mut()
+        .expect("remaining acceptance array")
+        .pop();
+    assert!(
+        serde_json::from_value::<SessionHaPersistentConsumerEvidenceV7>(missing_remaining.clone())
+            .is_err()
+    );
+    assert!(validate_structural_schema(&v7_evidence_schema, &missing_remaining).is_err());
+
+    let mut oversized_sample = typed_v7.clone();
+    *oversized_sample
+        .warm_latency
+        .raw_samples_micros
+        .last_mut()
+        .expect("fixture has samples") = QUALIFICATION_PERSISTENT_CONSUMER_MAX_SAMPLE_MICROS_V7 + 1;
+    // With exactly 1,000 samples, one high outlier does not change nearest-rank
+    // p99 or p99.9. This isolates the raw-sample schema maximum itself.
+    oversized_sample.execution.transcript_sha256 = oversized_sample
+        .canonical_transcript_sha256()
+        .expect("oversized transcript remains encodable");
+    assert!(oversized_sample
+        .validate("sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592")
+        .is_err());
+    assert!(validate_structural_schema(
+        &v7_evidence_schema,
+        &serde_json::to_value(&oversized_sample).expect("oversized evidence encodes"),
+    )
+    .is_err());
     let mut wrong_v7_profile_digest = v7_evidence.clone();
     wrong_v7_profile_digest["execution"]["profile_sha256"] =
         "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into();
@@ -1122,9 +1207,9 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
         serde_json::to_value(&typed_v7.observations).expect("observations");
     augmented_v6["warm_latency"] = serde_json::to_value(&typed_v7.warm_latency).expect("latency");
     augmented_v6["privacy"] = serde_json::to_value(&typed_v7.privacy).expect("privacy");
-    augmented_v6["coverage"] = serde_json::to_value(&typed_v7.coverage).expect("coverage");
+    augmented_v6["coverage"] = serde_json::to_value(typed_v7.coverage).expect("coverage");
     augmented_v6["remaining_acceptance"] =
-        serde_json::to_value(&typed_v7.remaining_acceptance).expect("remaining");
+        serde_json::to_value(typed_v7.remaining_acceptance).expect("remaining");
     assert!(
         validate_structural_schema(&v7_evidence_schema, &augmented_v6).is_err(),
         "a v6 run cannot become v7 by appending persistent labels"

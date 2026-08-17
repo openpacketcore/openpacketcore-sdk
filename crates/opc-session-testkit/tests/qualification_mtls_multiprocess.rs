@@ -44,8 +44,9 @@ use opc_session_testkit::qualification::{
     QualificationConnectionLifecycleConfig, QualificationConnectionLifecycleMetrics,
     QualificationConsensusRpcAvailability, QualificationMember, QualificationNodeCommand,
     QualificationNodeCommandKind, QualificationNodeConfig, QualificationNodeErrorCode,
-    QualificationNodeReply, QualificationPeerRouting, QualificationPersistentConsumerExecutionV7,
-    QualificationPersistentConsumerObservationsV7, QualificationPersistentConsumerPrivacyV7,
+    QualificationNodeReply, QualificationPeerRouting, QualificationPersistentConsumerCoverageV7,
+    QualificationPersistentConsumerExecutionV7, QualificationPersistentConsumerObservationsV7,
+    QualificationPersistentConsumerPrivacyV7, QualificationPersistentConsumerRemainingAcceptanceV7,
     QualificationPersistentConsumerTopologyV7, QualificationPersistentConsumerWarmLatencyV7,
     QualificationProjectedMtlsConfig, QualificationProjectedSvidAvailability,
     QualificationProjectedSvidReason, QualificationProjectedSvidStatus, QualificationReadinessCode,
@@ -8737,7 +8738,7 @@ fn nearest_rank_micros(samples: &[u64], numerator: usize, denominator: usize) ->
 fn structural_evidence_schema(mut schema: serde_json::Value) -> serde_json::Value {
     match &mut schema {
         serde_json::Value::Object(object) => {
-            for unsupported in ["maxItems", "maxLength", "maximum", "pattern", "uniqueItems"] {
+            for unsupported in ["maxItems", "maxLength", "pattern", "uniqueItems"] {
                 object.remove(unsupported);
             }
             for value in object.values_mut() {
@@ -8773,29 +8774,12 @@ fn emit_v7_persistent_consumer_evidence(
     assert!(p99_micros <= QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7);
     assert!(p999_micros <= QUALIFICATION_PERSISTENT_CONSUMER_MAX_P999_MICROS_V7);
 
-    let transcript = serde_json::json!({
-        "domain": "opc-session-ha/persistent-consumer-run/v1",
-        "source_revision": source_revision,
-        "source_tree": source_tree,
-        "members": member_count,
-        "authenticated_setup_successes": measurements.authenticated_setup_successes,
-        "warm_reused_calls": measurements.warm_reused_calls,
-        "raw_samples_micros": measurements.raw_samples_micros,
-        "exact_request_id_recovery": true,
-        "leader_loss_recovery": true,
-        "voter_loss_recovery": true,
-        "outcome_unknown_recovery": true
-    });
-    let transcript_sha256 = format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&transcript).expect("bounded transcript encodes"))
-    );
     let topology_coverage = if member_count == 3 {
-        "three_voter_latency"
+        QualificationPersistentConsumerCoverageV7::ThreeVoterLatency
     } else {
-        "five_voter_composition"
+        QualificationPersistentConsumerCoverageV7::FiveVoterComposition
     };
-    let evidence = SessionHaPersistentConsumerEvidenceV7 {
+    let mut evidence = SessionHaPersistentConsumerEvidenceV7 {
         schema_version: "opc-session-ha-evidence/v7".into(),
         profile_id: "opc-session-openraft-ha/v7".into(),
         experimental: true,
@@ -8806,7 +8790,7 @@ fn emit_v7_persistent_consumer_evidence(
         execution: QualificationPersistentConsumerExecutionV7 {
             profile_sha256: PROFILE_SHA256.into(),
             transcript_digest_domain: "opc-session-ha/persistent-consumer-run/v1".into(),
-            transcript_sha256,
+            transcript_sha256: String::new(),
             client_type: "PersistentSessionConsumerClient".into(),
             consumer_profile_path: "protocol.persistent_consumer".into(),
             transport_revision: 2,
@@ -8841,27 +8825,24 @@ fn emit_v7_persistent_consumer_evidence(
             identifying_values_recorded: false,
         },
         coverage: [
-            "persistent_prewarm",
-            "warm_connection_reuse",
-            "real_mtls",
-            "multi_process",
-            "leader_loss",
-            "voter_loss",
+            QualificationPersistentConsumerCoverageV7::PersistentPrewarm,
+            QualificationPersistentConsumerCoverageV7::WarmConnectionReuse,
+            QualificationPersistentConsumerCoverageV7::RealMtls,
+            QualificationPersistentConsumerCoverageV7::MultiProcess,
             topology_coverage,
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
+            QualificationPersistentConsumerCoverageV7::LeaderLoss,
+            QualificationPersistentConsumerCoverageV7::VoterLoss,
+        ],
         remaining_acceptance: [
-            "downstream_epdg_production_slo",
-            "deployed_kubernetes_platform_matrix",
-            "resource_soak",
-            "signed_release_bundle",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
+            QualificationPersistentConsumerRemainingAcceptanceV7::DownstreamEpdgProductionSlo,
+            QualificationPersistentConsumerRemainingAcceptanceV7::DeployedKubernetesPlatformMatrix,
+            QualificationPersistentConsumerRemainingAcceptanceV7::ResourceSoak,
+            QualificationPersistentConsumerRemainingAcceptanceV7::SignedReleaseBundle,
+        ],
     };
+    evidence.execution.transcript_sha256 = evidence
+        .canonical_transcript_sha256()
+        .expect("bounded canonical transcript encodes");
     evidence
         .validate(PROFILE_SHA256)
         .expect("typed persistent-consumer evidence validates");

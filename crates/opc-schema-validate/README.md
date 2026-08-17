@@ -30,7 +30,8 @@ Supported validation keywords include:
 - `type` for single JSON types.
 - `required`, `properties`, and `additionalProperties`.
 - `items` with a single item schema and `minItems`.
-- `minLength`, `minimum`, `const`, `enum`, `oneOf`, and `anyOf`.
+- `minLength`, inclusive `minimum`/`maximum`, `const`, `enum`, `oneOf`, and
+  `anyOf`.
 - `format` through the caller-supplied callback.
 - Annotation keywords such as `$comment`, `$id`, `$schema`, `$defs`, `default`,
   `definitions`, `deprecated`, `description`, `examples`, `readOnly`, `title`,
@@ -39,7 +40,7 @@ Supported validation keywords include:
 Unsupported keywords fail closed, including `$ref`, `allOf`, `not`,
 `if`/`then`/`else`, `multipleOf`, `uniqueItems`, `patternProperties`,
 `contains`, dependencies/dependent keywords, `propertyNames`, tuple-item
-keywords, `maxLength`, `pattern`, `maxItems`, `maximum`, and exclusive bounds.
+keywords, `maxLength`, `pattern`, `maxItems`, and exclusive bounds.
 
 ## Relationships
 

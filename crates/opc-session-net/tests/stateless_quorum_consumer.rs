@@ -12,20 +12,21 @@ use futures_util::stream::BoxStream;
 use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_session_net::{
-    RemoteAddrResolver, SessionConsumerAuthorizer, SessionConsumerClientError,
-    SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionQuorumConsumerServer,
-    StatelessSessionConsumerClient, SESSION_QUORUM_CONSUMER_ALPN,
+    PersistentSessionConsumerClient, RemoteAddrResolver, SessionConsumerAuthorizer,
+    SessionConsumerClientError, SessionConsumerLeaseMutationError, SessionConsumerMutationError,
+    SessionQuorumConsumerServer, StatelessSessionConsumerClient, SESSION_QUORUM_CONSUMER_ALPN,
     SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
-    BackendCapabilities, ConsensusSessionStore, OwnerId, QuorumReplicaDescriptor,
-    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    BackendCapabilities, ConsensusSessionStore, EncryptedSessionPayload, FenceToken, Generation,
+    OwnerId, QuorumReplicaDescriptor, RecordExpiryPreflight, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest,
     SessionConsensusIdentity, SessionConsumerChange, SessionConsumerIdentity,
     SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerRejection,
     SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
     SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
-    SessionLeaseManager, SessionQuorumConsumer, SqliteSessionBackend, StoreError,
-    ValidatedQuorumTopology,
+    SessionLeaseManager, SessionOp, SessionQuorumConsumer, SqliteSessionBackend, StateClass,
+    StateType, StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
@@ -330,6 +331,24 @@ fn production_default_features_expose_a_dedicated_stateless_consumer_boundary() 
     let _ = std::any::TypeId::of::<SessionConsumerAuthorizer>();
     assert_ne!(SESSION_QUORUM_CONSUMER_ALPN, b"opc-session-consensus/2");
     assert_ne!(SESSION_QUORUM_CONSUMER_ALPN, b"opc-session-net/5");
+}
+
+#[test]
+fn stateless_lease_response_payloads_remain_source_compatible_lease_guards() {
+    fn assert_lease_payload(
+        payload: Result<opc_session_store::LeaseGuard, SessionConsumerLeaseError>,
+    ) {
+        assert!(payload.is_err());
+    }
+
+    match SessionConsumerResponse::AcquireLease(Err(SessionConsumerLeaseError::Unavailable)) {
+        SessionConsumerResponse::AcquireLease(payload) => assert_lease_payload(payload),
+        _ => unreachable!("constructed acquire response"),
+    }
+    match SessionConsumerResponse::RenewLease(Err(SessionConsumerLeaseError::Unavailable)) {
+        SessionConsumerResponse::RenewLease(payload) => assert_lease_payload(payload),
+        _ => unreachable!("constructed renew response"),
+    }
 }
 
 #[tokio::test]
@@ -923,6 +942,112 @@ async fn resolver_failure_is_unavailable_and_not_transmitted_for_mutations_and_l
 }
 
 #[tokio::test]
+async fn deserialized_structurally_invalid_lease_guards_fail_before_resolve_or_effect() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("invalid-guard-server");
+    let client_spiffe = spiffe("invalid-guard-client");
+    let (_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            let resolutions = Arc::clone(&resolutions);
+            Box::pin(async move {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("invalid guard must never resolve"))
+            })
+        })
+    };
+    let client = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).into(),
+        ),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    );
+    let mut encoded = serde_json::to_value(test_lease().await).expect("encode valid lease guard");
+    encoded["credential_id"] = serde_json::json!(0);
+    let forged: opc_session_store::LeaseGuard =
+        serde_json::from_value(encoded).expect("public DTO accepts a structurally forged guard");
+
+    assert!(matches!(
+        client
+            .delete_fenced_with_id(
+                SessionConsumerRequestId::from_bytes([0x91; 16]),
+                forged.clone()
+            )
+            .await,
+        Err(SessionConsumerMutationError::NotTransmitted {
+            cause: SessionConsumerClientError::Protocol
+        })
+    ));
+    assert_eq!(
+        client
+            .execute(SessionConsumerRequest::new(
+                scope,
+                SessionConsumerRequestId::from_bytes([0x92; 16]),
+                SessionConsumerOperation::Batch {
+                    ops: vec![opc_session_store::SessionOp::DeleteFenced { lease: forged }]
+                },
+            ))
+            .await,
+        Err(SessionConsumerClientError::Protocol)
+    );
+    let descriptor = RecordExpiryPreflight::from_record(&StoredSessionRecord {
+        key: test_key(),
+        generation: Generation::new(1),
+        owner: OwnerId::new("invalid-preflight-owner").expect("preflight owner"),
+        fence: FenceToken::new(1),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("invalid-preflight"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new(b"opaque-invalid-preflight"),
+    });
+    for (request_byte, operation) in [
+        (
+            0x93,
+            SessionConsumerOperation::AcquireLease {
+                key: test_key(),
+                owner: OwnerId::new("invalid-ttl-owner").expect("invalid TTL owner"),
+                ttl: opc_session_store::MAX_SESSION_TTL + Duration::from_nanos(1),
+            },
+        ),
+        (
+            0x94,
+            SessionConsumerOperation::Batch {
+                ops: vec![SessionOp::Get { key: test_key() }; 257],
+            },
+        ),
+        (
+            0x95,
+            SessionConsumerOperation::PreflightRecordExpiry {
+                preflights: vec![descriptor; opc_session_store::MAX_RECORD_EXPIRY_PREFLIGHTS + 1],
+            },
+        ),
+        (
+            0x96,
+            SessionConsumerOperation::ScanRestoreRecords {
+                request: RestoreScanRequest::all(0),
+            },
+        ),
+    ] {
+        assert_eq!(
+            client
+                .execute(SessionConsumerRequest::new(
+                    scope,
+                    SessionConsumerRequestId::from_bytes([request_byte; 16]),
+                    operation,
+                ))
+                .await,
+            Err(SessionConsumerClientError::Protocol)
+        );
+    }
+    assert_eq!(resolutions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn outcome_unknown_is_not_replayed_and_consumer_debug_is_redacted() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("debug-server");
@@ -1298,7 +1423,7 @@ async fn durable_consumer_request_ids_deduplicate_lease_races_and_fence_stale_ow
         "a retained consumer request ID must replay only its prior durable result"
     );
     let lease = match winner_response {
-        SessionConsumerResponse::AcquireLease(Ok(grant)) => grant.into_guard(),
+        SessionConsumerResponse::AcquireLease(Ok(guard)) => guard,
         _ => unreachable!("winner response is an acquired lease"),
     };
     let conflicting_reuse = SessionConsumerRequest::new(
@@ -1358,5 +1483,57 @@ async fn durable_consumer_request_ids_deduplicate_lease_races_and_fence_stale_ow
             SessionConsumerLeaseError::StaleFence
         )))
     ));
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn stateless_and_persistent_consumers_accept_shorter_and_zero_ttl_renewals() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("renewal-server");
+    let client_spiffe = spiffe("renewal-client");
+    let (_snapshots, store, scope, authorizer) =
+        admitted_store_and_authorizer([client_spiffe.clone()]).await;
+    let service = Arc::new(store.consumer_service());
+    let (handle, address) =
+        SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
+            .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+            .await
+            .expect("start renewal consumer listener");
+    let stateless = consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope);
+
+    let original = stateless
+        .acquire_with_id(
+            SessionConsumerRequestId::from_bytes([0x81; 16]),
+            test_key(),
+            OwnerId::new("renewal-owner").expect("renewal owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("acquire thirty-second lease");
+    let shortened = stateless
+        .renew_with_id(
+            SessionConsumerRequestId::from_bytes([0x82; 16]),
+            original.clone(),
+            Duration::from_secs(7),
+        )
+        .await
+        .expect("stateless renewal may shorten a live lease");
+    assert!(shortened.expires_at() < original.expires_at());
+
+    let persistent = PersistentSessionConsumerClient::from_stateless(stateless);
+    let zero = persistent
+        .renew_with_id(
+            SessionConsumerRequestId::from_bytes([0x83; 16]),
+            &shortened,
+            Duration::ZERO,
+        )
+        .await
+        .expect("persistent renewal accepts the valid zero TTL boundary");
+    assert!(zero.expires_at() <= shortened.expires_at());
+    assert_eq!(zero.key(), shortened.key());
+    assert_eq!(zero.owner(), shortened.owner());
+    assert_eq!(zero.fence(), shortened.fence());
+
+    persistent.shutdown().await;
     handle.abort_and_wait().await;
 }

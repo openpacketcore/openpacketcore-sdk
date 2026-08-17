@@ -401,6 +401,17 @@ pub fn validate_record_expiry_preflights_at(
 }
 
 impl SessionOp {
+    /// Validate every caller-supplied lease guard carried by this operation.
+    pub(crate) fn validate_lease_guards(&self) -> Result<(), StoreError> {
+        match self {
+            Self::CompareAndSet(op) => op.lease.validate_profile(),
+            Self::DeleteFenced { lease } | Self::RefreshTtl { lease, .. } => {
+                lease.validate_profile()
+            }
+            Self::Get { .. } => Ok(()),
+        }
+    }
+
     /// Validate every caller-supplied TTL carried by this operation.
     ///
     /// Adapters should preflight an entire batch before performing any slot so
@@ -459,6 +470,7 @@ pub fn validate_session_ops_at(
 /// coordinator must still call [`validate_session_ops_at`] with its own clock.
 pub fn validate_session_ops_profile(ops: &[SessionOp]) -> Result<(), StoreError> {
     validate_session_ops_ttls(ops)?;
+    ops.iter().try_for_each(SessionOp::validate_lease_guards)?;
     ops.iter()
         .try_for_each(SessionOp::validate_record_expiry_profile)
 }

@@ -24,15 +24,15 @@ use opc_session_store::{
     RestoreScanScope, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
     SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
     SessionConsumerChange, SessionConsumerLeaseError, SessionConsumerLeaseGrant,
-    SessionConsumerOperation, SessionConsumerRejection, SessionConsumerRequest,
-    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-    StateClass, StateType, StoreError, StoredSessionRecord,
+    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+    SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
+    SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
     MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_TTL,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -346,7 +346,61 @@ struct CanonicalConsumerCallResponse {
     // Keep this as a JSON scalar so the zero-correlation adversary can reach
     // the production decoder instead of being rejected by the fixture.
     correlation: Value,
-    response: SessionConsumerResponse,
+    response: Value,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "body", rename_all = "snake_case")]
+enum CanonicalTypedConsumerWireResponse {
+    Response(CanonicalTypedConsumerCallResponse),
+}
+
+#[derive(Serialize)]
+struct CanonicalTypedConsumerCallResponse {
+    correlation: Value,
+    response: CanonicalConsumerSessionResponseWire,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalWireBackendCapabilities {
+    atomic_compare_and_set: bool,
+    monotonic_fencing_token: bool,
+    per_key_ttl: bool,
+    server_side_lease_expiry: bool,
+    ordered_replication_log: bool,
+    batch_write: bool,
+    watch: bool,
+    restore_scan: bool,
+    max_value_bytes: u64,
+}
+
+/// Test-side mirror of the private revision-2 response body. Tests may compose
+/// adversarial frames as JSON values, but valid control responses must be
+/// reserialized through this typed mirror so map ordering cannot accidentally
+/// turn the fixture itself into a noncanonical frame.
+#[derive(Serialize, Deserialize)]
+#[serde(
+    tag = "response",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum CanonicalConsumerSessionResponseWire {
+    Capabilities(CanonicalWireBackendCapabilities),
+    Get(Result<Option<StoredSessionRecord>, SessionConsumerStoreError>),
+    PreflightRecordExpiry(Result<(), SessionConsumerStoreError>),
+    CompareAndSet(Result<CompareAndSetResult, SessionConsumerStoreError>),
+    DeleteFenced(Result<(), SessionConsumerStoreError>),
+    RefreshTtl(Result<(), SessionConsumerStoreError>),
+    Batch(Result<Vec<SessionConsumerBatchResult>, SessionConsumerStoreError>),
+    ScanRestoreRecords(Result<RestoreScanPage, SessionConsumerStoreError>),
+    WatchOpened,
+    AcquireLease(Result<SessionConsumerLeaseGrant, SessionConsumerLeaseError>),
+    RenewLease(Result<SessionConsumerLeaseGrant, SessionConsumerLeaseError>),
+    ReleaseLease(Result<(), SessionConsumerLeaseError>),
+    OutcomeUnknown(SessionConsumerOutcomeUnknown),
+    Rejected(SessionConsumerRejection),
 }
 
 #[derive(Serialize)]
@@ -356,6 +410,19 @@ struct CanonicalConsumerWatchEntry {
 }
 
 fn canonical_response_payload(value: &Value) -> Vec<u8> {
+    if value["kind"] == "response" {
+        if let Ok(response) = serde_json::from_value::<CanonicalConsumerSessionResponseWire>(
+            value["body"]["response"].clone(),
+        ) {
+            return serde_json::to_vec(&CanonicalTypedConsumerWireResponse::Response(
+                CanonicalTypedConsumerCallResponse {
+                    correlation: value["body"]["correlation"].clone(),
+                    response,
+                },
+            ))
+            .expect("typed test response encodes");
+        }
+    }
     let response = match value["kind"].as_str() {
         Some("hello_ack") => CanonicalConsumerWireResponse::HelloAck(CanonicalConsumerHelloAck {
             transport_revision: serde_json::from_value(value["body"]["transport_revision"].clone())
@@ -367,8 +434,7 @@ fn canonical_response_payload(value: &Value) -> Vec<u8> {
         Some("response") => {
             CanonicalConsumerWireResponse::Response(CanonicalConsumerCallResponse {
                 correlation: value["body"]["correlation"].clone(),
-                response: serde_json::from_value(value["body"]["response"].clone())
-                    .expect("typed consumer response"),
+                response: value["body"]["response"].clone(),
             })
         }
         Some("watch_entry") => {
@@ -419,6 +485,20 @@ fn capability_response(correlation: Value) -> Value {
             )).expect("capability response encodes"),
         },
     })
+}
+
+fn revision_two_response_value(response: SessionConsumerResponse) -> Value {
+    match response {
+        SessionConsumerResponse::AcquireLease(Ok(guard)) => json!({
+            "response": "acquire_lease",
+            "body": {"Ok": {"authority_time": guard.acquired_at(), "guard": guard}},
+        }),
+        SessionConsumerResponse::RenewLease(Ok(guard)) => json!({
+            "response": "renew_lease",
+            "body": {"Ok": {"authority_time": guard.acquired_at(), "guard": guard}},
+        }),
+        response => serde_json::to_value(response).expect("consumer response encodes"),
+    }
 }
 
 fn watch_opened_response(correlation: Value) -> Value {
@@ -497,6 +577,19 @@ async fn assert_malicious_semantic_response_is_unconfirmed(
     request: SessionConsumerRequest,
     response: SessionConsumerResponse,
 ) {
+    assert_malicious_semantic_wire_response_is_unconfirmed(
+        case,
+        request,
+        revision_two_response_value(response),
+    )
+    .await;
+}
+
+async fn assert_malicious_semantic_wire_response_is_unconfirmed(
+    case: &str,
+    request: SessionConsumerRequest,
+    response: Value,
+) {
     let pki = TestPki::new();
     let server_spiffe = spiffe(&format!("semantic-{case}-server"));
     let client_spiffe = spiffe(&format!("semantic-{case}-client"));
@@ -518,7 +611,7 @@ async fn assert_malicious_semantic_response_is_unconfirmed(
             "kind": "response",
             "body": {
                 "correlation": call["body"]["correlation"].clone(),
-                "response": serde_json::to_value(response).expect("semantic response encodes"),
+                "response": response,
             },
         });
         write_value(&mut tls, &response).await;
@@ -538,11 +631,14 @@ async fn assert_malicious_semantic_response_is_unconfirmed(
     };
     let result = client.execute(&request).await;
     if effectful {
-        assert!(matches!(
-            result,
-            Err(PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id: returned })
-                if returned == request_id
-        ));
+        assert!(
+            matches!(
+                result,
+                Err(PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id: returned })
+                    if returned == request_id
+            ),
+            "effectful semantic mismatch {case} must remain outcome-unknown"
+        );
     } else {
         assert_eq!(
             result,
@@ -845,10 +941,7 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
             },
             4,
         ),
-        SessionConsumerResponse::AcquireLease(Ok(SessionConsumerLeaseGrant::new(
-            wrong_lease.clone(),
-            wrong_lease.acquired_at(),
-        ))),
+        SessionConsumerResponse::AcquireLease(Ok(wrong_lease.clone())),
     )
     .await;
     assert_malicious_semantic_response_is_unconfirmed(
@@ -884,10 +977,7 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
                 },
                 24,
             ),
-            SessionConsumerResponse::AcquireLease(Ok(SessionConsumerLeaseGrant::new(
-                wrong_ttl,
-                lease.acquired_at(),
-            ))),
+            SessionConsumerResponse::AcquireLease(Ok(wrong_ttl)),
         )
         .await;
     }
@@ -917,10 +1007,7 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
                 },
                 40,
             ),
-            SessionConsumerResponse::AcquireLease(Ok(SessionConsumerLeaseGrant::new(
-                malformed,
-                lease.acquired_at(),
-            ))),
+            SessionConsumerResponse::AcquireLease(Ok(malformed)),
         )
         .await;
     }
@@ -940,25 +1027,35 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
             },
             5,
         ),
-        SessionConsumerResponse::RenewLease(Ok(SessionConsumerLeaseGrant::new(
-            forged_renewal,
-            lease.acquired_at(),
-        ))),
+        SessionConsumerResponse::RenewLease(Ok(forged_renewal)),
     )
     .await;
-    assert_malicious_semantic_response_is_unconfirmed(
-        "renew-unchanged-lifetime",
+    let expired_renewal_authority = lease.expires_at();
+    let expired_renewal_ttl = Duration::from_secs(7);
+    let mut expired_renewal = serde_json::to_value(&lease).expect("lease encodes");
+    expired_renewal["expires_at"] = serde_json::to_value(
+        checked_session_deadline(expired_renewal_authority, expired_renewal_ttl)
+            .expect("expired-authority renewal deadline"),
+    )
+    .expect("deadline encodes");
+    assert_malicious_semantic_wire_response_is_unconfirmed(
+        "renew-expired-authority",
         semantic_request(
             SessionConsumerOperation::RenewLease {
                 lease: lease.clone(),
-                ttl: Duration::from_secs(30),
+                ttl: expired_renewal_ttl,
             },
             25,
         ),
-        SessionConsumerResponse::RenewLease(Ok(SessionConsumerLeaseGrant::new(
-            lease.clone(),
-            lease.acquired_at(),
-        ))),
+        json!({
+            "response": "renew_lease",
+            "body": {
+                "Ok": {
+                    "authority_time": expired_renewal_authority,
+                    "guard": expired_renewal,
+                },
+            },
+        }),
     )
     .await;
     assert_malicious_semantic_response_is_unconfirmed(
@@ -998,10 +1095,7 @@ async fn authenticated_semantic_response_mismatches_are_unconfirmed_and_poison_t
                 },
                 50,
             ),
-            SessionConsumerResponse::RenewLease(Ok(SessionConsumerLeaseGrant::new(
-                malformed,
-                lease.acquired_at(),
-            ))),
+            SessionConsumerResponse::RenewLease(Ok(malformed)),
         )
         .await;
     }
@@ -1744,6 +1838,13 @@ async fn partial_read_only_unary_response_expires_at_the_authenticated_idle_boun
                 .await
                 .expect("partial unary response obeys the authenticated idle bound"),
             Err(SessionConsumerClientError::Deadline)
+        );
+        let diagnostics = client.diagnostics().await;
+        assert_eq!(diagnostics.failures, 1);
+        assert_eq!(diagnostics.not_transmitted, 0);
+        assert_eq!(
+            diagnostics.outcome_unknown, 0,
+            "a transmitted read has no mutation or lease effect to classify as unknown"
         );
         client.shutdown().await;
         server.await.expect("malicious server");

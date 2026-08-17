@@ -9,7 +9,7 @@
   "execution": {
     "profile_sha256": "sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592",
     "transcript_digest_domain": "opc-session-ha/persistent-consumer-run/v1",
-    "transcript_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "transcript_sha256": "sha256:492b8f2e4cb0b5c25fbf418d739400e640177f24648e5473d98ee52b783f1995",
     "client_type": "PersistentSessionConsumerClient",
     "consumer_profile_path": "protocol.persistent_consumer",
     "transport_revision": 2,

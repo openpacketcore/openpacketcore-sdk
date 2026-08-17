@@ -151,18 +151,54 @@
       }
     },
     "remaining_acceptance": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 4,
-      "uniqueItems": true,
-      "items": {
-        "enum": [
-          "downstream_epdg_production_slo",
-          "deployed_kubernetes_platform_matrix",
-          "resource_soak",
-          "signed_release_bundle"
-        ]
+      "const": [
+        "downstream_epdg_production_slo",
+        "deployed_kubernetes_platform_matrix",
+        "resource_soak",
+        "signed_release_bundle"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "required": ["topology", "coverage"],
+      "properties": {
+        "topology": {
+          "properties": { "members": { "const": 3 } },
+          "required": ["members"]
+        },
+        "coverage": {
+          "const": [
+            "persistent_prewarm",
+            "warm_connection_reuse",
+            "real_mtls",
+            "multi_process",
+            "three_voter_latency",
+            "leader_loss",
+            "voter_loss"
+          ]
+        }
+      }
+    },
+    {
+      "required": ["topology", "coverage"],
+      "properties": {
+        "topology": {
+          "properties": { "members": { "const": 5 } },
+          "required": ["members"]
+        },
+        "coverage": {
+          "const": [
+            "persistent_prewarm",
+            "warm_connection_reuse",
+            "real_mtls",
+            "multi_process",
+            "five_voter_composition",
+            "leader_loss",
+            "voter_loss"
+          ]
+        }
       }
     }
-  }
+  ]
 }

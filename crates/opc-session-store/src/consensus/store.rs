@@ -54,10 +54,9 @@ use crate::consumer::{
     consumer_request_commitment, derive_consumer_consensus_request_id,
     derive_consumer_request_binding_id, SessionConsumerAuthorizationManifest,
     SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerIdentity,
-    SessionConsumerLeaseGrant, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionQuorumConsumer,
-    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerStoreError, SessionQuorumConsumer, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use crate::error::{LeaseError, StoreError};
 use crate::lease::{LeaseGuard, SessionLeaseManager};
@@ -4007,15 +4006,9 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                             deadline,
                         )
                         .await
-                        .and_then(|response| {
-                            let authority_time =
-                                response.logical_time.ok_or_else(consensus_unavailable)?;
-                            match response.result? {
-                                SessionMutationOutcome::Lease(lease) => {
-                                    Ok(SessionConsumerLeaseGrant::new(lease, authority_time))
-                                }
-                                _ => Err(StoreError::BackendOperationOutcomeUnavailable),
-                            }
+                        .and_then(|response| match response.result? {
+                            SessionMutationOutcome::Lease(lease) => Ok(lease),
+                            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
                         })
                         .map_err(LeaseError::from);
                     if matches!(result, Err(LeaseError::OperationOutcomeUnavailable)) {
@@ -4038,15 +4031,9 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                             deadline,
                         )
                         .await
-                        .and_then(|response| {
-                            let authority_time =
-                                response.logical_time.ok_or_else(consensus_unavailable)?;
-                            match response.result? {
-                                SessionMutationOutcome::Lease(lease) => {
-                                    Ok(SessionConsumerLeaseGrant::new(lease, authority_time))
-                                }
-                                _ => Err(StoreError::BackendOperationOutcomeUnavailable),
-                            }
+                        .and_then(|response| match response.result? {
+                            SessionMutationOutcome::Lease(lease) => Ok(lease),
+                            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
                         })
                         .map_err(LeaseError::from);
                     if matches!(result, Err(LeaseError::OperationOutcomeUnavailable)) {

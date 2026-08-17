@@ -288,6 +288,11 @@ impl fmt::Debug for SessionConsumerOperation {
 impl SessionConsumerOperation {
     /// Check fixed consumer-side operation bounds before quorum dispatch.
     pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
+        let validate_lease = |lease: &LeaseGuard| {
+            lease
+                .validate_profile()
+                .map_err(|_| SessionConsumerRejection::MalformedRequest)
+        };
         match self {
             Self::PreflightRecordExpiry { preflights } => {
                 crate::validate_record_expiry_preflights_profile(preflights)
@@ -303,16 +308,16 @@ impl SessionConsumerOperation {
             Self::ScanRestoreRecords { request } => request
                 .validate()
                 .map_err(|_| SessionConsumerRejection::MalformedRequest),
-            Self::RefreshTtl { ttl, .. }
-            | Self::AcquireLease { ttl, .. }
-            | Self::RenewLease { ttl, .. } => crate::validate_session_ttl(*ttl)
+            Self::CompareAndSet { op } => validate_lease(&op.lease),
+            Self::DeleteFenced { lease } | Self::ReleaseLease { lease } => validate_lease(lease),
+            Self::RefreshTtl { lease, ttl } | Self::RenewLease { lease, ttl } => {
+                validate_lease(lease)?;
+                crate::validate_session_ttl(*ttl)
+                    .map_err(|_| SessionConsumerRejection::MalformedRequest)
+            }
+            Self::AcquireLease { ttl, .. } => crate::validate_session_ttl(*ttl)
                 .map_err(|_| SessionConsumerRejection::MalformedRequest),
-            Self::Capabilities
-            | Self::Get { .. }
-            | Self::CompareAndSet { .. }
-            | Self::DeleteFenced { .. }
-            | Self::Watch { .. }
-            | Self::ReleaseLease { .. } => Ok(()),
+            Self::Capabilities | Self::Get { .. } | Self::Watch { .. } => Ok(()),
         }
     }
 }
@@ -714,7 +719,7 @@ pub enum SessionConsumerBatchResult {
     RefreshTtl(Result<(), SessionConsumerStoreError>),
 }
 
-/// Successful lease authority returned across the consumer transport.
+/// Successful lease authority carried only by the revision-2 transport wire.
 ///
 /// The committed authority time is carried separately from the guard because
 /// renewal preserves the guard's original acquisition timestamp. A client can
@@ -793,9 +798,9 @@ pub enum SessionConsumerResponse {
     /// Watch admission result; entries follow as separately framed messages.
     WatchOpened,
     /// Lease acquisition result.
-    AcquireLease(Result<SessionConsumerLeaseGrant, SessionConsumerLeaseError>),
+    AcquireLease(Result<LeaseGuard, SessionConsumerLeaseError>),
     /// Lease renewal result.
-    RenewLease(Result<SessionConsumerLeaseGrant, SessionConsumerLeaseError>),
+    RenewLease(Result<LeaseGuard, SessionConsumerLeaseError>),
     /// Lease release result.
     ReleaseLease(Result<(), SessionConsumerLeaseError>),
     /// A mutation outcome is ambiguous and must never be automatically replayed.

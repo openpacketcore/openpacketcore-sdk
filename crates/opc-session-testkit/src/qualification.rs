@@ -1301,6 +1301,33 @@ pub const QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7: usize = 1_000;
 pub const QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7: u64 = 25_000;
 /// Maximum nearest-rank p99.9 accepted by the SDK loopback real-mTLS harness.
 pub const QUALIFICATION_PERSISTENT_CONSUMER_MAX_P999_MICROS_V7: u64 = 100_000;
+/// Maximum one retained synthetic warm-call sample accepted by v7 evidence.
+pub const QUALIFICATION_PERSISTENT_CONSUMER_MAX_SAMPLE_MICROS_V7: u64 = 10_000_000;
+
+/// Closed v7 coverage vocabulary. Arrays use a fixed width and canonical
+/// order so topology claims cannot be relabeled after a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationPersistentConsumerCoverageV7 {
+    PersistentPrewarm,
+    WarmConnectionReuse,
+    RealMtls,
+    MultiProcess,
+    LeaderLoss,
+    VoterLoss,
+    ThreeVoterLatency,
+    FiveVoterComposition,
+}
+
+/// Closed set of gates intentionally left outside the synthetic v7 run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationPersistentConsumerRemainingAcceptanceV7 {
+    DownstreamEpdgProductionSlo,
+    DeployedKubernetesPlatformMatrix,
+    ResourceSoak,
+    SignedReleaseBundle,
+}
 
 /// Exact, source-bound v7 record emitted by the persistent consumer
 /// multiprocess harness. It intentionally contains only fixed-label numeric
@@ -1321,8 +1348,8 @@ pub struct SessionHaPersistentConsumerEvidenceV7 {
     pub observations: QualificationPersistentConsumerObservationsV7,
     pub warm_latency: QualificationPersistentConsumerWarmLatencyV7,
     pub privacy: QualificationPersistentConsumerPrivacyV7,
-    pub coverage: Vec<String>,
-    pub remaining_acceptance: Vec<String>,
+    pub coverage: [QualificationPersistentConsumerCoverageV7; 7],
+    pub remaining_acceptance: [QualificationPersistentConsumerRemainingAcceptanceV7; 4],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1377,7 +1404,60 @@ pub struct QualificationPersistentConsumerPrivacyV7 {
     pub identifying_values_recorded: bool,
 }
 
+#[derive(Serialize)]
+struct QualificationPersistentConsumerTranscriptV7<'a> {
+    domain: &'a str,
+    schema_version: &'a str,
+    profile_id: &'a str,
+    experimental: bool,
+    qualification_complete: bool,
+    source_revision: &'a str,
+    source_tree: &'a str,
+    source_tree_status: &'a str,
+    profile_sha256: &'a str,
+    client_type: &'a str,
+    consumer_profile_path: &'a str,
+    transport_revision: u16,
+    authenticated_route: &'a str,
+    topology: &'a QualificationPersistentConsumerTopologyV7,
+    observations: &'a QualificationPersistentConsumerObservationsV7,
+    warm_latency: &'a QualificationPersistentConsumerWarmLatencyV7,
+    privacy: &'a QualificationPersistentConsumerPrivacyV7,
+    coverage: &'a [QualificationPersistentConsumerCoverageV7; 7],
+    remaining_acceptance: &'a [QualificationPersistentConsumerRemainingAcceptanceV7; 4],
+}
+
 impl SessionHaPersistentConsumerEvidenceV7 {
+    /// Recompute the canonical digest over every v7 source, execution,
+    /// topology, observation, latency, privacy, coverage, and downstream-gate
+    /// claim. The digest field itself is deliberately excluded.
+    pub fn canonical_transcript_sha256(&self) -> Result<String, &'static str> {
+        let transcript = QualificationPersistentConsumerTranscriptV7 {
+            domain: &self.execution.transcript_digest_domain,
+            schema_version: &self.schema_version,
+            profile_id: &self.profile_id,
+            experimental: self.experimental,
+            qualification_complete: self.qualification_complete,
+            source_revision: &self.source_revision,
+            source_tree: &self.source_tree,
+            source_tree_status: &self.source_tree_status,
+            profile_sha256: &self.execution.profile_sha256,
+            client_type: &self.execution.client_type,
+            consumer_profile_path: &self.execution.consumer_profile_path,
+            transport_revision: self.execution.transport_revision,
+            authenticated_route: &self.execution.authenticated_route,
+            topology: &self.topology,
+            observations: &self.observations,
+            warm_latency: &self.warm_latency,
+            privacy: &self.privacy,
+            coverage: &self.coverage,
+            remaining_acceptance: &self.remaining_acceptance,
+        };
+        let encoded =
+            serde_json::to_vec(&transcript).map_err(|_| "v7 transcript encoding failed")?;
+        Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
+    }
+
     /// Validate semantic relationships JSON Schema cannot express, including
     /// exact percentile recomputation and non-sentinel source provenance.
     pub fn validate(&self, expected_profile_sha256: &str) -> Result<(), &'static str> {
@@ -1432,6 +1512,9 @@ impl SessionHaPersistentConsumerEvidenceV7 {
         {
             return Err("invalid v7 execution binding");
         }
+        if self.canonical_transcript_sha256()? != self.execution.transcript_sha256 {
+            return Err("invalid v7 transcript binding");
+        }
         if !matches!(self.topology.members, 3 | 5)
             || !self.topology.independent_processes
             || self.topology.transport_mode != "authenticated-mtls-persistent"
@@ -1447,6 +1530,38 @@ impl SessionHaPersistentConsumerEvidenceV7 {
         {
             return Err("invalid v7 persistent observations");
         }
+        let expected_coverage = match self.topology.members {
+            3 => [
+                QualificationPersistentConsumerCoverageV7::PersistentPrewarm,
+                QualificationPersistentConsumerCoverageV7::WarmConnectionReuse,
+                QualificationPersistentConsumerCoverageV7::RealMtls,
+                QualificationPersistentConsumerCoverageV7::MultiProcess,
+                QualificationPersistentConsumerCoverageV7::ThreeVoterLatency,
+                QualificationPersistentConsumerCoverageV7::LeaderLoss,
+                QualificationPersistentConsumerCoverageV7::VoterLoss,
+            ],
+            5 => [
+                QualificationPersistentConsumerCoverageV7::PersistentPrewarm,
+                QualificationPersistentConsumerCoverageV7::WarmConnectionReuse,
+                QualificationPersistentConsumerCoverageV7::RealMtls,
+                QualificationPersistentConsumerCoverageV7::MultiProcess,
+                QualificationPersistentConsumerCoverageV7::FiveVoterComposition,
+                QualificationPersistentConsumerCoverageV7::LeaderLoss,
+                QualificationPersistentConsumerCoverageV7::VoterLoss,
+            ],
+            _ => return Err("invalid v7 topology coverage"),
+        };
+        if self.coverage != expected_coverage
+            || self.remaining_acceptance
+                != [
+                    QualificationPersistentConsumerRemainingAcceptanceV7::DownstreamEpdgProductionSlo,
+                    QualificationPersistentConsumerRemainingAcceptanceV7::DeployedKubernetesPlatformMatrix,
+                    QualificationPersistentConsumerRemainingAcceptanceV7::ResourceSoak,
+                    QualificationPersistentConsumerRemainingAcceptanceV7::SignedReleaseBundle,
+                ]
+        {
+            return Err("invalid v7 acceptance coverage");
+        }
         let latency = &self.warm_latency;
         if latency.methodology != "sequential-capabilities-round-robin-after-prewarm"
             || latency.clock != "std::time::Instant"
@@ -1454,6 +1569,10 @@ impl SessionHaPersistentConsumerEvidenceV7 {
             || latency.sample_count != latency.raw_samples_micros.len()
             || latency.sample_count < QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7
             || latency.sample_count > 2_000
+            || latency
+                .raw_samples_micros
+                .iter()
+                .any(|sample| *sample > QUALIFICATION_PERSISTENT_CONSUMER_MAX_SAMPLE_MICROS_V7)
             || nearest_rank(&latency.raw_samples_micros, 99, 100) != latency.p99_micros
             || nearest_rank(&latency.raw_samples_micros, 999, 1_000) != latency.p999_micros
             || latency.p99_micros > QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7

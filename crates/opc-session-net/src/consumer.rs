@@ -213,14 +213,6 @@ impl Drop for QueuedConsumerWatchItem {
     }
 }
 
-fn consumer_watch_item_byte_count(item: &Result<SessionConsumerChange, StoreError>) -> Option<u32> {
-    let encoded = serde_json::to_vec(item).ok()?;
-    if encoded.len() > CONSUMER_WATCH_CHANNEL_MAX_BYTES {
-        return None;
-    }
-    u32::try_from(encoded.len().max(1)).ok()
-}
-
 #[derive(Clone, Copy)]
 enum ConsumerWatchTerminal {
     Unavailable,
@@ -1109,16 +1101,12 @@ enum BorrowedConsumerWireRequest<'a> {
 #[serde(deny_unknown_fields)]
 struct ConsumerCallResponse {
     correlation: NonZeroU32,
-    #[serde(
-        serialize_with = "serialize_consumer_response_box",
-        deserialize_with = "deserialize_consumer_response_box"
-    )]
-    response: Box<SessionConsumerResponse>,
+    response: Box<ConsumerSessionResponseWire>,
 }
 
 struct BorrowedConsumerCallResponse<'a> {
     correlation: NonZeroU32,
-    response: SerializableConsumerResponse<'a>,
+    response: &'a ConsumerSessionResponseWire,
 }
 
 impl Serialize for BorrowedConsumerCallResponse<'_> {
@@ -1130,29 +1118,12 @@ impl Serialize for BorrowedConsumerCallResponse<'_> {
 
         let mut state = serializer.serialize_struct("BorrowedConsumerCallResponse", 2)?;
         state.serialize_field("correlation", &self.correlation)?;
-        state.serialize_field("response", &self.response)?;
+        state.serialize_field("response", self.response)?;
         state.end()
     }
 }
 
-struct SerializableConsumerResponse<'a>(&'a SessionConsumerResponse);
-
-impl Serialize for SerializableConsumerResponse<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serialize_consumer_response(self.0, serializer)
-    }
-}
-
-#[derive(Serialize)]
-struct ConsumerCapabilitiesResponseWire {
-    response: &'static str,
-    body: WireBackendCapabilities,
-}
-
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(
     tag = "response",
     content = "body",
@@ -1196,8 +1167,12 @@ impl TryFrom<ConsumerSessionResponseWire> for SessionConsumerResponse {
                 Self::ScanRestoreRecords(value)
             }
             ConsumerSessionResponseWire::WatchOpened => Self::WatchOpened,
-            ConsumerSessionResponseWire::AcquireLease(value) => Self::AcquireLease(value),
-            ConsumerSessionResponseWire::RenewLease(value) => Self::RenewLease(value),
+            ConsumerSessionResponseWire::AcquireLease(value) => {
+                Self::AcquireLease(value.map(SessionConsumerLeaseGrant::into_guard))
+            }
+            ConsumerSessionResponseWire::RenewLease(value) => {
+                Self::RenewLease(value.map(SessionConsumerLeaseGrant::into_guard))
+            }
             ConsumerSessionResponseWire::ReleaseLease(value) => Self::ReleaseLease(value),
             ConsumerSessionResponseWire::OutcomeUnknown(value) => Self::OutcomeUnknown(value),
             ConsumerSessionResponseWire::Rejected(value) => Self::Rejected(value),
@@ -1205,45 +1180,142 @@ impl TryFrom<ConsumerSessionResponseWire> for SessionConsumerResponse {
     }
 }
 
-fn serialize_consumer_response<S>(
-    response: &SessionConsumerResponse,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match response {
-        SessionConsumerResponse::Capabilities(capabilities) => ConsumerCapabilitiesResponseWire {
-            response: "capabilities",
-            body: WireBackendCapabilities::try_from(capabilities)
-                .map_err(serde::ser::Error::custom)?,
+fn consumer_authority_time_from_expiry(
+    expires_at: opc_types::Timestamp,
+    ttl: Duration,
+) -> Option<opc_types::Timestamp> {
+    let seconds = i64::try_from(ttl.as_secs()).ok()?;
+    let delta = time::Duration::seconds(seconds)
+        .checked_add(time::Duration::nanoseconds(i64::from(ttl.subsec_nanos())))?;
+    expires_at
+        .as_offset_datetime()
+        .checked_sub(delta)
+        .map(opc_types::Timestamp::from_offset_datetime)
+}
+
+fn consumer_wire_response_from_public(
+    lease_context: ConsumerLeaseWireContext,
+    response: SessionConsumerResponse,
+) -> Result<ConsumerSessionResponseWire, ProtocolError> {
+    Ok(match response {
+        SessionConsumerResponse::Capabilities(value) => ConsumerSessionResponseWire::Capabilities(
+            WireBackendCapabilities::try_from(&value)
+                .map_err(|_| ProtocolError::InvalidWireValue)?,
+        ),
+        SessionConsumerResponse::Get(value) => ConsumerSessionResponseWire::Get(value),
+        SessionConsumerResponse::PreflightRecordExpiry(value) => {
+            ConsumerSessionResponseWire::PreflightRecordExpiry(value)
         }
-        .serialize(serializer),
-        response => response.serialize(serializer),
+        SessionConsumerResponse::CompareAndSet(value) => {
+            ConsumerSessionResponseWire::CompareAndSet(value)
+        }
+        SessionConsumerResponse::DeleteFenced(value) => {
+            ConsumerSessionResponseWire::DeleteFenced(value)
+        }
+        SessionConsumerResponse::RefreshTtl(value) => {
+            ConsumerSessionResponseWire::RefreshTtl(value)
+        }
+        SessionConsumerResponse::Batch(value) => ConsumerSessionResponseWire::Batch(value),
+        SessionConsumerResponse::ScanRestoreRecords(value) => {
+            ConsumerSessionResponseWire::ScanRestoreRecords(value)
+        }
+        SessionConsumerResponse::WatchOpened => ConsumerSessionResponseWire::WatchOpened,
+        SessionConsumerResponse::AcquireLease(value) => {
+            let value = value.map(|guard| {
+                let authority_time = guard.acquired_at();
+                SessionConsumerLeaseGrant::new(guard, authority_time)
+            });
+            ConsumerSessionResponseWire::AcquireLease(value)
+        }
+        SessionConsumerResponse::RenewLease(value) => {
+            let ConsumerLeaseWireContext::Renew(ttl) = lease_context else {
+                return Err(ProtocolError::UnexpectedResponse);
+            };
+            let value = match value {
+                Ok(guard) => {
+                    let authority_time =
+                        consumer_authority_time_from_expiry(guard.expires_at(), ttl)
+                            .ok_or(ProtocolError::InvalidWireValue)?;
+                    Ok(SessionConsumerLeaseGrant::new(guard, authority_time))
+                }
+                Err(error) => Err(error),
+            };
+            ConsumerSessionResponseWire::RenewLease(value)
+        }
+        SessionConsumerResponse::ReleaseLease(value) => {
+            ConsumerSessionResponseWire::ReleaseLease(value)
+        }
+        SessionConsumerResponse::OutcomeUnknown(value) => {
+            ConsumerSessionResponseWire::OutcomeUnknown(value)
+        }
+        SessionConsumerResponse::Rejected(value) => ConsumerSessionResponseWire::Rejected(value),
+        _ => return Err(ProtocolError::UnexpectedResponse),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ConsumerLeaseWireContext {
+    Other,
+    Acquire,
+    Renew(Duration),
+}
+
+impl ConsumerLeaseWireContext {
+    fn from_operation(operation: &SessionConsumerOperation) -> Self {
+        match operation {
+            SessionConsumerOperation::AcquireLease { .. } => Self::Acquire,
+            SessionConsumerOperation::RenewLease { ttl, .. } => Self::Renew(*ttl),
+            _ => Self::Other,
+        }
     }
 }
 
-fn serialize_consumer_response_box<S>(
-    response: &SessionConsumerResponse,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serialize_consumer_response(response, serializer)
-}
-
-fn deserialize_consumer_response_box<'de, D>(
-    deserializer: D,
-) -> Result<Box<SessionConsumerResponse>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    ConsumerSessionResponseWire::deserialize(deserializer)
-        .and_then(|response| {
-            SessionConsumerResponse::try_from(response).map_err(serde::de::Error::custom)
-        })
-        .map(Box::new)
+fn consumer_public_response_from_wire(
+    request: &SessionConsumerRequest,
+    response: ConsumerSessionResponseWire,
+) -> Result<SessionConsumerResponse, ProtocolError> {
+    match (&response, request.operation()) {
+        (
+            ConsumerSessionResponseWire::AcquireLease(Ok(grant)),
+            SessionConsumerOperation::AcquireLease { key, owner, ttl },
+        ) => {
+            let guard = grant.guard();
+            if guard.key() != key
+                || guard.owner() != owner
+                || crate::protocol::validate_lease_profile(guard).is_err()
+                || grant.authority_time() != guard.acquired_at()
+                || !checked_session_deadline(grant.authority_time(), *ttl)
+                    .is_ok_and(|deadline| deadline == guard.expires_at())
+            {
+                return Err(ProtocolError::UnexpectedResponse);
+            }
+        }
+        (
+            ConsumerSessionResponseWire::RenewLease(Ok(grant)),
+            SessionConsumerOperation::RenewLease { lease, ttl },
+        ) => {
+            let renewed = grant.guard();
+            if renewed.key() != lease.key()
+                || renewed.owner() != lease.owner()
+                || renewed.fence() != lease.fence()
+                || renewed.credential_id() != lease.credential_id()
+                || renewed.acquired_at() != lease.acquired_at()
+                || crate::protocol::validate_lease_profile(renewed).is_err()
+                || grant.authority_time() < lease.acquired_at()
+                || grant.authority_time() >= lease.expires_at()
+                || !checked_session_deadline(grant.authority_time(), *ttl)
+                    .is_ok_and(|deadline| deadline == renewed.expires_at())
+            {
+                return Err(ProtocolError::UnexpectedResponse);
+            }
+        }
+        (ConsumerSessionResponseWire::AcquireLease(Ok(_)), _)
+        | (ConsumerSessionResponseWire::RenewLease(Ok(_)), _) => {
+            return Err(ProtocolError::UnexpectedResponse);
+        }
+        _ => {}
+    }
+    SessionConsumerResponse::try_from(response).map_err(|_| ProtocolError::InvalidWireValue)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1755,14 +1827,12 @@ fn response_matches_request(
         ) => store_result_matches_operation(request.operation(), result),
         (
             SessionConsumerOperation::AcquireLease { key, owner, ttl },
-            SessionConsumerResponse::AcquireLease(Ok(grant)),
+            SessionConsumerResponse::AcquireLease(Ok(lease)),
         ) => {
-            let lease = grant.guard();
             lease.key() == key
                 && lease.owner() == owner
                 && crate::protocol::validate_lease_profile(lease).is_ok()
-                && grant.authority_time() == lease.acquired_at()
-                && checked_session_deadline(grant.authority_time(), *ttl)
+                && checked_session_deadline(lease.acquired_at(), *ttl)
                     .is_ok_and(|deadline| deadline == lease.expires_at())
         }
         (
@@ -1771,19 +1841,21 @@ fn response_matches_request(
         ) => lease_error_matches_operation(request.operation(), *error),
         (
             SessionConsumerOperation::RenewLease { lease, ttl },
-            SessionConsumerResponse::RenewLease(Ok(grant)),
+            SessionConsumerResponse::RenewLease(Ok(renewed)),
         ) => {
-            let renewed = grant.guard();
+            let authority_time = consumer_authority_time_from_expiry(renewed.expires_at(), *ttl);
             renewed.key() == lease.key()
                 && renewed.owner() == lease.owner()
                 && renewed.fence() == lease.fence()
                 && renewed.credential_id() == lease.credential_id()
                 && renewed.acquired_at() == lease.acquired_at()
                 && crate::protocol::validate_lease_profile(renewed).is_ok()
-                && grant.authority_time() >= lease.acquired_at()
-                && renewed.expires_at() > lease.expires_at()
-                && checked_session_deadline(grant.authority_time(), *ttl)
-                    .is_ok_and(|deadline| deadline == renewed.expires_at())
+                && authority_time.is_some_and(|authority_time| {
+                    authority_time >= lease.acquired_at()
+                        && authority_time < lease.expires_at()
+                        && checked_session_deadline(authority_time, *ttl)
+                            .is_ok_and(|deadline| deadline == renewed.expires_at())
+                })
         }
         (
             SessionConsumerOperation::RenewLease { .. },
@@ -2128,54 +2200,90 @@ impl tokio_rustls::rustls::server::ProducesTickets for DisabledConsumerSessionTi
 /// executing poll to return before shutdown publishes completion. The guard
 /// never spans `Pending`, so an unpolled caller cannot delay forced shutdown.
 struct PersistentConsumerIoBarrier {
-    forced: AtomicBool,
-    active_polls: AtomicUsize,
+    /// High bit is the irreversible forced state; remaining bits are the
+    /// number of synchronous transport polls that linearized before it.
+    state: AtomicUsize,
     quiescent: Notify,
+    #[cfg(test)]
+    enter_hook: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl PersistentConsumerIoBarrier {
+    const FORCED: usize = 1_usize << (usize::BITS - 1);
+    const ACTIVE_MASK: usize = Self::FORCED - 1;
+
     fn new() -> Self {
         Self {
-            forced: AtomicBool::new(false),
-            active_polls: AtomicUsize::new(0),
+            state: AtomicUsize::new(0),
             quiescent: Notify::new(),
+            #[cfg(test)]
+            enter_hook: StdMutex::new(None),
         }
     }
 
     fn is_forced(&self) -> bool {
-        self.forced.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) & Self::FORCED != 0
     }
 
     fn enter(&self) -> Option<PersistentConsumerIoPoll<'_>> {
-        if self.is_forced() {
-            return None;
+        let mut observed = self.state.load(Ordering::Acquire);
+        #[cfg(test)]
+        if let Some(hook) = self
+            .enter_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            hook();
         }
-        self.active_polls.fetch_add(1, Ordering::AcqRel);
-        if self.is_forced() {
-            self.leave();
-            return None;
+        loop {
+            if observed & Self::FORCED != 0 || observed & Self::ACTIVE_MASK == Self::ACTIVE_MASK {
+                return None;
+            }
+            match self.state.compare_exchange_weak(
+                observed,
+                observed + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(PersistentConsumerIoPoll { barrier: self }),
+                Err(current) => observed = current,
+            }
         }
-        Some(PersistentConsumerIoPoll { barrier: self })
     }
 
     fn leave(&self) {
-        if self.active_polls.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.quiescent.notify_waiters();
+        let previous = self.state.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous & Self::ACTIVE_MASK != 0);
+        if previous & Self::ACTIVE_MASK == 1 {
+            // Retain a permit if the shutdown driver has not registered its
+            // waiter yet; there is only one pool-owned quiescence waiter.
+            self.quiescent.notify_one();
         }
     }
 
     fn force(&self) {
-        self.forced.store(true, Ordering::Release);
+        self.state.fetch_or(Self::FORCED, Ordering::AcqRel);
     }
 
     async fn wait_quiescent(&self) {
         loop {
             let quiescent = self.quiescent.notified();
-            if self.active_polls.load(Ordering::Acquire) == 0 {
+            tokio::pin!(quiescent);
+            quiescent.as_mut().enable();
+            if self.state.load(Ordering::Acquire) & Self::ACTIVE_MASK == 0 {
                 return;
             }
             quiescent.await;
         }
+    }
+
+    #[cfg(test)]
+    fn set_enter_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self
+            .enter_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
 }
 
@@ -2196,11 +2304,33 @@ fn forced_consumer_io_error() -> io::Error {
     )
 }
 
+async fn poll_persistent_consumer_setup_io<F, T>(
+    future: F,
+    barrier: Option<&Arc<PersistentConsumerIoBarrier>>,
+) -> io::Result<T>
+where
+    F: std::future::Future<Output = io::Result<T>>,
+{
+    tokio::pin!(future);
+    std::future::poll_fn(|context| {
+        let poll = match barrier {
+            Some(barrier) => Some(barrier.enter().ok_or_else(forced_consumer_io_error)?),
+            None => None,
+        };
+        let result = std::future::Future::poll(future.as_mut(), context);
+        drop(poll);
+        result
+    })
+    .await
+}
+
+#[cfg(test)]
 struct PersistentConsumerShutdownReader<R> {
     inner: R,
     barrier: Arc<PersistentConsumerIoBarrier>,
 }
 
+#[cfg(test)]
 impl<R> AsyncRead for PersistentConsumerShutdownReader<R>
 where
     R: AsyncRead + Unpin,
@@ -2218,11 +2348,83 @@ where
     }
 }
 
+#[cfg(test)]
 struct PersistentConsumerShutdownWriter<W> {
     inner: W,
     barrier: Arc<PersistentConsumerIoBarrier>,
 }
 
+/// Transport wrapper installed before TLS so forced shutdown supervises TCP,
+/// TLS, Hello, and every established-frame poll through one linearizable
+/// barrier.
+struct PersistentConsumerShutdownIo<T> {
+    inner: T,
+    barrier: Option<Arc<PersistentConsumerIoBarrier>>,
+}
+
+impl<T> AsyncRead for PersistentConsumerShutdownIo<T>
+where
+    T: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let poll = match this.barrier.as_ref() {
+            Some(barrier) => Some(barrier.enter().ok_or_else(forced_consumer_io_error)?),
+            None => None,
+        };
+        let result = Pin::new(&mut this.inner).poll_read(context, buffer);
+        drop(poll);
+        result
+    }
+}
+
+impl<T> AsyncWrite for PersistentConsumerShutdownIo<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = match this.barrier.as_ref() {
+            Some(barrier) => Some(barrier.enter().ok_or_else(forced_consumer_io_error)?),
+            None => None,
+        };
+        let result = Pin::new(&mut this.inner).poll_write(context, bytes);
+        drop(poll);
+        result
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let poll = match this.barrier.as_ref() {
+            Some(barrier) => Some(barrier.enter().ok_or_else(forced_consumer_io_error)?),
+            None => None,
+        };
+        let result = Pin::new(&mut this.inner).poll_flush(context);
+        drop(poll);
+        result
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let poll = match this.barrier.as_ref() {
+            Some(barrier) => Some(barrier.enter().ok_or_else(forced_consumer_io_error)?),
+            None => None,
+        };
+        let result = Pin::new(&mut this.inner).poll_shutdown(context);
+        drop(poll);
+        result
+    }
+}
+
+#[cfg(test)]
 impl<W> AsyncWrite for PersistentConsumerShutdownWriter<W>
 where
     W: AsyncWrite + Unpin,
@@ -2765,13 +2967,20 @@ impl StatelessSessionConsumerClient {
         resolve_attempt.complete();
         let generation = self.reauthentication.generation();
         let tcp_attempt = ConsumerSetupPhaseAttempt::begin(setup_counters, ConsumerSetupPhase::Tcp);
-        let tcp = tokio::time::timeout_at(pre_request_deadline, TcpStream::connect(address))
-            .await
-            .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
-            .map_err(|_| SessionConsumerClientError::Unavailable)?;
+        let tcp = tokio::time::timeout_at(
+            pre_request_deadline,
+            poll_persistent_consumer_setup_io(TcpStream::connect(address), shutdown_io.as_ref()),
+        )
+        .await
+        .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
+        .map_err(|_| SessionConsumerClientError::Unavailable)?;
         tcp.set_nodelay(true)
             .map_err(|_| SessionConsumerClientError::Unavailable)?;
         tcp_attempt.complete();
+        let tcp = PersistentConsumerShutdownIo {
+            inner: tcp,
+            barrier: shutdown_io.clone(),
+        };
         let tls_attempt = ConsumerSetupPhaseAttempt::begin(setup_counters, ConsumerSetupPhase::Tls);
         let handshake = self
             .tls_config
@@ -2781,7 +2990,10 @@ impl StatelessSessionConsumerClient {
             tokio_rustls::TlsConnector::from(consumer_client_tls_config(handshake.rustls_config()));
         let tls = tokio::time::timeout_at(
             pre_request_deadline,
-            connector.connect(self.server_name.clone(), tcp),
+            poll_persistent_consumer_setup_io(
+                connector.connect(self.server_name.clone(), tcp),
+                shutdown_io.as_ref(),
+            ),
         )
         .await
         .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
@@ -2880,20 +3092,8 @@ impl StatelessSessionConsumerClient {
             Some(admission.epoch()),
         )
         .map_err(|_| SessionConsumerClientError::Protocol)?;
-        let reader: Box<dyn AsyncRead + Unpin + Send> = match shutdown_io.as_ref() {
-            Some(barrier) => Box::new(PersistentConsumerShutdownReader {
-                inner: reader,
-                barrier: Arc::clone(barrier),
-            }),
-            None => Box::new(reader),
-        };
-        let writer: Box<dyn AsyncWrite + Unpin + Send> = match shutdown_io.as_ref() {
-            Some(barrier) => Box::new(PersistentConsumerShutdownWriter {
-                inner: writer,
-                barrier: Arc::clone(barrier),
-            }),
-            None => Box::new(writer),
-        };
+        let reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(reader);
+        let writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(writer);
         let mut connection = ConsumerConnection {
             reader,
             writer,
@@ -3184,10 +3384,18 @@ impl StatelessSessionConsumerClient {
             ConsumerWireResponse::Response(ConsumerCallResponse {
                 correlation: received,
                 response,
-            }) if exact_correlation(correlation, received).is_ok()
-                && response_matches_request(request, response.as_ref()) =>
-            {
-                Ok(*response)
+            }) if exact_correlation(correlation, received).is_ok() => {
+                let response =
+                    consumer_public_response_from_wire(request, *response).map_err(|_| {
+                        SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Protocol)
+                    })?;
+                if response_matches_request(request, &response) {
+                    Ok(response)
+                } else {
+                    Err(SessionConsumerCallError::MayHaveSent(
+                        SessionConsumerClientError::Protocol,
+                    ))
+                }
             }
             _ => Err(SessionConsumerCallError::MayHaveSent(
                 SessionConsumerClientError::Protocol,
@@ -3221,6 +3429,11 @@ impl StatelessSessionConsumerClient {
             ));
         }
         if matches!(request.operation(), SessionConsumerOperation::Watch { .. }) {
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Protocol,
+            ));
+        }
+        if request.validate().is_err() {
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Protocol,
             ));
@@ -3447,9 +3660,7 @@ impl StatelessSessionConsumerClient {
             ))
             .await;
         lease_response(request_id, response, |response| match response {
-            SessionConsumerResponse::AcquireLease(result) => {
-                Some(result.map(SessionConsumerLeaseGrant::into_guard))
-            }
+            SessionConsumerResponse::AcquireLease(result) => Some(result),
             _ => None,
         })
     }
@@ -3468,9 +3679,7 @@ impl StatelessSessionConsumerClient {
             ))
             .await;
         lease_response(request_id, response, |response| match response {
-            SessionConsumerResponse::RenewLease(result) => {
-                Some(result.map(SessionConsumerLeaseGrant::into_guard))
-            }
+            SessionConsumerResponse::RenewLease(result) => Some(result),
             _ => None,
         })
     }
@@ -3840,7 +4049,16 @@ impl StatelessSessionConsumerClient {
             ConsumerWireResponse::Response(ConsumerCallResponse {
                 correlation: received,
                 response,
-            }) if exact_correlation(correlation, received).is_ok() => *response,
+            }) if exact_correlation(correlation, received).is_ok() => {
+                let request = SessionConsumerRequest::new(
+                    self.scope,
+                    SessionConsumerRequestId::from_bytes([0; 16]),
+                    SessionConsumerOperation::Watch { start_sequence },
+                );
+                consumer_public_response_from_wire(&request, *response).map_err(|_| {
+                    SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Protocol)
+                })?
+            }
             _ => {
                 return Err(SessionConsumerCallError::MayHaveSent(
                     SessionConsumerClientError::Protocol,
@@ -4080,9 +4298,10 @@ impl StatelessSessionConsumerClient {
                         return;
                     }
                 };
-                match serde_json::to_vec(&entry) {
+                let queued_entry = Ok(entry);
+                let byte_count = match serde_json::to_vec(&queued_entry) {
                     Ok(encoded) if encoded.len() <= CONSUMER_WATCH_CHANNEL_MAX_BYTES => {
-                        drop(encoded);
+                        u32::try_from(encoded.len()).expect("watch byte cap fits u32")
                     }
                     // Local encoding and size failures do not consume a
                     // committed sequence either. They are terminal rather
@@ -4099,54 +4318,9 @@ impl StatelessSessionConsumerClient {
                         return;
                     }
                 };
-                let Some(byte_count) = consumer_watch_item_byte_count(&Ok(entry.clone())) else {
-                    return;
-                };
-                let acquire_permit = Arc::clone(&byte_budget).acquire_many_owned(byte_count);
-                tokio::pin!(acquire_permit);
-                let permit = loop {
-                    let permit = tokio::select! {
-                        biased;
-                        _ = wait_for_optional_forced_shutdown(&mut force_shutdown, force_shutdown_state) => return,
-                        _ = tx.closed() => return,
-                        permit = &mut acquire_permit => {
-                            match permit {
-                                Ok(permit) => Some(permit),
-                                Err(_) => return,
-                            }
-                        }
-                        _ = tokio::time::sleep_until(connection.lifecycle.retire_at()) => {
-                            let _ = connection
-                                .lifecycle
-                                .retirement(tokio::time::Instant::now());
-                            terminate_stalled_watch!();
-                        },
-                        _ = reauthentication_changes.changed() => {
-                            if !consumer_connection_current(
-                                &mut connection.lifecycle,
-                                &tls_config,
-                                &reauthentication,
-                                connection.rotation_edge_key,
-                            ) {
-                                terminate_stalled_watch!();
-                            }
-                            None
-                        },
-                        _ = wait_consumer_material_change(&mut material_changes) => {
-                            if !consumer_connection_current(
-                                &mut connection.lifecycle,
-                                &tls_config,
-                                &reauthentication,
-                                connection.rotation_edge_key,
-                            ) {
-                                terminate_stalled_watch!();
-                            }
-                            None
-                        },
-                    };
-                    if let Some(permit) = permit {
-                        break permit;
-                    }
+                let permit = match Arc::clone(&byte_budget).try_acquire_many_owned(byte_count) {
+                    Ok(permit) => permit,
+                    Err(_) => terminate_stalled_watch!(),
                 };
                 if !connection.current(&tls_config, &reauthentication) {
                     reconnect_or_terminal!();
@@ -4154,61 +4328,29 @@ impl StatelessSessionConsumerClient {
                 if let Some(pool) = persistent_pool.as_ref() {
                     counter_increment(&pool.counters.watch_buffered);
                 }
-                let send = tx.send(QueuedConsumerWatchItem {
-                    item: Some(Ok(entry)),
+                let queued = QueuedConsumerWatchItem {
+                    item: Some(queued_entry),
                     _byte_permit: permit,
                     watch_pool: persistent_pool.clone(),
-                });
-                tokio::pin!(send);
-                let sent = loop {
-                    let sent = tokio::select! {
-                        biased;
-                        _ = wait_for_optional_forced_shutdown(&mut force_shutdown, force_shutdown_state) => return,
-                        result = &mut send => Some(result),
-                        _ = tokio::time::sleep_until(connection.lifecycle.retire_at()) => {
-                            let _ = connection
-                                .lifecycle
-                                .retirement(tokio::time::Instant::now());
-                            terminate_stalled_watch!();
-                        },
-                        _ = reauthentication_changes.changed() => {
-                            if !consumer_connection_current(
-                                &mut connection.lifecycle,
-                                &tls_config,
-                                &reauthentication,
-                                connection.rotation_edge_key,
-                            ) {
-                                terminate_stalled_watch!();
-                            }
-                            None
-                        },
-                        _ = wait_consumer_material_change(&mut material_changes) => {
-                            if !consumer_connection_current(
-                                &mut connection.lifecycle,
-                                &tls_config,
-                                &reauthentication,
-                                connection.rotation_edge_key,
-                            ) {
-                                terminate_stalled_watch!();
-                            }
-                            None
-                        },
-                    };
-                    if let Some(sent) = sent {
-                        break sent;
-                    }
                 };
-                if sent.is_err() {
+                match tx.try_send(queued) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => terminate_stalled_watch!(),
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                }
+                if expected_sequence == u64::MAX {
+                    // The terminal sequence is valid and caller-visible, but
+                    // it has no representable successor cursor. Close cleanly
+                    // after queueing it exactly once; never manufacture a
+                    // protocol error or reconnect from a wrapped cursor.
                     return;
                 }
                 // The cursor advances only after this item has crossed the
                 // bounded stream queue. A loss before then replays it; a loss
                 // after then resumes at the exact checked successor.
-                let Some(next_sequence) = expected_sequence.checked_add(1) else {
-                    reader_terminal.store(ConsumerWatchTerminal::Protocol);
-                    return;
-                };
-                expected_sequence = next_sequence;
+                expected_sequence = expected_sequence
+                    .checked_add(1)
+                    .expect("u64::MAX returns before cursor advancement");
                 // Only caller-visible progress clears the watch-level loss
                 // budget. A peer that repeatedly authenticates and returns
                 // WatchOpened without one validated queued entry cannot reset
@@ -5067,11 +5209,16 @@ impl PersistentSessionConsumerPool {
         }
     }
 
-    fn record_error(&self, error: SessionConsumerClientError, may_have_sent: bool) {
+    fn record_error(
+        &self,
+        error: SessionConsumerClientError,
+        may_have_sent: bool,
+        effectful: bool,
+    ) {
         self.record_failure(error);
-        if may_have_sent {
+        if may_have_sent && effectful {
             counter_increment(&self.counters.outcome_unknown);
-        } else {
+        } else if !may_have_sent {
             counter_increment(&self.counters.not_transmitted);
         }
     }
@@ -5295,6 +5442,8 @@ impl PersistentSessionConsumerPool {
         tokio::spawn(async move {
             loop {
                 let notified = pool.drained_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 let drained = {
                     let activity = pool
                         .activity
@@ -5305,7 +5454,10 @@ impl PersistentSessionConsumerPool {
                 if drained || tokio::time::Instant::now() >= deadline {
                     break;
                 }
-                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                if tokio::time::timeout_at(deadline, &mut notified)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -5347,6 +5499,8 @@ impl PersistentSessionConsumerPool {
     async fn shutdown_report(&self) -> PersistentSessionConsumerShutdownReport {
         loop {
             let completed = self.shutdown_complete.notified();
+            tokio::pin!(completed);
+            completed.as_mut().enable();
             if let Some(report) = *self
                 .shutdown_report
                 .lock()
@@ -5635,43 +5789,47 @@ impl PersistentSessionConsumerClient {
             ))?;
         if request.scope() != self.pool.client.scope {
             self.pool
-                .record_error(SessionConsumerClientError::Scope, false);
+                .record_error(SessionConsumerClientError::Scope, false, false);
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Scope,
             ));
         }
         if matches!(request.operation(), SessionConsumerOperation::Watch { .. }) {
             self.pool
-                .record_error(SessionConsumerClientError::Protocol, false);
+                .record_error(SessionConsumerClientError::Protocol, false, false);
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Protocol,
             ));
         }
         if request.validate().is_err() {
             self.pool
-                .record_error(SessionConsumerClientError::Protocol, false);
+                .record_error(SessionConsumerClientError::Protocol, false, false);
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Protocol,
             ));
         }
-        let (_pending, _lane) = self
-            .pool
-            .admit_call(started, deadline)
-            .await
-            .map_err(|error| {
-                self.pool.record_error(error, false);
-                SessionConsumerCallError::BeforeCallWrite(error)
-            })?;
-        let _activity = self.pool.register_call().map_err(|error| {
-            self.pool.record_error(error, false);
-            SessionConsumerCallError::BeforeCallWrite(error)
-        })?;
         let write_progress = FrameWriteProgress::new();
         let outcome = PersistentCallOutcome::new(
             Arc::clone(&self.pool),
             &write_progress,
             consumer_operation_is_effectful(request.operation()),
         );
+        let (_pending, _lane) = match self.pool.admit_call(started, deadline).await {
+            Ok(admission) => admission,
+            Err(error) => {
+                outcome.complete();
+                self.pool.record_error(error, false, false);
+                return Err(SessionConsumerCallError::BeforeCallWrite(error));
+            }
+        };
+        let _activity = match self.pool.register_call() {
+            Ok(activity) => activity,
+            Err(error) => {
+                outcome.complete();
+                self.pool.record_error(error, false, false);
+                return Err(SessionConsumerCallError::BeforeCallWrite(error));
+            }
+        };
         let result = self
             .execute_admitted(request, started, deadline, &write_progress)
             .await;
@@ -5704,6 +5862,7 @@ impl PersistentSessionConsumerClient {
                 self.pool.record_error(
                     error.into_client_error(),
                     matches!(error, SessionConsumerCallError::MayHaveSent(_)),
+                    consumer_operation_is_effectful(request.operation()),
                 );
                 Err(error)
             }
@@ -5904,9 +6063,7 @@ impl PersistentSessionConsumerClient {
             ))
             .await,
             |response| match response {
-                SessionConsumerResponse::AcquireLease(value) => {
-                    Some(value.map(SessionConsumerLeaseGrant::into_guard))
-                }
+                SessionConsumerResponse::AcquireLease(value) => Some(value),
                 _ => None,
             },
         )
@@ -5929,9 +6086,7 @@ impl PersistentSessionConsumerClient {
             ))
             .await,
             |response| match response {
-                SessionConsumerResponse::RenewLease(value) => {
-                    Some(value.map(SessionConsumerLeaseGrant::into_guard))
-                }
+                SessionConsumerResponse::RenewLease(value) => Some(value),
                 _ => None,
             },
         )
@@ -5972,18 +6127,18 @@ impl PersistentSessionConsumerClient {
     > {
         if self.pool.phase() != PersistentShutdownPhase::Running {
             self.pool
-                .record_error(SessionConsumerClientError::ShuttingDown, false);
+                .record_error(SessionConsumerClientError::ShuttingDown, false, false);
             return Err(SessionConsumerClientError::ShuttingDown);
         }
         let permit = Arc::clone(&self.pool.watches)
             .try_acquire_owned()
             .map_err(|_| {
                 self.pool
-                    .record_error(SessionConsumerClientError::Overloaded, false);
+                    .record_error(SessionConsumerClientError::Overloaded, false, false);
                 SessionConsumerClientError::Overloaded
             })?;
         let lease = self.pool.register_watch(permit).inspect_err(|&error| {
-            self.pool.record_error(error, false);
+            self.pool.record_error(error, false, false);
         })?;
         let mut shutdown = self.pool.shutdown_tx.subscribe();
         let mut watch_client = self.pool.client.clone();
@@ -6019,7 +6174,7 @@ impl PersistentSessionConsumerClient {
         let upstream = upstream.map_err(|error| {
             match error {
                 SessionConsumerCallError::BeforeCallWrite(error) => {
-                    self.pool.record_error(error, false);
+                    self.pool.record_error(error, false, false);
                     error
                 }
                 // Watch setup has no store mutation to recover, but a
@@ -6034,7 +6189,7 @@ impl PersistentSessionConsumerClient {
         setup_attempt.succeed();
         if self.pool.phase() != PersistentShutdownPhase::Running {
             self.pool
-                .record_error(SessionConsumerClientError::ShuttingDown, false);
+                .record_error(SessionConsumerClientError::ShuttingDown, false, false);
             return Err(SessionConsumerClientError::ShuttingDown);
         }
         Ok(stream::unfold(
@@ -6100,8 +6255,16 @@ impl PersistentSessionConsumerClient {
                         ) =>
                 {
                     counter_increment(&self.pool.counters.reconnects);
+                    let retry_deadline = if pre_request_budget_active {
+                        pre_request_deadline
+                    } else {
+                        deadline
+                    };
+                    if tokio::time::Instant::now() >= retry_deadline {
+                        return Err(SessionConsumerCallError::BeforeCallWrite(error));
+                    }
                     let delay = self.pool.reconnect_delay();
-                    if !delay.is_zero() && tokio::time::Instant::now() < deadline {
+                    if !delay.is_zero() {
                         tokio::select! {
                             biased;
                             _ = wait_for_forced_shutdown(&mut shutdown, &self.pool.shutdown_phase) => {
@@ -6110,9 +6273,12 @@ impl PersistentSessionConsumerClient {
                                 ));
                             }
                             _ = tokio::time::sleep_until(
-                                (tokio::time::Instant::now() + delay).min(deadline),
+                                (tokio::time::Instant::now() + delay).min(retry_deadline),
                             ) => {}
                         }
+                    }
+                    if tokio::time::Instant::now() >= retry_deadline {
+                        return Err(SessionConsumerCallError::BeforeCallWrite(error));
                     }
                     continue;
                 }
@@ -6151,8 +6317,16 @@ impl PersistentSessionConsumerClient {
                         ) =>
                 {
                     drop(connection);
+                    let retry_deadline = if pre_request_budget_active {
+                        pre_request_deadline
+                    } else {
+                        deadline
+                    };
+                    if tokio::time::Instant::now() >= retry_deadline {
+                        return Err(SessionConsumerCallError::BeforeCallWrite(error));
+                    }
                     let delay = self.pool.reconnect_delay();
-                    if !delay.is_zero() && tokio::time::Instant::now() < deadline {
+                    if !delay.is_zero() {
                         tokio::select! {
                             biased;
                             _ = wait_for_forced_shutdown(&mut shutdown, &self.pool.shutdown_phase) => {
@@ -6161,9 +6335,12 @@ impl PersistentSessionConsumerClient {
                                 ));
                             }
                             _ = tokio::time::sleep_until(
-                                (tokio::time::Instant::now() + delay).min(deadline),
+                                (tokio::time::Instant::now() + delay).min(retry_deadline),
                             ) => {}
                         }
+                    }
+                    if tokio::time::Instant::now() >= retry_deadline {
+                        return Err(SessionConsumerCallError::BeforeCallWrite(error));
                     }
                 }
                 Err(error) => return Err(error),
@@ -7025,7 +7202,7 @@ async fn handle_server_connection(
                 &mut writer,
                 ConsumerWireResponse::Response(ConsumerCallResponse {
                     correlation,
-                    response: Box::new(SessionConsumerResponse::Rejected(
+                    response: Box::new(ConsumerSessionResponseWire::Rejected(
                         SessionConsumerRejection::ScopeMismatch,
                     )),
                 }),
@@ -7040,7 +7217,7 @@ async fn handle_server_connection(
                 &mut writer,
                 ConsumerWireResponse::Response(ConsumerCallResponse {
                     correlation,
-                    response: Box::new(SessionConsumerResponse::Rejected(rejection)),
+                    response: Box::new(ConsumerSessionResponseWire::Rejected(rejection)),
                 }),
                 response_frame_size,
                 idle_timeout,
@@ -7048,6 +7225,7 @@ async fn handle_server_connection(
             .await?;
             return Ok(());
         }
+        let lease_wire_context = ConsumerLeaseWireContext::from_operation(request.operation());
         let watch_start = match request.operation() {
             SessionConsumerOperation::Watch { start_sequence } => Some(*start_sequence),
             _ => None,
@@ -7268,6 +7446,7 @@ async fn handle_server_connection(
         }
         let watch_opened = matches!(response, SessionConsumerResponse::WatchOpened);
         let retire_after_response = response_retires_connection_authority(&response);
+        let wire_response = consumer_wire_response_from_public(lease_wire_context, response)?;
         {
             let initial_hard_deadline = lifecycle
                 .hard_deadline()
@@ -7282,7 +7461,7 @@ async fn handle_server_connection(
                 &mut writer,
                 ConsumerWireResponse::Response(ConsumerCallResponse {
                     correlation,
-                    response: Box::new(response),
+                    response: Box::new(wire_response),
                 }),
                 response_frame_size,
                 response_write_deadline,
@@ -7603,6 +7782,11 @@ fn consumer_response_fits_for_correlation(
         }
     }
 
+    let Ok(wire_response) =
+        consumer_wire_response_from_public(ConsumerLeaseWireContext::Other, response.clone())
+    else {
+        return false;
+    };
     let mut size = BoundedResponseSize {
         encoded: 0,
         maximum: max_frame_size,
@@ -7611,7 +7795,7 @@ fn consumer_response_fits_for_correlation(
         &mut size,
         &BorrowedConsumerWireResponse::Response(BorrowedConsumerCallResponse {
             correlation,
-            response: SerializableConsumerResponse(response),
+            response: &wire_response,
         }),
     )
     .is_ok()
@@ -7670,25 +7854,25 @@ mod tests {
     use super::{
         classify_call_write_error, complete_before_deadline, consumer_fresh_admission_is_current,
         consumer_payload_fragments_exceed_frame, consumer_response_fits,
-        consumer_watch_error_is_legal, decode_consumer_frame_payload,
-        ensure_pre_request_budget_remaining, exact_correlation, lease_error_matches_operation,
-        lease_response, mutation_response, persistent_execute_error,
-        publish_monotonic_shutdown_phase, queued_consumer_watch_stream,
-        read_authenticated_consumer_frame_within, response_is_outcome_unknown,
-        response_matches_operation, response_matches_request,
+        consumer_watch_error_is_legal, consumer_wire_response_from_public,
+        decode_consumer_frame_payload, ensure_pre_request_budget_remaining, exact_correlation,
+        lease_error_matches_operation, lease_response, mutation_response, persistent_execute_error,
+        poll_persistent_consumer_setup_io, publish_monotonic_shutdown_phase,
+        queued_consumer_watch_stream, read_authenticated_consumer_frame_within,
+        response_is_outcome_unknown, response_matches_operation, response_matches_request,
         response_retires_connection_authority, server_connection_current,
         store_error_matches_operation, valid_consumer_operation_timeout, wait_for_forced_shutdown,
         BorrowedConsumerCall, BorrowedConsumerCallResponse, BorrowedConsumerWireRequest,
         BorrowedConsumerWireResponse, BoxStream, ConsumerCall, ConsumerCallResponse,
-        ConsumerConnection, ConsumerOperationKind, ConsumerServerSetupTestHooks,
-        ConsumerSetupPhase, ConsumerSetupPhaseAttempt, ConsumerWatchTerminal,
-        ConsumerWatchTerminalSlot, ConsumerWireRequest, ConsumerWireResponse,
-        PersistentCheckedOutConnection, PersistentConsumerCounters, PersistentConsumerIoBarrier,
-        PersistentConsumerShutdownReader, PersistentConsumerShutdownWriter,
-        PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-        PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
-        PersistentSetupAttempt, PersistentShutdownPhase, PersistentWatchRecovery,
-        QueuedConsumerWatchItem, SerializableConsumerResponse, SessionConsumerAuthorizationError,
+        ConsumerConnection, ConsumerHello, ConsumerLeaseWireContext, ConsumerOperationKind,
+        ConsumerServerSetupTestHooks, ConsumerSessionResponseWire, ConsumerSetupPhase,
+        ConsumerSetupPhaseAttempt, ConsumerWatchTerminal, ConsumerWatchTerminalSlot,
+        ConsumerWireRequest, ConsumerWireResponse, PersistentCheckedOutConnection,
+        PersistentConsumerCounters, PersistentConsumerIoBarrier, PersistentConsumerShutdownReader,
+        PersistentConsumerShutdownWriter, PersistentSessionConsumerClient,
+        PersistentSessionConsumerConfig, PersistentSessionConsumerConfigError,
+        PersistentSessionConsumerExecuteError, PersistentSetupAttempt, PersistentShutdownPhase,
+        PersistentWatchRecovery, QueuedConsumerWatchItem, SessionConsumerAuthorizationError,
         SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerChange,
         SessionConsumerClientError, SessionConsumerIdentity, SessionConsumerLeaseMutationError,
         SessionConsumerMutationError, SessionConsumerRejection, SessionQuorumConsumer,
@@ -7713,13 +7897,13 @@ mod tests {
         RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, SessionConsensusClusterId,
         SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
         SessionConsensusIdentity, SessionConsumerBatchResult, SessionConsumerLeaseError,
-        SessionConsumerLeaseGrant, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-        SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-        SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
-        SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
-        MAX_SESSION_TTL,
+        SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRequest,
+        SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
+        SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+        StateClass, StateType, StoreError, StoredSessionRecord, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
+    use serde::{Deserialize, Serialize};
     use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
     use tokio::sync::{mpsc, watch, Semaphore};
 
@@ -8604,10 +8788,7 @@ mod tests {
         );
         assert!(response_matches_request(
             &acquire,
-            &SessionConsumerResponse::AcquireLease(Ok(SessionConsumerLeaseGrant::new(
-                lease.clone(),
-                authority_time,
-            ))),
+            &SessionConsumerResponse::AcquireLease(Ok(lease.clone())),
         ));
         for wrong_ttl in [Duration::from_secs(29), Duration::from_secs(31)] {
             let wrong = lease_guard(
@@ -8620,10 +8801,7 @@ mod tests {
             );
             assert!(!response_matches_request(
                 &acquire,
-                &SessionConsumerResponse::AcquireLease(Ok(SessionConsumerLeaseGrant::new(
-                    wrong,
-                    authority_time,
-                ))),
+                &SessionConsumerResponse::AcquireLease(Ok(wrong)),
             ));
         }
 
@@ -8640,16 +8818,13 @@ mod tests {
         );
         assert!(response_matches_request(
             &maximum,
-            &SessionConsumerResponse::AcquireLease(Ok(SessionConsumerLeaseGrant::new(
-                lease_guard(
-                    key.clone(),
-                    owner.clone(),
-                    FenceToken::new(8),
-                    authority_time,
-                    maximum_expiry,
-                    10,
-                ),
+            &SessionConsumerResponse::AcquireLease(Ok(lease_guard(
+                key.clone(),
+                owner.clone(),
+                FenceToken::new(8),
                 authority_time,
+                maximum_expiry,
+                10,
             ))),
         ));
 
@@ -8664,16 +8839,13 @@ mod tests {
         );
         assert!(response_matches_request(
             &zero,
-            &SessionConsumerResponse::AcquireLease(Ok(SessionConsumerLeaseGrant::new(
-                lease_guard(
-                    key.clone(),
-                    owner.clone(),
-                    FenceToken::new(9),
-                    authority_time,
-                    authority_time,
-                    11,
-                ),
+            &SessionConsumerResponse::AcquireLease(Ok(lease_guard(
+                key.clone(),
+                owner.clone(),
+                FenceToken::new(9),
                 authority_time,
+                authority_time,
+                11,
             ))),
         ));
 
@@ -8698,25 +8870,75 @@ mod tests {
         );
         assert!(response_matches_request(
             &renew,
-            &SessionConsumerResponse::RenewLease(Ok(SessionConsumerLeaseGrant::new(
-                renewed.clone(),
-                renewal_authority,
-            ))),
+            &SessionConsumerResponse::RenewLease(Ok(renewed.clone())),
+        ));
+        assert!(response_matches_request(
+            &renew,
+            &SessionConsumerResponse::RenewLease(Ok(lease.clone())),
         ));
         assert!(!response_matches_request(
             &renew,
-            &SessionConsumerResponse::RenewLease(Ok(SessionConsumerLeaseGrant::new(
-                lease.clone(),
-                authority_time,
+            &SessionConsumerResponse::RenewLease(Ok(lease_guard(
+                key.clone(),
+                owner.clone(),
+                lease.fence(),
+                lease.acquired_at(),
+                renewed_expiry,
+                lease.credential_id().saturating_add(1),
             ))),
         ));
-        assert!(!response_matches_request(
-            &renew,
-            &SessionConsumerResponse::RenewLease(Ok(SessionConsumerLeaseGrant::new(
-                renewed,
-                authority_time,
-            ))),
-        ));
+
+        for shorter_ttl in [Duration::ZERO, Duration::from_secs(7)] {
+            let shorter_expiry = checked_session_deadline(renewal_authority, shorter_ttl)
+                .expect("short renewal expiry");
+            let shorter_renew = SessionConsumerRequest::new(
+                scope(),
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::RenewLease {
+                    lease: lease.clone(),
+                    ttl: shorter_ttl,
+                },
+            );
+            assert!(response_matches_request(
+                &shorter_renew,
+                &SessionConsumerResponse::RenewLease(Ok(lease_guard(
+                    key.clone(),
+                    owner.clone(),
+                    lease.fence(),
+                    lease.acquired_at(),
+                    shorter_expiry,
+                    lease.credential_id(),
+                ))),
+            ));
+        }
+
+        for invalid_authority in [
+            lease.expires_at(),
+            lease.expires_at().add_seconds(1).unwrap(),
+        ] {
+            let invalid_expiry =
+                checked_session_deadline(invalid_authority, Duration::from_secs(7))
+                    .expect("invalid renewal expiry remains representable");
+            let expired_renew = SessionConsumerRequest::new(
+                scope(),
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::RenewLease {
+                    lease: lease.clone(),
+                    ttl: Duration::from_secs(7),
+                },
+            );
+            assert!(!response_matches_request(
+                &expired_renew,
+                &SessionConsumerResponse::RenewLease(Ok(lease_guard(
+                    key.clone(),
+                    owner.clone(),
+                    lease.fence(),
+                    lease.acquired_at(),
+                    invalid_expiry,
+                    lease.credential_id(),
+                ))),
+            ));
+        }
 
         let invalid_record = StoredSessionRecord {
             key: key.clone(),
@@ -8847,9 +9069,14 @@ mod tests {
     fn consumer_capabilities_use_the_fixed_width_checked_wire_dto() {
         let mut capabilities = BackendCapabilities::all_enabled();
         capabilities.max_value_bytes = usize::MAX;
+        let wire = consumer_wire_response_from_public(
+            ConsumerLeaseWireContext::Other,
+            SessionConsumerResponse::Capabilities(capabilities),
+        )
+        .expect("capabilities fit the private wire");
         let response = ConsumerWireResponse::Response(ConsumerCallResponse {
             correlation: NonZeroU32::MIN,
-            response: Box::new(SessionConsumerResponse::Capabilities(capabilities)),
+            response: Box::new(wire),
         });
         let encoded = serde_json::to_value(&response).expect("consumer capabilities encode");
         assert_eq!(
@@ -8859,16 +9086,18 @@ mod tests {
         let encoded = serde_json::to_vec(&response).expect("consumer capabilities encode");
         let decoded = decode_consumer_frame_payload::<ConsumerWireResponse>(&encoded)
             .expect("consumer capabilities decode");
-        assert!(matches!(
-            decoded,
-            ConsumerWireResponse::Response(ConsumerCallResponse {
-                response,
-                ..
-            }) if matches!(*response, SessionConsumerResponse::Capabilities(BackendCapabilities {
-                max_value_bytes: usize::MAX,
-                ..
-            }))
-        ));
+        let ConsumerWireResponse::Response(ConsumerCallResponse { response, .. }) = decoded else {
+            panic!("capability response keeps its wire family");
+        };
+        let ConsumerSessionResponseWire::Capabilities(capabilities) = *response else {
+            panic!("capability response keeps its private DTO");
+        };
+        assert_eq!(
+            BackendCapabilities::try_from(capabilities)
+                .expect("wire capabilities remain representable")
+                .max_value_bytes,
+            usize::MAX,
+        );
     }
 
     #[test]
@@ -8887,7 +9116,11 @@ mod tests {
             serde_json::to_vec(&borrowed_request).expect("borrowed request encodes")
         );
 
-        let response = SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled());
+        let response = consumer_wire_response_from_public(
+            ConsumerLeaseWireContext::Other,
+            SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled()),
+        )
+        .expect("capabilities fit the private wire");
         let owned_response = ConsumerWireResponse::Response(ConsumerCallResponse {
             correlation: NonZeroU32::MIN,
             response: Box::new(response.clone()),
@@ -8895,12 +9128,113 @@ mod tests {
         let borrowed_response =
             BorrowedConsumerWireResponse::Response(BorrowedConsumerCallResponse {
                 correlation: NonZeroU32::MIN,
-                response: SerializableConsumerResponse(&response),
+                response: &response,
             });
         assert_eq!(
             serde_json::to_vec(&owned_response).expect("owned response encodes"),
             serde_json::to_vec(&borrowed_response).expect("borrowed response encodes")
         );
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FrozenRevisionOneHello {
+        transport_revision: u16,
+        scope: SessionConsumerScope,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(
+        tag = "kind",
+        content = "body",
+        rename_all = "snake_case",
+        deny_unknown_fields
+    )]
+    enum FrozenRevisionOneRequest {
+        Hello(FrozenRevisionOneHello),
+        Call(Box<SessionConsumerRequest>),
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(
+        tag = "kind",
+        content = "body",
+        rename_all = "snake_case",
+        deny_unknown_fields
+    )]
+    enum FrozenRevisionOneResponse {
+        Response(Box<SessionConsumerResponse>),
+    }
+
+    const REVISION_ONE_SCOPE_JSON: &str = concat!(
+        "{\"cluster_id\":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],",
+        "\"configuration_id\":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],",
+        "\"configuration_epoch\":1}"
+    );
+    const REVISION_ONE_RESPONSE_JSON: &str =
+        "{\"kind\":\"response\",\"body\":{\"response\":\"watch_opened\"}}";
+
+    #[test]
+    fn frozen_revision_one_frames_never_cross_decode_as_revision_two() {
+        let hello = format!(
+            "{{\"kind\":\"hello\",\"body\":{{\"transport_revision\":1,\"scope\":{REVISION_ONE_SCOPE_JSON}}}}}"
+        );
+        let call = format!(
+            "{{\"kind\":\"call\",\"body\":{{\"scope\":{REVISION_ONE_SCOPE_JSON},\"request_id\":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],\"operation\":{{\"operation\":\"capabilities\"}}}}}}"
+        );
+        for payload in [&hello, &call] {
+            let decoded: FrozenRevisionOneRequest =
+                serde_json::from_slice(payload.as_bytes()).expect("frozen revision-one request");
+            assert_eq!(
+                serde_json::to_vec(&decoded).expect("re-encode frozen revision-one request"),
+                payload.as_bytes()
+            );
+            assert!(
+                decode_consumer_frame_payload::<ConsumerWireRequest>(payload.as_bytes()).is_err()
+            );
+        }
+        let decoded: FrozenRevisionOneResponse =
+            serde_json::from_slice(REVISION_ONE_RESPONSE_JSON.as_bytes())
+                .expect("frozen revision-one response");
+        assert_eq!(
+            serde_json::to_vec(&decoded).expect("re-encode frozen revision-one response"),
+            REVISION_ONE_RESPONSE_JSON.as_bytes()
+        );
+        assert!(decode_consumer_frame_payload::<ConsumerWireResponse>(
+            REVISION_ONE_RESPONSE_JSON.as_bytes()
+        )
+        .is_err());
+
+        let current_hello = ConsumerWireRequest::Hello(ConsumerHello {
+            transport_revision: super::SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+            scope: scope(),
+            response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                .expect("consumer frame cap fits u32"),
+        });
+        assert!(serde_json::from_slice::<FrozenRevisionOneRequest>(
+            &serde_json::to_vec(&current_hello).expect("encode revision-two Hello")
+        )
+        .is_err());
+        let current_call = ConsumerWireRequest::Call(ConsumerCall {
+            correlation: NonZeroU32::MIN,
+            request: Box::new(SessionConsumerRequest::new(
+                scope(),
+                SessionConsumerRequestId::from_bytes([3; 16]),
+                SessionConsumerOperation::Capabilities,
+            )),
+        });
+        assert!(serde_json::from_slice::<FrozenRevisionOneRequest>(
+            &serde_json::to_vec(&current_call).expect("encode revision-two Call")
+        )
+        .is_err());
+        let current_response = ConsumerWireResponse::Response(ConsumerCallResponse {
+            correlation: NonZeroU32::MIN,
+            response: Box::new(ConsumerSessionResponseWire::WatchOpened),
+        });
+        assert!(serde_json::from_slice::<FrozenRevisionOneResponse>(
+            &serde_json::to_vec(&current_response).expect("encode revision-two Response")
+        )
+        .is_err());
     }
 
     #[test]
@@ -8940,11 +9274,14 @@ mod tests {
 
     #[test]
     fn consumer_decoder_rejects_unknown_shared_dto_fields() {
+        let response = consumer_wire_response_from_public(
+            ConsumerLeaseWireContext::Other,
+            SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled()),
+        )
+        .expect("capabilities fit the private wire");
         let response = ConsumerWireResponse::Response(ConsumerCallResponse {
             correlation: NonZeroU32::MIN,
-            response: Box::new(SessionConsumerResponse::Capabilities(
-                BackendCapabilities::all_enabled(),
-            )),
+            response: Box::new(response),
         });
         let mut encoded = serde_json::to_value(response).expect("consumer response encodes");
         encoded["body"]["Capabilities"]["unexpected"] = serde_json::Value::Bool(true);
@@ -8954,11 +9291,14 @@ mod tests {
 
     #[test]
     fn consumer_decoder_accepts_only_the_canonical_private_encoding() {
+        let response = consumer_wire_response_from_public(
+            ConsumerLeaseWireContext::Other,
+            SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled()),
+        )
+        .expect("capabilities fit the private wire");
         let response = ConsumerWireResponse::Response(ConsumerCallResponse {
             correlation: NonZeroU32::MIN,
-            response: Box::new(SessionConsumerResponse::Capabilities(
-                BackendCapabilities::all_enabled(),
-            )),
+            response: Box::new(response),
         });
         let canonical = serde_json::to_vec(&response).expect("consumer response encodes");
         assert!(decode_consumer_frame_payload::<ConsumerWireResponse>(&canonical).is_ok());
@@ -8971,11 +9311,14 @@ mod tests {
 
     #[test]
     fn consumer_decoder_rejects_trailing_json_values() {
+        let response = consumer_wire_response_from_public(
+            ConsumerLeaseWireContext::Other,
+            SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled()),
+        )
+        .expect("capabilities fit the private wire");
         let response = ConsumerWireResponse::Response(ConsumerCallResponse {
             correlation: NonZeroU32::MIN,
-            response: Box::new(SessionConsumerResponse::Capabilities(
-                BackendCapabilities::all_enabled(),
-            )),
+            response: Box::new(response),
         });
         let mut payload = serde_json::to_vec(&response).expect("consumer response encodes");
         payload.extend_from_slice(br#"{}"#);
@@ -8993,11 +9336,14 @@ mod tests {
             "duplicate or late correlation"
         );
 
+        let response = consumer_wire_response_from_public(
+            ConsumerLeaseWireContext::Other,
+            SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled()),
+        )
+        .expect("capabilities fit the private wire");
         let response = ConsumerWireResponse::Response(ConsumerCallResponse {
             correlation: one,
-            response: Box::new(SessionConsumerResponse::Capabilities(
-                BackendCapabilities::all_enabled(),
-            )),
+            response: Box::new(response),
         });
         let mut zero = serde_json::to_value(response).expect("consumer response encodes");
         zero["body"]["correlation"] = serde_json::Value::from(0);
@@ -10595,7 +10941,7 @@ mod tests {
             let may_have_sent = matches!(result, SessionConsumerCallError::MayHaveSent(_));
             persistent
                 .pool
-                .record_error(result.into_client_error(), may_have_sent);
+                .record_error(result.into_client_error(), may_have_sent, true);
             let public = persistent_execute_error(request_id, result);
             if partial {
                 assert!(matches!(
@@ -10690,7 +11036,7 @@ mod tests {
             let may_have_sent = matches!(result, SessionConsumerCallError::MayHaveSent(_));
             persistent
                 .pool
-                .record_error(result.into_client_error(), may_have_sent);
+                .record_error(result.into_client_error(), may_have_sent, true);
             let public = persistent_execute_error(request_id, result);
             if partial {
                 assert!(matches!(
@@ -10712,6 +11058,223 @@ mod tests {
             assert_eq!(diagnostics.outcome_unknown, u64::from(partial));
             assert_eq!(diagnostics.shutdown, 1);
         }
+    }
+
+    #[test]
+    fn forced_barrier_rejects_an_enter_that_sampled_running_before_force() {
+        let barrier = Arc::new(PersistentConsumerIoBarrier::new());
+        let (sampled_tx, sampled_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let resume_rx = Arc::new(std::sync::Mutex::new(resume_rx));
+        barrier.set_enter_hook(Some(Arc::new({
+            let resume_rx = Arc::clone(&resume_rx);
+            move || {
+                sampled_tx.send(()).expect("publish pre-CAS sample");
+                resume_rx
+                    .lock()
+                    .expect("lock barrier hook receiver")
+                    .recv()
+                    .expect("resume barrier admission");
+            }
+        })));
+
+        let contender = std::thread::spawn({
+            let barrier = Arc::clone(&barrier);
+            move || barrier.enter().is_some()
+        });
+        sampled_rx.recv().expect("barrier sampled Running");
+        barrier.force();
+        resume_tx.send(()).expect("release admission CAS");
+        assert!(!contender.join().expect("join admission contender"));
+        assert!(barrier.is_forced());
+        assert_eq!(
+            barrier.state.load(Ordering::Acquire) & PersistentConsumerIoBarrier::ACTIVE_MASK,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_barrier_blocks_every_later_setup_io_poll() {
+        let barrier = Arc::new(PersistentConsumerIoBarrier::new());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let waker = Arc::new(std::sync::Mutex::new(None::<std::task::Waker>));
+        let future = std::future::poll_fn({
+            let polls = Arc::clone(&polls);
+            let started = Arc::clone(&started);
+            let waker = Arc::clone(&waker);
+            move |context| {
+                polls.fetch_add(1, Ordering::SeqCst);
+                *waker.lock().expect("store setup I/O waker") = Some(context.waker().clone());
+                started.notify_one();
+                Poll::Pending::<io::Result<()>>
+            }
+        });
+        let setup = tokio::spawn({
+            let barrier = Arc::clone(&barrier);
+            async move { poll_persistent_consumer_setup_io(future, Some(&barrier)).await }
+        });
+
+        started.notified().await;
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        barrier.force();
+        waker
+            .lock()
+            .expect("load setup I/O waker")
+            .take()
+            .expect("setup I/O registered a waker")
+            .wake();
+        let error = setup
+            .await
+            .expect("join setup I/O")
+            .expect_err("forced setup I/O is rejected before the inner future is repolled");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        barrier.wait_quiescent().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_barrier_waits_for_an_already_executing_setup_poll() {
+        let barrier = Arc::new(PersistentConsumerIoBarrier::new());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let setup = tokio::spawn({
+            let barrier = Arc::clone(&barrier);
+            async move {
+                poll_persistent_consumer_setup_io(
+                    std::future::poll_fn(move |_| {
+                        entered_tx.send(()).expect("publish executing setup poll");
+                        release_rx.recv().expect("release executing setup poll");
+                        Poll::Ready(Ok::<_, io::Error>(()))
+                    }),
+                    Some(&barrier),
+                )
+                .await
+            }
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("join setup-poll observer")
+            .expect("observe setup poll");
+
+        barrier.force();
+        let quiescent = tokio::spawn({
+            let barrier = Arc::clone(&barrier);
+            async move { barrier.wait_quiescent().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !quiescent.is_finished(),
+            "forced completion must wait for the already executing TCP/TLS/Hello poll"
+        );
+        release_tx.send(()).expect("release setup poll");
+        assert!(
+            setup.await.expect("join setup poll").is_ok(),
+            "the already executing setup poll completes before quiescence"
+        );
+        quiescent.await.expect("join quiescence waiter");
+        assert!(barrier.is_forced());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pre_request_expiry_never_starts_a_retry_after_the_fixed_deadline() {
+        let control = SessionReauthenticationControl::new();
+        let (mut stateless, _material) = stateless_test_client(control);
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolve_started = Arc::new(tokio::sync::Notify::new());
+        stateless.resolve = Arc::new({
+            let resolutions = Arc::clone(&resolutions);
+            let resolve_started = Arc::clone(&resolve_started);
+            move || {
+                let resolutions = Arc::clone(&resolutions);
+                let resolve_started = Arc::clone(&resolve_started);
+                Box::pin(async move {
+                    resolutions.fetch_add(1, Ordering::SeqCst);
+                    resolve_started.notify_one();
+                    std::future::pending::<io::Result<std::net::SocketAddr>>().await
+                })
+            }
+        });
+        stateless.pre_request_connection_timeout = Some(Duration::from_millis(25));
+        stateless.operation_timeout = Duration::from_secs(1);
+        let persistent = PersistentSessionConsumerClient::from_stateless(stateless);
+        let call = tokio::spawn({
+            let persistent = persistent.clone();
+            async move { persistent.capabilities().await }
+        });
+
+        resolve_started.notified().await;
+        tokio::time::advance(Duration::from_millis(24)).await;
+        assert!(!call.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(
+            call.await.expect("join bounded setup call"),
+            Err(SessionConsumerClientError::Unavailable)
+        );
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        let diagnostics = persistent.diagnostics().await;
+        assert_eq!(diagnostics.setup_attempts, 1);
+        assert_eq!(diagnostics.setup_failures, 1);
+        assert_eq!(diagnostics.not_transmitted, 1);
+        persistent.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checked_out_prewrite_failure_never_retries_past_the_fixed_setup_deadline() {
+        let control = SessionReauthenticationControl::new();
+        let (mut stateless, _material) = stateless_test_client(control);
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        stateless.resolve = Arc::new({
+            let resolutions = Arc::clone(&resolutions);
+            move || {
+                let resolutions = Arc::clone(&resolutions);
+                Box::pin(async move {
+                    resolutions.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<io::Result<std::net::SocketAddr>>().await
+                })
+            }
+        });
+        stateless.pre_request_connection_timeout = Some(Duration::from_millis(25));
+        stateless.operation_timeout = Duration::from_secs(1);
+        let persistent = PersistentSessionConsumerClient::from_stateless(stateless);
+        let (connection, _) = synthetic_consumer_connection(
+            &persistent.pool.client,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Box::new(PhaseFailWriter {
+                accepted: 0,
+                fail_after: Some(0),
+                fail_flush: false,
+            }),
+        );
+        persistent
+            .pool
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(connection);
+        let call = tokio::spawn({
+            let persistent = persistent.clone();
+            async move { persistent.capabilities().await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!call.is_finished());
+        tokio::time::advance(Duration::from_millis(24)).await;
+        assert!(!call.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(
+            call.await.expect("join checked-out call"),
+            Err(SessionConsumerClientError::Unavailable)
+        );
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            0,
+            "the retry delay consumes the remaining setup budget before a resolver can run"
+        );
+        let diagnostics = persistent.diagnostics().await;
+        assert_eq!(diagnostics.not_transmitted, 1);
+        assert_eq!(diagnostics.outcome_unknown, 0);
+        persistent.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -10755,7 +11318,7 @@ mod tests {
 
         let response = ConsumerWireResponse::Response(ConsumerCallResponse {
             correlation: NonZeroU32::MIN,
-            response: Box::new(SessionConsumerResponse::AcquireLease(Err(
+            response: Box::new(ConsumerSessionResponseWire::AcquireLease(Err(
                 SessionConsumerLeaseError::Unavailable,
             ))),
         });
