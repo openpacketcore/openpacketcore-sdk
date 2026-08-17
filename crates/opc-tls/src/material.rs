@@ -13,6 +13,7 @@ use opc_types::{SpiffeId, Timestamp};
 use rustls::{ClientConfig, ServerConfig};
 use rustls_pki_types::CertificateDer;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -47,6 +48,57 @@ impl TlsMaterialEpoch {
     pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+/// Stable, directed digest of one authenticated TLS identity edge.
+///
+/// The digest deliberately has a redacted [`Debug`] implementation and no
+/// serialization surface. Transport lifecycle code can request bounded
+/// deterministic cooperative jitter without acquiring either the digest bytes
+/// or a new API that exposes the handshake's local SPIFFE identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TlsDirectedEdgeKey([u8; 32]);
+
+impl fmt::Debug for TlsDirectedEdgeKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TlsDirectedEdgeKey([redacted])")
+    }
+}
+
+impl TlsDirectedEdgeKey {
+    /// Map this private edge digest into `[0, maximum]` for cooperative
+    /// lifecycle retirement without exposing stable digest bytes.
+    pub fn bounded_jitter(self, maximum: Duration) -> Duration {
+        if maximum.is_zero() {
+            return Duration::ZERO;
+        }
+        let mut prefix = [0_u8; 16];
+        prefix.copy_from_slice(&self.0[..16]);
+        let sample = u128::from_be_bytes(prefix);
+        let ceiling = maximum.as_nanos();
+        let nanos = sample % ceiling.saturating_add(1);
+        let seconds = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
+        let subsecond_nanos = u32::try_from(nanos % 1_000_000_000).unwrap_or(999_999_999);
+        Duration::new(seconds, subsecond_nanos)
+    }
+}
+
+fn directed_authenticated_edge_key(
+    transport: &[u8],
+    initiator: &SpiffeId,
+    acceptor: &SpiffeId,
+) -> TlsDirectedEdgeKey {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openpacketcore/tls/authenticated-lifecycle-edge/v1\0");
+    for field in [
+        transport,
+        initiator.as_str().as_bytes(),
+        acceptor.as_str().as_bytes(),
+    ] {
+        hasher.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(field);
+    }
+    TlsDirectedEdgeKey(hasher.finalize().into())
 }
 
 /// Availability of coherent TLS material.
@@ -1285,6 +1337,17 @@ impl TlsClientHandshake {
         self.snapshot.certificate_chain_expires_at()
     }
 
+    /// Derive a private initiator-to-acceptor key for lifecycle jitter.
+    ///
+    /// Neither authenticated identity nor the digest is rendered by this API.
+    pub fn directed_lifecycle_edge_key(
+        &self,
+        transport: &[u8],
+        peer: &SpiffeId,
+    ) -> TlsDirectedEdgeKey {
+        directed_authenticated_edge_key(transport, &self.snapshot.state.identity.spiffe_id, peer)
+    }
+
     /// Verify the snapshot is still current after TLS and application negotiation.
     pub fn admit(&self) -> Result<TlsAdmittedConnection, TlsMaterialError> {
         self.controller.admit(&self.snapshot)
@@ -1344,6 +1407,18 @@ impl TlsServerHandshake {
     /// Earliest expiry across the fixed local certificate chain.
     pub fn certificate_chain_expires_at(&self) -> Timestamp {
         self.snapshot.certificate_chain_expires_at()
+    }
+
+    /// Derive the same initiator-to-acceptor lifecycle key as the client.
+    ///
+    /// The authenticated peer is the initiator on a server handshake. Neither
+    /// authenticated identity nor the digest is rendered by this API.
+    pub fn directed_lifecycle_edge_key(
+        &self,
+        transport: &[u8],
+        peer: &SpiffeId,
+    ) -> TlsDirectedEdgeKey {
+        directed_authenticated_edge_key(transport, peer, &self.snapshot.state.identity.spiffe_id)
     }
 
     /// Verify the snapshot is still current after TLS and application negotiation.

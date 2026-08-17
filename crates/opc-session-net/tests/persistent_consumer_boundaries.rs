@@ -247,6 +247,26 @@ fn persistent_client(
     tls: AuthenticatedClientConfig,
     config: PersistentSessionConsumerConfig,
 ) -> PersistentSessionConsumerClient {
+    persistent_client_with_lifecycle(
+        resolver,
+        server_name,
+        server_spiffe,
+        scope,
+        tls,
+        config,
+        ConnectionLifecyclePolicy::default(),
+    )
+}
+
+fn persistent_client_with_lifecycle(
+    resolver: RemoteAddrResolver,
+    server_name: rustls_pki_types::ServerName<'static>,
+    server_spiffe: &str,
+    scope: SessionConsumerScope,
+    tls: AuthenticatedClientConfig,
+    config: PersistentSessionConsumerConfig,
+    lifecycle: ConnectionLifecyclePolicy,
+) -> PersistentSessionConsumerClient {
     PersistentSessionConsumerClient::try_from_stateless(
         StatelessSessionConsumerClient::new_with_resolver(
             resolver,
@@ -255,7 +275,8 @@ fn persistent_client(
             scope,
             tls,
         )
-        .with_operation_timeout(Duration::from_secs(2)),
+        .with_operation_timeout(Duration::from_secs(2))
+        .with_connection_lifecycle(lifecycle),
         config,
     )
     .expect("persistent client")
@@ -544,30 +565,30 @@ async fn reauthentication_and_svid_rotation_drain_idle_lanes_then_prewarm_within
     let client_spiffe = spiffe("rotation-client");
     let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
     let service = Arc::new(RecordingConsumer::default());
+    let lifecycle = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+        Duration::ZERO,
+    )
+    .expect("deterministic lifecycle policy");
     let (handle, address) =
         SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
-            .with_connection_lifecycle(
-                ConnectionLifecyclePolicy::try_new(
-                    Duration::from_secs(30),
-                    Duration::from_secs(1),
-                    Duration::from_millis(1),
-                    Duration::from_millis(1),
-                    Duration::ZERO,
-                )
-                .expect("deterministic lifecycle policy"),
-            )
+            .with_connection_lifecycle(lifecycle)
             .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
             .await
             .expect("start consumer listener");
     let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
     let (tls, material_source) = pki.rotating_client_config(&client_spiffe);
-    let client = persistent_client(
+    let client = persistent_client_with_lifecycle(
         resolver,
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
         &server_spiffe,
         scope,
         tls,
         config(LANES),
+        lifecycle,
     );
 
     assert_eq!(

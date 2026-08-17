@@ -50,19 +50,20 @@ use opc_session_testkit::qualification::{
     QualificationSecurityMetricsSnapshot, QualificationTlsMaterialAvailability,
     QualificationTlsMaterialReason, QualificationTlsMaterialStatus, QualificationTrafficErrorClass,
     QualificationTrafficFailureCode, QualificationTrafficFailureStage, QualificationTrafficState,
-    QualificationTrafficStatus, QualificationTransportConfig, SessionMtlsCandidateCampaign,
-    SessionMtlsCandidateEvidenceV2, SessionMtlsCandidateSourceTreeStatus,
-    QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER,
-    QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS, QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
-    QUALIFICATION_FAULT_PATH_REFRESH_MILLIS, QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS,
-    QUALIFICATION_INBOUND_CONNECTION_SLOTS, QUALIFICATION_MAX_CONFIG_BYTES,
-    QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE, QUALIFICATION_NODE_SCHEMA_VERSION,
-    QUALIFICATION_OPERATION_TIMEOUT_MILLIS, QUALIFICATION_RESOLVER_BACKOFF_LOWER_BOUNDS_MILLIS,
-    QUALIFICATION_RESOLVER_PROOF_MILLIS, QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE,
-    QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE, QUALIFICATION_RESOURCE_SAMPLE_MILLIS,
-    QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB, QUALIFICATION_RESOURCE_SETTLE_MILLIS,
-    QUALIFICATION_RESOURCE_STABLE_SAMPLES, QUALIFICATION_RESOURCE_THREAD_GROWTH_ALLOWANCE,
-    QUALIFICATION_RESOURCE_VMHWM_GROWTH_KIB, QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR,
+    QualificationTrafficStatus, QualificationTransportConfig, SessionHaQualificationProfileV7,
+    SessionMtlsCandidateCampaign, SessionMtlsCandidateEvidenceV2,
+    SessionMtlsCandidateSourceTreeStatus, QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS,
+    QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER, QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS,
+    QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, QUALIFICATION_FAULT_PATH_REFRESH_MILLIS,
+    QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
+    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE,
+    QUALIFICATION_NODE_SCHEMA_VERSION, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+    QUALIFICATION_RESOLVER_BACKOFF_LOWER_BOUNDS_MILLIS, QUALIFICATION_RESOLVER_PROOF_MILLIS,
+    QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE, QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE,
+    QUALIFICATION_RESOURCE_SAMPLE_MILLIS, QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB,
+    QUALIFICATION_RESOURCE_SETTLE_MILLIS, QUALIFICATION_RESOURCE_STABLE_SAMPLES,
+    QUALIFICATION_RESOURCE_THREAD_GROWTH_ALLOWANCE, QUALIFICATION_RESOURCE_VMHWM_GROWTH_KIB,
+    QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR,
     QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
     QUALIFICATION_TRAFFIC_CONNECTION_BOUND_ALLOWANCE,
@@ -86,8 +87,8 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS,
-    QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
-    SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
+    QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS, SESSION_HA_EVIDENCE_V7_SCHEMA_JSON,
+    SESSION_HA_PROFILE_V7_JSON, SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
 };
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SanType};
@@ -8226,8 +8227,8 @@ fn run_consumer_multiprocess_qualification(member_count: usize, mode: ConsumerQu
         let (address, node_scope) =
             fleet.start_stateless_consumer(node_index, consumer_identities.clone());
         if let Some(expected) = scope {
-            assert_eq!(
-                node_scope, expected,
+            assert!(
+                node_scope == expected,
                 "consumer scope differs between voters"
             );
         } else {
@@ -8326,11 +8327,11 @@ fn run_consumer_multiprocess_qualification(member_count: usize, mode: ConsumerQu
         known_response,
         SessionConsumerResponse::AcquireLease(Ok(_))
     ));
-    assert_eq!(
-        runtime
-            .block_on(clients[0].execute(known_request))
-            .expect("exact known consumer mutation retry"),
-        known_response,
+    let recovered_known_response = runtime
+        .block_on(clients[0].execute(known_request))
+        .expect("exact known consumer mutation retry");
+    assert!(
+        recovered_known_response == known_response,
         "a known durable consumer success must be recoverable by its retained request ID"
     );
 
@@ -8371,7 +8372,7 @@ fn run_consumer_multiprocess_qualification(member_count: usize, mode: ConsumerQu
         previous_converged = signature;
         assert!(
             Instant::now() < convergence_deadline,
-            "{} consumer quorum did not reach a stable all-voter log head before leader loss: reports={reports:?}",
+            "{} consumer quorum did not reach a stable all-voter log head before leader loss",
             mode.name(),
         );
         let observation_interval = if wait_for_heartbeat {
@@ -8426,7 +8427,7 @@ fn run_consumer_multiprocess_qualification(member_count: usize, mode: ConsumerQu
         previous_replacement = replacement_signature;
         assert!(
             Instant::now() < leader_loss_deadline,
-            "{} consumer quorum exceeded its bounded functional leader-recovery path: reports={reports:?}",
+            "{} consumer quorum exceeded its bounded functional leader-recovery path",
             mode.name(),
         );
         thread::sleep(Duration::from_millis(50));
@@ -8449,16 +8450,16 @@ fn run_consumer_multiprocess_qualification(member_count: usize, mode: ConsumerQu
             Duration::from_secs(30),
         ))
         .expect("consumer mutation must commit through the replacement leader");
-    assert_eq!(
-        runtime
-            .block_on(leader_survivor_client.acquire_with_id(
-                leader_failover_request_id,
-                leader_failover_key,
-                leader_failover_owner,
-                Duration::from_secs(30),
-            ))
-            .expect("replacement leader must recover the durable mutation outcome"),
-        leader_failover_lease,
+    let recovered_leader_failover_lease = runtime
+        .block_on(leader_survivor_client.acquire_with_id(
+            leader_failover_request_id,
+            leader_failover_key,
+            leader_failover_owner,
+            Duration::from_secs(30),
+        ))
+        .expect("replacement leader must recover the durable mutation outcome");
+    assert!(
+        recovered_leader_failover_lease == leader_failover_lease,
         "the replacement leader must return the exact committed consumer outcome"
     );
 
@@ -8477,7 +8478,10 @@ fn run_consumer_multiprocess_qualification(member_count: usize, mode: ConsumerQu
     }
     let (_, restarted_scope) =
         fleet.start_stateless_consumer(leader_node_index, consumer_identities.clone());
-    assert_eq!(restarted_scope, scope);
+    assert!(
+        restarted_scope == scope,
+        "restarted listener retains its scope"
+    );
 
     let recovered_reports = fleet.readiness_reports(&all_nodes);
     let recovered_leader = recovered_reports
@@ -8513,7 +8517,7 @@ fn run_consumer_multiprocess_qualification(member_count: usize, mode: ConsumerQu
         }
         assert!(
             Instant::now() < voter_loss_deadline,
-            "{} consumer quorum did not recover one voter loss: reports={reports:?}",
+            "{} consumer quorum did not recover one voter loss",
             mode.name(),
         );
         thread::sleep(Duration::from_millis(50));
@@ -8579,7 +8583,57 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
     run_consumer_multiprocess_qualification(member_count, ConsumerQualificationMode::Stateless);
 }
 
+fn assert_v7_persistent_consumer_evidence_binding() {
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(SESSION_HA_PROFILE_V7_JSON.as_bytes())
+        ),
+        "f3ff570a6d9f828ea31edd92c483a87774510210545d64af62336d6f9fcb35a1",
+        "persistent multiprocess coverage must use the exact embedded v7 profile"
+    );
+
+    let evidence_schema: serde_json::Value =
+        serde_json::from_str(SESSION_HA_EVIDENCE_V7_SCHEMA_JSON)
+            .expect("v7 persistent-consumer evidence schema");
+    let binding =
+        &evidence_schema["properties"]["execution"]["properties"]["persistent_consumer_binding"];
+    assert_eq!(
+        evidence_schema["properties"]["execution"]["properties"]["profile_sha256"]["const"],
+        "sha256:f3ff570a6d9f828ea31edd92c483a87774510210545d64af62336d6f9fcb35a1"
+    );
+    assert_eq!(binding["additionalProperties"], false);
+    assert_eq!(
+        binding["required"],
+        serde_json::json!([
+            "client_type",
+            "consumer_profile_path",
+            "transport_revision",
+            "authenticated_route"
+        ])
+    );
+    assert_eq!(
+        binding["properties"]["client_type"]["const"],
+        "PersistentSessionConsumerClient"
+    );
+    assert_eq!(
+        binding["properties"]["consumer_profile_path"]["const"],
+        "protocol.persistent_consumer"
+    );
+    assert_eq!(binding["properties"]["transport_revision"]["const"], 2);
+    assert_eq!(
+        binding["properties"]["authenticated_route"]["const"],
+        "authenticated-mtls-persistent"
+    );
+}
+
 fn run_persistent_consumer_multiprocess_qualification(member_count: usize) {
+    assert_v7_persistent_consumer_evidence_binding();
+    let profile: SessionHaQualificationProfileV7 = serde_json::from_str(SESSION_HA_PROFILE_V7_JSON)
+        .expect("revision-2 persistent consumer qualification profile");
+    assert_eq!(profile.schema_version, "opc-session-ha-profile/v7");
+    assert_eq!(profile.profile_id, "opc-session-openraft-ha/v7");
+    assert_eq!(profile.protocol.persistent_consumer.transport_revision, 2);
     run_consumer_multiprocess_qualification(member_count, ConsumerQualificationMode::Persistent);
 }
 

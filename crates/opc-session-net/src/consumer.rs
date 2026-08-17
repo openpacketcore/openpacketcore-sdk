@@ -43,7 +43,8 @@ use crate::lifecycle::{
 };
 use crate::protocol::{
     read_authenticated_frame_payload_until, read_frame_payload, write_frame_bounded_until,
-    write_frame_bounded_until_classified, FrameWriteError, MAX_NEGOTIATED_FRAME_SIZE,
+    write_frame_bounded_until_classified, write_frame_bounded_until_classified_with_progress,
+    FrameWriteError, FrameWriteProgress, MAX_NEGOTIATED_FRAME_SIZE,
 };
 
 /// Dedicated ALPN for authenticated session-quorum consumers.
@@ -99,11 +100,50 @@ const CONSUMER_WATCH_CANCELLATION_RECHECK_INTERVAL: Duration = Duration::from_mi
 const MIN_SESSION_CONSUMER_RESPONSE_FRAME_SIZE: usize =
     MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES + 4 * 1024;
 
+fn valid_consumer_operation_timeout(timeout: Duration) -> bool {
+    !timeout.is_zero() && timeout <= DEFAULT_CONSUMER_OPERATION_TIMEOUT
+}
+
 struct QueuedConsumerWatchItem {
     item: Result<SessionConsumerChange, StoreError>,
     // Retained for precisely as long as this item occupies the bounded local
     // queue. Dropping it returns its byte budget to the producer.
     _byte_permit: OwnedSemaphorePermit,
+}
+
+fn consumer_watch_item_byte_count(item: &Result<SessionConsumerChange, StoreError>) -> Option<u32> {
+    let encoded = serde_json::to_vec(item).ok()?;
+    if encoded.len() > CONSUMER_WATCH_CHANNEL_MAX_BYTES {
+        return None;
+    }
+    u32::try_from(encoded.len().max(1)).ok()
+}
+
+fn try_send_consumer_watch_item(
+    sender: &mpsc::Sender<QueuedConsumerWatchItem>,
+    byte_budget: &Arc<Semaphore>,
+    item: Result<SessionConsumerChange, StoreError>,
+    byte_count: u32,
+) {
+    let Ok(permit) = Arc::clone(byte_budget).try_acquire_many_owned(byte_count) else {
+        return;
+    };
+    let _ = sender.try_send(QueuedConsumerWatchItem {
+        item,
+        _byte_permit: permit,
+    });
+}
+
+fn try_send_consumer_watch_terminal(
+    sender: &mpsc::Sender<QueuedConsumerWatchItem>,
+    byte_budget: &Arc<Semaphore>,
+    message: &'static str,
+) {
+    let item = Err(StoreError::BackendUnavailable(message.into()));
+    let Some(byte_count) = consumer_watch_item_byte_count(&item) else {
+        return;
+    };
+    try_send_consumer_watch_item(sender, byte_budget, item, byte_count);
 }
 
 /// Redaction-safe construction or transport failure for a typed consumer.
@@ -177,6 +217,20 @@ impl PersistentSessionConsumerExecuteError {
         match self {
             Self::OutcomeUnknown { request_id } => Some(*request_id),
             Self::NotTransmitted { .. } => None,
+        }
+    }
+}
+
+fn persistent_execute_error(
+    request_id: SessionConsumerRequestId,
+    error: SessionConsumerCallError,
+) -> PersistentSessionConsumerExecuteError {
+    match error {
+        SessionConsumerCallError::BeforeCallWrite(cause) => {
+            PersistentSessionConsumerExecuteError::NotTransmitted { cause }
+        }
+        SessionConsumerCallError::MayHaveSent(_) => {
+            PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id }
         }
     }
 }
@@ -412,6 +466,17 @@ fn classify_call_write_error(
     }
 }
 
+fn classify_interrupted_call_write(
+    progress: &FrameWriteProgress,
+    error: SessionConsumerClientError,
+) -> SessionConsumerCallError {
+    if progress.accepted_any() {
+        SessionConsumerCallError::MayHaveSent(error)
+    } else {
+        SessionConsumerCallError::BeforeCallWrite(error)
+    }
+}
+
 const fn pre_request_timeout_error(pre_request_budget_active: bool) -> SessionConsumerClientError {
     if pre_request_budget_active {
         SessionConsumerClientError::Unavailable
@@ -440,6 +505,17 @@ fn ensure_pre_request_budget_remaining(
         Err(SessionConsumerClientError::Unavailable)
     } else {
         Ok(())
+    }
+}
+
+const fn consumer_rejection_into_client_error(
+    rejection: SessionConsumerRejection,
+) -> SessionConsumerClientError {
+    match rejection {
+        SessionConsumerRejection::ScopeMismatch => SessionConsumerClientError::Scope,
+        SessionConsumerRejection::MalformedRequest => SessionConsumerClientError::Protocol,
+        SessionConsumerRejection::Unauthorized => SessionConsumerClientError::Authentication,
+        SessionConsumerRejection::Unavailable => SessionConsumerClientError::Unavailable,
     }
 }
 
@@ -1116,11 +1192,37 @@ struct ConsumerConnection {
     reader: Box<dyn AsyncRead + Unpin + Send>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
     lifecycle: ConnectionLifecycle,
-    admitted_generation: u64,
-    admitted_material_epoch: opc_tls::TlsMaterialEpoch,
+    rotation_edge_key: opc_tls::TlsDirectedEdgeKey,
     next_correlation: NonZeroU32,
     calls: usize,
     idle_deadline: tokio::time::Instant,
+    _physical_admission: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Clone)]
+struct StatelessConsumerPhysicalAdmission {
+    requests: Arc<Semaphore>,
+    watches: Arc<Semaphore>,
+}
+
+impl StatelessConsumerPhysicalAdmission {
+    fn new() -> Self {
+        Self {
+            requests: Arc::new(Semaphore::new(
+                MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+            )),
+            watches: Arc::new(Semaphore::new(
+                MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+            )),
+        }
+    }
+
+    fn try_acquire(&self, watch: bool) -> Result<OwnedSemaphorePermit, SessionConsumerClientError> {
+        let permits = if watch { &self.watches } else { &self.requests };
+        Arc::clone(permits)
+            .try_acquire_owned()
+            .map_err(|_| SessionConsumerClientError::Overloaded)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1173,8 +1275,7 @@ impl ConsumerConnection {
             &mut self.lifecycle,
             config,
             reauthentication,
-            self.admitted_generation,
-            self.admitted_material_epoch,
+            self.rotation_edge_key,
         )
     }
 
@@ -1217,12 +1318,13 @@ fn observe_consumer_rotation(
     now: tokio::time::Instant,
     generation: u64,
     material_epoch: opc_tls::TlsMaterialEpoch,
+    rotation_edge_key: opc_tls::TlsDirectedEdgeKey,
 ) {
-    lifecycle.observe_rotation(
+    lifecycle.observe_authenticated_rotation(
         now,
         generation,
         Some(material_epoch),
-        b"session-quorum-consumer",
+        rotation_edge_key,
     );
     // Explicit reauthentication and zero-jitter material cutovers begin
     // draining immediately. Recording here keeps lifecycle gauges and reason
@@ -1235,26 +1337,27 @@ fn consumer_connection_current(
     lifecycle: &mut ConnectionLifecycle,
     config: &opc_tls::AuthenticatedClientConfig,
     reauthentication: &SessionReauthenticationControl,
-    admitted_generation: u64,
-    admitted_material_epoch: opc_tls::TlsMaterialEpoch,
+    rotation_edge_key: opc_tls::TlsDirectedEdgeKey,
 ) -> bool {
     let now = tokio::time::Instant::now();
     let current_generation = reauthentication.generation();
     let current_material_epoch = config.material_status().epoch();
-    observe_consumer_rotation(lifecycle, now, current_generation, current_material_epoch);
+    observe_consumer_rotation(
+        lifecycle,
+        now,
+        current_generation,
+        current_material_epoch,
+        rotation_edge_key,
+    );
     if lifecycle.retirement(now).is_some() {
         return false;
     }
-    if let Some(reason) =
-        lifecycle.evidence_mismatch_reason(current_generation, Some(current_material_epoch))
-    {
-        // A cached or not-yet-dispatched connection cannot keep serving old
-        // authentication during rotation jitter. This records the actual
-        // reason exactly once before the socket is physically discarded.
-        lifecycle.record_forced_retirement(reason);
-        return false;
-    }
-    admitted_generation == current_generation && admitted_material_epoch == current_material_epoch
+    // Explicit generation changes schedule retirement at `now`. A material
+    // publication is different: this already-admitted lane remains eligible
+    // only until its stable per-edge retirement deadline, avoiding a
+    // synchronized reconnect burst without allowing a stale *new* handshake
+    // (checked by `consumer_fresh_admission_is_current`).
+    true
 }
 
 fn record_consumer_hard_overrun(lifecycle: &ConnectionLifecycle) {
@@ -1266,22 +1369,30 @@ fn server_connection_current(
     lifecycle: &mut ConnectionLifecycle,
     config: &opc_tls::AuthenticatedServerConfig,
     reauthentication: &SessionReauthenticationControl,
-    admitted_generation: u64,
-    admitted_material_epoch: opc_tls::TlsMaterialEpoch,
+    rotation_edge_key: opc_tls::TlsDirectedEdgeKey,
 ) -> bool {
     let now = tokio::time::Instant::now();
     let current_generation = reauthentication.generation();
     let current_material_epoch = config.material_status().epoch();
-    observe_consumer_rotation(lifecycle, now, current_generation, current_material_epoch);
+    observe_consumer_rotation(
+        lifecycle,
+        now,
+        current_generation,
+        current_material_epoch,
+        rotation_edge_key,
+    );
     if lifecycle.retirement(now).is_some() {
         return false;
     }
-    if let Some(reason) =
-        lifecycle.evidence_mismatch_reason(current_generation, Some(current_material_epoch))
-    {
-        lifecycle.record_forced_retirement(reason);
-        return false;
-    }
+    true
+}
+
+fn consumer_fresh_admission_is_current(
+    admitted_generation: u64,
+    admitted_material_epoch: opc_tls::TlsMaterialEpoch,
+    current_generation: u64,
+    current_material_epoch: opc_tls::TlsMaterialEpoch,
+) -> bool {
     admitted_generation == current_generation && admitted_material_epoch == current_material_epoch
 }
 
@@ -1306,6 +1417,9 @@ pub struct StatelessSessionConsumerClient {
     pre_request_connection_timeout: Option<Duration>,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
+    physical_admission: StatelessConsumerPhysicalAdmission,
+    #[cfg(test)]
+    final_admission_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl fmt::Debug for StatelessSessionConsumerClient {
@@ -1368,7 +1482,16 @@ impl StatelessSessionConsumerClient {
             pre_request_connection_timeout: None,
             lifecycle_policy: ConnectionLifecyclePolicy::default(),
             reauthentication: SessionReauthenticationControl::new(),
+            physical_admission: StatelessConsumerPhysicalAdmission::new(),
+            #[cfg(test)]
+            final_admission_test_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_final_admission_test_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.final_admission_test_hook = Some(hook);
+        self
     }
 
     /// Set the finite bootstrap and active-frame idle timeout.
@@ -1453,9 +1576,10 @@ impl StatelessSessionConsumerClient {
         pre_request_deadline: tokio::time::Instant,
         pre_request_budget_active: bool,
         setup_counters: Option<&PersistentConsumerCounters>,
+        watch: bool,
     ) -> Result<ConsumerConnection, SessionConsumerClientError> {
         if self.idle_timeout.is_zero()
-            || self.operation_timeout.is_zero()
+            || !valid_consumer_operation_timeout(self.operation_timeout)
             || self
                 .lifecycle_policy
                 .validate_at(tokio::time::Instant::now())
@@ -1463,6 +1587,7 @@ impl StatelessSessionConsumerClient {
         {
             return Err(SessionConsumerClientError::Protocol);
         }
+        let physical_admission = self.physical_admission.try_acquire(watch)?;
         record_setup_phase_attempt(setup_counters, ConsumerSetupPhase::Resolve);
         let address = tokio::time::timeout_at(pre_request_deadline, (self.resolve)())
             .await
@@ -1525,6 +1650,8 @@ impl StatelessSessionConsumerClient {
             record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Tls);
             return Err(SessionConsumerClientError::Authentication);
         }
+        let rotation_edge_key =
+            handshake.directed_lifecycle_edge_key(b"consumer", peer.spiffe_id());
         let (mut reader, mut writer) = tokio::io::split(tls);
         record_setup_phase_attempt(setup_counters, ConsumerSetupPhase::Hello);
         // The server starts its between-frame timeout after HelloAck. Stamp
@@ -1549,19 +1676,23 @@ impl StatelessSessionConsumerClient {
             record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
             pre_request_error(error, pre_request_budget_active)
         })?;
-        let ack = tokio::time::timeout_at(
-            pre_request_deadline,
-            read_consumer_frame::<_, ConsumerWireResponse>(&mut reader, MAX_NEGOTIATED_FRAME_SIZE),
+        let ack_deadline = pre_request_deadline.min(idle_deadline);
+        let ack = read_authenticated_consumer_frame_until::<_, ConsumerWireResponse>(
+            &mut reader,
+            MAX_NEGOTIATED_FRAME_SIZE,
+            ack_deadline,
         )
         .await
-        .map_err(|_| {
+        .map_err(SessionConsumerClientError::from)
+        .inspect_err(|_| {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
+            // Once an authenticated HelloAck frame has started, preserve its
+            // active-frame timeout classification. Only a no-byte setup
+            // expiry below is eligible for pre-request Unavailable mapping.
+        })?
+        .ok_or_else(|| {
             record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
             pre_request_timeout_error(pre_request_budget_active)
-        })?
-        .map_err(SessionConsumerClientError::from)
-        .map_err(|error| {
-            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
-            pre_request_error(error, pre_request_budget_active)
         })?;
         match ack {
             ConsumerWireResponse::HelloAck(ack)
@@ -1584,9 +1715,12 @@ impl StatelessSessionConsumerClient {
             record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
             SessionConsumerClientError::Authentication
         })?;
-        if generation != self.reauthentication.generation()
-            || admission.epoch() != self.tls_config.material_status().epoch()
-        {
+        if !consumer_fresh_admission_is_current(
+            generation,
+            admission.epoch(),
+            self.reauthentication.generation(),
+            self.tls_config.material_status().epoch(),
+        ) {
             record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
             return Err(SessionConsumerClientError::Deadline);
         }
@@ -1614,13 +1748,30 @@ impl StatelessSessionConsumerClient {
             reader: Box::new(reader),
             writer: Box::new(writer),
             lifecycle,
-            admitted_generation: generation,
-            admitted_material_epoch: admission.epoch(),
+            rotation_edge_key,
             next_correlation: NonZeroU32::MIN,
             calls: 0,
             idle_deadline,
+            _physical_admission: Some(physical_admission),
         };
         if !connection.current(&self.tls_config, &self.reauthentication) {
+            record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
+            return Err(SessionConsumerClientError::Deadline);
+        }
+        // This is the fresh-lane publication boundary. A material change
+        // observed after this exact sample belongs to an already-admitted
+        // lane and follows cooperative per-edge retirement; a stale handshake
+        // is never inserted into the pool or returned to a caller.
+        #[cfg(test)]
+        if let Some(hook) = &self.final_admission_test_hook {
+            hook();
+        }
+        if !consumer_fresh_admission_is_current(
+            generation,
+            admission.epoch(),
+            self.reauthentication.generation(),
+            self.tls_config.material_status().epoch(),
+        ) {
             record_setup_phase_failure(setup_counters, ConsumerSetupPhase::Hello);
             return Err(SessionConsumerClientError::Deadline);
         }
@@ -1634,10 +1785,15 @@ impl StatelessSessionConsumerClient {
         pre_request_deadline: tokio::time::Instant,
         pre_request_budget_active: bool,
         deadline: tokio::time::Instant,
-        mut force_shutdown: Option<watch::Receiver<PersistentShutdownPhase>>,
+        force_shutdown: Option<(watch::Receiver<PersistentShutdownPhase>, &AtomicU8)>,
     ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        let (mut force_shutdown, force_shutdown_state) = match force_shutdown {
+            Some((receiver, state)) => (Some(receiver), Some(state)),
+            None => (None, None),
+        };
         let mut reauthentication_changes = self.reauthentication.subscribe();
         let mut material_changes = Some(self.tls_config.subscribe_material_changes());
+        let rotation_edge_key = connection.rotation_edge_key;
         if !connection.current(&self.tls_config, &self.reauthentication) {
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Unavailable,
@@ -1665,16 +1821,21 @@ impl StatelessSessionConsumerClient {
                 SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol)
             })?;
             let write_deadline = pre_request_deadline.min(initial_hard_deadline);
-            let write = write_frame_bounded_until_classified(
+            let write_progress = FrameWriteProgress::new();
+            let write = write_frame_bounded_until_classified_with_progress(
                 &mut connection.writer,
                 &outbound,
                 MAX_NEGOTIATED_FRAME_SIZE,
                 write_deadline,
+                &write_progress,
             );
             tokio::pin!(write);
             loop {
                 let hard_deadline = lifecycle.hard_deadline().map_err(|_| {
-                    SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Protocol)
+                    classify_interrupted_call_write(
+                        &write_progress,
+                        SessionConsumerClientError::Protocol,
+                    )
                 })?;
                 tokio::select! {
                     biased;
@@ -1684,21 +1845,24 @@ impl StatelessSessionConsumerClient {
                         {
                             record_consumer_hard_overrun(lifecycle);
                             if result.is_ok() {
-                                return Err(SessionConsumerCallError::MayHaveSent(
+                                return Err(classify_interrupted_call_write(
+                                    &write_progress,
                                     SessionConsumerClientError::Deadline,
                                 ));
                             }
                         }
                         break result;
                     },
-                    _ = wait_for_optional_forced_shutdown(&mut force_shutdown) => {
-                        return Err(SessionConsumerCallError::MayHaveSent(
+                    _ = wait_for_optional_forced_shutdown(&mut force_shutdown, force_shutdown_state) => {
+                        return Err(classify_interrupted_call_write(
+                            &write_progress,
                             SessionConsumerClientError::ShuttingDown,
                         ));
                     }
                     _ = wait_for_shortened_deadline(hard_deadline, write_deadline) => {
                         record_consumer_hard_overrun(lifecycle);
-                        return Err(SessionConsumerCallError::MayHaveSent(
+                        return Err(classify_interrupted_call_write(
+                            &write_progress,
                             SessionConsumerClientError::Deadline,
                         ));
                     }
@@ -1708,6 +1872,7 @@ impl StatelessSessionConsumerClient {
                             tokio::time::Instant::now(),
                             self.reauthentication.generation(),
                             self.tls_config.material_status().epoch(),
+                            rotation_edge_key,
                         );
                     }
                     _ = wait_consumer_material_change(&mut material_changes) => {
@@ -1716,6 +1881,7 @@ impl StatelessSessionConsumerClient {
                             tokio::time::Instant::now(),
                             self.reauthentication.generation(),
                             self.tls_config.material_status().epoch(),
+                            rotation_edge_key,
                         );
                     }
                 }
@@ -1725,21 +1891,23 @@ impl StatelessSessionConsumerClient {
             .map_err(|error| classify_call_write_error(error, pre_request_budget_active))?;
         let response = {
             let lifecycle = &mut connection.lifecycle;
-            let read = read_consumer_frame::<_, ConsumerWireResponse>(
+            let read_deadline = deadline.min(connection.idle_deadline);
+            let read = read_authenticated_consumer_frame_until::<_, ConsumerWireResponse>(
                 &mut connection.reader,
                 MAX_NEGOTIATED_FRAME_SIZE,
+                read_deadline,
             );
             tokio::pin!(read);
             loop {
                 let hard_deadline = lifecycle.hard_deadline().map_err(|_| {
                     SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Protocol)
                 })?;
-                let response_deadline = deadline.min(hard_deadline);
+                let response_deadline = read_deadline.min(hard_deadline);
                 let response = tokio::select! {
                     biased;
                     response = &mut read => {
                         if tokio::time::Instant::now() >= response_deadline {
-                            if hard_deadline <= deadline {
+                            if hard_deadline <= read_deadline {
                                 record_consumer_hard_overrun(lifecycle);
                             }
                             return Err(SessionConsumerCallError::MayHaveSent(
@@ -1748,13 +1916,13 @@ impl StatelessSessionConsumerClient {
                         }
                         Some(response)
                     },
-                    _ = wait_for_optional_forced_shutdown(&mut force_shutdown) => {
+                    _ = wait_for_optional_forced_shutdown(&mut force_shutdown, force_shutdown_state) => {
                         return Err(SessionConsumerCallError::MayHaveSent(
                             SessionConsumerClientError::ShuttingDown,
                         ));
                     }
                     _ = tokio::time::sleep_until(response_deadline) => {
-                        if hard_deadline <= deadline {
+                        if hard_deadline <= read_deadline {
                             record_consumer_hard_overrun(lifecycle);
                         }
                         return Err(SessionConsumerCallError::MayHaveSent(
@@ -1767,6 +1935,7 @@ impl StatelessSessionConsumerClient {
                             tokio::time::Instant::now(),
                             self.reauthentication.generation(),
                             self.tls_config.material_status().epoch(),
+                            rotation_edge_key,
                         );
                         None
                     }
@@ -1776,18 +1945,21 @@ impl StatelessSessionConsumerClient {
                             tokio::time::Instant::now(),
                             self.reauthentication.generation(),
                             self.tls_config.material_status().epoch(),
+                            rotation_edge_key,
                         );
                         None
                     }
                 };
                 if let Some(response) = response {
-                    break response;
+                    break response
+                        .map_err(SessionConsumerClientError::from)
+                        .map_err(SessionConsumerCallError::MayHaveSent)?
+                        .ok_or(SessionConsumerCallError::MayHaveSent(
+                            SessionConsumerClientError::Deadline,
+                        ))?;
                 }
             }
         };
-        let response = response
-            .map_err(SessionConsumerClientError::from)
-            .map_err(SessionConsumerCallError::MayHaveSent)?;
         match response {
             ConsumerWireResponse::Response(ConsumerCallResponse {
                 correlation: received,
@@ -1840,7 +2012,7 @@ impl StatelessSessionConsumerClient {
         let (pre_request_deadline, pre_request_budget_active) =
             self.pre_request_deadline(started_at, deadline);
         let mut connection = self
-            .connect(pre_request_deadline, pre_request_budget_active, None)
+            .connect(pre_request_deadline, pre_request_budget_active, None, false)
             .await
             .map_err(SessionConsumerCallError::BeforeCallWrite)?;
         ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
@@ -2091,7 +2263,9 @@ impl StatelessSessionConsumerClient {
         &self,
         start_sequence: u64,
     ) -> Result<BoxStream<'static, Result<SessionConsumerChange, StoreError>>, StoreError> {
-        self.watch_with_counters(start_sequence, None, None).await
+        self.watch_with_counters(start_sequence, None, None)
+            .await
+            .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))
     }
 
     async fn write_watch_call_on_connection(
@@ -2099,6 +2273,7 @@ impl StatelessSessionConsumerClient {
         connection: &mut ConsumerConnection,
         request: &SessionConsumerRequest,
         pre_request_deadline: tokio::time::Instant,
+        pre_request_budget_active: bool,
         reauthentication_changes: &mut watch::Receiver<u64>,
         material_changes: &mut Option<opc_tls::TlsMaterialStatusReceiver>,
     ) -> Result<NonZeroU32, SessionConsumerClientError> {
@@ -2108,6 +2283,7 @@ impl StatelessSessionConsumerClient {
         if !connection.current(&self.tls_config, &self.reauthentication) {
             return Err(SessionConsumerClientError::Unavailable);
         }
+        let rotation_edge_key = connection.rotation_edge_key;
         let correlation = connection.take_correlation()?;
         connection.idle_deadline = tokio::time::Instant::now()
             .checked_add(self.idle_timeout.min(DEFAULT_CONSUMER_IDLE_TIMEOUT))
@@ -2122,7 +2298,7 @@ impl StatelessSessionConsumerClient {
                 .hard_deadline()
                 .map_err(|_| SessionConsumerClientError::Protocol)?;
             let write_deadline = pre_request_deadline.min(initial_hard_deadline);
-            let write = write_frame_bounded_until(
+            let write = write_frame_bounded_until_classified(
                 &mut connection.writer,
                 &outbound,
                 MAX_NEGOTIATED_FRAME_SIZE,
@@ -2154,6 +2330,7 @@ impl StatelessSessionConsumerClient {
                             tokio::time::Instant::now(),
                             self.reauthentication.generation(),
                             self.tls_config.material_status().epoch(),
+                            rotation_edge_key,
                         );
                         None
                     }
@@ -2163,12 +2340,21 @@ impl StatelessSessionConsumerClient {
                             tokio::time::Instant::now(),
                             self.reauthentication.generation(),
                             self.tls_config.material_status().epoch(),
+                            rotation_edge_key,
                         );
                         None
                     }
                 };
                 if let Some(result) = result {
-                    result.map_err(SessionConsumerClientError::from)?;
+                    result.map_err(|error| match error {
+                        FrameWriteError::BeforeWrite(error) => pre_request_error(
+                            SessionConsumerClientError::from(error),
+                            pre_request_budget_active,
+                        ),
+                        FrameWriteError::MayHaveWritten(error) => {
+                            SessionConsumerClientError::from(error)
+                        }
+                    })?;
                     break;
                 }
             }
@@ -2187,11 +2373,14 @@ impl StatelessSessionConsumerClient {
         start_sequence: u64,
         setup_counters: Option<&PersistentConsumerCounters>,
         persistent_runtime: Option<PersistentWatchRuntime>,
-    ) -> Result<BoxStream<'static, Result<SessionConsumerChange, StoreError>>, StoreError> {
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, StoreError>>,
+        SessionConsumerClientError,
+    > {
         let started_at = tokio::time::Instant::now();
         let deadline = started_at
             .checked_add(self.operation_timeout)
-            .ok_or_else(|| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
+            .ok_or(SessionConsumerClientError::Protocol)?;
         let (pre_request_deadline, pre_request_budget_active) =
             self.pre_request_deadline(started_at, deadline);
         let mut connection = self
@@ -2199,13 +2388,12 @@ impl StatelessSessionConsumerClient {
                 pre_request_deadline,
                 pre_request_budget_active,
                 setup_counters,
+                true,
             )
-            .await
-            .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
+            .await?;
         let mut reauthentication_changes = self.reauthentication.subscribe();
         let mut material_changes = Some(self.tls_config.subscribe_material_changes());
-        ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
-            .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
+        ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)?;
         let request = self.request(
             SessionConsumerRequestId::new(),
             SessionConsumerOperation::Watch { start_sequence },
@@ -2215,19 +2403,17 @@ impl StatelessSessionConsumerClient {
                 &mut connection,
                 &request,
                 pre_request_deadline,
+                pre_request_budget_active,
                 &mut reauthentication_changes,
                 &mut material_changes,
             )
-            .await
-            .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
+            .await?;
         let response = {
-            let watch_response_deadline = deadline.min(connection.lifecycle.retire_at());
-            let response_read = tokio::time::timeout_at(
+            let watch_response_deadline = deadline.min(connection.idle_deadline);
+            let response_read = read_authenticated_consumer_frame_until::<_, ConsumerWireResponse>(
+                &mut connection.reader,
+                MAX_NEGOTIATED_FRAME_SIZE,
                 watch_response_deadline,
-                read_consumer_frame::<_, ConsumerWireResponse>(
-                    &mut connection.reader,
-                    MAX_NEGOTIATED_FRAME_SIZE,
-                ),
             );
             tokio::pin!(response_read);
             loop {
@@ -2237,14 +2423,15 @@ impl StatelessSessionConsumerClient {
                         &mut connection.lifecycle,
                         &self.tls_config,
                         &self.reauthentication,
-                        connection.admitted_generation,
-                        connection.admitted_material_epoch,
+                        connection.rotation_edge_key,
                     )
                 {
                     let _ = connection.lifecycle.retirement(now);
-                    return Err(StoreError::BackendUnavailable(
-                        "consumer watch unavailable".into(),
-                    ));
+                    return Err(if now >= watch_response_deadline {
+                        SessionConsumerClientError::Deadline
+                    } else {
+                        SessionConsumerClientError::Unavailable
+                    });
                 }
                 let response = tokio::select! {
                     biased;
@@ -2255,14 +2442,15 @@ impl StatelessSessionConsumerClient {
                                 &mut connection.lifecycle,
                                 &self.tls_config,
                                 &self.reauthentication,
-                                connection.admitted_generation,
-                                connection.admitted_material_epoch,
+                                connection.rotation_edge_key,
                             )
                         {
                             let _ = connection.lifecycle.retirement(now);
-                            return Err(StoreError::BackendUnavailable(
-                                "consumer watch unavailable".into(),
-                            ));
+                            return Err(if now >= watch_response_deadline {
+                                SessionConsumerClientError::Deadline
+                            } else {
+                                SessionConsumerClientError::Unavailable
+                            });
                         }
                         Some(response)
                     },
@@ -2270,21 +2458,16 @@ impl StatelessSessionConsumerClient {
                         let _ = connection
                             .lifecycle
                             .retirement(tokio::time::Instant::now());
-                        return Err(StoreError::BackendUnavailable(
-                            "consumer watch unavailable".into(),
-                        ));
+                        return Err(SessionConsumerClientError::Unavailable);
                     }
                     _ = reauthentication_changes.changed() => {
                         if !consumer_connection_current(
                             &mut connection.lifecycle,
                             &self.tls_config,
                             &self.reauthentication,
-                            connection.admitted_generation,
-                            connection.admitted_material_epoch,
+                            connection.rotation_edge_key,
                         ) {
-                            return Err(StoreError::BackendUnavailable(
-                                "consumer watch unavailable".into(),
-                            ));
+                            return Err(SessionConsumerClientError::Unavailable);
                         }
                         None
                     }
@@ -2293,12 +2476,9 @@ impl StatelessSessionConsumerClient {
                             &mut connection.lifecycle,
                             &self.tls_config,
                             &self.reauthentication,
-                            connection.admitted_generation,
-                            connection.admitted_material_epoch,
+                            connection.rotation_edge_key,
                         ) {
-                            return Err(StoreError::BackendUnavailable(
-                                "consumer watch unavailable".into(),
-                            ));
+                            return Err(SessionConsumerClientError::Unavailable);
                         }
                         None
                     }
@@ -2308,24 +2488,27 @@ impl StatelessSessionConsumerClient {
                 }
             }
         }
-        .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))?
-        .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))?;
-        if !matches!(
-            response,
+        .map_err(SessionConsumerClientError::from)?
+        .ok_or(SessionConsumerClientError::Deadline)?;
+        let response = match response {
             ConsumerWireResponse::Response(ConsumerCallResponse {
                 correlation: received,
                 response,
-            }) if exact_correlation(correlation, received).is_ok()
-                && matches!(response.as_ref(), SessionConsumerResponse::WatchOpened)
-        ) {
-            return Err(StoreError::BackendUnavailable(
-                "consumer watch unavailable".into(),
-            ));
+            }) if exact_correlation(correlation, received).is_ok() => *response,
+            _ => return Err(SessionConsumerClientError::Protocol),
+        };
+        match response {
+            SessionConsumerResponse::WatchOpened => {}
+            SessionConsumerResponse::Rejected(rejection) => {
+                return Err(consumer_rejection_into_client_error(rejection));
+            }
+            _ => return Err(SessionConsumerClientError::Protocol),
         }
         let (tx, rx) = mpsc::channel(CONSUMER_WATCH_CHANNEL_CAPACITY);
         let byte_budget = Arc::new(Semaphore::new(CONSUMER_WATCH_CHANNEL_MAX_BYTES));
         let tls_config = self.tls_config.clone();
         let reauthentication = self.reauthentication.clone();
+        let active_frame_timeout = self.idle_timeout.min(DEFAULT_CONSUMER_IDLE_TIMEOUT);
         tokio::spawn(async move {
             let mut force_shutdown = persistent_runtime
                 .as_ref()
@@ -2335,29 +2518,22 @@ impl StatelessSessionConsumerClient {
             // forced shutdown, or caller stream drop even if the caller never
             // polls its returned stream again.
             let _persistent_runtime = persistent_runtime;
+            let force_shutdown_state = _persistent_runtime
+                .as_ref()
+                .map(|runtime| &runtime._lease.pool.shutdown_phase);
             let mut reauthentication_changes = reauthentication.subscribe();
             let mut material_changes = Some(tls_config.subscribe_material_changes());
-            let admitted_generation = connection.admitted_generation;
-            let admitted_material_epoch = connection.admitted_material_epoch;
-            loop {
+            let rotation_edge_key = connection.rotation_edge_key;
+            'watch_reader: loop {
                 if !connection.current(&tls_config, &reauthentication) {
                     // Never wait behind already queued entries merely to
                     // report retirement. An unpolled receiver must not retain
                     // authenticated transport or fixed watch capacity.
-                    let Ok(permit) = Arc::clone(&byte_budget).try_acquire_owned() else {
-                        return;
-                    };
-                    let _ = tokio::select! {
-                        _ = wait_for_optional_forced_shutdown(&mut force_shutdown) => return,
-                        _ = tx.closed() => return,
-                        result = tx.send(QueuedConsumerWatchItem {
-                            item: Err(StoreError::BackendUnavailable(
-                                "consumer watch authentication retired".into(),
-                            )),
-                            _byte_permit: permit,
-                        })
-                        => result,
-                    };
+                    try_send_consumer_watch_terminal(
+                        &tx,
+                        &byte_budget,
+                        "consumer watch authentication retired",
+                    );
                     return;
                 }
                 // A quiet, healthy watch is normal. Frame sizing still bounds
@@ -2365,21 +2541,31 @@ impl StatelessSessionConsumerClient {
                 // rotation, lifecycle retirement, and stream drop can all
                 // interrupt this otherwise unbounded wait.
                 let response = {
-                    let response_read = read_consumer_frame::<_, ConsumerWireResponse>(
-                        &mut connection.reader,
-                        MAX_NEGOTIATED_FRAME_SIZE,
-                    );
+                    let active_frame_deadline = tokio::time::Instant::now()
+                        .checked_add(active_frame_timeout)
+                        .expect("validated consumer idle timeout has an active-frame deadline");
+                    let response_read =
+                        read_authenticated_consumer_frame_until::<_, ConsumerWireResponse>(
+                            &mut connection.reader,
+                            MAX_NEGOTIATED_FRAME_SIZE,
+                            active_frame_deadline,
+                        );
                     tokio::pin!(response_read);
                     loop {
                         let response = tokio::select! {
                             biased;
-                            _ = wait_for_optional_forced_shutdown(&mut force_shutdown) => return,
+                            _ = wait_for_optional_forced_shutdown(&mut force_shutdown, force_shutdown_state) => return,
                             _ = tx.closed() => return,
                             response = &mut response_read => Some(response),
                             _ = tokio::time::sleep_until(connection.lifecycle.retire_at()) => {
                                 let _ = connection
                                     .lifecycle
                                     .retirement(tokio::time::Instant::now());
+                                try_send_consumer_watch_terminal(
+                                    &tx,
+                                    &byte_budget,
+                                    "consumer watch authentication retired",
+                                );
                                 return;
                             },
                             _ = reauthentication_changes.changed() => {
@@ -2387,9 +2573,13 @@ impl StatelessSessionConsumerClient {
                                     &mut connection.lifecycle,
                                     &tls_config,
                                     &reauthentication,
-                                    admitted_generation,
-                                    admitted_material_epoch,
+                                    rotation_edge_key,
                                 ) {
+                                    try_send_consumer_watch_terminal(
+                                        &tx,
+                                        &byte_budget,
+                                        "consumer watch authentication retired",
+                                    );
                                     return;
                                 }
                                 None
@@ -2399,20 +2589,33 @@ impl StatelessSessionConsumerClient {
                                     &mut connection.lifecycle,
                                     &tls_config,
                                     &reauthentication,
-                                    admitted_generation,
-                                    admitted_material_epoch,
+                                    rotation_edge_key,
                                 ) {
+                                    try_send_consumer_watch_terminal(
+                                        &tx,
+                                        &byte_budget,
+                                        "consumer watch authentication retired",
+                                    );
                                     return;
                                 }
                                 None
                             },
                         };
                         if let Some(response) = response {
-                            break response;
+                            match response {
+                                Ok(Some(response)) => break Ok(response),
+                                Ok(None) => continue 'watch_reader,
+                                Err(error) => break Err(error),
+                            }
                         }
                     }
                 };
                 if !connection.current(&tls_config, &reauthentication) {
+                    try_send_consumer_watch_terminal(
+                        &tx,
+                        &byte_budget,
+                        "consumer watch authentication retired",
+                    );
                     return;
                 }
                 let entry = match response {
@@ -2426,41 +2629,34 @@ impl StatelessSessionConsumerClient {
                         "consumer watch unavailable".into(),
                     )),
                 };
-                let (entry, byte_count) = match serde_json::to_vec(&entry) {
-                    Ok(encoded) if encoded.len() <= CONSUMER_WATCH_CHANNEL_MAX_BYTES => {
-                        let byte_count = u32::try_from(encoded.len().max(1));
-                        match byte_count {
-                            Ok(byte_count) => (entry, byte_count),
-                            Err(_) => (
-                                Err(StoreError::PayloadTooLarge {
-                                    actual: encoded.len(),
-                                    max: CONSUMER_WATCH_CHANNEL_MAX_BYTES,
-                                }),
-                                1,
-                            ),
-                        }
-                    }
-                    Ok(encoded) => (
-                        Err(StoreError::PayloadTooLarge {
-                            actual: encoded.len(),
-                            max: CONSUMER_WATCH_CHANNEL_MAX_BYTES,
-                        }),
-                        1,
-                    ),
-                    Err(_) => (
-                        Err(StoreError::BackendUnavailable(
-                            "consumer watch unavailable".into(),
-                        )),
-                        1,
-                    ),
+                let entry = match serde_json::to_vec(&entry) {
+                    Ok(encoded) if encoded.len() <= CONSUMER_WATCH_CHANNEL_MAX_BYTES => entry,
+                    Ok(encoded) => Err(StoreError::PayloadTooLarge {
+                        actual: encoded.len(),
+                        max: CONSUMER_WATCH_CHANNEL_MAX_BYTES,
+                    }),
+                    Err(_) => Err(StoreError::BackendUnavailable(
+                        "consumer watch unavailable".into(),
+                    )),
                 };
-                let stop = entry.is_err();
+                let Some(byte_count) = consumer_watch_item_byte_count(&entry) else {
+                    return;
+                };
+                // A terminal peer/protocol/local-encoding error must release
+                // the physical connection and isolated persistent watch slot
+                // even when an unpolled caller has filled the item queue.
+                // Delivery is therefore best-effort and never waits for
+                // receiver capacity once this watch is known to be terminal.
+                if entry.is_err() {
+                    try_send_consumer_watch_item(&tx, &byte_budget, entry, byte_count);
+                    return;
+                }
                 let acquire_permit = Arc::clone(&byte_budget).acquire_many_owned(byte_count);
                 tokio::pin!(acquire_permit);
                 let permit = loop {
                     let permit = tokio::select! {
                         biased;
-                        _ = wait_for_optional_forced_shutdown(&mut force_shutdown) => return,
+                        _ = wait_for_optional_forced_shutdown(&mut force_shutdown, force_shutdown_state) => return,
                         _ = tx.closed() => return,
                         permit = &mut acquire_permit => {
                             match permit {
@@ -2472,6 +2668,11 @@ impl StatelessSessionConsumerClient {
                             let _ = connection
                                 .lifecycle
                                 .retirement(tokio::time::Instant::now());
+                            try_send_consumer_watch_terminal(
+                                &tx,
+                                &byte_budget,
+                                "consumer watch authentication retired",
+                            );
                             return;
                         },
                         _ = reauthentication_changes.changed() => {
@@ -2479,9 +2680,13 @@ impl StatelessSessionConsumerClient {
                                 &mut connection.lifecycle,
                                 &tls_config,
                                 &reauthentication,
-                                admitted_generation,
-                                admitted_material_epoch,
+                                rotation_edge_key,
                             ) {
+                                try_send_consumer_watch_terminal(
+                                    &tx,
+                                    &byte_budget,
+                                    "consumer watch authentication retired",
+                                );
                                 return;
                             }
                             None
@@ -2491,19 +2696,28 @@ impl StatelessSessionConsumerClient {
                                 &mut connection.lifecycle,
                                 &tls_config,
                                 &reauthentication,
-                                admitted_generation,
-                                admitted_material_epoch,
+                                rotation_edge_key,
                             ) {
+                                try_send_consumer_watch_terminal(
+                                    &tx,
+                                    &byte_budget,
+                                    "consumer watch authentication retired",
+                                );
                                 return;
-                                }
-                                None
-                            },
+                            }
+                            None
+                        },
                     };
                     if let Some(permit) = permit {
                         break permit;
                     }
                 };
                 if !connection.current(&tls_config, &reauthentication) {
+                    try_send_consumer_watch_terminal(
+                        &tx,
+                        &byte_budget,
+                        "consumer watch authentication retired",
+                    );
                     return;
                 }
                 let send = tx.send(QueuedConsumerWatchItem {
@@ -2514,12 +2728,17 @@ impl StatelessSessionConsumerClient {
                 let sent = loop {
                     let sent = tokio::select! {
                         biased;
-                        _ = wait_for_optional_forced_shutdown(&mut force_shutdown) => return,
+                        _ = wait_for_optional_forced_shutdown(&mut force_shutdown, force_shutdown_state) => return,
                         result = &mut send => Some(result),
                         _ = tokio::time::sleep_until(connection.lifecycle.retire_at()) => {
                             let _ = connection
                                 .lifecycle
                                 .retirement(tokio::time::Instant::now());
+                            try_send_consumer_watch_terminal(
+                                &tx,
+                                &byte_budget,
+                                "consumer watch authentication retired",
+                            );
                             return;
                         },
                         _ = reauthentication_changes.changed() => {
@@ -2527,9 +2746,13 @@ impl StatelessSessionConsumerClient {
                                 &mut connection.lifecycle,
                                 &tls_config,
                                 &reauthentication,
-                                admitted_generation,
-                                admitted_material_epoch,
+                                rotation_edge_key,
                             ) {
+                                try_send_consumer_watch_terminal(
+                                    &tx,
+                                    &byte_budget,
+                                    "consumer watch authentication retired",
+                                );
                                 return;
                             }
                             None
@@ -2539,19 +2762,31 @@ impl StatelessSessionConsumerClient {
                                 &mut connection.lifecycle,
                                 &tls_config,
                                 &reauthentication,
-                                admitted_generation,
-                                admitted_material_epoch,
+                                rotation_edge_key,
                             ) {
+                                try_send_consumer_watch_terminal(
+                                    &tx,
+                                    &byte_budget,
+                                    "consumer watch authentication retired",
+                                );
                                 return;
-                                }
-                                None
-                            },
+                            }
+                            None
+                        },
                     };
                     if let Some(sent) = sent {
                         break sent;
                     }
                 };
-                if sent.is_err() || stop || !connection.current(&tls_config, &reauthentication) {
+                if sent.is_err() {
+                    return;
+                }
+                if !connection.current(&tls_config, &reauthentication) {
+                    try_send_consumer_watch_terminal(
+                        &tx,
+                        &byte_budget,
+                        "consumer watch authentication retired",
+                    );
                     return;
                 }
             }
@@ -2603,7 +2838,7 @@ struct PersistentConsumerCounters {
     deadline: AtomicU64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum PersistentShutdownPhase {
     Running = 0,
@@ -2621,9 +2856,49 @@ impl PersistentShutdownPhase {
     }
 }
 
-async fn wait_for_forced_shutdown(receiver: &mut watch::Receiver<PersistentShutdownPhase>) {
+fn advance_monotonic_shutdown_phase(
+    state: &AtomicU8,
+    requested: PersistentShutdownPhase,
+) -> PersistentShutdownPhase {
+    let requested = requested as u8;
+    let mut observed = state.load(Ordering::Acquire);
+    while observed < requested {
+        match state.compare_exchange_weak(observed, requested, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => break,
+            Err(current) => observed = current,
+        }
+    }
+    PersistentShutdownPhase::load(state)
+}
+
+fn publish_monotonic_shutdown_phase(
+    state: &AtomicU8,
+    sender: &watch::Sender<PersistentShutdownPhase>,
+    requested: PersistentShutdownPhase,
+) -> PersistentShutdownPhase {
+    advance_monotonic_shutdown_phase(state, requested);
+    // `send_modify` serializes concurrent publishers under the watch
+    // channel's write lock. Re-read the atomic inside that critical section
+    // and only advance the visible value, so a preempted Draining publisher
+    // can never overwrite a concurrently published Forced phase.
+    sender.send_modify(|visible| {
+        let published = PersistentShutdownPhase::load(state);
+        if (*visible as u8) < published as u8 {
+            *visible = published;
+        }
+    });
+    PersistentShutdownPhase::load(state)
+}
+
+async fn wait_for_forced_shutdown(
+    receiver: &mut watch::Receiver<PersistentShutdownPhase>,
+    state: &AtomicU8,
+) {
     loop {
-        if *receiver.borrow_and_update() == PersistentShutdownPhase::Forced {
+        if PersistentShutdownPhase::load(state) == PersistentShutdownPhase::Forced
+            || *receiver.borrow_and_update() == PersistentShutdownPhase::Forced
+        {
             return;
         }
         if receiver.changed().await.is_err() {
@@ -2634,10 +2909,12 @@ async fn wait_for_forced_shutdown(receiver: &mut watch::Receiver<PersistentShutd
 
 async fn wait_for_optional_forced_shutdown(
     receiver: &mut Option<watch::Receiver<PersistentShutdownPhase>>,
+    state: Option<&AtomicU8>,
 ) {
-    match receiver {
-        Some(receiver) => wait_for_forced_shutdown(receiver).await,
-        None => std::future::pending::<()>().await,
+    match (receiver, state) {
+        (Some(receiver), Some(state)) => wait_for_forced_shutdown(receiver, state).await,
+        (None, _) => std::future::pending::<()>().await,
+        (Some(_), None) => std::future::pending::<()>().await,
     }
 }
 
@@ -2663,10 +2940,77 @@ async fn wait_for_shutdown(receiver: &mut watch::Receiver<PersistentShutdownPhas
     }
 }
 
-async fn wait_for_optional_deadline(deadline: Option<tokio::time::Instant>) {
+#[cfg(test)]
+struct ArmedIdleReaperDeadline<'a> {
+    slot: &'a StdMutex<Option<tokio::time::Instant>>,
+    deadline: tokio::time::Instant,
+    armed: bool,
+}
+
+#[cfg(test)]
+impl ArmedIdleReaperDeadline<'_> {
+    fn arm(&mut self) {
+        if self.armed {
+            return;
+        }
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(self.deadline);
+        self.armed = true;
+    }
+}
+
+#[cfg(test)]
+impl Drop for ArmedIdleReaperDeadline<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *slot == Some(self.deadline) {
+            *slot = None;
+        }
+    }
+}
+
+async fn wait_for_optional_deadline(
+    deadline: Option<tokio::time::Instant>,
+    #[cfg(test)] armed_deadline: &StdMutex<Option<tokio::time::Instant>>,
+) {
     match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending::<()>().await,
+        Some(deadline) => {
+            let sleeper = tokio::time::sleep_until(deadline);
+            tokio::pin!(sleeper);
+            #[cfg(test)]
+            {
+                let mut armed = ArmedIdleReaperDeadline {
+                    slot: armed_deadline,
+                    deadline,
+                    armed: false,
+                };
+                std::future::poll_fn(|context| {
+                    let result = std::future::Future::poll(sleeper.as_mut(), context);
+                    armed.arm();
+                    result
+                })
+                .await
+            }
+            #[cfg(not(test))]
+            sleeper.await
+        }
+        None => {
+            #[cfg(test)]
+            {
+                *armed_deadline
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
+            std::future::pending::<()>().await
+        }
     }
 }
 
@@ -2717,6 +3061,28 @@ fn duration_millis(duration: Duration) -> u64 {
 struct PersistentIdleReaper {
     changed: Arc<Notify>,
     task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+#[cfg(test)]
+struct PersistentConsumerTestHooks {
+    material_reaper_processed: Arc<Notify>,
+    idle_reaper_armed_deadline: Arc<StdMutex<Option<tokio::time::Instant>>>,
+    pause_draining_publication: AtomicBool,
+    draining_transition: Notify,
+    resume_draining_publication: Notify,
+}
+
+#[cfg(test)]
+impl PersistentConsumerTestHooks {
+    fn new() -> Self {
+        Self {
+            material_reaper_processed: Arc::new(Notify::new()),
+            idle_reaper_armed_deadline: Arc::new(StdMutex::new(None)),
+            pause_draining_publication: AtomicBool::new(false),
+            draining_transition: Notify::new(),
+            resume_draining_publication: Notify::new(),
+        }
+    }
 }
 
 impl PersistentIdleReaper {
@@ -2770,6 +3136,8 @@ struct PersistentSessionConsumerPool {
     active_calls: AtomicUsize,
     active_watches: AtomicUsize,
     drained_notify: Notify,
+    #[cfg(test)]
+    test_hooks: PersistentConsumerTestHooks,
 }
 
 async fn reap_persistent_consumer_idle(
@@ -2778,7 +3146,11 @@ async fn reap_persistent_consumer_idle(
     mut shutdown: watch::Receiver<PersistentShutdownPhase>,
     mut reauthentication_changes: watch::Receiver<u64>,
     mut material_changes: Option<opc_tls::TlsMaterialStatusReceiver>,
+    #[cfg(test)] material_reaper_processed: Arc<Notify>,
+    #[cfg(test)] idle_reaper_armed_deadline: Arc<StdMutex<Option<tokio::time::Instant>>>,
 ) {
+    #[cfg(test)]
+    let mut material_notification_pending = false;
     loop {
         if *shutdown.borrow_and_update() != PersistentShutdownPhase::Running {
             return;
@@ -2800,6 +3172,14 @@ async fn reap_persistent_consumer_idle(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             pool.prune_idle(&mut idle);
+            #[cfg(test)]
+            if std::mem::take(&mut material_notification_pending) {
+                // Unlike notify_waiters, notify_one retains a permit if the
+                // test's Notified future has not reached its first poll yet.
+                // The acknowledgement is still exact: it is emitted only
+                // after this selected material event has reached prune_idle.
+                material_reaper_processed.notify_one();
+            }
             idle.iter()
                 .map(|connection| {
                     connection
@@ -2820,9 +3200,18 @@ async fn reap_persistent_consumer_idle(
                     return;
                 }
             }
-            _ = wait_consumer_material_change(&mut material_changes) => {}
+            _ = wait_consumer_material_change(&mut material_changes) => {
+                #[cfg(test)]
+                {
+                    material_notification_pending = true;
+                }
+            }
             _ = &mut idle_changed => {}
-            _ = wait_for_optional_deadline(next_deadline) => {}
+            _ = wait_for_optional_deadline(
+                next_deadline,
+                #[cfg(test)]
+                &idle_reaper_armed_deadline,
+            ) => {}
         }
     }
 }
@@ -2846,6 +3235,43 @@ struct PersistentWatchRuntime {
 
 struct PersistentCallActivity {
     pool: Arc<PersistentSessionConsumerPool>,
+}
+
+/// A physical request lane is either returned to the idle pool or counted
+/// exactly once as a discarded lane, including when its caller future is
+/// cancelled while a protocol operation is pending.
+struct PersistentCheckedOutConnection {
+    pool: Arc<PersistentSessionConsumerPool>,
+    connection: Option<ConsumerConnection>,
+}
+
+impl PersistentCheckedOutConnection {
+    fn new(pool: Arc<PersistentSessionConsumerPool>, connection: ConsumerConnection) -> Self {
+        Self {
+            pool,
+            connection: Some(connection),
+        }
+    }
+
+    fn connection_mut(&mut self) -> &mut ConsumerConnection {
+        self.connection
+            .as_mut()
+            .expect("checked-out consumer connection is returned at most once")
+    }
+
+    fn return_idle(mut self) {
+        if let Some(connection) = self.connection.take() {
+            self.pool.return_idle(connection);
+        }
+    }
+}
+
+impl Drop for PersistentCheckedOutConnection {
+    fn drop(&mut self) {
+        if self.connection.take().is_some() {
+            counter_increment(&self.pool.counters.reconnects);
+        }
+    }
 }
 
 struct PersistentPrewarmActivity {
@@ -2927,6 +3353,10 @@ impl PersistentSessionConsumerPool {
             shutdown,
             reauthentication_changes,
             material_changes,
+            #[cfg(test)]
+            Arc::clone(&self.test_hooks.material_reaper_processed),
+            #[cfg(test)]
+            Arc::clone(&self.test_hooks.idle_reaper_armed_deadline),
         )));
     }
 
@@ -3211,7 +3641,7 @@ impl PersistentSessionConsumerPool {
         counter_increment(&self.counters.setup_attempts);
         let result = self
             .client
-            .connect(setup_deadline, true, Some(&self.counters))
+            .connect(setup_deadline, true, Some(&self.counters), false)
             .await;
         // Tokio polls a timed inner future before its deadline future. Reject
         // setup that completed while this task was descheduled before the
@@ -3321,6 +3751,9 @@ impl PersistentSessionConsumerClient {
         config: PersistentSessionConsumerConfig,
     ) -> Result<Self, PersistentSessionConsumerConfigError> {
         config.validate()?;
+        if !valid_consumer_operation_timeout(client.operation_timeout) {
+            return Err(PersistentSessionConsumerConfigError::Timing);
+        }
         let (shutdown_tx, _) = watch::channel(PersistentShutdownPhase::Running);
         // A per-pool random starting point prevents independently constructed
         // clients from aligning their otherwise bounded reconnect sequences.
@@ -3356,6 +3789,8 @@ impl PersistentSessionConsumerClient {
                 active_calls: AtomicUsize::new(0),
                 active_watches: AtomicUsize::new(0),
                 drained_notify: Notify::new(),
+                #[cfg(test)]
+                test_hooks: PersistentConsumerTestHooks::new(),
             }),
         })
     }
@@ -3408,12 +3843,7 @@ impl PersistentSessionConsumerClient {
         let request_id = request.request_id();
         match self.execute_classified(request).await {
             Ok(response) => Ok(response),
-            Err(SessionConsumerCallError::BeforeCallWrite(cause)) => {
-                Err(PersistentSessionConsumerExecuteError::NotTransmitted { cause })
-            }
-            Err(SessionConsumerCallError::MayHaveSent(_)) => {
-                Err(PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id })
-            }
+            Err(error) => Err(persistent_execute_error(request_id, error)),
         }
     }
 
@@ -3690,6 +4120,10 @@ impl PersistentSessionConsumerClient {
     }
 
     /// Open a watch using slots isolated from normal request lanes.
+    ///
+    /// Exhaustion of either this pool's watch slots or the shared physical
+    /// admission for its stateless clone lineage is reported as
+    /// [`SessionConsumerClientError::Overloaded`].
     pub async fn open_watch(
         &self,
         start_sequence: u64,
@@ -3739,11 +4173,10 @@ impl PersistentSessionConsumerClient {
                 Some(runtime),
             ) => upstream,
         }
-        .map_err(|_| {
+        .map_err(|error| {
             counter_increment(&self.pool.counters.setup_failures);
-            self.pool
-                .record_error(SessionConsumerClientError::Unavailable, false);
-            SessionConsumerClientError::Unavailable
+            self.pool.record_error(error, false);
+            error
         })?;
         counter_increment(&self.pool.counters.setup_successes);
         if self.pool.phase() != PersistentShutdownPhase::Running {
@@ -3800,13 +4233,13 @@ impl PersistentSessionConsumerClient {
                 }
                 None => tokio::select! {
                     biased;
-                    _ = wait_for_forced_shutdown(&mut shutdown) => {
+                    _ = wait_for_forced_shutdown(&mut shutdown, &self.pool.shutdown_phase) => {
                         Err(SessionConsumerClientError::ShuttingDown)
                     }
                     result = self.pool.connect(pre_request_deadline) => result,
                 },
             };
-            let mut connection = match connection {
+            let connection = match connection {
                 Ok(connection) => connection,
                 Err(error)
                     if attempt < self.pool.config.connect_attempts
@@ -3821,7 +4254,7 @@ impl PersistentSessionConsumerClient {
                     if !delay.is_zero() && tokio::time::Instant::now() < deadline {
                         tokio::select! {
                             biased;
-                            _ = wait_for_forced_shutdown(&mut shutdown) => {
+                            _ = wait_for_forced_shutdown(&mut shutdown, &self.pool.shutdown_phase) => {
                                 return Err(SessionConsumerCallError::BeforeCallWrite(
                                     SessionConsumerClientError::ShuttingDown,
                                 ));
@@ -3835,23 +4268,25 @@ impl PersistentSessionConsumerClient {
                 }
                 Err(error) => return Err(SessionConsumerCallError::BeforeCallWrite(error)),
             };
+            let mut connection =
+                PersistentCheckedOutConnection::new(Arc::clone(&self.pool), connection);
             ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
                 .map_err(SessionConsumerCallError::BeforeCallWrite)?;
             let result = self
                 .pool
                 .client
                 .execute_on_connection(
-                    &mut connection,
+                    connection.connection_mut(),
                     request,
                     pre_request_deadline,
                     pre_request_budget_active,
                     deadline,
-                    Some(shutdown.clone()),
+                    Some((shutdown.clone(), &self.pool.shutdown_phase)),
                 )
                 .await;
             match result {
                 Ok(response) => {
-                    self.pool.return_idle(connection);
+                    connection.return_idle();
                     return Ok(response);
                 }
                 Err(SessionConsumerCallError::BeforeCallWrite(error))
@@ -3862,12 +4297,12 @@ impl PersistentSessionConsumerClient {
                                 | SessionConsumerClientError::Deadline
                         ) =>
                 {
-                    counter_increment(&self.pool.counters.reconnects);
+                    drop(connection);
                     let delay = self.pool.reconnect_delay();
                     if !delay.is_zero() && tokio::time::Instant::now() < deadline {
                         tokio::select! {
                             biased;
-                            _ = wait_for_forced_shutdown(&mut shutdown) => {
+                            _ = wait_for_forced_shutdown(&mut shutdown, &self.pool.shutdown_phase) => {
                                 return Err(SessionConsumerCallError::BeforeCallWrite(
                                     SessionConsumerClientError::ShuttingDown,
                                 ));
@@ -4030,15 +4465,34 @@ impl PersistentSessionConsumerClient {
                 .activity
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if activity.phase == PersistentShutdownPhase::Running {
-                activity.phase = PersistentShutdownPhase::Draining;
-                self.pool
-                    .shutdown_phase
-                    .store(PersistentShutdownPhase::Draining as u8, Ordering::Release);
+            let phase = advance_monotonic_shutdown_phase(
+                &self.pool.shutdown_phase,
+                PersistentShutdownPhase::Draining,
+            );
+            if (activity.phase as u8) < phase as u8 {
+                activity.phase = phase;
             }
-            (activity.calls, activity.watches, activity.phase)
+            (activity.calls, activity.watches, phase)
         };
-        self.pool.shutdown_tx.send_replace(published_phase);
+        #[cfg(test)]
+        if self
+            .pool
+            .test_hooks
+            .pause_draining_publication
+            .swap(false, Ordering::AcqRel)
+        {
+            self.pool.test_hooks.draining_transition.notify_waiters();
+            self.pool
+                .test_hooks
+                .resume_draining_publication
+                .notified()
+                .await;
+        }
+        publish_monotonic_shutdown_phase(
+            &self.pool.shutdown_phase,
+            &self.pool.shutdown_tx,
+            published_phase,
+        );
         self.pool.pending.close();
         self.pool.lanes.close();
         self.pool.watches.close();
@@ -4069,15 +4523,19 @@ impl PersistentSessionConsumerClient {
                 .activity
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            activity.phase = PersistentShutdownPhase::Forced;
-            self.pool
-                .shutdown_phase
-                .store(PersistentShutdownPhase::Forced as u8, Ordering::Release);
+            let phase = publish_monotonic_shutdown_phase(
+                &self.pool.shutdown_phase,
+                &self.pool.shutdown_tx,
+                PersistentShutdownPhase::Forced,
+            );
+            activity.phase = phase;
             (activity.calls, activity.watches)
         };
-        self.pool
-            .shutdown_tx
-            .send_replace(PersistentShutdownPhase::Forced);
+        publish_monotonic_shutdown_phase(
+            &self.pool.shutdown_phase,
+            &self.pool.shutdown_tx,
+            PersistentShutdownPhase::Forced,
+        );
         // This independently retires stateless watch reader tasks after the
         // grace period even if the returned stream is held without polling.
         let _ = self.pool.client.request_reauthentication();
@@ -4184,6 +4642,8 @@ pub struct SessionQuorumConsumerServer {
     operation_timeout: Duration,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
+    #[cfg(test)]
+    final_admission_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl fmt::Debug for SessionQuorumConsumerServer {
@@ -4217,7 +4677,15 @@ impl SessionQuorumConsumerServer {
             operation_timeout: DEFAULT_CONSUMER_OPERATION_TIMEOUT,
             lifecycle_policy: ConnectionLifecyclePolicy::default(),
             reauthentication: SessionReauthenticationControl::new(),
+            #[cfg(test)]
+            final_admission_test_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_final_admission_test_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.final_admission_test_hook = Some(hook);
+        self
     }
 
     /// Set the maximum simultaneous live consumer connections, including TLS
@@ -4292,6 +4760,8 @@ impl SessionQuorumConsumerServer {
         let operation_timeout = self.operation_timeout;
         let lifecycle_policy = self.lifecycle_policy;
         let reauthentication = self.reauthentication;
+        #[cfg(test)]
+        let final_admission_test_hook = self.final_admission_test_hook;
         let accept_cancellation = Arc::clone(&cancellation);
         let accept_connection_tasks = Arc::clone(&connection_tasks);
         let accept_handle = tokio::spawn(async move {
@@ -4309,6 +4779,8 @@ impl SessionQuorumConsumerServer {
                 let authorizer = authorizer.clone();
                 let cancellation = Arc::clone(&accept_cancellation);
                 let reauthentication = reauthentication.clone();
+                #[cfg(test)]
+                let final_admission_test_hook = final_admission_test_hook.clone();
                 let mut connection_tasks = accept_connection_tasks.lock().await;
                 // The semaphore limits live connections, but a JoinSet keeps
                 // completed task records until reaped. Drain those records on
@@ -4328,6 +4800,8 @@ impl SessionQuorumConsumerServer {
                         lifecycle_policy,
                         reauthentication,
                         cancellation,
+                        #[cfg(test)]
+                        final_admission_test_hook,
                     )
                     .await;
                 });
@@ -4350,7 +4824,7 @@ impl SessionQuorumConsumerServer {
             || self.max_frame_size > MAX_NEGOTIATED_FRAME_SIZE
             || self.idle_timeout.is_zero()
             || self.idle_timeout > DEFAULT_CONSUMER_IDLE_TIMEOUT
-            || self.operation_timeout.is_zero()
+            || !valid_consumer_operation_timeout(self.operation_timeout)
             || self
                 .lifecycle_policy
                 .validate_at(tokio::time::Instant::now())
@@ -4409,6 +4883,7 @@ async fn handle_server_connection(
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
     cancellation: Arc<AtomicBool>,
+    #[cfg(test)] final_admission_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<(), ProtocolError> {
     // Revision 2 reuses a socket for small request/response frames. Disable
     // Nagle on both peers so a warm exchange cannot inherit the platform's
@@ -4438,6 +4913,7 @@ async fn handle_server_connection(
     let identity = authorizer
         .authorize(peer.spiffe_id())
         .map_err(|_| ProtocolError::Authentication)?;
+    let rotation_edge_key = handshake.directed_lifecycle_edge_key(b"consumer", peer.spiffe_id());
     let (mut reader, mut writer) = tokio::io::split(tls);
     let hello = read_consumer_frame_within::<_, ConsumerWireRequest>(
         &mut reader,
@@ -4464,9 +4940,12 @@ async fn handle_server_connection(
     let admission = handshake
         .admit()
         .map_err(|_| ProtocolError::Authentication)?;
-    if generation != reauthentication.generation()
-        || admission.epoch() != tls_config.material_status().epoch()
-    {
+    if !consumer_fresh_admission_is_current(
+        generation,
+        admission.epoch(),
+        reauthentication.generation(),
+        tls_config.material_status().epoch(),
+    ) {
         return Err(ProtocolError::Authentication);
     }
     let mut lifecycle = ConnectionLifecycle::new(
@@ -4486,25 +4965,21 @@ async fn handle_server_connection(
         Some(admission.epoch()),
     )
     .map_err(|_| ProtocolError::InvalidWireValue)?;
-    lifecycle.observe_rotation(
-        tokio::time::Instant::now(),
-        reauthentication.generation(),
-        Some(tls_config.material_status().epoch()),
-        b"session-quorum-consumer",
-    );
-    if lifecycle.retirement(tokio::time::Instant::now()).is_some() {
-        return Err(ProtocolError::Authentication);
-    }
-    let admitted_generation = generation;
-    let admitted_material_epoch = admission.epoch();
     let mut reauthentication_changes = reauthentication.subscribe();
     let mut material_changes = Some(tls_config.subscribe_material_changes());
-    if !server_connection_current(
-        &mut lifecycle,
-        &tls_config,
-        &reauthentication,
-        admitted_generation,
-        admitted_material_epoch,
+    // Linearize fresh server admission immediately before publishing
+    // HelloAck. A later rotation applies to an admitted lane and is observed
+    // through the subscribed lifecycle path below; stale fresh handshakes are
+    // closed without an acknowledgement.
+    #[cfg(test)]
+    if let Some(hook) = &final_admission_test_hook {
+        hook();
+    }
+    if !consumer_fresh_admission_is_current(
+        generation,
+        admission.epoch(),
+        reauthentication.generation(),
+        tls_config.material_status().epoch(),
     ) {
         return Err(ProtocolError::Authentication);
     }
@@ -4581,8 +5056,7 @@ async fn handle_server_connection(
                             &mut lifecycle,
                             &tls_config,
                             &reauthentication,
-                            admitted_generation,
-                            admitted_material_epoch,
+                            rotation_edge_key,
                         ) {
                             return Ok(());
                         }
@@ -4593,8 +5067,7 @@ async fn handle_server_connection(
                             &mut lifecycle,
                             &tls_config,
                             &reauthentication,
-                            admitted_generation,
-                            admitted_material_epoch,
+                            rotation_edge_key,
                         ) {
                             return Ok(());
                         }
@@ -4620,8 +5093,7 @@ async fn handle_server_connection(
             &mut lifecycle,
             &tls_config,
             &reauthentication,
-            admitted_generation,
-            admitted_material_epoch,
+            rotation_edge_key,
         ) {
             return Ok(());
         }
@@ -4717,6 +5189,7 @@ async fn handle_server_connection(
                         tokio::time::Instant::now(),
                         reauthentication.generation(),
                         tls_config.material_status().epoch(),
+                        rotation_edge_key,
                     );
                     None
                 }
@@ -4726,6 +5199,7 @@ async fn handle_server_connection(
                         tokio::time::Instant::now(),
                         reauthentication.generation(),
                         tls_config.material_status().epoch(),
+                        rotation_edge_key,
                     );
                     None
                 }
@@ -4739,6 +5213,7 @@ async fn handle_server_connection(
             tokio::time::Instant::now(),
             reauthentication.generation(),
             tls_config.material_status().epoch(),
+            rotation_edge_key,
         );
         let hard_deadline = lifecycle
             .hard_deadline()
@@ -4819,8 +5294,9 @@ async fn handle_server_connection(
                                 &mut lifecycle,
                                 tokio::time::Instant::now(),
                                 reauthentication.generation(),
-                                tls_config.material_status().epoch(),
-                            );
+                        tls_config.material_status().epoch(),
+                        rotation_edge_key,
+                    );
                             None
                         }
                         _ = wait_consumer_material_change(&mut material_changes) => {
@@ -4828,8 +5304,9 @@ async fn handle_server_connection(
                                 &mut lifecycle,
                                 tokio::time::Instant::now(),
                                 reauthentication.generation(),
-                                tls_config.material_status().epoch(),
-                            );
+                        tls_config.material_status().epoch(),
+                        rotation_edge_key,
+                    );
                             None
                         }
                     };
@@ -4849,6 +5326,7 @@ async fn handle_server_connection(
                 tokio::time::Instant::now(),
                 reauthentication.generation(),
                 tls_config.material_status().epoch(),
+                rotation_edge_key,
             );
             let hard_deadline = lifecycle
                 .hard_deadline()
@@ -4866,7 +5344,12 @@ async fn handle_server_connection(
             let initial_hard_deadline = lifecycle
                 .hard_deadline()
                 .map_err(|_| ProtocolError::InvalidWireValue)?;
-            let response_write_deadline = request_deadline.min(initial_hard_deadline);
+            let active_frame_deadline = tokio::time::Instant::now()
+                .checked_add(idle_timeout)
+                .ok_or(ProtocolError::InvalidWireValue)?;
+            let response_write_deadline = request_deadline
+                .min(initial_hard_deadline)
+                .min(active_frame_deadline);
             let response_write = write_consumer_response_until(
                 &mut writer,
                 ConsumerWireResponse::Response(ConsumerCallResponse {
@@ -4916,8 +5399,9 @@ async fn handle_server_connection(
                             &mut lifecycle,
                             tokio::time::Instant::now(),
                             reauthentication.generation(),
-                            tls_config.material_status().epoch(),
-                        );
+                        tls_config.material_status().epoch(),
+                        rotation_edge_key,
+                    );
                         None
                     }
                     _ = wait_consumer_material_change(&mut material_changes) => {
@@ -4925,8 +5409,9 @@ async fn handle_server_connection(
                             &mut lifecycle,
                             tokio::time::Instant::now(),
                             reauthentication.generation(),
-                            tls_config.material_status().epoch(),
-                        );
+                        tls_config.material_status().epoch(),
+                        rotation_edge_key,
+                    );
                         None
                     }
                 };
@@ -4956,8 +5441,7 @@ async fn handle_server_connection(
                     &mut lifecycle,
                     &tls_config,
                     &reauthentication,
-                    admitted_generation,
-                    admitted_material_epoch,
+                    rotation_edge_key,
                 )
             {
                 return Ok(());
@@ -4981,9 +5465,8 @@ async fn handle_server_connection(
                         &mut lifecycle,
                         &tls_config,
                         &reauthentication,
-                        admitted_generation,
-                        admitted_material_epoch,
-                    ) {
+                            rotation_edge_key,
+                        ) {
                         return Ok(());
                     }
                     continue;
@@ -4993,9 +5476,8 @@ async fn handle_server_connection(
                         &mut lifecycle,
                         &tls_config,
                         &reauthentication,
-                        admitted_generation,
-                        admitted_material_epoch,
-                    ) {
+                            rotation_edge_key,
+                        ) {
                         return Ok(());
                     }
                     continue;
@@ -5009,8 +5491,7 @@ async fn handle_server_connection(
                     &mut lifecycle,
                     &tls_config,
                     &reauthentication,
-                    admitted_generation,
-                    admitted_material_epoch,
+                    rotation_edge_key,
                 )
             {
                 return Ok(());
@@ -5018,6 +5499,11 @@ async fn handle_server_connection(
             let watch_write_deadline = tokio::time::Instant::now()
                 .checked_add(operation_timeout)
                 .ok_or(ProtocolError::InvalidWireValue)?
+                .min(
+                    tokio::time::Instant::now()
+                        .checked_add(idle_timeout)
+                        .ok_or(ProtocolError::InvalidWireValue)?,
+                )
                 .min(
                     lifecycle
                         .hard_deadline()
@@ -5042,8 +5528,7 @@ async fn handle_server_connection(
                         &mut lifecycle,
                         &tls_config,
                         &reauthentication,
-                        admitted_generation,
-                        admitted_material_epoch,
+                        rotation_edge_key,
                     )
                 {
                     return Ok(());
@@ -5081,8 +5566,9 @@ async fn handle_server_connection(
                             &mut lifecycle,
                             tokio::time::Instant::now(),
                             reauthentication.generation(),
-                            tls_config.material_status().epoch(),
-                        );
+                        tls_config.material_status().epoch(),
+                        rotation_edge_key,
+                    );
                         None
                     }
                     _ = wait_consumer_material_change(&mut material_changes) => {
@@ -5090,8 +5576,9 @@ async fn handle_server_connection(
                             &mut lifecycle,
                             tokio::time::Instant::now(),
                             reauthentication.generation(),
-                            tls_config.material_status().epoch(),
-                        );
+                        tls_config.material_status().epoch(),
+                        rotation_edge_key,
+                    );
                         None
                     }
                 };
@@ -5101,8 +5588,7 @@ async fn handle_server_connection(
                         &mut lifecycle,
                         &tls_config,
                         &reauthentication,
-                        admitted_generation,
-                        admitted_material_epoch,
+                        rotation_edge_key,
                     ) {
                         return Ok(());
                     }
@@ -5237,23 +5723,29 @@ mod tests {
     use std::io;
     use std::num::NonZeroU32;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::task::{Context, Poll};
     use std::time::Duration;
 
     use super::{
-        classify_call_write_error, complete_before_deadline, consumer_response_fits,
-        decode_consumer_frame_payload, ensure_pre_request_budget_remaining, exact_correlation,
-        lease_response, mutation_response, read_authenticated_consumer_frame_within,
-        response_matches_operation, BorrowedConsumerCall, BorrowedConsumerCallResponse,
-        BorrowedConsumerWireRequest, BorrowedConsumerWireResponse, ConsumerCall,
+        classify_call_write_error, complete_before_deadline, consumer_fresh_admission_is_current,
+        consumer_response_fits, consumer_watch_item_byte_count, decode_consumer_frame_payload,
+        ensure_pre_request_budget_remaining, exact_correlation, lease_response, mutation_response,
+        persistent_execute_error, publish_monotonic_shutdown_phase,
+        read_authenticated_consumer_frame_within, response_matches_operation,
+        server_connection_current, try_send_consumer_watch_item, valid_consumer_operation_timeout,
+        wait_for_forced_shutdown, BorrowedConsumerCall, BorrowedConsumerCallResponse,
+        BorrowedConsumerWireRequest, BorrowedConsumerWireResponse, BoxStream, ConsumerCall,
         ConsumerCallResponse, ConsumerConnection, ConsumerOperationKind, ConsumerWireRequest,
-        ConsumerWireResponse, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-        PersistentSessionConsumerConfigError, SessionConsumerAuthorizationError,
-        SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerClientError,
-        SessionConsumerLeaseMutationError, SessionConsumerMutationError,
-        StatelessSessionConsumerClient, DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+        ConsumerWireResponse, PersistentCheckedOutConnection, PersistentSessionConsumerClient,
+        PersistentSessionConsumerConfig, PersistentSessionConsumerConfigError,
+        PersistentSessionConsumerExecuteError, PersistentShutdownPhase, QueuedConsumerWatchItem,
+        SessionConsumerAuthorizationError, SessionConsumerAuthorizer, SessionConsumerCallError,
+        SessionConsumerChange, SessionConsumerClientError, SessionConsumerIdentity,
+        SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionConsumerRejection,
+        SessionQuorumConsumer, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
+        DEFAULT_CONSUMER_OPERATION_TIMEOUT, DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
@@ -5272,17 +5764,71 @@ mod tests {
         SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerLeaseError,
         SessionConsumerOperation, SessionConsumerRequest, SessionConsumerRequestId,
         SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionKey,
-        SessionKeyType, StateClass, StateType, StoredSessionRecord,
+        SessionKeyType, StateClass, StateType, StoreError, StoredSessionRecord,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
     use tokio::io::{AsyncWrite, AsyncWriteExt};
+    use tokio::sync::{mpsc, watch, Semaphore};
 
     use crate::lifecycle::{
         ConnectionLifecycle, ConnectionLifecyclePolicy, RetirementReason,
         SessionReauthenticationControl,
     };
     use crate::protocol::MAX_NEGOTIATED_FRAME_SIZE;
-    use crate::test_support::RotatableClientMaterial;
+    use crate::test_support::{RotatableClientMaterial, RotatableServerMaterial};
+
+    struct RejectingTestConsumer;
+
+    #[async_trait::async_trait]
+    impl SessionQuorumConsumer for RejectingTestConsumer {
+        async fn execute(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _request: SessionConsumerRequest,
+        ) -> SessionConsumerResponse {
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+        }
+
+        async fn watch(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _scope: SessionConsumerScope,
+            _start_sequence: u64,
+        ) -> Result<
+            BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+            SessionConsumerRejection,
+        > {
+            Err(SessionConsumerRejection::Unavailable)
+        }
+    }
+
+    struct CountingRejectingTestConsumer {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionQuorumConsumer for CountingRejectingTestConsumer {
+        async fn execute(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _request: SessionConsumerRequest,
+        ) -> SessionConsumerResponse {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+        }
+
+        async fn watch(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _scope: SessionConsumerScope,
+            _start_sequence: u64,
+        ) -> Result<
+            BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+            SessionConsumerRejection,
+        > {
+            Err(SessionConsumerRejection::Unavailable)
+        }
+    }
 
     fn scope() -> SessionConsumerScope {
         SessionConsumerScope::new(SessionConsensusIdentity::new(
@@ -5292,11 +5838,56 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn nonblocking_watch_terminal_reserves_its_exact_queue_bytes() {
+        let item: Result<SessionConsumerChange, StoreError> = Err(StoreError::BackendUnavailable(
+            "consumer watch authentication retired".into(),
+        ));
+        let byte_count = consumer_watch_item_byte_count(&item)
+            .expect("fixed redacted terminal item has a bounded encoded size");
+        assert!(byte_count > 1);
+        let insufficient_size = usize::try_from(byte_count - 1).expect("u32 fits usize");
+        let exact_size = usize::try_from(byte_count).expect("u32 fits usize");
+
+        let (sender, mut receiver) = mpsc::channel::<QueuedConsumerWatchItem>(2);
+        let insufficient = Arc::new(Semaphore::new(insufficient_size));
+        try_send_consumer_watch_item(
+            &sender,
+            &insufficient,
+            Err(StoreError::BackendUnavailable(
+                "consumer watch authentication retired".into(),
+            )),
+            byte_count,
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(insufficient.available_permits(), insufficient_size);
+
+        let exact = Arc::new(Semaphore::new(exact_size));
+        try_send_consumer_watch_item(&sender, &exact, item, byte_count);
+        assert_eq!(exact.available_permits(), 0);
+        let queued = receiver
+            .try_recv()
+            .expect("an exact-size terminal item is admitted without waiting");
+        assert!(queued.item.is_err());
+        drop(queued);
+        assert_eq!(exact.available_permits(), exact_size);
+    }
+
     fn spiffe(suffix: &str) -> SpiffeId {
         SpiffeId::new(format!(
             "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/{suffix}"
         ))
         .expect("test SPIFFE ID")
+    }
+
+    fn material_spiffe(suffix: &str) -> SpiffeId {
+        SpiffeId::new(format!(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/consumer/instance/{suffix}"
+        ))
+        .expect("test material SPIFFE ID")
     }
 
     fn mutation_request(request_id: SessionConsumerRequestId) -> SessionConsumerRequest {
@@ -5354,6 +5945,26 @@ mod tests {
             } else {
                 Poll::Ready(Ok(()))
             }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct PendingWriter;
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -5455,11 +6066,15 @@ mod tests {
                 reader: Box::new(tokio::io::empty()),
                 writer,
                 lifecycle,
-                admitted_generation: generation,
-                admitted_material_epoch: material_epoch,
+                rotation_edge_key: client
+                    .tls_config
+                    .begin_handshake()
+                    .expect("test client handshake snapshot")
+                    .directed_lifecycle_edge_key(b"consumer", &client.expected_server_identity),
                 next_correlation: NonZeroU32::MIN,
                 calls: 0,
                 idle_deadline,
+                _physical_admission: None,
             },
             observed_lifecycle,
         )
@@ -5485,6 +6100,35 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len();
         assert_eq!(actual, expected, "raw idle storage did not converge");
+    }
+
+    async fn wait_for_idle_reaper_armed_deadline(
+        client: &PersistentSessionConsumerClient,
+        expected: tokio::time::Instant,
+    ) {
+        for _ in 0..32 {
+            let actual = *client
+                .pool
+                .test_hooks
+                .idle_reaper_armed_deadline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if actual == Some(expected) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        let actual = *client
+            .pool
+            .test_hooks
+            .idle_reaper_armed_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            actual,
+            Some(expected),
+            "idle reaper did not arm the exact shortened lifecycle deadline"
+        );
     }
 
     #[tokio::test]
@@ -5548,6 +6192,68 @@ mod tests {
                     if retry_id == request_id
             ));
             assert!(writer.accepted > 0, "{phase} crossed the write boundary");
+        }
+    }
+
+    #[test]
+    fn persistent_effectful_helper_matrix_preserves_before_write_and_unknown_ids() {
+        let before =
+            SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol);
+        let may_have_sent =
+            SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Deadline);
+        for family in ["cas", "delete", "refresh", "mutating_batch"] {
+            let request_id = SessionConsumerRequestId::new();
+            assert!(
+                matches!(
+                    persistent_execute_error(request_id, before),
+                    PersistentSessionConsumerExecuteError::NotTransmitted {
+                        cause: SessionConsumerClientError::Protocol
+                    }
+                ),
+                "{family} raw persistent execute remains safely retryable before write"
+            );
+            assert!(
+                matches!(
+                    mutation_response::<()>(request_id, Err(before), |_| None),
+                    Err(SessionConsumerMutationError::NotTransmitted {
+                        cause: SessionConsumerClientError::Protocol
+                    })
+                ),
+                "{family} helper remains safely retryable before write"
+            );
+            assert!(matches!(
+                persistent_execute_error(request_id, may_have_sent),
+                PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id: retry_id }
+                    if retry_id == request_id
+            ));
+            assert!(
+                matches!(
+                    mutation_response::<()>(request_id, Err(may_have_sent), |_| None),
+                    Err(SessionConsumerMutationError::OutcomeUnknown { request_id: retry_id })
+                        if retry_id == request_id
+                ),
+                "{family} has no automatic replay after a possible write"
+            );
+        }
+        for family in ["acquire", "renew", "release"] {
+            let request_id = SessionConsumerRequestId::new();
+            assert!(
+                matches!(
+                    lease_response::<()>(request_id, Err(before), |_| None),
+                    Err(SessionConsumerLeaseMutationError::NotTransmitted {
+                        cause: SessionConsumerClientError::Protocol
+                    })
+                ),
+                "{family} helper remains safely retryable before write"
+            );
+            assert!(
+                matches!(
+                    lease_response::<()>(request_id, Err(may_have_sent), |_| None),
+                    Err(SessionConsumerLeaseMutationError::OutcomeUnknown { request_id: retry_id })
+                        if retry_id == request_id
+                ),
+                "{family} has no automatic replay after a possible write"
+            );
         }
     }
 
@@ -5808,6 +6514,210 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn consumer_operation_timeout_accepts_exact_limit_and_rejects_one_over() {
+        assert!(valid_consumer_operation_timeout(
+            DEFAULT_CONSUMER_OPERATION_TIMEOUT
+        ));
+        assert!(!valid_consumer_operation_timeout(
+            DEFAULT_CONSUMER_OPERATION_TIMEOUT + Duration::from_nanos(1)
+        ));
+        assert!(!valid_consumer_operation_timeout(Duration::ZERO));
+
+        let control = SessionReauthenticationControl::new();
+        let (client, _material) = stateless_test_client(control);
+        assert!(PersistentSessionConsumerClient::try_from_stateless(
+            client
+                .clone()
+                .with_operation_timeout(DEFAULT_CONSUMER_OPERATION_TIMEOUT),
+            PersistentSessionConsumerConfig::default(),
+        )
+        .is_ok());
+        assert!(matches!(
+            PersistentSessionConsumerClient::try_from_stateless(
+                client.with_operation_timeout(
+                    DEFAULT_CONSUMER_OPERATION_TIMEOUT + Duration::from_nanos(1),
+                ),
+                PersistentSessionConsumerConfig::default(),
+            ),
+            Err(PersistentSessionConsumerConfigError::Timing)
+        ));
+
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let resolving = Arc::clone(&resolver_calls);
+        let control = SessionReauthenticationControl::new();
+        let (_base, material) = stateless_test_client(control);
+        let client = StatelessSessionConsumerClient::new_with_resolver(
+            Arc::new(move || {
+                resolving.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok("127.0.0.1:9".parse().expect("test address")) })
+            }),
+            rustls_pki_types::ServerName::try_from("consumer.test").expect("test TLS server name"),
+            spiffe("server"),
+            scope(),
+            material.config(),
+        )
+        .with_operation_timeout(DEFAULT_CONSUMER_OPERATION_TIMEOUT + Duration::from_nanos(1));
+        assert_eq!(
+            client.capabilities().await,
+            Err(SessionConsumerClientError::Protocol)
+        );
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+
+        let server_material = RotatableServerMaterial::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/consumer/instance/server",
+        );
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [spiffe("application")],
+            std::iter::empty(),
+        )
+        .expect("test authorizer");
+        assert!(SessionQuorumConsumerServer::new(
+            Arc::new(RejectingTestConsumer),
+            server_material.config(),
+            authorizer.clone(),
+        )
+        .with_operation_timeout(DEFAULT_CONSUMER_OPERATION_TIMEOUT)
+        .validate()
+        .is_ok());
+        let error = SessionQuorumConsumerServer::new(
+            Arc::new(RejectingTestConsumer),
+            server_material.config(),
+            authorizer,
+        )
+        .with_operation_timeout(DEFAULT_CONSUMER_OPERATION_TIMEOUT + Duration::from_nanos(1))
+        .validate()
+        .expect_err("one nanosecond over the server operation cap is rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn final_admission_samples_reject_rotated_client_and_server_handshakes() {
+        let client_identity = material_spiffe("application-0");
+        let server_identity = material_spiffe("server");
+
+        let client_material = Arc::new(RotatableClientMaterial::new(client_identity.as_str()));
+        let client_side_dispatches = Arc::new(AtomicUsize::new(0));
+        let client_side_service = Arc::new(CountingRejectingTestConsumer {
+            calls: Arc::clone(&client_side_dispatches),
+        });
+        let client_side_authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity.clone()],
+            std::iter::empty(),
+        )
+        .expect("consumer final-admission authorizer");
+        let (client_side_server, client_side_address) = SessionQuorumConsumerServer::new(
+            client_side_service,
+            client_material.trusted_server_config(server_identity.as_str()),
+            client_side_authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for client final-admission race");
+        let client_hook_calls = Arc::new(AtomicUsize::new(0));
+        let client_hook_material = Arc::clone(&client_material);
+        let client_hook_count = Arc::clone(&client_hook_calls);
+        let client = StatelessSessionConsumerClient::new(
+            client_side_address,
+            rustls_pki_types::ServerName::IpAddress(client_side_address.ip().into()),
+            server_identity.clone(),
+            scope(),
+            client_material.config(),
+        )
+        .with_final_admission_test_hook(Arc::new(move || {
+            client_hook_count.fetch_add(1, Ordering::SeqCst);
+            client_hook_material.rotate();
+        }));
+        let client_result = tokio::time::timeout(Duration::from_secs(1), client.capabilities())
+            .await
+            .expect("client final-admission race stays bounded");
+        assert_eq!(client_result, Err(SessionConsumerClientError::Deadline));
+        assert_eq!(client_hook_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(client_side_dispatches.load(Ordering::SeqCst), 0);
+        client_side_server.abort_and_wait().await;
+
+        let server_material = Arc::new(RotatableServerMaterial::new(server_identity.as_str()));
+        let server_config = server_material.config();
+        let server_edge_jitter = server_config
+            .begin_handshake()
+            .expect("server final-admission handshake snapshot")
+            .directed_lifecycle_edge_key(b"consumer", &client_identity)
+            .bounded_jitter(ConnectionLifecyclePolicy::default().rotation_jitter());
+        assert!(
+            server_edge_jitter > Duration::from_secs(1),
+            "a missing final admission check cannot retire this admitted test edge inside the observation bound"
+        );
+        let server_side_dispatches = Arc::new(AtomicUsize::new(0));
+        let server_side_service = Arc::new(CountingRejectingTestConsumer {
+            calls: Arc::clone(&server_side_dispatches),
+        });
+        let server_side_authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity.clone()],
+            std::iter::empty(),
+        )
+        .expect("consumer final-admission authorizer");
+        let server_hook_calls = Arc::new(AtomicUsize::new(0));
+        let server_hook_material = Arc::clone(&server_material);
+        let server_hook_count = Arc::clone(&server_hook_calls);
+        let (server_side_server, server_side_address) = SessionQuorumConsumerServer::new(
+            server_side_service,
+            server_config,
+            server_side_authorizer,
+        )
+        .with_final_admission_test_hook(Arc::new(move || {
+            server_hook_count.fetch_add(1, Ordering::SeqCst);
+            server_hook_material.rotate();
+        }))
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for server final-admission race");
+        let client = StatelessSessionConsumerClient::new(
+            server_side_address,
+            rustls_pki_types::ServerName::IpAddress(server_side_address.ip().into()),
+            server_identity,
+            scope(),
+            server_material.trusted_client_config(client_identity.as_str()),
+        );
+        let server_result = tokio::time::timeout(Duration::from_secs(1), client.capabilities())
+            .await
+            .expect("server final-admission race stays bounded");
+        assert_eq!(server_result, Err(SessionConsumerClientError::Unavailable));
+        assert_eq!(server_hook_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(server_side_dispatches.load(Ordering::SeqCst), 0);
+        server_side_server.abort_and_wait().await;
+    }
+
+    #[test]
+    fn stateless_clone_lineage_bounds_physical_request_and_watch_connections() {
+        let control = SessionReauthenticationControl::new();
+        let (client, _material) = stateless_test_client(control);
+        let clone = client.clone();
+        let mut requests = Vec::new();
+        for _ in 0..MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS {
+            requests.push(
+                client
+                    .physical_admission
+                    .try_acquire(false)
+                    .expect("configured request cap admits its exact bound"),
+            );
+        }
+        assert!(
+            matches!(
+                clone.physical_admission.try_acquire(false),
+                Err(SessionConsumerClientError::Overloaded)
+            ),
+            "clones share request physical admission before resolve or write"
+        );
+        assert!(
+            clone.physical_admission.try_acquire(true).is_ok(),
+            "watch physical admission is isolated from normal request lanes"
+        );
+        drop(requests);
+    }
+
     #[test]
     fn consumer_mutation_outcome_errors_preserve_the_exact_retry_id() {
         let request_id = SessionConsumerRequestId::new();
@@ -5935,6 +6845,45 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn zero_byte_watch_write_uses_the_pre_request_unavailable_classification() {
+        let control = SessionReauthenticationControl::new();
+        let (client, _material) = stateless_test_client(control.clone());
+        let (mut connection, _) = synthetic_consumer_connection(
+            &client,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Box::new(PendingWriter),
+        );
+        let request = SessionConsumerRequest::new(
+            scope(),
+            SessionConsumerRequestId::new(),
+            SessionConsumerOperation::Watch { start_sequence: 0 },
+        );
+        let mut reauthentication_changes = control.subscribe();
+        let mut material_changes = Some(client.tls_config.subscribe_material_changes());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+        let write = client.write_watch_call_on_connection(
+            &mut connection,
+            &request,
+            deadline,
+            true,
+            &mut reauthentication_changes,
+            &mut material_changes,
+        );
+        tokio::pin!(write);
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(write.as_mut(), context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        assert_eq!(
+            write.await,
+            Err(SessionConsumerClientError::Unavailable),
+            "a zero-byte setup-budget expiry remains proven not transmitted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn late_setup_and_pool_permit_are_rejected_before_publication() {
         let setup_ready = std::sync::Arc::new(tokio::sync::Notify::new());
         let setup_signal = std::sync::Arc::clone(&setup_ready);
@@ -5997,13 +6946,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn idle_reaper_physically_retires_without_a_pruning_api() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
         let control = SessionReauthenticationControl::new();
         let (stateless, material) = stateless_test_client(control.clone());
         let persistent = PersistentSessionConsumerClient::from_stateless(stateless);
 
+        let idle_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         let (connection, idle_lifecycle) = synthetic_consumer_connection(
             &persistent.pool.client,
-            tokio::time::Instant::now() + Duration::from_millis(100),
+            idle_deadline,
             Box::new(tokio::io::sink()),
         );
         persistent.pool.return_idle(connection);
@@ -6018,6 +6971,7 @@ mod tests {
                 .is_some(),
             "one pool-wide idle reaper is started lazily"
         );
+        wait_for_idle_reaper_armed_deadline(&persistent, idle_deadline).await;
         tokio::time::advance(Duration::from_millis(99)).await;
         tokio::task::yield_now().await;
         wait_for_raw_idle_count(&persistent, 1).await;
@@ -6031,20 +6985,73 @@ mod tests {
 
         let (connection, material_lifecycle) = synthetic_consumer_connection(
             &persistent.pool.client,
-            tokio::time::Instant::now() + Duration::from_secs(60),
+            tokio::time::Instant::now()
+                + persistent.pool.client.lifecycle_policy.rotation_jitter()
+                + Duration::from_secs(1),
             Box::new(tokio::io::sink()),
         );
+        let material_edge_key = connection.rotation_edge_key;
         persistent.pool.return_idle(connection);
         wait_for_raw_idle_count(&persistent, 1).await;
+        let same_epoch_processed = persistent
+            .pool
+            .test_hooks
+            .material_reaper_processed
+            .notified();
+        tokio::pin!(same_epoch_processed);
         material.publish_rejected_update();
-        tokio::task::yield_now().await;
+        same_epoch_processed.await;
         wait_for_raw_idle_count(&persistent, 1).await;
         assert_eq!(
             material_lifecycle.recorded_retirement_count(),
             0,
             "a same-epoch rejected publication retains authenticated capacity"
         );
+        let material_rotation_processed = persistent
+            .pool
+            .test_hooks
+            .material_reaper_processed
+            .notified();
+        tokio::pin!(material_rotation_processed);
+        let material_rotated_at = tokio::time::Instant::now();
         material.rotate();
+        material_rotation_processed.await;
+        let material_jitter = persistent.pool.client.lifecycle_policy.rotation_jitter();
+        let material_jitter = material_edge_key.bounded_jitter(material_jitter);
+        assert!(
+            !material_jitter.is_zero(),
+            "the fixed test identity has a nonzero cooperative rotation window"
+        );
+        let scheduled_retire_at = persistent
+            .pool
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .front()
+            .expect("the material-rotated lane remains cached before its deadline")
+            .lifecycle
+            .retire_at();
+        assert_eq!(
+            scheduled_retire_at,
+            material_rotated_at + material_jitter,
+            "the idle lane uses its stable authenticated edge jitter"
+        );
+        wait_for_idle_reaper_armed_deadline(&persistent, scheduled_retire_at).await;
+        wait_for_raw_idle_count(&persistent, 1).await;
+        assert_eq!(material_lifecycle.recorded_retirement_count(), 0);
+        tokio::time::advance(
+            material_jitter
+                .checked_sub(Duration::from_nanos(1))
+                .expect("test jitter exceeds one nanosecond"),
+        )
+        .await;
+        wait_for_raw_idle_count(&persistent, 1).await;
+        assert_eq!(material_lifecycle.recorded_retirement_count(), 0);
+        // Tokio's timer driver may schedule an arbitrary-nanosecond keyed
+        // deadline on the following millisecond tick. The live-connection
+        // test below seals the exact semantic boundary; this assertion seals
+        // autonomous physical removal immediately after that boundary.
+        tokio::time::advance(Duration::from_millis(1)).await;
         wait_for_raw_idle_count(&persistent, 0).await;
         assert_eq!(
             material_lifecycle.recorded_retirement_reason(),
@@ -6084,7 +7091,263 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn watch_call_rechecks_missed_rotation_before_any_write() {
+    async fn material_rotation_uses_stable_distinct_authenticated_edge_deadlines() {
+        let client_a_id = material_spiffe("edge-client-a");
+        let client_b_id = material_spiffe("edge-client-b");
+        let server_id = material_spiffe("edge-server");
+        let client_a_material = RotatableClientMaterial::new(client_a_id.as_str());
+        let client_b_material = RotatableClientMaterial::new(client_b_id.as_str());
+        let server_material = RotatableServerMaterial::new(server_id.as_str());
+        let client_a_config = client_a_material.config();
+        let client_b_config = client_b_material.config();
+        let server_config = server_material.config();
+        let client_a_key = client_a_config
+            .begin_handshake()
+            .expect("client A handshake snapshot")
+            .directed_lifecycle_edge_key(b"consumer", &server_id);
+        let stable_client_a_key = client_a_config
+            .begin_handshake()
+            .expect("second client A handshake snapshot")
+            .directed_lifecycle_edge_key(b"consumer", &server_id);
+        let client_b_key = client_b_config
+            .begin_handshake()
+            .expect("client B handshake snapshot")
+            .directed_lifecycle_edge_key(b"consumer", &server_id);
+        let server_a_key = server_config
+            .begin_handshake()
+            .expect("server handshake snapshot")
+            .directed_lifecycle_edge_key(b"consumer", &client_a_id);
+        assert_eq!(client_a_key, stable_client_a_key);
+        assert_eq!(client_a_key, server_a_key);
+        assert_ne!(client_a_key, client_b_key);
+        assert_eq!(
+            format!("{client_a_key:?}"),
+            "TlsDirectedEdgeKey([redacted])"
+        );
+
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_secs(10),
+        )
+        .expect("bounded edge-jitter policy");
+        let admitted_epoch = client_a_config.material_status().epoch();
+        client_a_material.rotate();
+        let current_epoch = client_a_config.material_status().epoch();
+        assert!(!consumer_fresh_admission_is_current(
+            0,
+            admitted_epoch,
+            0,
+            current_epoch,
+        ));
+        let now = tokio::time::Instant::now();
+        let mut edge_a = ConnectionLifecycle::new(policy, now, None, None, 0, Some(admitted_epoch))
+            .expect("edge A lifecycle");
+        let mut edge_b = ConnectionLifecycle::new(policy, now, None, None, 0, Some(admitted_epoch))
+            .expect("edge B lifecycle");
+        edge_a.observe_authenticated_rotation(now, 0, Some(current_epoch), client_a_key);
+        edge_b.observe_authenticated_rotation(now, 0, Some(current_epoch), client_b_key);
+        let edge_a_jitter = client_a_key.bounded_jitter(policy.rotation_jitter());
+        let edge_b_jitter = client_b_key.bounded_jitter(policy.rotation_jitter());
+        assert_ne!(edge_a_jitter, edge_b_jitter);
+        assert_eq!(edge_a.retire_at(), now + edge_a_jitter);
+        assert_eq!(edge_b.retire_at(), now + edge_b_jitter);
+        assert!(edge_a.retire_at() <= now + policy.rotation_jitter());
+        assert!(edge_b.retire_at() <= now + policy.rotation_jitter());
+        assert_eq!(
+            edge_a.hard_deadline().expect("edge A hard deadline"),
+            edge_a.retire_at() + policy.rotation_drain_window()
+        );
+        assert_eq!(
+            edge_b.hard_deadline().expect("edge B hard deadline"),
+            edge_b.retire_at() + policy.rotation_drain_window()
+        );
+
+        let server_admitted_epoch = server_config.material_status().epoch();
+        let server_control = SessionReauthenticationControl::new();
+        let mut server_material_lifecycle = ConnectionLifecycle::new(
+            policy,
+            now,
+            None,
+            None,
+            server_control.generation(),
+            Some(server_admitted_epoch),
+        )
+        .expect("server material lifecycle");
+        server_material.rotate();
+        assert!(
+            !edge_a_jitter.is_zero(),
+            "the fixed authenticated edge exercises cooperative reuse"
+        );
+        assert!(server_connection_current(
+            &mut server_material_lifecycle,
+            &server_config,
+            &server_control,
+            server_a_key,
+        ));
+        let server_retire_at = server_material_lifecycle.retire_at();
+        assert_eq!(server_retire_at, now + edge_a_jitter);
+        tokio::time::advance(edge_a_jitter - Duration::from_nanos(1)).await;
+        assert!(server_connection_current(
+            &mut server_material_lifecycle,
+            &server_config,
+            &server_control,
+            server_a_key,
+        ));
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert!(!server_connection_current(
+            &mut server_material_lifecycle,
+            &server_config,
+            &server_control,
+            server_a_key,
+        ));
+        assert_eq!(
+            server_material_lifecycle.recorded_retirement_reason(),
+            Some(RetirementReason::MaterialEpoch)
+        );
+
+        let explicit_now = tokio::time::Instant::now();
+        let mut server_explicit_lifecycle = ConnectionLifecycle::new(
+            policy,
+            explicit_now,
+            None,
+            None,
+            server_control.generation(),
+            Some(server_config.material_status().epoch()),
+        )
+        .expect("server explicit lifecycle");
+        server_control
+            .request_reauthentication()
+            .expect("advance server explicit generation");
+        assert!(!server_connection_current(
+            &mut server_explicit_lifecycle,
+            &server_config,
+            &server_control,
+            server_a_key,
+        ));
+        assert_eq!(
+            server_explicit_lifecycle.recorded_retirement_reason(),
+            Some(RetirementReason::Explicit)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checked_out_lane_discard_is_counted_once_and_idle_return_is_not() {
+        let control = SessionReauthenticationControl::new();
+        let (stateless, _material) = stateless_test_client(control);
+        let persistent = PersistentSessionConsumerClient::from_stateless(stateless);
+
+        let (discarded, _) = synthetic_consumer_connection(
+            &persistent.pool.client,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Box::new(tokio::io::sink()),
+        );
+        let checkout = PersistentCheckedOutConnection::new(Arc::clone(&persistent.pool), discarded);
+        drop(checkout);
+        assert_eq!(
+            persistent.pool.counters.reconnects.load(Ordering::Relaxed),
+            1,
+            "a cancelled or protocol-poisoned checked-out lane has one replacement"
+        );
+
+        let (returned, _) = synthetic_consumer_connection(
+            &persistent.pool.client,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Box::new(tokio::io::sink()),
+        );
+        PersistentCheckedOutConnection::new(Arc::clone(&persistent.pool), returned).return_idle();
+        assert_eq!(
+            persistent.pool.counters.reconnects.load(Ordering::Relaxed),
+            1,
+            "a successful idle return does not request a replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_phase_never_regresses_after_a_cancelled_stale_publisher() {
+        let state = Arc::new(AtomicU8::new(PersistentShutdownPhase::Running as u8));
+        let (sender, mut receiver) = watch::channel(PersistentShutdownPhase::Running);
+        let cancelled_state = Arc::clone(&state);
+        let mut cancelled_receiver = sender.subscribe();
+        let cancelled = tokio::spawn(async move {
+            wait_for_forced_shutdown(&mut cancelled_receiver, &cancelled_state).await;
+        });
+        cancelled.abort();
+        let _ = cancelled.await;
+
+        assert_eq!(
+            publish_monotonic_shutdown_phase(&state, &sender, PersistentShutdownPhase::Forced,),
+            PersistentShutdownPhase::Forced
+        );
+        assert_eq!(
+            publish_monotonic_shutdown_phase(&state, &sender, PersistentShutdownPhase::Draining,),
+            PersistentShutdownPhase::Forced,
+            "a delayed draining caller cannot overwrite forced shutdown"
+        );
+        // Exercise a stale watch value as well: forced waiters consult the
+        // monotonic atomic source before trusting a delayed publication.
+        sender.send_replace(PersistentShutdownPhase::Draining);
+        wait_for_forced_shutdown(&mut receiver, &state).await;
+        assert_eq!(
+            PersistentShutdownPhase::load(&state),
+            PersistentShutdownPhase::Forced
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_shutdown_cannot_publish_stale_draining_after_forced() {
+        let control = SessionReauthenticationControl::new();
+        let (stateless, _material) = stateless_test_client(control);
+        let client = PersistentSessionConsumerClient::from_stateless(stateless);
+        client
+            .pool
+            .test_hooks
+            .pause_draining_publication
+            .store(true, Ordering::Release);
+        let draining_transition = client.pool.test_hooks.draining_transition.notified();
+        tokio::pin!(draining_transition);
+        let first_client = client.clone();
+        let first = tokio::spawn(async move { first_client.shutdown().await });
+        draining_transition.await;
+        assert_eq!(
+            client.pool.phase(),
+            PersistentShutdownPhase::Draining,
+            "the first real shutdown advanced admission before its delayed publication"
+        );
+
+        let mut forced_receiver = client.pool.shutdown_tx.subscribe();
+        let waiter_pool = Arc::clone(&client.pool);
+        let forced_waiter = tokio::spawn(async move {
+            wait_for_forced_shutdown(&mut forced_receiver, &waiter_pool.shutdown_phase).await;
+            PersistentShutdownPhase::load(&waiter_pool.shutdown_phase)
+        });
+        let second_report = client.shutdown().await;
+        assert_eq!(second_report.forced_calls, 0);
+        assert_eq!(
+            forced_waiter.await.expect("forced waiter task completes"),
+            PersistentShutdownPhase::Forced,
+            "an active forced waiter observes the atomic forced phase"
+        );
+
+        client
+            .pool
+            .test_hooks
+            .resume_draining_publication
+            .notify_one();
+        let _first_report = first.await.expect("stale shutdown publisher completes");
+        assert_eq!(client.pool.phase(), PersistentShutdownPhase::Forced);
+        let final_receiver = client.pool.shutdown_tx.subscribe();
+        assert_eq!(
+            *final_receiver.borrow(),
+            PersistentShutdownPhase::Forced,
+            "the delayed first shutdown republishes forced, never stale draining"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_call_invalidates_explicit_but_drains_material_at_edge_deadline() {
         let control = SessionReauthenticationControl::new();
         let (client, material) = stateless_test_client(control.clone());
         let request = SessionConsumerRequest::new(
@@ -6111,6 +7374,7 @@ mod tests {
                 &mut explicit_connection,
                 &request,
                 tokio::time::Instant::now() + Duration::from_secs(1),
+                false,
                 &mut reauthentication_changes,
                 &mut material_changes,
             )
@@ -6139,13 +7403,23 @@ mod tests {
                 &mut material_connection,
                 &request,
                 tokio::time::Instant::now() + Duration::from_secs(1),
+                false,
                 &mut reauthentication_changes,
                 &mut material_changes,
             )
             .await;
-        assert_eq!(result, Err(SessionConsumerClientError::Unavailable));
-        assert_eq!(material_bytes.load(Ordering::SeqCst), 0);
-        assert_eq!(material_connection.calls, 0);
+        assert_eq!(result, Ok(NonZeroU32::MIN));
+        assert!(material_bytes.load(Ordering::SeqCst) > 0);
+        assert_eq!(material_connection.calls, 1);
+        assert_eq!(material_lifecycle.recorded_retirement_count(), 0);
+        let material_retire_at = material_connection.lifecycle.retire_at();
+        let now = tokio::time::Instant::now();
+        assert!(material_retire_at > now);
+        tokio::time::advance(material_retire_at.duration_since(now) - Duration::from_nanos(1))
+            .await;
+        assert!(material_connection.current(&client.tls_config, &client.reauthentication));
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert!(!material_connection.current(&client.tls_config, &client.reauthentication));
         assert_eq!(
             material_lifecycle.recorded_retirement_reason(),
             Some(RetirementReason::MaterialEpoch)
@@ -6190,6 +7464,7 @@ mod tests {
                 &mut connection,
                 &request,
                 tokio::time::Instant::now() + Duration::from_secs(1),
+                false,
                 &mut reauthentication_changes,
                 &mut material_changes,
             );
@@ -6224,6 +7499,259 @@ mod tests {
         }
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
         assert_eq!(connection.calls, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unary_rotation_interrupt_preserves_the_positive_byte_boundary() {
+        for partial in [false, true] {
+            let control = SessionReauthenticationControl::new();
+            let (client, _material) = stateless_test_client(control.clone());
+            let policy = ConnectionLifecyclePolicy::try_new(
+                Duration::from_secs(10),
+                Duration::from_millis(100),
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+                Duration::ZERO,
+            )
+            .expect("bounded zero-jitter test lifecycle");
+            let persistent = PersistentSessionConsumerClient::from_stateless(
+                client.with_connection_lifecycle(policy),
+            );
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let writer: Box<dyn AsyncWrite + Unpin + Send> = if partial {
+                Box::new(PartialPendingWriter {
+                    accepted: Arc::clone(&accepted),
+                    started: Arc::clone(&started),
+                    wrote_prefix: false,
+                })
+            } else {
+                Box::new(PendingWriter)
+            };
+            let (mut connection, observed_lifecycle) = synthetic_consumer_connection(
+                &persistent.pool.client,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                writer,
+            );
+            let request_id = SessionConsumerRequestId::new();
+            let request = mutation_request(request_id);
+            let write_started = started.notified();
+            tokio::pin!(write_started);
+            let call = persistent.pool.client.execute_on_connection(
+                &mut connection,
+                &request,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                false,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                None,
+            );
+            tokio::pin!(call);
+            if partial {
+                tokio::select! {
+                    biased;
+                    _ = &mut write_started => {}
+                    result = &mut call => {
+                        panic!("write completed before controlled rotation: {result:?}")
+                    }
+                }
+                assert_eq!(accepted.load(Ordering::SeqCst), 2);
+            } else {
+                std::future::poll_fn(|context| {
+                    assert!(std::future::Future::poll(call.as_mut(), context).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert_eq!(accepted.load(Ordering::SeqCst), 0);
+            }
+
+            control
+                .request_reauthentication()
+                .expect("rotate during the controlled request write");
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(call.as_mut(), context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(
+                observed_lifecycle.recorded_retirement_reason(),
+                Some(RetirementReason::Explicit)
+            );
+            tokio::time::advance(Duration::from_millis(100)).await;
+            let result = call
+                .await
+                .expect_err("rotation hard deadline interrupts the request write");
+            let may_have_sent = matches!(result, SessionConsumerCallError::MayHaveSent(_));
+            persistent
+                .pool
+                .record_error(result.into_client_error(), may_have_sent);
+            let public = persistent_execute_error(request_id, result);
+            if partial {
+                assert!(matches!(
+                    public,
+                    PersistentSessionConsumerExecuteError::OutcomeUnknown {
+                        request_id: retained
+                    } if retained == request_id
+                ));
+            } else {
+                assert_eq!(
+                    public,
+                    PersistentSessionConsumerExecuteError::NotTransmitted {
+                        cause: SessionConsumerClientError::Deadline,
+                    }
+                );
+            }
+            let diagnostics = persistent.diagnostics().await;
+            assert_eq!(diagnostics.not_transmitted, u64::from(!partial));
+            assert_eq!(diagnostics.outcome_unknown, u64::from(partial));
+            assert_eq!(diagnostics.deadline, 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unary_forced_shutdown_interrupt_preserves_the_positive_byte_boundary() {
+        for partial in [false, true] {
+            let control = SessionReauthenticationControl::new();
+            let (client, _material) = stateless_test_client(control);
+            let persistent = PersistentSessionConsumerClient::from_stateless(client);
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let writer: Box<dyn AsyncWrite + Unpin + Send> = if partial {
+                Box::new(PartialPendingWriter {
+                    accepted: Arc::clone(&accepted),
+                    started: Arc::clone(&started),
+                    wrote_prefix: false,
+                })
+            } else {
+                Box::new(PendingWriter)
+            };
+            let (mut connection, _) = synthetic_consumer_connection(
+                &persistent.pool.client,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                writer,
+            );
+            let request_id = SessionConsumerRequestId::new();
+            let request = mutation_request(request_id);
+            let (shutdown_tx, shutdown_rx) = watch::channel(PersistentShutdownPhase::Running);
+            let shutdown_state = AtomicU8::new(PersistentShutdownPhase::Running as u8);
+            let write_started = started.notified();
+            tokio::pin!(write_started);
+            let call = persistent.pool.client.execute_on_connection(
+                &mut connection,
+                &request,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                false,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Some((shutdown_rx, &shutdown_state)),
+            );
+            tokio::pin!(call);
+            if partial {
+                tokio::select! {
+                    biased;
+                    _ = &mut write_started => {}
+                    result = &mut call => {
+                        panic!("write completed before controlled shutdown: {result:?}")
+                    }
+                }
+                assert_eq!(accepted.load(Ordering::SeqCst), 2);
+            } else {
+                std::future::poll_fn(|context| {
+                    assert!(std::future::Future::poll(call.as_mut(), context).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert_eq!(accepted.load(Ordering::SeqCst), 0);
+            }
+
+            publish_monotonic_shutdown_phase(
+                &shutdown_state,
+                &shutdown_tx,
+                PersistentShutdownPhase::Forced,
+            );
+            let result = call
+                .await
+                .expect_err("forced shutdown interrupts the request write");
+            let may_have_sent = matches!(result, SessionConsumerCallError::MayHaveSent(_));
+            persistent
+                .pool
+                .record_error(result.into_client_error(), may_have_sent);
+            let public = persistent_execute_error(request_id, result);
+            if partial {
+                assert!(matches!(
+                    public,
+                    PersistentSessionConsumerExecuteError::OutcomeUnknown {
+                        request_id: retained
+                    } if retained == request_id
+                ));
+            } else {
+                assert_eq!(
+                    public,
+                    PersistentSessionConsumerExecuteError::NotTransmitted {
+                        cause: SessionConsumerClientError::ShuttingDown,
+                    }
+                );
+            }
+            let diagnostics = persistent.diagnostics().await;
+            assert_eq!(diagnostics.not_transmitted, u64::from(!partial));
+            assert_eq!(diagnostics.outcome_unknown, u64::from(partial));
+            assert_eq!(diagnostics.shutdown, 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unary_idle_deadline_does_not_record_a_later_lifecycle_overrun() {
+        let control = SessionReauthenticationControl::new();
+        let (client, _material) = stateless_test_client(control);
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_millis(6),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::ZERO,
+        )
+        .expect("bounded test lifecycle");
+        let client = client
+            .with_connection_lifecycle(policy)
+            .with_idle_timeout(Duration::from_millis(5))
+            .with_operation_timeout(Duration::from_millis(10));
+        let (mut connection, observed_lifecycle) = synthetic_consumer_connection(
+            &client,
+            tokio::time::Instant::now() + Duration::from_millis(5),
+            Box::new(tokio::io::sink()),
+        );
+        let (pending_peer, pending_reader) = tokio::io::duplex(64);
+        connection.reader = Box::new(pending_reader);
+        let request = SessionConsumerRequest::new(
+            scope(),
+            SessionConsumerRequestId::new(),
+            SessionConsumerOperation::Capabilities,
+        );
+        let now = tokio::time::Instant::now();
+        let execute = client.execute_on_connection(
+            &mut connection,
+            &request,
+            now + Duration::from_millis(10),
+            false,
+            now + Duration::from_millis(10),
+            None,
+        );
+        tokio::pin!(execute);
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(execute.as_mut(), context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_millis(5)).await;
+        assert!(matches!(
+            execute.await,
+            Err(SessionConsumerCallError::MayHaveSent(
+                SessionConsumerClientError::Deadline
+            ))
+        ));
+        assert!(
+            !observed_lifecycle.hard_overrun_recorded(),
+            "an earlier active-frame idle deadline must not start lifecycle draining"
+        );
+        drop(pending_peer);
     }
 
     #[tokio::test(start_paused = true)]
@@ -6301,6 +7829,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn pooled_retirement_records_the_earliest_elapsed_deadline() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
         let control = SessionReauthenticationControl::new();
         let (client, _material) = stateless_test_client(control);
         let lifecycle_first = ConnectionLifecyclePolicy::try_new(

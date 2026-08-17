@@ -1610,7 +1610,7 @@ umbrella until that fleet evidence passes.
 ### 12.5 Typed Session-Quorum Consumer Transport
 
 `StatelessSessionConsumerClient`, `PersistentSessionConsumerClient`, and
-`SessionQuorumConsumerServer` provide the only production
+`SessionQuorumConsumerServer` provide the typed least-authority
 application-consumer boundary. They MUST use mutual TLS and the dedicated
 `opc-session-consumer/1` ALPN with transport revision 2. This is a separate
 exact protocol from both `opc-session-consensus/2` and the quarantined
@@ -1622,6 +1622,14 @@ listeners, then make one coordinated revision-2 cutover; fallback, dual-mode,
 and mixed-revision consumer operation are unsupported. Revision-2 private JSON
 DTO bytes are canonical; reordered or otherwise noncanonical encodings,
 aliases, omissions, and unknown fields MUST fail closed.
+
+`StatelessSessionConsumerClient` remains a public, source-compatible
+production/compatibility fresh-authentication typed least-authority surface
+required by #649, #688, and #691; it is neither hidden, deprecated, nor
+test-only. `PersistentSessionConsumerClient` remains the required warm
+fixed-pool primitive for #695/ePDG latency, so production deployments requiring
+warm reuse should use it. This distinction is not an API-removal or
+feature-gating claim.
 
 The consumer listener authenticates the peer from the live mTLS connection and
 authorizes it only through the store-issued current-member manifest and the
@@ -1653,6 +1661,16 @@ configured), with 64 pending calls by default and a hard maximum of 256. A
 pending call may wait or age for at most 250 ms. Watches use two separate slots
 by default (at most 16 when configured), never consuming request-pool capacity.
 
+Stateless-client clones share fail-fast physical-admission caps of 16 request
+connections and 16 watch connections per clone lineage. The respective permit
+MUST be acquired before resolve/TCP and held for the complete physical
+connection lifetime, including by a persistent client derived from that
+stateless lineage. Independently constructed stateless clients define
+independent logical clients, as independently constructed persistent clients do.
+The typed persistent watch surface MUST preserve exhaustion of either bound as
+`Overloaded` and record that bounded outcome; it MUST NOT relabel intentional
+load shedding as endpoint unavailability.
+
 The hard listener limit is 256 live connections and its retained
 connection-task set is bounded by that limit; each watch owns one delivery
 task. Consumer frames are at most 16 MiB and a configured listener frame limit
@@ -1664,6 +1682,16 @@ ms, and is also bounded by the 256 KiB store-side projection buffer. The fixed
 request identity is 16 bytes; consumer identity input is capped at 253 UTF-8
 bytes; one batch has at most 256 operations and retains at most 8 MiB of
 serialized response data.
+
+The complete operation timeout MUST validate strictly greater than zero and no
+greater than 10 seconds. The configured idle timeout is at most 5 seconds and
+caps every active partial frame on all client bootstrap, unary, and watch reads;
+partial bytes do not reset that bound. A healthy watch with no bytes in flight
+may remain quiet. Retirement of a saturated, canceled, or rotated watch MUST
+NOT block while holding its watch lease. Each discarded checked-out request lane
+MUST have exactly one reconnect/replacement accounting outcome. Under concurrent
+shutdown callers, phase progression is monotonic from running to draining to
+forced and MUST NOT regress.
 
 Every client and listener retains the existing finite TLS lifecycle bounds: by
 default authentication age is at most 15 minutes, connection-retirement drain
@@ -1677,12 +1705,21 @@ clipped to the logical deadline. Reauthentication, material
 changes, certificate expiry, idle retirement, cancellation, malformed frames,
 EOF, or an uncertain stream position terminate the connection/watch and release
 its transport task slot; they do not create another request on that connection.
-"Material changes" here means an accepted material-epoch change; a rejected
-publication that retains the admitted epoch MUST NOT interrupt an active frame
-or healthy watch. Each logical request pool MUST use exactly one maintenance
-task to remove cached lanes autonomously at the earliest idle/lifecycle
-deadline and on accepted epoch or explicit-generation changes. Maintenance
-task/table cardinality MUST NOT scale with lanes, subscribers, or records.
+"Material changes" here means an accepted material-epoch change. It MUST
+schedule each already-admitted lane at a stable directed authenticated-edge
+deadline no later than the configured rotation-jitter maximum; admitted work
+and reuse remain permitted before that deadline and retire at it. An explicit
+generation change MUST invalidate cached admission immediately. A fresh client
+or server handshake MUST exactly match the current generation and material
+epoch at its final pre-publication sample and MUST NOT use the cooperative
+jitter exception. The edge key MUST remain an opaque, non-serializable TLS
+digest used only for bounded-jitter calculation and MUST NOT expose either
+identity or digest bytes to session-net diagnostics. A rejected publication
+that retains the admitted epoch MUST NOT interrupt an active frame or healthy
+watch. Each logical request pool MUST use exactly one maintenance task to
+remove cached lanes autonomously at the earliest idle/lifecycle deadline.
+Maintenance task/table cardinality MUST NOT scale with lanes, subscribers, or
+records.
 
 The caller owns the request ID for every mutation or lease operation. Only a
 failure classified as `NotTransmitted` may be automatically retried, and then
@@ -1705,9 +1742,12 @@ payloads, request or correlation IDs, owners, or fences. Any performance
 evidence for this transport is synthetic only and makes no ePDG production-SLO
 claim.
 
-The v6 qualification profile records this dedicated ALPN/revision and the
-connection, frame, request/response, watch, task, and lifecycle limits beside
-the consensus profile. It records no consumer identity or scope material.
+The v7 qualification profile records this revision-2 dedicated ALPN/revision
+and the connection, frame, request/response, watch, task, and lifecycle limits
+beside the consensus profile. The published v6 profile remains the unchanged
+revision-1 contract. Neither profile records consumer identity or scope
+material. Synthetic warm accept/reuse checks gate only their transport method;
+elapsed samples are non-gating and are not an SLO.
 
 ## 13. Local Cache
 

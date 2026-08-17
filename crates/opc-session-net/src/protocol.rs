@@ -3419,13 +3419,83 @@ fn write_timeout_error() -> ProtocolError {
 
 /// Effect boundary for one framed write.
 ///
-/// `BeforeWrite` proves that no length-prefix byte was offered to the
-/// transport. `MayHaveWritten` means the prefix write was entered, so callers
-/// must conservatively recover an outcome rather than issue a new mutation.
+/// `BeforeWrite` proves that no length-prefix byte was accepted by the
+/// transport. `MayHaveWritten` means at least one prefix or payload byte was
+/// accepted, so callers must conservatively recover an outcome rather than
+/// issue a new mutation.
 #[derive(Debug)]
 pub(crate) enum FrameWriteError {
     BeforeWrite(ProtocolError),
     MayHaveWritten(ProtocolError),
+}
+
+/// Shared positive-byte observation for a framed transport write.
+///
+/// Callers that select an in-progress frame write against lifecycle or
+/// shutdown signals use this token to preserve the exact transport boundary:
+/// cancellation before any byte is accepted remains `BeforeWrite`, while any
+/// accepted prefix or payload byte is permanently `MayHaveWritten`.
+pub(crate) struct FrameWriteProgress(AtomicBool);
+
+impl FrameWriteProgress {
+    pub(crate) const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    pub(crate) fn accepted_any(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn classify(&self, error: ProtocolError) -> FrameWriteError {
+        if self.accepted_any() {
+            FrameWriteError::MayHaveWritten(error)
+        } else {
+            FrameWriteError::BeforeWrite(error)
+        }
+    }
+}
+
+struct WriteProgress<'a, W> {
+    writer: &'a mut W,
+    progress: &'a FrameWriteProgress,
+}
+
+impl<W> tokio::io::AsyncWrite for WriteProgress<'_, W>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut *this.writer).poll_write(context, bytes) {
+            std::task::Poll::Ready(Ok(accepted)) => {
+                if accepted != 0 {
+                    this.progress.0.store(true, Ordering::Release);
+                }
+                std::task::Poll::Ready(Ok(accepted))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut *this.writer).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut *this.writer).poll_shutdown(context)
+    }
 }
 
 impl FrameWriteError {
@@ -3474,12 +3544,37 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     T: Serialize,
 {
-    write_frame_bounded_until_cancellable_classified(
+    let progress = FrameWriteProgress::new();
+    write_frame_bounded_until_cancellable_classified_with_progress(
         writer,
         frame,
         max_frame_size,
         deadline,
         &NEVER_CANCELLED,
+        &progress,
+    )
+    .await
+}
+
+/// Classified frame write with progress visible to an outer lifecycle select.
+pub(crate) async fn write_frame_bounded_until_classified_with_progress<W, T>(
+    writer: &mut W,
+    frame: &T,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+    progress: &FrameWriteProgress,
+) -> Result<(), FrameWriteError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: Serialize,
+{
+    write_frame_bounded_until_cancellable_classified_with_progress(
+        writer,
+        frame,
+        max_frame_size,
+        deadline,
+        &NEVER_CANCELLED,
+        progress,
     )
     .await
 }
@@ -3501,23 +3596,26 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     T: Serialize,
 {
-    write_frame_bounded_until_cancellable_classified(
+    let progress = FrameWriteProgress::new();
+    write_frame_bounded_until_cancellable_classified_with_progress(
         writer,
         frame,
         max_frame_size,
         deadline,
         cancellation,
+        &progress,
     )
     .await
     .map_err(FrameWriteError::into_protocol_error)
 }
 
-async fn write_frame_bounded_until_cancellable_classified<W, T>(
+async fn write_frame_bounded_until_cancellable_classified_with_progress<W, T>(
     writer: &mut W,
     frame: &T,
     max_frame_size: usize,
     deadline: tokio::time::Instant,
     cancellation: &AtomicBool,
+    progress: &FrameWriteProgress,
 ) -> Result<(), FrameWriteError>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -3536,6 +3634,7 @@ where
     let len = u32::try_from(json.encoded_len)
         .map_err(|_| ProtocolError::FrameTooLarge(json.encoded_len))
         .map_err(FrameWriteError::BeforeWrite)?;
+    let mut writer = WriteProgress { writer, progress };
     let write = async {
         writer
             .write_all(&len.to_be_bytes())
@@ -3551,18 +3650,19 @@ where
     };
     match tokio::time::timeout_at(deadline, write).await {
         Ok(result) => {
-            result.map_err(FrameWriteError::MayHaveWritten)?;
+            result.map_err(|error| progress.classify(error))?;
             // Tokio polls the inner write before its deadline future. A task
             // resumed at or after the absolute boundary must not publish a
-            // late success; the prefix may already have crossed the transport
-            // boundary, so retain the conservative MayHaveWritten class.
+            // late success. Preserve whether this exact frame crossed the
+            // transport boundary rather than treating a zero-byte pending
+            // writer as ambiguous.
             if tokio::time::Instant::now() >= deadline {
-                Err(FrameWriteError::MayHaveWritten(write_timeout_error()))
+                Err(progress.classify(write_timeout_error()))
             } else {
                 Ok(())
             }
         }
-        Err(_elapsed) => Err(FrameWriteError::MayHaveWritten(write_timeout_error())),
+        Err(_elapsed) => Err(progress.classify(write_timeout_error())),
     }
 }
 

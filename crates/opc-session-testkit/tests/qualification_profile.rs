@@ -37,15 +37,19 @@ use opc_session_store::{
 };
 use opc_session_testkit::qualification::{
     session_mtls_candidate_evidence_v2_schema_sha256, session_mtls_candidate_schedule_sha256,
-    SessionHaQualificationProfile, SessionMtlsCandidateCampaign, SessionMtlsCandidateEvidenceError,
-    SessionMtlsCandidateEvidenceV2, SESSION_HA_EVIDENCE_SCHEMA_JSON,
-    SESSION_HA_HISTORY_SCHEMA_JSON, SESSION_HA_PROFILE_JSON, SESSION_HA_PROFILE_SCHEMA_JSON,
-    SESSION_HA_SCHEDULE_SCHEMA_JSON, SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON,
-    SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES, SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
+    SessionHaQualificationProfile, SessionHaQualificationProfileV7, SessionMtlsCandidateCampaign,
+    SessionMtlsCandidateEvidenceError, SessionMtlsCandidateEvidenceV2,
+    SESSION_HA_EVIDENCE_V6_SCHEMA_JSON, SESSION_HA_EVIDENCE_V7_SCHEMA_JSON,
+    SESSION_HA_HISTORY_SCHEMA_JSON, SESSION_HA_PROFILE_V6_JSON, SESSION_HA_PROFILE_V6_SCHEMA_JSON,
+    SESSION_HA_PROFILE_V7_JSON, SESSION_HA_PROFILE_V7_SCHEMA_JSON, SESSION_HA_SCHEDULE_SCHEMA_JSON,
+    SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON, SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES,
+    SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const EVIDENCE_FIXTURE: &str = include_str!("fixtures/session-ha/evidence-fixture-v6.json");
+const V7_EVIDENCE_FIXTURE: &str = include_str!("fixtures/session-ha/evidence-fixture-v7.json");
 const HISTORY_FIXTURE: &str = include_str!("fixtures/session-ha/history-valid.jsonl");
 const SCHEDULE_FIXTURE: &str = include_str!("fixtures/session-ha/schedule-valid.jsonl");
 const OMITTED_HISTORY_FIXTURE: &str =
@@ -304,7 +308,7 @@ fn validate_exact_evidence_fields(evidence: &Value) -> Result<(), String> {
         return Err("execution timestamps are malformed or reversed".to_owned());
     }
 
-    let profile: SessionHaQualificationProfile = serde_json::from_str(SESSION_HA_PROFILE_JSON)
+    let profile: SessionHaQualificationProfile = serde_json::from_str(SESSION_HA_PROFILE_V6_JSON)
         .map_err(|_| "profile unavailable".to_owned())?;
     let results = &evidence["results"];
     let startup_within_bound = results["startup_millis"]
@@ -508,10 +512,11 @@ fn validate_history_shape(history: &str, schema: &Value) -> Result<(), String> {
 }
 
 #[test]
-fn current_v6_profile_matches_its_declared_consensus_and_store_contract() {
-    let profile_value: Value = serde_json::from_str(SESSION_HA_PROFILE_JSON).expect("profile JSON");
+fn frozen_v6_profile_matches_its_declared_consensus_and_store_contract() {
+    let profile_value: Value =
+        serde_json::from_str(SESSION_HA_PROFILE_V6_JSON).expect("profile JSON");
     let profile_schema: Value =
-        serde_json::from_str(SESSION_HA_PROFILE_SCHEMA_JSON).expect("profile schema JSON");
+        serde_json::from_str(SESSION_HA_PROFILE_V6_SCHEMA_JSON).expect("profile schema JSON");
     validate_structural_schema(&profile_schema, &profile_value)
         .expect("profile satisfies its committed schema");
     let profile: SessionHaQualificationProfile =
@@ -590,70 +595,12 @@ fn current_v6_profile_matches_its_declared_consensus_and_store_contract() {
         .protocol
         .stateless_consumer
         .as_ref()
-        .expect("current v6 profile has the consumer compatibility and persistent contract");
+        .expect("frozen v6 profile has the stateless consumer contract");
     assert_eq!(consumer.alpn.as_bytes(), SESSION_QUORUM_CONSUMER_ALPN);
-    assert_eq!(
-        consumer.transport_revision,
-        SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION
-    );
+    assert_eq!(consumer.transport_revision, 1);
     assert!(!consumer.fallback_or_dual_mode_enabled);
-    assert_eq!(
-        consumer.max_requests_per_connection,
-        MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION
-    );
-    assert_eq!(
-        consumer.correlation_id_bytes,
-        SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES
-    );
-    assert_eq!(
-        consumer.max_in_flight_per_connection,
-        MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION
-    );
+    assert_eq!(consumer.max_requests_per_connection, 1);
     assert_eq!(consumer.default_max_connections, 256);
-    assert_eq!(
-        consumer.default_persistent_request_connections,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS
-    );
-    assert_eq!(
-        consumer.max_persistent_request_connections,
-        MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS
-    );
-    assert_eq!(
-        consumer.default_persistent_pending_calls,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS
-    );
-    assert_eq!(
-        consumer.max_persistent_pending_calls,
-        MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS
-    );
-    assert_eq!(
-        consumer.default_persistent_pool_wait_timeout_millis,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT.as_millis() as u64
-    );
-    assert_eq!(
-        consumer.default_persistent_watch_connections,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS
-    );
-    assert_eq!(
-        consumer.max_persistent_watch_connections,
-        MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS
-    );
-    assert_eq!(
-        consumer.default_persistent_setup_timeout_millis,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT.as_millis() as u64
-    );
-    assert_eq!(
-        consumer.default_persistent_connect_attempts,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS
-    );
-    assert_eq!(
-        consumer.default_persistent_reconnect_jitter_millis,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER.as_millis() as u64
-    );
-    assert_eq!(
-        consumer.default_persistent_shutdown_drain_millis,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN.as_millis() as u64
-    );
     assert_eq!(
         consumer.min_response_frame_bytes,
         MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES + 4 * 1024
@@ -969,6 +916,191 @@ fn current_v6_profile_matches_its_declared_consensus_and_store_contract() {
 }
 
 #[test]
+fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(SESSION_HA_PROFILE_V6_JSON.as_bytes())
+        ),
+        "4ba6d641d3ed7f03badf2759efa8d1135a4e64f126496423493fbe613ad8d107"
+    );
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(SESSION_HA_PROFILE_V6_SCHEMA_JSON.as_bytes())
+        ),
+        "3e4429f2f2abc8ac535a8bed2c0b99ac5913d009694e42812bdbdb282a1ce794"
+    );
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(SESSION_HA_EVIDENCE_V6_SCHEMA_JSON.as_bytes())
+        ),
+        "4e85242efe548f9c9612e3802cf51371b713a2fcd4120765afce7bfe91666532"
+    );
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(SESSION_HA_PROFILE_V7_JSON.as_bytes())
+        ),
+        "f3ff570a6d9f828ea31edd92c483a87774510210545d64af62336d6f9fcb35a1"
+    );
+
+    let schema: Value =
+        serde_json::from_str(SESSION_HA_PROFILE_V7_SCHEMA_JSON).expect("v7 profile schema JSON");
+    let value: Value = serde_json::from_str(SESSION_HA_PROFILE_V7_JSON).expect("v7 profile JSON");
+    validate_structural_schema(&schema, &value).expect("v7 profile satisfies its closed schema");
+    let profile: SessionHaQualificationProfileV7 =
+        serde_json::from_value(value.clone()).expect("strict typed v7 profile");
+
+    assert_eq!(profile.schema_version, "opc-session-ha-profile/v7");
+    assert_eq!(profile.profile_id, "opc-session-openraft-ha/v7");
+    assert_eq!(
+        profile.evidence.evidence_schema,
+        "qualification/v7/session-ha-evidence.schema.json"
+    );
+    let consumer = &profile.protocol.persistent_consumer;
+    assert_eq!(consumer.alpn.as_bytes(), SESSION_QUORUM_CONSUMER_ALPN);
+    assert_eq!(
+        consumer.transport_revision,
+        SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION
+    );
+    assert_eq!(
+        consumer.max_requests_per_connection,
+        MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION
+    );
+    assert_eq!(
+        consumer.correlation_id_bytes,
+        SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES
+    );
+    assert_eq!(
+        consumer.max_in_flight_per_connection,
+        MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION
+    );
+    assert_eq!(
+        consumer.default_persistent_request_connections,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.max_persistent_request_connections,
+        MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.default_persistent_pending_calls,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS
+    );
+    assert_eq!(
+        consumer.max_persistent_pending_calls,
+        MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS
+    );
+    assert_eq!(
+        consumer.default_persistent_pool_wait_timeout_millis,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT.as_millis() as u64
+    );
+    assert_eq!(
+        consumer.default_persistent_watch_connections,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.max_persistent_watch_connections,
+        MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.default_persistent_setup_timeout_millis,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT.as_millis() as u64
+    );
+    assert_eq!(
+        consumer.default_persistent_connect_attempts,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS
+    );
+    assert_eq!(
+        consumer.default_persistent_reconnect_jitter_millis,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER.as_millis() as u64
+    );
+    assert_eq!(
+        consumer.default_persistent_shutdown_drain_millis,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN.as_millis() as u64
+    );
+
+    assert!(
+        serde_json::from_str::<SessionHaQualificationProfile>(SESSION_HA_PROFILE_V7_JSON).is_err()
+    );
+    assert!(
+        serde_json::from_str::<SessionHaQualificationProfileV7>(SESSION_HA_PROFILE_V6_JSON)
+            .is_err()
+    );
+
+    let v6_evidence_schema: Value =
+        serde_json::from_str(SESSION_HA_EVIDENCE_V6_SCHEMA_JSON).expect("v6 evidence schema JSON");
+    let v7_evidence_schema: Value =
+        serde_json::from_str(SESSION_HA_EVIDENCE_V7_SCHEMA_JSON).expect("v7 evidence schema JSON");
+    let v6_evidence: Value = serde_json::from_str(EVIDENCE_FIXTURE).expect("v6 evidence JSON");
+    validate_structural_schema(&v6_evidence_schema, &v6_evidence)
+        .expect("v6 evidence remains valid only for v6");
+    assert!(validate_structural_schema(&v7_evidence_schema, &v6_evidence).is_err());
+    let mut relabeled_v6_evidence = v6_evidence;
+    relabeled_v6_evidence["schema_version"] = "opc-session-ha-evidence/v7".into();
+    relabeled_v6_evidence["profile_id"] = "opc-session-openraft-ha/v7".into();
+    assert!(validate_structural_schema(&v7_evidence_schema, &relabeled_v6_evidence).is_err());
+
+    let v7_evidence: Value = serde_json::from_str(V7_EVIDENCE_FIXTURE).expect("v7 evidence JSON");
+    validate_structural_schema(&v7_evidence_schema, &v7_evidence)
+        .expect("genuine v7 evidence satisfies its v7-only binding");
+    assert!(validate_structural_schema(&v6_evidence_schema, &v7_evidence).is_err());
+    assert_eq!(
+        v7_evidence["execution"]["profile_sha256"],
+        "sha256:f3ff570a6d9f828ea31edd92c483a87774510210545d64af62336d6f9fcb35a1"
+    );
+    assert_eq!(
+        v7_evidence["execution"]["persistent_consumer_binding"],
+        serde_json::json!({
+            "client_type": "PersistentSessionConsumerClient",
+            "consumer_profile_path": "protocol.persistent_consumer",
+            "transport_revision": 2,
+            "authenticated_route": "authenticated-mtls-persistent"
+        })
+    );
+    let mut wrong_v7_profile_digest = v7_evidence.clone();
+    wrong_v7_profile_digest["execution"]["profile_sha256"] =
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into();
+    assert!(validate_structural_schema(&v7_evidence_schema, &wrong_v7_profile_digest).is_err());
+    let mut wrong_v7_client_binding = v7_evidence;
+    wrong_v7_client_binding["execution"]["persistent_consumer_binding"]["client_type"] =
+        "StatelessSessionConsumerClient".into();
+    assert!(validate_structural_schema(&v7_evidence_schema, &wrong_v7_client_binding).is_err());
+
+    let mut missing_persistent_consumer = value.clone();
+    missing_persistent_consumer["protocol"]
+        .as_object_mut()
+        .expect("protocol object")
+        .remove("persistent_consumer");
+    assert!(validate_structural_schema(&schema, &missing_persistent_consumer).is_err());
+    assert!(
+        serde_json::from_value::<SessionHaQualificationProfileV7>(missing_persistent_consumer)
+            .is_err()
+    );
+
+    let mut missing_revision_2_field = value.clone();
+    missing_revision_2_field["protocol"]["persistent_consumer"]
+        .as_object_mut()
+        .expect("consumer object")
+        .remove("correlation_id_bytes");
+    assert!(validate_structural_schema(&schema, &missing_revision_2_field).is_err());
+    assert!(
+        serde_json::from_value::<SessionHaQualificationProfileV7>(missing_revision_2_field)
+            .is_err()
+    );
+
+    let mut unknown_revision_2_field = value;
+    unknown_revision_2_field["protocol"]["persistent_consumer"]["unknown"] = true.into();
+    assert!(validate_structural_schema(&schema, &unknown_revision_2_field).is_err());
+    assert!(
+        serde_json::from_value::<SessionHaQualificationProfileV7>(unknown_revision_2_field)
+            .is_err()
+    );
+}
+
+#[test]
 fn inventory_pins_workspace_msrv_source_build_gate_and_openraft_revision() {
     let workspace = include_str!("../../../Cargo.toml");
     assert!(workspace.contains("rust-version = \"1.88\""));
@@ -1155,7 +1287,7 @@ fn history_and_evidence_fixtures_satisfy_strict_schemas() {
     }
 
     let evidence_schema: Value =
-        serde_json::from_str(SESSION_HA_EVIDENCE_SCHEMA_JSON).expect("evidence schema JSON");
+        serde_json::from_str(SESSION_HA_EVIDENCE_V6_SCHEMA_JSON).expect("evidence schema JSON");
     let evidence: Value = serde_json::from_str(EVIDENCE_FIXTURE).expect("evidence fixture JSON");
     validate_structural_schema(&evidence_schema, &evidence)
         .expect("evidence fixture satisfies schema");
@@ -1269,13 +1401,14 @@ fn checker_rejects_equal_and_descending_scheduled_cas_generations() {
 #[test]
 fn schemas_prevent_premature_production_or_tls_rotation_claims() {
     let profile_schema: Value =
-        serde_json::from_str(SESSION_HA_PROFILE_SCHEMA_JSON).expect("profile schema JSON");
-    let mut profile: Value = serde_json::from_str(SESSION_HA_PROFILE_JSON).expect("profile JSON");
+        serde_json::from_str(SESSION_HA_PROFILE_V6_SCHEMA_JSON).expect("profile schema JSON");
+    let mut profile: Value =
+        serde_json::from_str(SESSION_HA_PROFILE_V6_JSON).expect("profile JSON");
     profile["maturity"] = "production".into();
     assert!(validate_structural_schema(&profile_schema, &profile).is_err());
 
     let evidence_schema: Value =
-        serde_json::from_str(SESSION_HA_EVIDENCE_SCHEMA_JSON).expect("evidence schema JSON");
+        serde_json::from_str(SESSION_HA_EVIDENCE_V6_SCHEMA_JSON).expect("evidence schema JSON");
     let mut evidence: Value =
         serde_json::from_str(EVIDENCE_FIXTURE).expect("evidence fixture JSON");
     evidence["topology"]["counts_for_tls_rotation"] = true.into();

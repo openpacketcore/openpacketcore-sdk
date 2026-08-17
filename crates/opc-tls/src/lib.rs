@@ -19,12 +19,13 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 mod material;
 pub use material::{
-    TlsAdmittedConnection, TlsClientHandshake, TlsExternalHandshakeMaterial, TlsHandshakeOutcome,
-    TlsHandshakeRunError, TlsMaterialAvailability, TlsMaterialController, TlsMaterialEpoch,
-    TlsMaterialError, TlsMaterialReloadReason, TlsMaterialStatus, TlsMaterialStatusReceiver,
-    TlsServerHandshake, MAX_TLS_CONCURRENT_HANDSHAKES, MAX_TLS_HANDSHAKE_EPOCH_RETRIES,
-    MAX_TLS_MATERIAL_CHAIN_CERTIFICATES, MAX_TLS_MATERIAL_PRIVATE_KEY_BYTES,
-    MAX_TLS_MATERIAL_TOTAL_BYTES, MAX_TLS_MATERIAL_TRUST_ANCHORS, MAX_TLS_MATERIAL_TRUST_BUNDLES,
+    TlsAdmittedConnection, TlsClientHandshake, TlsDirectedEdgeKey, TlsExternalHandshakeMaterial,
+    TlsHandshakeOutcome, TlsHandshakeRunError, TlsMaterialAvailability, TlsMaterialController,
+    TlsMaterialEpoch, TlsMaterialError, TlsMaterialReloadReason, TlsMaterialStatus,
+    TlsMaterialStatusReceiver, TlsServerHandshake, MAX_TLS_CONCURRENT_HANDSHAKES,
+    MAX_TLS_HANDSHAKE_EPOCH_RETRIES, MAX_TLS_MATERIAL_CHAIN_CERTIFICATES,
+    MAX_TLS_MATERIAL_PRIVATE_KEY_BYTES, MAX_TLS_MATERIAL_TOTAL_BYTES,
+    MAX_TLS_MATERIAL_TRUST_ANCHORS, MAX_TLS_MATERIAL_TRUST_BUNDLES,
 };
 
 const TLS13_ONLY: [&rustls::SupportedProtocolVersion; 1] = [&rustls::version::TLS13];

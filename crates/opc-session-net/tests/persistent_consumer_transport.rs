@@ -15,17 +15,17 @@ use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfig
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_session_net::{
     ConnectionLifecyclePolicy, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-    PersistentSessionConsumerExecuteError, RemoteAddrResolver, SessionConsumerAuthorizer,
-    SessionConsumerClientError, SessionQuorumConsumerServer, SessionReauthenticationControl,
-    StatelessSessionConsumerClient,
+    PersistentSessionConsumerDiagnostics, PersistentSessionConsumerExecuteError,
+    RemoteAddrResolver, SessionConsumerAuthorizer, SessionConsumerClientError,
+    SessionQuorumConsumerServer, SessionReauthenticationControl, StatelessSessionConsumerClient,
 };
 use opc_session_store::{
     BackendCapabilities, ConsensusSessionStore, QuorumReplicaDescriptor, ReplicaBackingIdentity,
     ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionConsensusIdentity,
     SessionConsumerChange, SessionConsumerIdentity, SessionConsumerOperation,
-    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
-    SessionQuorumConsumer, SqliteSessionBackend, ValidatedQuorumTopology,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionKey,
+    SessionKeyType, SessionQuorumConsumer, SqliteSessionBackend, ValidatedQuorumTopology,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
@@ -98,6 +98,7 @@ struct ControlledConsumer {
     released: Notify,
     request_order: Mutex<Vec<opc_session_store::SessionConsumerRequestId>>,
     watch_entry: Mutex<Option<SessionConsumerChange>>,
+    watch_entry_limit: AtomicUsize,
     watch_emitted: Arc<AtomicUsize>,
 }
 
@@ -126,6 +127,19 @@ impl ControlledConsumer {
     }
 
     fn repeat_watch_entry(&self, entry: SessionConsumerChange) {
+        self.watch_entry_limit.store(0, Ordering::SeqCst);
+        *self
+            .watch_entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entry);
+    }
+
+    fn emit_watch_entries_then_close(&self, entry: SessionConsumerChange, count: usize) {
+        assert!(
+            count > 0,
+            "finite watch fixture must emit at least one entry"
+        );
+        self.watch_entry_limit.store(count, Ordering::SeqCst);
         *self
             .watch_entry
             .lock()
@@ -181,13 +195,17 @@ impl SessionQuorumConsumer for ControlledConsumer {
         let Some(entry) = entry else {
             return Ok(stream::pending().boxed());
         };
+        let entry_limit = self.watch_entry_limit.load(Ordering::SeqCst);
         let emitted = Arc::clone(&self.watch_emitted);
-        Ok(stream::repeat(entry)
-            .map(move |entry| {
-                emitted.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, SessionConsumerStoreError>(entry)
-            })
-            .boxed())
+        let entries = stream::repeat(entry).map(move |entry| {
+            emitted.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, SessionConsumerStoreError>(entry)
+        });
+        if entry_limit == 0 {
+            Ok(entries.boxed())
+        } else {
+            Ok(entries.take(entry_limit).boxed())
+        }
     }
 }
 
@@ -216,6 +234,72 @@ fn large_watch_change() -> SessionConsumerChange {
         encoded.len()
     );
     change
+}
+
+fn small_watch_change() -> SessionConsumerChange {
+    let key = SessionKey {
+        tenant: TenantId::new("watch-queue").expect("test tenant"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from_static(b"opaque-watch-queue")
+            .try_into()
+            .expect("bounded stable ID"),
+    };
+    serde_json::from_value(serde_json::json!({
+        "sequence": 1,
+        "changes": [{
+            "key": serde_json::to_value(key).expect("watch key encodes"),
+            "kind": "RecordWritten",
+        }],
+    }))
+    .expect("small synthetic watch change decodes")
+}
+
+fn assert_fixed_zero_diagnostics(diagnostics: PersistentSessionConsumerDiagnostics) {
+    // Keep this exhaustive literal: adding an identifier-bearing field to the
+    // public snapshot must be a deliberate compatibility decision, rather
+    // than silently inheriting `Default` in this boundary test.
+    assert_eq!(
+        diagnostics,
+        PersistentSessionConsumerDiagnostics {
+            setup_attempts: 0,
+            setup_failures: 0,
+            setup_successes: 0,
+            resolve_attempts: 0,
+            resolve_failures: 0,
+            tcp_attempts: 0,
+            tcp_failures: 0,
+            tls_attempts: 0,
+            tls_failures: 0,
+            hello_attempts: 0,
+            hello_failures: 0,
+            pool_wait_current: 0,
+            pool_wait_max: 0,
+            pool_wait_count: 0,
+            pool_wait_max_duration_millis: 0,
+            pool_wait_oldest_age_millis: 0,
+            active: 0,
+            max_active: 0,
+            idle: 0,
+            reused: 0,
+            reconnects: 0,
+            failures: 0,
+            queued: 0,
+            inflight: 0,
+            max_inflight: 0,
+            watch_active: 0,
+            max_watch_active: 0,
+            successes: 0,
+            not_transmitted: 0,
+            outcome_unknown: 0,
+            overload: 0,
+            shutdown: 0,
+            authentication: 0,
+            scope: 0,
+            protocol: 0,
+            deadline: 0,
+        }
+    );
 }
 
 fn spiffe(name: &str) -> String {
@@ -354,6 +438,35 @@ async fn prewarm_opens_fixed_lanes_reuses_them_and_keeps_diagnostics_redacted() 
         scope,
         config(LANES, 8, 1),
     );
+    let request_id_canary = SessionConsumerRequestId::from_bytes([0xa5; 16]);
+    let scope_debug_canary = format!("{scope:?}");
+    let scope_wire_canary = serde_json::to_string(&scope).expect("scope canary encodes");
+    let request_id_debug_canary = format!("{request_id_canary:?}");
+    let request_id_wire_canary = serde_json::to_string(&request_id_canary)
+        .expect("request-id canary encodes")
+        .trim_matches('"')
+        .to_owned();
+    let privacy_canaries = [
+        "127.0.0.1",
+        server_spiffe.as_str(),
+        client_spiffe.as_str(),
+        "prewarm-server",
+        "prewarm-client",
+        scope_debug_canary.as_str(),
+        scope_wire_canary.as_str(),
+        request_id_debug_canary.as_str(),
+        request_id_wire_canary.as_str(),
+    ];
+
+    let initial_diagnostics = client.diagnostics().await;
+    assert_fixed_zero_diagnostics(initial_diagnostics);
+    let diagnostics_debug = format!("{initial_diagnostics:?}");
+    for canary in privacy_canaries {
+        assert!(
+            !diagnostics_debug.contains(canary),
+            "fixed numeric diagnostics must not render endpoint, identity, scope, or request data"
+        );
+    }
 
     assert_eq!(
         client
@@ -393,13 +506,218 @@ async fn prewarm_opens_fixed_lanes_reuses_them_and_keeps_diagnostics_redacted() 
     assert_eq!(diagnostics.idle, LANES as u64);
     assert!(diagnostics.reused >= 16);
     let debug = format!("{client:?}");
-    assert!(!debug.contains("127.0.0.1"));
-    assert!(!debug.contains(&server_spiffe));
-    assert!(!debug.contains(&format!("{scope:?}")));
+    for canary in privacy_canaries {
+        assert!(
+            !debug.contains(canary),
+            "persistent client Debug must not render endpoint, identity, scope, or request data"
+        );
+    }
 
     let report = client.shutdown().await;
     assert_eq!(report.drained_calls, 0);
     assert_eq!(report.forced_calls, 0);
+    proxy_task.abort();
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn persistent_pools_derived_from_one_stateless_lineage_share_physical_admission() {
+    const PHYSICAL_CAP: usize = 16;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("lineage-cap-server");
+    let client_spiffe = spiffe("lineage-cap-client");
+    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    let (handle, upstream) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_max_connections(64)
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start lineage-cap listener");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind counting proxy");
+    let proxy = listener.local_addr().expect("proxy address");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let proxy_task = {
+        let accepted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let (mut downstream, _) = listener.accept().await.expect("accept consumer TCP");
+                accepted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let Ok(mut upstream_stream) = tokio::net::TcpStream::connect(upstream).await
+                    else {
+                        return;
+                    };
+                    let _ =
+                        tokio::io::copy_bidirectional(&mut downstream, &mut upstream_stream).await;
+                });
+            }
+        })
+    };
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(proxy) }));
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(proxy.ip().into()),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    )
+    .with_operation_timeout(Duration::from_secs(2));
+    let full_pool = PersistentSessionConsumerClient::try_from_stateless(
+        stateless.clone(),
+        config(PHYSICAL_CAP, 0, 1),
+    )
+    .expect("full persistent pool");
+    let second_pool =
+        PersistentSessionConsumerClient::try_from_stateless(stateless, config(1, 0, 1))
+            .expect("second persistent pool");
+
+    assert_eq!(
+        full_pool
+            .prewarm()
+            .await
+            .expect("first pool reaches the fixed physical cap")
+            .ready_request_connections,
+        PHYSICAL_CAP
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        second_pool.prewarm().await,
+        Err(SessionConsumerClientError::Overloaded),
+        "a second pool from one stateless clone lineage cannot start a seventeenth connection"
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
+    full_pool.shutdown().await;
+    assert_eq!(
+        second_pool
+            .prewarm()
+            .await
+            .expect("releasing the first pool admits a fresh connection")
+            .ready_request_connections,
+        1
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP + 1);
+
+    second_pool.shutdown().await;
+    proxy_task.abort();
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn persistent_watch_preserves_typed_overload_from_shared_physical_admission() {
+    const PHYSICAL_CAP: usize = 16;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("lineage-watch-cap-server");
+    let client_spiffe = spiffe("lineage-watch-cap-client");
+    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    let (handle, upstream) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_max_connections(64)
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start lineage-watch-cap listener");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind counting proxy");
+    let proxy = listener.local_addr().expect("proxy address");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let proxy_task = {
+        let accepted = Arc::clone(&accepted);
+        let active = Arc::clone(&active);
+        tokio::spawn(async move {
+            loop {
+                let (mut downstream, _) = listener.accept().await.expect("accept consumer TCP");
+                accepted.fetch_add(1, Ordering::SeqCst);
+                active.fetch_add(1, Ordering::SeqCst);
+                let active = Arc::clone(&active);
+                tokio::spawn(async move {
+                    if let Ok(mut upstream_stream) = tokio::net::TcpStream::connect(upstream).await
+                    {
+                        let _ =
+                            tokio::io::copy_bidirectional(&mut downstream, &mut upstream_stream)
+                                .await;
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        })
+    };
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(proxy) }));
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(proxy.ip().into()),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    )
+    .with_operation_timeout(Duration::from_secs(2));
+    let persistent =
+        PersistentSessionConsumerClient::try_from_stateless(stateless.clone(), config(1, 0, 1))
+            .expect("persistent client");
+
+    let mut held = Vec::with_capacity(PHYSICAL_CAP);
+    for _ in 0..PHYSICAL_CAP {
+        held.push(
+            stateless
+                .watch(0)
+                .await
+                .expect("stateless watch reaches shared physical cap"),
+        );
+    }
+    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
+    assert_eq!(active.load(Ordering::SeqCst), PHYSICAL_CAP);
+    assert_eq!(service.calls.load(Ordering::SeqCst), PHYSICAL_CAP);
+
+    assert!(matches!(
+        persistent.open_watch(0).await,
+        Err(SessionConsumerClientError::Overloaded)
+    ));
+    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
+    assert_eq!(service.calls.load(Ordering::SeqCst), PHYSICAL_CAP);
+    let overloaded = persistent.diagnostics().await;
+    assert_eq!(overloaded.setup_attempts, 1);
+    assert_eq!(overloaded.setup_failures, 1);
+    assert_eq!(overloaded.failures, 1);
+    assert_eq!(overloaded.not_transmitted, 1);
+    assert_eq!(overloaded.overload, 1);
+    assert_eq!(overloaded.watch_active, 0);
+
+    drop(held.pop().expect("one held stateless watch"));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while active.load(Ordering::SeqCst) == PHYSICAL_CAP {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reader-owned physical watch permit is released within the fixed bound");
+    let replacement = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match persistent.open_watch(0).await {
+                Ok(watch) => break watch,
+                Err(SessionConsumerClientError::Overloaded) => tokio::task::yield_now().await,
+                Err(error) => panic!("replacement watch failed outside overload: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("released physical capacity becomes observable within the fixed bound");
+    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP + 1);
+    assert_eq!(service.calls.load(Ordering::SeqCst), PHYSICAL_CAP + 1);
+
+    drop(replacement);
+    drop(held);
+    persistent.shutdown().await;
     proxy_task.abort();
     handle.abort_and_wait().await;
 }
@@ -862,6 +1180,140 @@ async fn saturated_watch_queue_and_server_write_release_on_bounded_rotation() {
 }
 
 #[tokio::test]
+async fn rotation_releases_an_unpolled_full_small_item_watch_queue() {
+    const WATCH_QUEUE_ITEMS: usize = 64;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("watch-small-queue-server");
+    let client_spiffe = spiffe("watch-small-queue-client");
+    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    service.repeat_watch_entry(small_watch_change());
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_max_connections(2)
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let client = persistent_client(
+        &pki,
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        &server_spiffe,
+        &client_spiffe,
+        scope,
+        config(1, 0, 1),
+    );
+
+    let stale_watch = client.open_watch(0).await.expect("open queued watch");
+    let pressure_deadline = Instant::now() + Duration::from_secs(1);
+    let mut previous = 0;
+    let mut unchanged_samples = 0;
+    loop {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let emitted = service.watch_emitted.load(Ordering::SeqCst);
+        unchanged_samples = if emitted > WATCH_QUEUE_ITEMS && emitted == previous {
+            unchanged_samples + 1
+        } else {
+            0
+        };
+        if unchanged_samples >= 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < pressure_deadline,
+            "the unpolled watch did not fill its fixed 64-item queue"
+        );
+        previous = emitted;
+    }
+    assert_eq!(client.diagnostics().await.watch_active, 1);
+
+    // Do not poll or drop `stale_watch`: the physical reader, not caller
+    // polling, owns the fixed lease and must release it on rotation.
+    client
+        .request_reauthentication()
+        .expect("retire the full unpolled watch queue");
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while client.diagnostics().await.watch_active != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rotation releases the stale fixed watch lease");
+    let replacement = client
+        .open_watch(0)
+        .await
+        .expect("released slot admits a replacement watch");
+    drop(replacement);
+    drop(stale_watch);
+
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn peer_terminal_releases_an_unpolled_full_small_item_watch_queue() {
+    const WATCH_QUEUE_ITEMS: usize = 64;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("watch-peer-terminal-server");
+    let client_spiffe = spiffe("watch-peer-terminal-client");
+    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    service.emit_watch_entries_then_close(small_watch_change(), WATCH_QUEUE_ITEMS);
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_max_connections(2)
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let client = persistent_client(
+        &pki,
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        &server_spiffe,
+        &client_spiffe,
+        scope,
+        config(1, 0, 1),
+    );
+
+    let stale_watch = client.open_watch(0).await.expect("open finite watch");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while service.watch_emitted.load(Ordering::SeqCst) < WATCH_QUEUE_ITEMS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("server emits exactly enough entries to fill the item queue");
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while client.diagnostics().await.watch_active != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer terminal releases the fixed watch lease without caller polling");
+
+    // Keep `stale_watch` unpolled and alive while proving that its full local
+    // queue cannot retain either the isolated watch slot or physical permit.
+    let replacement = tokio::time::timeout(Duration::from_millis(500), client.open_watch(0))
+        .await
+        .expect("replacement watch admission remains bounded")
+        .expect("released peer-terminal slot admits a replacement watch");
+    assert!(service.calls.load(Ordering::SeqCst) >= 2);
+    drop(replacement);
+    drop(stale_watch);
+
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn saturation_cancellation_and_reauthentication_replace_only_stale_lanes() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("replacement-server");
@@ -952,11 +1404,20 @@ async fn saturation_cancellation_and_reauthentication_replace_only_stale_lanes()
         Ok(BackendCapabilities::all_enabled()),
         "released bounds admit a new call and retain an idle lane for reauthentication"
     );
+    let after_cancellation = client.diagnostics().await;
+    assert_eq!(
+        after_cancellation.setup_successes, 2,
+        "caller cancellation discards its checked-out lane and the next caller opens one replacement"
+    );
+    assert_eq!(
+        after_cancellation.reconnects, 1,
+        "caller cancellation records exactly one discarded-lane reconnect"
+    );
 
     first_handle.abort_and_wait().await;
     let (second_authorizer, second_scope) = authorizer_and_scope(&client_spiffe).await;
-    assert_eq!(
-        scope, second_scope,
+    assert!(
+        scope == second_scope,
         "replacement retains the exact consumer scope"
     );
     let second_service = Arc::new(ControlledConsumer::default());

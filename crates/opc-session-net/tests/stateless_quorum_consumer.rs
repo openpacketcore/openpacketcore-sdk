@@ -15,6 +15,7 @@ use opc_session_net::{
     RemoteAddrResolver, SessionConsumerAuthorizer, SessionConsumerClientError,
     SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionQuorumConsumerServer,
     StatelessSessionConsumerClient, SESSION_QUORUM_CONSUMER_ALPN,
+    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     BackendCapabilities, ConsensusSessionStore, OwnerId, QuorumReplicaDescriptor,
@@ -23,7 +24,8 @@ use opc_session_store::{
     SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerRejection,
     SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
     SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
-    SessionLeaseManager, SessionQuorumConsumer, SqliteSessionBackend, ValidatedQuorumTopology,
+    SessionLeaseManager, SessionQuorumConsumer, SqliteSessionBackend, StoreError,
+    ValidatedQuorumTopology,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
@@ -107,10 +109,14 @@ impl SessionQuorumConsumer for HangingConsumer {
     async fn execute(
         &self,
         _identity: &SessionConsumerIdentity,
-        _request: SessionConsumerRequest,
+        request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        std::future::pending().await
+        if matches!(request.operation(), SessionConsumerOperation::Watch { .. }) {
+            SessionConsumerResponse::WatchOpened
+        } else {
+            std::future::pending().await
+        }
     }
 
     async fn watch(
@@ -122,7 +128,7 @@ impl SessionQuorumConsumer for HangingConsumer {
         BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
         SessionConsumerRejection,
     > {
-        Err(SessionConsumerRejection::Unavailable)
+        Ok(Box::pin(futures_util::stream::pending()))
     }
 }
 
@@ -279,6 +285,44 @@ async fn raw_authenticated_consumer_connection(
         .expect("complete raw consumer mTLS")
 }
 
+async fn counting_tcp_proxy(
+    upstream: SocketAddr,
+) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind counting proxy");
+    let address = listener.local_addr().expect("counting proxy address");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let task = {
+        let accepted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let (mut downstream, _) = listener.accept().await.expect("accept consumer TCP");
+                accepted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let Ok(mut upstream_stream) = tokio::net::TcpStream::connect(upstream).await
+                    else {
+                        return;
+                    };
+                    let _ =
+                        tokio::io::copy_bidirectional(&mut downstream, &mut upstream_stream).await;
+                });
+            }
+        })
+    };
+    (address, accepted, task)
+}
+
+async fn wait_for_dispatches(service: &HangingConsumer, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while service.calls.load(Ordering::SeqCst) < expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("bounded fixture observes authenticated dispatches");
+}
+
 #[test]
 fn production_default_features_expose_a_dedicated_stateless_consumer_boundary() {
     let _ = std::any::TypeId::of::<StatelessSessionConsumerClient>();
@@ -407,9 +451,178 @@ async fn stateless_serial_calls_authenticate_fresh_and_accumulate_setup_delay() 
     assert_eq!(
         accepted_connections.load(Ordering::SeqCst),
         CALLS,
-        "the compatibility client deliberately authenticates a fresh transport per call"
+        "the stateless client deliberately authenticates a fresh transport per call"
     );
 
+    proxy_task.abort();
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn cloned_stateless_request_connections_fail_fast_at_the_shared_physical_cap() {
+    const PHYSICAL_CAP: usize = 16;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("physical-request-server");
+    let client_spiffe = spiffe("physical-request-client");
+    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let service = Arc::new(HangingConsumer::default());
+    let (handle, upstream) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_max_connections(64)
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start physical-cap listener");
+    let (proxy, accepted, proxy_task) = counting_tcp_proxy(upstream).await;
+    let client = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, scope);
+
+    let mut held = (0..PHYSICAL_CAP)
+        .map(|_| {
+            let clone = client.clone();
+            tokio::spawn(async move { clone.capabilities().await })
+        })
+        .collect::<Vec<_>>();
+    wait_for_dispatches(&service, PHYSICAL_CAP).await;
+    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
+    assert_eq!(
+        client.capabilities().await,
+        Err(SessionConsumerClientError::Overloaded),
+        "the seventeenth clone is rejected before resolve, TCP, or dispatch"
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
+    assert_eq!(service.calls.load(Ordering::SeqCst), PHYSICAL_CAP);
+
+    let released = held.pop().expect("one held caller");
+    released.abort();
+    assert!(
+        released.await.is_err(),
+        "cancelling a held connection completes"
+    );
+    let replacement = {
+        let clone = client.clone();
+        tokio::spawn(async move { clone.capabilities().await })
+    };
+    wait_for_dispatches(&service, PHYSICAL_CAP + 1).await;
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        PHYSICAL_CAP + 1,
+        "releasing one cap slot admits one fresh authenticated TCP connection"
+    );
+    replacement.abort();
+    let _ = replacement.await;
+    for caller in held {
+        caller.abort();
+        let _ = caller.await;
+    }
+    proxy_task.abort();
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn cloned_stateless_watch_connections_have_an_isolated_shared_physical_cap() {
+    const PHYSICAL_CAP: usize = 16;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("physical-watch-server");
+    let client_spiffe = spiffe("physical-watch-client");
+    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let service = Arc::new(HangingConsumer::default());
+    let (handle, upstream) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_max_connections(64)
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start physical-watch listener");
+    let (proxy, accepted, proxy_task) = counting_tcp_proxy(upstream).await;
+    let client = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, scope);
+
+    let mut watches = Vec::with_capacity(PHYSICAL_CAP);
+    for _ in 0..PHYSICAL_CAP {
+        watches.push(client.watch(0).await.expect("watch reaches exact cap"));
+    }
+    wait_for_dispatches(&service, PHYSICAL_CAP).await;
+    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
+    assert!(matches!(
+        client.watch(0).await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
+    assert_eq!(service.calls.load(Ordering::SeqCst), PHYSICAL_CAP);
+
+    drop(watches.pop().expect("one held watch"));
+    let replacement = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(watch) = client.watch(0).await {
+                break watch;
+            }
+            // Dropping the caller's stream closes its bounded queue. The
+            // physical reader owns the permit and releases it on its next
+            // poll, so wait for that observable release without assuming a
+            // scheduler turn between drop and fail-fast admission.
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("released watch capacity becomes observable within the fixed bound");
+    wait_for_dispatches(&service, PHYSICAL_CAP + 1).await;
+    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP + 1);
+    drop(replacement);
+    drop(watches);
+    proxy_task.abort();
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn independent_stateless_constructors_do_not_share_physical_request_budgets() {
+    const PHYSICAL_CAP: usize = 16;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("independent-physical-server");
+    let client_spiffe = spiffe("independent-physical-client");
+    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let service = Arc::new(HangingConsumer::default());
+    let (handle, upstream) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_max_connections(64)
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start independent-budget listener");
+    let (proxy, accepted, proxy_task) = counting_tcp_proxy(upstream).await;
+    let first = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, scope);
+    let second = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, scope);
+
+    let mut held = (0..PHYSICAL_CAP)
+        .flat_map(|_| {
+            let first = first.clone();
+            let second = second.clone();
+            [
+                tokio::spawn(async move { first.capabilities().await }),
+                tokio::spawn(async move { second.capabilities().await }),
+            ]
+        })
+        .collect::<Vec<_>>();
+    wait_for_dispatches(&service, PHYSICAL_CAP * 2).await;
+    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP * 2);
+    assert_eq!(
+        first.capabilities().await,
+        Err(SessionConsumerClientError::Overloaded)
+    );
+    assert_eq!(
+        second.capabilities().await,
+        Err(SessionConsumerClientError::Overloaded)
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP * 2);
+
+    for caller in held.drain(..) {
+        caller.abort();
+        let _ = caller.await;
+    }
     proxy_task.abort();
     handle.abort_and_wait().await;
 }
@@ -939,7 +1152,7 @@ async fn malformed_and_oversized_consumer_frames_are_rejected_before_dispatch() 
     let pki = TestPki::new();
     let server_spiffe = spiffe("server");
     let client_spiffe = spiffe("client");
-    let (authorizer, _scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
     let service = Arc::new(CountingConsumer::default());
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -950,12 +1163,47 @@ async fn malformed_and_oversized_consumer_frames_are_rejected_before_dispatch() 
     .await
     .expect("start stateless consumer listener");
 
+    // This peer completes the same mTLS and ALPN handshake as a real caller,
+    // but offers the wrong fixed consumer revision. It must be closed before
+    // any application dispatch and without an upgrade oracle.
+    let mut wrong_revision =
+        raw_authenticated_consumer_connection(&pki, address, &client_spiffe).await;
+    let wrong_hello = serde_json::to_vec(&serde_json::json!({
+        "kind": "hello",
+        "body": {
+            "transport_revision": SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION.wrapping_add(1),
+            "scope": scope,
+        },
+    }))
+    .expect("wrong revision hello encodes");
+    wrong_revision
+        .write_all(
+            &u32::try_from(wrong_hello.len())
+                .expect("wrong revision hello fits frame")
+                .to_be_bytes(),
+        )
+        .await
+        .expect("write wrong revision prefix");
+    wrong_revision
+        .write_all(&wrong_hello)
+        .await
+        .expect("write wrong revision hello");
+    wrong_revision
+        .flush()
+        .await
+        .expect("flush wrong revision hello");
+    let mut response = [0_u8; 1];
+    let wrong_revision_result =
+        tokio::time::timeout(Duration::from_secs(1), wrong_revision.read(&mut response))
+            .await
+            .expect("wrong revision connection closes promptly");
+    assert!(matches!(wrong_revision_result, Err(_) | Ok(0)));
+
     let mut malformed = raw_authenticated_consumer_connection(&pki, address, &client_spiffe).await;
     malformed
         .write_all(&[0, 0, 0, 1, b'{'])
         .await
         .expect("write malformed consumer frame");
-    let mut response = [0_u8; 1];
     let malformed_result =
         tokio::time::timeout(Duration::from_secs(1), malformed.read(&mut response))
             .await

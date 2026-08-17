@@ -41,21 +41,36 @@ use sha2::{Digest, Sha256};
 const FROZEN_SESSION_HA_PROFILE_V2_JSON: &str =
     include_str!("../qualification/v2/session-ha-profile.json");
 
-/// Exact current profile inventory consumed by qualification tooling.
-pub const SESSION_HA_PROFILE_JSON: &str =
+/// Exact frozen v6 profile inventory consumed by retained qualification tooling.
+pub const SESSION_HA_PROFILE_V6_JSON: &str =
     include_str!("../qualification/v6/session-ha-profile.json");
-/// JSON Schema for the exact current experimental profile inventory.
-pub const SESSION_HA_PROFILE_SCHEMA_JSON: &str =
+/// Exact frozen v6 profile schema consumed by retained qualification tooling.
+pub const SESSION_HA_PROFILE_V6_SCHEMA_JSON: &str =
     include_str!("../qualification/v6/session-ha-profile.schema.json");
+/// Exact v7 profile inventory for the revision-2 persistent consumer transport.
+pub const SESSION_HA_PROFILE_V7_JSON: &str =
+    include_str!("../qualification/v7/session-ha-profile.json");
+/// Closed v7 profile schema for the revision-2 persistent consumer transport.
+pub const SESSION_HA_PROFILE_V7_SCHEMA_JSON: &str =
+    include_str!("../qualification/v7/session-ha-profile.schema.json");
+/// Backward-compatible alias for the frozen v6 profile inventory.
+pub const SESSION_HA_PROFILE_JSON: &str = SESSION_HA_PROFILE_V6_JSON;
+/// Backward-compatible alias for the frozen v6 profile schema.
+pub const SESSION_HA_PROFILE_SCHEMA_JSON: &str = SESSION_HA_PROFILE_V6_SCHEMA_JSON;
 /// JSON Schema for one independent history-checker input operation.
 pub const SESSION_HA_HISTORY_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-ha-history.schema.json");
 /// JSON Schema for one immutable qualification workload invocation.
 pub const SESSION_HA_SCHEDULE_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-ha-schedule.schema.json");
-/// JSON Schema for one current experimental qualification evidence record.
-pub const SESSION_HA_EVIDENCE_SCHEMA_JSON: &str =
+/// Exact frozen v6 schema for one experimental qualification evidence record.
+pub const SESSION_HA_EVIDENCE_V6_SCHEMA_JSON: &str =
     include_str!("../qualification/v6/session-ha-evidence.schema.json");
+/// Closed v7 evidence schema bound only to the v7 persistent-consumer profile.
+pub const SESSION_HA_EVIDENCE_V7_SCHEMA_JSON: &str =
+    include_str!("../qualification/v7/session-ha-evidence.schema.json");
+/// Backward-compatible alias for the frozen v6 evidence schema.
+pub const SESSION_HA_EVIDENCE_SCHEMA_JSON: &str = SESSION_HA_EVIDENCE_V6_SCHEMA_JSON;
 /// Closed schema for one bounded concurrent batch/watch/restore/readiness
 /// history. This v3 candidate contract does not graduate the experimental HA
 /// profile.
@@ -1333,13 +1348,79 @@ pub struct QualificationProtocol {
     pub stateless_consumer: Option<QualificationStatelessConsumerProtocol>,
 }
 
-/// Fixed/default bounded contract inventory for the dedicated session-quorum
-/// consumer transport. The `stateless_consumer` profile field remains for
-/// schema compatibility and inventories both the one-shot compatibility
-/// client and the persistent request client; watches remain dedicated.
+/// Fixed/default bounded v6 contract inventory for the dedicated stateless
+/// session-quorum consumer transport.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationStatelessConsumerProtocol {
+    pub alpn: String,
+    pub transport_revision: u16,
+    pub fallback_or_dual_mode_enabled: bool,
+    pub max_requests_per_connection: usize,
+    pub default_max_connections: usize,
+    pub min_response_frame_bytes: usize,
+    pub max_frame_bytes: usize,
+    pub default_idle_timeout_millis: u64,
+    pub default_operation_timeout_millis: u64,
+    pub request_id_bytes: usize,
+    pub max_consumer_identity_bytes: usize,
+    pub max_batch_operations: usize,
+    pub max_batch_response_bytes: usize,
+    pub max_store_watch_buffer_bytes: usize,
+    pub watch_channel_capacity: usize,
+    pub watch_channel_max_bytes: usize,
+    pub watch_cancellation_recheck_millis: u64,
+    pub watch_delivery_tasks_per_watch: usize,
+    pub default_listener_connection_task_limit: usize,
+    pub default_max_authentication_age_millis: u64,
+    pub default_rotation_drain_window_millis: u64,
+    pub default_reconnect_backoff_min_millis: u64,
+    pub default_reconnect_backoff_max_millis: u64,
+    pub default_rotation_jitter_millis: u64,
+}
+
+/// Machine-readable v7 experimental session-HA profile. This is separate
+/// from [`SessionHaQualificationProfile`] so revision-2 fields cannot make
+/// the published v6 decoder accept an altered document.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionHaQualificationProfileV7 {
+    pub schema_version: String,
+    pub profile_id: String,
+    pub maturity: String,
+    pub qualification_complete: bool,
+    pub workspace: QualificationWorkspace,
+    pub source_build_gate: QualificationSourceBuildGate,
+    pub artifacts: Vec<QualificationArtifact>,
+    pub platforms: Vec<QualificationPlatform>,
+    pub topology: QualificationTopology,
+    pub protocol: QualificationProtocolV7,
+    pub consensus_timing: QualificationConsensusTiming,
+    pub bounds: QualificationBounds,
+    pub provisional_test_thresholds: QualificationThresholds,
+    pub evidence: QualificationEvidenceRequirements,
+}
+
+/// v7 protocol inventory for the revision-2 persistent request-client contract.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationProtocolV7 {
+    pub consensus_alpn: String,
+    pub transport_revision: u16,
+    pub wire_schema_revision: u16,
+    pub error_set_revision: u16,
+    pub consensus_schema_version: u16,
+    pub min_frame_bytes: usize,
+    pub max_frame_bytes: usize,
+    pub max_rpc_payload_bytes: usize,
+    pub legacy_direct_backend_enabled: bool,
+    pub persistent_consumer: QualificationPersistentConsumerProtocolV7,
+}
+
+/// Fixed/default bounded revision-2 persistent consumer contract.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationPersistentConsumerProtocolV7 {
     pub alpn: String,
     pub transport_revision: u16,
     pub fallback_or_dual_mode_enabled: bool,

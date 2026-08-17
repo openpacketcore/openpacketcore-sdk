@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://openpacketcore.dev/schemas/session-ha-profile/v6",
+  "$id": "https://openpacketcore.dev/schemas/session-ha-profile/v7",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -20,8 +20,8 @@
     "evidence"
   ],
   "properties": {
-    "schema_version": { "const": "opc-session-ha-profile/v6" },
-    "profile_id": { "const": "opc-session-openraft-ha/v6" },
+    "schema_version": { "const": "opc-session-ha-profile/v7" },
+    "profile_id": { "const": "opc-session-openraft-ha/v7" },
     "maturity": { "const": "experimental" },
     "qualification_complete": { "const": false },
     "workspace": {
@@ -177,7 +177,7 @@
         "max_frame_bytes",
         "max_rpc_payload_bytes",
         "legacy_direct_backend_enabled",
-        "stateless_consumer"
+        "persistent_consumer"
       ],
       "properties": {
         "consensus_alpn": { "type": "string", "minLength": 1, "maxLength": 128 },
@@ -189,7 +189,7 @@
         "max_frame_bytes": { "type": "integer", "minimum": 1 },
         "max_rpc_payload_bytes": { "type": "integer", "minimum": 1 },
         "legacy_direct_backend_enabled": { "const": false },
-        "stateless_consumer": {
+        "persistent_consumer": {
           "type": "object",
           "additionalProperties": false,
           "required": [
@@ -197,7 +197,20 @@
             "transport_revision",
             "fallback_or_dual_mode_enabled",
             "max_requests_per_connection",
+            "correlation_id_bytes",
+            "max_in_flight_per_connection",
             "default_max_connections",
+            "default_persistent_request_connections",
+            "max_persistent_request_connections",
+            "default_persistent_pending_calls",
+            "max_persistent_pending_calls",
+            "default_persistent_pool_wait_timeout_millis",
+            "default_persistent_watch_connections",
+            "max_persistent_watch_connections",
+            "default_persistent_setup_timeout_millis",
+            "default_persistent_connect_attempts",
+            "default_persistent_reconnect_jitter_millis",
+            "default_persistent_shutdown_drain_millis",
             "min_response_frame_bytes",
             "max_frame_bytes",
             "default_idle_timeout_millis",
@@ -220,10 +233,23 @@
           ],
           "properties": {
             "alpn": { "const": "opc-session-consumer/1" },
-            "transport_revision": { "const": 1 },
+            "transport_revision": { "const": 2 },
             "fallback_or_dual_mode_enabled": { "const": false },
-            "max_requests_per_connection": { "const": 1 },
+            "max_requests_per_connection": { "const": 4096 },
+            "correlation_id_bytes": { "const": 4 },
+            "max_in_flight_per_connection": { "const": 1 },
             "default_max_connections": { "const": 256 },
+            "default_persistent_request_connections": { "const": 4 },
+            "max_persistent_request_connections": { "const": 16 },
+            "default_persistent_pending_calls": { "const": 64 },
+            "max_persistent_pending_calls": { "const": 256 },
+            "default_persistent_pool_wait_timeout_millis": { "const": 250 },
+            "default_persistent_watch_connections": { "const": 2 },
+            "max_persistent_watch_connections": { "const": 16 },
+            "default_persistent_setup_timeout_millis": { "const": 1500 },
+            "default_persistent_connect_attempts": { "const": 2 },
+            "default_persistent_reconnect_jitter_millis": { "const": 25 },
+            "default_persistent_shutdown_drain_millis": { "const": 5000 },
             "min_response_frame_bytes": { "const": 8392704 },
             "max_frame_bytes": { "const": 16777216 },
             "default_idle_timeout_millis": { "const": 5000 },
@@ -358,7 +384,7 @@
       "properties": {
         "schedule_schema": { "const": "session-ha-schedule.schema.json" },
         "history_schema": { "const": "session-ha-history.schema.json" },
-        "evidence_schema": { "const": "session-ha-evidence.schema.json" },
+        "evidence_schema": { "const": "qualification/v7/session-ha-evidence.schema.json" },
         "independent_checker": { "const": "scripts/check-session-ha-history.py" },
         "required_topologies": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "type": "integer", "minimum": 3 } },
         "required_transport_modes": { "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true, "items": { "enum": ["mtls"] } },

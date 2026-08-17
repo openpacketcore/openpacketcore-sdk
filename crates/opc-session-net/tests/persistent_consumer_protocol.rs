@@ -8,23 +8,30 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures_util::StreamExt;
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_session_net::{
-    PersistentSessionConsumerClient, PersistentSessionConsumerConfig, RemoteAddrResolver,
-    SessionConsumerClientError, StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE,
-    SESSION_QUORUM_CONSUMER_ALPN, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+    PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
+    PersistentSessionConsumerExecuteError, RemoteAddrResolver, SessionConsumerClientError,
+    StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
+    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
-    BackendCapabilities, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-    SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerResponse,
-    SessionConsumerScope,
+    BackendCapabilities, OwnerId, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
+    SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerOperation,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerResponse, SessionConsumerScope, SessionKey, SessionKeyType,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
-use opc_types::SpiffeId;
+use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+const SHORT_ACTIVE_FRAME_IDLE: Duration = Duration::from_millis(100);
+const SHORT_ACTIVE_FRAME_WAIT: Duration = Duration::from_millis(500);
 
 struct TestPki {
     ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
@@ -98,6 +105,28 @@ fn scope(marker: u8) -> SessionConsumerScope {
     ))
 }
 
+fn mutation_request(
+    scope: SessionConsumerScope,
+    request_id: SessionConsumerRequestId,
+) -> SessionConsumerRequest {
+    SessionConsumerRequest::new(
+        scope,
+        request_id,
+        SessionConsumerOperation::AcquireLease {
+            key: SessionKey {
+                tenant: TenantId::new("protocol-boundary").expect("test tenant"),
+                nf_kind: NetworkFunctionKind::smf(),
+                key_type: SessionKeyType::PduSession,
+                stable_id: Bytes::from_static(b"opaque-protocol-boundary")
+                    .try_into()
+                    .expect("bounded stable ID"),
+            },
+            owner: OwnerId::new("protocol-boundary-owner").expect("test owner"),
+            ttl: Duration::from_secs(30),
+        },
+    )
+}
+
 fn persistent_client(
     pki: &TestPki,
     address: SocketAddr,
@@ -131,12 +160,48 @@ fn persistent_client(
     .expect("persistent client")
 }
 
+fn persistent_client_with_short_active_frame_idle(
+    pki: &TestPki,
+    address: SocketAddr,
+    server_spiffe: &str,
+    client_spiffe: &str,
+    scope: SessionConsumerScope,
+) -> PersistentSessionConsumerClient {
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        SpiffeId::new(server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(client_spiffe),
+    )
+    .with_idle_timeout(SHORT_ACTIVE_FRAME_IDLE)
+    .with_operation_timeout(Duration::from_secs(1));
+    PersistentSessionConsumerClient::try_from_stateless(
+        stateless,
+        PersistentSessionConsumerConfig::try_new(
+            1,
+            0,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(500),
+            1,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("one-lane short-active-idle config"),
+    )
+    .expect("persistent client")
+}
+
 async fn accept_consumer_tls(
     listener: &TcpListener,
     authenticated: &AuthenticatedServerConfig,
     expected_client: &SpiffeId,
 ) -> tokio_rustls::server::TlsStream<tokio::net::TcpStream> {
     let (tcp, _) = listener.accept().await.expect("accept TLS socket");
+    tcp.set_nodelay(true)
+        .expect("malicious fixture preserves the production TCP boundary");
     let handshake = authenticated.begin_handshake().expect("server material");
     let mut config = handshake.rustls_config().as_ref().clone();
     config.alpn_protocols = vec![SESSION_QUORUM_CONSUMER_ALPN.to_vec()];
@@ -151,9 +216,8 @@ async fn accept_consumer_tls(
     );
     let peer = opc_tls::peer_tls_identity_from_server_connection(stream.get_ref().1)
         .expect("authenticated client SPIFFE identity");
-    assert_eq!(
-        peer.spiffe_id(),
-        expected_client,
+    assert!(
+        peer.spiffe_id() == expected_client,
         "exact client SPIFFE identity"
     );
     handshake.admit().expect("admit unchanged test material");
@@ -195,6 +259,30 @@ where
     writer.flush().await.expect("flush frame");
 }
 
+async fn write_partial_frame<W>(writer: &mut W, boundary: &str)
+where
+    W: AsyncWrite + Unpin,
+{
+    match boundary {
+        "prefix" => writer
+            .write_all(&[0])
+            .await
+            .expect("write partial frame prefix"),
+        "payload" => {
+            writer
+                .write_all(&2_u32.to_be_bytes())
+                .await
+                .expect("write partial payload prefix");
+            writer
+                .write_all(b"{")
+                .await
+                .expect("write partial frame payload");
+        }
+        _ => unreachable!("fixed partial-frame boundary"),
+    }
+    writer.flush().await.expect("flush partial frame");
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", content = "body", rename_all = "snake_case")]
 enum CanonicalConsumerWireResponse {
@@ -230,7 +318,7 @@ fn canonical_response_payload(value: &Value) -> Vec<u8> {
                     .expect("typed consumer response"),
             })
         }
-        other => panic!("unsupported test response kind: {other:?}"),
+        _ => panic!("unsupported test response kind"),
     };
     serde_json::to_vec(&response).expect("test JSON encodes")
 }
@@ -268,6 +356,28 @@ fn capability_response(correlation: Value) -> Value {
             "response": serde_json::to_value(SessionConsumerResponse::Capabilities(
                 BackendCapabilities::all_enabled(),
             )).expect("capability response encodes"),
+        },
+    })
+}
+
+fn watch_opened_response(correlation: Value) -> Value {
+    json!({
+        "kind": "response",
+        "body": {
+            "correlation": correlation,
+            "response": serde_json::to_value(SessionConsumerResponse::WatchOpened)
+                .expect("watch-opened response encodes"),
+        },
+    })
+}
+
+fn rejected_response(correlation: Value, rejection: SessionConsumerRejection) -> Value {
+    json!({
+        "kind": "response",
+        "body": {
+            "correlation": correlation,
+            "response": serde_json::to_value(SessionConsumerResponse::Rejected(rejection))
+                .expect("rejection response encodes"),
         },
     })
 }
@@ -330,6 +440,46 @@ async fn hello_ack_revision_and_scope_mismatches_fail_closed_without_a_call() {
         });
         let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
         assert_typed_protocol_error(client.capabilities().await, &server_spiffe, &client_spiffe);
+        server.await.expect("malicious server");
+    }
+}
+
+#[tokio::test]
+async fn partial_hello_ack_expires_at_the_authenticated_idle_bound() {
+    for boundary in ["prefix", "payload"] {
+        let pki = TestPki::new();
+        let server_spiffe = spiffe(&format!("partial-hello-ack-{boundary}-server"));
+        let client_spiffe = spiffe(&format!("partial-hello-ack-{boundary}-client"));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind malicious listener");
+        let address = listener.local_addr().expect("listener address");
+        let authenticated = pki.server_config(&server_spiffe);
+        let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+        let server = tokio::spawn(async move {
+            let mut tls = accept_consumer_tls(&listener, &authenticated, &expected_client).await;
+            let hello = read_value(&mut tls).await;
+            assert_eq!(hello["kind"], "hello", "client starts with consumer Hello");
+            write_partial_frame(&mut tls, boundary).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+        let client = persistent_client_with_short_active_frame_idle(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            scope(1),
+        );
+        assert_eq!(
+            tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, client.capabilities())
+                .await
+                .expect("partial HelloAck obeys the short authenticated idle bound"),
+            Err(SessionConsumerClientError::Deadline)
+        );
+        let diagnostics = client.diagnostics().await;
+        assert_eq!(diagnostics.hello_attempts, 1);
+        assert_eq!(diagnostics.hello_failures, 1);
+        client.shutdown().await;
         server.await.expect("malicious server");
     }
 }
@@ -418,6 +568,378 @@ async fn malformed_trailing_and_oversized_response_frames_fail_closed() {
 }
 
 #[tokio::test]
+async fn partial_read_only_unary_response_expires_at_the_authenticated_idle_bound() {
+    for boundary in ["prefix", "payload"] {
+        let pki = TestPki::new();
+        let server_spiffe = spiffe(&format!("partial-unary-{boundary}-server"));
+        let client_spiffe = spiffe(&format!("partial-unary-{boundary}-client"));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind malicious listener");
+        let address = listener.local_addr().expect("listener address");
+        let authenticated = pki.server_config(&server_spiffe);
+        let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+        let server = tokio::spawn(async move {
+            let (mut tls, _) =
+                accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+            write_partial_frame(&mut tls, boundary).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+        let client = persistent_client_with_short_active_frame_idle(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            scope(1),
+        );
+        assert_eq!(
+            tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, client.capabilities())
+                .await
+                .expect("partial unary response obeys the authenticated idle bound"),
+            Err(SessionConsumerClientError::Deadline)
+        );
+        client.shutdown().await;
+        server.await.expect("malicious server");
+    }
+}
+
+#[tokio::test]
+async fn partial_mutation_unary_response_is_unknown_once_without_auto_replay() {
+    for boundary in ["prefix", "payload"] {
+        let pki = TestPki::new();
+        let server_spiffe = spiffe(&format!("partial-mutation-{boundary}-server"));
+        let client_spiffe = spiffe(&format!("partial-mutation-{boundary}-client"));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind malicious listener");
+        let address = listener.local_addr().expect("listener address");
+        let authenticated = pki.server_config(&server_spiffe);
+        let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+        let request_id =
+            SessionConsumerRequestId::from_bytes([if boundary == "prefix" { 1 } else { 2 }; 16]);
+        let request = mutation_request(scope(1), request_id);
+        let expected_request = serde_json::to_value(&request).expect("mutation request encodes");
+        let (replay_checked, replay_check_complete) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut tls, call) =
+                accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+            assert!(
+                call["body"]["request"] == expected_request,
+                "the authenticated mutation preserves its exact durable request body"
+            );
+            write_partial_frame(&mut tls, boundary).await;
+            tokio::time::sleep(Duration::from_millis(125)).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "a partial post-call response must not trigger automatic mutation replay"
+            );
+            replay_checked
+                .send(())
+                .expect("test client waits until no automatic replay is proven");
+            let (mut recovery, recovery_call) =
+                accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+            assert_eq!(
+                recovery_call["body"]["request"]["operation"]["operation"], "capabilities",
+                "the next caller reaches a newly established lane"
+            );
+            write_value(
+                &mut recovery,
+                &capability_response(recovery_call["body"]["correlation"].clone()),
+            )
+            .await;
+        });
+        let client = persistent_client_with_short_active_frame_idle(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            scope(1),
+        );
+        let error = tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, client.execute(&request))
+            .await
+            .expect("partial mutation response obeys the authenticated idle bound")
+            .expect_err("post-call partial response leaves the durable mutation outcome unknown");
+        assert!(matches!(
+            error,
+            PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id: retry_id }
+                if retry_id == request_id
+        ));
+        replay_check_complete
+            .await
+            .expect("malicious peer proves there was no automatic replay");
+        assert_eq!(
+            client.capabilities().await,
+            Ok(BackendCapabilities::all_enabled()),
+            "the next caller uses a replacement lane after outcome-unknown eviction"
+        );
+        let diagnostics = client.diagnostics().await;
+        assert_eq!(diagnostics.outcome_unknown, 1);
+        assert_eq!(diagnostics.setup_successes, 2);
+        assert_eq!(diagnostics.reconnects, 1);
+        client.shutdown().await;
+        server.await.expect("malicious server");
+    }
+}
+
+#[tokio::test]
+async fn partial_initial_watch_open_response_releases_the_isolated_admission() {
+    for boundary in ["prefix", "payload"] {
+        let pki = TestPki::new();
+        let server_spiffe = spiffe(&format!("partial-watch-open-{boundary}-server"));
+        let client_spiffe = spiffe(&format!("partial-watch-open-{boundary}-client"));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind malicious listener");
+        let address = listener.local_addr().expect("listener address");
+        let authenticated = pki.server_config(&server_spiffe);
+        let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+        let server = tokio::spawn(async move {
+            let (mut tls, call) =
+                accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+            assert_eq!(
+                call["body"]["request"]["operation"]["operation"], "watch",
+                "initial request is the public Watch operation"
+            );
+            write_partial_frame(&mut tls, boundary).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(tls);
+            let (mut replacement, replacement_call) =
+                accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+            assert_eq!(
+                replacement_call["body"]["request"]["operation"]["operation"], "watch",
+                "replacement request is the public Watch operation"
+            );
+            write_value(
+                &mut replacement,
+                &watch_opened_response(replacement_call["body"]["correlation"].clone()),
+            )
+            .await;
+        });
+        let client = persistent_client_with_short_active_frame_idle(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            scope(1),
+        );
+        let result = tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, client.open_watch(0))
+            .await
+            .expect("partial WatchOpened response obeys the authenticated idle bound");
+        assert!(matches!(result, Err(SessionConsumerClientError::Deadline)));
+        tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, async {
+            while client.diagnostics().await.watch_active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial watch-open failure releases its isolated physical admission");
+        let replacement = tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, client.open_watch(0))
+            .await
+            .expect("released watch admission establishes a fresh authenticated watch")
+            .expect("released watch admission accepts the replacement watch");
+        drop(replacement);
+        client.shutdown().await;
+        server.await.expect("malicious server");
+    }
+}
+
+#[tokio::test]
+async fn correlated_watch_rejections_preserve_their_typed_setup_classification() {
+    for (name, rejection, expected) in [
+        (
+            "unavailable",
+            SessionConsumerRejection::Unavailable,
+            SessionConsumerClientError::Unavailable,
+        ),
+        (
+            "scope",
+            SessionConsumerRejection::ScopeMismatch,
+            SessionConsumerClientError::Scope,
+        ),
+        (
+            "authorization",
+            SessionConsumerRejection::Unauthorized,
+            SessionConsumerClientError::Authentication,
+        ),
+        (
+            "malformed",
+            SessionConsumerRejection::MalformedRequest,
+            SessionConsumerClientError::Protocol,
+        ),
+    ] {
+        let pki = TestPki::new();
+        let server_spiffe = spiffe(&format!("watch-rejection-{name}-server"));
+        let client_spiffe = spiffe(&format!("watch-rejection-{name}-client"));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rejecting listener");
+        let address = listener.local_addr().expect("listener address");
+        let authenticated = pki.server_config(&server_spiffe);
+        let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+        let server = tokio::spawn(async move {
+            let (mut tls, call) =
+                accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+            assert_eq!(
+                call["body"]["request"]["operation"]["operation"], "watch",
+                "rejection follows the public Watch operation"
+            );
+            write_value(
+                &mut tls,
+                &rejected_response(call["body"]["correlation"].clone(), rejection),
+            )
+            .await;
+        });
+        let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+
+        let result = client.open_watch(0).await;
+        assert!(matches!(result, Err(error) if error == expected));
+        let diagnostics = client.diagnostics().await;
+        assert_eq!(diagnostics.setup_attempts, 1);
+        assert_eq!(diagnostics.setup_failures, 1);
+        assert_eq!(diagnostics.failures, 1);
+        assert_eq!(diagnostics.watch_active, 0);
+        if rejection == SessionConsumerRejection::Unavailable {
+            assert_eq!(
+                diagnostics.protocol, 0,
+                "ordinary server unavailability is not wire corruption"
+            );
+        }
+
+        client.shutdown().await;
+        server.await.expect("rejecting server");
+    }
+}
+
+#[tokio::test]
+async fn partial_active_watch_frames_expire_and_release_the_isolated_slot() {
+    for boundary in ["prefix", "payload"] {
+        let pki = TestPki::new();
+        let server_spiffe = spiffe(&format!("partial-watch-{boundary}-server"));
+        let client_spiffe = spiffe(&format!("partial-watch-{boundary}-client"));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind malicious listener");
+        let address = listener.local_addr().expect("listener address");
+        let authenticated = pki.server_config(&server_spiffe);
+        let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+        let server = tokio::spawn(async move {
+            let (mut tls, call) =
+                accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+            write_value(
+                &mut tls,
+                &watch_opened_response(call["body"]["correlation"].clone()),
+            )
+            .await;
+            write_partial_frame(&mut tls, boundary).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+        let client = persistent_client_with_short_active_frame_idle(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            scope(1),
+        );
+        let mut watch = client.open_watch(0).await.expect("WatchOpened is admitted");
+        let item = tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, watch.next())
+            .await
+            .expect("a partial active frame obeys the configured idle bound")
+            .expect("reader reports the authenticated transport failure");
+        assert!(item.is_err(), "partial frame never becomes a watch entry");
+        tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, async {
+            while client.diagnostics().await.watch_active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed-out reader releases its isolated watch slot");
+        drop(watch);
+        client.shutdown().await;
+        server.await.expect("malicious server");
+    }
+}
+
+#[tokio::test]
+async fn quiet_authenticated_watch_remains_admitted_until_the_peer_closes() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("quiet-watch-server");
+    let client_spiffe = spiffe("quiet-watch-client");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind malicious listener");
+    let address = listener.local_addr().expect("listener address");
+    let authenticated = pki.server_config(&server_spiffe);
+    let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+    let (quiet_started, quiet_observed) = tokio::sync::oneshot::channel();
+    let (allow_close, close_allowed) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut tls, call) =
+            accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+        assert_eq!(
+            call["body"]["request"]["operation"]["operation"], "watch",
+            "quiet connection is the public Watch operation"
+        );
+        write_value(
+            &mut tls,
+            &watch_opened_response(call["body"]["correlation"].clone()),
+        )
+        .await;
+        quiet_started
+            .send(())
+            .expect("test client waits for the quiet watch");
+        close_allowed
+            .await
+            .expect("test client releases the synchronized quiet peer");
+        drop(tls);
+    });
+    let client = persistent_client_with_short_active_frame_idle(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        scope(1),
+    );
+    let mut watch = client.open_watch(0).await.expect("WatchOpened is admitted");
+    quiet_observed
+        .await
+        .expect("malicious peer confirms the quiet interval");
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(
+        client.diagnostics().await.watch_active,
+        1,
+        "a quiet authenticated watch remains admitted past three active-frame idle periods"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), watch.next())
+            .await
+            .is_err(),
+        "a quiet watch stays pending rather than fabricating a terminal item"
+    );
+    allow_close
+        .send(())
+        .expect("quiet peer remains live until the assertion completes");
+    let terminal = tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, watch.next())
+        .await
+        .expect("peer close terminates the quiet watch within a bounded wait");
+    assert!(
+        matches!(terminal, None | Some(Err(_))),
+        "peer close never manufactures a watch entry"
+    );
+    tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, async {
+        while client.diagnostics().await.watch_active != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer close releases the isolated quiet-watch admission");
+    drop(watch);
+    client.shutdown().await;
+    server.await.expect("malicious server");
+}
+
+#[tokio::test]
 async fn duplicate_response_poisons_lane_and_next_call_uses_a_new_connection() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("sequence-server");
@@ -459,6 +981,15 @@ async fn duplicate_response_poisons_lane_and_next_call_uses_a_new_connection() {
         client.capabilities().await,
         Ok(BackendCapabilities::all_enabled()),
         "a discarded lane must never deliver its late response to a later call"
+    );
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(
+        diagnostics.setup_successes, 2,
+        "the poisoned lane is replaced exactly once for the next caller"
+    );
+    assert_eq!(
+        diagnostics.reconnects, 1,
+        "one protocol poison records one reconnect, not an implicit retry loop"
     );
     server.await.expect("malicious server");
 }

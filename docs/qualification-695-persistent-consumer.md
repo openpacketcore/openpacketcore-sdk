@@ -4,9 +4,34 @@ This evidence is for the generic SDK transport in issue #695. It is synthetic
 loopback qualification only. It does not measure an ePDG call path and does not
 claim completion of the downstream ePDG #181 production SLO.
 
+The persistent revision-2 qualification contract is recorded in v7. The
+published v6 profile remains the unchanged revision-1 contract. This evidence
+qualifies `PersistentSessionConsumerClient` as the required warm fixed-pool
+primitive for #695/ePDG latency. Production deployments requiring warm reuse
+should use it. `StatelessSessionConsumerClient` remains a public,
+source-compatible production/compatibility fresh-authentication typed
+least-authority surface required by #649, #688, and #691; it is neither hidden,
+deprecated, nor test-only.
+
+A stateless clone lineage shares fail-fast physical-admission caps of 16 request
+connections and 16 watch connections. Permits are acquired before resolve/TCP
+and held for the physical connection lifetime, including by persistent clients
+derived from the same lineage. Independent stateless constructors define
+independent logical clients, as independent persistent constructors do.
+
+Paused-clock lifecycle regressions additionally require a cached lane to remain
+reusable before its stable directed authenticated-edge material deadline and to
+retire exactly at that deadline. Two authenticated edges must produce stable,
+distinct deadlines inside the configured jitter bound, while the opaque edge
+digest has no raw-byte, serialization, or identifying `Debug` surface. Separate
+actual TLS races rotate client and listener material immediately before their
+final publication samples and require no request dispatch (and no listener
+HelloAck for the server-side race). Explicit-generation invalidation remains
+immediate.
+
 ## Warm-call method and samples
 
-The measurement was recorded at `2026-08-16T22:03:40Z` on Fedora Linux 44,
+The measurement was recorded at `2026-08-17T04:58:12Z` on Fedora Linux 44,
 Linux 7.1.8 x86-64, an AMD EPYC 9335 host with 128 online logical CPUs, Rust
 1.97.1, and Cargo 1.97.1. The shared host was not isolated or CPU-pinned. The
 test used an unoptimized Cargo test build, an in-process loopback TLS server and
@@ -19,21 +44,23 @@ Reproduction command, with the required `opc-heavy` serialization wrapper on
 `PATH`:
 
 ```text
-opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_transport prewarm_opens_fixed_lanes_reuses_them_and_keeps_diagnostics_redacted -- --exact --nocapture --test-threads=1
+opc-heavy cargo test --locked -p opc-session-net --all-features --test persistent_consumer_transport prewarm_opens_fixed_lanes_reuses_them_and_keeps_diagnostics_redacted -- --exact --nocapture
 ```
 
 Bounded raw microsecond samples from the restored implementation:
 
 ```text
-[454, 330, 308, 301, 309, 297, 290, 297, 315, 292, 285, 334, 372, 359, 325, 288]
+[558, 397, 390, 411, 389, 400, 380, 385, 402, 383, 411, 386, 385, 394, 381, 399]
 ```
 
-The bounded sample set has minimum 285 us, median 308.5 us, arithmetic mean
-322.25 us, maximum 454 us, and total 5,156 us. The executable assertions require
+The bounded sample set has minimum 380 us, median 392.0 us, arithmetic mean
+403.188 us, maximum 558 us, and total 6,451 us. The executable assertions require
 exactly three physical accepts after prewarm and at least 16 authenticated-lane
 reuses; elapsed time is deliberately non-gating on a shared host. These numbers
 characterize this synthetic host and method only; they are not a production
-benchmark or downstream latency promise.
+benchmark or downstream latency promise. In particular, accept/reuse assertions
+gate only this synthetic transport-method evidence; the warm elapsed samples
+are explicitly non-gating and are not an SLO.
 
 ## Deterministic RED and mutation controls
 
@@ -49,6 +76,8 @@ opc-heavy cargo test --locked -p opc-session-net --test stateless_quorum_consume
 The retained stateless characterization is named
 `stateless_serial_calls_authenticate_fresh_and_accumulate_setup_delay` and
 continues to require four setups and at least 160 ms of injected setup delay.
+It is RED characterization of the fresh-authentication baseline and confirms
+that the stateless surface remains supported.
 
 For the fix-removal mutation, the successful-call
 `return_idle(connection)` was temporarily removed and the warm-call command
@@ -62,7 +91,7 @@ late response incorrectly completed the next call instead of producing the
 typed protocol error:
 
 ```text
-opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_protocol duplicate_response_poisons_lane_and_next_call_uses_a_new_connection -- --exact --nocapture --test-threads=1
+opc-heavy cargo test --locked -p opc-session-net --all-features --test persistent_consumer_protocol duplicate_response_poisons_lane_and_next_call_uses_a_new_connection -- --exact --nocapture
 ```
 
 Exact correlation matching was restored, after which the command passed and
