@@ -597,17 +597,14 @@ async fn independent_stateless_constructors_do_not_share_physical_request_budget
     let first = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, scope);
     let second = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, scope);
 
-    let mut held = (0..PHYSICAL_CAP)
-        .flat_map(|_| {
-            let first = first.clone();
-            let second = second.clone();
-            [
-                tokio::spawn(async move { first.capabilities().await }),
-                tokio::spawn(async move { second.capabilities().await }),
-            ]
-        })
-        .collect::<Vec<_>>();
-    wait_for_dispatches(&service, PHYSICAL_CAP * 2).await;
+    let mut held = Vec::with_capacity(PHYSICAL_CAP * 2);
+    for _ in 0..PHYSICAL_CAP {
+        for client in [&first, &second] {
+            let clone = client.clone();
+            held.push(tokio::spawn(async move { clone.capabilities().await }));
+            wait_for_dispatches(&service, held.len()).await;
+        }
+    }
     assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP * 2);
     assert_eq!(
         first.capabilities().await,
