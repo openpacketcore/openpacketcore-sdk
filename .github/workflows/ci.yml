@@ -357,6 +357,15 @@ jobs:
       - name: Run opc-gtpu-dataplane unit tests on macOS
         run: cargo test --locked -p opc-gtpu-dataplane --lib
 
+      # Dynamic and fixed durable consensus deliberately rely on Linux
+      # descriptor-pinned SQLite snapshot handling. This native lane proves
+      # the public and core constructors fail closed before durable setup.
+      - name: Prove unsupported consensus initialization is side-effect free on macOS
+        run: cargo test --locked -p opc-session-store --all-features unsupported_platform_before_durable_initialization
+
+      - name: Lint opc-session-store on macOS
+        run: cargo clippy --locked -p opc-session-store --all-targets --all-features -- -D warnings
+
   rust:
     name: Rust workspace
     runs-on: ubuntu-latest

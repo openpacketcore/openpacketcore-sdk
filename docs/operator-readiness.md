@@ -1133,9 +1133,10 @@ not omit a record or falsely report completion.
 Production completeness comes only from scanning the barrier-confirmed local
 Openraft-applied state. The transport validates the entire returned page
 against the fixed wire-payload cap and effective frame; it never trims or
-rewrites the page or cursor. An oversize page returns
-`RestoreScanResponseTooLarge` when representable and is retried from the same
-cursor with a smaller record limit, or closes the connection.
+rewrites records or the cursor. An oversize page returns
+`RestoreScanResponseTooLarge` when representable, or closes the connection.
+The SDK does not automatically retry, trim, rewrite, or change the request
+limit. A caller may retry the same cursor with a smaller record limit.
 
 Wire-schema revision 3 retains revision 2's negotiated response budget and
 adds the AES-256-GCM-SIV snapshot-bound cursor, explicit durable-page profile,

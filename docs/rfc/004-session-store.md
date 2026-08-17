@@ -769,6 +769,16 @@ crate, owns election, voting, log matching, commit, membership, snapshot
 coordination, and linearizable-read authority. The SDK state machine owns only
 deterministic session semantics.
 
+Public dynamic consensus construction, including membership-candidate
+construction, MUST be supported only on Linux. On every other platform it MUST
+return `DynamicConsensusUnsupportedPlatform` before topology or durable-state
+inspection and before creating a snapshot directory, consensus schema, or
+other consensus-owned filesystem state. The core initializer MUST independently
+return its typed `UnsupportedPlatform` storage error before those effects.
+Internal path-based snapshot helpers MUST NOT be treated as a portable
+consensus fallback. Standalone `SqliteSessionBackend` use remains
+cross-platform.
+
 HA topology admission MUST start from the complete descriptor set and one
 explicit logical self `ReplicaId`. It MUST bind a cluster ID, the exact
 order-independent configuration digest over the cluster, epoch, and complete

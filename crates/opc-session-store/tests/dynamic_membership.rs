@@ -14,6 +14,8 @@ use opc_key::{
     serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
     AES_256_GCM_SIV_NONCE_LEN,
 };
+#[cfg(not(target_os = "linux"))]
+use opc_session_store::ConsensusSessionStoreOpenError;
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, ConsensusSessionStore, EncryptedSessionPayload, Generation,
     OwnerId, QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity,
@@ -39,6 +41,53 @@ const STORE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TRANSITION_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_DEADLINE: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn public_dynamic_consensus_rejects_unsupported_platform_before_durable_initialization() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("standalone.sqlite");
+    let snapshot_dir = directory.path().join("must-not-exist");
+    let descriptor = member(0);
+    let cluster_id =
+        ConsensusClusterId::new("unsupported-dynamic-platform").expect("cluster identity");
+    let identity = consensus_identity(std::slice::from_ref(&descriptor), cluster_id, 1);
+    let topology = ValidatedQuorumTopology::try_new_consensus_lab_singleton(
+        replica_id(0),
+        vec![descriptor],
+        identity,
+    )
+    .expect("valid lab singleton");
+    let backend = SqliteSessionBackend::open(&database).expect("standalone backend");
+
+    let result = ConsensusSessionStore::open(
+        topology,
+        backend,
+        snapshot_dir.clone(),
+        std::collections::BTreeMap::new(),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(ConsensusSessionStoreOpenError::DynamicConsensusUnsupportedPlatform)
+    ));
+    assert!(
+        !snapshot_dir.exists(),
+        "unsupported construction must not create a snapshot directory"
+    );
+    let conn = rusqlite::Connection::open(database).expect("inspect standalone database");
+    let consensus_identity_tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect consensus schema");
+    assert_eq!(
+        consensus_identity_tables, 0,
+        "unsupported construction must not create consensus schema state"
+    );
+}
 
 type LoopbackHandler = Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>;
 
