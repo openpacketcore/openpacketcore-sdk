@@ -29,6 +29,7 @@ use opc_session_store::{
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
@@ -2468,11 +2469,6 @@ async fn consumer_listener_rejects_unbounded_config_and_reaps_a_tls_blackhole() 
             .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
             .await
             .expect("start bounded listener");
-    let blackhole = tokio::net::TcpStream::connect(address)
-        .await
-        .expect("open silent unauthenticated connection");
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
     let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
     let client = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
@@ -2482,8 +2478,45 @@ async fn consumer_listener_rejects_unbounded_config_and_reaps_a_tls_blackhole() 
         pki.client_config(&client_spiffe),
     )
     .with_operation_timeout(Duration::from_secs(1));
+
+    let mut blackhole = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("open silent unauthenticated connection");
+    let recovery_deadline = tokio::time::Instant::now() + Duration::from_millis(750);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        tokio::time::timeout_at(recovery_deadline, blackhole.read_u8())
+            .await
+            .expect("the TLS blackhole is reaped within the fixed recovery bound")
+            .is_err(),
+        "an unauthenticated blackhole must close without a server response"
+    );
+
+    // A malformed five-byte TLS header must be accepted and closed promptly.
+    // This directly proves that the sole listener permit was returned before
+    // the authenticated successor starts; merely racing another ClientHello
+    // against the expiring blackhole makes the fixture scheduler-dependent on
+    // slower 32-bit runners.
+    let mut release_probe = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect post-blackhole permit probe");
+    release_probe
+        .write_all(&[0_u8; 5])
+        .await
+        .expect("write malformed TLS header");
+    let probe_deadline =
+        (tokio::time::Instant::now() + Duration::from_millis(50)).min(recovery_deadline);
+    let mut discarded_probe_response = tokio::io::sink();
+    tokio::time::timeout_at(
+        probe_deadline,
+        tokio::io::copy(&mut release_probe, &mut discarded_probe_response),
+    )
+    .await
+    .expect("the released listener permit accepts and closes the bounded probe")
+    .expect("drain the fixed TLS rejection");
+
     assert_eq!(
-        tokio::time::timeout(Duration::from_millis(750), client.capabilities())
+        tokio::time::timeout_at(recovery_deadline, client.capabilities())
             .await
             .expect("the silent peer releases the sole listener permit"),
         Ok(BackendCapabilities::all_enabled())
