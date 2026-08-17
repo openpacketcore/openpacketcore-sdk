@@ -2223,6 +2223,11 @@ struct ConsumerConnection {
     _physical_admission: Option<OwnedSemaphorePermit>,
 }
 
+struct ConsumerRotationReceivers<'a> {
+    reauthentication: &'a mut watch::Receiver<u64>,
+    material: &'a mut Option<opc_tls::TlsMaterialStatusReceiver>,
+}
+
 impl Drop for ConsumerConnection {
     fn drop(&mut self) {
         if let Some(pool) = self.pool_connection.take().and_then(|pool| pool.upgrade()) {
@@ -3454,8 +3459,10 @@ impl StatelessSessionConsumerClient {
             request,
             pre_request_deadline,
             pre_request_budget_active,
-            reauthentication_changes,
-            material_changes,
+            ConsumerRotationReceivers {
+                reauthentication: reauthentication_changes,
+                material: material_changes,
+            },
             &write_progress,
         )
         .await
@@ -3468,8 +3475,7 @@ impl StatelessSessionConsumerClient {
         request: &SessionConsumerRequest,
         pre_request_deadline: tokio::time::Instant,
         pre_request_budget_active: bool,
-        reauthentication_changes: &mut watch::Receiver<u64>,
-        material_changes: &mut Option<opc_tls::TlsMaterialStatusReceiver>,
+        rotation: ConsumerRotationReceivers<'_>,
         write_progress: &FrameWriteProgress,
     ) -> Result<NonZeroU32, SessionConsumerCallError> {
         // The receivers are constructed before this check. A rotation between
@@ -3559,7 +3565,7 @@ impl StatelessSessionConsumerClient {
                             SessionConsumerClientError::Deadline,
                         ));
                     }
-                    _ = reauthentication_changes.changed() => {
+                    _ = rotation.reauthentication.changed() => {
                         observe_consumer_rotation(
                             lifecycle,
                             tokio::time::Instant::now(),
@@ -3569,7 +3575,7 @@ impl StatelessSessionConsumerClient {
                         );
                         None
                     }
-                    _ = wait_consumer_material_change(material_changes) => {
+                    _ = wait_consumer_material_change(rotation.material) => {
                         observe_consumer_rotation(
                             lifecycle,
                             tokio::time::Instant::now(),
@@ -3672,8 +3678,10 @@ impl StatelessSessionConsumerClient {
                 &request,
                 pre_request_deadline,
                 pre_request_budget_active,
-                &mut reauthentication_changes,
-                &mut material_changes,
+                ConsumerRotationReceivers {
+                    reauthentication: &mut reauthentication_changes,
+                    material: &mut material_changes,
+                },
                 write_progress,
             )
             .await?;
@@ -4809,7 +4817,7 @@ impl PersistentCheckedOutConnection {
 
     fn return_idle(mut self) {
         if let Some(connection) = self.connection.take() {
-            if let Err(connection) = self.pool.try_return_idle(connection) {
+            if let Some(connection) = self.pool.try_return_idle(connection) {
                 self.connection = Some(connection);
             }
         }
@@ -5110,9 +5118,9 @@ impl PersistentSessionConsumerPool {
     fn try_return_idle(
         self: &Arc<Self>,
         mut connection: ConsumerConnection,
-    ) -> Result<(), ConsumerConnection> {
+    ) -> Option<ConsumerConnection> {
         if self.phase() != PersistentShutdownPhase::Running {
-            return Err(connection);
+            return Some(connection);
         }
         // A returned lane must still be authenticated and within its absolute
         // lifecycle. A fresh prewarmed connection has not yet established a
@@ -5124,7 +5132,7 @@ impl PersistentSessionConsumerPool {
         if !connection.returnable_after_authenticated_work()
             || !connection.current(&self.client.tls_config, &self.client.reauthentication)
         {
-            return Err(connection);
+            return Some(connection);
         }
         if connection.calls == 0 {
             connection.idle_deadline = tokio::time::Instant::now()
@@ -5136,26 +5144,26 @@ impl PersistentSessionConsumerPool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.phase() != PersistentShutdownPhase::Running {
-            return Err(connection);
+            return Some(connection);
         }
         if !connection.reusable()
             || !connection.current(&self.client.tls_config, &self.client.reauthentication)
         {
-            return Err(connection);
+            return Some(connection);
         }
         if idle.len() < self.config.request_connections {
             idle.push_back(connection);
         } else {
-            return Err(connection);
+            return Some(connection);
         }
         drop(idle);
         self.ensure_idle_reaper();
         self.idle_reaper.changed.notify_one();
-        Ok(())
+        None
     }
 
     fn return_idle(self: &Arc<Self>, connection: ConsumerConnection) {
-        if let Err(connection) = self.try_return_idle(connection) {
+        if let Some(connection) = self.try_return_idle(connection) {
             counter_increment(&self.counters.reconnects);
             drop(connection);
         }

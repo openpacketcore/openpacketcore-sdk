@@ -1529,7 +1529,7 @@ async fn cancelled_initial_watch_accounts_the_exact_call_write_boundary_once() {
                 .expect("loopback IP")
                 .into(),
         ),
-        SpiffeId::new(&spiffe("watch-cancel-before-server")).expect("server SPIFFE"),
+        SpiffeId::new(spiffe("watch-cancel-before-server")).expect("server SPIFFE"),
         scope(1),
         pki.client_config(&spiffe("watch-cancel-before-client")),
     )
@@ -1622,7 +1622,7 @@ async fn pending_request_setup_separates_logical_inflight_from_physical_active()
                 .expect("loopback IP")
                 .into(),
         ),
-        SpiffeId::new(&spiffe("physical-active-server")).expect("server SPIFFE"),
+        SpiffeId::new(spiffe("physical-active-server")).expect("server SPIFFE"),
         scope(1),
         pki.client_config(&spiffe("physical-active-client")),
     )
