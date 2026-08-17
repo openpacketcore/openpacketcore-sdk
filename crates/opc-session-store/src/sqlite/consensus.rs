@@ -4889,14 +4889,6 @@ pub(crate) fn validate_command_for_log(
     command: &SessionConsensusCommand,
     identity: SessionConsensusIdentity,
 ) -> io::Result<()> {
-    validate_command_for_log_with_cap(command, identity, true)
-}
-
-fn validate_command_for_log_with_cap(
-    command: &SessionConsensusCommand,
-    identity: SessionConsensusIdentity,
-    enforce_payload_cap: bool,
-) -> io::Result<()> {
     if command.schema_version != SESSION_CONSENSUS_SCHEMA_VERSION {
         return Err(invalid_data("unsupported session consensus command schema"));
     }
@@ -4934,17 +4926,6 @@ fn validate_command_for_log_with_cap(
             .map_err(|_| invalid_data("session consensus record expiry is invalid"))?;
         match super::validate_consensus_record(&op.new_record) {
             Ok(()) => {}
-            Err(StoreError::PayloadTooLarge { .. }) if !enforce_payload_cap => {
-                if op.new_record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
-                    return Err(invalid_data(
-                        "session consensus requires a sealed record payload",
-                    ));
-                }
-                op.new_record
-                    .payload
-                    .validate_envelope_for_record(&op.new_record)
-                    .map_err(|_| invalid_data("session consensus record envelope is invalid"))?;
-            }
             Err(StoreError::PayloadTooLarge { .. }) => {
                 return Err(invalid_data(
                     "session consensus record payload exceeds the consensus limit",
@@ -4984,17 +4965,7 @@ fn validate_entry_for_apply(
     storage_identity: SessionConsensusIdentity,
     scope: &MembershipValidationScope,
 ) -> io::Result<()> {
-    match &entry.payload {
-        EntryPayload::Normal(command) => {
-            validate_command_for_log_with_cap(command, storage_identity, false)
-        }
-        EntryPayload::Membership(membership) => validate_membership_for_log(
-            &StoredMembership::new(Some(entry.log_id), membership.clone()),
-            scope,
-            entry.log_id.index,
-        ),
-        EntryPayload::Blank => Ok(()),
-    }
+    validate_entry_for_membership_scope(entry, storage_identity, scope)
 }
 
 struct MembershipLogProjection {
@@ -7486,6 +7457,9 @@ fn validate_fixed_durable_state_sync(
         validate_epoch(epoch, identity)?;
         let entry: Entry<SessionRaftTypeConfig> = decode_json(&encoded)?;
         validate_fixed_log_id(&entry.log_id)?;
+        if let EntryPayload::Normal(command) = &entry.payload {
+            validate_command_for_log(command, identity)?;
+        }
         if checked_u64(term)? != entry.log_id.leader_id.term
             || checked_u64(index)? != entry.log_id.index
             || fixed_profile_entry_changes_topology(&entry, expected_members)
@@ -7824,8 +7798,12 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
         let credential = checked_positive_u64(credential).map_err(|_| invalid_lease_state())?;
         let fence = checked_positive_u64(fence).map_err(|_| invalid_lease_state())?;
         ops::persisted_owner_id(owner).map_err(|_| invalid_lease_state())?;
+        let guard_expires_at_text = guard_expires_at;
         let guard_expires_at =
-            Timestamp::from_str(&guard_expires_at).map_err(|_| invalid_lease_state())?;
+            Timestamp::from_str(&guard_expires_at_text).map_err(|_| invalid_lease_state())?;
+        if ops::format_rfc3339_normalized(guard_expires_at) != guard_expires_at_text {
+            return Err(invalid_lease_state());
+        }
         let guard_expires_at_unix_ms =
             ops::timestamp_unix_millis(guard_expires_at).map_err(|_| invalid_lease_state())?;
         if (active == 1 && expires_at_unix_ms != guard_expires_at_unix_ms)
@@ -7880,6 +7858,16 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
                  AND fence.key_type = lease.key_type
                  AND fence.stable_id = lease.stable_id
                 WHERE fence.fence IS NULL OR fence.fence != lease.fence
+                UNION ALL
+                SELECT 1
+                FROM session_records AS record
+                JOIN leases AS lease
+                  ON lease.tenant = record.tenant
+                 AND lease.nf_kind = record.nf_kind
+                 AND lease.key_type = record.key_type
+                 AND lease.stable_id = record.stable_id
+                 AND lease.fence = record.fence
+                WHERE record.owner != lease.owner
             )
             "#,
             [],

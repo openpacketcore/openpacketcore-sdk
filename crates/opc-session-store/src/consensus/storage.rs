@@ -1390,11 +1390,12 @@ async fn seal_snapshot_database(
     Ok((snapshot, checksum, total))
 }
 
-/// Seal a Dynamic snapshot using the portable path-based SQLite image flow.
+/// Seal a Dynamic snapshot using the internal path-based SQLite image flow.
 ///
-/// Dynamic consensus intentionally retains the released cross-platform
-/// behavior. Fixed authority uses `seal_snapshot_database` above, whose
-/// descriptor pinning remains an additional Linux-only identity fence.
+/// Public dynamic consensus construction is Linux-only. This helper remains
+/// path-based within that boundary; it is not a portable consensus fallback.
+/// Fixed authority uses `seal_snapshot_database` above, whose descriptor
+/// pinning is an additional identity fence.
 async fn seal_snapshot_database_from_path(
     raw_path: &Path,
     output_path: &Path,

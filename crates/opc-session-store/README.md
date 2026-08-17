@@ -102,7 +102,11 @@ evidence.
   profile evaluation over fresh authenticated evidence may report `Quorum`.
 - `ConsensusSessionStore::open` is the operational construction path.
   `QuorumSessionStore` is a compatibility type alias to that same Openraft
-  implementation, not a second quorum algorithm. Callers install its
+  implementation, not a second quorum algorithm. Durable consensus
+  construction is Linux-only: dynamic construction returns the typed
+  `DynamicConsensusUnsupportedPlatform` error on other platforms before
+  creating snapshot directories or consensus schema state. Standalone
+  `SqliteSessionBackend` use remains cross-platform. Callers install its
   consensus RPC handler, then call `initialize_cluster` for pristine storage.
   Every member may make that call concurrently. On clean first formation only
   the canonical lowest node initializes Openraft; the other pristine members
@@ -556,6 +560,12 @@ replayable copy, including nested logs, snapshots, and restore sources. The v4
 handshake does not make an opaque `OPCH` payload readable by an older binary.
 
 ### Validated HA construction
+
+All public durable consensus constructors are Linux-only. Dynamic construction
+returns `DynamicConsensusUnsupportedPlatform` before consensus-owned filesystem
+or schema initialization; fixed construction retains its distinct
+`FixedQuorumUnsupportedPlatform` error. This boundary does not restrict
+standalone `SqliteSessionBackend` use.
 
 Build the complete descriptor set first, derive its order-independent
 configuration digest with `opc_consensus::derive_configuration_id`, and pass

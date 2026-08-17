@@ -459,7 +459,9 @@ impl ConsensusSessionStore {
     /// `topology` contains only immutable member descriptors. `backend` is this
     /// node's sole local state-machine database; every remote member must be
     /// represented by exactly one consensus-only peer instead of a backend
-    /// adapter.
+    /// adapter. Dynamic consensus is Linux-only; other platforms return
+    /// [`ConsensusSessionStoreOpenError::DynamicConsensusUnsupportedPlatform`]
+    /// before creating consensus snapshot or database state.
     pub async fn open(
         topology: ValidatedQuorumTopology,
         backend: SqliteSessionBackend,
@@ -645,6 +647,8 @@ impl ConsensusSessionStore {
 
     /// Start a node with an injected logical-clock source and bounded complete
     /// operation deadline. Primarily useful for deterministic qualification.
+    /// On non-Linux platforms this fails before topology validation or any
+    /// consensus-owned filesystem or schema initialization.
     pub async fn open_with_clock(
         topology: ValidatedQuorumTopology,
         backend: SqliteSessionBackend,
