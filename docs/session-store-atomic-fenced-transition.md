@@ -225,10 +225,10 @@ complete canonical bytes with the supplied token; only that journal copy may
 be dispatched. A missing, wrong-key, locked, incompatible, corrupt, or
 byte-mismatched journal fails before transport and performs no provider or
 transport I/O. Execute reports a condition that proves this invocation did not
-dispatch as `NotTransmitted` and a binding conflict as
-`Rejected(FencedTransitionRequestConflict)`; status and recovery have no
-`NotTransmitted` result variant and instead return their typed local
-fail-closed result without dispatch.
+dispatch—including a local binding mismatch—as `NotTransmitted`. `Rejected`
+is reserved for a confirmed rejection returned by the inner effect boundary;
+status and recovery have no `NotTransmitted` result variant and instead return
+their typed local fail-closed result without dispatch.
 
 The inner backend must explicitly attest that it preserves already protected
 payload bytes unchanged through preparation and observation. Raw consensus
@@ -271,10 +271,13 @@ stable 32-byte `PreparedFencedTransitionJournalKey`. The key and path are
 deployment secrets/configuration: the key MUST be independent of payload
 encryption, remote provider, TLS, and record keys, and MUST be restored
 unchanged after a process restart. It is never stored in the database. On Unix
-the private parent directory MUST be mode `0700`, the database file MUST be
-mode `0600`, and the database path MUST NOT be a symlink; other platforms
-require equivalent deployment controls. The journal uses an application ID,
-schema version, strict tables, WAL,
+every existing ancestor is descriptor-walked without following symlinks. The
+immediate parent and database MUST be owned by the effective user, with no
+group or other access (normally `0700` and `0600`, respectively); the database
+MUST be a regular, single-link file. The SDK pins and revalidates the admitted
+parent and file identities before each operation. Other platforms require
+equivalent access and stable-path controls. The journal uses an application ID,
+schema version, strict tables, a bounded SQLite value-allocation limit, WAL,
 `synchronous=EXTRA`, an atomic create-only ID binding, and HMAC-SHA-256 over
 each exact token and its stable ID. The journal rejects a wrong key, foreign or
 partial schema, unsupported version, corrupt metadata/row, and insecure path

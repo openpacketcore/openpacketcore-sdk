@@ -3421,6 +3421,13 @@ impl SessionBackend for SessionConsumerFencedTransitionBackend {
         true
     }
 
+    fn fenced_transition_accepts_prepared_physical_token(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> bool {
+        self.decode_prepared(prepared).is_ok()
+    }
+
     async fn prepare_fenced_transition(
         &self,
         request: FencedTransitionRequest,
@@ -3434,11 +3441,9 @@ impl SessionBackend for SessionConsumerFencedTransitionBackend {
         &self,
         prepared: &PreparedFencedTransition,
     ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
-        let request = self.decode_prepared(prepared).map_err(|_| {
-            FencedTransitionExecuteError::Rejected(
-                invalid_authenticated_consumer_fenced_transition(),
-            )
-        })?;
+        let request = self
+            .decode_prepared(prepared)
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         consumer_execute_into_fenced_transition(&request, self.client.execute(&request).await)
     }
 
@@ -9276,8 +9281,8 @@ mod tests {
         EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedTransitionExecuteError,
         FencedTransitionLease, FencedTransitionMutation, FencedTransitionOutcome,
         FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus, Generation,
-        LeaseGuard, OwnerId, RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest,
-        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
+        LeaseGuard, OwnerId, PreparedFencedTransition, RestoreScanCursorProfile, RestoreScanPage,
+        RestoreScanRequest, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
         SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
         SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
         SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
@@ -10527,6 +10532,43 @@ mod tests {
         assert_eq!(original, failover);
         assert_ne!(original, different_consumer);
         assert!(authenticated_consumer_binding(None, scope()).is_err());
+    }
+
+    #[test]
+    fn authenticated_consumer_physical_token_rejects_another_consumer_binding() {
+        let key = SessionKey {
+            tenant: TenantId::new("consumer-physical-token").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"consumer-physical-token")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let request = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x83; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("consumer-physical-token-owner").expect("test owner"),
+                FenceToken::new(0),
+                Duration::from_secs(30),
+            )
+            .expect("bounded acquire"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("bounded transition");
+        let accepted = authenticated_consumer_binding(Some([0x53; 32]), scope())
+            .expect("local identity is available");
+        let other = authenticated_consumer_binding(Some([0x54; 32]), scope())
+            .expect("local identity is available");
+        let prepared = PreparedFencedTransition::from_unprotected_request(request)
+            .expect("prepare unprotected token")
+            .with_authenticated_consumer_binding(accepted)
+            .expect("attach consumer marker");
+
+        assert!(prepared
+            .request_for_authenticated_consumer(accepted)
+            .is_ok());
+        assert!(prepared.request_for_authenticated_consumer(other).is_err());
     }
 
     #[test]

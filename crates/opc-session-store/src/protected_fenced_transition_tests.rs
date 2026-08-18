@@ -1,7 +1,7 @@
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -26,11 +26,11 @@ use crate::{
     PreparedFencedTransitionJournalKey, PreparedFencedTransitionLookup,
     RemoteSealingSessionBackend, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager,
     SessionOp, SessionOpResult, SessionPayloadEncoding, SessionStore, StateClass, StateType,
-    StoreError, StoredSessionRecord,
+    StoreError, StoredSessionRecord, FENCED_TRANSITION_MAX_PREPARED_BYTES,
 };
 
 const NAMESPACE: &str = "protected-fenced-transition";
-const PLAINTEXT: &[u8] = b"protected-fenced-transition-secret";
+const SYNTHETIC_PAYLOAD: &[u8] = b"synthetic-opaque-payload";
 
 struct JournalFixture {
     _directory: tempfile::TempDir,
@@ -64,6 +64,28 @@ impl JournalFixture {
             )
             .expect("open prepared journal"),
         )
+    }
+
+    fn replace_token_with_oversized_blob(&self) {
+        let connection = rusqlite::Connection::open(&self.path)
+            .expect("open journal fixture for bounded corruption");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("enable bounded corruption fixture");
+        let blob_len = FENCED_TRANSITION_MAX_PREPARED_BYTES
+            .checked_add(4096)
+            .and_then(|length| i64::try_from(length).ok())
+            .expect("bounded oversized fixture length");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE prepared_fenced_transition_journal \
+                     SET prepared_token = zeroblob(?1)",
+                    [blob_len],
+                )
+                .expect("replace token with oversized fixture"),
+            1
+        );
     }
 }
 
@@ -100,12 +122,12 @@ fn record(
         state_class: StateClass::AuthoritativeSession,
         state_type: StateType::from_static("protected-fenced-transition-state"),
         expires_at: None,
-        payload: EncryptedSessionPayload::new(PLAINTEXT),
+        payload: EncryptedSessionPayload::new(SYNTHETIC_PAYLOAD),
     }
 }
 
 fn create_request(id: u8) -> FencedTransitionRequest {
-    create_request_with_payload(id, PLAINTEXT)
+    create_request_with_payload(id, SYNTHETIC_PAYLOAD)
 }
 
 fn create_request_with_payload(id: u8, payload: &[u8]) -> FencedTransitionRequest {
@@ -202,6 +224,7 @@ struct SpyState {
     get_calls: usize,
     dispatches: usize,
     delay_ambiguous_commit: bool,
+    emit_nonphysical_prepared_token: bool,
     pending: Option<FencedTransitionRequest>,
     receipt: Option<(FencedTransitionRequest, FencedTransitionOutcome)>,
 }
@@ -212,6 +235,7 @@ struct SpyState {
 #[derive(Default)]
 struct AtomicSpy {
     state: Mutex<SpyState>,
+    reject_physical_tokens: AtomicBool,
 }
 
 impl AtomicSpy {
@@ -267,6 +291,17 @@ impl AtomicSpy {
     fn disable_capability(&self) {
         self.state.lock().expect("spy lock").capability = None;
     }
+
+    fn emit_nonphysical_prepared_token(&self) {
+        self.state
+            .lock()
+            .expect("spy lock")
+            .emit_nonphysical_prepared_token = true;
+    }
+
+    fn reject_physical_tokens(&self) {
+        self.reject_physical_tokens.store(true, Ordering::SeqCst);
+    }
 }
 
 fn outcome_for(request: &FencedTransitionRequest) -> FencedTransitionOutcome {
@@ -319,6 +354,14 @@ impl SessionBackend for AtomicSpy {
         true
     }
 
+    fn fenced_transition_accepts_prepared_physical_token(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> bool {
+        !self.reject_physical_tokens.load(Ordering::SeqCst)
+            && prepared.request_for_unprotected_backend().is_ok()
+    }
+
     async fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities::minimal()
     }
@@ -362,12 +405,17 @@ impl SessionBackend for AtomicSpy {
         &self,
         request: FencedTransitionRequest,
     ) -> Result<PreparedFencedTransition, StoreError> {
-        self.state
-            .lock()
-            .expect("spy lock")
-            .prepared
-            .push(request.clone());
-        PreparedFencedTransition::from_unprotected_request(request)
+        let emit_nonphysical_prepared_token = {
+            let mut state = self.state.lock().expect("spy lock");
+            state.prepared.push(request.clone());
+            state.emit_nonphysical_prepared_token
+        };
+        let prepared = PreparedFencedTransition::from_unprotected_request(request)?;
+        if emit_nonphysical_prepared_token {
+            prepared.with_authenticated_consumer_binding([0; 32])
+        } else {
+            Ok(prepared)
+        }
     }
 
     async fn fenced_transition(
@@ -572,6 +620,225 @@ impl RemoteSealProvider for CountingRemoteProvider {
 }
 
 #[tokio::test]
+async fn protected_fenced_transition_rejects_nonphysical_inner_token_before_journaling() {
+    let local_spy = Arc::new(AtomicSpy::new());
+    local_spy.emit_nonphysical_prepared_token();
+    let local_journal = JournalFixture::new(0x8d);
+    let local_inner: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::from_arc(Arc::clone(&local_spy)));
+    let local = EncryptingSessionBackend::new(
+        local_inner,
+        CountingKeyProvider::with_key("local-nonphysical", 0x14),
+        NAMESPACE,
+    )
+    .with_fenced_transition_journal(local_journal.open());
+    let local_request = create_request(41);
+    assert!(matches!(
+        local.prepare_fenced_transition(local_request.clone()).await,
+        Err(StoreError::CapabilityNotSupported(_))
+    ));
+    assert!(matches!(
+        local_journal
+            .open()
+            .lookup(local_request.request_id())
+            .await
+            .expect("journal lookup"),
+        PreparedFencedTransitionLookup::Absent
+    ));
+
+    let remote_spy = Arc::new(AtomicSpy::new());
+    remote_spy.emit_nonphysical_prepared_token();
+    let remote_journal = JournalFixture::new(0x8e);
+    let remote_inner: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::from_arc(Arc::clone(&remote_spy)));
+    let remote = RemoteSealingSessionBackend::new(
+        remote_inner,
+        CountingRemoteProvider::with_key("remote-nonphysical", 0x15),
+        NAMESPACE,
+    )
+    .with_fenced_transition_journal(remote_journal.open());
+    let remote_request = create_request(42);
+    assert!(matches!(
+        remote
+            .prepare_fenced_transition(remote_request.clone())
+            .await,
+        Err(StoreError::CapabilityNotSupported(_))
+    ));
+    assert!(matches!(
+        remote_journal
+            .open()
+            .lookup(remote_request.request_id())
+            .await
+            .expect("journal lookup"),
+        PreparedFencedTransitionLookup::Absent
+    ));
+}
+
+#[tokio::test]
+async fn protected_fenced_transition_rejects_same_kind_physical_substitution_before_effects() {
+    let local_a = Arc::new(AtomicSpy::new());
+    let local_journal = JournalFixture::new(0x8f);
+    let local_a_inner: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::from_arc(Arc::clone(&local_a)));
+    let local_a_backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::from_arc(Arc::new(
+        EncryptingSessionBackend::new(
+            local_a_inner,
+            CountingKeyProvider::with_key("local-physical-a", 0x16),
+            NAMESPACE,
+        )
+        .with_fenced_transition_journal(local_journal.open()),
+    )));
+    let local_token = local_a_backend
+        .prepare_fenced_transition(create_request(43))
+        .await
+        .expect("prepare local token");
+    let local_b = Arc::new(AtomicSpy::new());
+    local_b.reject_physical_tokens();
+    let local_b_provider = CountingKeyProvider::with_key("local-physical-b", 0x17);
+    let local_b_inner: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::from_arc(Arc::clone(&local_b)));
+    let local_b_backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::from_arc(Arc::new(
+        EncryptingSessionBackend::new(local_b_inner, Arc::clone(&local_b_provider), NAMESPACE)
+            .with_fenced_transition_journal(local_journal.open()),
+    )));
+    assert!(matches!(
+        local_b_backend
+            .recover_prepared_fenced_transition(local_token.request_id())
+            .await,
+        Err(StoreError::CapabilityNotSupported(_))
+    ));
+    assert!(matches!(
+        local_b_backend.fenced_transition_status(&local_token).await,
+        Err(StoreError::CapabilityNotSupported(_))
+    ));
+    assert!(matches!(
+        local_b_backend.fenced_transition(&local_token).await,
+        Err(FencedTransitionExecuteError::NotTransmitted)
+    ));
+    assert_eq!(local_b.dispatches(), 0);
+    assert!(local_b.statuses().is_empty());
+    assert_eq!(local_b_provider.calls(), 0);
+
+    let remote_a = Arc::new(AtomicSpy::new());
+    let remote_journal = JournalFixture::new(0x90);
+    let remote_a_inner: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::from_arc(Arc::clone(&remote_a)));
+    let remote_a_backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::from_arc(Arc::new(
+        RemoteSealingSessionBackend::new(
+            remote_a_inner,
+            CountingRemoteProvider::with_key("remote-physical-a", 0x18),
+            NAMESPACE,
+        )
+        .with_fenced_transition_journal(remote_journal.open()),
+    )));
+    let remote_token = remote_a_backend
+        .prepare_fenced_transition(create_request(44))
+        .await
+        .expect("prepare remote token");
+    let remote_b = Arc::new(AtomicSpy::new());
+    remote_b.reject_physical_tokens();
+    let remote_b_provider = CountingRemoteProvider::with_key("remote-physical-b", 0x19);
+    let remote_b_inner: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::from_arc(Arc::clone(&remote_b)));
+    let remote_b_backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::from_arc(Arc::new(
+        RemoteSealingSessionBackend::new(remote_b_inner, Arc::clone(&remote_b_provider), NAMESPACE)
+            .with_fenced_transition_journal(remote_journal.open()),
+    )));
+    assert!(matches!(
+        remote_b_backend
+            .recover_prepared_fenced_transition(remote_token.request_id())
+            .await,
+        Err(StoreError::CapabilityNotSupported(_))
+    ));
+    assert!(matches!(
+        remote_b_backend
+            .fenced_transition_status(&remote_token)
+            .await,
+        Err(StoreError::CapabilityNotSupported(_))
+    ));
+    assert!(matches!(
+        remote_b_backend.fenced_transition(&remote_token).await,
+        Err(FencedTransitionExecuteError::NotTransmitted)
+    ));
+    assert_eq!(remote_b.dispatches(), 0);
+    assert!(remote_b.statuses().is_empty());
+    assert_eq!(remote_b_provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn protected_fenced_transition_rejects_oversized_journal_row_without_effects() {
+    let local_spy = Arc::new(AtomicSpy::new());
+    let local_provider = CountingKeyProvider::with_key("local-corrupt-journal", 0x1a);
+    let local_journal = JournalFixture::new(0x9a);
+    let local: Arc<dyn SessionBackend> = Arc::new(SessionStore::from_arc(Arc::new(
+        EncryptingSessionBackend::new(
+            Arc::clone(&local_spy),
+            Arc::clone(&local_provider),
+            NAMESPACE,
+        )
+        .with_fenced_transition_journal(local_journal.open()),
+    )));
+    let local_token = local
+        .prepare_fenced_transition(create_request(45))
+        .await
+        .expect("prepare local corruption fixture");
+    let local_provider_calls = local_provider.calls();
+    local_journal.replace_token_with_oversized_blob();
+    assert!(matches!(
+        local.fenced_transition(&local_token).await,
+        Err(FencedTransitionExecuteError::NotTransmitted)
+    ));
+    assert!(matches!(
+        local
+            .recover_prepared_fenced_transition(local_token.request_id())
+            .await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert!(matches!(
+        local.fenced_transition_status(&local_token).await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(local_provider.calls(), local_provider_calls);
+    assert_eq!(local_spy.dispatches(), 0);
+    assert!(local_spy.statuses().is_empty());
+
+    let remote_spy = Arc::new(AtomicSpy::new());
+    let remote_provider = CountingRemoteProvider::with_key("remote-corrupt-journal", 0x1b);
+    let remote_journal = JournalFixture::new(0x9b);
+    let remote: Arc<dyn SessionBackend> = Arc::new(SessionStore::from_arc(Arc::new(
+        RemoteSealingSessionBackend::new(
+            Arc::clone(&remote_spy),
+            Arc::clone(&remote_provider),
+            NAMESPACE,
+        )
+        .with_fenced_transition_journal(remote_journal.open()),
+    )));
+    let remote_token = remote
+        .prepare_fenced_transition(create_request(46))
+        .await
+        .expect("prepare remote corruption fixture");
+    let remote_provider_calls = remote_provider.calls();
+    remote_journal.replace_token_with_oversized_blob();
+    assert!(matches!(
+        remote.fenced_transition(&remote_token).await,
+        Err(FencedTransitionExecuteError::NotTransmitted)
+    ));
+    assert!(matches!(
+        remote
+            .recover_prepared_fenced_transition(remote_token.request_id())
+            .await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert!(matches!(
+        remote.fenced_transition_status(&remote_token).await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(remote_provider.calls(), remote_provider_calls);
+    assert_eq!(remote_spy.dispatches(), 0);
+    assert!(remote_spy.statuses().is_empty());
+}
+
+#[tokio::test]
 async fn protected_fenced_transition_local_prepares_once_and_recovers_exact_physical_request() {
     let spy = Arc::new(AtomicSpy::new());
     spy.delay_ambiguous_commit();
@@ -614,7 +881,7 @@ async fn protected_fenced_transition_local_prepares_once_and_recovers_exact_phys
         let payload = &request.mutation().record().expect("record").payload;
         assert_eq!(payload.encoding(), SessionPayloadEncoding::EnvelopeV1);
         assert!(
-            payload.as_bytes() != PLAINTEXT,
+            payload.as_bytes() != SYNTHETIC_PAYLOAD,
             "the physical local request must not expose the logical payload"
         );
     }
@@ -630,7 +897,8 @@ async fn protected_fenced_transition_local_prepares_once_and_recovers_exact_phys
         serde_json::from_slice(&serialized).expect("deserialize opaque token");
     assert_eq!(restored, prepared);
     assert!(format!("{prepared:?}").contains("redacted"));
-    assert!(!format!("{prepared:?}").contains("protected-fenced-transition-secret"));
+    assert!(!format!("{prepared:?}")
+        .contains(std::str::from_utf8(SYNTHETIC_PAYLOAD).expect("synthetic payload is UTF-8")));
 
     assert!(matches!(
         backend.fenced_transition(&restored).await,
@@ -754,7 +1022,7 @@ async fn protected_fenced_transition_remote_prepares_create_and_update_once_with
         let payload = &request.mutation().record().expect("record").payload;
         assert_eq!(payload.encoding(), SessionPayloadEncoding::EnvelopeV1);
         assert!(
-            payload.as_bytes() != PLAINTEXT,
+            payload.as_bytes() != SYNTHETIC_PAYLOAD,
             "the physical remote request must not expose the logical payload"
         );
     }
@@ -851,7 +1119,8 @@ async fn protected_fenced_transition_observation_unprotects_once_preserves_fence
         .expect_err("missing key must fail observation");
     assert!(matches!(error, StoreError::Crypto(_)));
     assert!(
-        !format!("{error} {error:?}").contains("protected-fenced-transition-secret"),
+        !format!("{error} {error:?}")
+            .contains(std::str::from_utf8(SYNTHETIC_PAYLOAD).expect("synthetic payload is UTF-8")),
         "observation failure must not become a plaintext oracle"
     );
     let calls_before_observation = provider.calls();
@@ -861,7 +1130,7 @@ async fn protected_fenced_transition_observation_unprotects_once_preserves_fence
         .expect("observe plaintext");
     assert_eq!(observation.current_fence(), FenceToken::new(1));
     assert!(
-        observation.record().expect("record").payload.as_bytes() == PLAINTEXT,
+        observation.record().expect("record").payload.as_bytes() == SYNTHETIC_PAYLOAD,
         "local observation must return the logical payload"
     );
     assert_eq!(
@@ -870,7 +1139,8 @@ async fn protected_fenced_transition_observation_unprotects_once_preserves_fence
         "exactly one unprotect"
     );
     assert!(format!("{observation:?}").contains("redacted"));
-    assert!(!format!("{observation:?}").contains("protected-fenced-transition-secret"));
+    assert!(!format!("{observation:?}")
+        .contains(std::str::from_utf8(SYNTHETIC_PAYLOAD).expect("synthetic payload is UTF-8")));
     spy.set_observed(None);
     let calls_before_none = provider.calls();
     let none = backend
@@ -915,7 +1185,7 @@ async fn protected_fenced_transition_observation_unprotects_once_preserves_fence
             .expect("record")
             .payload
             .as_bytes()
-            == PLAINTEXT,
+            == SYNTHETIC_PAYLOAD,
         "remote observation must return the logical payload"
     );
     assert_eq!(remote_observation.current_fence(), FenceToken::new(1));
@@ -954,6 +1224,7 @@ async fn protected_fenced_transition_full_surface_forwards_through_session_store
         .prepare_fenced_transition(create_request(17))
         .await
         .expect("prepare create through SessionStore");
+    let request_id = prepared.request_id();
     let durable = Zeroizing::new(prepared.as_bytes().to_vec());
     let physical = spy.prepared().pop().expect("captured physical request");
     assert_eq!(
@@ -976,7 +1247,18 @@ async fn protected_fenced_transition_full_surface_forwards_through_session_store
         EncryptingSessionBackend::new(Arc::clone(&spy), Arc::clone(&rotated), NAMESPACE)
             .with_fenced_transition_journal(journal.open()),
     ));
-    let restored = PreparedFencedTransition::try_from_bytes(&durable).expect("restore token");
+    let restored = match reconstructed
+        .recover_prepared_fenced_transition(request_id)
+        .await
+        .expect("recover through SessionStore")
+    {
+        PreparedFencedTransitionLookup::Found(prepared) => prepared,
+        PreparedFencedTransitionLookup::Absent => panic!("durable prepared request was lost"),
+    };
+    assert!(
+        restored.as_bytes() == durable.as_slice(),
+        "SessionStore recovery must preserve the exact opaque token"
+    );
     assert!(matches!(
         reconstructed.fenced_transition(&restored).await,
         Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
@@ -1003,7 +1285,7 @@ async fn protected_fenced_transition_full_surface_forwards_through_session_store
             .expect("observed record")
             .payload
             .as_bytes()
-            == PLAINTEXT,
+            == SYNTHETIC_PAYLOAD,
         "SessionStore observation must return the logical payload"
     );
     assert_eq!(observation.current_fence(), FenceToken::new(1));
@@ -1150,9 +1432,13 @@ async fn protected_fenced_transition_rejects_both_nested_protection_orders() {
         .expect("raw test token");
     assert!(matches!(
         local_over_remote.fenced_transition(&raw_local_token).await,
-        Err(FencedTransitionExecuteError::Rejected(
-            StoreError::CapabilityNotSupported(_)
-        ))
+        Err(FencedTransitionExecuteError::NotTransmitted)
+    ));
+    assert!(matches!(
+        local_over_remote
+            .recover_prepared_fenced_transition(raw_local_token.request_id())
+            .await,
+        Err(StoreError::CapabilityNotSupported(_))
     ));
     assert!(matches!(
         local_over_remote
@@ -1204,9 +1490,13 @@ async fn protected_fenced_transition_rejects_both_nested_protection_orders() {
         .expect("raw test token");
     assert!(matches!(
         remote_over_local.fenced_transition(&raw_remote_token).await,
-        Err(FencedTransitionExecuteError::Rejected(
-            StoreError::CapabilityNotSupported(_)
-        ))
+        Err(FencedTransitionExecuteError::NotTransmitted)
+    ));
+    assert!(matches!(
+        remote_over_local
+            .recover_prepared_fenced_transition(raw_remote_token.request_id())
+            .await,
+        Err(StoreError::CapabilityNotSupported(_))
     ));
     assert!(matches!(
         remote_over_local
@@ -1378,9 +1668,7 @@ async fn protected_fenced_transition_capability_preflight_and_token_binding_fail
     let dispatches_before = spy.dispatches();
     assert!(matches!(
         wrong_namespace.fenced_transition(&token).await,
-        Err(FencedTransitionExecuteError::Rejected(
-            StoreError::Serialization(_)
-        ))
+        Err(FencedTransitionExecuteError::NotTransmitted)
     ));
     assert_eq!(wrong_namespace_provider.calls(), 0);
     assert_eq!(spy.dispatches(), dispatches_before);
@@ -1391,6 +1679,10 @@ async fn protected_fenced_transition_capability_preflight_and_token_binding_fail
         NAMESPACE,
     )
     .with_fenced_transition_journal(local_journal.open());
+    assert!(matches!(
+        wrong_mode.fenced_transition(&token).await,
+        Err(FencedTransitionExecuteError::NotTransmitted)
+    ));
     assert!(matches!(
         wrong_mode.fenced_transition_status(&token).await,
         Err(StoreError::Serialization(_))

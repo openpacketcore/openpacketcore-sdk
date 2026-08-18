@@ -1340,6 +1340,24 @@ pub trait SessionBackend: Send + Sync {
         false
     }
 
+    /// Accept the exact raw V1 token emitted by this physical backend.
+    ///
+    /// This synchronous, local predicate is a composition boundary for
+    /// protected fenced transitions. It must not expose caller, marker, or
+    /// parser detail and must not perform provider, transport, readback, clock,
+    /// lock, or durable I/O. A capable raw backend returns `true` only when
+    /// `prepared` has its expected physical marker and becomes a valid
+    /// unprotected request after that marker is removed. Wrappers deliberately
+    /// retain the default so protected layers cannot become physical
+    /// boundaries for one another.
+    #[doc(hidden)]
+    fn fenced_transition_accepts_prepared_physical_token(
+        &self,
+        _prepared: &PreparedFencedTransition,
+    ) -> bool {
+        false
+    }
+
     /// Validate and retain the exact physical request that execute and status
     /// must reuse.
     ///
@@ -2046,6 +2064,21 @@ where
     }
 }
 
+fn require_fenced_transition_physical_token<B>(
+    backend: &B,
+    prepared: &PreparedFencedTransition,
+) -> Result<(), StoreError>
+where
+    B: SessionBackend + ?Sized,
+{
+    require_fenced_transition_physical_boundary(backend)?;
+    if backend.fenced_transition_accepts_prepared_physical_token(prepared) {
+        Ok(())
+    } else {
+        Err(unsupported_fenced_transition())
+    }
+}
+
 async fn require_fenced_transition_capability<B>(backend: &B) -> Result<(), StoreError>
 where
     B: SessionBackend + ?Sized,
@@ -2175,13 +2208,14 @@ where
             } => FencedTransitionMutation::refresh_ttl(expected_generation, ttl)?,
         };
         let protected_request = FencedTransitionRequest::new(request_id, lease, mutation)?;
-        let prepared = self
+        let inner = self
             .inner
             .prepare_fenced_transition(protected_request)
-            .await?
-            .with_protection(PreparedFencedTransitionProtection::LocalAeadV1 {
-                scope_commitment,
-            })?;
+            .await?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+        let prepared = inner.with_protection(PreparedFencedTransitionProtection::LocalAeadV1 {
+            scope_commitment,
+        })?;
         journal.insert(&prepared).await?;
         Ok(prepared)
     }
@@ -2192,12 +2226,14 @@ where
     ) -> Result<PreparedFencedTransitionLookup, StoreError> {
         let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
             .ok_or_else(unsupported_protected_fenced_transition)?;
+        require_fenced_transition_physical_boundary(self.inner.as_ref())?;
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
         match journal.lookup(request_id).await? {
             PreparedFencedTransitionLookup::Found(prepared) => {
-                prepared.without_outer_protection(
+                let inner = prepared.without_outer_protection(
                     PreparedFencedTransitionProtection::LocalAeadV1 { scope_commitment },
                 )?;
+                require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
                 Ok(PreparedFencedTransitionLookup::Found(prepared))
             }
             PreparedFencedTransitionLookup::Absent => Ok(PreparedFencedTransitionLookup::Absent),
@@ -2209,27 +2245,24 @@ where
         prepared: &PreparedFencedTransition,
     ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
         require_fenced_transition_physical_boundary(self.inner.as_ref())
-            .map_err(FencedTransitionExecuteError::Rejected)?;
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
             .ok_or_else(unsupported_protected_fenced_transition)
-            .map_err(FencedTransitionExecuteError::Rejected)?;
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())
             .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         let stored = match journal.require_exact(prepared).await {
             Ok(Some(stored)) => stored,
             Ok(None) => return Err(FencedTransitionExecuteError::NotTransmitted),
-            Err(StoreError::FencedTransitionRequestConflict) => {
-                return Err(FencedTransitionExecuteError::Rejected(
-                    StoreError::FencedTransitionRequestConflict,
-                ));
-            }
             Err(_) => return Err(FencedTransitionExecuteError::NotTransmitted),
         };
         let inner = stored
             .without_outer_protection(PreparedFencedTransitionProtection::LocalAeadV1 {
                 scope_commitment,
             })
-            .map_err(FencedTransitionExecuteError::Rejected)?;
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         let request_id = stored.request_id();
         match self.inner.fenced_transition(&inner).await {
             Err(FencedTransitionExecuteError::OutcomeUnknown {
@@ -2257,6 +2290,7 @@ where
             stored.without_outer_protection(PreparedFencedTransitionProtection::LocalAeadV1 {
                 scope_commitment,
             })?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
         self.inner.fenced_transition_status(&inner).await
     }
 
@@ -2808,13 +2842,14 @@ where
             } => FencedTransitionMutation::refresh_ttl(expected_generation, ttl)?,
         };
         let protected_request = FencedTransitionRequest::new(request_id, lease, mutation)?;
-        let prepared = self
+        let inner = self
             .inner
             .prepare_fenced_transition(protected_request)
-            .await?
-            .with_protection(PreparedFencedTransitionProtection::RemoteSealV1 {
-                scope_commitment,
-            })?;
+            .await?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+        let prepared = inner.with_protection(PreparedFencedTransitionProtection::RemoteSealV1 {
+            scope_commitment,
+        })?;
         journal.insert(&prepared).await?;
         Ok(prepared)
     }
@@ -2825,12 +2860,14 @@ where
     ) -> Result<PreparedFencedTransitionLookup, StoreError> {
         let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
             .ok_or_else(unsupported_protected_fenced_transition)?;
+        require_fenced_transition_physical_boundary(self.inner.as_ref())?;
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
         match journal.lookup(request_id).await? {
             PreparedFencedTransitionLookup::Found(prepared) => {
-                prepared.without_outer_protection(
+                let inner = prepared.without_outer_protection(
                     PreparedFencedTransitionProtection::RemoteSealV1 { scope_commitment },
                 )?;
+                require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
                 Ok(PreparedFencedTransitionLookup::Found(prepared))
             }
             PreparedFencedTransitionLookup::Absent => Ok(PreparedFencedTransitionLookup::Absent),
@@ -2842,27 +2879,24 @@ where
         prepared: &PreparedFencedTransition,
     ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
         require_fenced_transition_physical_boundary(self.inner.as_ref())
-            .map_err(FencedTransitionExecuteError::Rejected)?;
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
             .ok_or_else(unsupported_protected_fenced_transition)
-            .map_err(FencedTransitionExecuteError::Rejected)?;
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())
             .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         let stored = match journal.require_exact(prepared).await {
             Ok(Some(stored)) => stored,
             Ok(None) => return Err(FencedTransitionExecuteError::NotTransmitted),
-            Err(StoreError::FencedTransitionRequestConflict) => {
-                return Err(FencedTransitionExecuteError::Rejected(
-                    StoreError::FencedTransitionRequestConflict,
-                ));
-            }
             Err(_) => return Err(FencedTransitionExecuteError::NotTransmitted),
         };
         let inner = stored
             .without_outer_protection(PreparedFencedTransitionProtection::RemoteSealV1 {
                 scope_commitment,
             })
-            .map_err(FencedTransitionExecuteError::Rejected)?;
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         let request_id = stored.request_id();
         match self.inner.fenced_transition(&inner).await {
             Err(FencedTransitionExecuteError::OutcomeUnknown {
@@ -2890,6 +2924,7 @@ where
             stored.without_outer_protection(PreparedFencedTransitionProtection::RemoteSealV1 {
                 scope_commitment,
             })?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
         self.inner.fenced_transition_status(&inner).await
     }
 

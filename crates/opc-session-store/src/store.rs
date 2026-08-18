@@ -128,6 +128,14 @@ impl<B: SessionBackend> SessionBackend for SessionStore<B> {
             .fenced_transition_preserves_protected_payloads()
     }
 
+    fn fenced_transition_accepts_prepared_physical_token(
+        &self,
+        prepared: &crate::fenced_transition::PreparedFencedTransition,
+    ) -> bool {
+        self.backend
+            .fenced_transition_accepts_prepared_physical_token(prepared)
+    }
+
     async fn capabilities(&self) -> BackendCapabilities {
         self.backend.capabilities().await
     }

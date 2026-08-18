@@ -4876,6 +4876,20 @@ impl SessionBackend for ConsensusSessionStore {
         true
     }
 
+    fn fenced_transition_accepts_prepared_physical_token(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> bool {
+        prepared
+            .without_outer_protection(PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+                storage_commitment: prepared_fenced_transition_storage_commitment(
+                    self.inner.storage_identity,
+                ),
+            })
+            .and_then(|inner| inner.request_for_unprotected_backend())
+            .is_ok()
+    }
+
     fn restore_scan_cursor_profile(&self) -> Option<crate::RestoreScanCursorProfile> {
         Some(crate::RestoreScanCursorProfile::DurableOpaqueV1)
     }
@@ -4967,10 +4981,10 @@ impl SessionBackend for ConsensusSessionStore {
                     self.inner.storage_identity,
                 ),
             })
-            .map_err(FencedTransitionExecuteError::Rejected)?;
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         let request = prepared
             .request_for_unprotected_backend()
-            .map_err(FencedTransitionExecuteError::Rejected)?;
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         match ConsensusSessionStore::fenced_transition(self, request).await {
             Ok(outcome) => Ok(outcome),
             Err(StoreError::FencedTransitionOutcomeUnknown) => {
@@ -5938,6 +5952,62 @@ mod membership_tests {
                 "fenced_transition_request_id_mismatch".into()
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn consensus_physical_token_hook_rejects_a_marker_for_another_storage_identity() {
+        let directory = tempfile::tempdir().expect("physical token directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("physical token SQLite backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open physical token store");
+        let key = SessionKey {
+            tenant: TenantId::new("physical-token").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"physical-token")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let request = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x45; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("physical-token-owner").expect("owner"),
+                FenceToken::new(0),
+                Duration::from_secs(30),
+            )
+            .expect("lease"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("transition");
+        let prepared = SessionBackend::prepare_fenced_transition(&store, request)
+            .await
+            .expect("prepare physical token");
+        let expected = prepared_fenced_transition_storage_commitment(store.inner.storage_identity);
+        let mut foreign = expected;
+        foreign[0] ^= 1;
+        let foreign_prepared = prepared
+            .without_outer_protection(PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+                storage_commitment: expected,
+            })
+            .expect("strip local marker")
+            .with_protection(PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+                storage_commitment: foreign,
+            })
+            .expect("attach foreign marker");
+
+        assert!(!store.fenced_transition_accepts_prepared_physical_token(&foreign_prepared));
+        assert!(matches!(
+            SessionBackend::fenced_transition(&store, &foreign_prepared).await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        ));
     }
 
     #[test]
