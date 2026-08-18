@@ -332,14 +332,17 @@ cycle, restart, snapshot restore, or memory pressure.
 
 History reclamation is an explicit replicated operator-maintenance command,
 available only at the local state-process operator boundary under durable
-fixed-quorum authority. It is eligible only after the maximum retained
-deadline of the active epoch. The first command atomically clears the active
-epoch, advances the irreversible retired floor, and then deletes the first
-ordered, fixed 1,024-row batch. Every command is compare-and-set against the
-observed lifecycle generation and epoch/floor state. Subsequent commands
-delete one ordered batch; the final batch atomically creates
-`retired_floor + 1` as the only active epoch. The floor is included in
-recovery and snapshots, so physical row deletion cannot reopen an identity.
+fixed-quorum authority. The operator entry point is local-leader-only and is
+not forwarded through the ordinary application surface; an operator loop MUST
+resolve the current leader again after a term change and before each batch. It
+is eligible only after the maximum retained deadline of the active epoch. The
+first command atomically clears the active epoch, advances the irreversible
+retired floor, and then deletes the first ordered, fixed 1,024-row batch. Every
+command is compare-and-set against the observed lifecycle generation and
+epoch/floor state. Subsequent commands delete one ordered batch; the final
+batch atomically creates `retired_floor + 1` as the only active epoch. The
+floor is included in recovery and snapshots, so physical row deletion cannot
+reopen an identity.
 
 A maintenance transport failure is ambiguous: its lifecycle CAS may already
 have committed even though the caller did not receive the reply. The operator
