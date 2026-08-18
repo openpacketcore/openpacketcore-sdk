@@ -434,6 +434,13 @@ impl TestCluster {
     }
 
     async fn start_with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self::start_with_clock_and_operation_timeout(clock, OPERATION_TIMEOUT).await
+    }
+
+    async fn start_with_clock_and_operation_timeout(
+        clock: Arc<dyn Clock>,
+        operation_timeout: Duration,
+    ) -> Self {
         let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
         let identity = consensus_identity(&members);
         let topologies = (0..MEMBER_COUNT)
@@ -446,7 +453,7 @@ impl TestCluster {
                 .expect("validate consensus topology")
             })
             .collect::<Vec<_>>();
-        Self::start_with_topologies_and_clock(OPERATION_TIMEOUT, topologies, clock).await
+        Self::start_with_topologies_and_clock(operation_timeout, topologies, clock).await
     }
 
     async fn start_with_topologies(
@@ -2991,7 +2998,13 @@ async fn fenced_transition_stale_fence_and_generation_rejections_leave_state_unc
 async fn fenced_transition_renew_rejects_record_owner_or_fence_mismatch() {
     use futures_util::StreamExt;
 
-    let cluster = TestCluster::start().await;
+    // This proof qualifies deterministic stale-fence rejection after durable
+    // record drift, not the compressed fixture deadline. Use the production
+    // budget so concurrent workspace work cannot turn the expected typed
+    // rejection into an unrelated quorum failure.
+    let cluster =
+        TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+            .await;
     let store = &cluster.stores[0];
     let key = session_key(b"fenced-transition-renew-owner-fence-mismatch");
     let observation = store
@@ -3269,7 +3282,12 @@ async fn fenced_transition_expired_old_owner_races_new_owner_with_one_effect() {
 async fn fenced_transition_renew_update_refresh_ttl_and_delete_preserve_fence_rules() {
     use futures_util::StreamExt;
 
-    let cluster = TestCluster::start().await;
+    // This proof qualifies atomic renewal/mutation effects, not a sub-second
+    // operation deadline. Use the production budget so scheduler contention
+    // cannot turn a healthy committed transition into an ambiguous outcome.
+    let cluster =
+        TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+            .await;
     let (leader_index, _, _) = cluster.observed_leader();
     let store = &cluster.stores[leader_index];
     let key = session_key(b"fenced-transition-mutation-variants");
@@ -3531,7 +3549,14 @@ async fn fenced_transition_renew_rejects_absent_or_expired_records_without_effec
         time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("test timestamp"),
     );
     let clock = Arc::new(MutableTestClock::new(admission_time));
-    let cluster = TestCluster::start_with_clock(clock.clone()).await;
+    // This proof uses a controlled logical clock to distinguish no-effect CAS
+    // rejections from silent renewals. It does not qualify a compressed
+    // transport deadline, so retain the production operation budget.
+    let cluster = TestCluster::start_with_clock_and_operation_timeout(
+        clock.clone(),
+        DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    )
+    .await;
     let store = &cluster.stores[0];
     let request_owner = owner("fenced-transition-rejection-owner");
 
@@ -4093,7 +4118,12 @@ async fn fenced_transition_new_follower_rejects_old_leader_before_forwarding() {
 async fn fenced_transition_enqueued_without_quorum_recovers_one_effect_by_exact_id() {
     use futures_util::StreamExt;
 
-    let cluster = TestCluster::start().await;
+    // The fault below deliberately exceeds the selected operation budget to
+    // prove OutcomeUnknown recovery. Healthy setup and recovery use the
+    // production budget so unrelated scheduler contention does not become the
+    // quorum loss under test.
+    let operation_timeout = DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
+    let cluster = TestCluster::start_with_operation_timeout(operation_timeout).await;
     let (leader, _, _) = cluster.observed_leader();
     let store = &cluster.stores[leader];
     let key = session_key(b"fenced-transition-enqueued-without-quorum");
@@ -4120,7 +4150,7 @@ async fn fenced_transition_enqueued_without_quorum_recovers_one_effect_by_exact_
     let delayed_before = cluster.delay_append_entries_for_request(
         leader,
         *request.request_id().as_bytes(),
-        OPERATION_TIMEOUT + Duration::from_millis(250),
+        operation_timeout + Duration::from_millis(250),
     );
 
     let ambiguous = store.fenced_transition(request.clone()).await;

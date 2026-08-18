@@ -572,6 +572,35 @@ heavy-1: PASS (2 passed; 444.97s)
 ci/test-shards.py verify-heavy: PASS (48 = 44 misc + 4 heavy)
 ```
 
+## First hosted exact-head result and fixture correction
+
+The first hosted run of signed feature head
+`e926cbfc407307451846d2e1efdc21ad79b4b3a2` (tree
+`78e7fe927152cfab5fc9ad44bf9d08f98f258433`) completed 36 of 38 check
+runs successfully. Security (`32107520559`), IPsec load-balancing
+(`32107520554`), privileged GTP-U (`32107520555`), and egress-fence
+(`32107520558`) were terminal green. The only underlying failure in CI run
+`32107520556` was `Rust tests (it-0)` job `95619867084`; the `Rust
+workspace` failure was its aggregate result.
+
+All four failing `consensus_openraft` cases were healthy semantic paths using
+the fixture-local 750 ms operation deadline rather than the exported 10 s
+production complete-operation budget. Under hosted scheduler contention, two
+read/status barriers returned the fixed `BackendUnavailable` outcome, one
+accepted write correctly returned `FencedTransitionOutcomeUnknown`, and an
+expiry assertion compared the same deadline class to `LeaseExpired`. No
+production transition, authority, receipt, or ambiguity behavior failed.
+
+The correction changes only those four semantic fixtures to use
+`DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT`. The deliberate
+possibly-transmitted fault still delays AppendEntries by the selected operation
+budget plus 250 ms, so it continues to require `OutcomeUnknown` followed by
+exact-ID recovery. With repository-default parallelism, the focused transition
+filter passed 17/17 and the repository-generated `it-0` command passed in full;
+its `consensus_openraft` target passed 34/34. Formatting and diff checks also
+passed. The failed first run is not treated as a pass; a new signed exact head
+must be published and its hosted terminal state recorded in PR #698.
+
 The isolated and platform-admission lanes also passed:
 
 ```text
