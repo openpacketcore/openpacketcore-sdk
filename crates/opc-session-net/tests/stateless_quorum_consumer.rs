@@ -12,9 +12,10 @@ use futures_util::stream::BoxStream;
 use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_session_net::{
-    PersistentSessionConsumerClient, RemoteAddrResolver, SessionConsumerAuthorizer,
-    SessionConsumerClientError, SessionConsumerLeaseMutationError, SessionConsumerMutationError,
-    SessionQuorumConsumerServer, StatelessSessionConsumerClient, SESSION_QUORUM_CONSUMER_ALPN,
+    conservative_payload_budget, PersistentSessionConsumerClient, RemoteAddrResolver,
+    SessionConsumerAuthorizer, SessionConsumerClientError, SessionConsumerLeaseMutationError,
+    SessionConsumerMutationError, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
+    MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
     SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
@@ -32,6 +33,13 @@ use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBui
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+fn transported_capabilities() -> BackendCapabilities {
+    BackendCapabilities {
+        max_value_bytes: conservative_payload_budget(MAX_NEGOTIATED_FRAME_SIZE),
+        ..BackendCapabilities::all_enabled()
+    }
+}
 
 struct TestPki {
     ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
@@ -379,7 +387,7 @@ async fn one_authenticated_consumer_call_uses_the_dedicated_alpn_without_replay(
             .capabilities()
             .await
             .expect("authenticated capability call"),
-        BackendCapabilities::all_enabled()
+        transported_capabilities()
     );
     assert_eq!(
         service.calls.load(Ordering::SeqCst),
@@ -456,10 +464,7 @@ async fn stateless_serial_calls_authenticate_fresh_and_accumulate_setup_delay() 
     let client = consumer_client(&pki, proxy_address, &server_spiffe, &client_spiffe, scope);
     let started_at = tokio::time::Instant::now();
     for _ in 0..CALLS {
-        assert_eq!(
-            client.capabilities().await,
-            Ok(BackendCapabilities::all_enabled())
-        );
+        assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
     }
     let elapsed = started_at.elapsed();
 
@@ -681,10 +686,7 @@ async fn consumer_resolver_reconnects_the_same_client_after_endpoint_replacement
         pki.client_config(&client_spiffe),
     );
 
-    assert_eq!(
-        client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled())
-    );
+    assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
     assert_eq!(first_service.calls.load(Ordering::SeqCst), 1);
     first_handle.abort_and_wait().await;
 
@@ -703,7 +705,7 @@ async fn consumer_resolver_reconnects_the_same_client_after_endpoint_replacement
 
     assert_eq!(
         client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled()),
+        Ok(transported_capabilities()),
         "the same client must reconnect through the replacement address"
     );
     assert_eq!(second_service.calls.load(Ordering::SeqCst), 1);
@@ -835,7 +837,7 @@ async fn pre_request_connection_budget_leaves_time_for_a_healthy_later_roster_en
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
     assert_eq!(
         client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled()),
+        Ok(transported_capabilities()),
         "a later admitted endpoint must remain reachable within the caller window"
     );
     assert_eq!(healthy_service.calls.load(Ordering::SeqCst), 1);
@@ -1204,7 +1206,7 @@ async fn twelve_concurrent_stateless_consumers_remain_outside_member_authority()
         futures_util::future::join_all(clients.iter().map(|client| client.capabilities())).await;
     assert!(results
         .iter()
-        .all(|result| result == &Ok(BackendCapabilities::all_enabled())));
+        .all(|result| result == &Ok(transported_capabilities())));
     assert_eq!(service.calls.load(Ordering::SeqCst), 12);
     for client in clients {
         let diagnostic = format!("{client:?}");
@@ -1520,7 +1522,8 @@ async fn stateless_and_persistent_consumers_accept_shorter_and_zero_ttl_renewals
         .expect("stateless renewal may shorten a live lease");
     assert!(shortened.expires_at() < original.expires_at());
 
-    let persistent = PersistentSessionConsumerClient::from_stateless(stateless);
+    let persistent = PersistentSessionConsumerClient::from_stateless(stateless)
+        .expect("valid persistent configuration");
     let zero = persistent
         .renew_with_id(
             SessionConsumerRequestId::from_bytes([0x83; 16]),

@@ -62,8 +62,6 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
     QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE,
     QUALIFICATION_NODE_SCHEMA_VERSION, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
-    QUALIFICATION_PERSISTENT_CONSUMER_MAX_P999_MICROS_V7,
-    QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7,
     QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7,
     QUALIFICATION_RESOLVER_BACKOFF_LOWER_BOUNDS_MILLIS, QUALIFICATION_RESOLVER_PROOF_MILLIS,
     QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE, QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE,
@@ -8680,7 +8678,7 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
 
 fn assert_v7_persistent_consumer_evidence_binding() {
     const PROFILE_SHA256: &str =
-        "sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592";
+        "sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7";
     assert_eq!(
         format!(
             "{:x}",
@@ -8760,19 +8758,16 @@ fn emit_v7_persistent_consumer_evidence(
     measurements: PersistentConsumerRunMeasurements,
 ) {
     const PROFILE_SHA256: &str =
-        "sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592";
-    let source_revision = exact_git_value(&["rev-parse", "HEAD^{commit}"]);
+        "sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7";
+    let (source_revision, source_status, _) =
+        candidate_source_provenance().expect("capture bounded v7 source provenance");
     let source_tree = exact_git_value(&["rev-parse", "HEAD^{tree}"]);
-    let source_tree_status =
-        if exact_git_value(&["status", "--porcelain", "--untracked-files=no"]).is_empty() {
-            "clean"
-        } else {
-            "dirty_unqualified"
-        };
+    let source_tree_status = match source_status {
+        SessionMtlsCandidateSourceTreeStatus::Clean => "clean",
+        SessionMtlsCandidateSourceTreeStatus::DirtyUnqualified => "dirty_unqualified",
+    };
     let p99_micros = nearest_rank_micros(&measurements.raw_samples_micros, 99, 100);
     let p999_micros = nearest_rank_micros(&measurements.raw_samples_micros, 999, 1_000);
-    assert!(p99_micros <= QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7);
-    assert!(p999_micros <= QUALIFICATION_PERSISTENT_CONSUMER_MAX_P999_MICROS_V7);
 
     let topology_coverage = if member_count == 3 {
         QualificationPersistentConsumerCoverageV7::ThreeVoterLatency

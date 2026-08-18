@@ -14,10 +14,11 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_session_net::{
-    ConnectionLifecyclePolicy, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-    PersistentSessionConsumerDiagnostics, PersistentSessionConsumerExecuteError,
-    RemoteAddrResolver, SessionConsumerAuthorizer, SessionConsumerClientError,
-    SessionQuorumConsumerServer, SessionReauthenticationControl, StatelessSessionConsumerClient,
+    conservative_payload_budget, ConnectionLifecyclePolicy, PersistentSessionConsumerClient,
+    PersistentSessionConsumerConfig, PersistentSessionConsumerDiagnostics,
+    PersistentSessionConsumerExecuteError, RemoteAddrResolver, SessionConsumerAuthorizer,
+    SessionConsumerClientError, SessionQuorumConsumerServer, SessionReauthenticationControl,
+    StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE,
 };
 use opc_session_store::{
     BackendCapabilities, ConsensusSessionStore, QuorumReplicaDescriptor, ReplicaBackingIdentity,
@@ -31,7 +32,14 @@ use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBui
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
+
+fn transported_capabilities() -> BackendCapabilities {
+    BackendCapabilities {
+        max_value_bytes: conservative_payload_budget(MAX_NEGOTIATED_FRAME_SIZE),
+        ..BackendCapabilities::all_enabled()
+    }
+}
 
 struct TestPki {
     ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
@@ -413,6 +421,81 @@ fn watch_result_envelope_edge_change() -> SessionConsumerChange {
     change
 }
 
+fn exact_watch_byte_budget_change() -> SessionConsumerChange {
+    const BYTE_CAP: usize = 512 * 1024;
+    let ordinary_key = SessionKey {
+        tenant: TenantId::new("watch-exact-cap").expect("test tenant"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from(vec![0_u8; 64])
+            .try_into()
+            .expect("maximum bounded stable ID"),
+    };
+    let ordinary = serde_json::json!({
+        "key": serde_json::to_value(ordinary_key).expect("ordinary watch key encodes"),
+        "kind": "RecordWritten",
+    });
+
+    // Two 64-byte stable IDs provide 256 single-byte JSON-width increments:
+    // `0` -> `10` adds one byte and `0` -> `100` adds two. That covers the
+    // complete spacing between adjacent repeated projections without trial
+    // allocations proportional to the byte cap.
+    for ordinary_count in 2_000..=2_300 {
+        let build = |first: Vec<u8>, second: Vec<u8>| {
+            let edge = |stable_id: Vec<u8>| {
+                let key = SessionKey {
+                    tenant: TenantId::new("watch-exact-cap").expect("test tenant"),
+                    nf_kind: NetworkFunctionKind::smf(),
+                    key_type: SessionKeyType::PduSession,
+                    stable_id: Bytes::from(stable_id)
+                        .try_into()
+                        .expect("maximum bounded stable ID"),
+                };
+                serde_json::json!({
+                    "key": serde_json::to_value(key).expect("edge watch key encodes"),
+                    "kind": "RecordWritten",
+                })
+            };
+            let mut changes = vec![ordinary.clone(); ordinary_count];
+            changes.push(edge(first));
+            changes.push(edge(second));
+            serde_json::from_value::<SessionConsumerChange>(serde_json::json!({
+                "sequence": 1,
+                "changes": changes,
+            }))
+            .expect("synthetic exact-cap watch change decodes")
+        };
+        let baseline = build(vec![0_u8; 64], vec![0_u8; 64]);
+        let baseline_len = serde_json::to_vec(&Ok::<_, SessionConsumerStoreError>(baseline))
+            .expect("baseline queued watch result encodes")
+            .len();
+        let Some(delta) = BYTE_CAP.checked_sub(baseline_len) else {
+            continue;
+        };
+        if delta > 256 {
+            continue;
+        }
+        let mut bytes = vec![0_u8; 128];
+        let three_digit = delta / 2;
+        for byte in bytes.iter_mut().take(three_digit) {
+            *byte = 100;
+        }
+        if delta % 2 == 1 {
+            bytes[three_digit] = 10;
+        }
+        let exact = build(bytes[..64].to_vec(), bytes[64..].to_vec());
+        assert_eq!(
+            serde_json::to_vec(&Ok::<_, SessionConsumerStoreError>(exact.clone()))
+                .expect("exact queued watch result encodes")
+                .len(),
+            BYTE_CAP,
+            "fixture consumes every local byte permit exactly"
+        );
+        return exact;
+    }
+    panic!("unable to construct the exact fixed watch-byte boundary");
+}
+
 fn small_watch_change_at(sequence: u64) -> SessionConsumerChange {
     let key = SessionKey {
         tenant: TenantId::new("watch-queue").expect("test tenant"),
@@ -677,10 +760,7 @@ async fn prewarm_opens_fixed_lanes_reuses_them_and_keeps_diagnostics_redacted() 
     let mut warm_call_micros = Vec::with_capacity(16);
     for _ in 0..16 {
         let call_started = Instant::now();
-        assert_eq!(
-            client.capabilities().await,
-            Ok(BackendCapabilities::all_enabled())
-        );
+        assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
         warm_call_micros.push(call_started.elapsed().as_micros());
     }
     println!("synthetic_warm_call_samples_micros={warm_call_micros:?}");
@@ -959,10 +1039,7 @@ async fn lane_retires_before_the_4097th_call_and_correlation_restarts_on_replace
 
     client.prewarm().await.expect("prewarm one lane");
     for _ in 0..=opc_session_net::MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION {
-        assert_eq!(
-            client.capabilities().await,
-            Ok(BackendCapabilities::all_enabled())
-        );
+        assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
     }
     let diagnostics = client.diagnostics().await;
     assert_eq!(
@@ -1325,7 +1402,7 @@ async fn slow_lane_does_not_serialize_sixteen_callers_and_watch_capacity_is_isol
             .expect("caller task");
         assert_eq!(
             result,
-            Ok(BackendCapabilities::all_enabled()),
+            Ok(transported_capabilities()),
             "caller {index} failed; diagnostics={:?}",
             client.diagnostics().await,
         );
@@ -1333,17 +1410,14 @@ async fn slow_lane_does_not_serialize_sixteen_callers_and_watch_capacity_is_isol
     assert_eq!(service.calls.load(Ordering::SeqCst), 16);
     assert_eq!(
         slow.await.expect("slow task"),
-        Ok(BackendCapabilities::all_enabled())
+        Ok(transported_capabilities())
     );
 
     let watch = client
         .open_watch(0)
         .await
         .expect("first isolated watch slot");
-    assert_eq!(
-        client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled())
-    );
+    assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
     assert!(matches!(
         client.open_watch(0).await,
         Err(SessionConsumerClientError::Overloaded)
@@ -1450,7 +1524,7 @@ async fn admitted_call_drains_across_rotation_and_hard_deadline_releases_its_lan
     assert_eq!(
         completing.await.expect("completing task"),
         Ok(SessionConsumerResponse::Capabilities(
-            BackendCapabilities::all_enabled()
+            transported_capabilities()
         )),
         "already-admitted work may finish inside the rotation drain window"
     );
@@ -1553,6 +1627,74 @@ async fn byte_saturated_watch_queue_terminalizes_without_rotation_or_caller_poll
     ));
     assert!(stale_watch.next().await.is_none());
 
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn endpoint_loss_at_exact_watch_byte_saturation_releases_without_reconnect() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("watch-exact-byte-loss-server");
+    let client_spiffe = spiffe("watch-exact-byte-loss-client");
+    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    service.emit_watch_entries_then_close(exact_watch_byte_budget_change(), 1);
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_max_connections(2)
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start exact-byte consumer listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&resolutions);
+    let resolver: RemoteAddrResolver = Arc::new(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(address) })
+    });
+    let client = persistent_client(
+        &pki,
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        &server_spiffe,
+        &client_spiffe,
+        scope,
+        config(1, 0, 1),
+    );
+
+    let mut watch = client.open_watch(0).await.expect("open exact-byte watch");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        service.wait_for_watch_emissions(1).await;
+        while client.diagnostics().await.watch_active != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("endpoint loss releases the byte-saturated isolated lease");
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        1,
+        "a saturated unpolled queue never starts replacement setup"
+    );
+    assert!(watch
+        .next()
+        .await
+        .expect("exact-cap item remains ordered")
+        .is_ok());
+    assert!(matches!(
+        watch.next().await,
+        Some(Err(opc_session_store::StoreError::BackendUnavailable(_)))
+    ));
+    assert!(watch.next().await.is_none());
+
+    let replacement = client
+        .open_watch(0)
+        .await
+        .expect("released slot admits one explicit replacement");
+    drop(replacement);
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
     client.shutdown().await;
     handle.abort_and_wait().await;
 }
@@ -2302,7 +2444,7 @@ async fn saturation_cancellation_and_reauthentication_replace_only_stale_lanes()
     first_service.release();
     assert_eq!(
         client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled()),
+        Ok(transported_capabilities()),
         "released bounds admit a new call and retain an idle lane for reauthentication"
     );
     let after_cancellation = client.diagnostics().await;
@@ -2336,10 +2478,7 @@ async fn saturation_cancellation_and_reauthentication_replace_only_stale_lanes()
     .expect("start replacement listener");
     *resolved.write().expect("resolver address lock") = second_address;
     client.request_reauthentication().expect("drain stale lane");
-    assert_eq!(
-        client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled())
-    );
+    assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
     assert_eq!(second_service.calls.load(Ordering::SeqCst), 1);
     assert!(
         resolutions.load(Ordering::SeqCst) >= 2,
@@ -2525,10 +2664,7 @@ async fn shutting_down_one_derived_pool_does_not_rotate_its_live_sibling() {
 
     first.shutdown().await;
     assert_eq!(reauthentication.generation(), initial_generation);
-    assert_eq!(
-        sibling.capabilities().await,
-        Ok(BackendCapabilities::all_enabled())
-    );
+    assert_eq!(sibling.capabilities().await, Ok(transported_capabilities()));
     assert_eq!(sibling.diagnostics().await.watch_active, 1);
 
     drop(sibling_watch);
@@ -2537,7 +2673,7 @@ async fn shutting_down_one_derived_pool_does_not_rotate_its_live_sibling() {
 }
 
 #[tokio::test]
-async fn consumer_listener_rejects_unbounded_config_and_reaps_a_tls_blackhole() {
+async fn consumer_listener_preserves_stateless_bounds_and_reaps_a_tls_blackhole() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("bounded-listener-server");
     let client_spiffe = spiffe("bounded-listener-client");
@@ -2553,10 +2689,10 @@ async fn consumer_listener_rejects_unbounded_config_and_reaps_a_tls_blackhole() 
         pki.server_config(&server_spiffe),
         authorizer.clone(),
     )
-    .with_max_connections(257)
+    .with_max_connections(Semaphore::MAX_PERMITS.saturating_add(1))
     .listen(occupied_address)
     .await
-    .expect_err("the fixed 256-listener-task ceiling is enforced before bind");
+    .expect_err("a semaphore-unrepresentable listener ceiling is rejected before bind");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 
     let error = SessionQuorumConsumerServer::new(
@@ -2564,10 +2700,10 @@ async fn consumer_listener_rejects_unbounded_config_and_reaps_a_tls_blackhole() 
         pki.server_config(&server_spiffe),
         authorizer.clone(),
     )
-    .with_idle_timeout(Duration::MAX)
+    .with_idle_timeout(Duration::ZERO)
     .listen(occupied_address)
     .await
-    .expect_err("an unbounded pre-authentication timeout is rejected before bind");
+    .expect_err("a zero pre-authentication timeout is rejected before bind");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     drop(occupied);
 
@@ -2664,7 +2800,7 @@ async fn consumer_listener_rejects_unbounded_config_and_reaps_a_tls_blackhole() 
         tokio::time::timeout_at(authenticated_deadline, client.capabilities())
             .await
             .expect("the separately bounded authenticated successor completes"),
-        Ok(BackendCapabilities::all_enabled())
+        Ok(transported_capabilities())
     );
 
     proxy_task.abort();

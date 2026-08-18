@@ -19,19 +19,19 @@ use opc_session_net::{
 };
 use opc_session_store::{
     checked_session_deadline, BackendCapabilities, CompareAndSet, CompareAndSetResult,
-    EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, OwnerId,
+    EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, LeaseGuard, OwnerId,
     RestoreScanCursor, RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest,
     RestoreScanScope, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
     SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
-    SessionConsumerChange, SessionConsumerLeaseError, SessionConsumerLeaseGrant,
-    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
-    SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
+    SessionConsumerChange, SessionConsumerLeaseError, SessionConsumerOperation,
+    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
+    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    StateClass, StateType, StoreError, StoredSessionRecord,
     MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_TTL,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
-use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -375,6 +375,13 @@ struct CanonicalWireBackendCapabilities {
     max_value_bytes: u64,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalConsumerLeaseGrantWire {
+    guard: LeaseGuard,
+    authority_time: Timestamp,
+}
+
 /// Test-side mirror of the private revision-2 response body. Tests may compose
 /// adversarial frames as JSON values, but valid control responses must be
 /// reserialized through this typed mirror so map ordering cannot accidentally
@@ -396,8 +403,8 @@ enum CanonicalConsumerSessionResponseWire {
     Batch(Result<Vec<SessionConsumerBatchResult>, SessionConsumerStoreError>),
     ScanRestoreRecords(Result<RestoreScanPage, SessionConsumerStoreError>),
     WatchOpened,
-    AcquireLease(Result<SessionConsumerLeaseGrant, SessionConsumerLeaseError>),
-    RenewLease(Result<SessionConsumerLeaseGrant, SessionConsumerLeaseError>),
+    AcquireLease(Result<CanonicalConsumerLeaseGrantWire, SessionConsumerLeaseError>),
+    RenewLease(Result<CanonicalConsumerLeaseGrantWire, SessionConsumerLeaseError>),
     ReleaseLease(Result<(), SessionConsumerLeaseError>),
     OutcomeUnknown(SessionConsumerOutcomeUnknown),
     Rejected(SessionConsumerRejection),
@@ -481,10 +488,17 @@ fn capability_response(correlation: Value) -> Value {
         "body": {
             "correlation": correlation,
             "response": serde_json::to_value(SessionConsumerResponse::Capabilities(
-                BackendCapabilities::all_enabled(),
+                bounded_capabilities(),
             )).expect("capability response encodes"),
         },
     })
+}
+
+fn bounded_capabilities() -> BackendCapabilities {
+    BackendCapabilities {
+        max_value_bytes: 1_024,
+        ..BackendCapabilities::all_enabled()
+    }
 }
 
 fn revision_two_response_value(response: SessionConsumerResponse) -> Value {
@@ -780,7 +794,7 @@ async fn negotiated_reduced_request_cap_rejects_a_large_mutation_before_transmis
 }
 
 #[tokio::test]
-async fn partial_hello_ack_expires_at_the_configured_setup_bound() {
+async fn partial_hello_ack_expires_at_the_active_frame_bound() {
     for boundary in ["prefix", "payload"] {
         let pki = TestPki::new();
         let server_spiffe = spiffe(&format!("partial-hello-ack-{boundary}-server"));
@@ -791,15 +805,17 @@ async fn partial_hello_ack_expires_at_the_configured_setup_bound() {
         let address = listener.local_addr().expect("listener address");
         let authenticated = pki.server_config(&server_spiffe);
         let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+        let (partial_written, partial_observed) = tokio::sync::oneshot::channel();
+        let (release_server, server_released) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let mut tls = accept_consumer_tls(&listener, &authenticated, &expected_client).await;
             let hello = read_value(&mut tls).await;
             assert_eq!(hello["kind"], "hello", "client starts with consumer Hello");
             write_partial_frame(&mut tls, boundary).await;
-            // Hello is authenticated setup rather than an idle lane. Keep the
-            // peer silent past the fixture's 500ms setup cap, independently
-            // of its much shorter active-frame idle timeout.
-            tokio::time::sleep(Duration::from_millis(750)).await;
+            partial_written
+                .send(())
+                .expect("publish the exact first authenticated frame byte");
+            let _ = server_released.await;
         });
         let client = persistent_client_with_short_active_frame_idle(
             &pki,
@@ -808,12 +824,23 @@ async fn partial_hello_ack_expires_at_the_configured_setup_bound() {
             &client_spiffe,
             scope(1),
         );
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.capabilities().await }
+        });
+        partial_observed
+            .await
+            .expect("authenticated peer started the partial HelloAck");
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), client.capabilities())
+            tokio::time::timeout(Duration::from_millis(300), call)
                 .await
-                .expect("partial HelloAck obeys the configured setup bound"),
+                .expect("partial HelloAck obeys the shorter active-frame bound")
+                .expect("join client call"),
             Err(SessionConsumerClientError::Deadline)
         );
+        release_server
+            .send(())
+            .expect("release the deliberately stalled peer");
         let diagnostics = client.diagnostics().await;
         assert_eq!(diagnostics.hello_attempts, 1);
         assert_eq!(diagnostics.hello_failures, 1);
@@ -1379,7 +1406,7 @@ async fn local_persistent_validation_failures_are_typed_and_counted_once_before_
 }
 
 #[tokio::test]
-async fn authenticated_cas_outcome_unavailable_is_typed_unknown_without_poisoning_the_lane() {
+async fn authenticated_cas_outcome_unavailable_is_typed_unknown_and_evicts_the_lane() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("cas-outcome-unavailable-server");
     let client_spiffe = spiffe("cas-outcome-unavailable-client");
@@ -1407,13 +1434,15 @@ async fn authenticated_cas_outcome_unavailable_is_typed_unknown_without_poisonin
             },
         });
         write_value(&mut tls, &response).await;
-        let second = read_value(&mut tls).await;
+        drop(tls);
+        let (mut replacement, second) =
+            accept_hello_and_call(&listener, &authenticated, &expected_client).await;
         assert_eq!(
             second["body"]["request"]["operation"]["operation"], "capabilities",
-            "a typed CAS ambiguity does not poison a valid authenticated lane"
+            "a typed CAS ambiguity evicts its lane before the next request"
         );
         write_value(
-            &mut tls,
+            &mut replacement,
             &capability_response(second["body"]["correlation"].clone()),
         )
         .await;
@@ -1446,13 +1475,10 @@ async fn authenticated_cas_outcome_unavailable_is_typed_unknown_without_poisonin
         Err(SessionConsumerMutationError::OutcomeUnknown { request_id: returned })
             if returned == request_id
     ));
-    assert_eq!(
-        client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled())
-    );
+    assert_eq!(client.capabilities().await, Ok(bounded_capabilities()));
     let diagnostics = client.diagnostics().await;
-    assert_eq!(diagnostics.setup_successes, 1);
-    assert_eq!(diagnostics.reconnects, 0);
+    assert_eq!(diagnostics.setup_successes, 2);
+    assert_eq!(diagnostics.reconnects, 1);
     assert_eq!(diagnostics.successes, 1);
     assert_eq!(diagnostics.failures, 1);
     assert_eq!(diagnostics.outcome_unknown, 1);
@@ -1495,10 +1521,13 @@ async fn batch_ambiguity_and_all_read_unavailability_use_one_canonical_outcome_r
         )
         .await;
 
-        let read = read_value(&mut tls).await;
-        assert_eq!(read["body"]["correlation"], json!(2));
+        drop(tls);
+        let (mut replacement, read) =
+            accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+
+        assert_eq!(read["body"]["correlation"], json!(1));
         write_value(
-            &mut tls,
+            &mut replacement,
             &json!({
                 "kind": "response",
                 "body": {
@@ -1512,10 +1541,10 @@ async fn batch_ambiguity_and_all_read_unavailability_use_one_canonical_outcome_r
         )
         .await;
 
-        let capability = read_value(&mut tls).await;
-        assert_eq!(capability["body"]["correlation"], json!(3));
+        let capability = read_value(&mut replacement).await;
+        assert_eq!(capability["body"]["correlation"], json!(2));
         write_value(
-            &mut tls,
+            &mut replacement,
             &capability_response(capability["body"]["correlation"].clone()),
         )
         .await;
@@ -1552,12 +1581,12 @@ async fn batch_ambiguity_and_all_read_unavailability_use_one_canonical_outcome_r
     ));
     assert_eq!(
         client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled()),
-        "both canonical typed outcomes leave the authenticated lane reusable"
+        Ok(bounded_capabilities()),
+        "read-only unavailability leaves the replacement lane reusable"
     );
     let diagnostics = client.diagnostics().await;
-    assert_eq!(diagnostics.setup_successes, 1);
-    assert_eq!(diagnostics.reconnects, 0);
+    assert_eq!(diagnostics.setup_successes, 2);
+    assert_eq!(diagnostics.reconnects, 1);
     assert_eq!(diagnostics.successes, 1);
     assert_eq!(diagnostics.failures, 2);
     assert_eq!(diagnostics.outcome_unknown, 1);
@@ -1643,7 +1672,8 @@ async fn cancelled_initial_watch_accounts_the_exact_call_write_boundary_once() {
         pki.client_config(&spiffe("watch-cancel-before-client")),
     )
     .with_operation_timeout(Duration::from_secs(1));
-    let before = PersistentSessionConsumerClient::from_stateless(stateless);
+    let before = PersistentSessionConsumerClient::from_stateless(stateless)
+        .expect("valid persistent configuration");
     let before_task = {
         let before = before.clone();
         tokio::spawn(async move { before.open_watch(0).await })
@@ -1736,7 +1766,8 @@ async fn pending_request_setup_separates_logical_inflight_from_physical_active()
         pki.client_config(&spiffe("physical-active-client")),
     )
     .with_operation_timeout(Duration::from_secs(1));
-    let client = PersistentSessionConsumerClient::from_stateless(stateless);
+    let client = PersistentSessionConsumerClient::from_stateless(stateless)
+        .expect("valid persistent configuration");
     let request = {
         let client = client.clone();
         tokio::spawn(async move { client.capabilities().await })
@@ -1919,7 +1950,7 @@ async fn partial_mutation_unary_response_is_unknown_once_without_auto_replay() {
             .expect("malicious peer proves there was no automatic replay");
         assert_eq!(
             client.capabilities().await,
-            Ok(BackendCapabilities::all_enabled()),
+            Ok(bounded_capabilities()),
             "the next caller uses a replacement lane after outcome-unknown eviction"
         );
         let diagnostics = client.diagnostics().await;
@@ -2365,14 +2396,11 @@ async fn duplicate_response_poisons_lane_and_next_call_uses_a_new_connection() {
     });
     let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
 
-    assert_eq!(
-        client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled())
-    );
+    assert_eq!(client.capabilities().await, Ok(bounded_capabilities()));
     assert_typed_protocol_error(client.capabilities().await, &server_spiffe, &client_spiffe);
     assert_eq!(
         client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled()),
+        Ok(bounded_capabilities()),
         "a discarded lane must never deliver its late response to a later call"
     );
     let diagnostics = client.diagnostics().await;
@@ -2480,7 +2508,7 @@ async fn scope_rejection_retires_the_lane_and_resolves_a_fresh_authority() {
     );
     assert_eq!(
         client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled()),
+        Ok(bounded_capabilities()),
         "the later caller resolves and authenticates a replacement authority"
     );
     let diagnostics = client.diagnostics().await;
@@ -2536,10 +2564,7 @@ async fn authenticated_unavailable_rejection_is_typed_counted_and_reuses_a_healt
         client.capabilities().await,
         Err(SessionConsumerClientError::Unavailable)
     );
-    assert_eq!(
-        client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled())
-    );
+    assert_eq!(client.capabilities().await, Ok(bounded_capabilities()));
     let diagnostics = client.diagnostics().await;
     assert_eq!(diagnostics.setup_successes, 1);
     assert_eq!(diagnostics.reconnects, 0);
@@ -2634,10 +2659,7 @@ async fn malformed_rejection_retires_the_lane_before_the_next_request() {
         client.capabilities().await,
         Err(SessionConsumerClientError::Protocol)
     );
-    assert_eq!(
-        client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled())
-    );
+    assert_eq!(client.capabilities().await, Ok(bounded_capabilities()));
     let diagnostics = client.diagnostics().await;
     assert_eq!(diagnostics.setup_successes, 2);
     assert_eq!(diagnostics.reconnects, 1);
@@ -2736,10 +2758,7 @@ async fn unauthorized_rejection_retires_the_lane_and_resolves_a_fresh_authority(
         client.capabilities().await,
         Err(SessionConsumerClientError::Authentication)
     );
-    assert_eq!(
-        client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled())
-    );
+    assert_eq!(client.capabilities().await, Ok(bounded_capabilities()));
     let diagnostics = client.diagnostics().await;
     assert_eq!(diagnostics.setup_successes, 2);
     assert_eq!(diagnostics.reconnects, 1);

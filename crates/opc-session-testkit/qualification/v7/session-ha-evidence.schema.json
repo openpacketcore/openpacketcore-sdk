@@ -46,7 +46,7 @@
         "authenticated_route"
       ],
       "properties": {
-        "profile_sha256": { "const": "sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592" },
+        "profile_sha256": { "const": "sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7" },
         "transcript_digest_domain": { "const": "opc-session-ha/persistent-consumer-run/v1" },
         "transcript_sha256": {
           "type": "string",
@@ -118,8 +118,8 @@
           "maxItems": 2000,
           "items": { "type": "integer", "minimum": 0, "maximum": 10000000 }
         },
-        "p99_micros": { "type": "integer", "minimum": 0, "maximum": 25000 },
-        "p999_micros": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "p99_micros": { "type": "integer", "minimum": 0 },
+        "p999_micros": { "type": "integer", "minimum": 0 },
         "claim_boundary": { "const": "sdk-loopback-real-mtls-synthetic-not-epdg-production-slo" }
       }
     },

@@ -97,13 +97,12 @@ pub use consumer::{
     session_consumer_batch_result_into_store, SessionConsumerAuthorizationManifest,
     SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerChangeItem,
     SessionConsumerChangeKind, SessionConsumerIdentity, SessionConsumerIdentityError,
-    SessionConsumerLeaseError, SessionConsumerLeaseGrant, SessionConsumerOperation,
-    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
-    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionQuorumConsumer, StatelessSessionConsumer,
-    MAX_SESSION_CONSUMER_BATCH_OPERATIONS, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
-    MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES, SESSION_CONSUMER_IDENTITY_MAX_BYTES,
-    SESSION_CONSUMER_REQUEST_ID_BYTES,
+    SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+    SessionQuorumConsumer, StatelessSessionConsumer, MAX_SESSION_CONSUMER_BATCH_OPERATIONS,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES,
+    SESSION_CONSUMER_IDENTITY_MAX_BYTES, SESSION_CONSUMER_REQUEST_ID_BYTES,
 };
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;

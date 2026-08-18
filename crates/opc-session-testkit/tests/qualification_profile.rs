@@ -19,7 +19,10 @@ use opc_session_net::{
     MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
     MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
     MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION,
-    MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION, MIN_SESSION_CONSENSUS_FRAME_SIZE,
+    MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION,
+    MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+    MAX_STATELESS_SESSION_CONSUMER_WATCH_CONNECTIONS, MIN_SESSION_CONSENSUS_FRAME_SIZE,
+    PERSISTENT_SESSION_CONSUMER_MAINTENANCE_TASKS_PER_POOL,
     RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES, SESSION_CONSENSUS_ALPN,
     SESSION_CONSENSUS_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_ALPN,
     SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
@@ -40,10 +43,10 @@ use opc_session_testkit::qualification::{
     SessionHaPersistentConsumerEvidenceV7, SessionHaQualificationProfile,
     SessionHaQualificationProfileV7, SessionMtlsCandidateCampaign,
     SessionMtlsCandidateEvidenceError, SessionMtlsCandidateEvidenceV2,
-    QUALIFICATION_PERSISTENT_CONSUMER_MAX_P999_MICROS_V7,
-    QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7,
     QUALIFICATION_PERSISTENT_CONSUMER_MAX_SAMPLE_MICROS_V7,
-    QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7, SESSION_HA_EVIDENCE_V6_SCHEMA_JSON,
+    QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7,
+    QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P999_MICROS_V7,
+    QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P99_MICROS_V7, SESSION_HA_EVIDENCE_V6_SCHEMA_JSON,
     SESSION_HA_EVIDENCE_V7_SCHEMA_JSON, SESSION_HA_HISTORY_SCHEMA_JSON, SESSION_HA_PROFILE_V6_JSON,
     SESSION_HA_PROFILE_V6_SCHEMA_JSON, SESSION_HA_PROFILE_V7_JSON,
     SESSION_HA_PROFILE_V7_SCHEMA_JSON, SESSION_HA_SCHEDULE_SCHEMA_JSON,
@@ -948,7 +951,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
             "{:x}",
             Sha256::digest(SESSION_HA_PROFILE_V7_JSON.as_bytes())
         ),
-        "c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592"
+        "875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7"
     );
 
     let schema: Value =
@@ -969,14 +972,14 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
     assert_eq!(
         profile
             .persistent_consumer_thresholds
-            .max_warm_call_p99_micros,
-        QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7
+            .reference_warm_call_p99_micros,
+        QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P99_MICROS_V7
     );
     assert_eq!(
         profile
             .persistent_consumer_thresholds
-            .max_warm_call_p999_micros,
-        QUALIFICATION_PERSISTENT_CONSUMER_MAX_P999_MICROS_V7
+            .reference_warm_call_p999_micros,
+        QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P999_MICROS_V7
     );
     assert_eq!(
         profile
@@ -1035,6 +1038,19 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
         MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS
     );
     assert_eq!(
+        consumer.stateless_lineage_max_request_connections,
+        MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.stateless_lineage_max_watch_connections,
+        MAX_STATELESS_SESSION_CONSUMER_WATCH_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.maintenance_tasks_per_request_pool,
+        PERSISTENT_SESSION_CONSUMER_MAINTENANCE_TASKS_PER_POOL
+    );
+    assert!(consumer.watch_cancellation_event_driven);
+    assert_eq!(
         consumer.default_persistent_setup_timeout_millis,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT.as_millis() as u64
     );
@@ -1078,7 +1094,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
     assert!(validate_structural_schema(&v6_evidence_schema, &v7_evidence).is_err());
     assert_eq!(
         v7_evidence["execution"]["profile_sha256"],
-        "sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592"
+        "sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7"
     );
     assert_eq!(
         v7_evidence["execution"]["client_type"],
@@ -1087,8 +1103,21 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
     let typed_v7: SessionHaPersistentConsumerEvidenceV7 =
         serde_json::from_value(v7_evidence.clone()).expect("strict typed v7 evidence");
     typed_v7
-        .validate("sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .expect("fixture satisfies computed v7 evidence relationships");
+    let rendered_v7 = format!("{typed_v7:?}\n{:?}", typed_v7.execution);
+    for sensitive in [
+        typed_v7.source_revision.as_str(),
+        typed_v7.source_tree.as_str(),
+        typed_v7.execution.profile_sha256.as_str(),
+        typed_v7.execution.transcript_sha256.as_str(),
+    ] {
+        assert!(
+            !rendered_v7.contains(sensitive),
+            "v7 Debug must redact stable source and digest bindings"
+        );
+    }
+    assert!(rendered_v7.contains("[redacted]"));
 
     for (label, mut changed) in [
         ("source", typed_v7.clone()),
@@ -1109,7 +1138,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
         }
         assert!(
             changed
-                .validate("sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592")
+                .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
                 .is_err(),
             "{label} mutation with the retained transcript digest must reject"
         );
@@ -1121,7 +1150,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
         .canonical_transcript_sha256()
         .expect("mutated transcript remains encodable");
     assert!(wrong_topology_claim
-        .validate("sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .is_err());
     assert!(validate_structural_schema(
         &v7_evidence_schema,
@@ -1135,7 +1164,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
         .canonical_transcript_sha256()
         .expect("reordered transcript remains encodable");
     assert!(reordered_coverage
-        .validate("sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .is_err());
     assert!(validate_structural_schema(
         &v7_evidence_schema,
@@ -1166,7 +1195,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
         .canonical_transcript_sha256()
         .expect("oversized transcript remains encodable");
     assert!(oversized_sample
-        .validate("sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .is_err());
     assert!(validate_structural_schema(
         &v7_evidence_schema,
@@ -1184,17 +1213,17 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
     let mut sentinel_revision = typed_v7.clone();
     sentinel_revision.source_revision = "0000000000000000000000000000000000000000".into();
     assert!(sentinel_revision
-        .validate("sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .is_err());
     let mut sentinel_tree = typed_v7.clone();
     sentinel_tree.source_tree = "0000000000000000000000000000000000000000".into();
     assert!(sentinel_tree
-        .validate("sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .is_err());
     let mut forged_percentile = typed_v7.clone();
     forged_percentile.warm_latency.p99_micros += 1;
     assert!(forged_percentile
-        .validate("sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592")
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
         .is_err());
 
     let mut augmented_v6 = v6_evidence;

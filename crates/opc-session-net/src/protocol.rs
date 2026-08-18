@@ -4005,6 +4005,50 @@ where
     Ok(Some(payload))
 }
 
+/// Read one authenticated frame with a separate no-byte setup deadline and
+/// absolute active-frame timeout.
+///
+/// Quiet bootstrap may consume the full setup budget. Once the first length
+/// prefix byte is accepted, every remaining prefix/payload byte must arrive by
+/// `min(setup_deadline, first_byte_at + active_timeout)`; later bytes never
+/// renew that deadline.
+pub(crate) async fn read_authenticated_frame_payload_with_active_timeout_until<R>(
+    reader: &mut R,
+    max_frame_size: usize,
+    setup_deadline: tokio::time::Instant,
+    active_timeout: std::time::Duration,
+) -> Result<Option<Vec<u8>>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    if active_timeout.is_zero() {
+        return Err(ProtocolError::InvalidWireValue);
+    }
+    let mut len_bytes = [0_u8; 4];
+    match tokio::time::timeout_at(setup_deadline, reader.read_exact(&mut len_bytes[..1])).await {
+        Ok(result) => {
+            result.map_err(ProtocolError::Io)?;
+            if tokio::time::Instant::now() >= setup_deadline {
+                return Err(active_frame_timeout_error());
+            }
+        }
+        Err(_) => return Ok(None),
+    }
+    let active_deadline = tokio::time::Instant::now()
+        .checked_add(active_timeout)
+        .ok_or(ProtocolError::InvalidWireValue)?
+        .min(setup_deadline);
+    read_exact_frame_bytes_until(reader, &mut len_bytes[1..], active_deadline).await?;
+    let len = usize::try_from(u32::from_be_bytes(len_bytes))
+        .map_err(|_| ProtocolError::InvalidWireValue)?;
+    if len > max_frame_size {
+        return Err(ProtocolError::FrameTooLarge(len));
+    }
+    let mut payload = vec![0_u8; len];
+    read_exact_frame_bytes_until(reader, &mut payload, active_deadline).await?;
+    Ok(Some(payload))
+}
+
 async fn read_exact_frame_bytes_until<R>(
     reader: &mut R,
     bytes: &mut [u8],

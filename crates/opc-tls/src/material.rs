@@ -218,23 +218,30 @@ impl fmt::Display for TlsMaterialReloadReason {
 /// controller validates every certificate it will present. An upstream
 /// identity-source status describes source acquisition and is not a substitute
 /// for this admission status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct TlsMaterialStatus {
     epoch: TlsMaterialEpoch,
     availability: TlsMaterialAvailability,
     reason: Option<TlsMaterialReloadReason>,
     leaf_expires_at: Option<Timestamp>,
     certificate_chain_expires_at: Option<Timestamp>,
+    /// Monotonic acceptance instant for `epoch`. This is deliberately omitted
+    /// from serialization and redacted Debug output: it exists only so
+    /// authenticated transports anchor cooperative drain jitter to the actual
+    /// publication rather than to an arbitrarily late first observation.
+    #[serde(skip_serializing)]
+    published_at: tokio::time::Instant,
 }
 
 impl TlsMaterialStatus {
-    const fn initial() -> Self {
+    fn initial() -> Self {
         Self {
             epoch: TlsMaterialEpoch::INITIAL,
             availability: TlsMaterialAvailability::Initializing,
             reason: Some(TlsMaterialReloadReason::AwaitingInitialMaterial),
             leaf_expires_at: None,
             certificate_chain_expires_at: None,
+            published_at: tokio::time::Instant::now(),
         }
     }
 
@@ -261,6 +268,30 @@ impl TlsMaterialStatus {
     /// Earliest expiry across the retained presented certificate chain.
     pub const fn certificate_chain_expires_at(self) -> Option<Timestamp> {
         self.certificate_chain_expires_at
+    }
+
+    /// Monotonic instant at which the current accepted epoch was published.
+    ///
+    /// Rejected updates that retain the last-good epoch retain this instant.
+    /// The value is process-local and must never be serialized or logged.
+    pub const fn published_at(self) -> tokio::time::Instant {
+        self.published_at
+    }
+}
+
+impl fmt::Debug for TlsMaterialStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TlsMaterialStatus")
+            .field("epoch", &self.epoch)
+            .field("availability", &self.availability)
+            .field("reason", &self.reason)
+            .field("leaf_expires_at", &self.leaf_expires_at)
+            .field(
+                "certificate_chain_expires_at",
+                &self.certificate_chain_expires_at,
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -816,6 +847,7 @@ impl TlsMaterialController {
             reason: None,
             leaf_expires_at: Some(leaf_expires_at),
             certificate_chain_expires_at: Some(certificate_chain_expires_at),
+            published_at: tokio::time::Instant::now(),
         };
         let pin = snapshot.state.identity.spiffe_id.clone();
         match (self.inner.metrics.as_ref(), metrics_publication) {
@@ -1030,13 +1062,14 @@ fn expire_locked(
         .and_then(|snapshot| snapshot.metrics_publication.as_ref())
         .cloned();
     controller.snapshot = None;
-    let epoch = status_tx.borrow().epoch;
+    let current = *status_tx.borrow();
     status_tx.send_replace(TlsMaterialStatus {
-        epoch,
+        epoch: current.epoch,
         availability: TlsMaterialAvailability::Unavailable,
         reason: Some(TlsMaterialReloadReason::LastGoodExpired),
         leaf_expires_at: None,
         certificate_chain_expires_at: None,
+        published_at: current.published_at,
     });
     if let (Some(metrics), Some(publication)) = (metrics, metrics_publication.as_ref()) {
         metrics.record_expired_once(publication);
@@ -1068,6 +1101,7 @@ fn publish_rejection(
         leaf_expires_at: retained.map(TlsMaterialSnapshot::leaf_expires_at),
         certificate_chain_expires_at: retained
             .map(TlsMaterialSnapshot::certificate_chain_expires_at),
+        published_at: current.published_at,
     });
     if reason == TlsMaterialReloadReason::LastGoodExpired {
         return;
@@ -1108,6 +1142,7 @@ fn publish_expired_candidate(
         leaf_expires_at: retained.map(TlsMaterialSnapshot::leaf_expires_at),
         certificate_chain_expires_at: retained
             .map(TlsMaterialSnapshot::certificate_chain_expires_at),
+        published_at: current.published_at,
     });
 }
 

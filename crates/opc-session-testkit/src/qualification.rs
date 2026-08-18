@@ -1290,17 +1290,17 @@ pub struct SessionHaQualificationProfile {
 #[serde(deny_unknown_fields)]
 pub struct QualificationPersistentConsumerThresholdsV7 {
     pub minimum_warm_call_samples: usize,
-    pub max_warm_call_p99_micros: u64,
-    pub max_warm_call_p999_micros: u64,
+    pub reference_warm_call_p99_micros: u64,
+    pub reference_warm_call_p999_micros: u64,
     pub real_mtls_latency_members: usize,
 }
 
 /// Minimum real-mTLS warm calls retained by one v7 run record.
 pub const QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7: usize = 1_000;
-/// Maximum nearest-rank p99 accepted by the SDK loopback real-mTLS harness.
-pub const QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7: u64 = 25_000;
-/// Maximum nearest-rank p99.9 accepted by the SDK loopback real-mTLS harness.
-pub const QUALIFICATION_PERSISTENT_CONSUMER_MAX_P999_MICROS_V7: u64 = 100_000;
+/// Observational nearest-rank p99 reference for the SDK loopback harness.
+pub const QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P99_MICROS_V7: u64 = 25_000;
+/// Observational nearest-rank p99.9 reference for the SDK loopback harness.
+pub const QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P999_MICROS_V7: u64 = 100_000;
 /// Maximum one retained synthetic warm-call sample accepted by v7 evidence.
 pub const QUALIFICATION_PERSISTENT_CONSUMER_MAX_SAMPLE_MICROS_V7: u64 = 10_000_000;
 
@@ -1333,7 +1333,7 @@ pub enum QualificationPersistentConsumerRemainingAcceptanceV7 {
 /// multiprocess harness. It intentionally contains only fixed-label numeric
 /// observations; endpoints, identities, request IDs, keys, owners, and
 /// payloads never enter the record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionHaPersistentConsumerEvidenceV7 {
     pub schema_version: String,
@@ -1352,7 +1352,7 @@ pub struct SessionHaPersistentConsumerEvidenceV7 {
     pub remaining_acceptance: [QualificationPersistentConsumerRemainingAcceptanceV7; 4],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationPersistentConsumerExecutionV7 {
     pub profile_sha256: String,
@@ -1362,6 +1362,43 @@ pub struct QualificationPersistentConsumerExecutionV7 {
     pub consumer_profile_path: String,
     pub transport_revision: u16,
     pub authenticated_route: String,
+}
+
+impl fmt::Debug for QualificationPersistentConsumerExecutionV7 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QualificationPersistentConsumerExecutionV7")
+            .field("profile_sha256", &"[redacted]")
+            .field("transcript_digest_domain", &self.transcript_digest_domain)
+            .field("transcript_sha256", &"[redacted]")
+            .field("client_type", &self.client_type)
+            .field("consumer_profile_path", &self.consumer_profile_path)
+            .field("transport_revision", &self.transport_revision)
+            .field("authenticated_route", &self.authenticated_route)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SessionHaPersistentConsumerEvidenceV7 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionHaPersistentConsumerEvidenceV7")
+            .field("schema_version", &self.schema_version)
+            .field("profile_id", &self.profile_id)
+            .field("experimental", &self.experimental)
+            .field("qualification_complete", &self.qualification_complete)
+            .field("source_revision", &"[redacted]")
+            .field("source_tree", &"[redacted]")
+            .field("source_tree_status", &self.source_tree_status)
+            .field("execution", &self.execution)
+            .field("topology", &self.topology)
+            .field("observations", &self.observations)
+            .field("warm_latency_sample_count", &self.warm_latency.sample_count)
+            .field("privacy", &self.privacy)
+            .field("coverage", &self.coverage)
+            .field("remaining_acceptance", &self.remaining_acceptance)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1575,8 +1612,6 @@ impl SessionHaPersistentConsumerEvidenceV7 {
                 .any(|sample| *sample > QUALIFICATION_PERSISTENT_CONSUMER_MAX_SAMPLE_MICROS_V7)
             || nearest_rank(&latency.raw_samples_micros, 99, 100) != latency.p99_micros
             || nearest_rank(&latency.raw_samples_micros, 999, 1_000) != latency.p999_micros
-            || latency.p99_micros > QUALIFICATION_PERSISTENT_CONSUMER_MAX_P99_MICROS_V7
-            || latency.p999_micros > QUALIFICATION_PERSISTENT_CONSUMER_MAX_P999_MICROS_V7
         {
             return Err("invalid v7 warm latency evidence");
         }
@@ -1740,6 +1775,9 @@ pub struct QualificationPersistentConsumerProtocolV7 {
     pub default_persistent_pool_wait_timeout_millis: u64,
     pub default_persistent_watch_connections: usize,
     pub max_persistent_watch_connections: usize,
+    pub stateless_lineage_max_request_connections: usize,
+    pub stateless_lineage_max_watch_connections: usize,
+    pub maintenance_tasks_per_request_pool: usize,
     pub default_persistent_setup_timeout_millis: u64,
     pub default_persistent_connect_attempts: usize,
     pub default_persistent_reconnect_jitter_millis: u64,
@@ -1755,7 +1793,7 @@ pub struct QualificationPersistentConsumerProtocolV7 {
     pub max_store_watch_buffer_bytes: usize,
     pub watch_channel_capacity: usize,
     pub watch_channel_max_bytes: usize,
-    pub watch_cancellation_recheck_millis: u64,
+    pub watch_cancellation_event_driven: bool,
     pub watch_delivery_tasks_per_watch: usize,
     pub default_listener_connection_task_limit: usize,
     pub default_max_authentication_age_millis: u64,

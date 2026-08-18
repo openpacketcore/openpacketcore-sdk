@@ -17,10 +17,11 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_session_net::{
-    ConnectionLifecyclePolicy, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-    PersistentSessionConsumerExecuteError, RemoteAddrResolver, SessionConsumerAuthorizer,
-    SessionQuorumConsumerServer, StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE,
-    SESSION_QUORUM_CONSUMER_ALPN, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+    conservative_payload_budget, ConnectionLifecyclePolicy, PersistentSessionConsumerClient,
+    PersistentSessionConsumerConfig, PersistentSessionConsumerExecuteError, RemoteAddrResolver,
+    SessionConsumerAuthorizer, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
+    MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
+    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     BackendCapabilities, ConsensusSessionStore, OwnerId, QuorumReplicaDescriptor,
@@ -36,6 +37,13 @@ use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
+
+fn transported_capabilities() -> BackendCapabilities {
+    BackendCapabilities {
+        max_value_bytes: conservative_payload_budget(MAX_NEGOTIATED_FRAME_SIZE),
+        ..BackendCapabilities::all_enabled()
+    }
+}
 
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", content = "body", rename_all = "snake_case")]
@@ -369,10 +377,7 @@ async fn reestablished_lanes_reresolve_exact_endpoint_without_resolving_warm_cal
         LANES
     );
     for _ in 0..3 {
-        assert_eq!(
-            client.capabilities().await,
-            Ok(BackendCapabilities::all_enabled())
-        );
+        assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
     }
     assert_eq!(resolutions.load(Ordering::SeqCst), LANES);
 
@@ -409,10 +414,7 @@ async fn reestablished_lanes_reresolve_exact_endpoint_without_resolving_warm_cal
         LANES * 2,
         "each new physical lane resolves; warm logical calls do not"
     );
-    assert_eq!(
-        client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled())
-    );
+    assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
     assert_eq!(second_service.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         client.diagnostics().await.setup_successes,
@@ -573,10 +575,7 @@ async fn expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call() 
     })
     .await
     .expect("client idle reaper retires the prewarmed lane");
-    assert_eq!(
-        client.capabilities().await,
-        Ok(BackendCapabilities::all_enabled())
-    );
+    assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
     let diagnostics = client.diagnostics().await;
     assert_eq!(resolutions.load(Ordering::SeqCst), 2);
     assert_eq!(diagnostics.setup_successes, 2);
@@ -589,7 +588,7 @@ async fn expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call() 
 }
 
 #[tokio::test]
-async fn server_active_idle_timeout_starts_only_after_authenticated_hello() {
+async fn server_bootstrap_distinguishes_no_byte_setup_from_active_partial_hello() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("server-bootstrap-idle-server");
     let client_spiffe = spiffe("server-bootstrap-idle-client");
@@ -656,6 +655,61 @@ async fn server_active_idle_timeout_starts_only_after_authenticated_hello() {
     );
 
     drop(tls);
+
+    for boundary in ["prefix", "payload"] {
+        let mut tls_config = pki
+            .client_config(&client_spiffe)
+            .rustls_config()
+            .as_ref()
+            .clone();
+        tls_config.alpn_protocols = vec![SESSION_QUORUM_CONSUMER_ALPN.to_vec()];
+        let tcp = TcpStream::connect(address)
+            .await
+            .expect("connect partial authenticated consumer");
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(tls_config))
+            .connect(
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                tcp,
+            )
+            .await
+            .expect("complete TLS before the partial Hello");
+        let payload = serde_json::to_vec(&CanonicalConsumerBootstrapRequest::Hello(
+            CanonicalConsumerHello {
+                transport_revision: SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+                scope,
+                response_frame_size: u32::try_from(MAX_NEGOTIATED_FRAME_SIZE)
+                    .expect("consumer frame cap fits u32"),
+            },
+        ))
+        .expect("canonical partial Hello encodes");
+        let length = u32::try_from(payload.len())
+            .expect("partial Hello frame length")
+            .to_be_bytes();
+        match boundary {
+            "prefix" => tls
+                .write_all(&length[..1])
+                .await
+                .expect("write one Hello prefix byte"),
+            "payload" => {
+                tls.write_all(&length)
+                    .await
+                    .expect("write complete Hello prefix");
+                tls.write_all(&payload[..1])
+                    .await
+                    .expect("write one Hello payload byte");
+            }
+            _ => unreachable!("fixed test boundary"),
+        }
+        tls.flush().await.expect("flush partial Hello");
+        let closed = tokio::time::timeout(Duration::from_millis(300), tls.read_u8())
+            .await
+            .expect("partial Hello is bounded by the 20ms active-frame deadline");
+        assert!(
+            closed.is_err(),
+            "the server closes a stalled authenticated {boundary} frame without a response"
+        );
+    }
+
     handle.abort_and_wait().await;
 }
 

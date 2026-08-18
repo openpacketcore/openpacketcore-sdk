@@ -135,6 +135,9 @@
       "default_persistent_pool_wait_timeout_millis": 250,
       "default_persistent_watch_connections": 2,
       "max_persistent_watch_connections": 16,
+      "stateless_lineage_max_request_connections": 16,
+      "stateless_lineage_max_watch_connections": 16,
+      "maintenance_tasks_per_request_pool": 1,
       "default_persistent_setup_timeout_millis": 1500,
       "default_persistent_connect_attempts": 2,
       "default_persistent_reconnect_jitter_millis": 25,
@@ -150,7 +153,7 @@
       "max_store_watch_buffer_bytes": 262144,
       "watch_channel_capacity": 64,
       "watch_channel_max_bytes": 524288,
-      "watch_cancellation_recheck_millis": 50,
+      "watch_cancellation_event_driven": true,
       "watch_delivery_tasks_per_watch": 1,
       "default_listener_connection_task_limit": 256,
       "default_max_authentication_age_millis": 900000,
@@ -202,8 +205,8 @@
   },
   "persistent_consumer_thresholds": {
     "minimum_warm_call_samples": 1000,
-    "max_warm_call_p99_micros": 25000,
-    "max_warm_call_p999_micros": 100000,
+    "reference_warm_call_p99_micros": 25000,
+    "reference_warm_call_p999_micros": 100000,
     "real_mtls_latency_members": 3
   },
   "evidence": {

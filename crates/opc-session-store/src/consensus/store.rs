@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::stream::{BoxStream, StreamExt};
+use futures_util::stream::{self, BoxStream, StreamExt};
 use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError};
 use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
 use opc_consensus::{
@@ -4134,13 +4134,38 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
         let deadline = self.operation_deadline()?;
         let admission = self.store.admit_consumer_scope(scope, deadline).await?;
         drop(admission);
-        self.store
+        match self
+            .store
             .consumer_watch(scope, start_sequence, deadline)
             .await
-            .map_err(|error| match error {
-                StoreError::TopologyAuthorityRevoked => SessionConsumerRejection::ScopeMismatch,
-                _ => SessionConsumerRejection::Unavailable,
-            })
+        {
+            Ok(watch) => Ok(watch),
+            Err(StoreError::TopologyAuthorityRevoked) => {
+                Err(SessionConsumerRejection::ScopeMismatch)
+            }
+            Err(error @ StoreError::ReplicationWatchCatchUpRequired)
+            | Err(error @ StoreError::ReplicationLogCursorCompacted { .. }) => {
+                // These are coherent cursor decisions, not transient setup
+                // failures. Open the watch and deliver one typed terminal so
+                // callers can catch up without a blind reconnect loop.
+                Ok(stream::once(async move {
+                    Err(consumer_watch_setup_terminal(error)
+                        .expect("matched permanent watch setup error"))
+                })
+                .boxed())
+            }
+            Err(_) => Err(SessionConsumerRejection::Unavailable),
+        }
+    }
+}
+
+fn consumer_watch_setup_terminal(error: StoreError) -> Option<SessionConsumerStoreError> {
+    match error {
+        error @ (StoreError::ReplicationWatchCatchUpRequired
+        | StoreError::ReplicationLogCursorCompacted { .. }) => {
+            Some(SessionConsumerStoreError::from(error))
+        }
+        _ => None,
     }
 }
 
@@ -4474,6 +4499,27 @@ mod membership_tests {
 
     fn node(value: u64) -> SessionConsensusNodeId {
         SessionConsensusNodeId::new(value).expect("valid test consensus node ID")
+    }
+
+    #[test]
+    fn permanent_consumer_watch_setup_errors_remain_typed_terminals() {
+        assert_eq!(
+            consumer_watch_setup_terminal(StoreError::ReplicationWatchCatchUpRequired),
+            Some(SessionConsumerStoreError::WatchCatchUpRequired)
+        );
+        assert_eq!(
+            consumer_watch_setup_terminal(StoreError::ReplicationLogCursorCompacted {
+                resume_from: 7,
+            }),
+            Some(SessionConsumerStoreError::InvalidInput)
+        );
+        assert_eq!(
+            consumer_watch_setup_terminal(StoreError::BackendUnavailable(
+                "fixed test unavailable".into(),
+            )),
+            None,
+            "only coherent permanent cursor decisions bypass transient setup rejection"
+        );
     }
 
     #[derive(Debug)]

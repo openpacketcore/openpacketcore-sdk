@@ -916,6 +916,7 @@ impl ConnectionLifecycle {
             now,
             current_generation,
             current_material_epoch,
+            None,
             self.policy.deterministic_jitter(peer_key),
         );
     }
@@ -924,13 +925,14 @@ impl ConnectionLifecycle {
         &mut self,
         now: tokio::time::Instant,
         current_generation: u64,
-        current_material_epoch: Option<opc_tls::TlsMaterialEpoch>,
+        current_material_status: opc_tls::TlsMaterialStatus,
         edge_key: opc_tls::TlsDirectedEdgeKey,
     ) {
         self.observe_rotation_with_jitter(
             now,
             current_generation,
-            current_material_epoch,
+            Some(current_material_status.epoch()),
+            Some(current_material_status.published_at()),
             edge_key.bounded_jitter(self.policy.rotation_jitter()),
         );
     }
@@ -940,6 +942,7 @@ impl ConnectionLifecycle {
         now: tokio::time::Instant,
         current_generation: u64,
         current_material_epoch: Option<opc_tls::TlsMaterialEpoch>,
+        material_published_at: Option<tokio::time::Instant>,
         material_jitter: Duration,
     ) {
         let retirement = if current_generation != self.generation {
@@ -951,7 +954,10 @@ impl ConnectionLifecycle {
             Some((now, RetirementReason::Explicit))
         } else if current_material_epoch != self.evidence.material_epoch {
             Some((
-                now.checked_add(material_jitter).unwrap_or(now),
+                material_published_at
+                    .unwrap_or(now)
+                    .checked_add(material_jitter)
+                    .unwrap_or(now),
                 RetirementReason::MaterialEpoch,
             ))
         } else {

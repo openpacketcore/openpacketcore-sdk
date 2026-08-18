@@ -7,9 +7,9 @@
   "source_tree": "2222222222222222222222222222222222222222",
   "source_tree_status": "clean",
   "execution": {
-    "profile_sha256": "sha256:c354928e8b221791bb13e24ea21372e6a546ec888d26c1bd901bf2046751b592",
+    "profile_sha256": "sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7",
     "transcript_digest_domain": "opc-session-ha/persistent-consumer-run/v1",
-    "transcript_sha256": "sha256:492b8f2e4cb0b5c25fbf418d739400e640177f24648e5473d98ee52b783f1995",
+    "transcript_sha256": "sha256:1b61ba536eefffedefe8d9fb1b98c1d502079fdfd163ec82070ffc0236b0020f",
     "client_type": "PersistentSessionConsumerClient",
     "consumer_profile_path": "protocol.persistent_consumer",
     "transport_revision": 2,

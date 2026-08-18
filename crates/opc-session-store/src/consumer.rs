@@ -19,7 +19,7 @@ use crate::{
     BackendCapabilities, CompareAndSet, CompareAndSetResult, LeaseError, LeaseGuard, OwnerId,
     RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionConsensusIdentity,
     SessionConsensusRequestId, SessionKey, SessionOp, SessionOpResult, StoreError,
-    StoredSessionRecord, Timestamp, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    StoredSessionRecord, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
 };
 
 /// Maximum batch slots admitted by one consumer request.
@@ -717,50 +717,6 @@ pub enum SessionConsumerBatchResult {
     DeleteFenced(Result<(), SessionConsumerStoreError>),
     /// TTL-refresh slot result.
     RefreshTtl(Result<(), SessionConsumerStoreError>),
-}
-
-/// Successful lease authority carried only by the revision-2 transport wire.
-///
-/// The committed authority time is carried separately from the guard because
-/// renewal preserves the guard's original acquisition timestamp. A client can
-/// therefore bind the returned expiry to the exact requested TTL without
-/// trusting peer-selected lifetime fields.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionConsumerLeaseGrant {
-    guard: LeaseGuard,
-    authority_time: Timestamp,
-}
-
-impl SessionConsumerLeaseGrant {
-    /// Construct a grant from a quorum-validated committed response.
-    pub fn new(guard: LeaseGuard, authority_time: Timestamp) -> Self {
-        Self {
-            guard,
-            authority_time,
-        }
-    }
-
-    /// Borrow the validated lease guard.
-    pub fn guard(&self) -> &LeaseGuard {
-        &self.guard
-    }
-
-    /// Return the committed logical time used to calculate the lease expiry.
-    pub const fn authority_time(&self) -> Timestamp {
-        self.authority_time
-    }
-
-    /// Consume the grant and return its guard.
-    pub fn into_guard(self) -> LeaseGuard {
-        self.guard
-    }
-}
-
-impl fmt::Debug for SessionConsumerLeaseGrant {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("SessionConsumerLeaseGrant(<redacted>)")
-    }
 }
 
 impl fmt::Debug for SessionConsumerBatchResult {
