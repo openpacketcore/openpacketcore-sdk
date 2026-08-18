@@ -580,6 +580,15 @@ delete one ordered batch; the final batch atomically creates
 `retired_floor + 1` as the only active epoch. The floor is included in
 recovery and snapshots, so physical row deletion cannot reopen an identity.
 
+A maintenance transport failure is ambiguous: its lifecycle CAS may already
+have committed even though the caller did not receive the reply. The operator
+MUST obtain a fresh linearized V2 history state before retrying. If that state
+differs from the complete state supplied to the ambiguous CAS, the observed
+state is authoritative and the stale CAS MUST NOT be replayed as a request for
+another batch. If the complete state is unchanged, retrying that same CAS is
+safe. An unavailable reply alone is never evidence that a batch did or did not
+commit, and an operator MUST NOT manufacture a later expected generation.
+
 ### Capacity and operational sizing
 
 At most 135,168 receipt bindings coexist: V1's fixed 4,096 plus one V2 active

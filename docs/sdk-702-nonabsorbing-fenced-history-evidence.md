@@ -92,6 +92,14 @@ logical time before calling `maintain_fenced_transition_v2_history` on the
 elected fixed-quorum leader. No LabSingleton authority, direct SQLite change,
 private intent, or wall-clock sleep is used.
 
+The release fixture also treats a maintenance reply loss as an ambiguous CAS,
+not as permission to submit a later batch. It reads the linearized history
+state after a transient unavailable or stale-CAS reply: a changed complete
+state proves that the attempted batch committed, while an unchanged state
+permits a bounded retry of the same expected lifecycle state. Deterministic
+`HistoryFull`, `Retired`, `RequestConflict`, and `EpochNotActive` transition
+results are never classified as transient.
+
 The continuation makes these linearized assertions, not merely observes row
 counts: after the first reclaim command and
 through every intermediate ordered 1,024-row batch, a well-formed request for
