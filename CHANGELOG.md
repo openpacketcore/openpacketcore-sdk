@@ -584,6 +584,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. Modelling grouped-IE flag bits remains deferred.
 
 ### Changed
+- **Prepared protected atomic transitions — `opc-session-store` (breaking):**
+  `SessionBackend` now separates `prepare_fenced_transition` from execution and
+  status and adds typed `NotTransmitted`/`OutcomeUnknown` execution errors.
+  Local and remote protection wrappers seal create/update exactly once after
+  expiry preflight, leave delete/refresh provider-free, and unprotect only
+  returned observations. Protected atomic capability now remains closed unless
+  the outer wrapper has an SDK `PreparedFencedTransitionJournal` on a private
+  durable volume. The journal immutably HMAC-binds the complete opaque physical
+  token to its caller-stable request ID before dispatch, so a new process can
+  recover exact bytes without readback or provider/key reuse after ambiguity,
+  `NotFound`, endpoint/leader change, or record-key/provider rotation.
+  Authenticated consumer clients use an explicit least-authority physical
+  bridge below the same wrappers; unrelated backend and lease-coordination
+  authority remains unavailable. This protected composition advertises V2 over
+  an exact V1 physical store/consumer, while unjournaled wrappers fail closed.
+  The token and journal have fixed independent schemas and redacted failures;
+  their contents must never enter logs, metrics, diagnostics, fixtures, or
+  evidence. Recovery requires the same durable volume/path, independent journal
+  key, protection mode/namespace, stable consumer identity and cluster; host or
+  volume loss is not covered. Rollback requires a prior drain or retaining the
+  compatible reader/journal through every unresolved delayed proposal.
+- **HTTP/2 empty-DATA-frame remediation — `opc-sbi`:** raises the direct `h2`
+  floor to 0.4.16, removing RUSTSEC-2026-0258 without an advisory allowlist.
 - **Native async management-audit acknowledgement — `opc-mgmt-audit`,
   `opc-mgmt-audit-store`, `opc-gnmi-server`, and `opc-netconf-server`:**
   `AuditSink` now has an object-safe, source-compatible `record_async` method

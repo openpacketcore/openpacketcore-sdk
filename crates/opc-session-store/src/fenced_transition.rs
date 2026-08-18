@@ -8,6 +8,7 @@ use std::{fmt, time::Duration};
 
 use opc_types::Timestamp;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::{
     checked_session_deadline,
@@ -62,6 +63,9 @@ pub const FENCED_TRANSITION_MAX_PREPARED_BYTES: usize =
 pub enum AtomicFencedTransitionCapability {
     /// One exact-key lease acquire/renew and one same-record mutation.
     V1,
+    /// V1 plus caller-side durable recovery of an exact protected request by
+    /// its stable transition identity before any ambiguous dispatch.
+    V2,
 }
 
 /// Exact-result recovery window for a committed fenced transition.
@@ -88,6 +92,11 @@ const INVALID_TRANSITION_OUTCOME: &str = "fenced_transition_outcome_invalid";
 const INVALID_TRANSITION_REQUEST_ID: &str = "fenced_transition_request_id_invalid";
 const INVALID_PREPARED_TRANSITION: &str = "prepared_fenced_transition_invalid";
 const PREPARED_TRANSITION_MAGIC: [u8; 8] = *b"OPCFPT01";
+const PREPARED_TRANSITION_VERSION_BYTES: usize = 2;
+const PREPARED_TRANSITION_BODY_LENGTH_BYTES: usize = 4;
+const PREPARED_TRANSITION_HEADER_BYTES: usize = PREPARED_TRANSITION_MAGIC.len()
+    + PREPARED_TRANSITION_VERSION_BYTES
+    + PREPARED_TRANSITION_BODY_LENGTH_BYTES;
 const PREPARED_TRANSITION_DIGEST_BYTES: usize = 32;
 
 /// Caller-generated identity retained unchanged across submission and status.
@@ -496,12 +505,21 @@ pub(crate) enum PreparedFencedTransitionProtection {
     LocalAeadV1 { scope_commitment: [u8; 32] },
     RemoteSealV1 { scope_commitment: [u8; 32] },
     ConsensusPhysicalV1 { storage_commitment: [u8; 32] },
+    // Append-only: the discriminants above are part of the prepared-token V1
+    // compatibility corpus. This binds an opaque token to one authenticated
+    // application-consumer physical boundary without retaining any identity
+    // text or endpoint/topology details.
+    AuthenticatedConsumerPhysicalV1 { binding_commitment: [u8; 32] },
 }
 
+/// Frozen payload of the prepared-transition V1 wire frame.
+///
+/// The fixed outer header dispatches on the schema before this type is
+/// decoded. This layout must remain readable after later schemas are added;
+/// its complete lease, mutation, record/expiry, and supported protection-stack
+/// shapes are pinned by a golden compatibility corpus.
 #[derive(Serialize, Deserialize)]
-struct PreparedFencedTransitionBody {
-    magic: [u8; 8],
-    schema_version: u16,
+struct PreparedFencedTransitionWireV1 {
     request: FencedTransitionRequest,
     protection_layer_count: u8,
     protection_layers:
@@ -523,25 +541,102 @@ pub enum PreparedFencedTransitionError {
     UnsupportedVersion,
 }
 
+/// Durable lookup result for one caller-stable transition identity.
+///
+/// `Absent` describes only the SDK prepared-request journal. It is distinct
+/// from [`FencedTransitionStatus::NotFound`], which is a non-exclusionary
+/// observation of the consensus receipt ledger.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PreparedFencedTransitionLookup {
+    /// The exact protected request is durably available for retry or status.
+    Found(PreparedFencedTransition),
+    /// No exact request is bound to this identity in the prepared journal.
+    Absent,
+}
+
+impl fmt::Debug for PreparedFencedTransitionLookup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Found(_) => "found",
+            Self::Absent => "absent",
+        };
+        formatter
+            .debug_struct("PreparedFencedTransitionLookup")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Effect-boundary-preserving failure from a prepared fenced transition.
+///
+/// This type prevents a local pre-dispatch journal failure from being
+/// confused with a request that may already have crossed the transport or
+/// consensus proposal boundary.
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FencedTransitionExecuteError {
+    /// This invocation did not dispatch any request because its exact durable
+    /// prepared binding was unavailable.
+    #[error("fenced transition was not transmitted")]
+    NotTransmitted,
+    /// The exact request may have reached its effect boundary.
+    #[error("fenced transition outcome is unknown; recover only the retained request")]
+    OutcomeUnknown {
+        /// Stable identity whose exact prepared request remains recoverable.
+        request_id: FencedTransitionRequestId,
+    },
+    /// A confirmed validation, authority, conflict, or store rejection.
+    #[error(transparent)]
+    Rejected(StoreError),
+}
+
+impl fmt::Debug for FencedTransitionExecuteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::NotTransmitted => "not_transmitted",
+            Self::OutcomeUnknown { .. } => "outcome_unknown",
+            Self::Rejected(_) => "rejected",
+        };
+        formatter
+            .debug_struct("FencedTransitionExecuteError")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FencedTransitionExecuteError {
+    /// Return the only transition identity allowed for exact recovery after
+    /// this invocation.
+    pub const fn exact_retry_id(&self) -> Option<FencedTransitionRequestId> {
+        match self {
+            Self::OutcomeUnknown { request_id } => Some(*request_id),
+            Self::NotTransmitted | Self::Rejected(_) => None,
+        }
+    }
+}
+
 /// Persistable exact body produced before an atomic transition is dispatched.
 ///
 /// Create and update preparation through an SDK protection wrapper seals the
 /// payload exactly once, then retains the complete physical request in this
-/// token. Callers MUST durably persist the serialized token before the first
-/// execute call and MUST reuse it unchanged for every retry and status read.
-/// This is what preserves the store's complete-body digest binding across an
-/// ambiguous outcome, process restart, and key/provider rotation.
+/// token. A raw V1 physical backend exposes the serializable token but does
+/// not promise restart recovery. Protected production composition requires a
+/// V2 outer wrapper backed by [`crate::PreparedFencedTransitionJournal`]; that
+/// SDK journal commits the exact token before dispatch and recovers it by the
+/// caller-stable request ID after ambiguity or process restart without
+/// resealing under a rotated key/provider.
 ///
 /// The fields and `Debug` representation are intentionally opaque. A token
 /// prepared through a protection wrapper contains no payload plaintext, but
 /// every serialized token still contains the complete physical request and
-/// belongs in trusted, integrity-protected application state. Tokens must
-/// never be logged, placed in metrics, or included in diagnostics. A binding
-/// digest detects accidental modification but is not a substitute for
-/// authenticated durable storage.
+/// belongs only in trusted, integrity-protected storage. Tokens must never be
+/// logged, placed in metrics, or included in diagnostics. The frame digest
+/// detects accidental modification but is not a substitute for the V2
+/// journal's authenticated durable binding.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PreparedFencedTransition {
-    canonical: Vec<u8>,
+    canonical: Zeroizing<Vec<u8>>,
     request_id: FencedTransitionRequestId,
 }
 
@@ -550,13 +645,12 @@ impl PreparedFencedTransition {
     ///
     /// This low-level adapter hook exists for [`crate::SessionBackend`]
     /// implementations. Application code should prepare through the complete
-    /// composed backend so every protection layer is retained in the token.
+    /// journaled protected backend so every layer is retained durably before
+    /// dispatch.
     #[doc(hidden)]
     pub fn from_unprotected_request(request: FencedTransitionRequest) -> Result<Self, StoreError> {
         request.validate()?;
-        Self::from_body(PreparedFencedTransitionBody {
-            magic: PREPARED_TRANSITION_MAGIC,
-            schema_version: FENCED_TRANSITION_PREPARED_SCHEMA_V1,
+        Self::from_body(PreparedFencedTransitionWireV1 {
             request,
             protection_layer_count: 0,
             protection_layers: [None; FENCED_TRANSITION_MAX_PREPARED_LAYERS],
@@ -605,16 +699,51 @@ impl PreparedFencedTransition {
         Self::from_body(body).map_err(|_| invalid_prepared_transition())
     }
 
+    /// Attach the opaque authenticated-consumer physical-boundary marker.
+    ///
+    /// This SDK adapter hook intentionally accepts only a fixed-width
+    /// commitment. It never exposes the protected request body or any local
+    /// SPIFFE identity material to callers.
+    #[doc(hidden)]
+    pub fn with_authenticated_consumer_binding(
+        self,
+        binding_commitment: [u8; 32],
+    ) -> Result<Self, StoreError> {
+        self.with_protection(
+            PreparedFencedTransitionProtection::AuthenticatedConsumerPhysicalV1 {
+                binding_commitment,
+            },
+        )
+    }
+
+    /// Recover the exact request for a matching authenticated-consumer
+    /// physical boundary.
+    ///
+    /// This SDK adapter hook fails closed before returning a request whenever
+    /// the token was made by a different consumer boundary. A V2 outer wrapper
+    /// must reload and pass the journaled token unchanged.
+    #[doc(hidden)]
+    pub fn request_for_authenticated_consumer(
+        &self,
+        binding_commitment: [u8; 32],
+    ) -> Result<FencedTransitionRequest, StoreError> {
+        self.without_outer_protection(
+            PreparedFencedTransitionProtection::AuthenticatedConsumerPhysicalV1 {
+                binding_commitment,
+            },
+        )?
+        .request_for_unprotected_backend()
+    }
+
     /// Restore one canonical opaque token from trusted durable bytes.
     pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, PreparedFencedTransitionError> {
         if bytes.len() > FENCED_TRANSITION_MAX_PREPARED_BYTES {
             return Err(PreparedFencedTransitionError::TooLarge);
         }
-        let canonical = bytes.to_vec();
-        let body = decode_prepared_body(&canonical)?;
+        let body = decode_prepared_body(bytes)?;
         let request_id = body.request.request_id();
         Ok(Self {
-            canonical,
+            canonical: Zeroizing::new(bytes.to_vec()),
             request_id,
         })
     }
@@ -656,25 +785,10 @@ impl PreparedFencedTransition {
     }
 
     fn from_body(
-        body: PreparedFencedTransitionBody,
+        body: PreparedFencedTransitionWireV1,
     ) -> Result<Self, PreparedFencedTransitionError> {
         validate_prepared_body(&body)?;
-        let body_size = postcard::experimental::serialized_size(&body)
-            .map_err(|_| PreparedFencedTransitionError::InvalidEncoding)?;
-        let total_size = body_size
-            .checked_add(PREPARED_TRANSITION_DIGEST_BYTES)
-            .ok_or(PreparedFencedTransitionError::TooLarge)?;
-        if total_size > FENCED_TRANSITION_MAX_PREPARED_BYTES {
-            return Err(PreparedFencedTransitionError::TooLarge);
-        }
-        let mut canonical = vec![0_u8; body_size];
-        let encoded = postcard::to_slice(&body, canonical.as_mut_slice())
-            .map_err(|_| PreparedFencedTransitionError::InvalidEncoding)?;
-        if encoded.len() != body_size {
-            return Err(PreparedFencedTransitionError::InvalidEncoding);
-        }
-        let digest = prepared_transition_digest(encoded);
-        canonical.extend_from_slice(&digest);
+        let canonical = encode_prepared_body(&body)?;
         let request_id = body.request.request_id();
         Ok(Self {
             canonical,
@@ -682,7 +796,7 @@ impl PreparedFencedTransition {
         })
     }
 
-    fn decode_body(&self) -> Result<PreparedFencedTransitionBody, PreparedFencedTransitionError> {
+    fn decode_body(&self) -> Result<PreparedFencedTransitionWireV1, PreparedFencedTransitionError> {
         decode_prepared_body(&self.canonical)
     }
 }
@@ -722,6 +836,7 @@ impl<'de> Deserialize<'de> for PreparedFencedTransition {
             where
                 E: serde::de::Error,
             {
+                let value = Zeroizing::new(value);
                 self.visit_bytes(&value)
             }
 
@@ -729,22 +844,21 @@ impl<'de> Deserialize<'de> for PreparedFencedTransition {
             where
                 A: serde::de::SeqAccess<'de>,
             {
-                let capacity = sequence
-                    .size_hint()
-                    .unwrap_or(0)
-                    .min(FENCED_TRANSITION_MAX_PREPARED_BYTES);
-                let mut bytes = Vec::with_capacity(capacity);
+                let mut bytes =
+                    Zeroizing::new(Vec::with_capacity(FENCED_TRANSITION_MAX_PREPARED_BYTES));
                 while let Some(byte) = sequence.next_element::<u8>()? {
                     if bytes.len() == FENCED_TRANSITION_MAX_PREPARED_BYTES {
                         return Err(serde::de::Error::custom(INVALID_PREPARED_TRANSITION));
                     }
                     bytes.push(byte);
                 }
-                self.visit_byte_buf(bytes)
+                self.visit_bytes(&bytes)
             }
         }
 
-        deserializer.deserialize_bytes(PreparedVisitor)
+        deserializer
+            .deserialize_bytes(PreparedVisitor)
+            .map_err(|_| serde::de::Error::custom(INVALID_PREPARED_TRANSITION))
     }
 }
 
@@ -755,14 +869,8 @@ impl fmt::Debug for PreparedFencedTransition {
 }
 
 fn validate_prepared_body(
-    body: &PreparedFencedTransitionBody,
+    body: &PreparedFencedTransitionWireV1,
 ) -> Result<(), PreparedFencedTransitionError> {
-    if body.magic != PREPARED_TRANSITION_MAGIC {
-        return Err(PreparedFencedTransitionError::InvalidEncoding);
-    }
-    if body.schema_version != FENCED_TRANSITION_PREPARED_SCHEMA_V1 {
-        return Err(PreparedFencedTransitionError::UnsupportedVersion);
-    }
     let count = usize::from(body.protection_layer_count);
     if count > FENCED_TRANSITION_MAX_PREPARED_LAYERS
         || body.protection_layers[..count].iter().any(Option::is_none)
@@ -777,30 +885,96 @@ fn validate_prepared_body(
 
 fn decode_prepared_body(
     canonical: &[u8],
-) -> Result<PreparedFencedTransitionBody, PreparedFencedTransitionError> {
+) -> Result<PreparedFencedTransitionWireV1, PreparedFencedTransitionError> {
     if canonical.len() > FENCED_TRANSITION_MAX_PREPARED_BYTES {
         return Err(PreparedFencedTransitionError::TooLarge);
     }
-    let body_len = canonical
-        .len()
-        .checked_sub(PREPARED_TRANSITION_DIGEST_BYTES)
-        .ok_or(PreparedFencedTransitionError::InvalidEncoding)?;
-    let (body_bytes, digest_bytes) = canonical.split_at(body_len);
-    if prepared_transition_digest(body_bytes).as_slice() != digest_bytes {
+    let minimum_size = PREPARED_TRANSITION_HEADER_BYTES
+        .checked_add(PREPARED_TRANSITION_DIGEST_BYTES)
+        .ok_or(PreparedFencedTransitionError::TooLarge)?;
+    if canonical.len() < minimum_size
+        || canonical[..PREPARED_TRANSITION_MAGIC.len()] != PREPARED_TRANSITION_MAGIC
+    {
         return Err(PreparedFencedTransitionError::InvalidEncoding);
     }
-    let (body, remainder) = postcard::take_from_bytes::<PreparedFencedTransitionBody>(body_bytes)
+
+    let version_offset = PREPARED_TRANSITION_MAGIC.len();
+    let version = u16::from_be_bytes([canonical[version_offset], canonical[version_offset + 1]]);
+    if version != FENCED_TRANSITION_PREPARED_SCHEMA_V1 {
+        return Err(PreparedFencedTransitionError::UnsupportedVersion);
+    }
+
+    let length_offset = version_offset + PREPARED_TRANSITION_VERSION_BYTES;
+    let body_len = u32::from_be_bytes([
+        canonical[length_offset],
+        canonical[length_offset + 1],
+        canonical[length_offset + 2],
+        canonical[length_offset + 3],
+    ]) as usize;
+    let body_end = PREPARED_TRANSITION_HEADER_BYTES
+        .checked_add(body_len)
+        .ok_or(PreparedFencedTransitionError::TooLarge)?;
+    let total_size = body_end
+        .checked_add(PREPARED_TRANSITION_DIGEST_BYTES)
+        .ok_or(PreparedFencedTransitionError::TooLarge)?;
+    if total_size != canonical.len() {
+        return Err(PreparedFencedTransitionError::InvalidEncoding);
+    }
+
+    let digest_bytes = &canonical[body_end..];
+    if prepared_transition_digest(&canonical[..body_end]).as_slice() != digest_bytes {
+        return Err(PreparedFencedTransitionError::InvalidEncoding);
+    }
+    let body_bytes = &canonical[PREPARED_TRANSITION_HEADER_BYTES..body_end];
+    let (body, remainder) = postcard::take_from_bytes::<PreparedFencedTransitionWireV1>(body_bytes)
         .map_err(|_| PreparedFencedTransitionError::InvalidEncoding)?;
     if !remainder.is_empty() {
         return Err(PreparedFencedTransitionError::InvalidEncoding);
     }
     validate_prepared_body(&body)?;
-    let reencoded =
-        postcard::to_allocvec(&body).map_err(|_| PreparedFencedTransitionError::InvalidEncoding)?;
-    if reencoded != body_bytes {
+    let reencoded = encode_prepared_body(&body)?;
+    if reencoded.as_slice() != canonical {
         return Err(PreparedFencedTransitionError::InvalidEncoding);
     }
     Ok(body)
+}
+
+fn encode_prepared_body(
+    body: &PreparedFencedTransitionWireV1,
+) -> Result<Zeroizing<Vec<u8>>, PreparedFencedTransitionError> {
+    let body_size = postcard::experimental::serialized_size(body)
+        .map_err(|_| PreparedFencedTransitionError::InvalidEncoding)?;
+    let body_size_u32 =
+        u32::try_from(body_size).map_err(|_| PreparedFencedTransitionError::TooLarge)?;
+    let body_end = PREPARED_TRANSITION_HEADER_BYTES
+        .checked_add(body_size)
+        .ok_or(PreparedFencedTransitionError::TooLarge)?;
+    let total_size = body_end
+        .checked_add(PREPARED_TRANSITION_DIGEST_BYTES)
+        .ok_or(PreparedFencedTransitionError::TooLarge)?;
+    if total_size > FENCED_TRANSITION_MAX_PREPARED_BYTES {
+        return Err(PreparedFencedTransitionError::TooLarge);
+    }
+
+    let mut canonical = Zeroizing::new(vec![0_u8; total_size]);
+    canonical[..PREPARED_TRANSITION_MAGIC.len()].copy_from_slice(&PREPARED_TRANSITION_MAGIC);
+    let version_offset = PREPARED_TRANSITION_MAGIC.len();
+    canonical[version_offset..version_offset + PREPARED_TRANSITION_VERSION_BYTES]
+        .copy_from_slice(&FENCED_TRANSITION_PREPARED_SCHEMA_V1.to_be_bytes());
+    let length_offset = version_offset + PREPARED_TRANSITION_VERSION_BYTES;
+    canonical[length_offset..length_offset + PREPARED_TRANSITION_BODY_LENGTH_BYTES]
+        .copy_from_slice(&body_size_u32.to_be_bytes());
+    let encoded = postcard::to_slice(
+        body,
+        &mut canonical[PREPARED_TRANSITION_HEADER_BYTES..body_end],
+    )
+    .map_err(|_| PreparedFencedTransitionError::InvalidEncoding)?;
+    if encoded.len() != body_size {
+        return Err(PreparedFencedTransitionError::InvalidEncoding);
+    }
+    let digest = prepared_transition_digest(&canonical[..body_end]);
+    canonical[body_end..].copy_from_slice(&digest);
+    Ok(canonical)
 }
 
 fn prepared_transition_digest(body: &[u8]) -> [u8; 32] {
@@ -1167,11 +1341,103 @@ mod tests {
         .expect("request")
     }
 
-    fn encode_unvalidated_prepared_body(body: &PreparedFencedTransitionBody) -> Vec<u8> {
-        let mut encoded = postcard::to_allocvec(body).expect("encode test body");
-        let digest = prepared_transition_digest(&encoded);
-        encoded.extend_from_slice(&digest);
-        encoded
+    fn prepared_delete_request(request_id: u8) -> FencedTransitionRequest {
+        let owner = OwnerId::new("prepared-wire-owner").expect("owner");
+        let key = key();
+        FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([request_id; 16]),
+            FencedTransitionLease::renew(
+                lease_guard(key, owner, FenceToken::new(9)),
+                Duration::from_secs(30),
+            )
+            .expect("renewal"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("record-free request")
+    }
+
+    fn prepared_wire_create_request(request_id: u8) -> FencedTransitionRequest {
+        let owner = OwnerId::new("prepared-wire-owner").expect("owner");
+        let key = key();
+        let record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(1),
+            owner: owner.clone(),
+            fence: FenceToken::new(8),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new("prepared-wire-state").expect("state type"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([]),
+        };
+        FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([request_id; 16]),
+            FencedTransitionLease::acquire(key, owner, FenceToken::new(7), Duration::new(30, 123))
+                .expect("acquire"),
+            FencedTransitionMutation::create(record),
+        )
+        .expect("empty-payload create request")
+    }
+
+    fn prepared_wire_update_request(request_id: u8) -> FencedTransitionRequest {
+        let owner = OwnerId::new("prepared-wire-owner").expect("owner");
+        let key = key();
+        let record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(2),
+            owner: owner.clone(),
+            fence: FenceToken::new(9),
+            state_class: StateClass::EphemeralProcedure,
+            state_type: StateType::new("prepared-wire-state").expect("state type"),
+            expires_at: Some(timestamp(90)),
+            payload: EncryptedSessionPayload::unclassified([]),
+        };
+        FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([request_id; 16]),
+            FencedTransitionLease::renew(
+                lease_guard(key, owner, FenceToken::new(9)),
+                Duration::new(45, 456),
+            )
+            .expect("renewal"),
+            FencedTransitionMutation::update(Generation::new(1), record),
+        )
+        .expect("empty-payload update request")
+    }
+
+    fn prepared_wire_refresh_request(request_id: u8) -> FencedTransitionRequest {
+        let owner = OwnerId::new("prepared-wire-owner").expect("owner");
+        let key = key();
+        FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([request_id; 16]),
+            FencedTransitionLease::renew(
+                lease_guard(key, owner, FenceToken::new(9)),
+                Duration::from_secs(30),
+            )
+            .expect("renewal"),
+            FencedTransitionMutation::refresh_ttl(Generation::new(1), Duration::new(60, 789))
+                .expect("refresh"),
+        )
+        .expect("record-free refresh request")
+    }
+
+    fn prepared_wire_with_layers(
+        request_id: u8,
+        layers: &[PreparedFencedTransitionProtection],
+    ) -> PreparedFencedTransition {
+        let mut prepared =
+            PreparedFencedTransition::from_unprotected_request(prepared_delete_request(request_id))
+                .expect("prepare record-free V1 token");
+        for layer in layers {
+            prepared = prepared
+                .with_protection(*layer)
+                .expect("append compatibility layer");
+        }
+        prepared
+    }
+
+    fn encode_unvalidated_prepared_body(
+        body: &PreparedFencedTransitionWireV1,
+    ) -> Zeroizing<Vec<u8>> {
+        encode_prepared_body(body).expect("encode test body")
     }
 
     #[test]
@@ -1180,16 +1446,26 @@ mod tests {
         let request_id = request.request_id();
         let prepared = PreparedFencedTransition::from_unprotected_request(request)
             .expect("prepare exact request");
-        let durable = prepared.as_bytes().to_vec();
+        let durable = Zeroizing::new(prepared.as_bytes().to_vec());
 
         let restored = PreparedFencedTransition::try_from_bytes(&durable).expect("restore bytes");
-        let serde_bytes = serde_json::to_vec(&prepared).expect("serialize token");
+        let serialized_capacity = prepared
+            .as_bytes()
+            .len()
+            .checked_mul(4)
+            .and_then(|size| size.checked_add(2))
+            .expect("bounded JSON capacity");
+        let mut serde_bytes = Zeroizing::new(Vec::with_capacity(serialized_capacity));
+        serde_json::to_writer(&mut *serde_bytes, &prepared).expect("serialize token");
         let serde_restored: PreparedFencedTransition =
             serde_json::from_slice(&serde_bytes).expect("deserialize token");
 
         assert_eq!(restored, prepared);
         assert_eq!(serde_restored, prepared);
-        assert_eq!(restored.as_bytes(), durable);
+        assert!(
+            restored.as_bytes() == durable.as_slice(),
+            "the durable token bytes must round trip exactly"
+        );
         assert_eq!(restored.request_id(), request_id);
         assert_eq!(
             format!("{prepared:?}"),
@@ -1200,11 +1476,112 @@ mod tests {
     }
 
     #[test]
+    fn protected_fenced_transition_v1_wire_compatibility_corpus_is_frozen() {
+        const EXPECTED_V1_FINGERPRINT: [u8; 32] = [
+            123, 207, 182, 22, 202, 255, 98, 71, 138, 154, 18, 23, 207, 41, 199, 72, 63, 142, 188,
+            103, 49, 40, 14, 78, 237, 111, 126, 164, 124, 231, 94, 98,
+        ];
+
+        use sha2::{Digest, Sha256};
+
+        let consensus = PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+            storage_commitment: [0x31; 32],
+        };
+        let local = PreparedFencedTransitionProtection::LocalAeadV1 {
+            scope_commitment: [0x32; 32],
+        };
+        let remote = PreparedFencedTransitionProtection::RemoteSealV1 {
+            scope_commitment: [0x33; 32],
+        };
+        let consumer = PreparedFencedTransitionProtection::AuthenticatedConsumerPhysicalV1 {
+            binding_commitment: [0x34; 32],
+        };
+        let corpus = [
+            (
+                "acquire-create-record-no-expiry",
+                PreparedFencedTransition::from_unprotected_request(prepared_wire_create_request(
+                    0x38,
+                ))
+                .expect("prepare create V1 token"),
+            ),
+            (
+                "renew-update-record-with-expiry",
+                PreparedFencedTransition::from_unprotected_request(prepared_wire_update_request(
+                    0x39,
+                ))
+                .expect("prepare update V1 token"),
+            ),
+            ("renew-delete", prepared_wire_with_layers(0x3a, &[])),
+            (
+                "renew-refresh-ttl",
+                PreparedFencedTransition::from_unprotected_request(prepared_wire_refresh_request(
+                    0x3b,
+                ))
+                .expect("prepare refresh V1 token"),
+            ),
+            ("local-only", prepared_wire_with_layers(0x3c, &[local])),
+            ("remote-only", prepared_wire_with_layers(0x3d, &[remote])),
+            (
+                "consensus-only",
+                prepared_wire_with_layers(0x3e, &[consensus]),
+            ),
+            (
+                "consensus-then-local",
+                prepared_wire_with_layers(0x3f, &[consensus, local]),
+            ),
+            (
+                "consensus-then-remote",
+                prepared_wire_with_layers(0x40, &[consensus, remote]),
+            ),
+            (
+                "consumer-only",
+                prepared_wire_with_layers(0x41, &[consumer]),
+            ),
+            (
+                "consumer-then-local",
+                prepared_wire_with_layers(0x42, &[consumer, local]),
+            ),
+            (
+                "consumer-then-remote",
+                prepared_wire_with_layers(0x43, &[consumer, remote]),
+            ),
+        ];
+        let mut digest = Sha256::new();
+        digest
+            .update(b"openpacketcore/session-store/prepared-fenced-transition/golden-corpus/v1\0");
+        for (label, prepared) in corpus {
+            let label = label.as_bytes();
+            digest.update(
+                u32::try_from(label.len())
+                    .expect("bounded label")
+                    .to_be_bytes(),
+            );
+            digest.update(label);
+            digest.update(
+                u32::try_from(prepared.as_bytes().len())
+                    .expect("bounded token")
+                    .to_be_bytes(),
+            );
+            digest.update(prepared.as_bytes());
+            assert!(
+                PreparedFencedTransition::try_from_bytes(prepared.as_bytes()).is_ok(),
+                "each frozen V1 corpus member must be canonical and readable"
+            );
+        }
+        let fingerprint: [u8; 32] = digest.finalize().into();
+
+        assert!(
+            fingerprint == EXPECTED_V1_FINGERPRINT,
+            "the complete prepared-transition V1 wire compatibility corpus changed"
+        );
+    }
+
+    #[test]
     fn protected_fenced_transition_token_rejects_corruption_and_trailing_bytes() {
         let prepared = PreparedFencedTransition::from_unprotected_request(prepared_request(0x32))
             .expect("prepare exact request");
 
-        let mut corrupt = prepared.as_bytes().to_vec();
+        let mut corrupt = Zeroizing::new(prepared.as_bytes().to_vec());
         corrupt[0] ^= 0x80;
         assert_eq!(
             PreparedFencedTransition::try_from_bytes(&corrupt),
@@ -1212,7 +1589,8 @@ mod tests {
         );
 
         let body_len = prepared.as_bytes().len() - PREPARED_TRANSITION_DIGEST_BYTES;
-        let mut trailing = prepared.as_bytes()[..body_len].to_vec();
+        let mut trailing = Zeroizing::new(Vec::with_capacity(prepared.as_bytes().len() + 1));
+        trailing.extend_from_slice(&prepared.as_bytes()[..body_len]);
         trailing.push(0);
         let digest = prepared_transition_digest(&trailing);
         trailing.extend_from_slice(&digest);
@@ -1223,37 +1601,51 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_consumer_marker_requires_the_exact_binding() {
+        let request = prepared_delete_request(0x41);
+        let request_id = request.request_id();
+        let prepared = PreparedFencedTransition::from_unprotected_request(request)
+            .expect("prepare exact request")
+            .with_authenticated_consumer_binding([0x61; 32])
+            .expect("append consumer binding");
+
+        assert_eq!(
+            prepared
+                .request_for_authenticated_consumer([0x61; 32])
+                .expect("matching consumer binding")
+                .request_id(),
+            request_id,
+        );
+        assert!(prepared
+            .request_for_authenticated_consumer([0x62; 32])
+            .is_err());
+        assert_eq!(
+            format!("{prepared:?}"),
+            "PreparedFencedTransition(<redacted>)"
+        );
+    }
+
+    #[test]
     fn protected_fenced_transition_token_rejects_wrong_header_version_and_shape() {
-        let base = PreparedFencedTransitionBody {
-            magic: PREPARED_TRANSITION_MAGIC,
-            schema_version: FENCED_TRANSITION_PREPARED_SCHEMA_V1,
+        let base = PreparedFencedTransitionWireV1 {
             request: prepared_request(0x33),
             protection_layer_count: 0,
             protection_layers: [None; FENCED_TRANSITION_MAX_PREPARED_LAYERS],
         };
 
-        let wrong_magic = PreparedFencedTransitionBody {
-            magic: *b"BADFPT01",
-            ..base
-        };
+        let mut wrong_magic = encode_unvalidated_prepared_body(&base);
+        wrong_magic[0] ^= 0x80;
         assert_eq!(
-            PreparedFencedTransition::try_from_bytes(&encode_unvalidated_prepared_body(
-                &wrong_magic
-            )),
+            PreparedFencedTransition::try_from_bytes(&wrong_magic),
             Err(PreparedFencedTransitionError::InvalidEncoding)
         );
 
-        let unsupported = PreparedFencedTransitionBody {
-            magic: PREPARED_TRANSITION_MAGIC,
-            schema_version: FENCED_TRANSITION_PREPARED_SCHEMA_V1 + 1,
-            request: prepared_request(0x34),
-            protection_layer_count: 0,
-            protection_layers: [None; FENCED_TRANSITION_MAX_PREPARED_LAYERS],
-        };
+        let mut unsupported = encode_unvalidated_prepared_body(&base);
+        let version_offset = PREPARED_TRANSITION_MAGIC.len();
+        unsupported[version_offset..version_offset + PREPARED_TRANSITION_VERSION_BYTES]
+            .copy_from_slice(&(FENCED_TRANSITION_PREPARED_SCHEMA_V1 + 1).to_be_bytes());
         assert_eq!(
-            PreparedFencedTransition::try_from_bytes(&encode_unvalidated_prepared_body(
-                &unsupported
-            )),
+            PreparedFencedTransition::try_from_bytes(&unsupported),
             Err(PreparedFencedTransitionError::UnsupportedVersion)
         );
 
@@ -1261,9 +1653,7 @@ mod tests {
         layers[1] = Some(PreparedFencedTransitionProtection::LocalAeadV1 {
             scope_commitment: [0x44; 32],
         });
-        let hole = PreparedFencedTransitionBody {
-            magic: PREPARED_TRANSITION_MAGIC,
-            schema_version: FENCED_TRANSITION_PREPARED_SCHEMA_V1,
+        let hole = PreparedFencedTransitionWireV1 {
             request: prepared_request(0x35),
             protection_layer_count: 2,
             protection_layers: layers,
@@ -1322,7 +1712,7 @@ mod tests {
         let secret = "prepared-owner";
         let prepared = PreparedFencedTransition::from_unprotected_request(prepared_request(0x37))
             .expect("prepare exact request");
-        let mut corrupt = prepared.as_bytes().to_vec();
+        let mut corrupt = Zeroizing::new(prepared.as_bytes().to_vec());
         let last = corrupt.len() - 1;
         corrupt[last] ^= 1;
         let public_error =
@@ -1340,6 +1730,28 @@ mod tests {
             assert!(!rendered.contains("99"));
             assert!(!rendered.contains("37"));
             assert!(rendered.len() < 96);
+        }
+    }
+
+    #[test]
+    fn protected_fenced_transition_serde_errors_never_echo_malformed_input() {
+        const CANARY: &str = "opaque-import-redaction-canary";
+        let malformed = [
+            format!("\"{CANARY}\""),
+            format!("[1,\"{CANARY}\"]"),
+            format!("{{\"unexpected\":\"{CANARY}\"}}"),
+        ];
+
+        for input in malformed {
+            let error = serde_json::from_str::<PreparedFencedTransition>(&input)
+                .expect_err("malformed token must fail");
+            for rendered in [error.to_string(), format!("{error:?}")] {
+                assert!(
+                    !rendered.contains(CANARY),
+                    "prepared-token import errors must not echo input"
+                );
+                assert!(rendered.len() < 128, "prepared-token errors stay bounded");
+            }
         }
     }
 

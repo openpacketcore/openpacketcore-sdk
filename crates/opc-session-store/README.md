@@ -1183,6 +1183,64 @@ authoritative re-read rules before retrying. Diagnostics use fixed
 operation-family/reason categories and never record keys, owners, payloads,
 transaction IDs, peer identities, or backend/peer-controlled error text.
 
+## Atomic fenced transitions
+
+The exact V1 atomic surface combines one lease acquire/renew and one same-key
+create/update/delete/TTL mutation at a single capable backend linearization
+point. V1 alone does not promise local restart recovery. A protected production
+composition MUST add an SDK-owned `PreparedFencedTransitionJournal` to the
+outer `EncryptingSessionBackend` or `RemoteSealingSessionBackend`; only that
+journaled composition advertises `AtomicFencedTransitionCapability::V2`.
+Legacy wrapper constructors remain source compatible but their atomic surface
+stays fail closed until a journal is installed.
+
+The journal is a dedicated SQLite database on a caller-selected durable volume.
+Its containing directory and file MUST be private, and its stable 32-byte
+`PreparedFencedTransitionJournalKey` MUST come from secret configuration
+independent of record-encryption/provider keys. Preparation rejects an already
+bound request ID before expiry/provider work, protects create/update exactly
+once after the authoritative expiry preflight, and commits the complete opaque
+prepared token to the journal before returning. Delete/refresh remain
+body- and provider-free. Execute/status reload and byte-compare the journaled
+token and never reseal, unseal, or reconstruct it. After a process restart,
+`recover_prepared_fenced_transition` looks it up by the same caller-stable
+`FencedTransitionRequestId`; `NotFound` at the consensus status barrier never
+deletes the journal row or proves that a delayed proposal cannot commit.
+
+`FencedTransitionExecuteError` separates a definitely pre-dispatch
+`NotTransmitted`, a possibly delivered `OutcomeUnknown { request_id }`, and a
+confirmed `Rejected` store result. Journal absence, corruption, wrong key, or
+unavailability prevents a new dispatch. Any ambiguity returned by an inner
+layer remains ambiguity under the expected outer request ID. Observation
+unprotects only a returned record and preserves the authority fence.
+
+This is a breaking replacement for passing a logical request directly to
+execute/status. Custom backends must implement the prepare/execute/status trio;
+transparent adapters must forward it and may forward the protected-byte
+preservation witness only when the complete durable path retains bytes exactly.
+Defaults fail closed. Nested local/remote protection wrappers are unsupported.
+The explicit authenticated-consumer physical bridge implements only this
+atomic subset below a protected wrapper; all unrelated `SessionBackend`
+authority fails closed and it does not implement lease coordination.
+
+Prepared tokens use a bounded, versioned magic/version/length frame and wiping
+in-memory storage. A golden V1 compatibility corpus covers both lease forms,
+every mutation, record/expiry shapes, and each supported protection-stack
+shape/order. Journal rows contain request metadata and, for protected writes,
+ciphertext; the HMAC authenticates them but does not encrypt them. Never log,
+diagnose, export, or place token/journal contents in fixtures or metrics.
+
+V2 guarantees recovery after loss of the process while the same durable
+volume, path, journal key, protection namespace/mode, authenticated consumer
+identity (when used), and stable consensus cluster remain available. It does
+not claim recovery after volume/host loss. Endpoint, leader, certificate/key,
+provider key, and consensus configuration-epoch rotation do not change the
+binding. A rolling upgrade MUST deploy readers for the prepared-token and
+journal schema everywhere recovery may run before enabling V2. Rollback
+requires draining every unresolved/delayed request or retaining a compatible
+reader and the same journal; never re-encode, reseal, reconstruct, copy into a
+fresh journal identity, or migrate an in-flight token.
+
 ## Fenced ownership
 
 The ownership facade does not add a database, sequencer, election, encryption,

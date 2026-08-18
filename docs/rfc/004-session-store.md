@@ -1657,6 +1657,15 @@ consensus/replication/snapshot/rebuild/membership/admin APIs. The server
 constructor accepts only the existing least-authority `SessionQuorumConsumer`
 port, and all accepted mutations route through the durable quorum leader path.
 
+The raw physical store and authenticated-consumer transport advertise exactly
+`AtomicFencedTransitionCapability::V1`. A protected
+`EncryptingSessionBackend` or `RemoteSealingSessionBackend` advertises V2 only
+when it owns the SDK caller-side durable prepared-transition journal and its
+exact inner physical boundary advertises V1. V2 is a local durable-recovery
+composition, not a consumer-wire or consensus revision. A legacy protection
+wrapper without that journal, an older binary, and raw V1 transport MUST fail
+closed for the journaled protected atomic path.
+
 The first authorized transition after that unanimous proof carries the scope
 identity and canonical voter-set commitment inside its same single user command
 and application position. Apply atomically installs its receipt/effects, the
@@ -1789,7 +1798,8 @@ canonical body in the same single consensus entry as the lease and record
 effect. A changing authorized configuration scope does not change that internal
 receipt ID, so an authorized successor can recover the same retained result; a
 revoked predecessor cannot observe it. Status is read-only, and `NotFound` does
-not prove that an earlier delayed proposal cannot still commit.
+not prove that an earlier delayed proposal cannot still commit, does not permit
+deletion, and does not permit reuse of the stable transition ID.
 
 Prewarm and readiness may prove authenticated consumer transport capacity only;
 they never prove quorum or product readiness. Readiness deliberately becomes
@@ -1863,22 +1873,62 @@ unavailability MAY block new protection or plaintext reads, but MUST NOT cause
 provider I/O during deterministic apply or make already sealed Raft replay and
 quorum formation depend on provider availability.
 
-Atomic fenced transitions MUST prepare their complete physical request before
-dispatch. The caller durably retains the bounded, opaque serialized prepared
-token and supplies that exact token to execution, retry, and status. Local and
-remote wrappers seal a create/update body exactly once, after authoritative
-expiry preflight and before consensus admission; delete and refresh perform no
-provider operation. Execution and status MUST NOT reseal, unseal, read back, or
-consult the current active key/provider. The durable receipt continues to bind
-the complete protected request, so restart or rotation reuses the original
-envelope rather than manufacturing a conflicting nonce/key/provider result.
-Observation unprotects only a returned record and preserves its authoritative
-fence. Every adapter advertises the atomic capability only when every composed
-layer implements this exact prepared-token contract. In particular, a
-protection wrapper requires an explicit inner witness that protected bytes are
-preserved through preparation and observation; nested payload-protection
-wrappers fail closed rather than double-sealing or returning an inner envelope
-as plaintext.
+Raw physical stores and authenticated-consumer transport implement only V1.
+For protected transitions, V2 requires the outer
+`EncryptingSessionBackend` or `RemoteSealingSessionBackend` to own an SDK
+caller-side durable `PreparedFencedTransitionJournal` and to compose over an
+exact V1 physical boundary that explicitly witnesses unchanged protected bytes.
+This journal, rather than a legacy prepared token or application-persisted
+request state, is the durable recovery authority. The application retains only
+the caller-stable `FencedTransitionRequestId`, which it MUST reuse for that
+same logical operation after restart.
+
+Protected preparation validates the request, capability-gates the exact inner
+V1 boundary, and checks that the journal has no binding for the ID before
+effects. It obtains record-expiry preflight before provider work, seals each
+create/update body exactly once, leaves delete and refresh provider-free,
+obtains the inner physical token, and durably inserts the complete outer token
+with create-only semantics before returning success. Execution, status, and
+recovery reload and authenticate the exact journal token; execution and status
+may dispatch only its retained physical bytes. They MUST NOT reseal, unseal,
+read back, reconstruct, or consult the current active key/provider. Missing,
+incompatible, corrupt, or byte-mismatched journal state fails closed with no
+provider or transport I/O; execute reports the known-local case as
+`NotTransmitted`, while status and recovery return their typed local
+fail-closed result. Any may-have-sent result remains `OutcomeUnknown` under the
+expected request ID. `NotFound` is non-exclusion: it never permits deletion or
+reuse of the ID and does not prove a delayed proposal cannot commit.
+
+The consumer physical bridge is only for use underneath such a protected
+journaled wrapper. It is atomic-subset-only, fails every unrelated
+`SessionBackend` operation locally without I/O, and does not implement
+`SessionLeaseManager`. Its opaque local marker commits only the authenticated
+consumer SPIFFE identity and stable cluster ID; it excludes endpoint/address,
+TLS server identity, leader, configuration ID/epoch, certificate/key, and
+material epoch. Authorized endpoint, leader, topology, TLS-leaf, server, and
+provider/key rotation can therefore use the same durable journal path, key,
+and volume. This does not claim host failover, host/volume-loss recovery,
+journal replication, or a second consensus transition.
+
+The journal path and independent stable integrity key are deployment
+secrets/configuration and MUST NOT be logged. On Unix it uses a private `0700`
+parent directory, `0600` file, no symlink path, HMAC-SHA-256 integrity,
+SQLite WAL, `synchronous=EXTRA`, and bounded opaque rows containing no
+plaintext. Payloads, identities, request IDs, paths, keys, provider material,
+token bytes, and journal contents MUST NOT appear in examples, fixtures, logs,
+diagnostics, or evidence. Prepared-token schema, journal schema, and V2 are
+downgrade fences: unknown versions, raw V1, and older binaries MUST NOT operate
+the protected journaled path. The V2 journal layer makes no journal GC,
+retention, ledger-lifetime, or capacity-lifecycle claim.
+
+The token wire form begins with a fixed magic, schema version, and body length;
+version dispatch precedes decoding the frozen V1 body. A golden compatibility
+corpus pins both lease forms, every mutation, no-expiry and finite-expiry record
+shapes, and every supported local/remote/consensus protection-stack shape and
+order. SDK-owned canonical and complete-body scratch allocations wipe on drop.
+External serialization and persistence buffers remain the caller's
+responsibility and inherit the same prohibition on diagnostic or metric
+emission.
 
 Remote unseal MUST pass the canonical envelope key ID through the provider
 boundary after validating envelope shape and record AAD. The active remote key

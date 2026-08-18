@@ -154,10 +154,22 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         self.backend.prepare_fenced_transition(request).await
     }
 
+    async fn recover_prepared_fenced_transition(
+        &self,
+        request_id: crate::fenced_transition::FencedTransitionRequestId,
+    ) -> Result<crate::fenced_transition::PreparedFencedTransitionLookup, StoreError> {
+        self.backend
+            .recover_prepared_fenced_transition(request_id)
+            .await
+    }
+
     async fn fenced_transition(
         &self,
         prepared: &crate::fenced_transition::PreparedFencedTransition,
-    ) -> Result<crate::fenced_transition::FencedTransitionOutcome, StoreError> {
+    ) -> Result<
+        crate::fenced_transition::FencedTransitionOutcome,
+        crate::fenced_transition::FencedTransitionExecuteError,
+    > {
         self.backend.fenced_transition(prepared).await
     }
 

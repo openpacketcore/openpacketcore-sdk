@@ -30,7 +30,10 @@ use crate::consensus::{
 use crate::fenced_transition::{
     AtomicFencedTransitionCapability, FencedTransitionLease, FencedTransitionMutation,
     FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus,
-    PreparedFencedTransition,
+    PreparedFencedTransitionLookup,
+};
+use crate::fenced_transition_journal::{
+    PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
 };
 use crate::lease::SessionLeaseManager;
 use crate::model::{
@@ -429,21 +432,39 @@ async fn protected_fenced_transition_survives_consensus_restart_and_key_rotation
     const PLAINTEXT: &[u8] = b"prepared-fenced-transition-consensus-plaintext-canary";
 
     let directory = tempfile::tempdir().expect("qualification directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private qualification directory");
+    }
     let database = directory.path().join("sessions.sqlite");
     let snapshots = directory.path().join("snapshots");
+    let journal_path = directory.path().join("prepared.sqlite");
+    let journal_key = [0xb1; 32];
     let provider = provider();
     let store = open_store(&database, &snapshots).await;
-    let backend: Arc<dyn SessionBackend> = Arc::new(EncryptingSessionBackend::new(
-        Arc::new(store.clone()),
-        Arc::clone(&provider),
-        "prepared-fenced-transition-consensus",
-    ));
+    let backend: Arc<dyn SessionBackend> = Arc::new(
+        EncryptingSessionBackend::new(
+            Arc::new(store.clone()),
+            Arc::clone(&provider),
+            "prepared-fenced-transition-consensus",
+        )
+        .with_fenced_transition_journal(Arc::new(
+            PreparedFencedTransitionJournal::open(
+                &journal_path,
+                PreparedFencedTransitionJournalKey::from_bytes(journal_key),
+            )
+            .expect("open prepared journal"),
+        )),
+    );
     assert_eq!(
         backend
             .fenced_transition_capability()
             .await
             .expect("capability"),
-        Some(AtomicFencedTransitionCapability::V1)
+        Some(AtomicFencedTransitionCapability::V2)
     );
 
     let session_key = key(b"prepared-fenced-transition");
@@ -482,13 +503,14 @@ async fn protected_fenced_transition_survives_consensus_restart_and_key_rotation
         .expect("prepare protected request");
     assert_eq!(provider.call_counts(), (1, 0, 0));
     assert!(!contains_bytes(prepared.as_bytes(), PLAINTEXT));
-    let durable_token = prepared.as_bytes().to_vec();
+    let request_id = prepared.request_id();
 
     provider
         .rotate_key(KeyPurpose::Session, &tenant())
         .await
         .expect("rotate active key after preparation");
     assert_eq!(provider.call_counts(), (1, 0, 1));
+    drop(prepared);
     drop(backend);
     store
         .inner
@@ -499,13 +521,28 @@ async fn protected_fenced_transition_survives_consensus_restart_and_key_rotation
     drop(store);
 
     let restarted = open_store(&database, &snapshots).await;
-    let backend: Arc<dyn SessionBackend> = Arc::new(EncryptingSessionBackend::new(
-        Arc::new(restarted.clone()),
-        Arc::clone(&provider),
-        "prepared-fenced-transition-consensus",
-    ));
-    let restored =
-        PreparedFencedTransition::try_from_bytes(&durable_token).expect("restore exact token");
+    let backend: Arc<dyn SessionBackend> = Arc::new(
+        EncryptingSessionBackend::new(
+            Arc::new(restarted.clone()),
+            Arc::clone(&provider),
+            "prepared-fenced-transition-consensus",
+        )
+        .with_fenced_transition_journal(Arc::new(
+            PreparedFencedTransitionJournal::open(
+                &journal_path,
+                PreparedFencedTransitionJournalKey::from_bytes(journal_key),
+            )
+            .expect("reopen prepared journal"),
+        )),
+    );
+    let restored = match backend
+        .recover_prepared_fenced_transition(request_id)
+        .await
+        .expect("recover exact token by ID")
+    {
+        PreparedFencedTransitionLookup::Found(prepared) => prepared,
+        PreparedFencedTransitionLookup::Absent => panic!("prepared token was lost"),
+    };
     let outcome = backend
         .fenced_transition(&restored)
         .await
@@ -542,27 +579,22 @@ async fn protected_fenced_transition_survives_consensus_restart_and_key_rotation
         .await
         .expect("plaintext observation");
     assert_eq!(plaintext.current_fence(), outcome.lease().fence());
-    assert_eq!(
+    assert!(
         plaintext
             .record()
             .expect("observed record")
             .payload
-            .as_bytes(),
-        PLAINTEXT
+            .as_bytes()
+            == PLAINTEXT,
+        "protected observation must return the logical payload"
     );
     assert_eq!(provider.call_counts(), (1, 1, 1));
 
-    let newly_sealed = backend
-        .prepare_fenced_transition(request)
-        .await
-        .expect("prepare same logical request after rotation");
-    assert_ne!(newly_sealed.as_bytes(), restored.as_bytes());
-    assert_eq!(provider.call_counts(), (2, 1, 1));
     assert_eq!(
-        backend.fenced_transition(&newly_sealed).await,
+        backend.prepare_fenced_transition(request).await,
         Err(crate::StoreError::FencedTransitionRequestConflict)
     );
-    assert_eq!(provider.call_counts(), (2, 1, 1));
+    assert_eq!(provider.call_counts(), (1, 1, 1));
     assert_sqlite_authority_is_sealed(&database);
 
     drop(backend);

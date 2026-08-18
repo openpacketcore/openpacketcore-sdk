@@ -62,9 +62,9 @@ use crate::consumer::{
 };
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_transition::{
-    AtomicFencedTransitionCapability, FencedTransitionObservation, FencedTransitionOutcome,
-    FencedTransitionRequest, FencedTransitionStatus, PreparedFencedTransition,
-    PreparedFencedTransitionProtection, FENCED_TRANSITION_SCHEMA_V1,
+    AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionObservation,
+    FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionStatus,
+    PreparedFencedTransition, PreparedFencedTransitionProtection, FENCED_TRANSITION_SCHEMA_V1,
 };
 use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{OwnerId, SessionKey};
@@ -4959,16 +4959,25 @@ impl SessionBackend for ConsensusSessionStore {
     async fn fenced_transition(
         &self,
         prepared: &PreparedFencedTransition,
-    ) -> Result<FencedTransitionOutcome, StoreError> {
-        let prepared = prepared.without_outer_protection(
-            PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+    ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
+        let request_id = prepared.request_id();
+        let prepared = prepared
+            .without_outer_protection(PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
                 storage_commitment: prepared_fenced_transition_storage_commitment(
                     self.inner.storage_identity,
                 ),
-            },
-        )?;
-        let request = prepared.request_for_unprotected_backend()?;
-        ConsensusSessionStore::fenced_transition(self, request).await
+            })
+            .map_err(FencedTransitionExecuteError::Rejected)?;
+        let request = prepared
+            .request_for_unprotected_backend()
+            .map_err(FencedTransitionExecuteError::Rejected)?;
+        match ConsensusSessionStore::fenced_transition(self, request).await {
+            Ok(outcome) => Ok(outcome),
+            Err(StoreError::FencedTransitionOutcomeUnknown) => {
+                Err(FencedTransitionExecuteError::OutcomeUnknown { request_id })
+            }
+            Err(error) => Err(FencedTransitionExecuteError::Rejected(error)),
+        }
     }
 
     async fn fenced_transition_status(

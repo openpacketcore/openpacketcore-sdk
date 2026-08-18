@@ -63,6 +63,78 @@ pub enum SessionPayloadEncoding {
     Unclassified,
 }
 
+const PAYLOAD_DESERIALIZE_CHUNK_BYTES: usize = 4 * 1024;
+
+struct WipingPayloadBytes(Zeroizing<Vec<u8>>);
+
+impl<'de> serde::Deserialize<'de> for WipingPayloadBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct WipingPayloadVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for WipingPayloadVisitor {
+            type Value = WipingPayloadBytes;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("opaque session payload bytes")
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WipingPayloadBytes(Zeroizing::new(value.to_vec())))
+            }
+
+            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WipingPayloadBytes(Zeroizing::new(value)))
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut chunks = Vec::new();
+                let mut current =
+                    Zeroizing::new(Vec::with_capacity(PAYLOAD_DESERIALIZE_CHUNK_BYTES));
+                while let Some(byte) = sequence.next_element::<u8>()? {
+                    if current.len() == PAYLOAD_DESERIALIZE_CHUNK_BYTES {
+                        chunks.push(current);
+                        current =
+                            Zeroizing::new(Vec::with_capacity(PAYLOAD_DESERIALIZE_CHUNK_BYTES));
+                    }
+                    current.push(byte);
+                }
+                let total = chunks
+                    .iter()
+                    .try_fold(current.len(), |total, chunk| total.checked_add(chunk.len()));
+                let total = total.ok_or_else(|| {
+                    serde::de::Error::custom("opaque session payload bytes are invalid")
+                })?;
+                let mut bytes = Zeroizing::new(vec![0_u8; total]);
+                let mut offset = 0;
+                for chunk in chunks.iter().chain(std::iter::once(&current)) {
+                    let end = offset + chunk.len();
+                    bytes[offset..end].copy_from_slice(chunk);
+                    offset = end;
+                }
+                Ok(WipingPayloadBytes(bytes))
+            }
+        }
+
+        // `EncryptedSessionPayload::serialize` has always emitted this field
+        // as a generic Serde sequence. Request the same data model here so
+        // formats that distinguish sequences from byte buffers continue to
+        // read bytes produced by older and current SDKs.
+        deserializer.deserialize_seq(WipingPayloadVisitor)
+    }
+}
+
 /// Session payload bytes held by a session record.
 ///
 /// Above [`crate::backend::EncryptingSessionBackend`], callers provide
@@ -107,11 +179,11 @@ impl<'de> serde::Deserialize<'de> for EncryptedSessionPayload {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Helper {
-            bytes: Vec<u8>,
+            bytes: WipingPayloadBytes,
             encoding: SessionPayloadEncoding,
         }
         let helper = Helper::deserialize(deserializer)?;
-        Self::try_from_vec_with_encoding(helper.bytes, helper.encoding)
+        Self::try_from_zeroizing_with_encoding(helper.bytes.0, helper.encoding)
             .map_err(serde::de::Error::custom)
     }
 }
@@ -162,10 +234,14 @@ impl EncryptedSessionPayload {
         bytes: Vec<u8>,
         encoding: SessionPayloadEncoding,
     ) -> Result<Self, StoreError> {
-        let payload = Self {
-            bytes: Zeroizing::new(bytes),
-            encoding,
-        };
+        Self::try_from_zeroizing_with_encoding(Zeroizing::new(bytes), encoding)
+    }
+
+    fn try_from_zeroizing_with_encoding(
+        bytes: Zeroizing<Vec<u8>>,
+        encoding: SessionPayloadEncoding,
+    ) -> Result<Self, StoreError> {
+        let payload = Self { bytes, encoding };
         if encoding == SessionPayloadEncoding::EnvelopeV1 {
             payload.decode_valid_session_envelope()?;
         }
@@ -606,4 +682,45 @@ fn build_session_aad_with_digest(
         SESSION_ENVELOPE_VERSION,
         metadata,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WipingPayloadBytes;
+    use serde::{de, Deserialize};
+
+    struct SequenceOnlyDeserializer;
+
+    impl<'de> serde::Deserializer<'de> for SequenceOnlyDeserializer {
+        type Error = de::value::Error;
+
+        fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: de::Visitor<'de>,
+        {
+            Err(de::Error::custom("expected the sequence data model"))
+        }
+
+        fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: de::Visitor<'de>,
+        {
+            visitor.visit_seq(de::value::SeqDeserializer::<_, Self::Error>::new(
+                std::iter::empty::<u8>(),
+            ))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct tuple tuple_struct map struct
+            enum identifier ignored_any
+        }
+    }
+
+    #[test]
+    fn payload_deserialization_preserves_the_generic_sequence_wire_contract() {
+        let payload = WipingPayloadBytes::deserialize(SequenceOnlyDeserializer)
+            .expect("the payload byte field must request a Serde sequence");
+        assert!(payload.0.is_empty());
+    }
 }

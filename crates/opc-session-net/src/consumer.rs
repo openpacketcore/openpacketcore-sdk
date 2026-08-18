@@ -24,9 +24,10 @@ use futures_util::FutureExt;
 use opc_session_store::{
     checked_session_deadline, session_consumer_batch_result_into_store,
     validate_stored_record_expiry_profile, AtomicFencedTransitionCapability, BackendCapabilities,
-    CompareAndSet, CompareAndSetResult, FencedTransitionObservation, FencedTransitionOutcome,
-    FencedTransitionRequest, FencedTransitionRequestId, LeaseError, LeaseGuard, OwnerId,
-    RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest,
+    CompareAndSet, CompareAndSetResult, FencedTransitionExecuteError, FencedTransitionObservation,
+    FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
+    FencedTransitionStatus, LeaseError, LeaseGuard, OwnerId, PreparedFencedTransition,
+    RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionBackend,
     SessionConsumerAuthorizationManifest, SessionConsumerBatchResult, SessionConsumerChange,
     SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
     SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
@@ -37,6 +38,7 @@ use opc_session_store::{
 };
 use opc_types::SpiffeId;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore};
@@ -3178,6 +3180,340 @@ fn consumer_fresh_admission_is_current(
 
 fn constant_address_resolver(address: SocketAddr) -> RemoteAddrResolver {
     Arc::new(move || Box::pin(async move { Ok(address) }))
+}
+
+const AUTHENTICATED_CONSUMER_FENCED_TRANSITION_ONLY_CAPABILITY: &str =
+    "authenticated_consumer_fenced_transition_only";
+
+fn authenticated_consumer_fenced_transition_only() -> StoreError {
+    StoreError::CapabilityNotSupported(
+        AUTHENTICATED_CONSUMER_FENCED_TRANSITION_ONLY_CAPABILITY.into(),
+    )
+}
+
+fn invalid_authenticated_consumer_fenced_transition() -> StoreError {
+    StoreError::Serialization("prepared_fenced_transition_invalid".into())
+}
+
+/// Redaction-safe construction failure for
+/// [`SessionConsumerFencedTransitionBackend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("authenticated consumer identity is unavailable")]
+pub struct SessionConsumerFencedTransitionBackendError;
+
+#[derive(Clone)]
+enum SessionConsumerFencedTransitionClient {
+    Stateless(Box<StatelessSessionConsumerClient>),
+    Persistent(PersistentSessionConsumerClient),
+}
+
+impl SessionConsumerFencedTransitionClient {
+    async fn preflight_record_expiry(
+        &self,
+        preflights: Vec<RecordExpiryPreflight>,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Stateless(client) => client.preflight_record_expiry(preflights).await,
+            Self::Persistent(client) => client.preflight_record_expiry(preflights).await,
+        }
+    }
+
+    async fn capability(&self) -> Result<AtomicFencedTransitionCapability, StoreError> {
+        match self {
+            Self::Stateless(client) => client.fenced_transition_capability().await,
+            Self::Persistent(client) => client.fenced_transition_capability().await,
+        }
+    }
+
+    async fn observe(
+        &self,
+        key: opc_session_store::SessionKey,
+    ) -> Result<FencedTransitionObservation, StoreError> {
+        match self {
+            Self::Stateless(client) => client.observe_fenced_transition(key).await,
+            Self::Persistent(client) => client.observe_fenced_transition(key).await,
+        }
+    }
+
+    async fn execute(
+        &self,
+        request: &FencedTransitionRequest,
+    ) -> Result<FencedTransitionOutcome, SessionConsumerFencedTransitionMutationError> {
+        match self {
+            Self::Stateless(client) => client.fenced_transition(request).await,
+            Self::Persistent(client) => client.fenced_transition(request).await,
+        }
+    }
+
+    async fn status(
+        &self,
+        request: &FencedTransitionRequest,
+    ) -> Result<SessionConsumerFencedTransitionStatus, StoreError> {
+        match self {
+            Self::Stateless(client) => client.fenced_transition_status(request).await,
+            Self::Persistent(client) => client.fenced_transition_status(request).await,
+        }
+    }
+}
+
+/// Narrow [`SessionBackend`] adapter for the atomic fenced-transition subset
+/// of an authenticated consumer client.
+///
+/// This intentionally does not implement `SessionLeaseManager` and every
+/// unrelated backend operation rejects locally before client/transport I/O.
+/// Its prepared tokens carry an opaque binding to the local authenticated
+/// consumer identity and stable cluster identity; endpoint, leader, server
+/// identity, and mutable configuration scope are deliberately excluded so a
+/// normal authenticated failover remains usable.
+#[derive(Clone)]
+pub struct SessionConsumerFencedTransitionBackend {
+    client: SessionConsumerFencedTransitionClient,
+    binding_commitment: [u8; 32],
+}
+
+impl fmt::Debug for SessionConsumerFencedTransitionBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerFencedTransitionBackend(<redacted>)")
+    }
+}
+
+impl SessionConsumerFencedTransitionBackend {
+    /// Adapt a stateless authenticated consumer client to the atomic physical
+    /// transition surface.
+    pub fn stateless(
+        client: StatelessSessionConsumerClient,
+    ) -> Result<Self, SessionConsumerFencedTransitionBackendError> {
+        let binding_commitment = authenticated_consumer_binding(
+            client.tls_config.local_spiffe_identity_commitment(),
+            client.scope(),
+        )?;
+        Ok(Self {
+            client: SessionConsumerFencedTransitionClient::Stateless(Box::new(client)),
+            binding_commitment,
+        })
+    }
+
+    /// Adapt a persistent authenticated consumer client to the atomic
+    /// physical transition surface.
+    pub fn persistent(
+        client: PersistentSessionConsumerClient,
+    ) -> Result<Self, SessionConsumerFencedTransitionBackendError> {
+        let binding_commitment = authenticated_consumer_binding(
+            client
+                .pool
+                .client
+                .tls_config
+                .local_spiffe_identity_commitment(),
+            client.scope(),
+        )?;
+        Ok(Self {
+            client: SessionConsumerFencedTransitionClient::Persistent(client),
+            binding_commitment,
+        })
+    }
+
+    fn decode_prepared(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<FencedTransitionRequest, StoreError> {
+        prepared.request_for_authenticated_consumer(self.binding_commitment)
+    }
+}
+
+fn authenticated_consumer_binding(
+    local_identity_commitment: Option<[u8; 32]>,
+    scope: SessionConsumerScope,
+) -> Result<[u8; 32], SessionConsumerFencedTransitionBackendError> {
+    let local_identity_commitment =
+        local_identity_commitment.ok_or(SessionConsumerFencedTransitionBackendError)?;
+    let mut digest = Sha256::new();
+    digest.update(b"openpacketcore/session-consumer/fenced-transition-physical/v1\0");
+    digest.update(local_identity_commitment);
+    digest.update(scope.consensus_identity().cluster_id().as_bytes());
+    Ok(digest.finalize().into())
+}
+
+fn consumer_status_into_fenced_transition(
+    status: SessionConsumerFencedTransitionStatus,
+) -> Result<FencedTransitionStatus, StoreError> {
+    Ok(match status {
+        SessionConsumerFencedTransitionStatus::Recorded(result) => {
+            FencedTransitionStatus::Recorded(Box::new(match *result {
+                Ok(outcome) => Ok(outcome),
+                Err(error) => Err(consumer_fenced_transition_store_error(error)),
+            }))
+        }
+        SessionConsumerFencedTransitionStatus::RequestConflict => {
+            FencedTransitionStatus::RequestConflict
+        }
+        SessionConsumerFencedTransitionStatus::Expired => FencedTransitionStatus::Expired,
+        SessionConsumerFencedTransitionStatus::HistoryFull => FencedTransitionStatus::HistoryFull,
+        SessionConsumerFencedTransitionStatus::RetentionExhausted => {
+            FencedTransitionStatus::RetentionExhausted
+        }
+        SessionConsumerFencedTransitionStatus::NotFound => FencedTransitionStatus::NotFound,
+        _ => return Err(invalid_authenticated_consumer_fenced_transition()),
+    })
+}
+
+fn consumer_execute_into_fenced_transition(
+    request: &FencedTransitionRequest,
+    result: Result<FencedTransitionOutcome, SessionConsumerFencedTransitionMutationError>,
+) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
+    let request_id = request.request_id();
+    match result {
+        Ok(outcome) if outcome.matches_request(request) => Ok(outcome),
+        // Concrete clients already convert a malformed or mismatched
+        // post-write response to ambiguity. Preserve that conservative effect
+        // classification if another implementation reaches this boundary.
+        Ok(_) => Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }),
+        Err(SessionConsumerFencedTransitionMutationError::NotTransmitted { .. }) => {
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        }
+        Err(SessionConsumerFencedTransitionMutationError::OutcomeUnknown { .. }) => {
+            Err(FencedTransitionExecuteError::OutcomeUnknown { request_id })
+        }
+        Err(SessionConsumerFencedTransitionMutationError::Store(error)) => {
+            Err(FencedTransitionExecuteError::Rejected(error))
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for SessionConsumerFencedTransitionBackend {
+    async fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::minimal()
+    }
+
+    async fn preflight_record_expiry(
+        &self,
+        preflights: &[RecordExpiryPreflight],
+    ) -> Result<(), StoreError> {
+        self.client
+            .preflight_record_expiry(preflights.to_vec())
+            .await
+    }
+
+    async fn get(
+        &self,
+        _key: &opc_session_store::SessionKey,
+    ) -> Result<Option<opc_session_store::StoredSessionRecord>, StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn observe_fenced_transition(
+        &self,
+        key: &opc_session_store::SessionKey,
+    ) -> Result<FencedTransitionObservation, StoreError> {
+        self.client.observe(key.clone()).await
+    }
+
+    async fn fenced_transition_capability(
+        &self,
+    ) -> Result<Option<AtomicFencedTransitionCapability>, StoreError> {
+        match self.client.capability().await? {
+            AtomicFencedTransitionCapability::V1 => Ok(Some(AtomicFencedTransitionCapability::V1)),
+            _ => Ok(None),
+        }
+    }
+
+    fn fenced_transition_preserves_protected_payloads(&self) -> bool {
+        true
+    }
+
+    async fn prepare_fenced_transition(
+        &self,
+        request: FencedTransitionRequest,
+    ) -> Result<PreparedFencedTransition, StoreError> {
+        request.validate()?;
+        PreparedFencedTransition::from_unprotected_request(request)?
+            .with_authenticated_consumer_binding(self.binding_commitment)
+    }
+
+    async fn fenced_transition(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
+        let request = self.decode_prepared(prepared).map_err(|_| {
+            FencedTransitionExecuteError::Rejected(
+                invalid_authenticated_consumer_fenced_transition(),
+            )
+        })?;
+        consumer_execute_into_fenced_transition(&request, self.client.execute(&request).await)
+    }
+
+    async fn fenced_transition_status(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<FencedTransitionStatus, StoreError> {
+        let request = self
+            .decode_prepared(prepared)
+            .map_err(|_| invalid_authenticated_consumer_fenced_transition())?;
+        consumer_status_into_fenced_transition(self.client.status(&request).await?)
+    }
+
+    async fn compare_and_set(&self, _op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn batch(&self, _ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn scan_restore_records(
+        &self,
+        _request: RestoreScanRequest,
+    ) -> Result<RestoreScanPage, StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn get_replication_log(
+        &self,
+        _start: u64,
+        _limit: usize,
+    ) -> Result<Vec<opc_session_store::ReplicationEntry>, StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn replicate_entry(
+        &self,
+        _entry: opc_session_store::ReplicationEntry,
+    ) -> Result<(), StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn rebuild_replication_state(
+        &self,
+        _entries: Vec<opc_session_store::ReplicationEntry>,
+    ) -> Result<(), StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn watch(
+        &self,
+        _start_sequence: u64,
+    ) -> Result<
+        BoxStream<'static, Result<opc_session_store::ReplicationEntry, StoreError>>,
+        StoreError,
+    > {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
+
+    async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
+        Err(authenticated_consumer_fenced_transition_only())
+    }
 }
 
 /// Stateless mTLS client for the typed session-quorum consumer contract.
@@ -8890,7 +9226,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        classify_call_write_error, complete_before_deadline, consumer_connection_current,
+        authenticated_consumer_binding, classify_call_write_error, complete_before_deadline,
+        consumer_connection_current, consumer_execute_into_fenced_transition,
         consumer_fresh_admission_is_current, consumer_payload_fragments_exceed_frame,
         consumer_request_has_exact_fenced_transition_id, consumer_response_fits,
         consumer_watch_error_is_legal, consumer_wire_response_from_public,
@@ -8936,17 +9273,18 @@ mod tests {
     use futures_util::StreamExt;
     use opc_session_store::{
         checked_session_deadline, BackendCapabilities, CompareAndSet, CompareAndSetResult,
-        EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedTransitionLease,
-        FencedTransitionMutation, FencedTransitionOutcome, FencedTransitionRequest,
-        FencedTransitionRequestId, Generation, LeaseGuard, OwnerId, RestoreScanCursorProfile,
-        RestoreScanPage, RestoreScanRequest, SessionConsensusClusterId,
-        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-        SessionConsensusIdentity, SessionConsumerBatchResult, SessionConsumerFencedTransitionError,
-        SessionConsumerFencedTransitionStatus, SessionConsumerLeaseError, SessionConsumerOperation,
-        SessionConsumerOutcomeUnknown, SessionConsumerRequest, SessionConsumerRequestId,
-        SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionKey,
-        SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType, StoreError,
-        StoredSessionRecord, MAX_SESSION_TTL,
+        EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedTransitionExecuteError,
+        FencedTransitionLease, FencedTransitionMutation, FencedTransitionOutcome,
+        FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus, Generation,
+        LeaseGuard, OwnerId, RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest,
+        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
+        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
+        SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+        SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+        SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+        SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
+        SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
+        MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
@@ -10169,6 +10507,104 @@ mod tests {
                 request_id: exact_id,
             }),
         ));
+    }
+
+    #[test]
+    fn authenticated_consumer_binding_survives_configuration_failover() {
+        let changed_scope = SessionConsumerScope::new(SessionConsensusIdentity::new(
+            SessionConsensusClusterId::from_bytes([1; 32]),
+            SessionConsensusConfigurationId::from_bytes([9; 32]),
+            SessionConsensusConfigurationEpoch::new(2).expect("non-zero configuration epoch"),
+        ));
+        let local_identity = [0x51; 32];
+        let original = authenticated_consumer_binding(Some(local_identity), scope())
+            .expect("local identity is available");
+        let failover = authenticated_consumer_binding(Some(local_identity), changed_scope)
+            .expect("local identity is available");
+        let different_consumer = authenticated_consumer_binding(Some([0x52; 32]), scope())
+            .expect("local identity is available");
+
+        assert_eq!(original, failover);
+        assert_ne!(original, different_consumer);
+        assert!(authenticated_consumer_binding(None, scope()).is_err());
+    }
+
+    #[test]
+    fn consumer_fenced_transition_adapter_preserves_typed_ambiguity_and_statuses() {
+        let key = SessionKey {
+            tenant: TenantId::new("adapter-transition").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"adapter-transition")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let outcome_key = key.clone();
+        let request = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x81; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("adapter-transition-owner").expect("test owner"),
+                FenceToken::new(0),
+                Duration::from_secs(30),
+            )
+            .expect("bounded acquire"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("bounded transition");
+
+        assert_eq!(
+            consumer_execute_into_fenced_transition(
+                &request,
+                Err(
+                    SessionConsumerFencedTransitionMutationError::OutcomeUnknown {
+                        request_id: FencedTransitionRequestId::from_bytes([0x82; 16]),
+                    }
+                ),
+            ),
+            Err(FencedTransitionExecuteError::OutcomeUnknown {
+                request_id: request.request_id(),
+            }),
+        );
+        let timestamp = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let mismatched_outcome: FencedTransitionOutcome =
+            serde_json::from_value(serde_json::json!({
+                "lease": {
+                    "key": outcome_key,
+                    "owner": OwnerId::new("adapter-transition-owner").expect("test owner"),
+                    "fence": FenceToken::new(1),
+                    "acquired_at": timestamp,
+                    "expires_at": timestamp,
+                    "credential_id": 1,
+                },
+                "committed_generation": Generation::new(1),
+                "mutation": "Deleted",
+                "recorded_at": timestamp,
+                "retained_until": timestamp,
+            }))
+            .expect("bounded outcome wire shape");
+        assert_eq!(
+            consumer_execute_into_fenced_transition(&request, Ok(mismatched_outcome)),
+            Err(FencedTransitionExecuteError::OutcomeUnknown {
+                request_id: request.request_id(),
+            }),
+        );
+        assert_eq!(
+            super::consumer_status_into_fenced_transition(
+                SessionConsumerFencedTransitionStatus::RequestConflict,
+            ),
+            Ok(FencedTransitionStatus::RequestConflict),
+        );
+        assert_eq!(
+            super::consumer_status_into_fenced_transition(
+                SessionConsumerFencedTransitionStatus::Recorded(Box::new(Err(
+                    SessionConsumerFencedTransitionError::Expired,
+                ))),
+            ),
+            Ok(FencedTransitionStatus::Recorded(Box::new(Err(
+                StoreError::FencedTransitionRequestExpired,
+            )))),
+        );
     }
 
     #[test]
