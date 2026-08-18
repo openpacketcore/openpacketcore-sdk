@@ -133,6 +133,13 @@ fn create_request(id: u8) -> FencedTransitionRequest {
 }
 
 fn create_request_with_payload(id: u8, payload: &[u8]) -> FencedTransitionRequest {
+    create_request_with_encoded_payload(id, EncryptedSessionPayload::new(payload))
+}
+
+fn create_request_with_encoded_payload(
+    id: u8,
+    payload: EncryptedSessionPayload,
+) -> FencedTransitionRequest {
     let key = key();
     let owner = owner();
     let lease = FencedTransitionLease::acquire(
@@ -143,7 +150,7 @@ fn create_request_with_payload(id: u8, payload: &[u8]) -> FencedTransitionReques
     )
     .expect("valid acquire");
     let mut record = record(key, owner, FenceToken::new(1), 1);
-    record.payload = EncryptedSessionPayload::new(payload);
+    record.payload = payload;
     FencedTransitionRequest::new(
         FencedTransitionRequestId::from_bytes([id; 16]),
         lease,
@@ -153,6 +160,13 @@ fn create_request_with_payload(id: u8, payload: &[u8]) -> FencedTransitionReques
 }
 
 fn update_request(id: u8) -> FencedTransitionRequest {
+    update_request_with_encoded_payload(id, EncryptedSessionPayload::new(SYNTHETIC_PAYLOAD))
+}
+
+fn update_request_with_encoded_payload(
+    id: u8,
+    payload: EncryptedSessionPayload,
+) -> FencedTransitionRequest {
     let key = key();
     let owner = owner();
     let acquired_at = Timestamp::now_utc();
@@ -167,10 +181,11 @@ fn update_request(id: u8) -> FencedTransitionRequest {
     FencedTransitionRequest::new(
         FencedTransitionRequestId::from_bytes([id; 16]),
         FencedTransitionLease::renew(lease, Duration::from_secs(60)).expect("valid renewal"),
-        FencedTransitionMutation::update(
-            Generation::new(1),
-            record(key, owner, FenceToken::new(1), 2),
-        ),
+        FencedTransitionMutation::update(Generation::new(1), {
+            let mut record = record(key, owner, FenceToken::new(1), 2);
+            record.payload = payload;
+            record
+        }),
     )
     .expect("valid update request")
 }
@@ -217,8 +232,10 @@ fn refresh_request(id: u8) -> FencedTransitionRequest {
 #[derive(Default)]
 struct SpyState {
     capability: Option<AtomicFencedTransitionCapability>,
+    capability_calls: usize,
     reject_expiry_preflight: bool,
     observed: Option<StoredSessionRecord>,
+    observation_calls: usize,
     prepared: Vec<FencedTransitionRequest>,
     executed: Vec<FencedTransitionRequest>,
     statuses: Vec<FencedTransitionRequest>,
@@ -269,6 +286,14 @@ impl AtomicSpy {
 
     fn get_calls(&self) -> usize {
         self.state.lock().expect("spy lock").get_calls
+    }
+
+    fn capability_calls(&self) -> usize {
+        self.state.lock().expect("spy lock").capability_calls
+    }
+
+    fn observation_calls(&self) -> usize {
+        self.state.lock().expect("spy lock").observation_calls
     }
 
     fn set_observed(&self, record: Option<StoredSessionRecord>) {
@@ -389,7 +414,8 @@ impl SessionBackend for AtomicSpy {
         &self,
         _key: &SessionKey,
     ) -> Result<FencedTransitionObservation, StoreError> {
-        let state = self.state.lock().expect("spy lock");
+        let mut state = self.state.lock().expect("spy lock");
+        state.observation_calls += 1;
         let fence = state
             .observed
             .as_ref()
@@ -400,7 +426,9 @@ impl SessionBackend for AtomicSpy {
     async fn fenced_transition_capability(
         &self,
     ) -> Result<Option<AtomicFencedTransitionCapability>, StoreError> {
-        Ok(self.state.lock().expect("spy lock").capability)
+        let mut state = self.state.lock().expect("spy lock");
+        state.capability_calls += 1;
+        Ok(state.capability)
     }
 
     async fn prepare_fenced_transition(
@@ -1204,6 +1232,302 @@ async fn protected_fenced_transition_observation_unprotects_once_preserves_fence
         .record()
         .is_none());
     assert_eq!(remote_provider.calls(), calls_before_remote_none);
+}
+
+#[tokio::test]
+async fn protected_fenced_transition_rejects_nonplaintext_callers_before_effects() {
+    let local_spy = Arc::new(AtomicSpy::new());
+    let local_provider = CountingKeyProvider::with_key("local-caller-encoding", 0x66);
+    let local_journal = JournalFixture::new(0xa3);
+    let local = EncryptingSessionBackend::new(
+        Arc::clone(&local_spy),
+        Arc::clone(&local_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_journal(local_journal.open());
+    local
+        .prepare_fenced_transition(create_request(60))
+        .await
+        .expect("prepare plaintext local request");
+    let local_envelope = local_spy.prepared()[0]
+        .mutation()
+        .record()
+        .expect("physical record")
+        .payload
+        .clone();
+    let local_capabilities = local_spy.capability_calls();
+    let local_preflights = local_spy.preflight_calls();
+    for (id, payload) in [
+        (61, local_envelope.clone()),
+        (62, EncryptedSessionPayload::legacy_plaintext([0x62])),
+        (63, EncryptedSessionPayload::unclassified([0x63])),
+    ] {
+        assert!(matches!(
+            local
+                .prepare_fenced_transition(create_request_with_encoded_payload(id, payload.clone()))
+                .await,
+            Err(StoreError::CapabilityNotSupported(_))
+        ));
+        assert!(matches!(
+            local
+                .prepare_fenced_transition(update_request_with_encoded_payload(id + 10, payload))
+                .await,
+            Err(StoreError::CapabilityNotSupported(_))
+        ));
+    }
+    assert_eq!(local_provider.calls(), 1);
+    assert_eq!(local_spy.capability_calls(), local_capabilities);
+    assert_eq!(local_spy.preflight_calls(), local_preflights);
+    assert_eq!(local_spy.prepared().len(), 1);
+    local
+        .prepare_fenced_transition(delete_request(64))
+        .await
+        .expect("delete remains payload-free");
+    local
+        .prepare_fenced_transition(refresh_request(65))
+        .await
+        .expect("refresh remains payload-free");
+    assert_eq!(local_provider.calls(), 1);
+
+    let remote_spy = Arc::new(AtomicSpy::new());
+    let remote_provider = CountingRemoteProvider::with_key("remote-caller-encoding", 0x67);
+    let remote_journal = JournalFixture::new(0xa4);
+    let remote = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_spy),
+        Arc::clone(&remote_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_journal(remote_journal.open());
+    remote
+        .prepare_fenced_transition(create_request(70))
+        .await
+        .expect("prepare plaintext remote request");
+    let remote_envelope = remote_spy.prepared()[0]
+        .mutation()
+        .record()
+        .expect("physical record")
+        .payload
+        .clone();
+    let remote_capabilities = remote_spy.capability_calls();
+    let remote_preflights = remote_spy.preflight_calls();
+    for (id, payload) in [
+        (71, remote_envelope.clone()),
+        (72, EncryptedSessionPayload::legacy_plaintext([0x72])),
+        (73, EncryptedSessionPayload::unclassified([0x73])),
+    ] {
+        assert!(matches!(
+            remote
+                .prepare_fenced_transition(create_request_with_encoded_payload(id, payload.clone()))
+                .await,
+            Err(StoreError::CapabilityNotSupported(_))
+        ));
+        assert!(matches!(
+            remote
+                .prepare_fenced_transition(update_request_with_encoded_payload(id + 10, payload))
+                .await,
+            Err(StoreError::CapabilityNotSupported(_))
+        ));
+    }
+    assert_eq!(remote_provider.calls(), 1);
+    assert_eq!(remote_spy.capability_calls(), remote_capabilities);
+    assert_eq!(remote_spy.preflight_calls(), remote_preflights);
+    assert_eq!(remote_spy.prepared().len(), 1);
+    remote
+        .prepare_fenced_transition(delete_request(74))
+        .await
+        .expect("delete remains payload-free");
+    remote
+        .prepare_fenced_transition(refresh_request(75))
+        .await
+        .expect("refresh remains payload-free");
+    assert_eq!(remote_provider.calls(), 1);
+}
+
+#[tokio::test]
+async fn protected_fenced_transition_rejects_non_envelope_observations_before_provider_work() {
+    let local_spy = Arc::new(AtomicSpy::new());
+    let local_provider = CountingKeyProvider::with_key("local-observation-encoding", 0x68);
+    let local_journal = JournalFixture::new(0xa5);
+    let local = EncryptingSessionBackend::new(
+        Arc::clone(&local_spy),
+        Arc::clone(&local_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_journal(local_journal.open());
+    local
+        .prepare_fenced_transition(create_request(80))
+        .await
+        .expect("prepare local observation fixture");
+    let local_physical = local_spy.prepared()[0]
+        .mutation()
+        .record()
+        .expect("physical record")
+        .clone();
+    local_spy.set_observed(Some(local_physical.clone()));
+    assert_eq!(
+        local
+            .observe_fenced_transition(&key())
+            .await
+            .expect("envelope observation")
+            .record()
+            .expect("caller record")
+            .payload
+            .encoding(),
+        SessionPayloadEncoding::Plaintext
+    );
+    let local_calls = local_provider.calls();
+    for payload in [
+        EncryptedSessionPayload::new([0x81]),
+        EncryptedSessionPayload::legacy_plaintext([0x82]),
+        EncryptedSessionPayload::unclassified([0x83]),
+    ] {
+        let mut record = local_physical.clone();
+        record.payload = payload;
+        local_spy.set_observed(Some(record));
+        assert!(matches!(
+            local.observe_fenced_transition(&key()).await,
+            Err(StoreError::CapabilityNotSupported(_))
+        ));
+        assert_eq!(local_provider.calls(), local_calls);
+    }
+
+    let remote_spy = Arc::new(AtomicSpy::new());
+    let remote_provider = CountingRemoteProvider::with_key("remote-observation-encoding", 0x69);
+    let remote_journal = JournalFixture::new(0xa6);
+    let remote = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_spy),
+        Arc::clone(&remote_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_journal(remote_journal.open());
+    remote
+        .prepare_fenced_transition(create_request(90))
+        .await
+        .expect("prepare remote observation fixture");
+    let remote_physical = remote_spy.prepared()[0]
+        .mutation()
+        .record()
+        .expect("physical record")
+        .clone();
+    remote_spy.set_observed(Some(remote_physical.clone()));
+    assert_eq!(
+        remote
+            .observe_fenced_transition(&key())
+            .await
+            .expect("envelope observation")
+            .record()
+            .expect("caller record")
+            .payload
+            .encoding(),
+        SessionPayloadEncoding::Plaintext
+    );
+    let remote_calls = remote_provider.calls();
+    for payload in [
+        EncryptedSessionPayload::new([0x91]),
+        EncryptedSessionPayload::legacy_plaintext([0x92]),
+        EncryptedSessionPayload::unclassified([0x93]),
+    ] {
+        let mut record = remote_physical.clone();
+        record.payload = payload;
+        remote_spy.set_observed(Some(record));
+        assert!(matches!(
+            remote.observe_fenced_transition(&key()).await,
+            Err(StoreError::CapabilityNotSupported(_))
+        ));
+        assert_eq!(remote_provider.calls(), remote_calls);
+    }
+}
+
+#[tokio::test]
+async fn protected_fenced_transition_capability_withdrawal_blocks_atomic_actions_but_not_recovery()
+{
+    let local_spy = Arc::new(AtomicSpy::new());
+    let local_provider = CountingKeyProvider::with_key("local-withdrawal", 0x6a);
+    let local_journal = JournalFixture::new(0xa7);
+    let local_backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::from_arc(Arc::new(
+        EncryptingSessionBackend::new(
+            Arc::clone(&local_spy),
+            Arc::clone(&local_provider),
+            NAMESPACE,
+        )
+        .with_fenced_transition_journal(local_journal.open()),
+    )));
+    let local_token = local_backend
+        .prepare_fenced_transition(create_request(100))
+        .await
+        .expect("prepare local token");
+    let local_provider_calls = local_provider.calls();
+    let local_observations = local_spy.observation_calls();
+    local_spy.disable_capability();
+    assert!(matches!(
+        local_backend.observe_fenced_transition(&key()).await,
+        Err(StoreError::CapabilityNotSupported(_))
+    ));
+    assert!(matches!(
+        local_backend.fenced_transition(&local_token).await,
+        Err(FencedTransitionExecuteError::NotTransmitted)
+    ));
+    assert!(matches!(
+        local_backend.fenced_transition_status(&local_token).await,
+        Err(StoreError::CapabilityNotSupported(_))
+    ));
+    let recovered_local = match local_backend
+        .recover_prepared_fenced_transition(local_token.request_id())
+        .await
+        .expect("recover local token while capability is withdrawn")
+    {
+        PreparedFencedTransitionLookup::Found(prepared) => prepared,
+        PreparedFencedTransitionLookup::Absent => panic!("retained local token was lost"),
+    };
+    assert!(recovered_local.as_bytes() == local_token.as_bytes());
+    assert_eq!(local_provider.calls(), local_provider_calls);
+    assert_eq!(local_spy.observation_calls(), local_observations);
+    assert_eq!(local_spy.dispatches(), 0);
+    assert!(local_spy.statuses().is_empty());
+
+    let remote_spy = Arc::new(AtomicSpy::new());
+    let remote_provider = CountingRemoteProvider::with_key("remote-withdrawal", 0x6b);
+    let remote_journal = JournalFixture::new(0xa8);
+    let remote_backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::from_arc(Arc::new(
+        RemoteSealingSessionBackend::new(
+            Arc::clone(&remote_spy),
+            Arc::clone(&remote_provider),
+            NAMESPACE,
+        )
+        .with_fenced_transition_journal(remote_journal.open()),
+    )));
+    let remote_token = remote_backend
+        .prepare_fenced_transition(create_request(101))
+        .await
+        .expect("prepare remote token");
+    let remote_provider_calls = remote_provider.calls();
+    let remote_observations = remote_spy.observation_calls();
+    remote_spy.disable_capability();
+    assert!(matches!(
+        remote_backend.observe_fenced_transition(&key()).await,
+        Err(StoreError::CapabilityNotSupported(_))
+    ));
+    assert!(matches!(
+        remote_backend.fenced_transition(&remote_token).await,
+        Err(FencedTransitionExecuteError::NotTransmitted)
+    ));
+    assert!(matches!(
+        remote_backend.fenced_transition_status(&remote_token).await,
+        Err(StoreError::CapabilityNotSupported(_))
+    ));
+    let recovered_remote = match remote_backend
+        .recover_prepared_fenced_transition(remote_token.request_id())
+        .await
+        .expect("recover remote token while capability is withdrawn")
+    {
+        PreparedFencedTransitionLookup::Found(prepared) => prepared,
+        PreparedFencedTransitionLookup::Absent => panic!("retained remote token was lost"),
+    };
+    assert!(recovered_remote.as_bytes() == remote_token.as_bytes());
+    assert_eq!(remote_provider.calls(), remote_provider_calls);
+    assert_eq!(remote_spy.observation_calls(), remote_observations);
+    assert_eq!(remote_spy.dispatches(), 0);
+    assert!(remote_spy.statuses().is_empty());
 }
 
 #[tokio::test]

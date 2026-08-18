@@ -27,7 +27,7 @@ use crate::{
     fenced_transition_journal::PreparedFencedTransitionJournal,
     lease::{LeaseGuard, SessionLeaseManager},
     model::{FenceToken, Generation, OwnerId, SessionKey},
-    record::{EncryptedSessionPayload, StoredSessionRecord},
+    record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord},
     restore::{RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest},
     topology::{ReplicaId, ReplicaTlsIdentity},
     ttl::{
@@ -2053,6 +2053,37 @@ fn require_fenced_transition_journal(
     journal.ok_or_else(unsupported_protected_fenced_transition)
 }
 
+/// A protected V2 wrapper is the sole caller-to-physical payload boundary.
+/// Create and update bodies must therefore be the exact caller-facing
+/// plaintext representation before any capability, expiry, provider, inner,
+/// or journal work occurs.
+fn require_fenced_transition_caller_plaintext(
+    request: &FencedTransitionRequest,
+) -> Result<(), StoreError> {
+    if request
+        .mutation()
+        .record()
+        .is_none_or(|record| record.payload.encoding() == SessionPayloadEncoding::Plaintext)
+    {
+        Ok(())
+    } else {
+        Err(unsupported_protected_fenced_transition())
+    }
+}
+
+/// The inner V1 physical boundary may only return the sealed representation
+/// for a protected V2 observation. This intentionally does not reuse legacy
+/// migration decoding, which remains available on the general read surface.
+fn require_fenced_transition_physical_envelope(
+    record: Option<&StoredSessionRecord>,
+) -> Result<(), StoreError> {
+    if record.is_none_or(|record| record.payload.encoding() == SessionPayloadEncoding::EnvelopeV1) {
+        Ok(())
+    } else {
+        Err(unsupported_protected_fenced_transition())
+    }
+}
+
 fn require_fenced_transition_physical_boundary<B>(backend: &B) -> Result<(), StoreError>
 where
     B: SessionBackend + ?Sized,
@@ -2141,8 +2172,9 @@ where
         require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?
             .health_check()
             .await?;
-        require_fenced_transition_physical_boundary(self.inner.as_ref())?;
+        require_fenced_transition_capability(self.inner.as_ref()).await?;
         let observation = self.inner.observe_fenced_transition(key).await?;
+        require_fenced_transition_physical_envelope(observation.record())?;
         let record = self
             .decrypt_optional_record(observation.record().cloned())
             .await?;
@@ -2175,6 +2207,7 @@ where
         request: FencedTransitionRequest,
     ) -> Result<PreparedFencedTransition, StoreError> {
         request.validate()?;
+        require_fenced_transition_caller_plaintext(&request)?;
         let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
             .ok_or_else(unsupported_protected_fenced_transition)?;
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
@@ -2244,8 +2277,6 @@ where
         &self,
         prepared: &PreparedFencedTransition,
     ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
-        require_fenced_transition_physical_boundary(self.inner.as_ref())
-            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
             .ok_or_else(unsupported_protected_fenced_transition)
             .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
@@ -2263,6 +2294,9 @@ where
             .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         require_fenced_transition_physical_token(self.inner.as_ref(), &inner)
             .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        require_fenced_transition_capability(self.inner.as_ref())
+            .await
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         let request_id = stored.request_id();
         match self.inner.fenced_transition(&inner).await {
             Err(FencedTransitionExecuteError::OutcomeUnknown {
@@ -2278,7 +2312,6 @@ where
         &self,
         prepared: &PreparedFencedTransition,
     ) -> Result<FencedTransitionStatus, StoreError> {
-        require_fenced_transition_physical_boundary(self.inner.as_ref())?;
         let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
             .ok_or_else(unsupported_protected_fenced_transition)?;
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
@@ -2291,6 +2324,7 @@ where
                 scope_commitment,
             })?;
         require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+        require_fenced_transition_capability(self.inner.as_ref()).await?;
         self.inner.fenced_transition_status(&inner).await
     }
 
@@ -2775,8 +2809,9 @@ where
         require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?
             .health_check()
             .await?;
-        require_fenced_transition_physical_boundary(self.inner.as_ref())?;
+        require_fenced_transition_capability(self.inner.as_ref()).await?;
         let observation = self.inner.observe_fenced_transition(key).await?;
+        require_fenced_transition_physical_envelope(observation.record())?;
         let record = self
             .unseal_optional_record(observation.record().cloned())
             .await?;
@@ -2809,6 +2844,7 @@ where
         request: FencedTransitionRequest,
     ) -> Result<PreparedFencedTransition, StoreError> {
         request.validate()?;
+        require_fenced_transition_caller_plaintext(&request)?;
         let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
             .ok_or_else(unsupported_protected_fenced_transition)?;
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
@@ -2878,8 +2914,6 @@ where
         &self,
         prepared: &PreparedFencedTransition,
     ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
-        require_fenced_transition_physical_boundary(self.inner.as_ref())
-            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
             .ok_or_else(unsupported_protected_fenced_transition)
             .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
@@ -2897,6 +2931,9 @@ where
             .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         require_fenced_transition_physical_token(self.inner.as_ref(), &inner)
             .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        require_fenced_transition_capability(self.inner.as_ref())
+            .await
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
         let request_id = stored.request_id();
         match self.inner.fenced_transition(&inner).await {
             Err(FencedTransitionExecuteError::OutcomeUnknown {
@@ -2912,7 +2949,6 @@ where
         &self,
         prepared: &PreparedFencedTransition,
     ) -> Result<FencedTransitionStatus, StoreError> {
-        require_fenced_transition_physical_boundary(self.inner.as_ref())?;
         let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
             .ok_or_else(unsupported_protected_fenced_transition)?;
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
@@ -2925,6 +2961,7 @@ where
                 scope_commitment,
             })?;
         require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+        require_fenced_transition_capability(self.inner.as_ref()).await?;
         self.inner.fenced_transition_status(&inner).await
     }
 

@@ -33,8 +33,9 @@ use opc_session_store::{
     SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
     SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
     SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionOp, SessionOpResult, SessionQuorumConsumer,
-    StatelessSessionConsumer, StoreError, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    SessionConsumerStoreError, SessionOp, SessionOpResult, SessionPayloadEncoding,
+    SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use opc_types::SpiffeId;
 use serde::{Deserialize, Serialize};
@@ -1999,6 +2000,7 @@ fn response_matches_request(
         ) => observation.record().is_none_or(|record| {
             record.key == *key
                 && record.fence <= observation.current_fence()
+                && record.payload.encoding() == SessionPayloadEncoding::EnvelopeV1
                 && validate_stored_record_expiry_profile(record).is_ok()
         }),
         (
@@ -9279,17 +9281,17 @@ mod tests {
     use opc_session_store::{
         checked_session_deadline, BackendCapabilities, CompareAndSet, CompareAndSetResult,
         EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedTransitionExecuteError,
-        FencedTransitionLease, FencedTransitionMutation, FencedTransitionOutcome,
-        FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus, Generation,
-        LeaseGuard, OwnerId, PreparedFencedTransition, RestoreScanCursorProfile, RestoreScanPage,
-        RestoreScanRequest, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
-        SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
-        SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-        SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-        SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
-        SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
-        MAX_SESSION_TTL,
+        FencedTransitionLease, FencedTransitionMutation, FencedTransitionObservation,
+        FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
+        FencedTransitionStatus, Generation, LeaseGuard, OwnerId, PreparedFencedTransition,
+        RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, SessionConsensusClusterId,
+        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+        SessionConsensusIdentity, SessionConsumerBatchResult, SessionConsumerFencedTransitionError,
+        SessionConsumerFencedTransitionStatus, SessionConsumerLeaseError, SessionConsumerOperation,
+        SessionConsumerOutcomeUnknown, SessionConsumerRequest, SessionConsumerRequestId,
+        SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionKey,
+        SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType, StoreError,
+        StoredSessionRecord, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
@@ -10350,6 +10352,37 @@ mod tests {
             &get,
             &SessionConsumerResponse::Get(Ok(Some(invalid_record.clone()))),
         ));
+        let observe = SessionConsumerRequest::new(
+            scope(),
+            SessionConsumerRequestId::new(),
+            SessionConsumerOperation::ObserveFencedTransition { key: key.clone() },
+        );
+        for payload in [
+            EncryptedSessionPayload::new([0x41]),
+            EncryptedSessionPayload::legacy_plaintext([0x42]),
+            EncryptedSessionPayload::unclassified([0x43]),
+        ] {
+            let observation_record = StoredSessionRecord {
+                key: key.clone(),
+                generation: Generation::new(1),
+                owner: owner.clone(),
+                fence: lease.fence(),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::from_static("fenced-observation-encoding"),
+                expires_at: None,
+                payload,
+            };
+            let observation: FencedTransitionObservation =
+                serde_json::from_value(serde_json::json!({
+                    "record": observation_record,
+                    "current_fence": lease.fence(),
+                }))
+                .expect("valid fenced observation shape");
+            assert!(!response_matches_request(
+                &observe,
+                &SessionConsumerResponse::ObserveFencedTransition(Ok(observation)),
+            ));
+        }
         let cas = CompareAndSet {
             key: key.clone(),
             lease: lease.clone(),
