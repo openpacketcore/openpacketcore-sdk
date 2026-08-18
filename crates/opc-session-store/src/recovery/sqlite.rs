@@ -43,9 +43,9 @@ const FILE_IDENTITY_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file-ident
 const LOGICAL_STATE_DOMAIN: &[u8] = b"openpacketcore/session-recovery/logical-state/v1\0";
 const FILE_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file/v1\0";
 const WORKFLOW_VERSION: u16 = 2;
-// Six base SQLite objects plus sixteen bounded consensus/recovery tables.
+// Six base SQLite objects plus seventeen bounded consensus/recovery tables.
 // The sole bounded receipt-ledger index is validated separately below.
-const MAX_CURRENT_SCHEMA_OBJECTS: usize = 22;
+const MAX_CURRENT_SCHEMA_OBJECTS: usize = 23;
 const MAX_SCHEMA_SQL_BYTES: usize = 16_384;
 
 const LEGACY_LEASE_COLUMNS_WITH_ACQUIRED_AT: &[&str] = &[
@@ -393,7 +393,16 @@ fn inspect_current(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    if schema_version != i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) {
+    let expected_schema_version = match receipt_ledger_layout {
+        consensus::FencedTransitionReceiptLedgerLayout::Published684
+        | consensus::FencedTransitionReceiptLedgerLayout::Prepared => {
+            i64::from(SESSION_CONSENSUS_SCHEMA_VERSION)
+        }
+        consensus::FencedTransitionReceiptLedgerLayout::Activated => {
+            i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 1
+        }
+    };
+    if schema_version != expected_schema_version {
         return Err(RecoveryError::CorruptReplica);
     }
     let cluster: [u8; 32] = cluster
@@ -425,7 +434,7 @@ fn inspect_current(
         .map_err(|_| RecoveryError::CorruptReplica)?;
     validate_consensus_sealed_records(conn, budget)?;
     validate_legacy_lease_state(conn, budget)?;
-    if receipt_ledger_layout == consensus::FencedTransitionReceiptLedgerLayout::Activated {
+    if receipt_ledger_layout != consensus::FencedTransitionReceiptLedgerLayout::Published684 {
         consensus::validate_fenced_transition_receipts_sync(conn, storage_identity)
             .map_err(|_| RecoveryError::CorruptReplica)?;
     }
@@ -585,6 +594,27 @@ fn preflight_current_tables(
             FencedReceiptCommitmentColumns::Partial => {
                 return Err(RecoveryError::CorruptReplica);
             }
+        }
+    }
+    if table_exists(conn, "consensus_fenced_transition_activation")? {
+        let (count, maximum, total): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(MAX(length(scope_configuration_id), length(voter_set_digest))), 0), COALESCE(SUM(length(scope_configuration_id) + length(voter_set_digest)), 0) FROM consensus_fenced_transition_activation",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| inspection_sql_error(error, budget))?;
+        let count = u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
+        let maximum = u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?;
+        let total = u64::try_from(total).map_err(|_| RecoveryError::CorruptReplica)?;
+        total_bytes = total_bytes
+            .checked_add(total)
+            .ok_or(RecoveryError::WorkLimitExceeded)?;
+        if count > 1
+            || maximum > budget.limits.max_value_bytes()
+            || total_bytes > budget.limits.max_total_value_bytes()
+        {
+            return Err(RecoveryError::WorkLimitExceeded);
         }
     }
     if table_exists(conn, "consensus_operator_recovery")? {
@@ -814,6 +844,38 @@ fn hash_current_checkpoint(
     budget: &mut InspectionBudget,
     hasher: &mut Sha256,
 ) -> Result<(), RecoveryError> {
+    // Compatibility state is consensus evidence, not incidental SQLite
+    // layout.  In particular, two otherwise identical checkpoints whose V2
+    // activation certificate differs must never compare as one recoverable
+    // branch.
+    let receipt_layout = consensus::fenced_transition_receipt_ledger_layout_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    hasher.update(b"openpacketcore/session-recovery/fenced-transition-layout/v1\0");
+    // An exact #684 predecessor and an empty Prepared layout carry the same
+    // state-machine semantics: neither can serve V1 and a writable reopen
+    // may prepare the latter without a consensus command. Keep those
+    // checkpoints recoverably equivalent during a rolling upgrade. Activated
+    // is deliberately distinct because its schema fence rejects an old
+    // reader and its optional current-scope certificate changes V1 authority.
+    hasher.update(match receipt_layout {
+        consensus::FencedTransitionReceiptLedgerLayout::Published684
+        | consensus::FencedTransitionReceiptLedgerLayout::Prepared => [0],
+        consensus::FencedTransitionReceiptLedgerLayout::Activated => [1],
+    });
+    let schema_version: i64 = conn
+        .query_row(
+            "SELECT schema_version FROM consensus_identity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    hasher.update(schema_version.to_be_bytes());
+    if receipt_layout == consensus::FencedTransitionReceiptLedgerLayout::Activated
+        && table_exists(conn, "consensus_fenced_transition_activation")?
+    {
+        let query = "SELECT * FROM consensus_fenced_transition_activation ORDER BY singleton";
+        hash_query_rows_with_identity(conn, query, query, budget, hasher)?;
+    }
     let records_query =
         "SELECT * FROM session_records ORDER BY tenant, nf_kind, key_type, stable_id";
     hash_query_rows_with_identity(conn, records_query, records_query, budget, hasher)?;
@@ -1130,10 +1192,9 @@ fn validate_exact_recovery_schema(
     conn: &Connection,
     require_recovery_table: bool,
 ) -> Result<(), RecoveryError> {
-    if consensus::fenced_transition_receipt_ledger_layout_sync(conn)
-        .map_err(|_| RecoveryError::CorruptReplica)?
-        == consensus::FencedTransitionReceiptLedgerLayout::Published684
-    {
+    let receipt_ledger_layout = consensus::fenced_transition_receipt_ledger_layout_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if receipt_ledger_layout == consensus::FencedTransitionReceiptLedgerLayout::Published684 {
         // The classifier compared the complete released manifest.  Its absent
         // ledger is canonically an empty ledger for recovery hashing, while a
         // marker-bearing database can never take this path.
@@ -1173,6 +1234,9 @@ fn validate_exact_recovery_schema(
         .ok_or(RecoveryError::DatabaseUnavailable)?;
     let canonical_fenced_receipts = expected
         .remove("consensus_fenced_transition_receipts")
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
+    let canonical_fenced_activation = expected
+        .remove("consensus_fenced_transition_activation")
         .ok_or(RecoveryError::DatabaseUnavailable)?;
     expected
         .remove("restore_scan_state")
@@ -1263,6 +1327,17 @@ fn validate_exact_recovery_schema(
         // The receipt ledger is an additive tombstone table. Pre-ledger
         // replicas are inspected as an empty ledger and upgrade on reopen.
         None => {}
+    }
+    match observed.remove("consensus_fenced_transition_activation") {
+        Some(sql) if sql == canonical_fenced_activation => {}
+        Some(_) => return Err(RecoveryError::CorruptReplica),
+        // This is unreachable for a correctly-classified markerless #684
+        // replica because it returned above. Keep the layout branch explicit:
+        // recovery inspection must never turn a read-only predecessor into a
+        // V2-shaped database merely to validate its manifest.
+        None if receipt_ledger_layout
+            == consensus::FencedTransitionReceiptLedgerLayout::Published684 => {}
+        None => return Err(RecoveryError::CorruptReplica),
     }
     if observed != expected {
         return Err(RecoveryError::CorruptReplica);
@@ -4380,14 +4455,29 @@ mod terminal_history_digest_tests {
     }
 
     #[test]
-    fn empty_fenced_receipt_ledger_preserves_the_legacy_recovery_digest() {
+    fn fenced_transition_activation_state_contributes_to_recovery_digest() {
         let missing_ledger = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
             .expect("canonical database");
-        let empty_ledger = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+        let prepared_ledger = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
             .expect("canonical database");
-        let populated_ledger = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+        let activated_empty = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
             .expect("canonical database");
-        for conn in [&missing_ledger, &empty_ledger, &populated_ledger] {
+        let activated_certificate_a =
+            crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+                .expect("canonical database");
+        let activated_certificate_b =
+            crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+                .expect("canonical database");
+        let activated_receipt = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .expect("canonical database");
+        for conn in [
+            &missing_ledger,
+            &prepared_ledger,
+            &activated_empty,
+            &activated_certificate_a,
+            &activated_certificate_b,
+            &activated_receipt,
+        ] {
             consensus::install_recovery_validation_schema_sync(conn, false)
                 .expect("install consensus schema");
             conn.execute(
@@ -4404,12 +4494,37 @@ mod terminal_history_digest_tests {
             .execute_batch(
                 r#"
                 DROP TABLE consensus_fenced_transition_receipts;
+                DROP TABLE consensus_fenced_transition_activation;
                 ALTER TABLE consensus_identity
                 DROP COLUMN fenced_transition_receipt_ledger_activated;
                 "#,
             )
             .expect("restore published #684 receipt shape");
-        populated_ledger
+        validate_exact_recovery_schema(&missing_ledger, false)
+            .expect("exact markerless #684 remains inspection-compatible");
+        for conn in [
+            &activated_empty,
+            &activated_certificate_a,
+            &activated_certificate_b,
+            &activated_receipt,
+        ] {
+            conn.execute(
+                "UPDATE consensus_identity SET schema_version = ?1, fenced_transition_receipt_ledger_activated = 1 WHERE singleton = 1",
+                [i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 1],
+            )
+            .expect("form activated fixture");
+        }
+        for (conn, digest) in [
+            (&activated_certificate_a, [0x56_u8; 32]),
+            (&activated_certificate_b, [0x57_u8; 32]),
+        ] {
+            conn.execute(
+                "INSERT INTO consensus_fenced_transition_activation (singleton, storage_configuration_epoch, scope_configuration_id, scope_configuration_epoch, voter_set_digest) VALUES (1, 1, ?1, 1, ?2)",
+                rusqlite::params![[0x53_u8; 32].as_slice(), digest.as_slice()],
+            )
+            .expect("insert activated certificate fixture");
+        }
+        activated_receipt
             .execute(
                 "INSERT INTO consensus_fenced_transition_receipts (request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, 1, ?2, ?3, ?4, NULL, NULL)",
                 rusqlite::params![
@@ -4423,12 +4538,22 @@ mod terminal_history_digest_tests {
 
         assert_eq!(
             current_checkpoint_digest(&missing_ledger),
-            current_checkpoint_digest(&empty_ledger),
-            "a present-but-empty additive ledger must preserve the pre-ledger digest",
+            current_checkpoint_digest(&prepared_ledger),
+            "an empty Prepared layout remains recovery-equivalent to exact #684",
         );
         assert_ne!(
-            current_checkpoint_digest(&empty_ledger),
-            current_checkpoint_digest(&populated_ledger),
+            current_checkpoint_digest(&prepared_ledger),
+            current_checkpoint_digest(&activated_empty),
+            "the activated schema fence is distinct even without a certificate",
+        );
+        assert_ne!(
+            current_checkpoint_digest(&activated_certificate_a),
+            current_checkpoint_digest(&activated_certificate_b),
+            "different activated certificates are distinct recovery evidence",
+        );
+        assert_ne!(
+            current_checkpoint_digest(&activated_empty),
+            current_checkpoint_digest(&activated_receipt),
             "a durable request binding must contribute to recovery branch evidence",
         );
     }

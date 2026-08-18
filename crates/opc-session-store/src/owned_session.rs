@@ -425,6 +425,9 @@ impl OwnedSessionMutationError {
             StoreError::FencedTransitionRetentionExhausted => Self::StoreRejected {
                 code: "fenced-transition-retention-exhausted",
             },
+            StoreError::FencedTransitionStorageExhausted => Self::StoreRejected {
+                code: "fenced-transition-storage-exhausted",
+            },
             StoreError::BackendOperationOutcomeUnavailable => Self::StoreRejected {
                 code: "backend-operation-outcome-unavailable",
             },
@@ -740,6 +743,17 @@ mod tests {
         assert_eq!(
             OwnedSessionMutationError::from_store_error(StoreError::TopologyAuthorityRevoked),
             OwnedSessionMutationError::LeaseLost
+        );
+    }
+
+    #[test]
+    fn fenced_transition_storage_exhaustion_has_a_fixed_safe_error_code() {
+        assert_eq!(
+            OwnedSessionMutationError::from_store_error(
+                StoreError::FencedTransitionStorageExhausted
+            )
+            .code(),
+            "fenced-transition-storage-exhausted"
         );
     }
 }

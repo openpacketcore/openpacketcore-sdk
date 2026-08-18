@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use opc_consensus::{
-    derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
-    DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+    decode_bounded, derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch,
+    ConsensusIdentity, DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
@@ -18,26 +18,27 @@ use opc_key::{
     AES_256_GCM_SIV_NONCE_LEN,
 };
 use opc_session_store::{
-    Clock, CompareAndSet, CompareAndSetResult, ConsensusSessionStore, DurableReadinessReport,
-    DurableReadinessScope, DurableReadinessState, DurableRecoveryState, EncryptedSessionPayload,
-    EncryptingSessionBackend, FenceToken, FencedTransitionLease, FencedTransitionMutation,
-    FencedTransitionMutationResult, FencedTransitionRequest, FencedTransitionRequestId,
-    FencedTransitionStatus, Generation, LeaseError, ObservedPhysicalNodeIdentity, OwnerId,
-    QuorumReplicaDescriptor, QuorumTopologyAttestor, QuorumTopologyConfig, ReplicaBackingIdentity,
-    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationOp,
-    RestoreScanRequest, SessionBackend, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
-    SessionLeaseManager, SessionOp, SessionPayloadEncoding, SessionStorePlatformProfile,
-    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord, SystemClock,
-    TopologyAttestationClaims, TopologyAttestationEvidence, TopologyAttestationPolicy,
-    TopologyAttestationProvenance, TopologyAttestationResult, TopologyAttestationTime,
-    TopologyAttestationVerificationError, TopologyAttestationVerificationInput,
-    TopologyCollectorId, ValidatedQuorumTopology, VerifiedQuorumTopologyAttestation,
-    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    AtomicFencedTransitionCapability, Clock, CompareAndSet, CompareAndSetResult,
+    ConsensusSessionStore, DurableReadinessReport, DurableReadinessScope, DurableReadinessState,
+    DurableRecoveryState, EncryptedSessionPayload, EncryptingSessionBackend, FenceToken,
+    FencedTransitionLease, FencedTransitionMutation, FencedTransitionMutationResult,
+    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus, Generation,
+    LeaseError, ObservedPhysicalNodeIdentity, OwnerId, QuorumReplicaDescriptor,
+    QuorumTopologyAttestor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationOp, RestoreScanRequest,
+    SessionBackend, SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionPayloadEncoding, SessionStorePlatformProfile, SqliteSessionBackend, StateClass,
+    StateType, StoreError, StoredSessionRecord, SystemClock, TopologyAttestationClaims,
+    TopologyAttestationEvidence, TopologyAttestationPolicy, TopologyAttestationProvenance,
+    TopologyAttestationResult, TopologyAttestationTime, TopologyAttestationVerificationError,
+    TopologyAttestationVerificationInput, TopologyCollectorId, ValidatedQuorumTopology,
+    VerifiedQuorumTopologyAttestation, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use rusqlite::OptionalExtension;
+use serde::Deserialize;
 use tempfile::TempDir;
 
 const MEMBER_COUNT: usize = 3;
@@ -88,7 +89,6 @@ struct LoopbackPeer {
     target: SessionConsensusNodeId,
     handler: Arc<StdRwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
-    read_barrier_supported: Arc<AtomicBool>,
     forward_mutation_calls: Arc<AtomicUsize>,
     forward_responses_to_drop: Arc<AtomicUsize>,
     dropped_forward_responses: Arc<AtomicUsize>,
@@ -107,7 +107,6 @@ impl LoopbackPeer {
             target,
             handler: Arc::new(StdRwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
-            read_barrier_supported: Arc::new(AtomicBool::new(true)),
             forward_mutation_calls: Arc::new(AtomicUsize::new(0)),
             forward_responses_to_drop: Arc::new(AtomicUsize::new(0)),
             dropped_forward_responses: Arc::new(AtomicUsize::new(0)),
@@ -134,11 +133,6 @@ impl LoopbackPeer {
 
     fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::SeqCst);
-    }
-
-    fn set_read_barrier_supported(&self, supported: bool) {
-        self.read_barrier_supported
-            .store(supported, Ordering::SeqCst);
     }
 
     fn forward_mutation_calls(&self) -> usize {
@@ -241,26 +235,37 @@ impl fmt::Debug for LoopbackPeer {
     }
 }
 
-/// Simulates a same-identity peer restarted with an older implementation that
-/// rejects the new capability probe while leaving the RPC identity unchanged.
-struct RejectReadBarrierHandler {
+/// Test-only probe shape matching the V1 capability request. It lets the
+/// shim below reject precisely that new request while preserving ordinary
+/// linearizable read barriers and all current Raft traffic.
+#[derive(Deserialize)]
+struct FencedTransitionCapabilityProbeV1 {
+    schema_version: u16,
+}
+
+struct RejectFencedTransitionCapabilityProbeHandler {
     inner: Arc<dyn SessionConsensusRpcHandler>,
 }
 
-impl fmt::Debug for RejectReadBarrierHandler {
+impl fmt::Debug for RejectFencedTransitionCapabilityProbeHandler {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("RejectReadBarrierHandler(<redacted>)")
+        formatter.write_str("RejectFencedTransitionCapabilityProbeHandler(<redacted>)")
     }
 }
 
 #[async_trait]
-impl SessionConsensusRpcHandler for RejectReadBarrierHandler {
+impl SessionConsensusRpcHandler for RejectFencedTransitionCapabilityProbeHandler {
     async fn handle(
         &self,
         authenticated_sender: SessionConsensusNodeId,
         request: SessionConsensusWireRequest,
     ) -> SessionConsensusWireResponse {
-        if request.family == SessionConsensusRpcFamily::ReadBarrier {
+        if request.family == SessionConsensusRpcFamily::ReadBarrier
+            && matches!(
+                decode_bounded::<FencedTransitionCapabilityProbeV1>(&request.payload),
+                Ok(FencedTransitionCapabilityProbeV1 { schema_version: 1 })
+            )
+        {
             return SessionConsensusWireResponse {
                 result: Err(SessionConsensusPeerError::Protocol),
             };
@@ -285,12 +290,6 @@ impl SessionConsensusPeer for LoopbackPeer {
         if request.family == SessionConsensusRpcFamily::ForwardMutation {
             self.forward_mutation_calls.fetch_add(1, Ordering::SeqCst);
         }
-        if request.family == SessionConsensusRpcFamily::ReadBarrier
-            && !self.read_barrier_supported.load(Ordering::SeqCst)
-        {
-            return Err(SessionConsensusPeerError::Protocol);
-        }
-
         let rpc_delay = self.rpc_delay_millis.load(Ordering::SeqCst);
         if rpc_delay != 0 {
             self.delayed_calls.fetch_add(1, Ordering::SeqCst);
@@ -796,18 +795,11 @@ impl TestCluster {
             .sum()
     }
 
-    fn set_read_barrier_supported(&self, source: usize, target: usize, supported: bool) {
+    fn reject_fenced_transition_capability_probe(&self, source: usize, target: usize) {
         self.paths
             .get(&(source, target))
             .expect("outbound path")
-            .set_read_barrier_supported(supported);
-    }
-
-    fn restart_same_node_id_with_old_read_barrier(&self, source: usize, target: usize) {
-        self.paths
-            .get(&(source, target))
-            .expect("outbound path")
-            .install(Arc::new(RejectReadBarrierHandler {
+            .install(Arc::new(RejectFencedTransitionCapabilityProbeHandler {
                 inner: self.stores[target].rpc_handler(),
             }));
     }
@@ -3910,18 +3902,28 @@ async fn fenced_transition_preproposal_partition_leaves_no_receipt_or_fence() {
         .max_replication_sequence()
         .await
         .expect("read application head before preproposal fault");
+    let forwards_before = cluster.forward_mutation_calls(source);
 
-    // The isolated follower cannot complete the fresh unanimous compatibility
-    // probe, so it fails before transmitting ForwardMutation to the leader.
+    // Observation established only a fresh live-voter proof, not a durable
+    // activation. Once this follower is isolated it cannot re-establish the
+    // required linearizable admission, so it must fail before ForwardMutation.
     cluster.isolate(source);
     let rejected = store.fenced_transition(request.clone()).await;
     assert!(
-        matches!(
+        matches!(rejected.as_ref(), Err(StoreError::BackendUnavailable(_))),
+        "an unactivated isolated source is definitely rejected before transmission"
+    );
+    assert!(
+        !matches!(
             rejected.as_ref(),
-            Err(StoreError::CapabilityNotSupported(capability))
-                if capability == "atomic_fenced_transition_v1"
+            Err(StoreError::FencedTransitionOutcomeUnknown)
         ),
-        "a request stopped before transmission is a definite capability failure"
+        "a pre-transmission activation failure is never an ambiguous outcome"
+    );
+    assert_eq!(
+        cluster.forward_mutation_calls(source),
+        forwards_before,
+        "an unactivated isolated source never sends ForwardMutation"
     );
 
     cluster.heal(source);
@@ -3955,80 +3957,88 @@ async fn fenced_transition_preproposal_partition_leaves_no_receipt_or_fence() {
 }
 
 #[tokio::test]
-async fn fenced_transition_reprobes_after_same_node_id_restart_and_never_forwards() {
+async fn fenced_transition_durable_activation_avoids_reprobe_on_rejecting_peer_path() {
     let cluster = TestCluster::start().await;
     let (leader, _, _) = cluster.observed_leader();
     let source = (leader + 1) % MEMBER_COUNT;
     let store = &cluster.stores[source];
 
-    let first_key = session_key(b"fenced-transition-capability-proof-before-downgrade");
-    let first_observation = store
-        .observe_fenced_transition(&first_key)
+    let activation_key = session_key(b"fenced-transition-activation-before-rejected-probe");
+    let activation_observation = store
+        .observe_fenced_transition(&activation_key)
         .await
-        .expect("observe first transition key");
-    let (first_request, _) = fenced_acquire_create_request(
-        first_key,
-        owner("fenced-transition-capability-owner"),
-        first_observation.current_fence(),
+        .expect("observe the activating transition key");
+    let (activation_request, _) = fenced_acquire_create_request(
+        activation_key,
+        owner("fenced-transition-activation-owner"),
+        activation_observation.current_fence(),
         [0x60; 16],
         Duration::from_secs(30),
-        b"sealed-fenced-transition-capability-before-downgrade",
+        b"sealed-fenced-transition-activation-before-rejected-probe",
     );
     store
-        .fenced_transition(first_request)
+        .fenced_transition(activation_request)
         .await
-        .expect("establish a successful compatibility proof");
+        .expect("commit the first transition and durable activation");
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("all live voters apply durable activation");
 
-    let rejected_key = session_key(b"fenced-transition-capability-after-downgrade");
-    let rejected_observation = store
-        .observe_fenced_transition(&rejected_key)
+    // This precise shim is not an old binary: it rejects only a new V1 probe,
+    // while ordinary barriers, forwarding, and Raft append traffic stay live.
+    // A later operation must use the durable activation rather than probing it.
+    cluster.reject_fenced_transition_capability_probe(source, leader);
+    assert!(
+        matches!(
+            store
+                .fenced_transition_capability()
+                .await
+                .expect("durable activation avoids the rejected capability-probe path"),
+            Some(AtomicFencedTransitionCapability::V1)
+        ),
+        "a durably activated scope advertises V1 without a fresh peer probe"
+    );
+
+    let second_key = session_key(b"fenced-transition-after-rejected-probe");
+    let second_observation = store
+        .observe_fenced_transition(&second_key)
         .await
-        .expect("observe rejected transition key before downgrade");
-    let (rejected_request, _) = fenced_acquire_create_request(
-        rejected_key.clone(),
-        owner("fenced-transition-capability-owner"),
-        rejected_observation.current_fence(),
+        .expect("observe a post-activation transition key");
+    let (second_request, second_expected) = fenced_acquire_create_request(
+        second_key.clone(),
+        owner("fenced-transition-activation-owner"),
+        second_observation.current_fence(),
         [0x5f; 16],
         Duration::from_secs(30),
-        b"sealed-fenced-transition-capability-after-downgrade",
+        b"sealed-fenced-transition-after-rejected-probe",
     );
     let forwards_before = cluster.forward_mutation_calls(source);
-
-    // This path previously completed the probe and the forwarded commit. Swap
-    // the leader's handler on this same node-ID path for an old implementation
-    // that rejects the probe: an earlier process's proof must not be cached.
-    cluster.restart_same_node_id_with_old_read_barrier(source, leader);
-    let rejected = store.fenced_transition(rejected_request.clone()).await;
-    assert!(
-        matches!(
-            rejected,
-            Err(StoreError::CapabilityNotSupported(capability))
-                if capability == "atomic_fenced_transition_v1"
-        ),
-        "a fresh incompatible peer response fails closed"
-    );
-    assert_eq!(
-        cluster.forward_mutation_calls(source),
-        forwards_before,
-        "the follower must establish fresh compatibility before forwarding"
-    );
-
-    cluster.restore_current_rpc_handler(source, leader);
-    assert!(
-        matches!(
-            store.fenced_transition_status(&rejected_request).await,
-            Ok(FencedTransitionStatus::NotFound)
-        ),
-        "the rejected request leaves no durable receipt"
-    );
-    let after = store
-        .observe_fenced_transition(&rejected_key)
+    let second = store
+        .fenced_transition(second_request.clone())
         .await
-        .expect("observe rejected key after restoring compatibility");
+        .expect("post-activation transition succeeds through the rejecting probe path");
     assert!(
-        after.record().is_none() && after.current_fence() == rejected_observation.current_fence(),
-        "the rejected request leaves neither a record nor a fence effect"
+        matches!(second.mutation(), FencedTransitionMutationResult::Created),
+        "the activated path commits one fresh record"
     );
+    assert!(
+        cluster.forward_mutation_calls(source) > forwards_before,
+        "the activated follower forwards normally through the current implementation"
+    );
+    assert!(
+        matches!(store.get(&second_key).await, Ok(Some(record)) if record == second_expected),
+        "the post-activation transition leaves its expected record"
+    );
+    assert!(
+        matches!(
+            store.fenced_transition_status(&second_request).await,
+            Ok(FencedTransitionStatus::Recorded(result))
+                if matches!(result.as_ref(), Ok(recorded) if recorded == &second)
+        ),
+        "the post-activation transition retains its exact result"
+    );
+    cluster.restore_current_rpc_handler(source, leader);
 }
 
 #[tokio::test]
@@ -4052,10 +4062,10 @@ async fn fenced_transition_new_follower_rejects_old_leader_before_forwarding() {
     );
     let forwards_before = cluster.forward_mutation_calls(source);
 
-    // The source has not previously submitted this primitive. Its current
-    // leader now behaves as an old implementation, so local capability
-    // preflight must fail before the forwarding write boundary is crossed.
-    cluster.set_read_barrier_supported(source, leader, false);
+    // The source has not activated this scope. Its leader rejects only the
+    // V1 capability probe while still serving ordinary read barriers, so a
+    // fresh all-voter proof must fail before the forwarding boundary.
+    cluster.reject_fenced_transition_capability_probe(source, leader);
     let rejected = store.fenced_transition(request).await;
     assert!(
         matches!(
@@ -4237,6 +4247,10 @@ async fn fenced_transition_leader_transfer_preserves_exact_replay_on_surviving_v
                 if matches!(ops.as_slice(), [ReplicationOp::AcquireLease { .. }, ReplicationOp::CompareAndSet { .. }])),
         "the committed transition has one atomic watch effect before failover"
     );
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("all live voters apply the durable activation before failover");
 
     cluster.isolate(old_leader);
     let recovery_deadline = tokio::time::Instant::now() + RECOVERY_TIMEOUT;
@@ -4265,6 +4279,16 @@ async fn fenced_transition_leader_transfer_preserves_exact_replay_on_surviving_v
     assert!(new_leader_id != old_leader_id && new_term > old_term);
 
     let survivor = &cluster.stores[survivors[0]];
+    assert!(
+        matches!(
+            survivor
+                .fenced_transition_capability()
+                .await
+                .expect("surviving quorum advertises the durably activated capability"),
+            Some(AtomicFencedTransitionCapability::V1)
+        ),
+        "one unavailable minority does not prevent a durably activated scope from advertising V1"
+    );
     let status = survivor
         .fenced_transition_status(&request)
         .await
@@ -4274,22 +4298,60 @@ async fn fenced_transition_leader_transfer_preserves_exact_replay_on_surviving_v
             if matches!(result.as_ref(), Ok(recorded) if recorded == &committed)),
         "leader transfer preserves the exact recorded result"
     );
-    let unavailable_replay = survivor.fenced_transition(request.clone()).await;
+    let replay = survivor
+        .fenced_transition(request.clone())
+        .await
+        .expect("surviving quorum replays the exact committed result after durable activation");
     assert!(
-        matches!(
-            unavailable_replay,
-            Err(StoreError::CapabilityNotSupported(capability))
-                if capability == "atomic_fenced_transition_v1"
-        ),
-        "a missing configured voter prevents a fresh whole-scope compatibility proof"
+        replay == committed,
+        "exact replay returns the original outcome while the old leader remains unavailable"
     );
     assert!(
         survivor
             .max_replication_sequence()
             .await
-            .expect("read surviving application head after failed proof")
+            .expect("read surviving application head after exact replay")
             == before + 1,
-        "failed compatibility proof does not add an application effect"
+        "exact replay through a surviving activated quorum does not add an application effect"
+    );
+    assert!(
+        tokio::time::timeout(OPERATION_TIMEOUT, watch.next())
+            .await
+            .is_err(),
+        "exact replay through a surviving activated quorum emits no second watch effect"
+    );
+
+    let fresh_key = session_key(b"fenced-transition-leader-transfer-after-activation");
+    let fresh_observation = survivor
+        .observe_fenced_transition(&fresh_key)
+        .await
+        .expect("surviving quorum observes a fresh transition after failover");
+    let (fresh_request, fresh_expected) = fenced_acquire_create_request(
+        fresh_key.clone(),
+        owner("fenced-transition-transfer-survivor-owner"),
+        fresh_observation.current_fence(),
+        [0x64; 16],
+        Duration::from_secs(30),
+        b"sealed-fenced-transition-transfer-after-activation",
+    );
+    let fresh = survivor
+        .fenced_transition(fresh_request)
+        .await
+        .expect("surviving activated quorum commits a fresh transition");
+    assert!(
+        matches!(fresh.mutation(), FencedTransitionMutationResult::Created),
+        "the surviving activated quorum remains available for a fresh transition"
+    );
+    let fresh_watched = tokio::time::timeout(RECOVERY_TIMEOUT, watch.next())
+        .await
+        .expect("fresh watch entry arrives within the recovery bound")
+        .expect("fresh watch remains open")
+        .expect("fresh watch entry succeeds");
+    assert!(
+        fresh_watched.sequence == before + 2
+            && matches!(&fresh_watched.op, ReplicationOp::Batch { ops }
+                if matches!(ops.as_slice(), [ReplicationOp::AcquireLease { .. }, ReplicationOp::CompareAndSet { .. }])),
+        "the fresh surviving-quorum transition has exactly one atomic watch effect"
     );
 
     cluster.heal(old_leader);
@@ -4310,12 +4372,16 @@ async fn fenced_transition_leader_transfer_preserves_exact_replay_on_surviving_v
         "the surviving voter retains the committed record"
     );
     assert!(
+        matches!(survivor.get(&fresh_key).await, Ok(Some(record)) if record == fresh_expected),
+        "the healed cluster retains the fresh surviving-quorum record"
+    );
+    assert!(
         survivor
             .max_replication_sequence()
             .await
             .expect("read surviving application head after replay")
-            == before + 1,
-        "leader transfer and exact replay do not add a second application effect"
+            == before + 2,
+        "leader transfer, exact replay, and recovery retain exactly the two committed applications"
     );
 }
 

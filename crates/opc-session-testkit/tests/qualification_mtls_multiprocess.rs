@@ -22,20 +22,25 @@ use opc_identity::{
     build_identity_state, parse_certs_pem, parse_key_pem, IdentityState, TrustBundle,
     TrustBundleSet, TrustDomain,
 };
+use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_session_net::{
     ConnectionLifecyclePolicy, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
     RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId, SessionConfigurationEpoch,
     SessionConfigurationGeneration, SessionConsumerClientError, SessionConsumerLeaseMutationError,
     SessionReplicationManifest, StatelessSessionConsumerClient, DEFAULT_MAX_AUTHENTICATION_AGE,
     DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW,
-    DEFAULT_ROTATION_JITTER,
+    DEFAULT_ROTATION_JITTER, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
-    BackendCapabilities, LeaseGuard, OwnerId, QuorumReplicaDescriptor, ReplicaBackingIdentity,
-    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusWireRequest,
-    SessionConsumerOperation, SessionConsumerRequest, SessionConsumerRequestId,
-    SessionConsumerResponse, SessionConsumerScope, SessionKey, SessionKeyType,
+    AtomicFencedTransitionCapability, BackendCapabilities, EncryptedSessionPayload, FenceToken,
+    FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
+    FencedTransitionRequestId, Generation, LeaseGuard, OwnerId, QuorumReplicaDescriptor,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
+    SessionConsensusWireRequest, SessionConsumerFencedTransitionError,
+    SessionConsumerFencedTransitionStatus, SessionConsumerOperation, SessionConsumerRequest,
+    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope, SessionKey,
+    SessionKeyType, StateClass, StateType, StoredSessionRecord,
 };
 use opc_session_testkit::qualification::{
     qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
@@ -44,25 +49,20 @@ use opc_session_testkit::qualification::{
     QualificationConnectionLifecycleConfig, QualificationConnectionLifecycleMetrics,
     QualificationConsensusRpcAvailability, QualificationMember, QualificationNodeCommand,
     QualificationNodeCommandKind, QualificationNodeConfig, QualificationNodeErrorCode,
-    QualificationNodeReply, QualificationPeerRouting, QualificationPersistentConsumerCoverageV7,
-    QualificationPersistentConsumerExecutionV7, QualificationPersistentConsumerObservationsV7,
-    QualificationPersistentConsumerPrivacyV7, QualificationPersistentConsumerRemainingAcceptanceV7,
-    QualificationPersistentConsumerTopologyV7, QualificationPersistentConsumerWarmLatencyV7,
-    QualificationProjectedMtlsConfig, QualificationProjectedSvidAvailability,
-    QualificationProjectedSvidReason, QualificationProjectedSvidStatus, QualificationReadinessCode,
+    QualificationNodeReply, QualificationPeerRouting, QualificationProjectedMtlsConfig,
+    QualificationProjectedSvidAvailability, QualificationProjectedSvidReason,
+    QualificationProjectedSvidStatus, QualificationReadinessCode,
     QualificationSecurityMetricsSnapshot, QualificationTlsMaterialAvailability,
     QualificationTlsMaterialReason, QualificationTlsMaterialStatus, QualificationTrafficErrorClass,
     QualificationTrafficFailureCode, QualificationTrafficFailureStage, QualificationTrafficState,
-    QualificationTrafficStatus, QualificationTransportConfig,
-    SessionHaPersistentConsumerEvidenceV7, SessionHaQualificationProfileV7,
-    SessionMtlsCandidateCampaign, SessionMtlsCandidateEvidenceV2,
-    SessionMtlsCandidateSourceTreeStatus, QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS,
-    QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER, QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS,
-    QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, QUALIFICATION_FAULT_PATH_REFRESH_MILLIS,
-    QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
-    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE,
-    QUALIFICATION_NODE_SCHEMA_VERSION, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
-    QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7,
+    QualificationTrafficStatus, QualificationTransportConfig, SessionMtlsCandidateCampaign,
+    SessionMtlsCandidateEvidenceV2, SessionMtlsCandidateSourceTreeStatus,
+    QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER,
+    QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS, QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
+    QUALIFICATION_FAULT_PATH_REFRESH_MILLIS, QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS,
+    QUALIFICATION_INBOUND_CONNECTION_SLOTS, QUALIFICATION_MAX_CONFIG_BYTES,
+    QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE, QUALIFICATION_NODE_SCHEMA_VERSION,
+    QUALIFICATION_OPERATION_TIMEOUT_MILLIS, QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7,
     QUALIFICATION_RESOLVER_BACKOFF_LOWER_BOUNDS_MILLIS, QUALIFICATION_RESOLVER_PROOF_MILLIS,
     QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE, QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE,
     QUALIFICATION_RESOURCE_SAMPLE_MILLIS, QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB,
@@ -92,8 +92,9 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS,
-    QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS, SESSION_HA_EVIDENCE_V7_SCHEMA_JSON,
-    SESSION_HA_PROFILE_V7_JSON, SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
+    QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
+    SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON,
+    SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
 };
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SanType};
@@ -8143,6 +8144,55 @@ fn stateless_consumer_key(index: usize) -> SessionKey {
     }
 }
 
+fn qualification_fenced_transition_key(index: usize) -> SessionKey {
+    SessionKey {
+        tenant: TenantId::new("session-ha-qualification")
+            .expect("qualification fenced-transition tenant"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from(format!("opaque-fenced-transition-{index}"))
+            .try_into()
+            .expect("bounded opaque fenced-transition key"),
+    }
+}
+
+async fn qualification_fenced_transition_record(
+    member_count: usize,
+    key: SessionKey,
+    owner: OwnerId,
+    fence: FenceToken,
+    payload: &'static [u8],
+) -> StoredSessionRecord {
+    let mut record = StoredSessionRecord {
+        key,
+        generation: Generation::new(1),
+        owner,
+        fence,
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("qualification-fenced-transition"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new(payload),
+    };
+    let provider = MemoryKeyProvider::new();
+    provider
+        .insert_active_key(
+            KeyId::new("session-ha-qualification-key-v1")
+                .expect("qualification fenced-transition key ID"),
+            KeyPurpose::Session,
+            record.key.tenant.clone(),
+            Zeroizing::new([0x5a; AES_256_GCM_SIV_KEY_LEN]),
+        )
+        .expect("install qualification fenced-transition key");
+    record.payload = EncryptedSessionPayload::encrypt(
+        &provider,
+        &record,
+        &format!("qualification-mtls-{member_count}-cluster"),
+    )
+    .await
+    .expect("seal opaque qualification fenced-transition payload");
+    record
+}
+
 #[derive(Clone, Copy)]
 enum ConsumerQualificationMode {
     Stateless,
@@ -8234,7 +8284,6 @@ impl QualificationConsumerClient {
 }
 
 struct PersistentConsumerRunMeasurements {
-    raw_samples_micros: Vec<u64>,
     authenticated_setup_successes: u64,
     warm_reused_calls: u64,
 }
@@ -8343,17 +8392,10 @@ fn run_consumer_multiprocess_qualification(
             "twelve persistent clients prewarm four authenticated lanes each"
         );
 
-        let mut raw_samples_micros =
-            Vec::with_capacity(QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7);
         for sample in 0..QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7 {
-            let started = Instant::now();
             runtime
                 .block_on(clients[sample % clients.len()].capabilities())
                 .expect("warm persistent capability call");
-            raw_samples_micros.push(
-                u64::try_from(started.elapsed().as_micros())
-                    .expect("bounded warm-call duration fits u64"),
-            );
         }
         let after = runtime.block_on(async {
             futures_util::future::join_all(
@@ -8376,7 +8418,6 @@ fn run_consumer_multiprocess_qualification(
             "every measured warm call reuses authenticated capacity"
         );
         Some(PersistentConsumerRunMeasurements {
-            raw_samples_micros,
             authenticated_setup_successes: setup_successes,
             warm_reused_calls,
         })
@@ -8421,6 +8462,163 @@ fn run_consumer_multiprocess_qualification(
     assert!(
         recovered_known_response == known_response,
         "a known durable consumer success must be recoverable by its retained request ID"
+    );
+
+    let first_atomic_key = qualification_fenced_transition_key(0);
+    let first_atomic_capability = runtime
+        .block_on(clients[1].execute(SessionConsumerRequest::new(
+            scope,
+            SessionConsumerRequestId::from_bytes([0x60; 16]),
+            SessionConsumerOperation::FencedTransitionCapability,
+        )))
+        .expect("atomic transition capability response");
+    assert_eq!(
+        first_atomic_capability,
+        SessionConsumerResponse::FencedTransitionCapability(Ok(
+            AtomicFencedTransitionCapability::V1
+        )),
+        "all admitted voters must prove the exact V1 transition capability"
+    );
+    let first_atomic_observation = runtime
+        .block_on(clients[1].execute(SessionConsumerRequest::new(
+            scope,
+            SessionConsumerRequestId::from_bytes([0x61; 16]),
+            SessionConsumerOperation::ObserveFencedTransition {
+                key: first_atomic_key.clone(),
+            },
+        )))
+        .expect("fresh atomic transition observation response");
+    let first_atomic_fence = match first_atomic_observation {
+        SessionConsumerResponse::ObserveFencedTransition(Ok(observation)) => {
+            assert!(
+                observation.record().is_none(),
+                "a fresh atomic transition key must have no record"
+            );
+            assert_eq!(
+                observation.current_fence(),
+                FenceToken::new(0),
+                "a fresh atomic transition key must expose its zero fence floor"
+            );
+            observation.current_fence()
+        }
+        _ => panic!("fresh atomic transition observation must be typed and successful"),
+    };
+    let first_atomic_id_bytes = [0x62; 16];
+    let first_atomic_id = FencedTransitionRequestId::from_bytes(first_atomic_id_bytes);
+    let first_atomic_owner =
+        OwnerId::new("qualification-atomic-owner").expect("atomic transition owner");
+    let first_atomic_lease = FencedTransitionLease::acquire(
+        first_atomic_key.clone(),
+        first_atomic_owner.clone(),
+        first_atomic_fence,
+        Duration::from_secs(30),
+    )
+    .expect("build first atomic acquire action");
+    let first_atomic_record = runtime.block_on(qualification_fenced_transition_record(
+        member_count,
+        first_atomic_key.clone(),
+        first_atomic_owner.clone(),
+        first_atomic_lease
+            .committed_fence()
+            .expect("derive first committed fence"),
+        b"opaque-qualification-fenced-transition-one",
+    ));
+    assert_eq!(first_atomic_record.generation, Generation::new(1));
+    assert_eq!(
+        first_atomic_record.fence,
+        FenceToken::new(first_atomic_fence.get() + 1),
+        "the first atomic record must bind the observed fence successor"
+    );
+    let first_atomic_transition = FencedTransitionRequest::new(
+        first_atomic_id,
+        first_atomic_lease,
+        FencedTransitionMutation::create(first_atomic_record.clone()),
+    )
+    .expect("build first atomic create transition");
+    assert_eq!(
+        first_atomic_transition.request_id().as_bytes(),
+        &first_atomic_id_bytes,
+        "the nested atomic transition ID must retain the caller bytes"
+    );
+    let first_atomic_request = SessionConsumerRequest::new(
+        scope,
+        SessionConsumerRequestId::from_bytes(first_atomic_id_bytes),
+        SessionConsumerOperation::FencedTransition {
+            request: Box::new(first_atomic_transition.clone()),
+        },
+    );
+    assert_eq!(
+        first_atomic_request.request_id().as_bytes(),
+        first_atomic_transition.request_id().as_bytes(),
+        "the public and nested atomic transition IDs must be byte-identical"
+    );
+    let first_atomic_outcome = match runtime
+        .block_on(clients[1].execute(first_atomic_request.clone()))
+        .expect("first atomic transition response")
+    {
+        SessionConsumerResponse::FencedTransition(Ok(outcome)) => {
+            assert!(
+                outcome.matches_request(&first_atomic_transition),
+                "the atomic transition outcome must exactly match its request"
+            );
+            outcome
+        }
+        _ => panic!("first atomic transition must return a typed success"),
+    };
+    assert_eq!(
+        runtime
+            .block_on(clients[1].execute(first_atomic_request.clone()))
+            .expect("first atomic transition replay response"),
+        SessionConsumerResponse::FencedTransition(Ok(first_atomic_outcome.clone())),
+        "the exact atomic transition replay must return its recorded outcome"
+    );
+    let conflicting_atomic_lease = FencedTransitionLease::acquire(
+        first_atomic_key.clone(),
+        first_atomic_owner.clone(),
+        first_atomic_fence,
+        Duration::from_secs(31),
+    )
+    .expect("build conflicting atomic acquire action");
+    let conflicting_atomic_transition = FencedTransitionRequest::new(
+        first_atomic_id,
+        conflicting_atomic_lease,
+        FencedTransitionMutation::create(first_atomic_record.clone()),
+    )
+    .expect("build conflicting atomic transition");
+    assert!(
+        matches!(
+            runtime
+                .block_on(clients[1].execute(SessionConsumerRequest::new(
+                    scope,
+                    SessionConsumerRequestId::from_bytes(first_atomic_id_bytes),
+                    SessionConsumerOperation::FencedTransition {
+                        request: Box::new(conflicting_atomic_transition),
+                    },
+                )))
+                .expect("conflicting atomic transition response"),
+            SessionConsumerResponse::FencedTransition(Err(
+                SessionConsumerFencedTransitionError::RequestConflict
+            ))
+        ),
+        "a different atomic body under one retained ID must be a typed conflict"
+    );
+    let first_atomic_status_request = SessionConsumerRequest::new(
+        scope,
+        SessionConsumerRequestId::from_bytes(first_atomic_id_bytes),
+        SessionConsumerOperation::FencedTransitionStatus {
+            request: Box::new(first_atomic_transition.clone()),
+        },
+    );
+    assert_eq!(
+        runtime
+            .block_on(clients[1].execute(first_atomic_status_request.clone()))
+            .expect("first atomic transition status response"),
+        SessionConsumerResponse::FencedTransitionStatus(Ok(
+            SessionConsumerFencedTransitionStatus::Recorded(Box::new(Ok(
+                first_atomic_outcome.clone()
+            )))
+        )),
+        "the first atomic transition status must retain the original success"
     );
 
     // Keep the consumer outcome proof and the leader-loss proof distinct. A
@@ -8495,7 +8693,7 @@ fn run_consumer_multiprocess_qualification(
         .collect::<Vec<_>>();
     let leader_loss_deadline = Instant::now() + STATELESS_CONSUMER_LEADER_RECOVERY_TIMEOUT;
     let mut previous_replacement = None;
-    loop {
+    let replacement_reports = loop {
         let reports = fleet.readiness_reports(&leader_survivors);
         let replacement = reports.first().and_then(|report| report.leader_id);
         let coherent_replacement = replacement.is_some_and(|leader| leader != old_leader_id)
@@ -8510,7 +8708,7 @@ fn run_consumer_multiprocess_qualification(
             });
         let replacement_signature = coherent_replacement.then_some((replacement, reports[0].term));
         if replacement_signature.is_some() && replacement_signature == previous_replacement {
-            break;
+            break reports;
         }
         previous_replacement = replacement_signature;
         assert!(
@@ -8519,13 +8717,180 @@ fn run_consumer_multiprocess_qualification(
             mode.name(),
         );
         thread::sleep(Duration::from_millis(50));
-    }
-    let leader_survivor_client = clients
+    };
+    let replacement_leader_node_index = replacement_reports
         .iter()
-        .enumerate()
-        .find(|(index, _)| index % member_count != leader_node_index)
-        .map(|(_, client)| client)
-        .expect("consumer client on a surviving voter");
+        .find_map(|report| {
+            report
+                .leader_id
+                .filter(|leader| *leader == report.node_id)
+                .map(|_| report.node_index)
+        })
+        .expect("coherent replacement leader");
+    // Status identities are deliberately namespaced by the authenticated
+    // consumer, independently of the server endpoint. Build a fresh transport
+    // to the replacement leader with the same identity that submitted the
+    // first transition; using an arbitrary endpoint-local client here would
+    // correctly query a different receipt namespace and return NotFound.
+    let (replacement_identity_source, replacement_identity_receiver) = watch::channel(Some(
+        fleet.pki.consumer_identity_state(&consumer_identities[1]),
+    ));
+    let replacement_tls = TlsConfigBuilder::new(replacement_identity_receiver)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("replacement-leader consumer mTLS configuration");
+    let replacement_stateless = StatelessSessionConsumerClient::new(
+        endpoints[replacement_leader_node_index],
+        rustls_pki_types::ServerName::IpAddress(
+            endpoints[replacement_leader_node_index].ip().into(),
+        ),
+        SpiffeId::new(spiffe_id(replacement_leader_node_index))
+            .expect("replacement-leader consumer server identity"),
+        scope,
+        replacement_tls,
+    );
+    let leader_survivor_client = match mode {
+        ConsumerQualificationMode::Stateless => {
+            QualificationConsumerClient::Stateless(Box::new(replacement_stateless))
+        }
+        ConsumerQualificationMode::Persistent => QualificationConsumerClient::Persistent(
+            PersistentSessionConsumerClient::try_from_stateless(
+                replacement_stateless,
+                PersistentSessionConsumerConfig::default(),
+            )
+            .expect("replacement-leader persistent consumer configuration"),
+        ),
+    };
+    assert!(
+        runtime
+            .block_on(leader_survivor_client.prewarm())
+            .is_ok_and(|ready| ready),
+        "the same authenticated consumer must establish replacement-leader transport"
+    );
+    assert_eq!(
+        runtime
+            .block_on(leader_survivor_client.execute(first_atomic_status_request))
+            .expect("recovered atomic transition status response"),
+        SessionConsumerResponse::FencedTransitionStatus(Ok(
+            SessionConsumerFencedTransitionStatus::Recorded(Box::new(Ok(
+                first_atomic_outcome.clone()
+            )))
+        )),
+        "the replacement leader must recover the exact prior atomic outcome"
+    );
+    assert_eq!(
+        runtime
+            .block_on(leader_survivor_client.execute(SessionConsumerRequest::new(
+                scope,
+                SessionConsumerRequestId::from_bytes([0x63; 16]),
+                SessionConsumerOperation::Get {
+                    key: first_atomic_key.clone(),
+                },
+            )))
+            .expect("recovered atomic record response"),
+        SessionConsumerResponse::Get(Ok(Some(first_atomic_record.clone()))),
+        "the replacement leader must read the created atomic record"
+    );
+
+    let second_atomic_key = qualification_fenced_transition_key(1);
+    let second_atomic_fence = match runtime
+        .block_on(leader_survivor_client.execute(SessionConsumerRequest::new(
+            scope,
+            SessionConsumerRequestId::from_bytes([0x64; 16]),
+            SessionConsumerOperation::ObserveFencedTransition {
+                key: second_atomic_key.clone(),
+            },
+        )))
+        .expect("second fresh atomic observation response")
+    {
+        SessionConsumerResponse::ObserveFencedTransition(Ok(observation)) => {
+            assert!(
+                observation.record().is_none() && observation.current_fence() == FenceToken::new(0),
+                "the replacement leader must observe a fresh atomic key"
+            );
+            observation.current_fence()
+        }
+        _ => panic!("second fresh atomic observation must be typed and successful"),
+    };
+    let second_atomic_id_bytes = [0x65; 16];
+    let second_atomic_id = FencedTransitionRequestId::from_bytes(second_atomic_id_bytes);
+    let second_atomic_owner =
+        OwnerId::new("qualification-atomic-failover-owner").expect("failover atomic owner");
+    let second_atomic_lease = FencedTransitionLease::acquire(
+        second_atomic_key.clone(),
+        second_atomic_owner.clone(),
+        second_atomic_fence,
+        Duration::from_secs(30),
+    )
+    .expect("build second atomic acquire action");
+    let second_atomic_record = runtime.block_on(qualification_fenced_transition_record(
+        member_count,
+        second_atomic_key.clone(),
+        second_atomic_owner,
+        second_atomic_lease
+            .committed_fence()
+            .expect("derive second committed fence"),
+        b"opaque-qualification-fenced-transition-two",
+    ));
+    assert_eq!(second_atomic_record.generation, Generation::new(1));
+    assert_eq!(
+        second_atomic_record.fence,
+        FenceToken::new(second_atomic_fence.get() + 1),
+        "the failover atomic record must bind the observed fence successor"
+    );
+    let second_atomic_transition = FencedTransitionRequest::new(
+        second_atomic_id,
+        second_atomic_lease,
+        FencedTransitionMutation::create(second_atomic_record),
+    )
+    .expect("build second atomic create transition");
+    let second_atomic_request = SessionConsumerRequest::new(
+        scope,
+        SessionConsumerRequestId::from_bytes(second_atomic_id_bytes),
+        SessionConsumerOperation::FencedTransition {
+            request: Box::new(second_atomic_transition.clone()),
+        },
+    );
+    assert_eq!(
+        second_atomic_request.request_id().as_bytes(),
+        second_atomic_transition.request_id().as_bytes(),
+        "the failover public and nested transition IDs must be byte-identical"
+    );
+    let second_atomic_outcome = match runtime
+        .block_on(leader_survivor_client.execute(second_atomic_request.clone()))
+        .expect("second atomic transition response")
+    {
+        SessionConsumerResponse::FencedTransition(Ok(outcome)) => {
+            assert!(
+                outcome.matches_request(&second_atomic_transition),
+                "the replacement-leader atomic outcome must exactly match its request"
+            );
+            outcome
+        }
+        _ => panic!("replacement leader must return a typed atomic success"),
+    };
+    assert_eq!(
+        runtime
+            .block_on(leader_survivor_client.execute(second_atomic_request))
+            .expect("second atomic transition replay response"),
+        SessionConsumerResponse::FencedTransition(Ok(second_atomic_outcome.clone())),
+        "the replacement leader must replay the second atomic outcome"
+    );
+    assert_eq!(
+        runtime
+            .block_on(leader_survivor_client.execute(SessionConsumerRequest::new(
+                scope,
+                SessionConsumerRequestId::from_bytes(second_atomic_id_bytes),
+                SessionConsumerOperation::FencedTransitionStatus {
+                    request: Box::new(second_atomic_transition),
+                },
+            )))
+            .expect("second atomic transition status response"),
+        SessionConsumerResponse::FencedTransitionStatus(Ok(
+            SessionConsumerFencedTransitionStatus::Recorded(Box::new(Ok(second_atomic_outcome)))
+        )),
+        "the replacement leader must retain the second atomic success"
+    );
     let leader_failover_request_id = SessionConsumerRequestId::from_bytes([0x51; 16]);
     let leader_failover_key = stateless_consumer_key(2);
     let leader_failover_owner = OwnerId::new("qualification-leader-failover-owner")
@@ -8661,8 +9026,10 @@ fn run_consumer_multiprocess_qualification(
             for client in &clients {
                 client.shutdown().await;
             }
+            leader_survivor_client.shutdown().await;
         });
     }
+    drop(replacement_identity_source);
     drop(identity_sources);
     fleet.shutdown();
     persistent_measurements
@@ -8676,24 +9043,14 @@ fn run_stateless_consumer_multiprocess_qualification(member_count: usize) {
     .is_none());
 }
 
-fn assert_v7_persistent_consumer_evidence_binding() {
-    const PROFILE_SHA256: &str =
-        "sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7";
-    assert_eq!(
-        format!(
-            "{:x}",
-            Sha256::digest(SESSION_HA_PROFILE_V7_JSON.as_bytes())
-        ),
-        PROFILE_SHA256.trim_start_matches("sha256:"),
-        "persistent multiprocess coverage must use the exact embedded v7 profile"
-    );
-
+fn assert_current_persistent_consumer_head_evidence_binding() {
     let evidence_schema: serde_json::Value =
-        serde_json::from_str(SESSION_HA_EVIDENCE_V7_SCHEMA_JSON)
-            .expect("v7 persistent-consumer evidence schema");
+        serde_json::from_str(SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON)
+            .expect("v8 current-head persistent-consumer evidence schema");
     assert_eq!(
-        evidence_schema["properties"]["execution"]["properties"]["profile_sha256"]["const"],
-        PROFILE_SHA256
+        evidence_schema["properties"]["execution"]["properties"]["transport_revision"]["const"],
+        serde_json::json!(SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION),
+        "the current-head schema must change with the compiled consumer wire revision"
     );
     assert_eq!(
         evidence_schema["properties"]["execution"]["properties"]["client_type"]["const"],
@@ -8702,11 +9059,6 @@ fn assert_v7_persistent_consumer_evidence_binding() {
     assert_eq!(
         evidence_schema["properties"]["execution"]["properties"]["consumer_profile_path"]["const"],
         "protocol.persistent_consumer"
-    );
-    assert_eq!(
-        evidence_schema["properties"]["warm_latency"]["properties"]["raw_samples_micros"]
-            ["minItems"],
-        QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7
     );
 }
 
@@ -8720,17 +9072,6 @@ fn exact_git_value(arguments: &[&str]) -> String {
     assert!(output.status.success(), "git source inspection succeeds");
     let value = String::from_utf8(output.stdout).expect("git output is UTF-8");
     value.trim().to_owned()
-}
-
-fn nearest_rank_micros(samples: &[u64], numerator: usize, denominator: usize) -> u64 {
-    let mut sorted = samples.to_vec();
-    sorted.sort_unstable();
-    let index = samples
-        .len()
-        .saturating_mul(numerator)
-        .div_ceil(denominator)
-        .saturating_sub(1);
-    sorted[index]
 }
 
 fn structural_evidence_schema(mut schema: serde_json::Value) -> serde_json::Value {
@@ -8753,124 +9094,60 @@ fn structural_evidence_schema(mut schema: serde_json::Value) -> serde_json::Valu
     schema
 }
 
-fn emit_v7_persistent_consumer_evidence(
+fn emit_current_persistent_consumer_head_evidence(
     member_count: usize,
     measurements: PersistentConsumerRunMeasurements,
 ) {
-    const PROFILE_SHA256: &str =
-        "sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7";
     let (source_revision, source_status, _) =
-        candidate_source_provenance().expect("capture bounded v7 source provenance");
+        candidate_source_provenance().expect("capture bounded current-head source provenance");
     let source_tree = exact_git_value(&["rev-parse", "HEAD^{tree}"]);
     let source_tree_status = match source_status {
         SessionMtlsCandidateSourceTreeStatus::Clean => "clean",
         SessionMtlsCandidateSourceTreeStatus::DirtyUnqualified => "dirty_unqualified",
     };
-    let p99_micros = nearest_rank_micros(&measurements.raw_samples_micros, 99, 100);
-    let p999_micros = nearest_rank_micros(&measurements.raw_samples_micros, 999, 1_000);
-
-    let topology_coverage = if member_count == 3 {
-        QualificationPersistentConsumerCoverageV7::ThreeVoterLatency
-    } else {
-        QualificationPersistentConsumerCoverageV7::FiveVoterComposition
-    };
-    let mut evidence = SessionHaPersistentConsumerEvidenceV7 {
-        schema_version: "opc-session-ha-evidence/v7".into(),
-        profile_id: "opc-session-openraft-ha/v7".into(),
-        experimental: true,
-        qualification_complete: false,
-        source_revision,
-        source_tree,
-        source_tree_status: source_tree_status.into(),
-        execution: QualificationPersistentConsumerExecutionV7 {
-            profile_sha256: PROFILE_SHA256.into(),
-            transcript_digest_domain: "opc-session-ha/persistent-consumer-run/v1".into(),
-            transcript_sha256: String::new(),
-            client_type: "PersistentSessionConsumerClient".into(),
-            consumer_profile_path: "protocol.persistent_consumer".into(),
-            transport_revision: 2,
-            authenticated_route: "authenticated-mtls-persistent".into(),
+    let evidence = serde_json::json!({
+        "schema_version": "opc-session-ha-persistent-consumer-head-evidence/v8",
+        "evidence_kind": "persistent-consumer-wire-binding",
+        "experimental": true,
+        "qualification_complete": false,
+        "source_revision": source_revision,
+        "source_tree": source_tree,
+        "source_tree_status": source_tree_status,
+        "execution": {
+            "client_type": "PersistentSessionConsumerClient",
+            "consumer_profile_path": "protocol.persistent_consumer",
+            "transport_revision": SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+            "authenticated_route": "authenticated-mtls-persistent"
         },
-        topology: QualificationPersistentConsumerTopologyV7 {
-            members: member_count,
-            independent_processes: true,
-            transport_mode: "authenticated-mtls-persistent".into(),
-            configured_clients: 12,
-            prewarmed_clients: 12,
+        "measurements": {
+            "members": member_count,
+            "authenticated_setup_successes": measurements.authenticated_setup_successes,
+            "warm_reused_calls": measurements.warm_reused_calls
         },
-        observations: QualificationPersistentConsumerObservationsV7 {
-            authenticated_setup_successes: measurements.authenticated_setup_successes,
-            warm_reused_calls: measurements.warm_reused_calls,
-            exact_request_id_recovery: true,
-            leader_loss_recovery: true,
-            voter_loss_recovery: true,
-            outcome_unknown_recovery: true,
-        },
-        warm_latency: QualificationPersistentConsumerWarmLatencyV7 {
-            methodology: "sequential-capabilities-round-robin-after-prewarm".into(),
-            clock: "std::time::Instant".into(),
-            sample_count: measurements.raw_samples_micros.len(),
-            raw_samples_micros: measurements.raw_samples_micros,
-            p99_micros,
-            p999_micros,
-            claim_boundary: "sdk-loopback-real-mtls-synthetic-not-epdg-production-slo".into(),
-        },
-        privacy: QualificationPersistentConsumerPrivacyV7 {
-            fixed_labels_only: true,
-            identifying_values_recorded: false,
-        },
-        coverage: [
-            QualificationPersistentConsumerCoverageV7::PersistentPrewarm,
-            QualificationPersistentConsumerCoverageV7::WarmConnectionReuse,
-            QualificationPersistentConsumerCoverageV7::RealMtls,
-            QualificationPersistentConsumerCoverageV7::MultiProcess,
-            topology_coverage,
-            QualificationPersistentConsumerCoverageV7::LeaderLoss,
-            QualificationPersistentConsumerCoverageV7::VoterLoss,
-        ],
-        remaining_acceptance: [
-            QualificationPersistentConsumerRemainingAcceptanceV7::DownstreamEpdgProductionSlo,
-            QualificationPersistentConsumerRemainingAcceptanceV7::DeployedKubernetesPlatformMatrix,
-            QualificationPersistentConsumerRemainingAcceptanceV7::ResourceSoak,
-            QualificationPersistentConsumerRemainingAcceptanceV7::SignedReleaseBundle,
-        ],
-    };
-    evidence.execution.transcript_sha256 = evidence
-        .canonical_transcript_sha256()
-        .expect("bounded canonical transcript encodes");
-    evidence
-        .validate(PROFILE_SHA256)
-        .expect("typed persistent-consumer evidence validates");
-    let schema: serde_json::Value = serde_json::from_str(SESSION_HA_EVIDENCE_V7_SCHEMA_JSON)
-        .expect("v7 evidence schema parses");
-    let value = serde_json::to_value(&evidence).expect("v7 evidence encodes");
-    opc_schema_validate::validate(&structural_evidence_schema(schema), &value)
-        .expect("emitted persistent-consumer evidence satisfies the closed v7 schema");
+        "privacy": {
+            "fixed_labels_only": true,
+            "identifying_values_recorded": false
+        }
+    });
+    let schema: serde_json::Value =
+        serde_json::from_str(SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON)
+            .expect("v8 current-head evidence schema parses");
+    opc_schema_validate::validate(&structural_evidence_schema(schema), &evidence)
+        .expect("emitted persistent-consumer evidence satisfies the current-head schema");
     println!(
-        "V7_PERSISTENT_CONSUMER_EVIDENCE {}",
+        "V8_PERSISTENT_CONSUMER_HEAD_EVIDENCE {}",
         serde_json::to_string(&evidence).expect("bounded evidence encodes")
     );
 }
 
 fn run_persistent_consumer_multiprocess_qualification(member_count: usize) {
-    assert_v7_persistent_consumer_evidence_binding();
-    let profile: SessionHaQualificationProfileV7 = serde_json::from_str(SESSION_HA_PROFILE_V7_JSON)
-        .expect("revision-2 persistent consumer qualification profile");
-    assert_eq!(profile.schema_version, "opc-session-ha-profile/v7");
-    assert_eq!(profile.profile_id, "opc-session-openraft-ha/v7");
-    assert_eq!(profile.protocol.persistent_consumer.transport_revision, 2);
-    assert_eq!(
-        profile
-            .persistent_consumer_thresholds
-            .minimum_warm_call_samples,
-        QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7
-    );
+    assert_current_persistent_consumer_head_evidence_binding();
     let measurements = run_consumer_multiprocess_qualification(
         member_count,
         ConsumerQualificationMode::Persistent,
     )
     .expect("persistent run emits bounded measurements");
-    emit_v7_persistent_consumer_evidence(member_count, measurements);
+    emit_current_persistent_consumer_head_evidence(member_count, measurements);
 }
 
 #[test]

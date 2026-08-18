@@ -69,6 +69,11 @@ pub const SESSION_HA_EVIDENCE_V6_SCHEMA_JSON: &str =
 /// Closed v7 evidence schema bound only to the v7 persistent-consumer profile.
 pub const SESSION_HA_EVIDENCE_V7_SCHEMA_JSON: &str =
     include_str!("../qualification/v7/session-ha-evidence.schema.json");
+/// Current exact-head evidence schema for the live persistent-consumer wire
+/// revision. This is intentionally distinct from frozen profile/evidence
+/// revisions and therefore cannot attest to the closed v7 contract.
+pub const SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON: &str =
+    include_str!("../qualification/v8/session-ha-persistent-consumer-head-evidence.schema.json");
 /// Backward-compatible alias for the frozen v6 evidence schema.
 pub const SESSION_HA_EVIDENCE_SCHEMA_JSON: &str = SESSION_HA_EVIDENCE_V6_SCHEMA_JSON;
 /// Closed schema for one bounded concurrent batch/watch/restore/readiness

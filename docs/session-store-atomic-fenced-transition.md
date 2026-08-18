@@ -22,14 +22,33 @@ user mutation again.
 
 Only a store that proves `AtomicFencedTransitionCapability::V1` for the exact
 current consensus voter scope may advertise or execute this primitive.
-Each transition proposal obtains a fresh point-in-time proof instead of using a
-capability cache. A voter that is unsupported, incompatible, mixed-version, or
-unreachable while that proof is collected makes admission fail closed with
+Before V1 is activated for that exact scope, capability, observation, and
+status access, and admission of the first transition, require a fresh
+authenticated V1 reply from **every** exact voter. A Raft quorum is not a
+mixed-version proof: an unavailable or incompatible voter fails that
+pre-activation access closed with
 `StoreError::CapabilityNotSupported("atomic_fenced_transition_v1")` or the
-applicable availability error. Once all voters have answered and the exact
-scope has been rechecked, the proposal uses ordinary Raft quorum fault
-tolerance; a later process crash cannot retroactively invalidate completed
-admission. Legacy capability bits are insufficient evidence.
+applicable availability error. Legacy capability bits are insufficient
+evidence.
+
+The first authorized transition after that unanimous proof carries the current
+scope identity and canonical voter-set commitment inside the same single user
+transition command, log position, and state-machine application as its receipt,
+lease action, and record effect. Apply atomically installs those effects, the
+receipt binding, a one-way persistent schema-version downgrade fence, and, when
+the scope needs one, its single-row exact-current-scope activation certificate.
+It adds no separate user mutation or log position. These proof and commitment
+fields are internal durable admission state, not public consumer-wire
+semantics.
+
+Once that command commits, ordinary linearizable Raft quorum availability is
+sufficient for capability, observation, execution, and status in the certified
+scope; leader loss or a minority outage does not re-trigger an every-voter
+probe. A topology cutover deletes the old scope certificate but retains the
+one-way activated schema fence and all receipt bindings. The successor scope
+therefore needs a new every-voter proof and a first activating or recovery
+transition, while a stable request ID and body can still recover its retained
+receipt across the rollover.
 
 ## Lease and mutation rules
 
@@ -53,18 +72,36 @@ not derive or trust a caller-supplied timestamp. Such a legacy guard remains
 safe to expire or be superseded, but renew, release, and fenced mutation fail
 closed as stale until authority is reacquired. New acquisition, replication,
 snapshot, and recovery paths preserve the exact normalized timestamp.
-The exact published #684 database and snapshot shapes also have no fenced
-receipt ledger; their bounded compatibility path introduces it empty and sets
-a one-way local activation marker in the same transaction. After activation,
-a missing, weak, partial, or malformed receipt ledger is corruption and is
-never reconstructed. Main-database open and read-only recovery accept no other
-markerless layout. Snapshot installation additionally recognizes the exact
-older Dynamic-consensus snapshot manifest that predates the #684 authority
-columns, lease-acquisition timestamp, and fenced receipt ledger. That exception
-is attached-snapshot-only, requires every historical schema product to match
-exactly, and supplies only the same empty predecessor ledger classification; it
-cannot reopen an old main database, weaken Fixed authority, or erase a local
-receipt binding. Every near-miss or hybrid markerless layout fails closed.
+The exact published #684 database and snapshot shapes have no fenced receipt
+ledger. A current writable open may add the exact empty ledger, activation
+table, and zero marker as the Prepared layout while retaining the predecessor
+schema version; no V1 receipt or authority exists yet, and an exact predecessor
+reader remains safe. The first authorized activating command changes that
+Prepared layout to Activated by installing the persistent higher schema fence,
+the exact-scope certificate, and the first receipt atomically with its user
+effect. After activation, a missing, weak, partial, or malformed fence or
+receipt ledger is corruption and is never reconstructed. The certificate is
+either the single exact-current-scope row or, only after a legitimate topology
+cutover, absent while the successor scope awaits its new unanimous proof;
+same-scope erasure, substitution, or malformed certificate state is corruption.
+Main-database open and read-only recovery preserve this state; an exact
+predecessor binary rejects the higher schema fence rather than silently reading
+an activated database.
+
+Snapshot installation additionally recognizes the exact older
+Dynamic-consensus snapshot manifest that predates the #684 authority columns,
+lease-acquisition timestamp, and fenced receipt ledger. That exception is
+attached-snapshot-only, requires every historical schema product to match
+exactly, and supplies only the same empty Prepared classification. It cannot
+reopen an old main database, weaken Fixed authority, regress Activated to
+Prepared, erase a receipt binding, omit the activated fence, or erase or
+substitute a same-scope certificate. A legitimately unactivated successor
+scope may have no certificate until its new proof and activating transition.
+Every near-miss or hybrid layout fails closed. An offline pre-V1 minority is
+not safe to catch up merely because it did not acknowledge the activating
+command: an old reader could otherwise silently omit new snapshot state. The
+persistent schema fence makes that follower reject the activated image until it
+is compatible.
 
 The mutation is exactly one of the following:
 
@@ -201,6 +238,26 @@ respectively:
   no longer representable; or
 - `NotFound` when no binding existed at that status barrier.
 
+`FencedTransitionStorageExhausted` is a retained, body-bound deterministic
+no-effect result. It is returned only after ordinary stale-fence, CAS, and
+lease admission has established that the transition would otherwise succeed.
+The SQLite representability check covers the requested generation and fence,
+the exact acquire fence successor and global successor, credential allocation,
+the application and watch sequences, and the restore-scan revision. While
+retained, the same ID and complete body exactly replays
+`Recorded(Err(StorageExhausted))` and status returns that same recorded error;
+a different body remains a conflict.
+No lease, record, fence, watch, restore, or ordinary mutation effect occurs.
+Existing fenced receipts and generic-ID conflicts, `HistoryFull`, and
+`RetentionExhausted` retain precedence, and revoked authority masks all of
+these storage states.
+
+At the maximum application sequence, the result intentionally binds using the
+current nonzero application sequence and digest, advances only logical time,
+the applied pointer, and the receipt, and leaves the watch sequence unchanged.
+Later blank or membership entries may still apply; this condition does not
+promise that generic normal mutations remain available.
+
 `NotFound` is not proof that an earlier delayed proposal cannot commit later.
 Only an explicit submission of the identical ID and complete body is
 idempotency-safe: it may create the first binding, replay or expire an existing
@@ -214,8 +271,10 @@ infer an unknown outcome from local intent, continue writes under an uncertain
 lease, or derive a next mutation until they have an authoritative observation.
 A post-retention history must likewise be re-derived from current authoritative
 state under a fresh ID; the old transition is never revived. The consumer wire
-contract deliberately has no new capacity or retention-horizon variant until
-issue #695 negotiates that schema; legacy consumer mapping remains fail-closed.
+revision-3 contract preserves every status distinction, including
+`StorageExhausted` inside `Recorded`, through a closed wire-safe enum. Frozen
+legacy session-net v5 maps this result fail-closed as an unknown capability; no
+v5 wire enum changes and that protocol does not expose the transition operation.
 
 Each durable receipt carries a permanent commitment over fenced V1, its stable
 storage identity, row request ID, canonical request digest, and normalized
@@ -230,9 +289,10 @@ Snapshot installation also preserves monotonic local durability floors before
 replacing any state: consensus logical time, application sequence and digest,
 watch sequence and cursor-invalidation floor, recovery epoch and plan digest,
 and any pending recovery workflow. An exact published #684 snapshot may supply
-an empty ledger only when the activated destination ledger is still empty; it
-cannot erase a binding. Current snapshots must carry the activation marker and
-the complete bounded ledger, including compacted tombstones.
+the empty Prepared layout only when the destination is still Prepared; it
+cannot erase a binding or regress an Activated destination. Activated snapshots
+must carry the persistent schema fence, any exact-current-scope certificate,
+and the complete bounded ledger, including compacted tombstones.
 
 ## Validation and diagnostics
 
@@ -265,9 +325,20 @@ categories; the size error may report only the requested and maximum byte
 counts. Diagnostics do not expose opaque IDs, record payloads, keys, owners,
 timestamps, topology endpoints, or local storage details.
 
-## Deliberate deferral
+## Deliberate boundary
 
-This is generic store-side semantics only. Session-net and least-authority wire
-integration are intentionally deferred until issue #695 publishes its contract.
-This issue does not change `crates/opc-session-net`, its wire revisions, or any
-product/ePDG workflow or semantics.
+This remains generic SDK semantics. Consumer transport revision 3 carries the
+same capability, observation, execution, ambiguity, and exact-status contract
+over both the one-shot and bounded persistent least-authority mTLS clients
+published by #695. It does not expose a generic backend, replication,
+membership, snapshot, rebuild, or administrative authority. Product/ePDG
+composition and workflow semantics remain outside this SDK operation.
+
+For that consumer surface, the public request ID is byte-identical to the
+nested transition ID. The internal receipt ID is domain-separated by the
+authenticated consumer identity, stable cluster identity, and public ID; it
+excludes the body and changing configuration epoch. The receipt itself binds
+the complete canonical body. The current exact scope is enforced under the
+activation lifecycle above, so an authorized successor can recover across
+rollover while a revoked predecessor cannot observe the receipt. No separate
+`BindConsumerRequest` or log entry exists.

@@ -23,9 +23,12 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use futures_util::FutureExt;
 use opc_session_store::{
     checked_session_deadline, session_consumer_batch_result_into_store,
-    validate_stored_record_expiry_profile, BackendCapabilities, CompareAndSet, CompareAndSetResult,
-    LeaseError, LeaseGuard, OwnerId, RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest,
+    validate_stored_record_expiry_profile, AtomicFencedTransitionCapability, BackendCapabilities,
+    CompareAndSet, CompareAndSetResult, FencedTransitionObservation, FencedTransitionOutcome,
+    FencedTransitionRequest, FencedTransitionRequestId, LeaseError, LeaseGuard, OwnerId,
+    RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest,
     SessionConsumerAuthorizationManifest, SessionConsumerBatchResult, SessionConsumerChange,
+    SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
     SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
     SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
     SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
@@ -60,7 +63,7 @@ use crate::protocol::{
 pub const SESSION_QUORUM_CONSUMER_ALPN: &[u8] = b"opc-session-consumer/1";
 
 /// Fixed wire revision for [`SESSION_QUORUM_CONSUMER_ALPN`].
-pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 2;
+pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 3;
 
 /// Maximum sequential application requests processed on one consumer
 /// connection. Every request has an exact nonzero connection-local
@@ -68,7 +71,7 @@ pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 2;
 pub const MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION: usize = 4096;
 /// Fixed logical width of the nonzero connection-local correlation value.
 pub const SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES: usize = std::mem::size_of::<u32>();
-/// Revision 2 deliberately admits one in-flight request per physical lane.
+/// Revision 3 deliberately admits one in-flight request per physical lane.
 pub const MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION: usize = 1;
 
 /// Default number of authenticated request lanes retained by a persistent
@@ -175,6 +178,11 @@ fn consumer_payload_fragments_exceed_frame(
         SessionConsumerOperation::CompareAndSet { op } => {
             debit_payload(&mut remaining, op.new_record.payload.as_bytes())
         }
+        SessionConsumerOperation::FencedTransition { request }
+        | SessionConsumerOperation::FencedTransitionStatus { request } => request
+            .mutation()
+            .record()
+            .is_some_and(|record| debit_payload(&mut remaining, record.payload.as_bytes())),
         SessionConsumerOperation::Batch { ops } => ops.iter().any(|operation| match operation {
             SessionOp::CompareAndSet(op) => {
                 debit_payload(&mut remaining, op.new_record.payload.as_bytes())
@@ -521,7 +529,10 @@ fn consumer_operation_is_effectful(operation: &SessionConsumerOperation) -> bool
         | SessionConsumerOperation::Get { .. }
         | SessionConsumerOperation::PreflightRecordExpiry { .. }
         | SessionConsumerOperation::ScanRestoreRecords { .. }
-        | SessionConsumerOperation::Watch { .. } => false,
+        | SessionConsumerOperation::Watch { .. }
+        | SessionConsumerOperation::FencedTransitionCapability
+        | SessionConsumerOperation::ObserveFencedTransition { .. }
+        | SessionConsumerOperation::FencedTransitionStatus { .. } => false,
         SessionConsumerOperation::Batch { ops } => ops
             .iter()
             .any(|operation| !matches!(operation, SessionOp::Get { .. })),
@@ -530,7 +541,24 @@ fn consumer_operation_is_effectful(operation: &SessionConsumerOperation) -> bool
         | SessionConsumerOperation::RefreshTtl { .. }
         | SessionConsumerOperation::AcquireLease { .. }
         | SessionConsumerOperation::RenewLease { .. }
-        | SessionConsumerOperation::ReleaseLease { .. } => true,
+        | SessionConsumerOperation::ReleaseLease { .. }
+        | SessionConsumerOperation::FencedTransition { .. } => true,
+        _ => true,
+    }
+}
+
+/// Revision 3 deliberately binds the outer consumer id to the complete
+/// fenced-transition body's stable id byte-for-byte.  Keep this check at both
+/// client and listener boundaries so a hand-built generic request cannot
+/// submit one durable body under a second public identity.
+fn consumer_request_has_exact_fenced_transition_id(request: &SessionConsumerRequest) -> bool {
+    match request.operation() {
+        SessionConsumerOperation::FencedTransition {
+            request: transition,
+        }
+        | SessionConsumerOperation::FencedTransitionStatus {
+            request: transition,
+        } => request.request_id().as_bytes() == transition.request_id().as_bytes(),
         _ => true,
     }
 }
@@ -885,6 +913,61 @@ impl SessionConsumerMutationError {
     }
 }
 
+/// Result failure for an atomic fenced transition submitted through the
+/// consumer port.
+///
+/// The stable transition identity is deliberately distinct from the generic
+/// consumer request identity.  The consumer envelope is constructed from the
+/// exact same sixteen bytes, but callers recover an ambiguous transition only
+/// with the complete retained transition body and its own request ID.
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionConsumerFencedTransitionMutationError {
+    /// No application-call byte was written, so the transition did not reach
+    /// the quorum and may be submitted on another admitted endpoint.
+    #[error("consumer fenced transition was not transmitted: {cause}")]
+    NotTransmitted {
+        /// Redaction-safe pre-write transport classification.
+        cause: SessionConsumerClientError,
+    },
+    /// The transition may have reached the quorum.  Do not automatically
+    /// replay it; use only the retained identical request body and ID.
+    #[error(
+        "consumer fenced transition outcome is unconfirmed; recover only the retained request"
+    )]
+    OutcomeUnknown {
+        /// Exact caller-retained transition identity.
+        request_id: FencedTransitionRequestId,
+    },
+    /// A confirmed typed store or rejection failure.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl fmt::Debug for SessionConsumerFencedTransitionMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::NotTransmitted { .. } => "not_transmitted",
+            Self::OutcomeUnknown { .. } => "outcome_unknown",
+            Self::Store(_) => "store",
+        };
+        formatter
+            .debug_struct("SessionConsumerFencedTransitionMutationError")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionConsumerFencedTransitionMutationError {
+    /// Return the only identity permitted for exact status/recovery.
+    pub const fn exact_retry_id(&self) -> Option<FencedTransitionRequestId> {
+        match self {
+            Self::OutcomeUnknown { request_id } => Some(*request_id),
+            Self::NotTransmitted { .. } | Self::Store(_) => None,
+        }
+    }
+}
+
 /// Result failure for a lease mutation submitted through the consumer port.
 ///
 /// While [`Self::OutcomeUnknown`] is held, the presented guard is lost for
@@ -1100,7 +1183,7 @@ struct BorrowedConsumerCall<'a> {
 
 /// Serialization-only view of a call. Keeping the caller-owned request
 /// borrowed avoids copying a potentially maximum-sized payload for every safe
-/// pre-write reconnect attempt while retaining the exact revision-2 encoding.
+/// pre-write reconnect attempt while retaining the exact revision-3 encoding.
 #[derive(Serialize)]
 #[serde(
     tag = "kind",
@@ -1147,6 +1230,12 @@ impl Serialize for BorrowedConsumerCallResponse<'_> {
 )]
 enum ConsumerSessionResponseWire {
     Capabilities(WireBackendCapabilities),
+    FencedTransitionCapability(Result<AtomicFencedTransitionCapability, SessionConsumerStoreError>),
+    ObserveFencedTransition(Result<FencedTransitionObservation, SessionConsumerStoreError>),
+    FencedTransition(Result<FencedTransitionOutcome, SessionConsumerFencedTransitionError>),
+    FencedTransitionStatus(
+        Result<SessionConsumerFencedTransitionStatus, SessionConsumerStoreError>,
+    ),
     Get(Result<Option<opc_session_store::StoredSessionRecord>, SessionConsumerStoreError>),
     PreflightRecordExpiry(Result<(), SessionConsumerStoreError>),
     CompareAndSet(Result<CompareAndSetResult, SessionConsumerStoreError>),
@@ -1162,7 +1251,7 @@ enum ConsumerSessionResponseWire {
     Rejected(SessionConsumerRejection),
 }
 
-/// Private revision-2 lease authority envelope. The public store response
+/// Private revision-3 lease authority envelope. The public store response
 /// remains the source-compatible `LeaseGuard`; only this transport validates
 /// the committed authority time before removing the envelope.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1206,6 +1295,16 @@ impl TryFrom<ConsumerSessionResponseWire> for SessionConsumerResponse {
         Ok(match response {
             ConsumerSessionResponseWire::Capabilities(capabilities) => {
                 Self::Capabilities(BackendCapabilities::try_from(capabilities)?)
+            }
+            ConsumerSessionResponseWire::FencedTransitionCapability(value) => {
+                Self::FencedTransitionCapability(value)
+            }
+            ConsumerSessionResponseWire::ObserveFencedTransition(value) => {
+                Self::ObserveFencedTransition(value)
+            }
+            ConsumerSessionResponseWire::FencedTransition(value) => Self::FencedTransition(value),
+            ConsumerSessionResponseWire::FencedTransitionStatus(value) => {
+                Self::FencedTransitionStatus(value)
             }
             ConsumerSessionResponseWire::Get(value) => Self::Get(value),
             ConsumerSessionResponseWire::PreflightRecordExpiry(value) => {
@@ -1254,6 +1353,18 @@ fn consumer_wire_response_from_public(
             WireBackendCapabilities::try_from(&value)
                 .map_err(|_| ProtocolError::InvalidWireValue)?,
         ),
+        SessionConsumerResponse::FencedTransitionCapability(value) => {
+            ConsumerSessionResponseWire::FencedTransitionCapability(value)
+        }
+        SessionConsumerResponse::ObserveFencedTransition(value) => {
+            ConsumerSessionResponseWire::ObserveFencedTransition(value)
+        }
+        SessionConsumerResponse::FencedTransition(value) => {
+            ConsumerSessionResponseWire::FencedTransition(value)
+        }
+        SessionConsumerResponse::FencedTransitionStatus(value) => {
+            ConsumerSessionResponseWire::FencedTransitionStatus(value)
+        }
         SessionConsumerResponse::Get(value) => ConsumerSessionResponseWire::Get(value),
         SessionConsumerResponse::PreflightRecordExpiry(value) => {
             ConsumerSessionResponseWire::PreflightRecordExpiry(value)
@@ -1425,6 +1536,10 @@ fn exact_correlation(expected: NonZeroU32, received: NonZeroU32) -> Result<(), P
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConsumerOperationKind {
     Capabilities,
+    FencedTransitionCapability,
+    ObserveFencedTransition,
+    FencedTransition,
+    FencedTransitionStatus,
     Get,
     PreflightRecordExpiry,
     CompareAndSet,
@@ -1447,6 +1562,14 @@ impl ConsumerOperationKind {
     fn from_operation(operation: &SessionConsumerOperation) -> Self {
         match operation {
             SessionConsumerOperation::Capabilities => Self::Capabilities,
+            SessionConsumerOperation::FencedTransitionCapability => {
+                Self::FencedTransitionCapability
+            }
+            SessionConsumerOperation::ObserveFencedTransition { .. } => {
+                Self::ObserveFencedTransition
+            }
+            SessionConsumerOperation::FencedTransition { .. } => Self::FencedTransition,
+            SessionConsumerOperation::FencedTransitionStatus { .. } => Self::FencedTransitionStatus,
             SessionConsumerOperation::Get { .. } => Self::Get,
             SessionConsumerOperation::PreflightRecordExpiry { .. } => Self::PreflightRecordExpiry,
             SessionConsumerOperation::CompareAndSet { .. } => Self::CompareAndSet,
@@ -1477,6 +1600,18 @@ fn response_matches_operation(
         (
             ConsumerOperationKind::Capabilities,
             SessionConsumerResponse::Capabilities(_)
+        ) | (
+            ConsumerOperationKind::FencedTransitionCapability,
+            SessionConsumerResponse::FencedTransitionCapability(_)
+        ) | (
+            ConsumerOperationKind::ObserveFencedTransition,
+            SessionConsumerResponse::ObserveFencedTransition(_)
+        ) | (
+            ConsumerOperationKind::FencedTransition,
+            SessionConsumerResponse::FencedTransition(_)
+        ) | (
+            ConsumerOperationKind::FencedTransitionStatus,
+            SessionConsumerResponse::FencedTransitionStatus(_)
         ) | (ConsumerOperationKind::Get, SessionConsumerResponse::Get(_))
             | (
                 ConsumerOperationKind::PreflightRecordExpiry,
@@ -1522,17 +1657,29 @@ fn response_matches_operation(
                 ConsumerOperationKind::CompareAndSet
                     | ConsumerOperationKind::DeleteFenced
                     | ConsumerOperationKind::RefreshTtl,
-                SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Mutation),
+                SessionConsumerResponse::OutcomeUnknown(
+                    SessionConsumerOutcomeUnknown::Mutation { .. }
+                ),
             )
             | (
                 ConsumerOperationKind::Batch {
                     contains_mutation: true,
                 },
-                SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Mutation),
+                SessionConsumerResponse::OutcomeUnknown(
+                    SessionConsumerOutcomeUnknown::Mutation { .. }
+                ),
             )
             | (
                 ConsumerOperationKind::UnknownEffectful,
-                SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Mutation),
+                SessionConsumerResponse::OutcomeUnknown(
+                    SessionConsumerOutcomeUnknown::Mutation { .. }
+                ),
+            )
+            | (
+                ConsumerOperationKind::FencedTransition,
+                SessionConsumerResponse::OutcomeUnknown(
+                    SessionConsumerOutcomeUnknown::Mutation { .. }
+                ),
             )
             | (
                 ConsumerOperationKind::AcquireLease
@@ -1553,6 +1700,30 @@ fn store_error_matches_operation(
     error: SessionConsumerStoreError,
 ) -> bool {
     match operation {
+        SessionConsumerOperation::FencedTransitionCapability => matches!(
+            error,
+            SessionConsumerStoreError::Unavailable
+                | SessionConsumerStoreError::CapabilityNotSupported
+                | SessionConsumerStoreError::ProtectedDataRejected
+        ),
+        SessionConsumerOperation::ObserveFencedTransition { .. } => matches!(
+            error,
+            SessionConsumerStoreError::Unavailable
+                | SessionConsumerStoreError::InvalidInput
+                | SessionConsumerStoreError::CapabilityNotSupported
+                | SessionConsumerStoreError::ProtectedDataRejected
+        ),
+        SessionConsumerOperation::FencedTransition { .. } => {
+            fenced_transition_execute_store_error_matches(error)
+        }
+        SessionConsumerOperation::FencedTransitionStatus { .. } => matches!(
+            error,
+            SessionConsumerStoreError::RequestConflict
+                | SessionConsumerStoreError::Unavailable
+                | SessionConsumerStoreError::InvalidInput
+                | SessionConsumerStoreError::CapabilityNotSupported
+                | SessionConsumerStoreError::ProtectedDataRejected
+        ),
         SessionConsumerOperation::Get { .. } => matches!(
             error,
             SessionConsumerStoreError::StaleFence
@@ -1673,7 +1844,7 @@ fn batch_slot_error_matches_operation(
     }
 }
 
-/// Closed revision-2 error family for an already-open watch. These are the
+/// Closed revision-3 error family for an already-open watch. These are the
 /// only failures that can describe observation/catch-up of committed changes;
 /// mutation, request-binding, lease, restore, and TTL errors are impossible on
 /// this stream and therefore poison the authenticated lane.
@@ -1816,6 +1987,42 @@ fn response_matches_request(
     }
 
     match (request.operation(), response) {
+        (
+            SessionConsumerOperation::FencedTransitionCapability,
+            SessionConsumerResponse::FencedTransitionCapability(result),
+        ) => store_result_matches_operation(request.operation(), result),
+        (
+            SessionConsumerOperation::ObserveFencedTransition { key },
+            SessionConsumerResponse::ObserveFencedTransition(Ok(observation)),
+        ) => observation.record().is_none_or(|record| {
+            record.key == *key
+                && record.fence <= observation.current_fence()
+                && validate_stored_record_expiry_profile(record).is_ok()
+        }),
+        (
+            SessionConsumerOperation::ObserveFencedTransition { .. },
+            SessionConsumerResponse::ObserveFencedTransition(result),
+        ) => store_result_matches_operation(request.operation(), result),
+        (
+            SessionConsumerOperation::FencedTransition {
+                request: transition,
+            },
+            SessionConsumerResponse::FencedTransition(Ok(outcome)),
+        ) => outcome.matches_request(transition),
+        (
+            SessionConsumerOperation::FencedTransition { .. },
+            SessionConsumerResponse::FencedTransition(Err(error)),
+        ) => fenced_transition_execute_error_matches_request(error),
+        (
+            SessionConsumerOperation::FencedTransitionStatus {
+                request: transition,
+            },
+            SessionConsumerResponse::FencedTransitionStatus(Ok(status)),
+        ) => fenced_transition_status_matches_request(transition, status),
+        (
+            SessionConsumerOperation::FencedTransitionStatus { .. },
+            SessionConsumerResponse::FencedTransitionStatus(result),
+        ) => store_result_matches_operation(request.operation(), result),
         (SessionConsumerOperation::Get { key }, SessionConsumerResponse::Get(result)) => {
             get_result_matches_key(
                 key,
@@ -1923,10 +2130,109 @@ fn response_matches_request(
             SessionConsumerOperation::ReleaseLease { .. },
             SessionConsumerResponse::ReleaseLease(Ok(())),
         )
-        | (_, SessionConsumerResponse::Rejected(_))
-        | (_, SessionConsumerResponse::OutcomeUnknown(_)) => true,
+        | (_, SessionConsumerResponse::Rejected(_)) => true,
+        (
+            _,
+            SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Mutation {
+                request_id,
+            }),
+        ) => {
+            consumer_operation_is_effectful(request.operation())
+                && *request_id == request.request_id()
+        }
+        (
+            SessionConsumerOperation::AcquireLease { .. }
+            | SessionConsumerOperation::RenewLease { .. }
+            | SessionConsumerOperation::ReleaseLease { .. },
+            SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Lease),
+        ) => true,
         _ => false,
     }
+}
+
+/// Validate every transition recovery form against the complete exact body
+/// retained by the caller.  In particular, a status response must not turn a
+/// receipt for a different key, owner, fence, or payload-bearing body into a
+/// successful recovery.
+fn fenced_transition_status_matches_request(
+    request: &FencedTransitionRequest,
+    status: &SessionConsumerFencedTransitionStatus,
+) -> bool {
+    match status {
+        SessionConsumerFencedTransitionStatus::Recorded(result) => match result.as_ref() {
+            Ok(outcome) => outcome.matches_request(request),
+            Err(error) => fenced_transition_recorded_error_matches_request(error),
+        },
+        SessionConsumerFencedTransitionStatus::RequestConflict
+        | SessionConsumerFencedTransitionStatus::Expired
+        | SessionConsumerFencedTransitionStatus::HistoryFull
+        | SessionConsumerFencedTransitionStatus::RetentionExhausted
+        | SessionConsumerFencedTransitionStatus::NotFound => true,
+        _ => false,
+    }
+}
+
+/// Direct execution can report the complete safe execution-error inventory.
+/// A retained receipt is deliberately stricter: it can contain only an exact
+/// deterministic no-effect result, never an availability or request-binding
+/// failure that could not safely have been persisted as that receipt.
+fn fenced_transition_execute_error_matches_request(
+    error: &SessionConsumerFencedTransitionError,
+) -> bool {
+    match error {
+        SessionConsumerFencedTransitionError::Store(error) => {
+            fenced_transition_execute_store_error_matches(*error)
+        }
+        SessionConsumerFencedTransitionError::RequestConflict
+        | SessionConsumerFencedTransitionError::Expired
+        | SessionConsumerFencedTransitionError::HistoryFull
+        | SessionConsumerFencedTransitionError::RetentionExhausted
+        | SessionConsumerFencedTransitionError::StorageExhausted => true,
+        _ => false,
+    }
+}
+
+fn fenced_transition_recorded_error_matches_request(
+    error: &SessionConsumerFencedTransitionError,
+) -> bool {
+    match error {
+        SessionConsumerFencedTransitionError::Store(error) => {
+            fenced_transition_recorded_store_error_matches(*error)
+        }
+        SessionConsumerFencedTransitionError::StorageExhausted => true,
+        _ => false,
+    }
+}
+
+fn fenced_transition_execute_store_error_matches(error: SessionConsumerStoreError) -> bool {
+    matches!(
+        error,
+        SessionConsumerStoreError::NotFound
+            | SessionConsumerStoreError::StaleFence
+            | SessionConsumerStoreError::CasConflict
+            | SessionConsumerStoreError::RequestConflict
+            | SessionConsumerStoreError::OutcomeUnavailable
+            | SessionConsumerStoreError::Unavailable
+            | SessionConsumerStoreError::InvalidInput
+            | SessionConsumerStoreError::CapabilityNotSupported
+            | SessionConsumerStoreError::InvalidTtl
+            | SessionConsumerStoreError::LeaseUnavailable
+            | SessionConsumerStoreError::PayloadTooLarge
+            | SessionConsumerStoreError::ProtectedDataRejected
+    )
+}
+
+fn fenced_transition_recorded_store_error_matches(error: SessionConsumerStoreError) -> bool {
+    matches!(
+        error,
+        SessionConsumerStoreError::NotFound
+            | SessionConsumerStoreError::StaleFence
+            | SessionConsumerStoreError::CasConflict
+            | SessionConsumerStoreError::InvalidInput
+            | SessionConsumerStoreError::InvalidTtl
+            | SessionConsumerStoreError::LeaseUnavailable
+            | SessionConsumerStoreError::PayloadTooLarge
+    )
 }
 
 fn consumer_capability_payload_budget(
@@ -2024,6 +2330,11 @@ fn response_is_outcome_unknown(
             consumer_operation_is_effectful(operation)
                 && results.iter().any(batch_result_is_outcome_unknown)
         }
+        SessionConsumerResponse::FencedTransition(Err(
+            SessionConsumerFencedTransitionError::Store(
+                SessionConsumerStoreError::OutcomeUnavailable,
+            ),
+        )) => true,
         SessionConsumerResponse::AcquireLease(Err(
             SessionConsumerLeaseError::OutcomeUnavailable,
         ))
@@ -2041,7 +2352,10 @@ fn response_is_outcome_unknown(
 /// though the authenticated lane can often be reused safely.
 fn response_is_known_failure(response: &SessionConsumerResponse) -> bool {
     match response {
-        SessionConsumerResponse::Get(Err(_))
+        SessionConsumerResponse::FencedTransition(Err(_))
+        | SessionConsumerResponse::Get(Err(_))
+        | SessionConsumerResponse::ObserveFencedTransition(Err(_))
+        | SessionConsumerResponse::FencedTransitionStatus(Err(_))
         | SessionConsumerResponse::PreflightRecordExpiry(Err(_))
         | SessionConsumerResponse::CompareAndSet(Err(_))
         | SessionConsumerResponse::DeleteFenced(Err(_))
@@ -2057,6 +2371,9 @@ fn response_is_known_failure(response: &SessionConsumerResponse) -> bool {
         SessionConsumerResponse::AcquireLease(Err(_))
         | SessionConsumerResponse::RenewLease(Err(_))
         | SessionConsumerResponse::ReleaseLease(Err(_)) => true,
+        SessionConsumerResponse::FencedTransitionStatus(Ok(
+            SessionConsumerFencedTransitionStatus::Recorded(result),
+        )) => result.is_err(),
         SessionConsumerResponse::Rejected(_) => true,
         _ => false,
     }
@@ -2068,7 +2385,7 @@ fn response_is_known_failure(response: &SessionConsumerResponse) -> bool {
 /// internal/legacy code and cannot globally enable `deny_unknown_fields`.
 /// `serde_ignored` reports most fields that shared DTO deserializers would
 /// ignore. Internally tagged enums can hide deeper ignored fields from that
-/// adapter, so the decoded revision-2 type is serialized through a streaming
+/// adapter, so the decoded revision-3 type is serialized through a streaming
 /// byte comparator against the bounded received payload. This rejects aliases,
 /// omissions, noncanonical encodings, and unknown nested fields without a
 /// second buffer, a generic JSON tree, or surfacing their content.
@@ -2191,7 +2508,7 @@ where
 }
 
 /// Compare the exact private wire encoding without retaining a second JSON
-/// buffer or materializing generic value trees. Revision 2 is emitted only by
+/// buffer or materializing generic value trees. Revision 3 is emitted only by
 /// this module's private DTOs, so canonical bytes are part of the negotiated
 /// contract; the borrowed/owned wire-equivalence tests seal both writers.
 struct ExactConsumerJson<'a> {
@@ -2577,7 +2894,7 @@ struct ConsumerConnection {
     next_correlation: NonZeroU32,
     calls: usize,
     idle_deadline: tokio::time::Instant,
-    /// Exact server-advertised request-frame ceiling for this revision-2 lane.
+    /// Exact server-advertised request-frame ceiling for this revision-3 lane.
     request_frame_size: usize,
     shutdown_io: Option<Arc<PersistentConsumerIoBarrier>>,
     /// Weak owner used only for exact physical request-lane accounting.
@@ -2960,7 +3277,7 @@ impl StatelessSessionConsumerClient {
     /// Set the finite bootstrap and active-frame idle timeout.
     ///
     /// Zero remains invalid. Source-compatible stateless callers may retain a
-    /// larger legacy value; revision 2 applies its five-second active-frame
+    /// larger legacy value; revision 3 applies its five-second active-frame
     /// ceiling internally. Persistent construction rejects values outside its
     /// explicit bounded profile.
     #[must_use]
@@ -3631,7 +3948,8 @@ impl StatelessSessionConsumerClient {
                 SessionConsumerClientError::Protocol,
             ));
         }
-        if request.validate().is_err() {
+        if !consumer_request_has_exact_fenced_transition_id(&request) || request.validate().is_err()
+        {
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Protocol,
             ));
@@ -3736,6 +4054,98 @@ impl StatelessSessionConsumerClient {
             }
             Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
                 "consumer expiry authority unavailable".into(),
+            )),
+        }
+    }
+
+    /// Read the quorum's exact atomic-transition capability declaration.
+    pub async fn fenced_transition_capability(
+        &self,
+    ) -> Result<AtomicFencedTransitionCapability, StoreError> {
+        match self
+            .execute(self.request(
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::FencedTransitionCapability,
+            ))
+            .await
+        {
+            Ok(SessionConsumerResponse::FencedTransitionCapability(result)) => {
+                result.map_err(SessionConsumerStoreError::into_store_error)
+            }
+            Ok(SessionConsumerResponse::Rejected(rejection)) => {
+                Err(rejection_into_store_error(rejection))
+            }
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer fenced-transition capability unavailable".into(),
+            )),
+        }
+    }
+
+    /// Read one exact key's record and durable fence floor at quorum authority.
+    pub async fn observe_fenced_transition(
+        &self,
+        key: opc_session_store::SessionKey,
+    ) -> Result<FencedTransitionObservation, StoreError> {
+        match self
+            .execute(self.request(
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::ObserveFencedTransition { key },
+            ))
+            .await
+        {
+            Ok(SessionConsumerResponse::ObserveFencedTransition(result)) => {
+                result.map_err(SessionConsumerStoreError::into_store_error)
+            }
+            Ok(SessionConsumerResponse::Rejected(rejection)) => {
+                Err(rejection_into_store_error(rejection))
+            }
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer fenced-transition observation unavailable".into(),
+            )),
+        }
+    }
+
+    /// Submit exactly one complete atomic transition without automatic replay.
+    pub async fn fenced_transition(
+        &self,
+        request: &FencedTransitionRequest,
+    ) -> Result<FencedTransitionOutcome, SessionConsumerFencedTransitionMutationError> {
+        let outer_request_id = consumer_fenced_transition_request_id(request);
+        fenced_transition_response(
+            request,
+            self.execute_classified(self.request(
+                outer_request_id,
+                SessionConsumerOperation::FencedTransition {
+                    request: Box::new(request.clone()),
+                },
+            ))
+            .await,
+        )
+    }
+
+    /// Recover the typed retained status using the identical transition body.
+    pub async fn fenced_transition_status(
+        &self,
+        request: &FencedTransitionRequest,
+    ) -> Result<SessionConsumerFencedTransitionStatus, StoreError> {
+        let request_id = consumer_fenced_transition_request_id(request);
+        match self
+            .execute(self.request(
+                request_id,
+                SessionConsumerOperation::FencedTransitionStatus {
+                    request: Box::new(request.clone()),
+                },
+            ))
+            .await
+        {
+            Ok(SessionConsumerResponse::FencedTransitionStatus(result)) => {
+                result.map_err(SessionConsumerStoreError::into_store_error)
+            }
+            Ok(SessionConsumerResponse::Rejected(rejection)) => {
+                Err(rejection_into_store_error(rejection))
+            }
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer fenced-transition status unavailable".into(),
             )),
         }
     }
@@ -6020,7 +6430,8 @@ impl PersistentSessionConsumerClient {
                 SessionConsumerClientError::Protocol,
             ));
         }
-        if request.validate().is_err() {
+        if !consumer_request_has_exact_fenced_transition_id(request) || request.validate().is_err()
+        {
             self.pool
                 .record_error(SessionConsumerClientError::Protocol, false, false);
             return Err(SessionConsumerCallError::BeforeCallWrite(
@@ -6143,6 +6554,102 @@ impl PersistentSessionConsumerClient {
             Ok(SessionConsumerResponse::Rejected(value)) => Err(rejection_into_store_error(value)),
             Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
                 "consumer expiry authority unavailable".into(),
+            )),
+        }
+    }
+
+    /// Read the quorum's exact atomic-transition capability through a
+    /// retained request lane.
+    pub async fn fenced_transition_capability(
+        &self,
+    ) -> Result<AtomicFencedTransitionCapability, StoreError> {
+        match self
+            .execute_read(self.request(
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::FencedTransitionCapability,
+            ))
+            .await
+        {
+            Ok(SessionConsumerResponse::FencedTransitionCapability(result)) => {
+                result.map_err(SessionConsumerStoreError::into_store_error)
+            }
+            Ok(SessionConsumerResponse::Rejected(rejection)) => {
+                Err(rejection_into_store_error(rejection))
+            }
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer fenced-transition capability unavailable".into(),
+            )),
+        }
+    }
+
+    /// Read one exact key's record and durable fence floor through a retained
+    /// request lane.
+    pub async fn observe_fenced_transition(
+        &self,
+        key: opc_session_store::SessionKey,
+    ) -> Result<FencedTransitionObservation, StoreError> {
+        match self
+            .execute_read(self.request(
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::ObserveFencedTransition { key },
+            ))
+            .await
+        {
+            Ok(SessionConsumerResponse::ObserveFencedTransition(result)) => {
+                result.map_err(SessionConsumerStoreError::into_store_error)
+            }
+            Ok(SessionConsumerResponse::Rejected(rejection)) => {
+                Err(rejection_into_store_error(rejection))
+            }
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer fenced-transition observation unavailable".into(),
+            )),
+        }
+    }
+
+    /// Submit exactly one complete atomic transition over a persistent lane.
+    /// A post-write timeout or EOF retires the lane and returns the exact
+    /// caller-owned transition ID as an unknown outcome.
+    pub async fn fenced_transition(
+        &self,
+        request: &FencedTransitionRequest,
+    ) -> Result<FencedTransitionOutcome, SessionConsumerFencedTransitionMutationError> {
+        let outer_request_id = consumer_fenced_transition_request_id(request);
+        fenced_transition_response(
+            request,
+            self.execute_classified(&self.request(
+                outer_request_id,
+                SessionConsumerOperation::FencedTransition {
+                    request: Box::new(request.clone()),
+                },
+            ))
+            .await,
+        )
+    }
+
+    /// Recover one retained transition status through a persistent read lane.
+    pub async fn fenced_transition_status(
+        &self,
+        request: &FencedTransitionRequest,
+    ) -> Result<SessionConsumerFencedTransitionStatus, StoreError> {
+        let request_id = consumer_fenced_transition_request_id(request);
+        match self
+            .execute_read(self.request(
+                request_id,
+                SessionConsumerOperation::FencedTransitionStatus {
+                    request: Box::new(request.clone()),
+                },
+            ))
+            .await
+        {
+            Ok(SessionConsumerResponse::FencedTransitionStatus(result)) => {
+                result.map_err(SessionConsumerStoreError::into_store_error)
+            }
+            Ok(SessionConsumerResponse::Rejected(rejection)) => {
+                Err(rejection_into_store_error(rejection))
+            }
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer fenced-transition status unavailable".into(),
             )),
         }
     }
@@ -6808,6 +7315,86 @@ fn lease_response<T>(
     }
 }
 
+fn consumer_fenced_transition_request_id(
+    request: &FencedTransitionRequest,
+) -> SessionConsumerRequestId {
+    SessionConsumerRequestId::from_bytes(*request.request_id().as_bytes())
+}
+
+fn consumer_fenced_transition_store_error(
+    error: SessionConsumerFencedTransitionError,
+) -> StoreError {
+    match error {
+        SessionConsumerFencedTransitionError::Store(error) => error.into_store_error(),
+        SessionConsumerFencedTransitionError::RequestConflict => {
+            StoreError::FencedTransitionRequestConflict
+        }
+        SessionConsumerFencedTransitionError::Expired => StoreError::FencedTransitionRequestExpired,
+        SessionConsumerFencedTransitionError::HistoryFull => {
+            StoreError::FencedTransitionHistoryFull
+        }
+        SessionConsumerFencedTransitionError::RetentionExhausted => {
+            StoreError::FencedTransitionRetentionExhausted
+        }
+        SessionConsumerFencedTransitionError::StorageExhausted => {
+            StoreError::FencedTransitionStorageExhausted
+        }
+        _ => StoreError::BackendUnavailable("consumer fenced-transition error unavailable".into()),
+    }
+}
+
+fn fenced_transition_response(
+    request: &FencedTransitionRequest,
+    response: Result<SessionConsumerResponse, SessionConsumerCallError>,
+) -> Result<FencedTransitionOutcome, SessionConsumerFencedTransitionMutationError> {
+    let request_id = request.request_id();
+    match response {
+        Ok(SessionConsumerResponse::FencedTransition(Ok(outcome)))
+            if outcome.matches_request(request) =>
+        {
+            Ok(outcome)
+        }
+        Ok(SessionConsumerResponse::FencedTransition(Err(
+            SessionConsumerFencedTransitionError::Store(
+                SessionConsumerStoreError::OutcomeUnavailable,
+            ),
+        )))
+        | Err(SessionConsumerCallError::MayHaveSent(_)) => {
+            Err(SessionConsumerFencedTransitionMutationError::OutcomeUnknown { request_id })
+        }
+        Ok(SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Mutation {
+            request_id: wire_request_id,
+        })) if wire_request_id == consumer_fenced_transition_request_id_from_fenced(request_id) => {
+            Err(SessionConsumerFencedTransitionMutationError::OutcomeUnknown { request_id })
+        }
+        Err(SessionConsumerCallError::BeforeCallWrite(cause)) => {
+            Err(SessionConsumerFencedTransitionMutationError::NotTransmitted { cause })
+        }
+        Ok(SessionConsumerResponse::Rejected(rejection)) => {
+            Err(SessionConsumerFencedTransitionMutationError::Store(
+                rejection_into_store_error(rejection),
+            ))
+        }
+        Ok(SessionConsumerResponse::FencedTransition(Err(error)))
+            if fenced_transition_execute_error_matches_request(&error) =>
+        {
+            Err(SessionConsumerFencedTransitionMutationError::Store(
+                consumer_fenced_transition_store_error(error),
+            ))
+        }
+        // A semantically checked typed call can reach this only if a newer
+        // peer violates the response contract.  Its effect boundary is not
+        // safely knowable, so retain the exact transition ID.
+        Ok(_) => Err(SessionConsumerFencedTransitionMutationError::OutcomeUnknown { request_id }),
+    }
+}
+
+fn consumer_fenced_transition_request_id_from_fenced(
+    request_id: FencedTransitionRequestId,
+) -> SessionConsumerRequestId {
+    SessionConsumerRequestId::from_bytes(*request_id.as_bytes())
+}
+
 /// Dedicated server for typed session-quorum consumers.
 ///
 /// The constructor accepts only the typed [`SessionQuorumConsumer`] port. It
@@ -6927,7 +7514,7 @@ impl SessionQuorumConsumerServer {
     }
 
     /// Set the active authenticated-frame idle deadline. A larger legacy
-    /// stateless value remains source-compatible, while revision 2 applies its
+    /// stateless value remains source-compatible, while revision 3 applies its
     /// five-second active-frame ceiling internally.
     #[must_use]
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
@@ -7295,7 +7882,7 @@ async fn handle_server_connection(
     #[cfg(test)] setup_test_hooks: Option<Arc<ConsumerServerSetupTestHooks>>,
     #[cfg(test)] expire_at_final_ack_boundary: bool,
 ) -> Result<(), ProtocolError> {
-    // Revision 2 reuses a socket for small request/response frames. Disable
+    // Revision 3 reuses a socket for small request/response frames. Disable
     // Nagle on both peers so a warm exchange cannot inherit the platform's
     // delayed-ACK cadence and consume the bounded fair-pool wait budget.
     stream.set_nodelay(true).map_err(ProtocolError::Io)?;
@@ -7725,6 +8312,25 @@ async fn handle_server_connection(
             .await?;
             return Ok(());
         }
+        if !consumer_request_has_exact_fenced_transition_id(&request) {
+            let _ = write_consumer_call_rejection_supervised(
+                &mut writer,
+                correlation,
+                SessionConsumerRejection::MalformedRequest,
+                response_frame_size,
+                request_deadline,
+                idle_timeout,
+                &mut lifecycle,
+                &tls_config,
+                &reauthentication,
+                &mut reauthentication_changes,
+                &mut material_changes,
+                &cancellation,
+                rotation_jitter,
+            )
+            .await?;
+            return Ok(());
+        }
         if let Err(rejection) = request.validate() {
             let _ = write_consumer_call_rejection_supervised(
                 &mut writer,
@@ -7755,6 +8361,7 @@ async fn handle_server_connection(
         };
         let operation = ConsumerOperationKind::from_operation(request.operation());
         let scope = request.scope();
+        let request_id = request.request_id();
         let execute = service.execute(&identity, *request);
         tokio::pin!(execute);
         let mut response = loop {
@@ -7771,7 +8378,7 @@ async fn handle_server_connection(
                     record_consumer_hard_overrun(&lifecycle);
                     return Ok(());
                 }
-                break consumer_timeout_response(operation);
+                break consumer_timeout_response(operation, request_id);
             }
             let response = tokio::select! {
                 biased;
@@ -7782,7 +8389,7 @@ async fn handle_server_connection(
                             record_consumer_hard_overrun(&lifecycle);
                             return Ok(());
                         }
-                        Some(consumer_timeout_response(operation))
+                        Some(consumer_timeout_response(operation, request_id))
                     } else {
                         Some(response)
                     }
@@ -7792,7 +8399,7 @@ async fn handle_server_connection(
                         record_consumer_hard_overrun(&lifecycle);
                         return Ok(());
                     }
-                    Some(consumer_timeout_response(operation))
+                    Some(consumer_timeout_response(operation, request_id))
                 }
                 _ = cancellation.cancelled() => return Ok(()),
                 _ = reauthentication_changes.changed() => {
@@ -7845,7 +8452,7 @@ async fn handle_server_connection(
             (&restore_request, &response)
         {
             // Keep #684's page validation and response-fit replacement before
-            // writing a frame; revision-2 only adds the small correlation
+            // writing a frame; revision-3 only adds the small correlation
             // envelope to the fit calculation.
             if page.validate_for_request(request).is_err()
                 || !consumer_response_fits_for_correlation(
@@ -8154,19 +8761,28 @@ async fn handle_server_connection(
     Ok(())
 }
 
-fn consumer_timeout_response(operation: ConsumerOperationKind) -> SessionConsumerResponse {
+fn consumer_timeout_response(
+    operation: ConsumerOperationKind,
+    request_id: SessionConsumerRequestId,
+) -> SessionConsumerResponse {
     let mutation_may_have_been_accepted = match operation {
         ConsumerOperationKind::CompareAndSet
         | ConsumerOperationKind::DeleteFenced
         | ConsumerOperationKind::RefreshTtl
-        | ConsumerOperationKind::UnknownEffectful => Some(SessionConsumerOutcomeUnknown::Mutation),
+        | ConsumerOperationKind::FencedTransition
+        | ConsumerOperationKind::UnknownEffectful => {
+            Some(SessionConsumerOutcomeUnknown::Mutation { request_id })
+        }
         ConsumerOperationKind::AcquireLease
         | ConsumerOperationKind::RenewLease
         | ConsumerOperationKind::ReleaseLease => Some(SessionConsumerOutcomeUnknown::Lease),
         ConsumerOperationKind::Batch {
             contains_mutation: true,
-        } => Some(SessionConsumerOutcomeUnknown::Mutation),
+        } => Some(SessionConsumerOutcomeUnknown::Mutation { request_id }),
         ConsumerOperationKind::Capabilities
+        | ConsumerOperationKind::FencedTransitionCapability
+        | ConsumerOperationKind::ObserveFencedTransition
+        | ConsumerOperationKind::FencedTransitionStatus
         | ConsumerOperationKind::Get
         | ConsumerOperationKind::PreflightRecordExpiry
         | ConsumerOperationKind::Batch {
@@ -8276,13 +8892,14 @@ mod tests {
     use super::{
         classify_call_write_error, complete_before_deadline, consumer_connection_current,
         consumer_fresh_admission_is_current, consumer_payload_fragments_exceed_frame,
-        consumer_response_fits, consumer_watch_error_is_legal, consumer_wire_response_from_public,
+        consumer_request_has_exact_fenced_transition_id, consumer_response_fits,
+        consumer_watch_error_is_legal, consumer_wire_response_from_public,
         decode_consumer_frame_payload, ensure_pre_request_budget_remaining, exact_correlation,
-        lease_error_matches_operation, lease_response, mutation_response, persistent_execute_error,
-        poll_persistent_consumer_setup_io, publish_monotonic_shutdown_phase,
-        queued_consumer_watch_stream, read_authenticated_consumer_frame_until,
-        read_authenticated_consumer_frame_within, response_is_outcome_unknown,
-        response_matches_operation, response_matches_request,
+        fenced_transition_response, lease_error_matches_operation, lease_response,
+        mutation_response, persistent_execute_error, poll_persistent_consumer_setup_io,
+        publish_monotonic_shutdown_phase, queued_consumer_watch_stream,
+        read_authenticated_consumer_frame_until, read_authenticated_consumer_frame_within,
+        response_is_outcome_unknown, response_matches_operation, response_matches_request,
         response_retires_connection_authority, server_connection_current,
         store_error_matches_operation, valid_consumer_operation_timeout, wait_for_forced_shutdown,
         write_consumer_call_rejection_supervised, BorrowedConsumerCall,
@@ -8298,9 +8915,10 @@ mod tests {
         PersistentSessionConsumerExecuteError, PersistentSetupAttempt, PersistentShutdownPhase,
         PersistentWatchRecovery, QueuedConsumerWatchItem, SessionConsumerAuthorizationError,
         SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerChange,
-        SessionConsumerClientError, SessionConsumerIdentity, SessionConsumerLeaseMutationError,
-        SessionConsumerMutationError, SessionConsumerRejection, SessionQuorumConsumer,
-        SessionQuorumConsumerServer, StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
+        SessionConsumerClientError, SessionConsumerFencedTransitionMutationError,
+        SessionConsumerIdentity, SessionConsumerLeaseMutationError, SessionConsumerMutationError,
+        SessionConsumerRejection, SessionQuorumConsumer, SessionQuorumConsumerServer,
+        StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
         DEFAULT_CONSUMER_MAX_CONNECTIONS, DEFAULT_CONSUMER_OPERATION_TIMEOUT,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
@@ -8318,14 +8936,17 @@ mod tests {
     use futures_util::StreamExt;
     use opc_session_store::{
         checked_session_deadline, BackendCapabilities, CompareAndSet, CompareAndSetResult,
-        EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, LeaseGuard, OwnerId,
-        RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, SessionConsensusClusterId,
+        EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedTransitionLease,
+        FencedTransitionMutation, FencedTransitionOutcome, FencedTransitionRequest,
+        FencedTransitionRequestId, Generation, LeaseGuard, OwnerId, RestoreScanCursorProfile,
+        RestoreScanPage, RestoreScanRequest, SessionConsensusClusterId,
         SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-        SessionConsensusIdentity, SessionConsumerBatchResult, SessionConsumerLeaseError,
-        SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRequest,
-        SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-        SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-        StateClass, StateType, StoreError, StoredSessionRecord, MAX_SESSION_TTL,
+        SessionConsensusIdentity, SessionConsumerBatchResult, SessionConsumerFencedTransitionError,
+        SessionConsumerFencedTransitionStatus, SessionConsumerLeaseError, SessionConsumerOperation,
+        SessionConsumerOutcomeUnknown, SessionConsumerRequest, SessionConsumerRequestId,
+        SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionKey,
+        SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType, StoreError,
+        StoredSessionRecord, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
@@ -9164,7 +9785,7 @@ mod tests {
     }
 
     #[test]
-    fn revision_two_semantics_bind_ttl_records_batches_watches_and_future_operations() {
+    fn revision_three_semantics_bind_ttl_records_batches_watches_and_future_operations() {
         fn lease_guard(
             key: SessionKey,
             owner: OwnerId,
@@ -9484,12 +10105,196 @@ mod tests {
         ));
         assert!(response_matches_operation(
             ConsumerOperationKind::UnknownEffectful,
-            &SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Mutation),
+            &SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Mutation {
+                request_id: SessionConsumerRequestId::from_bytes([0x9a; 16]),
+            }),
         ));
         assert!(response_matches_operation(
             ConsumerOperationKind::UnknownEffectful,
             &SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest),
         ));
+    }
+
+    #[test]
+    fn revision_three_fenced_transition_outer_identity_is_byte_exact() {
+        let key = SessionKey {
+            tenant: TenantId::new("fenced-transition-id").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"fenced-transition-id")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let transition = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x71; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("fenced-transition-owner").expect("test owner"),
+                FenceToken::new(0),
+                Duration::from_secs(30),
+            )
+            .expect("bounded acquire"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("bounded transition");
+        let exact_id = SessionConsumerRequestId::from_bytes([0x71; 16]);
+        let exact = SessionConsumerRequest::new(
+            scope(),
+            exact_id,
+            SessionConsumerOperation::FencedTransition {
+                request: Box::new(transition.clone()),
+            },
+        );
+        assert!(consumer_request_has_exact_fenced_transition_id(&exact));
+        assert!(response_matches_request(
+            &exact,
+            &SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Mutation {
+                request_id: exact_id,
+            }),
+        ));
+
+        let mismatched = SessionConsumerRequest::new(
+            scope(),
+            SessionConsumerRequestId::from_bytes([0x72; 16]),
+            SessionConsumerOperation::FencedTransition {
+                request: Box::new(transition),
+            },
+        );
+        assert!(!consumer_request_has_exact_fenced_transition_id(
+            &mismatched
+        ));
+        assert!(!response_matches_request(
+            &mismatched,
+            &SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Mutation {
+                request_id: exact_id,
+            }),
+        ));
+    }
+
+    #[test]
+    fn fenced_transition_receipts_reject_nonpersisted_errors_and_preserve_ambiguity() {
+        let key = SessionKey {
+            tenant: TenantId::new("fenced-transition-receipt").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"fenced-transition-receipt")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let transition = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x73; 16]),
+            FencedTransitionLease::acquire(
+                key.clone(),
+                OwnerId::new("fenced-transition-receipt-owner").expect("test owner"),
+                FenceToken::new(0),
+                Duration::from_secs(30),
+            )
+            .expect("bounded acquire"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("bounded transition");
+        let consumer_request = SessionConsumerRequest::new(
+            scope(),
+            SessionConsumerRequestId::from_bytes([0x73; 16]),
+            SessionConsumerOperation::FencedTransition {
+                request: Box::new(transition.clone()),
+            },
+        );
+        let status_request = SessionConsumerRequest::new(
+            scope(),
+            SessionConsumerRequestId::from_bytes([0x73; 16]),
+            SessionConsumerOperation::FencedTransitionStatus {
+                request: Box::new(transition.clone()),
+            },
+        );
+
+        let storage_exhausted = SessionConsumerFencedTransitionError::StorageExhausted;
+        assert!(response_matches_request(
+            &consumer_request,
+            &SessionConsumerResponse::FencedTransition(Err(storage_exhausted)),
+        ));
+        assert_eq!(
+            fenced_transition_response(
+                &transition,
+                Ok(SessionConsumerResponse::FencedTransition(Err(
+                    storage_exhausted
+                ))),
+            ),
+            Err(SessionConsumerFencedTransitionMutationError::Store(
+                StoreError::FencedTransitionStorageExhausted,
+            )),
+        );
+        assert!(response_matches_request(
+            &status_request,
+            &SessionConsumerResponse::FencedTransitionStatus(Ok(
+                SessionConsumerFencedTransitionStatus::Recorded(Box::new(Err(storage_exhausted,))),
+            )),
+        ));
+
+        for impossible in [
+            SessionConsumerStoreError::Unavailable,
+            SessionConsumerStoreError::OutcomeUnavailable,
+            SessionConsumerStoreError::CapabilityNotSupported,
+            SessionConsumerStoreError::ProtectedDataRejected,
+            SessionConsumerStoreError::RequestConflict,
+        ] {
+            assert!(
+                !response_matches_request(
+                    &status_request,
+                    &SessionConsumerResponse::FencedTransitionStatus(Ok(
+                        SessionConsumerFencedTransitionStatus::Recorded(Box::new(Err(
+                            SessionConsumerFencedTransitionError::Store(impossible),
+                        ))),
+                    )),
+                ),
+                "nonpersisted error {impossible:?} must not be accepted as a receipt"
+            );
+        }
+
+        let wrong_recorded_error = SessionConsumerResponse::FencedTransition(Err(
+            SessionConsumerFencedTransitionError::Store(SessionConsumerStoreError::RestoreRejected),
+        ));
+        assert!(!response_matches_request(
+            &consumer_request,
+            &wrong_recorded_error,
+        ));
+        assert_eq!(
+            fenced_transition_response(&transition, Ok(wrong_recorded_error)),
+            Err(
+                SessionConsumerFencedTransitionMutationError::OutcomeUnknown {
+                    request_id: transition.request_id(),
+                }
+            ),
+        );
+
+        let timestamp = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let wrong_lease: LeaseGuard = serde_json::from_value(serde_json::json!({
+            "key": key,
+            "owner": OwnerId::new("fenced-transition-receipt-owner").expect("test owner"),
+            "fence": FenceToken::new(1),
+            "acquired_at": timestamp,
+            "expires_at": timestamp,
+            "credential_id": 1,
+        }))
+        .expect("public lease wire shape");
+        let wrong_outcome: FencedTransitionOutcome = serde_json::from_value(serde_json::json!({
+            "lease": wrong_lease,
+            "committed_generation": Generation::new(1),
+            "mutation": "Deleted",
+            "recorded_at": timestamp,
+            "retained_until": timestamp,
+        }))
+        .expect("bounded outcome wire shape");
+        let wrong_success = SessionConsumerResponse::FencedTransition(Ok(wrong_outcome));
+        assert!(!response_matches_request(&consumer_request, &wrong_success));
+        assert_eq!(
+            fenced_transition_response(&transition, Ok(wrong_success)),
+            Err(
+                SessionConsumerFencedTransitionMutationError::OutcomeUnknown {
+                    request_id: transition.request_id(),
+                }
+            ),
+        );
     }
 
     #[test]
@@ -9559,7 +10364,7 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_revision_two_envelopes_are_wire_identical() {
+    fn borrowed_revision_three_envelopes_are_wire_identical() {
         let request = mutation_request(SessionConsumerRequestId::new());
         let owned_request = ConsumerWireRequest::Call(ConsumerCall {
             correlation: NonZeroU32::MIN,
@@ -9633,7 +10438,7 @@ mod tests {
         "{\"kind\":\"response\",\"body\":{\"response\":\"watch_opened\"}}";
 
     #[test]
-    fn frozen_revision_one_frames_never_cross_decode_as_revision_two() {
+    fn frozen_revision_one_frames_never_cross_decode_as_revision_three() {
         let hello = format!(
             "{{\"kind\":\"hello\",\"body\":{{\"transport_revision\":1,\"scope\":{REVISION_ONE_SCOPE_JSON}}}}}"
         );
@@ -10006,7 +10811,7 @@ mod tests {
         assert_eq!(
             resolver_calls.load(Ordering::SeqCst),
             1,
-            "a legacy stateless timeout above the revision-2 ceiling remains source-compatible; the effective wire operation is internally capped"
+            "a legacy stateless timeout above the revision-3 ceiling remains source-compatible; the effective wire operation is internally capped"
         );
 
         let server_material = RotatableServerMaterial::new(

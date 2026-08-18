@@ -31,6 +31,29 @@ pub const SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES: usize =
     opc_consensus::CONSENSUS_CLUSTER_ID_MAX_BYTES;
 
 const COMMAND_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/command/v1\0";
+const FENCED_TRANSITION_VOTER_SET_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/fenced-transition-voter-set/v1\0";
+
+/// Produce the canonical, non-describing binding of one exact voter scope.
+///
+/// The durable activation certificate stores this digest rather than a second
+/// copy of membership descriptors.  The current scope remains authoritative
+/// for the actual members, while this fixed-width value prevents a certificate
+/// from being reused after a configuration or voter-set change.
+pub(crate) fn fenced_transition_voter_set_digest(
+    identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(FENCED_TRANSITION_VOTER_SET_DIGEST_DOMAIN);
+    hasher.update(identity.cluster_id().as_bytes());
+    hasher.update(identity.configuration_id().as_bytes());
+    hasher.update(identity.configuration_epoch().get().to_be_bytes());
+    for voter in voters {
+        hasher.update(voter.get().to_be_bytes());
+    }
+    hasher.finalize().into()
+}
 
 /// Redacted fixed-width binding of one topology member's admitted identities.
 ///
@@ -219,6 +242,20 @@ pub enum SessionMutationIntent {
     },
     /// Atomically acquire or renew one exact fence and mutate the same record.
     FencedTransition(Box<FencedTransitionRequest>),
+    /// The first V1 fenced transition for one exact voter scope.
+    ///
+    /// This is intentionally an internal command shape rather than a separate
+    /// admin request: its receipt, activation certificate, lease, and record
+    /// effect commit at exactly the caller's one transition log position.
+    #[doc(hidden)]
+    ActivateFencedTransition {
+        /// Original caller-owned transition.
+        request: Box<FencedTransitionRequest>,
+        /// Exact current authority scope observed during unanimous V1 proof.
+        scope_identity: SessionConsensusIdentity,
+        /// Canonical digest of the exact voter IDs in that scope.
+        voter_set_digest: [u8; 32],
+    },
 }
 
 impl fmt::Debug for SessionMutationIntent {

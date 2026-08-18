@@ -22,10 +22,19 @@ build-environment override was used.
   found that the first removal mutation below had accidentally remained in
   both published commits; the current source restores the typed outcome and
   the restoration digest pinned below before any #695 integration.
-- Included before #695: generic `opc-session-store` model, consensus admission,
-  SQLite apply/persistence/recovery, snapshots, documentation, and tests.
-- Excluded before #695 publishes: `opc-session-net`, any wire revision, and all
-  product/ePDG schema or protocol semantics.
+- Pre-#695 feature head: `e2706a32a8d109cf3ad1a327f45ddcb562db6cd6`
+  (tree `4c64318d5c2bb6747d24a951203af2de8b1d5329`).
+- Landed #695/main dependency and reviewed feature tree:
+  `b67143041c00b632fc5af634117b491839af68ff` (tree
+  `d47deb6bcd6bac85497ea06ed540403ff3593ade`).
+- Signed normal, non-rebased #695/main merge:
+  `dbe54e362a8cc0ce2143fbb3c1e427565d568cdc` (tree
+  `14b27eb4e760f7a3164aec4f67ea9a4300285c76`).
+- Included after that merge: the generic `opc-session-store` model and all
+  consensus/SQLite/recovery/snapshot boundaries, plus the revision-3 typed
+  least-authority one-shot and bounded persistent consumer transports.
+- Still excluded: every product/ePDG schema, Diameter/IKE/SWm/S2b/XFRM
+  semantic, arbitrary multi-key transaction, or raw consensus authority.
 
 ## Retained RED: the old split boundary
 
@@ -171,22 +180,24 @@ were then checked against the values captured before the mutation sequence:
 26f4bc9d530f34573ecf3e6d0250131e41a9b660efde3e834e5105aadfc1f049  crates/opc-session-store/src/consensus/store.rs
 ```
 
-They are rerun once more after #695 integration at the final exact head; this
+They were rerun once more after #695 integration at the final candidate; this
 pre-integration evidence is intentionally not the final merge gate.
 
-## Restored mutation integrity and final requalification plan
+## Final post-#695 mutation integrity
 
 The historical mutation results above are retained evidence, not a substitute
 for the final current-head qualification. Exact-head review of the preservation
 checkpoint detected that the OutcomeUnknown mutation itself had been retained;
-it was restored before continuing. The resulting source digests match the
-pre-mutation restoration baseline. After the normal #695/origin-main
-integration, run one mutation at a time, immediately restore it, and verify
-these source digests before starting the next mutation.
+it was restored before continuing. On 2026-08-18, after the normal #695 merge,
+durable activation, counter-exhaustion handling, recovery work, and the
+revoked-envelope ordering correction, all five mutations were rerun again.
+Each exact test failed at its intended invariant, the single mutation was
+restored immediately, and the same test then passed. Both source digests were
+verified before every next mutation and after the complete sequence:
 
 ```text
-4e090668dd34cfe70564787f4e43980b94fd9e698a0ae50542692ccd1b94107b  crates/opc-session-store/src/sqlite/consensus.rs
-298dab3f94c9a182be3e667ce60f0cb61e7ce8cfcb475d440169b8562c795736  crates/opc-session-store/src/consensus/store.rs
+6131da4ba33366220c43c8c5872974df95d502407fc43fff17c7e69b651b8419  crates/opc-session-store/src/sqlite/consensus.rs
+45f15c2e1f4c30c44a5122b1e590eb441576d6327b345d4f35b23dd8d490f9a4  crates/opc-session-store/src/consensus/store.rs
 ```
 
 The five one-line removal mutations and their exact regression commands are:
@@ -212,17 +223,21 @@ The five one-line removal mutations and their exact regression commands are:
    `sqlite::consensus::tests::fenced_transition_outer_request_id_mismatch_fails_follower_and_apply_admission`
    must fail, then pass after restoring that equality check.
 
-Each command uses the exact `opc-heavy cargo test --locked -p
+Each command used the exact `opc-heavy cargo test --locked -p
 opc-session-store --all-features` invocation already printed in its historical
-mutation section above, adding `--nocapture` only when diagnostic output is
-needed. No mutation may be retained for a second command, and a restored
-source digest mismatch is a hard stop rather than an opportunity to infer a
-passing restoration.
+mutation section above. The five RED assertions were, respectively: loss of
+typed ambiguity after possible delivery; mutation of a record with a different
+owner or fence; renewal/replacement at an unexpected generation; a receipt
+body conflict no longer returning its committed no-effect result; and a
+mismatched outer/nested ID entering a follower log. No mutation was retained
+for a second command.
 
-## Current focused regressions after deterministic repairs
+## Post-#695 integration checkpoint
 
-These are current working-tree results from 2026-08-17; they are not the
-remaining aggregate, mutation, Clippy, package, workspace, or post-#695 gates.
+These commands passed on 2026-08-17 after the normal #695 merge and initial
+revision-3 transport integration. They remain an historical integration
+checkpoint; the later durable activation and final mutation reruns are recorded
+separately above and in the final candidate sections below.
 
 ```text
 production_readiness_requires_fresh_authenticated_topology_and_accepts_refresh
@@ -239,7 +254,35 @@ result: PASS (1 passed, 0.89s)
 
 cargo fmt --all --check && git diff --check
 result: PASS (wrapper exit 0)
+
+cargo check --locked -p opc-session-store --all-targets --all-features
+result: PASS
+
+cargo check --locked -p opc-session-net --all-targets --all-features
+result: PASS
+
+cargo test --locked -p opc-session-store --lib fenced_transition --all-features
+result: PASS (41 passed)
+
+cargo test --locked -p opc-session-store --lib --all-features
+result: PASS (383 passed)
+
+cargo test --locked -p opc-session-net --lib consumer --no-fail-fast
+result: PASS (59 passed)
+
+cargo test --locked -p opc-session-net --lib --all-features
+result: PASS (261 passed)
 ```
+
+The revision-3 store consumer boundary derives one domain-separated internal
+receipt ID from the authenticated consumer identity, stable cluster identity,
+and public request ID, independent of body and changing configuration epoch.
+The same internal ID occupies the outer and nested consensus request fields;
+the durable receipt binds the complete canonical transition body. The adapter
+does not emit the legacy `BindConsumerRequest` command, so one consumer
+transition still has exactly one application log position. Both one-shot and
+persistent clients preserve the public request ID across `NotTransmitted`,
+`OutcomeUnknown`, and exact status recovery.
 
 The snapshot tests previously exceeded their five-minute command-batch bound
 because the durable append/apply path reconstructed two canonical in-memory
@@ -266,10 +309,14 @@ The current store-only hardening adds and exercises:
 - permanent bounded request/body and response commitments, including exact V1
   request-digest parity and corruption/reopen rejection;
 - the 4096-entry absorbing history cap and exact 24-hour retention horizon;
-- a one-way receipt-ledger activation marker, exact markerless #684 migration,
-  exact enumeration of all 12 released lease/operator-recovery/restore schema
-  products, an attached-only exact pre-authority Dynamic snapshot exception,
-  and rejection of activated missing/weak/partial ledger, identity-marker, or
+- an additive empty `Prepared` receipt ledger at the released schema version,
+  followed only by a unanimously proved first transition that atomically raises
+  the persistent downgrade fence, installs the exact current-scope activation
+  certificate, and records the caller receipt/effect in the same command;
+- exact markerless #684 migration, exact enumeration of all 12 released
+  lease/operator-recovery/restore schema products, an attached-only exact
+  pre-authority Dynamic snapshot exception, and rejection of activated
+  missing/weak/partial ledger, identity-marker, certificate, or
   historical-hybrid state;
 - monotonic snapshot-install floors for logical/application/watch/recovery
   state, including the application and recovery digest chains;
@@ -314,22 +361,25 @@ fence, application sequence, or watch effect.
 
 These are retained historical store-side gates, not the final exact-head
 verification. The hardened pre-#695 work was published early for durability;
-its exact heavy-gate rerun remains pending behind the active #695/urgent shared
-build queue. Every gate, including all five restored mutations, is rerun after
-the normal #695 merge together with workspace CI and least-authority consumer
-transport evidence.
+at that checkpoint its exact heavy-gate rerun remained pending behind the
+active #695/urgent shared build queue. The final sections below record the
+completed post-merge reruns, including all five restored mutations, workspace
+CI, and least-authority consumer transport evidence.
 
 ## Published-#684 recovery compatibility
 
 The additive receipt commitments and persisted lease-acquisition timestamp
 remain compatible with the exact published #684 database and snapshot shapes.
 Read-only recovery projects the absent acquisition timestamp as an explicit
-non-authoritative `NULL`. Only the exact markerless #684 manifest with no
-receipt table is accepted as an empty ledger. Read-only inspection does not
-mutate that source; writable open or staged recovery creates the exact empty
-ledger and one-way activation marker transactionally. A present empty weak or
-unpublished table, as well as any populated, partial, malformed, or activated
-missing-ledger layout, remains fail-closed.
+non-authoritative `NULL`. Only the exact markerless #684 manifest with neither
+receipt nor activation-certificate table is accepted as an empty ledger.
+Read-only inspection does not mutate that source; writable open or staged
+recovery creates the exact empty `Prepared` ledger with marker `0` at the
+released schema version. It does not activate V1. Activation happens only in a
+unanimously proved caller transition and raises the persistent schema fence in
+that same command. A present empty weak or unpublished table, as well as any
+populated, partial, malformed, or activated missing-ledger layout, remains
+fail-closed.
 
 Snapshot installation has one narrower historical exception: the exact
 pre-authority Dynamic-consensus manifest is accepted only while attached as an
@@ -350,16 +400,200 @@ result: PASS (1 passed)
 
 /srv/agents/agent-codex/.local/bin/opc-heavy cargo test --locked \
   -p opc-session-store --lib recovery:: --all-features
-result: PASS (41 passed)
+result: PASS (42 passed)
 ```
 
-The current 41-test recovery matrix (also covered by the complete
-package PASS above) includes exact pre-acquisition lease schema inspection,
+The current 42-test recovery matrix (also covered by the final 389-test
+store-library PASS below) includes exact pre-acquisition lease schema inspection,
 conversion, recovery planning, and digest equivalence; exact absent-ledger
 #684 acceptance; and rejection of present weak/empty, populated, partial,
 oversized, prematurely compacted, malformed, or durable-floor-inconsistent
-receipts.
+receipts. It also stages and applies an `Activated` majority checkpoint and
+proves that the raised schema fence, exact certificate, and retained receipt
+body/response commitments survive inspection, planning, and recovery.
 
-The final section will contain the exact post-integration store package, Clippy,
-format, documentation, workspace CI, hosted-check, and three-voter transport
-results once #695 publishes and is merged normally.
+## Independent canonical lanes after the #695 merge
+
+The following source-independent lanes passed on 2026-08-17 and were retained
+through the completed final Rust activation qualification:
+
+```text
+management-plane policy self-test/check: PASS
+Diameter corpus helper self-test: PASS
+CI shard manifest/partition verification: PASS (269 integration targets)
+Go SDK reference operator gofmt/vet/race: PASS
+Go operator SDK gofmt/vet/race/downstream import: PASS
+Kustomize build plus Helm lint and both rendered YAML modes: PASS
+vendored dimpl source-policy searches: PASS
+```
+
+The source-independent results are retained here; the final integrated
+candidate results and current host-only limitations are recorded below.
+
+## Final integrated candidate: authority, durability, and transport
+
+The post-#695 candidate retains one generic mutation command. A consumer
+request derives one domain-separated, nonzero internal ID from the
+authenticated consumer identity, stable cluster identity, and public 16-byte
+request ID. The operation body and rotating authority epoch are deliberately
+excluded from that derivation. The same internal ID occupies the outer
+consensus envelope and nested fenced request, while the durable receipt binds
+the complete canonical transition body. Consequently, an exact replay returns
+the recorded outcome, a changed body under the same public ID returns
+`FencedTransitionRequestConflict`, and distinct authenticated identities use
+distinct receipt namespaces. The adapter never emits the legacy consumer
+binding command, so the lease decision and one bounded record mutation still
+occupy one application-log position.
+
+Mixed-version admission is durable rather than a perpetual all-voter liveness
+dependency. An empty writable ledger is only `Prepared`. Before the first V1
+transition for an exact authority scope, every configured voter must answer an
+authenticated V1 capability probe. The first caller command then carries the
+internal activation wrapper and atomically installs the raised schema-version
+downgrade fence, exact scope/voter-set certificate, receipt, lease decision,
+and record effect. Once that command commits, capability, observation,
+execution, status, failover, and restart use ordinary current-scope quorum
+authority. A topology cutover deletes the predecessor certificate but retains
+the one-way schema fence and receipt history; the successor scope must prove
+all of its exact voters on its first transition. Revoked predecessor envelopes
+are deterministic no-effect entries: they neither install a certificate nor
+execute the body, and an unactivated ledger does not bind them prematurely.
+
+Follower projection validates the outer/nested ID, activation state, exact
+projected scope and voter digest, including topology and activation commands in
+the same batch. Snapshot installation copies the identity fence, optional
+exact-current certificate, and receipt ledger atomically; it rejects activated
+to prepared regression and same-scope certificate erasure/substitution while
+permitting a legitimately unactivated successor scope. Recovery includes the
+activation layout and optional certificate in its checkpoint digest and
+preserves them through inspect/plan/stage/apply. A released #684 database
+remains accepted only in its exact historical shape, and a pre-V1 binary is
+fenced from opening the activated schema.
+
+All SQLite-backed counters that must fit positive signed storage values are
+admitted before effect persistence. Generation, fence, credential, restore,
+application, and watch exhaustion produce the fixed retained
+`FencedTransitionStorageExhausted` no-effect result instead of a committed
+node-local state-machine fault. Exact replay, status, changed-body conflict,
+snapshot/reopen, replica convergence, and a following log entry remain
+deterministic at the boundary.
+
+The public consumer wire revision is `3` for both one-shot and bounded
+persistent transports. Frozen v7/#695 qualification remains the historical
+revision-2 contract; the live runner emits a separate v8 exact-head evidence
+document whose schema pins revision `3` to the compiled handshake constant.
+The immutable schema digests are:
+
+```text
+3ce5f0e622508ba89820742514eddfd2c0575265754c0bdd1a726e5b3335ecca  qualification/v7/session-ha-profile.schema.json
+0b02633f0118283f425c4b60d8540de4503023d3759b7c6939ebaf2d16365772  qualification/v7/session-ha-evidence.schema.json
+cdd148f29968e71de58438947d3c6ca9f0fcd36d85420f4b87bf8983027e922a  qualification/v8/session-ha-persistent-consumer-head-evidence.schema.json
+```
+
+Request admission separately requires byte-identical public outer/nested IDs
+and derived internal consensus outer/nested IDs. Transport response validation
+checks the complete typed outcome against the request body and recorded logical
+time; wire correlation and the status/recovery envelopes validate the public
+request ID where they carry it. Proven pre-transmission failures remain
+`NotTransmitted`; any possibly transmitted missing, substituted, malformed,
+body-inconsistent, or envelope-ID-inconsistent response becomes
+`OutcomeUnknown` with the public request ID retained for exact status recovery.
+Observation and status collapse local SQLite/schema/hydration
+failures to fixed SDK-controlled diagnostics; keys, owners, request IDs,
+timestamps, record values, state classes, paths, SQL, and table names are not
+returned.
+
+## Final integrated candidate: focused and canonical local gates
+
+The following focused gates passed after the activation, counter-exhaustion,
+revision-3 transport, recovery, and revoked-envelope corrections were combined:
+
+```text
+cargo test --locked -p opc-session-store --lib fenced_transition --all-features
+result: PASS (46 passed)
+
+cargo test --locked -p opc-session-store --lib --all-features
+result: PASS (389 passed)
+
+cargo test --locked -p opc-session-store --test consensus_openraft fenced_transition --all-features
+result: PASS (17 passed)
+
+cargo test --locked -p opc-session-store --test consensus_openraft red_696_split --all-features
+result: PASS (2 passed)
+
+cargo test --locked -p opc-session-store --lib recovery:: --all-features
+result: PASS (42 passed)
+
+cargo test --locked -p opc-session-net --lib consumer --all-features --no-fail-fast
+result: PASS (60 passed)
+
+cargo test --locked -p opc-session-testkit --test qualification_profile
+result: PASS (19 passed)
+
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+result: PASS
+
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+result: PASS
+
+cargo fmt --all --check && git diff --check
+result: PASS
+
+management-plane policy self-test/check: PASS
+Diameter corpus helper self-test: PASS
+publish-order graph check: PASS (33 publishable crates)
+```
+
+The typed least-authority mTLS transition path passed independently in every
+topology/transport combination. Each run covers capability and fresh
+observation, Acquire+Create, exact replay, changed-body conflict, exact status,
+all-voter convergence, replacement-leader status/readback with the same
+authenticated consumer identity, and a fresh transition after failover:
+
+```text
+three_process_projected_mtls_stateless_quorum_consumers: PASS (42.09s)
+three_process_projected_mtls_persistent_quorum_consumers: PASS (33.57s)
+five_process_projected_mtls_stateless_quorum_consumers: PASS (35.39s)
+five_process_projected_mtls_persistent_quorum_consumers: PASS (33.99s)
+```
+
+The repository-authored shard plan verified 269 integration targets plus the
+explicit mTLS heavy partition. All six unmodified shard plans passed using
+their generated commands and repository-default test thread counts:
+
+```text
+ci/test-shards.py verify: PASS (6 shards; 269 integration targets)
+misc: PASS (including 42 selected mTLS tests; 2 ignored by plan)
+it-0: PASS (94 targets)
+it-1: PASS (75 targets)
+it-2: PASS (100 targets)
+heavy-0: PASS (2 passed; 349.74s)
+heavy-1: PASS (2 passed; 444.97s)
+ci/test-shards.py verify-heavy: PASS (48 = 44 misc + 4 heavy)
+```
+
+The isolated and platform-admission lanes also passed:
+
+```text
+opc-persist default/no-feature Clippy and no-run contract: PASS
+opc-persist four security/break-glass suites, serial: PASS (38 passed)
+opc-persist all-feature serial suite: PASS
+forced unsupported GTP-U cfg suite: PASS
+examples/smf-reference format, all-target/all-feature Clippy, tests: PASS
+vendored dimpl external-consumer resolution and formatting: PASS
+vendored dimpl RustCrypto production panic-path Clippy: PASS
+vendored dimpl RFC 6083 source invariants: PASS
+```
+
+The installed i686 Rust target could not be compiled or linked locally, and
+therefore could not execute, because this host lacks the 32-bit libc
+development/startup objects (`gnu/stubs-32.h`,
+`Scrt1.o`, `crti.o`, and 32-bit `libgcc_s`). The vendored all-target/test lanes
+likewise stop before source compilation because the host lacks `autoreconf` for
+the wolfSSL build. No system package, toolchain, Git identity, concurrency, or
+build configuration was changed to bypass either environmental prerequisite;
+the dedicated hosted lanes must supply the authoritative results. The host also
+lacks the pinned actionlint/pyflakes, cargo-hack, rasn-compiler, Rust 1.88,
+FreeBSD, and macOS
+toolchains, so those remain explicit hosted gates rather than locally inferred
+passes.

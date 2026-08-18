@@ -697,6 +697,29 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Check the bounded V1 activation certificate after a caller-owned
+    /// consensus barrier.  A missing or stale certificate is a normal
+    /// unsupported state; storage failure remains unavailable.
+    pub(crate) async fn consensus_fenced_transition_activation_matches_scope(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        scope_identity: crate::consensus::SessionConsensusIdentity,
+        voters: std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+    ) -> Result<bool, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::fenced_transition_activation_matches_scope_sync(
+                conn,
+                storage_identity,
+                scope_identity,
+                &voters,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable("fenced transition activation is unavailable".into())
+            })
+        })
+        .await
+    }
+
     /// Read at a logical timestamp already committed by the consensus state
     /// machine. This path is read-only: expiry affects visibility but never
     /// prunes physical rows outside a committed command.
@@ -751,6 +774,13 @@ impl SqliteSessionBackend {
             Ok(observation)
         })
         .await
+        // This observation is returned to fenced-transition callers. Persisted
+        // rows and SQLite diagnostics can contain session data or local schema
+        // details, so its entire failure surface is intentionally one fixed,
+        // SDK-controlled availability error.
+        .map_err(|_| {
+            StoreError::BackendUnavailable("fenced transition observation is unavailable".into())
+        })
     }
 
     /// Read one exact fenced-transition receipt after a caller-owned barrier.
@@ -1178,6 +1208,111 @@ fn consensus_value_cap_stays_below_unexpanded_transport_contract() {
         SQLITE_CONSENSUS_MAX_VALUE_BYTES
     );
     assert!(backend.consensus_capabilities().max_value_bytes < SQLITE_SESSION_MAX_VALUE_BYTES);
+}
+
+#[cfg(test)]
+mod fenced_transition_observation_redaction_tests {
+    use super::*;
+    use crate::model::SessionKeyType;
+    use bytes::Bytes;
+    use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+
+    const FIXED_MESSAGE: &str = "fenced transition observation is unavailable";
+
+    fn key() -> SessionKey {
+        SessionKey {
+            tenant: TenantId::new("sqlite-observe-tenant").expect("tenant"),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"key-canary")
+                .try_into()
+                .expect("stable ID"),
+        }
+    }
+
+    fn assert_fixed_redacted_error(error: StoreError) {
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable(FIXED_MESSAGE.into()),
+            "observation errors use one fixed SDK category"
+        );
+        assert_eq!(
+            display,
+            format!("backend unavailable: {FIXED_MESSAGE}"),
+            "observation display is fixed"
+        );
+        assert_eq!(
+            debug,
+            format!("BackendUnavailable(\"{FIXED_MESSAGE}\")"),
+            "observation debug is fixed"
+        );
+        for forbidden in [
+            "key-canary",
+            "owner-canary",
+            "request-canary",
+            "state-class-canary",
+            "timestamp-canary",
+            "session_records",
+            "key_fences",
+            "state_class",
+            "no such table",
+            "SQLite",
+            "/",
+        ] {
+            assert!(
+                !display.contains(forbidden) && !debug.contains(forbidden),
+                "observation error leaked {forbidden:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_persisted_record_is_redacted_from_fenced_transition_observation() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite backend");
+        let key = key();
+        {
+            let conn = backend.conn.lock().await;
+            conn.execute(
+                "INSERT INTO session_records (tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding) VALUES (?1, ?2, ?3, ?4, 1, ?5, 1, ?6, ?7, ?8, X'00', 2)",
+                rusqlite::params![
+                    key.tenant.as_str(),
+                    key.nf_kind.as_str(),
+                    key.key_type.to_string(),
+                    key.stable_id.as_ref(),
+                    "owner-canary",
+                    "state-class-canary",
+                    "request-canary",
+                    "timestamp-canary",
+                ],
+            )
+            .expect("insert corrupt persisted record");
+        }
+
+        let error = backend
+            .consensus_observe_fenced_transition_at(&key, Timestamp::now_utc())
+            .await
+            .expect_err("corrupt persisted record must fail observation");
+        assert_fixed_redacted_error(error);
+    }
+
+    #[tokio::test]
+    async fn schema_failure_is_redacted_from_fenced_transition_observation() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite backend");
+        let key = key();
+        {
+            let conn = backend.conn.lock().await;
+            conn.execute_batch("DROP TABLE session_records")
+                .expect("remove observation table");
+        }
+
+        let error = backend
+            .consensus_observe_fenced_transition_at(&key, Timestamp::now_utc())
+            .await
+            .expect_err("missing table must fail observation");
+        assert_fixed_redacted_error(error);
+    }
 }
 
 fn sqlite_store_outcome_unavailable(kind: SqliteStoreWorkKind) -> StoreError {

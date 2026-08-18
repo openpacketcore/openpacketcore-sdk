@@ -200,12 +200,20 @@ impl FencedTransitionLease {
 
     pub(crate) fn validate(&self) -> Result<(), StoreError> {
         validate_positive_ttl(self.ttl())?;
+        if let Self::Renew { lease, .. } = self {
+            lease.validate_profile()?;
+        }
         let _ = self.committed_fence()?;
         Ok(())
     }
 
     pub(crate) fn validate_at(&self, logical_time: Timestamp) -> Result<(), StoreError> {
         self.validate()?;
+        if let Self::Renew { lease, .. } = self {
+            if lease.expires_at() <= logical_time {
+                return Err(StoreError::LeaseExpired);
+            }
+        }
         let _ = checked_session_deadline(logical_time, self.ttl())?;
         Ok(())
     }
@@ -533,6 +541,15 @@ impl FencedTransitionOutcome {
     /// Whether exact replay/status has expired at a committed logical time.
     pub fn is_expired_at(&self, logical_time: Timestamp) -> bool {
         self.retained_until <= logical_time
+    }
+
+    /// Validate a deserialized outcome against its complete transition body.
+    ///
+    /// The outcome's own committed timestamp is authoritative; callers do not
+    /// supply a wall-clock value that could accidentally validate a receipt at
+    /// a different logical time.
+    pub fn matches_request(&self, request: &FencedTransitionRequest) -> bool {
+        self.matches_request_at(request, self.recorded_at)
     }
 
     /// Validate that one serialized success is the exact result shape implied
@@ -897,6 +914,109 @@ mod tests {
     }
 
     #[test]
+    fn renew_rejects_malformed_guard_profile_structurally() {
+        let owner = OwnerId::new("owner-a").expect("owner");
+        let request = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x11; 16]),
+            FencedTransitionLease::Renew {
+                lease: LeaseGuard::new(
+                    key(),
+                    owner,
+                    FenceToken::new(8),
+                    timestamp(20),
+                    timestamp(19),
+                    1,
+                ),
+                ttl: Duration::from_secs(30),
+            },
+            FencedTransitionMutation::delete(Generation::new(1)),
+        );
+
+        assert!(matches!(
+            request,
+            Err(StoreError::InvalidKey(message)) if message == "invalid lease guard"
+        ));
+    }
+
+    #[test]
+    fn renew_requires_a_guard_live_at_admission() {
+        let owner = OwnerId::new("owner-a").expect("owner");
+        let admission = timestamp(20);
+        let request_with_expiry = |request_id, expires_at| {
+            FencedTransitionRequest::new(
+                FencedTransitionRequestId::from_bytes([request_id; 16]),
+                FencedTransitionLease::renew(
+                    LeaseGuard::new(
+                        key(),
+                        owner.clone(),
+                        FenceToken::new(8),
+                        timestamp(10),
+                        expires_at,
+                        1,
+                    ),
+                    Duration::from_secs(30),
+                )
+                .expect("structurally valid lease"),
+                FencedTransitionMutation::delete(Generation::new(1)),
+            )
+            .expect("structurally valid request")
+        };
+
+        for (request_id, expires_at) in [(0x12, admission), (0x13, timestamp(19))] {
+            assert_eq!(
+                request_with_expiry(request_id, expires_at).validate_at(admission),
+                Err(StoreError::LeaseExpired)
+            );
+        }
+        assert!(request_with_expiry(0x14, timestamp(21))
+            .validate_at(admission)
+            .is_ok());
+    }
+
+    #[test]
+    fn renew_outcome_matches_only_a_guard_live_at_recorded_time() {
+        let owner = OwnerId::new("owner-a").expect("owner");
+        let recorded_at = timestamp(20);
+        let request_with_expiry = |request_id, expires_at| {
+            FencedTransitionRequest::new(
+                FencedTransitionRequestId::from_bytes([request_id; 16]),
+                FencedTransitionLease::renew(
+                    LeaseGuard::new(
+                        key(),
+                        owner.clone(),
+                        FenceToken::new(8),
+                        timestamp(10),
+                        expires_at,
+                        1,
+                    ),
+                    Duration::from_secs(30),
+                )
+                .expect("structurally valid lease"),
+                FencedTransitionMutation::delete(Generation::new(1)),
+            )
+            .expect("structurally valid request")
+        };
+        let outcome = FencedTransitionOutcome::new(
+            LeaseGuard::new(
+                key(),
+                owner.clone(),
+                FenceToken::new(8),
+                timestamp(10),
+                checked_session_deadline(recorded_at, Duration::from_secs(30))
+                    .expect("renewed lease expiry"),
+                1,
+            ),
+            Generation::new(1),
+            FencedTransitionMutationResult::Deleted,
+            recorded_at,
+        )
+        .expect("valid outcome shape");
+
+        assert!(outcome.matches_request(&request_with_expiry(0x15, timestamp(21))));
+        assert!(!outcome.matches_request(&request_with_expiry(0x16, recorded_at)));
+    }
+
+    #[test]
     fn request_identity_must_not_be_all_zeroes() {
         let owner = OwnerId::new("owner-a").expect("owner");
         let request = FencedTransitionRequest::new(
@@ -988,6 +1108,39 @@ mod tests {
             invalid.validate(),
             Err(StoreError::Serialization(_))
         ));
+    }
+
+    #[test]
+    fn public_outcome_validation_uses_the_outcome_recorded_time() {
+        let recorded_at = timestamp(10);
+        let owner = OwnerId::new("outcome-validation-owner").expect("owner");
+        let request = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x44; 16]),
+            FencedTransitionLease::acquire(
+                key(),
+                owner.clone(),
+                FenceToken::new(7),
+                Duration::from_secs(30),
+            )
+            .expect("lease"),
+            FencedTransitionMutation::create(record(key(), owner.clone(), FenceToken::new(8), 1)),
+        )
+        .expect("request");
+        let outcome = FencedTransitionOutcome::new(
+            LeaseGuard::new(
+                key(),
+                owner,
+                FenceToken::new(8),
+                recorded_at,
+                checked_session_deadline(recorded_at, Duration::from_secs(30)).expect("expiry"),
+                1,
+            ),
+            Generation::new(1),
+            FencedTransitionMutationResult::Created,
+            recorded_at,
+        )
+        .expect("outcome");
+        assert!(outcome.matches_request(&request));
     }
 
     #[test]
@@ -1179,6 +1332,7 @@ mod tests {
                 StoreError::FencedTransitionRequestExpired,
                 StoreError::FencedTransitionHistoryFull,
                 StoreError::FencedTransitionRetentionExhausted,
+                StoreError::FencedTransitionStorageExhausted,
             ]
             .map(|error| error.to_string()),
             [
@@ -1187,6 +1341,7 @@ mod tests {
                 "fenced transition result retention expired",
                 "fenced transition request history is full",
                 "fenced transition result retention horizon is exhausted",
+                "fenced transition storage counter is exhausted",
             ]
             .map(str::to_owned)
         );

@@ -1595,7 +1595,8 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
             )
         }
         StoreError::FencedTransitionHistoryFull
-        | StoreError::FencedTransitionRetentionExhausted => IpsecLbError::Unsupported,
+        | StoreError::FencedTransitionRetentionExhausted
+        | StoreError::FencedTransitionStorageExhausted => IpsecLbError::Unsupported,
         StoreError::BackendOperationOutcomeUnavailable => IpsecLbError::io(
             "session_store_mutation",
             io::Error::new(
@@ -3487,6 +3488,10 @@ mod tests {
             ),
             (
                 StoreError::FencedTransitionRetentionExhausted,
+                IpsecLbError::Unsupported,
+            ),
+            (
+                StoreError::FencedTransitionStorageExhausted,
                 IpsecLbError::Unsupported,
             ),
         ] {

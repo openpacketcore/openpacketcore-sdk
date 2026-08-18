@@ -210,6 +210,11 @@ pub enum StoreError {
     /// The request remains unbound and no lease or record effect occurred.
     #[error("fenced transition result retention horizon is exhausted")]
     FencedTransitionRetentionExhausted,
+    /// SQLite's signed persistent counters cannot represent the next atomic
+    /// fenced-transition effect. The request is durably recorded as a fixed
+    /// deterministic rejection so an exact retry can recover this result.
+    #[error("fenced transition storage counter is exhausted")]
+    FencedTransitionStorageExhausted,
 }
 
 /// Error type for lease operations.
@@ -511,6 +516,13 @@ mod tests {
             StoreError::RestoreScanResponseTooLarge { max_bytes: 2 },
             LegacyStoreError684::RestoreScanResponseTooLarge { max_bytes: 2 }
         );
+
+        // This variant was appended after the published schema-v1 enum. It
+        // intentionally has no legacy counterpart: every preexisting ordinal
+        // above must continue to cross-decode unchanged.
+        let encoded = opc_consensus::encode_bounded(&StoreError::FencedTransitionStorageExhausted)
+            .expect("appended StoreError postcard encoding");
+        assert!(opc_consensus::decode_bounded::<LegacyStoreError684>(&encoded).is_err());
     }
 
     #[test]

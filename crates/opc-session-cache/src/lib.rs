@@ -702,6 +702,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::FencedTransitionRequestExpired => "fenced_transition_request_expired",
         StoreError::FencedTransitionHistoryFull => "fenced_transition_history_full",
         StoreError::FencedTransitionRetentionExhausted => "fenced_transition_retention_exhausted",
+        StoreError::FencedTransitionStorageExhausted => "fenced_transition_storage_exhausted",
         StoreError::BackendOperationOutcomeUnavailable => "backend_operation_outcome_unavailable",
         StoreError::TopologyAuthorityRevoked => "topology_authority_revoked",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
@@ -785,6 +786,10 @@ mod tests {
             (
                 StoreError::FencedTransitionRetentionExhausted,
                 "fenced_transition_retention_exhausted",
+            ),
+            (
+                StoreError::FencedTransitionStorageExhausted,
+                "fenced_transition_storage_exhausted",
             ),
         ] {
             assert_eq!(store_error_kind(&error), kind);

@@ -246,14 +246,30 @@ and compatibility fresh-authentication typed least-authority surface required by
 `PersistentSessionConsumerClient` with `SessionQuorumConsumerServer` is the
 required warm fixed-pool primitive for #695/ePDG latency. Production deployments
 that require warm reuse should use it. Both use mutual TLS with the unchanged
-`opc-session-consumer/1` ALPN and exact consumer transport revision 2. Revision
-1 will not fall back or interoperate. The
-unreleased SDK requires one coordinated, drained client/listener cutover; there
-is no dual mode. Revision-2 private JSON DTO bytes are canonical; reordered or
+`opc-session-consumer/1` ALPN and exact consumer transport revision 3. Earlier
+revisions will not fall back or interoperate. The unreleased SDK requires one
+coordinated, drained client/listener cutover; there is no dual mode. Revision-3
+private JSON DTO bytes are canonical; reordered or
 otherwise noncanonical encodings, aliases, omissions, and unknown fields fail
 closed. This does not add `RemoteSessionBackend` or any
 consensus/replication/snapshot/rebuild/membership/admin authority, and it
-explicitly excludes #696 atomic transition and product composition.
+adds only #696's generic, single-record atomic fenced-transition capability,
+observation, execution, and exact-status operations. Product composition and
+ePDG-specific semantics remain excluded.
+
+For a fenced transition, the public consumer request ID is byte-identical to
+the nested transition ID. The internal receipt ID is domain-separated by
+authenticated consumer identity, stable cluster identity, and that public ID;
+it excludes the body and changing configuration epoch, while the receipt binds
+the complete canonical body. Exact current scope is admitted independently on
+every access: an authorized successor can recover across rollover, but a
+revoked predecessor cannot observe the receipt. No separate
+`BindConsumerRequest` or log entry is used. The deterministic
+`FencedTransitionStorageExhausted` result is retained and body-bound after
+ordinary admission; exact replay and status return it as a closed
+`StorageExhausted` error inside `Recorded`, with no lease, record, watch, or
+restore effect. Frozen legacy session-net v5 maps it fail-closed as an unknown
+capability without a wire-enum change.
 
 Each request connection carries a nonzero, monotonically increasing
 connection-local `u32` correlation with no wrap and at most 4,096 sequential
@@ -333,8 +349,11 @@ its elapsed samples are explicitly non-gating. The exact method and bounded raw
 samples are retained in
 [`qualification-695-persistent-consumer.md`](../../docs/qualification-695-persistent-consumer.md).
 
-The revision-2 persistent-consumer qualification contract is recorded in the
-v7 profile. The published v6 profile remains the unchanged revision-1 contract.
+The revision-2 persistent-consumer transport qualification contract remains
+recorded in the v7 profile and the published v6 profile remains the unchanged
+revision-1 contract. Revision 3 retains every bounded persistent-transport
+property from that evidence and adds the generic #696 operation family; its
+exact-head evidence is recorded with the atomic-transition qualification.
 
 ## API Shape
 

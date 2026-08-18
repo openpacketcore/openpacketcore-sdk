@@ -4012,7 +4012,8 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
             "session re-pin journal fenced transition identity was reused",
         ),
         StoreError::FencedTransitionHistoryFull
-        | StoreError::FencedTransitionRetentionExhausted => IpsecLbError::Unsupported,
+        | StoreError::FencedTransitionRetentionExhausted
+        | StoreError::FencedTransitionStorageExhausted => IpsecLbError::Unsupported,
         StoreError::InvalidSessionTtl => IpsecLbError::invalid_config(
             "session_repin.ttl",
             "session re-pin journal TTL is invalid",
@@ -4131,6 +4132,10 @@ mod tests {
             ),
             (
                 StoreError::FencedTransitionRetentionExhausted,
+                IpsecLbError::Unsupported,
+            ),
+            (
+                StoreError::FencedTransitionStorageExhausted,
                 IpsecLbError::Unsupported,
             ),
         ] {

@@ -440,15 +440,58 @@ least-authority surface required by #649, #688, and #691; it is neither hidden,
 deprecated, nor test-only. `PersistentSessionConsumerClient` remains the
 required warm fixed-pool primitive for #695/ePDG latency, so production
 deployments requiring warm reuse should use it. It retains the
-`opc-session-consumer/1` ALPN and advances the exact
-consumer transport revision from 1 to 2. There is no fallback, dual mode, or
+`opc-session-consumer/1` ALPN and now uses exact consumer transport revision 3.
+There is no fallback, dual mode, or
 mixed-revision path: clients and listeners must be drained and cut over
-coordinately. Revision-2 private JSON DTO bytes are canonical; reordered or
+coordinately. Revision-3 private JSON DTO bytes are canonical; reordered or
 otherwise noncanonical encodings, aliases, omissions, and unknown fields fail
 closed. This boundary remains separate from consensus and the quarantined
 legacy backend protocol; it exposes no `RemoteSessionBackend`, consensus,
-replication, snapshot, rebuild, membership, or admin API, and does not include
-#696 atomic transition or product composition.
+replication, snapshot, rebuild, membership, or admin API. Revision 3 includes
+only #696's generic one-record atomic fenced-transition capability,
+observation, execution, and exact status; it does not include product
+composition or ePDG-specific semantics.
+
+Before V1 is activated for the exact current consensus voter scope, capability,
+observation, status, and first-transition admission require fresh authenticated
+V1 replies from every exact voter; a Raft quorum is not mixed-version proof,
+and an unavailable or incompatible voter fails closed. The first authorized
+transition after that proof carries internal scope identity and a canonical
+voter-set commitment in its same single user command/application position. Its
+atomic apply installs receipt/effects, the one-way persistent schema-version
+downgrade fence, and an optional single-row exact-current-scope certificate,
+without another user mutation or log position. These are durable admission
+fields, not public consumer-wire fields. Once committed, ordinary linearizable
+Raft quorum availability serves capability, observation, execution, and status;
+leader or minority loss does not re-probe every voter.
+
+Topology cutover deletes the old certificate only: the schema fence and receipt
+bindings remain, and the successor scope requires a fresh every-voter proof and
+its first activating or recovery transition. Stable request ID/body recovery
+survives that rollover. The exact #684 layout is empty Prepared state and safe
+for predecessor readers until activation. Activated databases, snapshots, and
+recovery preserve the fence and receipts plus any exact-current certificate;
+snapshots never regress Activated to Prepared or erase/substitute a same-scope
+certificate. A legitimately unactivated successor scope may have no
+certificate pending its new proof. Exact predecessor binaries reject the
+higher schema fence. An
+offline pre-V1 minority is not safe to catch up simply because it did not
+acknowledge activation: the persistent fence prevents an old reader from
+silently omitting activated snapshot state.
+
+The public consumer request ID is byte-identical to the nested transition ID.
+The quorum adapter's internal receipt ID is domain-separated by authenticated
+consumer identity, stable cluster identity, and public ID; it excludes the
+body and changing configuration epoch, while the receipt binds the complete
+canonical body. The current exact scope is enforced under the activation
+lifecycle above, so an authorized successor recovers across rollover and a
+revoked predecessor cannot observe the receipt. There is no separate
+`BindConsumerRequest` or log entry. `FencedTransitionStorageExhausted` is a
+retained, body-bound deterministic no-effect result after ordinary
+stale-fence/CAS/lease admission;
+consumer revision 3 carries it as a closed `StorageExhausted` error inside
+`Recorded` status. Frozen legacy session-net v5 maps it fail-closed as an
+unknown capability without changing its wire enum.
 
 Request connections are deliberately sequential: a nonzero connection-local
 monotonic `u32` correlation never wraps, retires after at most 4,096 calls, and
@@ -502,7 +545,8 @@ is leased; isolated watch slots are non-gating. Performance evidence is
 synthetic only and makes no ePDG production-SLO claim. Its warm accept/reuse
 checks gate only the synthetic transport method; elapsed samples are
 non-gating. The revision-2 persistent-consumer qualification contract is v7;
-the published v6 profile remains the unchanged revision-1 contract.
+the published v6 profile remains the unchanged revision-1 contract. Revision 3
+retains that bounded transport and adds exact-head atomic-transition evidence.
 
 ### Legacy backend and restore transport (protocol v5)
 

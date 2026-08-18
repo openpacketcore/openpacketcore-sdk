@@ -1612,14 +1612,14 @@ umbrella until that fleet evidence passes.
 `StatelessSessionConsumerClient`, `PersistentSessionConsumerClient`, and
 `SessionQuorumConsumerServer` provide the typed least-authority
 application-consumer boundary. They MUST use mutual TLS and the dedicated
-`opc-session-consumer/1` ALPN with transport revision 2. This is a separate
+`opc-session-consumer/1` ALPN with transport revision 3. This is a separate
 exact protocol from both `opc-session-consensus/2` and the quarantined
 `opc-session-net/5` compatibility protocol. A listener MUST NOT offer a
 fallback, negotiate a common revision, or multiplex either other protocol as
-equivalent consumer authority. Revision 1 and revision 2 do not interoperate.
+equivalent consumer authority. Revisions 1, 2, and 3 do not interoperate.
 Because this SDK is unreleased, deployments MUST drain consumer clients and
-listeners, then make one coordinated revision-2 cutover; fallback, dual-mode,
-and mixed-revision consumer operation are unsupported. Revision-2 private JSON
+listeners, then make one coordinated revision-3 cutover; fallback, dual-mode,
+and mixed-revision consumer operation are unsupported. Revision-3 private JSON
 DTO bytes are canonical; reordered or otherwise noncanonical encodings,
 aliases, omissions, and unknown fields MUST fail closed.
 
@@ -1642,14 +1642,47 @@ record only redaction-safe status/count information, never their concrete
 values.
 
 The API exposes typed session reads, bounded mutation/lease operations,
-bounded restore scans, capability discovery, and a coarse committed-change
-watch. It does not expose membership, voting, peer discovery, replication-log
-read/append, raw replication operation trees, snapshots, rebuild/recovery,
-atomic transition/product composition, or any topology/consensus authority.
+bounded restore scans, capability discovery, a coarse committed-change watch,
+and #696's generic one-record atomic fenced transition. The latter includes an
+exact-key observation, one lease-acquire or lease-renew action plus one bounded
+record mutation, and exact retained-status readback. Before V1 activation for
+the exact current voter scope, capability, observation, status, and first
+transition admission require fresh authenticated replies from every exact
+voter; an unavailable or incompatible voter fails closed. A quorum is not a
+mixed-version proof. It does not expose membership, voting, peer discovery,
+replication-log read/append, raw replication operation trees, snapshots,
+rebuild/recovery, product composition, or any topology/consensus authority.
 It also excludes every legacy `RemoteSessionBackend` API and all
 consensus/replication/snapshot/rebuild/membership/admin APIs. The server
 constructor accepts only the existing least-authority `SessionQuorumConsumer`
 port, and all accepted mutations route through the durable quorum leader path.
+
+The first authorized transition after that unanimous proof carries the scope
+identity and canonical voter-set commitment inside its same single user command
+and application position. Apply atomically installs its receipt/effects, the
+one-way persistent schema-version downgrade fence, and an optional single-row
+exact-current-scope activation certificate; it creates no separate user
+mutation or log position. Those internal proof fields are not consumer-wire
+semantics. After this command commits, normal linearizable Raft quorum
+availability suffices for capability, observation, execution, and status; a
+leader change or minority loss does not require another all-voter probe. A
+topology cutover deletes only the old scope certificate, retaining the schema
+fence and receipt bindings. Its successor scope must repeat the every-voter
+proof and first activating or recovery transition, while stable request-ID/body
+receipt recovery survives the rollover.
+
+The exact #684 layout has no ledger. A current writable open may add the exact
+empty Prepared ledger and zero marker without changing the predecessor schema
+version, so no V1 authority exists and predecessor readers remain safe until
+activation. Activated main databases, snapshots, and recovery preserve the
+schema fence and receipt bindings plus any exact-current certificate; snapshot
+install never regresses Activated to Prepared or erases/substitutes a
+same-scope certificate. A legitimately unactivated successor scope may have no
+certificate pending its new proof. Exact predecessor binaries reject the
+higher schema fence. An offline pre-V1 minority is not safe
+to catch up merely because it did not acknowledge activation: an old reader
+could silently omit new snapshot state, which the persistent fence prevents by
+rejecting the activated image.
 
 Each request connection carries a connection-local, nonzero `u32`
 correlation that increases monotonically and never wraps; it is retired after
@@ -1732,6 +1765,32 @@ of that ID for a different request is a closed conflict. Applications otherwise
 must perform authoritative readback and apply the existing fencing/idempotency
 contract.
 
+`FencedTransitionStorageExhausted` is a retained, complete-body-bound,
+deterministic no-effect receipt, returned only after ordinary stale-fence,
+CAS, and lease admission for an otherwise successful transition. Its SQLite
+representability check covers requested generation/fence, exact acquire fence
+and global successors, credential allocation, application/watch sequences, and
+restore-scan revision. While retained, exact ID/body replay and status return
+`Recorded(Err(StorageExhausted))`; another body conflicts. No lease, record,
+watch, restore, or ordinary mutation effect occurs. Existing fenced receipts,
+generic-ID conflicts, `HistoryFull`, and `RetentionExhausted` precede this
+decision, and revoked authority masks storage state. At maximum application
+sequence it binds with the current nonzero sequence/digest and advances only
+logical time, the applied pointer, and the receipt; later blank or membership
+entries may still apply, without promising normal mutations remain available.
+
+For a fenced transition the public consumer request ID MUST be byte-identical
+to its nested `FencedTransitionRequestId`. The quorum adapter namespaces the
+internal receipt ID by authenticated consumer identity and stable cluster
+identity, enforces the exact current cluster/configuration/epoch scope under the
+activation lifecycle above, and submits no separate `BindConsumerRequest` or
+binding log entry. The transition receipt therefore binds the complete
+canonical body in the same single consensus entry as the lease and record
+effect. A changing authorized configuration scope does not change that internal
+receipt ID, so an authorized successor can recover the same retained result; a
+revoked predecessor cannot observe it. Status is read-only, and `NotFound` does
+not prove that an earlier delayed proposal cannot still commit.
+
 Prewarm and readiness may prove authenticated consumer transport capacity only;
 they never prove quorum or product readiness. Readiness deliberately becomes
 false while a request lane is leased; isolated watch slots are non-gating.
@@ -1743,12 +1802,20 @@ payloads, request or correlation IDs, owners, or fences. Any performance
 evidence for this transport is synthetic only and makes no ePDG production-SLO
 claim.
 
-The v7 qualification profile records this revision-2 dedicated ALPN/revision
-and the connection, frame, request/response, watch, task, and lifecycle limits
-beside the consensus profile. The published v6 profile remains the unchanged
-revision-1 contract. Neither profile records consumer identity or scope
-material. Synthetic warm accept/reuse checks gate only their transport method;
-elapsed samples are non-gating and are not an SLO.
+The v7 qualification profile remains the revision-2 persistent-transport
+inventory and records its connection, frame, request/response, watch, task,
+and lifecycle limits beside the consensus profile. The published v6 profile
+remains the unchanged revision-1 contract. Revision 3 retains those bounded
+transport properties and adds the generic #696 family; its exact-head evidence
+is recorded with the atomic-transition qualification. No profile or evidence
+records consumer identity or scope material. Synthetic warm accept/reuse checks
+gate only their transport method; elapsed samples are non-gating and are not an
+SLO.
+
+Revision 3 carries `StorageExhausted` only inside the closed fenced-transition
+`Recorded` status result. Frozen session-net v5 maps this outcome fail-closed as
+an unknown capability; its wire enum and revision remain unchanged. Product and
+ePDG composition remain outside this generic API.
 
 ## 13. Local Cache
 
