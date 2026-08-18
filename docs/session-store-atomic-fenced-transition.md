@@ -304,7 +304,11 @@ membership proof independent of retained token size, and read-only proofs use
 WAL snapshots rather than reserving the writer. The schema catalog is an exact
 whitelist of the SDK tables, generated primary-key autoindex, and membership
 index; every other catalog object, including a reserved-prefix object, is
-rejected before journal setup. The journal rejects a wrong key, foreign or
+rejected before journal setup. The authenticated membership index is the
+presence authority; its bounded scan cross-validates every rowid, request ID,
+and tag against the table and compares the independently bounded table count,
+so table/primary/secondary-index divergence cannot become false absence. The
+journal rejects a wrong key, foreign or
 partial schema, unsupported version, corrupt metadata/row, and insecure or
 changed path with one fixed coarse availability error. An authenticated full
 journal rejects a new ID before expiry, provider, or inner-prepare work.

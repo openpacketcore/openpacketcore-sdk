@@ -1223,14 +1223,17 @@ VFS checks fail closed for V2.
 The schema-2 journal authenticates more than each row: a per-journal random
 incarnation, bounded row count, and root over the complete request-ID/tag set
 are committed by a separate HMAC. Health, lookup/recovery, and insertion scan
-and authenticate that small bounded set; lookup authenticates the selected
-token, while insertion re-reads its new row and updates the membership
-commitment atomically before returning success. A fixed covering index keeps a
-full membership proof independent of retained token size. The SQLite catalog is
-an exact whitelist of the two SDK tables, generated primary-key autoindex, and
-membership index, so any other object, including a reserved-prefix object,
-fails closed before journal setup. These checks detect offline row deletion,
-addition, primary-key replacement, and tag corruption in the same durable file.
+and authenticate that small bounded set. The authenticated covering index is
+the presence authority, and the scan cross-validates each indexed row against
+the table plus an independently bounded table count; divergent table, primary,
+or secondary-index state therefore cannot become false absence. Lookup
+authenticates the selected token, while insertion re-reads its new row and
+updates the membership commitment atomically before returning success. The
+SQLite catalog is an exact whitelist of the two SDK tables, generated
+primary-key autoindex, and membership index, so any other object, including a
+reserved-prefix object, fails closed before journal setup. These checks detect
+offline row deletion, addition, primary-key replacement, index divergence, and
+tag corruption in the same durable file.
 A corrupt selected body fails its exact row authentication and cannot be
 treated as absent or rebound. Restoring an older complete valid database
 snapshot cannot be detected without an external monotonic anti-rollback anchor

@@ -7,6 +7,7 @@
 //! without invoking a key or remote-seal provider again.
 
 use std::{
+    collections::BTreeSet,
     fmt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -955,10 +956,12 @@ fn scan_journal_membership(
     if !valid_membership_count(expected_count) {
         return Err(journal_unavailable());
     }
+    let table_count = scan_journal_table_count(conn)?;
     let mut root = MembershipRoot::new(incarnation, expected_count)?;
+    let mut rowids = BTreeSet::new();
     let mut statement = conn
         .prepare(&format!(
-            "SELECT request_id, integrity_tag \
+            "SELECT request_id, integrity_tag, rowid \
              FROM prepared_fenced_transition_journal \
              INDEXED BY prepared_fenced_transition_journal_membership_idx \
              ORDER BY request_id ASC \
@@ -982,12 +985,39 @@ fn scan_journal_membership(
         );
         let integrity_tag = fixed_blob(row.get_ref(1).map_err(|_| journal_unavailable())?)
             .map_err(|_| journal_unavailable())?;
+        let ValueRef::Integer(rowid) = row.get_ref(2).map_err(|_| journal_unavailable())? else {
+            return Err(journal_unavailable());
+        };
+        if rowid <= 0 || !rowids.insert(rowid) {
+            return Err(journal_unavailable());
+        }
+        let table_entry: Option<(
+            [u8; FENCED_TRANSITION_REQUEST_ID_BYTES],
+            [u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+        )> = conn
+            .query_row(
+                "SELECT request_id, integrity_tag \
+                 FROM prepared_fenced_transition_journal NOT INDEXED \
+                 WHERE rowid = ?1",
+                params![rowid],
+                |table_row| {
+                    Ok((
+                        fixed_blob(table_row.get_ref(0)?)?,
+                        fixed_blob(table_row.get_ref(1)?)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| journal_unavailable())?;
+        if table_entry != Some((*request_id.as_bytes(), integrity_tag)) {
+            return Err(journal_unavailable());
+        }
         root.include(request_id, &integrity_tag);
         observed_count = observed_count
             .checked_add(1)
             .ok_or_else(journal_unavailable)?;
     }
-    if observed_count != expected_count {
+    if observed_count != expected_count || table_count != expected_count {
         return Err(journal_unavailable());
     }
     Ok(JournalMembershipSnapshot {
@@ -996,19 +1026,81 @@ fn scan_journal_membership(
     })
 }
 
+fn scan_journal_table_count(conn: &Connection) -> Result<i64, StoreError> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT rowid FROM prepared_fenced_transition_journal NOT INDEXED \
+             LIMIT {JOURNAL_MEMBERSHIP_SCAN_LIMIT}"
+        ))
+        .map_err(|_| journal_unavailable())?;
+    let mut rows = statement.query([]).map_err(|_| journal_unavailable())?;
+    let mut count = 0_i64;
+    while let Some(row) = rows.next().map_err(|_| journal_unavailable())? {
+        let ValueRef::Integer(rowid) = row.get_ref(0).map_err(|_| journal_unavailable())? else {
+            return Err(journal_unavailable());
+        };
+        if rowid <= 0
+            || count
+                >= i64::try_from(FENCED_TRANSITION_MAX_HISTORY_ENTRIES)
+                    .map_err(|_| journal_unavailable())?
+        {
+            return Err(journal_unavailable());
+        }
+        count = count.checked_add(1).ok_or_else(journal_unavailable)?;
+    }
+    Ok(count)
+}
+
 fn read_entry(
     conn: &Connection,
     key: &PreparedFencedTransitionJournalKey,
     request_id: FencedTransitionRequestId,
 ) -> Result<Option<PreparedFencedTransition>, StoreError> {
+    // Absence decisions call this only after `verify_metadata` authenticates
+    // the complete covering index. Treat that index as the presence authority,
+    // then dereference its rowid without consulting the independently
+    // corruptible primary-key index. The post-insert call uses the same path
+    // only to verify the new row before authenticating the updated membership.
+    let indexed: Option<(i64, [u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES])> = {
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT rowid, integrity_tag \
+                 FROM prepared_fenced_transition_journal \
+                 INDEXED BY {JOURNAL_MEMBERSHIP_INDEX} \
+                 WHERE request_id = ?1 LIMIT 2"
+            ))
+            .map_err(|_| journal_unavailable())?;
+        let mut rows = statement
+            .query(params![request_id.as_bytes().as_slice()])
+            .map_err(|_| journal_unavailable())?;
+        let Some(row) = rows.next().map_err(|_| journal_unavailable())? else {
+            return Ok(None);
+        };
+        let ValueRef::Integer(rowid) = row.get_ref(0).map_err(|_| journal_unavailable())? else {
+            return Err(journal_unavailable());
+        };
+        if rowid <= 0 {
+            return Err(journal_unavailable());
+        }
+        let integrity_tag = fixed_blob(row.get_ref(1).map_err(|_| journal_unavailable())?)
+            .map_err(|_| journal_unavailable())?;
+        if rows.next().map_err(|_| journal_unavailable())?.is_some() {
+            return Err(journal_unavailable());
+        }
+        Some((rowid, integrity_tag))
+    };
+    let Some((rowid, indexed_tag)) = indexed else {
+        return Ok(None);
+    };
     let row: Option<(
         Zeroizing<Vec<u8>>,
         [u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
     )> = conn
         .query_row(
             "SELECT prepared_schema_version, prepared_token, integrity_tag \
-             FROM prepared_fenced_transition_journal WHERE request_id = ?1",
-            params![request_id.as_bytes().as_slice()],
+             FROM prepared_fenced_transition_journal NOT INDEXED \
+             WHERE rowid = ?1 AND request_id = ?2",
+            params![rowid, request_id.as_bytes().as_slice()],
             |row| {
                 let ValueRef::Integer(schema_version) = row.get_ref(0)? else {
                     return Err(rusqlite::Error::InvalidQuery);
@@ -1025,8 +1117,11 @@ fn read_entry(
         .optional()
         .map_err(|_| journal_unavailable())?;
     let Some((token, stored_tag)) = row else {
-        return Ok(None);
+        return Err(journal_unavailable());
     };
+    if !bool::from(stored_tag.ct_eq(&indexed_tag)) {
+        return Err(journal_unavailable());
+    }
     if verify_entry_tag(key, request_id, &token, &stored_tag).is_err() {
         return Err(journal_unavailable());
     }
@@ -1774,6 +1869,81 @@ mod tests {
 
         assert_live_integrity_failure(&journal, retained.request_id()).await;
         assert_coarse_unavailable(journal.ensure_absent(retained.request_id()).await);
+    }
+
+    #[tokio::test]
+    async fn prepared_journal_rejects_dangling_authenticated_membership_index() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let fixture = JournalFixture::new(0x6c);
+        let journal = fixture.open();
+        let retained = prepared(0x6d);
+        journal.insert(&retained).await.expect("durable insert");
+        drop(journal);
+
+        let connection = Connection::open(&fixture.path).expect("open divergence fixture");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint divergence fixture");
+        let page_size: i64 = connection
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .expect("read page size");
+        let index_root: i64 = connection
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE name = ?1",
+                params![JOURNAL_MEMBERSHIP_INDEX],
+                |row| row.get(0),
+            )
+            .expect("read membership root page");
+        drop(connection);
+
+        let page_size = usize::try_from(page_size).expect("positive page size");
+        let page_offset = u64::try_from(index_root - 1)
+            .expect("positive root page")
+            .checked_mul(u64::try_from(page_size).expect("page size fits u64"))
+            .expect("root-page offset");
+        let mut saved_index_page = Zeroizing::new(vec![0_u8; page_size]);
+        let mut database = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&fixture.path)
+            .expect("open database page source");
+        database
+            .seek(SeekFrom::Start(page_offset))
+            .expect("seek membership root page");
+        database
+            .read_exact(saved_index_page.as_mut_slice())
+            .expect("read membership root page");
+        drop(database);
+
+        let connection = Connection::open(&fixture.path).expect("reopen divergence fixture");
+        connection
+            .execute(
+                "DELETE FROM prepared_fenced_transition_journal WHERE request_id = ?1",
+                params![retained.request_id().as_bytes().as_slice()],
+            )
+            .expect("remove table and live index entry");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint divergent deletion");
+        drop(connection);
+
+        let mut database = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.path)
+            .expect("open database page target");
+        database
+            .seek(SeekFrom::Start(page_offset))
+            .expect("seek membership root-page target");
+        database
+            .write_all(saved_index_page.as_slice())
+            .expect("restore stale membership root page");
+        database.sync_all().expect("sync divergent index page");
+        drop(database);
+
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
+            &fixture.path,
+            PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
+        ));
     }
 
     #[tokio::test]

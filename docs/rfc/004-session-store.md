@@ -1941,13 +1941,17 @@ separate HMAC. Health, lookup/recovery, and insertion verify that complete
 small bounded set; lookup authenticates the selected token, and insertion
 verifies its new row and updates the membership commitment in its single
 transaction before commit. A fixed covering index keeps the proof independent
-of token size. The SQLite catalog is an exact whitelist of the SDK tables,
-generated primary-key autoindex, and membership index, rejecting every other
-object, including reserved-prefix catalog entries, before setup. This detects
-offline row deletion, addition, primary-key replacement, and tag corruption
-inside the same durable file. A corrupt selected body fails its exact row
-authentication and cannot be treated as absent or rebound. It cannot detect
-restoration of an older complete valid database snapshot: that rollback is
+of token size. That authenticated index is the presence authority; the bounded
+proof cross-validates every index rowid, request ID, and tag against the table
+and compares an independently bounded table count. Divergent table, primary,
+or secondary-index state therefore fails closed instead of becoming absence.
+The SQLite catalog is an exact whitelist of the SDK tables, generated
+primary-key autoindex, and membership index, rejecting every other object,
+including reserved-prefix catalog entries, before setup. This detects offline
+row deletion, addition, primary-key replacement, index divergence, and tag
+corruption inside the same durable file. A corrupt selected body fails its
+exact row authentication and cannot be treated as absent or rebound. It cannot
+detect restoration of an older complete valid database snapshot: that rollback is
 outside the same-durable-file guarantee unless deployment provides an external
 monotonic anti-rollback anchor.
 
