@@ -1863,6 +1863,23 @@ unavailability MAY block new protection or plaintext reads, but MUST NOT cause
 provider I/O during deterministic apply or make already sealed Raft replay and
 quorum formation depend on provider availability.
 
+Atomic fenced transitions MUST prepare their complete physical request before
+dispatch. The caller durably retains the bounded, opaque serialized prepared
+token and supplies that exact token to execution, retry, and status. Local and
+remote wrappers seal a create/update body exactly once, after authoritative
+expiry preflight and before consensus admission; delete and refresh perform no
+provider operation. Execution and status MUST NOT reseal, unseal, read back, or
+consult the current active key/provider. The durable receipt continues to bind
+the complete protected request, so restart or rotation reuses the original
+envelope rather than manufacturing a conflicting nonce/key/provider result.
+Observation unprotects only a returned record and preserves its authoritative
+fence. Every adapter advertises the atomic capability only when every composed
+layer implements this exact prepared-token contract. In particular, a
+protection wrapper requires an explicit inner witness that protected bytes are
+preserved through preparation and observation; nested payload-protection
+wrappers fail closed rather than double-sealing or returning an inner envelope
+as plaintext.
+
 Remote unseal MUST pass the canonical envelope key ID through the provider
 boundary after validating envelope shape and record AAD. The active remote key
 is an atomic process-local material epoch used only by future seals; a seal

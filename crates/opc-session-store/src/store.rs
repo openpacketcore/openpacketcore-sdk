@@ -124,6 +124,11 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         self.backend.restore_scan_cursor_profile()
     }
 
+    fn fenced_transition_preserves_protected_payloads(&self) -> bool {
+        self.backend
+            .fenced_transition_preserves_protected_payloads()
+    }
+
     async fn capabilities(&self) -> BackendCapabilities {
         self.backend.capabilities().await
     }
@@ -142,18 +147,25 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         self.backend.fenced_transition_capability().await
     }
 
-    async fn fenced_transition(
+    async fn prepare_fenced_transition(
         &self,
         request: crate::fenced_transition::FencedTransitionRequest,
+    ) -> Result<crate::fenced_transition::PreparedFencedTransition, StoreError> {
+        self.backend.prepare_fenced_transition(request).await
+    }
+
+    async fn fenced_transition(
+        &self,
+        prepared: &crate::fenced_transition::PreparedFencedTransition,
     ) -> Result<crate::fenced_transition::FencedTransitionOutcome, StoreError> {
-        self.backend.fenced_transition(request).await
+        self.backend.fenced_transition(prepared).await
     }
 
     async fn fenced_transition_status(
         &self,
-        request: &crate::fenced_transition::FencedTransitionRequest,
+        prepared: &crate::fenced_transition::PreparedFencedTransition,
     ) -> Result<crate::fenced_transition::FencedTransitionStatus, StoreError> {
-        self.backend.fenced_transition_status(request).await
+        self.backend.fenced_transition_status(prepared).await
     }
 
     fn record_expiry_reference(&self) -> Option<opc_types::Timestamp> {

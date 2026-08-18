@@ -63,7 +63,8 @@ use crate::consumer::{
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_transition::{
     AtomicFencedTransitionCapability, FencedTransitionObservation, FencedTransitionOutcome,
-    FencedTransitionRequest, FencedTransitionStatus, FENCED_TRANSITION_SCHEMA_V1,
+    FencedTransitionRequest, FencedTransitionStatus, PreparedFencedTransition,
+    PreparedFencedTransitionProtection, FENCED_TRANSITION_SCHEMA_V1,
 };
 use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{OwnerId, SessionKey};
@@ -4860,8 +4861,21 @@ fn consumer_watch_setup_terminal(error: StoreError) -> Option<SessionConsumerSto
     }
 }
 
+fn prepared_fenced_transition_storage_commitment(identity: SessionConsensusIdentity) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"openpacketcore/session-store/prepared-consensus-storage/v1\0");
+    digest.update(identity.cluster_id().as_bytes());
+    digest.update(identity.configuration_id().as_bytes());
+    digest.update(identity.configuration_epoch().get().to_be_bytes());
+    digest.finalize().into()
+}
+
 #[async_trait]
 impl SessionBackend for ConsensusSessionStore {
+    fn fenced_transition_preserves_protected_payloads(&self) -> bool {
+        true
+    }
+
     fn restore_scan_cursor_profile(&self) -> Option<crate::RestoreScanCursorProfile> {
         Some(crate::RestoreScanCursorProfile::DurableOpaqueV1)
     }
@@ -4925,18 +4939,51 @@ impl SessionBackend for ConsensusSessionStore {
         ConsensusSessionStore::fenced_transition_capability(self).await
     }
 
-    async fn fenced_transition(
+    async fn prepare_fenced_transition(
         &self,
         request: FencedTransitionRequest,
+    ) -> Result<PreparedFencedTransition, StoreError> {
+        request.validate()?;
+        if let Some(record) = request.mutation().record() {
+            crate::sqlite::validate_consensus_record(record)?;
+        }
+        PreparedFencedTransition::from_unprotected_request(request)?.with_protection(
+            PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+                storage_commitment: prepared_fenced_transition_storage_commitment(
+                    self.inner.storage_identity,
+                ),
+            },
+        )
+    }
+
+    async fn fenced_transition(
+        &self,
+        prepared: &PreparedFencedTransition,
     ) -> Result<FencedTransitionOutcome, StoreError> {
+        let prepared = prepared.without_outer_protection(
+            PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+                storage_commitment: prepared_fenced_transition_storage_commitment(
+                    self.inner.storage_identity,
+                ),
+            },
+        )?;
+        let request = prepared.request_for_unprotected_backend()?;
         ConsensusSessionStore::fenced_transition(self, request).await
     }
 
     async fn fenced_transition_status(
         &self,
-        request: &FencedTransitionRequest,
+        prepared: &PreparedFencedTransition,
     ) -> Result<FencedTransitionStatus, StoreError> {
-        ConsensusSessionStore::fenced_transition_status(self, request).await
+        let prepared = prepared.without_outer_protection(
+            PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+                storage_commitment: prepared_fenced_transition_storage_commitment(
+                    self.inner.storage_identity,
+                ),
+            },
+        )?;
+        let request = prepared.request_for_unprotected_backend()?;
+        ConsensusSessionStore::fenced_transition_status(self, &request).await
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {

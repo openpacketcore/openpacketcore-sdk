@@ -3694,6 +3694,7 @@ dependencies = [
  "opc-mgmt-audit",
  "opc-redaction",
  "opc-types",
+ "postcard",
  "proptest",
  "rand 0.10.2",
  "rusqlite",

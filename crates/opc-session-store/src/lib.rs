@@ -71,6 +71,9 @@ pub mod topology;
 pub mod topology_attestation;
 pub mod ttl;
 
+#[cfg(test)]
+mod protected_fenced_transition_tests;
+
 pub use backend::{
     next_replication_sequence, record_expiry_preflights, validate_record_expiry_preflights_at,
     validate_record_expiry_preflights_profile, validate_replication_log_page,
@@ -127,8 +130,10 @@ pub use fenced_transition::{
     AtomicFencedTransitionCapability, FencedTransitionLease, FencedTransitionMutation,
     FencedTransitionMutationResult, FencedTransitionObservation, FencedTransitionOutcome,
     FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus,
-    FENCED_TRANSITION_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_MAX_OUTCOME_BYTES,
-    FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_REQUEST_ID_BYTES,
+    PreparedFencedTransition, PreparedFencedTransitionError, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_MAX_OUTCOME_BYTES, FENCED_TRANSITION_MAX_PREPARED_BYTES,
+    FENCED_TRANSITION_MAX_PREPARED_LAYERS, FENCED_TRANSITION_OUTCOME_RETENTION,
+    FENCED_TRANSITION_PREPARED_SCHEMA_V1, FENCED_TRANSITION_REQUEST_ID_BYTES,
     FENCED_TRANSITION_SCHEMA_V1,
 };
 pub use handover::{

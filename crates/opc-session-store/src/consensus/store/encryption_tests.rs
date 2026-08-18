@@ -27,8 +27,15 @@ use crate::consensus::{
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
 };
+use crate::fenced_transition::{
+    AtomicFencedTransitionCapability, FencedTransitionLease, FencedTransitionMutation,
+    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus,
+    PreparedFencedTransition,
+};
 use crate::lease::SessionLeaseManager;
-use crate::model::{Generation, OwnerId, SessionKey, SessionKeyType, StateClass, StateType};
+use crate::model::{
+    FenceToken, Generation, OwnerId, SessionKey, SessionKeyType, StateClass, StateType,
+};
 use crate::record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 use crate::restore::RestoreScanRequest;
 use crate::sqlite::SqliteSessionBackend;
@@ -415,6 +422,156 @@ async fn invalid_consensus_batch_is_rejected_before_log_or_key_provider_work() {
     );
     assert_eq!(provider.call_counts(), (0, 0, 0));
     assert_eq!(consensus_authority_counts(&database), before);
+}
+
+#[tokio::test]
+async fn protected_fenced_transition_survives_consensus_restart_and_key_rotation() {
+    const PLAINTEXT: &[u8] = b"prepared-fenced-transition-consensus-plaintext-canary";
+
+    let directory = tempfile::tempdir().expect("qualification directory");
+    let database = directory.path().join("sessions.sqlite");
+    let snapshots = directory.path().join("snapshots");
+    let provider = provider();
+    let store = open_store(&database, &snapshots).await;
+    let backend: Arc<dyn SessionBackend> = Arc::new(EncryptingSessionBackend::new(
+        Arc::new(store.clone()),
+        Arc::clone(&provider),
+        "prepared-fenced-transition-consensus",
+    ));
+    assert_eq!(
+        backend
+            .fenced_transition_capability()
+            .await
+            .expect("capability"),
+        Some(AtomicFencedTransitionCapability::V1)
+    );
+
+    let session_key = key(b"prepared-fenced-transition");
+    let observation = backend
+        .observe_fenced_transition(&session_key)
+        .await
+        .expect("initial observation");
+    assert!(observation.record().is_none());
+    assert_eq!(observation.current_fence(), FenceToken::new(0));
+    let owner = OwnerId::new("prepared-fenced-transition-owner").expect("owner");
+    let lease = FencedTransitionLease::acquire(
+        session_key.clone(),
+        owner.clone(),
+        observation.current_fence(),
+        Duration::from_secs(30),
+    )
+    .expect("acquire lease");
+    let request = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0x71; 16]),
+        lease.clone(),
+        FencedTransitionMutation::create(StoredSessionRecord {
+            key: session_key.clone(),
+            generation: Generation::new(1),
+            owner,
+            fence: lease.committed_fence().expect("committed fence"),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("prepared-fenced-transition"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(PLAINTEXT),
+        }),
+    )
+    .expect("logical request");
+    let prepared = backend
+        .prepare_fenced_transition(request.clone())
+        .await
+        .expect("prepare protected request");
+    assert_eq!(provider.call_counts(), (1, 0, 0));
+    assert!(!contains_bytes(prepared.as_bytes(), PLAINTEXT));
+    let durable_token = prepared.as_bytes().to_vec();
+
+    provider
+        .rotate_key(KeyPurpose::Session, &tenant())
+        .await
+        .expect("rotate active key after preparation");
+    assert_eq!(provider.call_counts(), (1, 0, 1));
+    drop(backend);
+    store
+        .inner
+        .raft
+        .shutdown()
+        .await
+        .expect("shutdown before prepared execution");
+    drop(store);
+
+    let restarted = open_store(&database, &snapshots).await;
+    let backend: Arc<dyn SessionBackend> = Arc::new(EncryptingSessionBackend::new(
+        Arc::new(restarted.clone()),
+        Arc::clone(&provider),
+        "prepared-fenced-transition-consensus",
+    ));
+    let restored =
+        PreparedFencedTransition::try_from_bytes(&durable_token).expect("restore exact token");
+    let outcome = backend
+        .fenced_transition(&restored)
+        .await
+        .expect("execute restored token");
+    assert_eq!(provider.call_counts(), (1, 0, 1));
+    assert_eq!(
+        backend
+            .fenced_transition_status(&restored)
+            .await
+            .expect("status restored token"),
+        FencedTransitionStatus::Recorded(Box::new(Ok(outcome.clone())))
+    );
+    assert_eq!(
+        backend
+            .fenced_transition(&restored)
+            .await
+            .expect("exact replay"),
+        outcome
+    );
+    assert_eq!(provider.call_counts(), (1, 0, 1));
+
+    let physical = restarted
+        .get(&session_key)
+        .await
+        .expect("raw consensus read")
+        .expect("physical record");
+    assert_eq!(
+        physical.payload.encoding(),
+        SessionPayloadEncoding::EnvelopeV1
+    );
+    assert!(!contains_bytes(physical.payload.as_bytes(), PLAINTEXT));
+    let plaintext = backend
+        .observe_fenced_transition(&session_key)
+        .await
+        .expect("plaintext observation");
+    assert_eq!(plaintext.current_fence(), outcome.lease().fence());
+    assert_eq!(
+        plaintext
+            .record()
+            .expect("observed record")
+            .payload
+            .as_bytes(),
+        PLAINTEXT
+    );
+    assert_eq!(provider.call_counts(), (1, 1, 1));
+
+    let newly_sealed = backend
+        .prepare_fenced_transition(request)
+        .await
+        .expect("prepare same logical request after rotation");
+    assert_ne!(newly_sealed.as_bytes(), restored.as_bytes());
+    assert_eq!(provider.call_counts(), (2, 1, 1));
+    assert_eq!(
+        backend.fenced_transition(&newly_sealed).await,
+        Err(crate::StoreError::FencedTransitionRequestConflict)
+    );
+    assert_eq!(provider.call_counts(), (2, 1, 1));
+    assert_sqlite_authority_is_sealed(&database);
+
+    drop(backend);
+    restarted
+        .inner
+        .raft
+        .shutdown()
+        .await
+        .expect("shutdown restarted consensus node");
 }
 
 #[tokio::test]

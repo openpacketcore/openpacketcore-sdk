@@ -169,6 +169,66 @@ or durable apply:
   strictly below that ceiling under the public field bounds, and its
   payload-free shape makes the response bound independent of the record
   payload.
+- `PreparedFencedTransition` uses
+  `FENCED_TRANSITION_PREPARED_SCHEMA_V1`, has at most
+  `FENCED_TRANSITION_MAX_PREPARED_LAYERS` (8) SDK-owned protection frames, and
+  is at most `FENCED_TRANSITION_MAX_PREPARED_BYTES` (2 MiB). Import rejects an
+  over-limit, corrupt, noncanonical, trailing, or unsupported token before
+  backend or provider work.
+
+## Protected preparation and exact retry bodies
+
+The production protected API is deliberately two phase. A caller first passes
+its logical request to `SessionBackend::prepare_fenced_transition`. It MUST
+durably persist the returned opaque `PreparedFencedTransition` before calling
+`fenced_transition`, and it MUST retain those exact serialized bytes for every
+retry and `fenced_transition_status` call. Execute and status borrow the token;
+they do not consume it.
+
+Preparation validates the logical request and exact V1 capability across the
+complete wrapper stack first. For create and update it then obtains the
+authoritative, payload-free record-expiry preflight before any provider call,
+protects the record exactly once, validates the resulting physical request,
+and lets the inner capable backend add its own bounded token frame. Delete and
+refresh carry no record and perform no seal or unseal. The wrapper preserves
+the request ID, lease, mutation metadata, record metadata, and committed fence
+unchanged; only the create/update payload encoding changes.
+
+The inner backend must explicitly attest that it preserves already protected
+payload bytes unchanged through preparation and observation. Raw consensus
+does so and transparent adapters forward that witness. Payload-transforming
+adapters do not: nesting local and remote protection wrappers in either order
+therefore advertises no atomic capability and fails before preflight, provider,
+observation, or dispatch work. This prevents double sealing and prevents an
+inner envelope from being mislabeled as caller plaintext.
+
+The consensus receipt digest continues to bind the complete physical request,
+including the exact `EnvelopeV1` bytes. A fresh nonce, active key, or remote
+provider result therefore creates a different body and correctly conflicts
+under the same request ID. Preparation never tries to recover a physical body
+from readback, process memory, plaintext persistence, or an application-local
+retry cache. After successful preparation, execute and status peel only their
+bounded local token frame and use the retained physical bytes without provider
+I/O, so restart and active-key/provider rotation cannot change the submitted
+body. `NotTransmitted` may retry that same token. An `OutcomeUnknown` retains
+that token for exact status recovery; `NotFound` still does not prove that a
+delayed proposal cannot commit.
+
+Fenced observation delegates the authority-consistent record/fence read and
+then unprotects only a present record. It preserves `current_fence` exactly; an
+absent record performs no provider call, and any protection failure returns no
+partial observation.
+
+The token is opaque application state, not an authorization credential. A
+protected create/update token contains request metadata and ciphertext but no
+payload plaintext. Its domain-separated digest detects accidental corruption;
+it does not authenticate a malicious rewrite. Callers MUST keep tokens in
+trusted, integrity-protected durable storage and MUST NOT emit their bytes,
+request metadata, provider/key identifiers, or payloads through diagnostics,
+logs, or metrics. The generic remote provider interface has no stable token-MAC
+operation, so deployments requiring integrity against a writer that can
+rewrite and recompute token bytes need a separately approved authenticated
+token-storage boundary.
 
 ## Idempotency, retention, and uncertainty
 
