@@ -276,10 +276,21 @@ immediate parent and database MUST be owned by the effective user, with no
 group or other access (normally `0700` and `0600`, respectively); the database
 MUST be a regular, single-link file. The SDK pins and revalidates the admitted
 parent and file identities before each operation. Other platforms require
-equivalent access and stable-path controls. The journal uses an application ID,
-schema version, strict tables, a bounded SQLite value-allocation limit, WAL,
-`synchronous=EXTRA`, an atomic create-only ID binding, and HMAC-SHA-256 over
-each exact token and its stable ID. The journal rejects a wrong key, foreign or
+equivalent access and stable-path controls. The schema-2 journal uses an
+application ID, strict tables, a bounded SQLite value-allocation limit, WAL,
+`synchronous=EXTRA`, and an atomic create-only ID binding. It assigns every
+journal incarnation a fresh bounded random value and stores an authenticated
+membership count and root over the complete request-ID/integrity-tag set. The
+membership HMAC commits that incarnation, count, and root; health, lookup,
+recovery, and insertion validate the complete small bounded set. Lookup
+authenticates the selected token, while insertion re-authenticates its new row,
+updates membership metadata in the same transaction, and verifies the result
+before commit. A fixed `(request_id, integrity_tag)` covering index keeps a full
+membership proof independent of retained token size, and read-only proofs use
+WAL snapshots rather than reserving the writer. The schema catalog is an exact
+whitelist of the SDK tables, generated primary-key autoindex, and membership
+index; every other catalog object, including a reserved-prefix object, is
+rejected before journal setup. The journal rejects a wrong key, foreign or
 partial schema, unsupported version, corrupt metadata/row, and insecure path
 with one fixed coarse availability error.
 
@@ -291,6 +302,14 @@ as other sensitive SDK metadata. Token bytes, rows, payloads, identities,
 request IDs, paths, keys, request metadata, and provider material MUST NOT be
 emitted in examples, fixtures, logs, metrics, errors, diagnostics, crash
 evidence, or PR evidence.
+
+This integrity proof detects offline row deletion, addition, primary-key
+replacement, and tag corruption within the same durable journal file. A
+corrupt selected body fails its exact row authentication and cannot be treated
+as absent or rebound. It cannot distinguish restoration of an older complete,
+internally valid database snapshot from that older state itself. Whole-database
+rollback is outside the same-durable-file guarantee unless deployment supplies
+an external monotonic anti-rollback anchor.
 
 The SDK retains canonical token bytes and complete-body import/re-encoding
 scratch buffers in wiping allocations. This reduces allocator residue but does
@@ -315,7 +334,7 @@ The prepared-token wire schema and the journal database schema are separate,
 versioned durable formats and, together with capability V2, are downgrade
 fences. The current journal can retain only canonical
 `FENCED_TRANSITION_PREPARED_SCHEMA_V1` tokens, and its current database
-`user_version` is one. Neither version is inferred from the record envelope,
+`user_version` is two. Neither version is inferred from the record envelope,
 consumer wire, or consensus capability. `AtomicFencedTransitionCapability::V2`
 is a local composition promise over an inner V1 physical contract; it does not
 rename the consensus or revision-3 authenticated-consumer wire as V2.

@@ -1921,6 +1921,22 @@ downgrade fences: unknown versions, raw V1, and older binaries MUST NOT operate
 the protected journaled path. The V2 journal layer makes no journal GC,
 retention, ledger-lifetime, or capacity-lifecycle claim.
 
+The schema-2 journal also commits a fresh per-journal incarnation, bounded
+membership count, and root over the exact retained request-ID/tag set with a
+separate HMAC. Health, lookup/recovery, and insertion verify that complete
+small bounded set; lookup authenticates the selected token, and insertion
+verifies its new row and updates the membership commitment in its single
+transaction before commit. A fixed covering index keeps the proof independent
+of token size. The SQLite catalog is an exact whitelist of the SDK tables,
+generated primary-key autoindex, and membership index, rejecting every other
+object, including reserved-prefix catalog entries, before setup. This detects
+offline row deletion, addition, primary-key replacement, and tag corruption
+inside the same durable file. A corrupt selected body fails its exact row
+authentication and cannot be treated as absent or rebound. It cannot detect
+restoration of an older complete valid database snapshot: that rollback is
+outside the same-durable-file guarantee unless deployment provides an external
+monotonic anti-rollback anchor.
+
 The token wire form begins with a fixed magic, schema version, and body length;
 version dispatch precedes decoding the frozen V1 body. A golden compatibility
 corpus pins both lease forms, every mutation, no-expiry and finite-expiry record

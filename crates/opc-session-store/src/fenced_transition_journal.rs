@@ -17,24 +17,27 @@ use std::{
 use std::fs::OpenOptions;
 
 use hmac::{Hmac, Mac};
+use rand::{rngs::SysRng, TryRng};
 use rusqlite::{
     limits::Limit, params, types::ValueRef, Connection, OpenFlags, OptionalExtension,
     TransactionBehavior,
 };
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
     FencedTransitionRequestId, PreparedFencedTransition, PreparedFencedTransitionLookup,
     StoreError, FENCED_TRANSITION_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_MAX_PREPARED_BYTES,
-    FENCED_TRANSITION_PREPARED_SCHEMA_V1,
+    FENCED_TRANSITION_PREPARED_SCHEMA_V1, FENCED_TRANSITION_REQUEST_ID_BYTES,
 };
 
 /// Width of the independent integrity key protecting one prepared journal.
 pub const PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES: usize = 32;
 
 const JOURNAL_APPLICATION_ID: i64 = 0x4f50_464a;
-const JOURNAL_SCHEMA_VERSION: i64 = 1;
+const JOURNAL_SCHEMA_VERSION: i64 = 2;
+const JOURNAL_SCHEMA_OBJECT_COUNT: i64 = 4;
+const JOURNAL_MEMBERSHIP_INDEX: &str = "prepared_fenced_transition_journal_membership_idx";
 const JOURNAL_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 const JOURNAL_UNAVAILABLE: &str = "prepared fenced-transition journal unavailable";
 // SQLite's length limit applies to an entire record as well as its largest
@@ -46,6 +49,10 @@ const JOURNAL_SQLITE_LENGTH_ROW_OVERHEAD_BYTES: usize =
 const JOURNAL_KEY_CHECK_DOMAIN: &[u8] =
     b"openpacketcore/session-store/prepared-journal/key-check/v1\0";
 const JOURNAL_ENTRY_DOMAIN: &[u8] = b"openpacketcore/session-store/prepared-journal/entry/v1\0";
+const JOURNAL_MEMBERSHIP_ROOT_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/prepared-journal/membership-root/v1\0";
+const JOURNAL_MEMBERSHIP_TAG_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/prepared-journal/membership-tag/v1\0";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -162,8 +169,12 @@ impl PreparedFencedTransitionJournal {
     }
 
     pub(crate) async fn health_check(&self) -> Result<(), StoreError> {
-        self.with_connection(|conn, key| verify_metadata(conn, key))
-            .await
+        self.with_connection(|conn, key| {
+            let transaction = journal_read_transaction(conn)?;
+            verify_metadata(&transaction, key)?;
+            transaction.commit().map_err(|_| journal_unavailable())
+        })
+        .await
     }
 
     pub(crate) async fn ensure_absent(
@@ -188,22 +199,15 @@ impl PreparedFencedTransitionJournal {
             let transaction = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| journal_unavailable())?;
-            verify_metadata(&transaction, key)?;
+            let membership = verify_metadata(&transaction, key)?;
 
             let existing = read_entry(&transaction, key, request_id)?;
             if existing.is_some() {
                 return Err(StoreError::FencedTransitionRequestConflict);
             }
-            let count: i64 = transaction
-                .query_row(
-                    "SELECT COUNT(*) FROM prepared_fenced_transition_journal",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|_| journal_unavailable())?;
-            if count < 0
-                || usize::try_from(count).map_err(|_| journal_unavailable())?
-                    >= FENCED_TRANSITION_MAX_HISTORY_ENTRIES
+            if membership.count
+                >= i64::try_from(FENCED_TRANSITION_MAX_HISTORY_ENTRIES)
+                    .map_err(|_| journal_unavailable())?
             {
                 return Err(StoreError::FencedTransitionHistoryFull);
             }
@@ -225,6 +229,46 @@ impl PreparedFencedTransitionJournal {
             if inserted != 1 {
                 return Err(journal_unavailable());
             }
+            let Some(inserted_prepared) = read_entry(&transaction, key, request_id)? else {
+                return Err(journal_unavailable());
+            };
+            if inserted_prepared.as_bytes() != canonical.as_slice() {
+                return Err(journal_unavailable());
+            }
+
+            let updated = scan_journal_membership(&transaction, &membership.incarnation)?;
+            if updated.count
+                != membership
+                    .count
+                    .checked_add(1)
+                    .ok_or_else(journal_unavailable)?
+            {
+                return Err(journal_unavailable());
+            }
+            let updated_tag =
+                membership_tag(key, &membership.incarnation, updated.count, &updated.root)?;
+            let metadata_updated = transaction
+                .execute(
+                    "UPDATE prepared_fenced_transition_journal_metadata \
+                     SET membership_count = ?1, membership_root = ?2, membership_tag = ?3 \
+                     WHERE singleton = 1 \
+                       AND membership_count = ?4 \
+                       AND membership_root = ?5 \
+                       AND membership_tag = ?6",
+                    params![
+                        updated.count,
+                        updated.root.as_slice(),
+                        updated_tag.as_slice(),
+                        membership.count,
+                        membership.root.as_slice(),
+                        membership.tag.as_slice(),
+                    ],
+                )
+                .map_err(|_| journal_unavailable())?;
+            if metadata_updated != 1 {
+                return Err(journal_unavailable());
+            }
+            verify_metadata(&transaction, key)?;
             transaction.commit().map_err(|_| journal_unavailable())
         })
         .await
@@ -235,11 +279,14 @@ impl PreparedFencedTransitionJournal {
         request_id: FencedTransitionRequestId,
     ) -> Result<PreparedFencedTransitionLookup, StoreError> {
         self.with_connection(move |conn, key| {
-            verify_metadata(conn, key)?;
-            read_entry(conn, key, request_id).map(|entry| match entry {
+            let transaction = journal_read_transaction(conn)?;
+            verify_metadata(&transaction, key)?;
+            let lookup = read_entry(&transaction, key, request_id).map(|entry| match entry {
                 Some(prepared) => PreparedFencedTransitionLookup::Found(prepared),
                 None => PreparedFencedTransitionLookup::Absent,
-            })
+            })?;
+            transaction.commit().map_err(|_| journal_unavailable())?;
+            Ok(lookup)
         })
         .await
     }
@@ -293,11 +340,11 @@ fn initialize_connection(
         .map_err(|_| journal_unavailable())?;
     let initial_application_id = journal_application_id(conn)?;
     let initial_user_version = journal_user_version(conn)?;
-    let initial_object_count = journal_user_object_count(conn)?;
+    let initial_object_count = journal_schema_catalog_count(conn)?;
     if !((initial_application_id == 0 && initial_user_version == 0 && initial_object_count == 0)
         || (initial_application_id == JOURNAL_APPLICATION_ID
             && initial_user_version == JOURNAL_SCHEMA_VERSION
-            && initial_object_count == 2))
+            && initial_object_count == JOURNAL_SCHEMA_OBJECT_COUNT))
     {
         return Err(journal_unavailable());
     }
@@ -323,7 +370,7 @@ fn initialize_connection(
     let application_id = journal_application_id(&transaction)?;
     let user_version = journal_user_version(&transaction)?;
     if application_id == 0 && user_version == 0 {
-        if journal_user_object_count(&transaction)? != 0 {
+        if journal_schema_catalog_count(&transaction)? != 0 {
             return Err(journal_unavailable());
         }
         transaction
@@ -332,6 +379,19 @@ fn initialize_connection(
             CREATE TABLE prepared_fenced_transition_journal_metadata (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 schema_version INTEGER NOT NULL CHECK (schema_version = {JOURNAL_SCHEMA_VERSION}),
+                journal_incarnation BLOB NOT NULL CHECK (
+                    typeof(journal_incarnation) = 'blob' AND length(journal_incarnation) = 32
+                ),
+                membership_count INTEGER NOT NULL CHECK (
+                    membership_count >= 0
+                    AND membership_count <= {FENCED_TRANSITION_MAX_HISTORY_ENTRIES}
+                ),
+                membership_root BLOB NOT NULL CHECK (
+                    typeof(membership_root) = 'blob' AND length(membership_root) = 32
+                ),
+                membership_tag BLOB NOT NULL CHECK (
+                    typeof(membership_tag) = 'blob' AND length(membership_tag) = 32
+                ),
                 key_check BLOB NOT NULL CHECK (
                     typeof(key_check) = 'blob' AND length(key_check) = 32
                 )
@@ -351,17 +411,33 @@ fn initialize_connection(
                     typeof(integrity_tag) = 'blob' AND length(integrity_tag) = 32
                 )
             ) STRICT;
+            CREATE INDEX {JOURNAL_MEMBERSHIP_INDEX}
+                ON prepared_fenced_transition_journal (request_id, integrity_tag);
             PRAGMA application_id = {JOURNAL_APPLICATION_ID};
             PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};
             "#
             ))
             .map_err(|_| journal_unavailable())?;
         let key_check = key_check(key)?;
+        let mut journal_incarnation = [0_u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES];
+        SysRng
+            .try_fill_bytes(&mut journal_incarnation)
+            .map_err(|_| journal_unavailable())?;
+        let empty_root = MembershipRoot::new(&journal_incarnation, 0)?.finalize();
+        let empty_tag = membership_tag(key, &journal_incarnation, 0, &empty_root)?;
         transaction
             .execute(
                 "INSERT INTO prepared_fenced_transition_journal_metadata \
-                 (singleton, schema_version, key_check) VALUES (1, ?1, ?2)",
-                params![JOURNAL_SCHEMA_VERSION, key_check.as_slice()],
+                 (singleton, schema_version, journal_incarnation, membership_count, \
+                  membership_root, membership_tag, key_check) \
+                 VALUES (1, ?1, ?2, 0, ?3, ?4, ?5)",
+                params![
+                    JOURNAL_SCHEMA_VERSION,
+                    journal_incarnation.as_slice(),
+                    empty_root.as_slice(),
+                    empty_tag.as_slice(),
+                    key_check.as_slice(),
+                ],
             )
             .map_err(|_| journal_unavailable())?;
     } else if application_id != JOURNAL_APPLICATION_ID || user_version != JOURNAL_SCHEMA_VERSION {
@@ -374,39 +450,73 @@ fn initialize_connection(
 fn verify_metadata(
     conn: &Connection,
     key: &PreparedFencedTransitionJournalKey,
-) -> Result<(), StoreError> {
+) -> Result<JournalMembership, StoreError> {
     verify_connection_profile(conn)?;
     if journal_application_id(conn)? != JOURNAL_APPLICATION_ID
         || journal_user_version(conn)? != JOURNAL_SCHEMA_VERSION
-        || journal_user_object_count(conn)? != 2
+        || journal_schema_catalog_count(conn)? != JOURNAL_SCHEMA_OBJECT_COUNT
     {
         return Err(journal_unavailable());
     }
     verify_journal_schema(conn)?;
-    let row: Option<[u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES]> = conn
+    let metadata_count: i64 = conn
         .query_row(
-            "SELECT schema_version, key_check \
+            "SELECT COUNT(*) FROM prepared_fenced_transition_journal_metadata",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| journal_unavailable())?;
+    if metadata_count != 1 {
+        return Err(journal_unavailable());
+    }
+    let row: Option<JournalMetadata> = conn
+        .query_row(
+            "SELECT schema_version, key_check, journal_incarnation, membership_count, \
+                    membership_root, membership_tag \
              FROM prepared_fenced_transition_journal_metadata WHERE singleton = 1",
             [],
             |row| {
                 let ValueRef::Integer(schema_version) = row.get_ref(0)? else {
                     return Err(rusqlite::Error::InvalidQuery);
                 };
-                if schema_version != JOURNAL_SCHEMA_VERSION {
+                let ValueRef::Integer(membership_count) = row.get_ref(3)? else {
                     return Err(rusqlite::Error::InvalidQuery);
-                }
-                fixed_blob(row.get_ref(1)?)
+                };
+                Ok(JournalMetadata {
+                    schema_version,
+                    key_check: fixed_blob(row.get_ref(1)?)?,
+                    membership: JournalMembership {
+                        incarnation: fixed_blob(row.get_ref(2)?)?,
+                        count: membership_count,
+                        root: fixed_blob(row.get_ref(4)?)?,
+                        tag: fixed_blob(row.get_ref(5)?)?,
+                    },
+                })
             },
         )
         .optional()
         .map_err(|_| journal_unavailable())?;
-    let Some(stored_check) = row else {
+    let Some(metadata) = row else {
         return Err(journal_unavailable());
     };
-    if verify_key_check(key, &stored_check).is_err() {
+    if metadata.schema_version != JOURNAL_SCHEMA_VERSION
+        || !valid_membership_count(metadata.membership.count)
+        || verify_key_check(key, &metadata.key_check).is_err()
+    {
         return Err(journal_unavailable());
     }
-    Ok(())
+    let actual = scan_journal_membership(conn, &metadata.membership.incarnation)?;
+    if actual.count != metadata.membership.count || actual.root != metadata.membership.root {
+        return Err(journal_unavailable());
+    }
+    verify_membership_tag(
+        key,
+        &metadata.membership.incarnation,
+        metadata.membership.count,
+        &metadata.membership.root,
+        &metadata.membership.tag,
+    )?;
+    Ok(metadata.membership)
 }
 
 fn verify_connection_profile(conn: &Connection) -> Result<(), StoreError> {
@@ -464,11 +574,26 @@ fn verify_journal_sqlite_length_limit(conn: &Connection) -> Result<(), StoreErro
 fn verify_journal_schema(conn: &Connection) -> Result<(), StoreError> {
     let expected = [
         (
+            "table",
+            "prepared_fenced_transition_journal_metadata",
             "prepared_fenced_transition_journal_metadata",
             format!(
                 r#"CREATE TABLE prepared_fenced_transition_journal_metadata (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     schema_version INTEGER NOT NULL CHECK (schema_version = {JOURNAL_SCHEMA_VERSION}),
+                    journal_incarnation BLOB NOT NULL CHECK (
+                        typeof(journal_incarnation) = 'blob' AND length(journal_incarnation) = 32
+                    ),
+                    membership_count INTEGER NOT NULL CHECK (
+                        membership_count >= 0
+                        AND membership_count <= {FENCED_TRANSITION_MAX_HISTORY_ENTRIES}
+                    ),
+                    membership_root BLOB NOT NULL CHECK (
+                        typeof(membership_root) = 'blob' AND length(membership_root) = 32
+                    ),
+                    membership_tag BLOB NOT NULL CHECK (
+                        typeof(membership_tag) = 'blob' AND length(membership_tag) = 32
+                    ),
                     key_check BLOB NOT NULL CHECK (
                         typeof(key_check) = 'blob' AND length(key_check) = 32
                     )
@@ -476,6 +601,8 @@ fn verify_journal_schema(conn: &Connection) -> Result<(), StoreError> {
             ),
         ),
         (
+            "table",
+            "prepared_fenced_transition_journal",
             "prepared_fenced_transition_journal",
             format!(
                 r#"CREATE TABLE prepared_fenced_transition_journal (
@@ -495,8 +622,23 @@ fn verify_journal_schema(conn: &Connection) -> Result<(), StoreError> {
                 ) STRICT"#
             ),
         ),
+        (
+            "index",
+            "sqlite_autoindex_prepared_fenced_transition_journal_1",
+            "prepared_fenced_transition_journal",
+            String::new(),
+        ),
+        (
+            "index",
+            JOURNAL_MEMBERSHIP_INDEX,
+            "prepared_fenced_transition_journal",
+            format!(
+                "CREATE INDEX {JOURNAL_MEMBERSHIP_INDEX} \
+                 ON prepared_fenced_transition_journal (request_id, integrity_tag)"
+            ),
+        ),
     ];
-    for (name, expected_sql) in expected {
+    for (expected_type, name, expected_table_name, expected_sql) in expected {
         let row: Option<(String, String, Option<String>)> = conn
             .query_row(
                 "SELECT type, tbl_name, sql FROM sqlite_schema WHERE name = ?1",
@@ -505,13 +647,17 @@ fn verify_journal_schema(conn: &Connection) -> Result<(), StoreError> {
             )
             .optional()
             .map_err(|_| journal_unavailable())?;
-        let Some((object_type, table_name, Some(actual_sql))) = row else {
+        let Some((object_type, table_name, actual_sql)) = row else {
             return Err(journal_unavailable());
         };
-        if object_type != "table"
-            || table_name != name
-            || canonical_schema_sql(&actual_sql) != canonical_schema_sql(&expected_sql)
-        {
+        let sql_matches = if expected_sql.is_empty() {
+            actual_sql.is_none()
+        } else {
+            actual_sql.is_some_and(|actual_sql| {
+                canonical_schema_sql(&actual_sql) == canonical_schema_sql(&expected_sql)
+            })
+        };
+        if object_type != expected_type || table_name != expected_table_name || !sql_matches {
             return Err(journal_unavailable());
         }
     }
@@ -534,13 +680,122 @@ fn journal_user_version(conn: &Connection) -> Result<i64, StoreError> {
         .map_err(|_| journal_unavailable())
 }
 
-fn journal_user_object_count(conn: &Connection) -> Result<i64, StoreError> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
-        [],
-        |row| row.get(0),
-    )
-    .map_err(|_| journal_unavailable())
+fn journal_schema_catalog_count(conn: &Connection) -> Result<i64, StoreError> {
+    conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))
+        .map_err(|_| journal_unavailable())
+}
+
+fn journal_read_transaction(
+    conn: &mut Connection,
+) -> Result<rusqlite::Transaction<'_>, StoreError> {
+    conn.transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(|_| journal_unavailable())
+}
+
+struct JournalMetadata {
+    schema_version: i64,
+    key_check: [u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+    membership: JournalMembership,
+}
+
+#[derive(Clone, Copy)]
+struct JournalMembership {
+    incarnation: [u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+    count: i64,
+    root: [u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+    tag: [u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+}
+
+struct JournalMembershipSnapshot {
+    count: i64,
+    root: [u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+}
+
+struct MembershipRoot {
+    hasher: Sha256,
+}
+
+impl MembershipRoot {
+    fn new(
+        incarnation: &[u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+        count: i64,
+    ) -> Result<Self, StoreError> {
+        if !valid_membership_count(count) {
+            return Err(journal_unavailable());
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(JOURNAL_MEMBERSHIP_ROOT_DOMAIN);
+        hasher.update(incarnation);
+        hasher.update(
+            u64::try_from(count)
+                .map_err(|_| journal_unavailable())?
+                .to_be_bytes(),
+        );
+        Ok(Self { hasher })
+    }
+
+    fn include(
+        &mut self,
+        request_id: FencedTransitionRequestId,
+        integrity_tag: &[u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+    ) {
+        self.hasher.update(request_id.as_bytes());
+        self.hasher.update(integrity_tag);
+    }
+
+    fn finalize(self) -> [u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES] {
+        self.hasher.finalize().into()
+    }
+}
+
+fn valid_membership_count(count: i64) -> bool {
+    count >= 0
+        && usize::try_from(count).is_ok_and(|count| count <= FENCED_TRANSITION_MAX_HISTORY_ENTRIES)
+}
+
+fn scan_journal_membership(
+    conn: &Connection,
+    incarnation: &[u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+) -> Result<JournalMembershipSnapshot, StoreError> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM prepared_fenced_transition_journal",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| journal_unavailable())?;
+    let mut root = MembershipRoot::new(incarnation, count)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT request_id, integrity_tag \
+             FROM prepared_fenced_transition_journal \
+             INDEXED BY prepared_fenced_transition_journal_membership_idx \
+             ORDER BY request_id ASC",
+        )
+        .map_err(|_| journal_unavailable())?;
+    let mut rows = statement.query([]).map_err(|_| journal_unavailable())?;
+    let mut observed_count = 0_i64;
+    while let Some(row) = rows.next().map_err(|_| journal_unavailable())? {
+        let request_id = FencedTransitionRequestId::from_bytes(
+            fixed_blob::<FENCED_TRANSITION_REQUEST_ID_BYTES>(
+                row.get_ref(0).map_err(|_| journal_unavailable())?,
+            )
+            .map_err(|_| journal_unavailable())?,
+        );
+        let integrity_tag = fixed_blob(row.get_ref(1).map_err(|_| journal_unavailable())?)
+            .map_err(|_| journal_unavailable())?;
+        root.include(request_id, &integrity_tag);
+        observed_count = observed_count
+            .checked_add(1)
+            .ok_or_else(journal_unavailable)?;
+    }
+    if observed_count != count {
+        return Err(journal_unavailable());
+    }
+    Ok(JournalMembershipSnapshot {
+        count,
+        root: root.finalize(),
+    })
 }
 
 fn read_entry(
@@ -645,6 +900,47 @@ fn verify_entry_tag(
     mac.update(&FENCED_TRANSITION_PREPARED_SCHEMA_V1.to_be_bytes());
     mac.update(&length.to_be_bytes());
     mac.update(canonical);
+    mac.verify_slice(stored).map_err(|_| journal_unavailable())
+}
+
+fn membership_tag(
+    key: &PreparedFencedTransitionJournalKey,
+    incarnation: &[u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+    count: i64,
+    root: &[u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+) -> Result<[u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES], StoreError> {
+    if !valid_membership_count(count) {
+        return Err(journal_unavailable());
+    }
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).map_err(|_| journal_unavailable())?;
+    mac.update(JOURNAL_MEMBERSHIP_TAG_DOMAIN);
+    mac.update(incarnation);
+    let encoded_count = u64::try_from(count)
+        .map_err(|_| journal_unavailable())?
+        .to_be_bytes();
+    mac.update(&encoded_count);
+    mac.update(root);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn verify_membership_tag(
+    key: &PreparedFencedTransitionJournalKey,
+    incarnation: &[u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+    count: i64,
+    root: &[u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+    stored: &[u8],
+) -> Result<(), StoreError> {
+    if !valid_membership_count(count) {
+        return Err(journal_unavailable());
+    }
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).map_err(|_| journal_unavailable())?;
+    mac.update(JOURNAL_MEMBERSHIP_TAG_DOMAIN);
+    mac.update(incarnation);
+    let encoded_count = u64::try_from(count)
+        .map_err(|_| journal_unavailable())?
+        .to_be_bytes();
+    mac.update(&encoded_count);
+    mac.update(root);
     mac.verify_slice(stored).map_err(|_| journal_unavailable())
 }
 
@@ -944,6 +1240,12 @@ mod tests {
     }
 
     fn prepared(request_id: u8) -> PreparedFencedTransition {
+        prepared_with_request_id([request_id; FENCED_TRANSITION_REQUEST_ID_BYTES])
+    }
+
+    fn prepared_with_request_id(
+        request_id: [u8; FENCED_TRANSITION_REQUEST_ID_BYTES],
+    ) -> PreparedFencedTransition {
         let key = SessionKey {
             tenant: TenantId::from_static("journal-test"),
             nf_kind: NetworkFunctionKind::smf(),
@@ -959,7 +1261,7 @@ mod tests {
         );
         let guard = LeaseGuard::new(key, owner, FenceToken::new(9), acquired_at, expires_at, 1);
         let request = FencedTransitionRequest::new(
-            FencedTransitionRequestId::from_bytes([request_id; 16]),
+            FencedTransitionRequestId::from_bytes(request_id),
             FencedTransitionLease::renew(guard, Duration::from_secs(30)).expect("renewal"),
             FencedTransitionMutation::delete(Generation::new(1)),
         )
@@ -974,6 +1276,14 @@ mod tests {
             }
             Ok(_) | Err(_) => panic!("journal failure was not coarsely classified"),
         }
+    }
+
+    async fn assert_live_integrity_failure(
+        journal: &PreparedFencedTransitionJournal,
+        request_id: FencedTransitionRequestId,
+    ) {
+        assert_coarse_unavailable(journal.health_check().await);
+        assert_coarse_unavailable(journal.lookup(request_id).await);
     }
 
     #[tokio::test]
@@ -1013,6 +1323,263 @@ mod tests {
             .await
             .expect("exact binding")
             .is_some());
+        reopened
+            .health_check()
+            .await
+            .expect("reopen integrity check");
+    }
+
+    #[tokio::test]
+    async fn prepared_journal_read_snapshot_does_not_reserve_the_wal_writer() {
+        let fixture = JournalFixture::new(0x68);
+        let reader = fixture.open();
+        let writer = fixture.open();
+        let retained = prepared(0x69);
+        let (snapshot_started_tx, snapshot_started_rx) = tokio::sync::oneshot::channel();
+        let (release_snapshot_tx, release_snapshot_rx) = tokio::sync::oneshot::channel();
+
+        let held_snapshot = tokio::spawn(async move {
+            reader
+                .with_connection(move |conn, key| {
+                    let transaction = journal_read_transaction(conn)?;
+                    verify_metadata(&transaction, key)?;
+                    snapshot_started_tx
+                        .send(())
+                        .map_err(|_| journal_unavailable())?;
+                    release_snapshot_rx
+                        .blocking_recv()
+                        .map_err(|_| journal_unavailable())?;
+                    transaction.commit().map_err(|_| journal_unavailable())
+                })
+                .await
+        });
+
+        snapshot_started_rx
+            .await
+            .expect("reader reached a stable WAL snapshot");
+        writer
+            .insert(&retained)
+            .await
+            .expect("writer proceeds beside a read snapshot");
+        release_snapshot_tx
+            .send(())
+            .expect("release the read snapshot");
+        held_snapshot
+            .await
+            .expect("join read snapshot task")
+            .expect("finish read snapshot");
+    }
+
+    #[tokio::test]
+    async fn prepared_journal_public_reads_do_not_request_the_wal_writer() {
+        let fixture = JournalFixture::new(0x6a);
+        let journal = fixture.open();
+        let retained = prepared(0x6b);
+        journal.insert(&retained).await.expect("durable insert");
+
+        let mut writer = Connection::open(&fixture.path).expect("open reserved writer fixture");
+        let reserved_writer = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("reserve the WAL writer");
+        assert!(matches!(
+            journal.lookup(retained.request_id()).await,
+            Ok(PreparedFencedTransitionLookup::Found(_))
+        ));
+        journal
+            .health_check()
+            .await
+            .expect("health remains a read transaction");
+        reserved_writer
+            .rollback()
+            .expect("release reserved WAL writer");
+    }
+
+    #[tokio::test]
+    async fn prepared_journal_enforces_membership_capacity_boundary() {
+        let fixture = JournalFixture::new(0x69);
+        drop(fixture.open());
+        let mut connection = Connection::open(&fixture.path).expect("open capacity fixture");
+        let transaction = connection
+            .transaction()
+            .expect("start capacity transaction");
+        let incarnation = transaction
+            .query_row(
+                "SELECT journal_incarnation FROM prepared_fenced_transition_journal_metadata",
+                [],
+                |row| fixed_blob(row.get_ref(0)?),
+            )
+            .expect("read journal incarnation");
+        let capacity = i64::try_from(FENCED_TRANSITION_MAX_HISTORY_ENTRIES)
+            .expect("history capacity is representable");
+        let key = PreparedFencedTransitionJournalKey::from_bytes(fixture.key);
+        let mut root = MembershipRoot::new(&incarnation, capacity).expect("start capacity root");
+        for ordinal in 0..FENCED_TRANSITION_MAX_HISTORY_ENTRIES {
+            let mut request_id = [0_u8; FENCED_TRANSITION_REQUEST_ID_BYTES];
+            request_id[8..].copy_from_slice(
+                &u64::try_from(ordinal + 1)
+                    .expect("ordinal is representable")
+                    .to_be_bytes(),
+            );
+            let retained = prepared_with_request_id(request_id);
+            let tag = entry_tag(&key, retained.request_id(), retained.as_bytes())
+                .expect("capacity row tag");
+            transaction
+                .execute(
+                    "INSERT INTO prepared_fenced_transition_journal \
+                     (request_id, prepared_schema_version, prepared_token, integrity_tag) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        retained.request_id().as_bytes().as_slice(),
+                        i64::from(FENCED_TRANSITION_PREPARED_SCHEMA_V1),
+                        retained.as_bytes(),
+                        tag.as_slice(),
+                    ],
+                )
+                .expect("insert capacity row");
+            root.include(retained.request_id(), &tag);
+        }
+        let root = root.finalize();
+        let tag = membership_tag(&key, &incarnation, capacity, &root).expect("capacity tag");
+        transaction
+            .execute(
+                "UPDATE prepared_fenced_transition_journal_metadata \
+                 SET membership_count = ?1, membership_root = ?2, membership_tag = ?3",
+                params![capacity, root.as_slice(), tag.as_slice()],
+            )
+            .expect("commit capacity membership");
+        transaction.commit().expect("finish capacity transaction");
+        drop(connection);
+
+        let journal = fixture.open();
+        let overflow = prepared_with_request_id([0xff; FENCED_TRANSITION_REQUEST_ID_BYTES]);
+        assert_eq!(
+            journal.insert(&overflow).await,
+            Err(StoreError::FencedTransitionHistoryFull)
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_journal_rejects_deleted_membership_at_health_lookup_and_absence_check() {
+        let fixture = JournalFixture::new(0x70);
+        let journal = fixture.open();
+        let retained = prepared(0x71);
+        journal.insert(&retained).await.expect("durable insert");
+
+        let connection = Connection::open(&fixture.path).expect("open deletion fixture");
+        connection
+            .execute("DELETE FROM prepared_fenced_transition_journal", [])
+            .expect("delete retained row");
+        drop(connection);
+
+        assert_live_integrity_failure(&journal, retained.request_id()).await;
+        assert_coarse_unavailable(journal.ensure_absent(retained.request_id()).await);
+    }
+
+    #[tokio::test]
+    async fn prepared_journal_rejects_primary_key_membership_replacement() {
+        let fixture = JournalFixture::new(0x72);
+        let journal = fixture.open();
+        let retained = prepared(0x73);
+        let replacement = prepared(0x74);
+        journal.insert(&retained).await.expect("durable insert");
+        let replacement_tag = entry_tag(
+            &PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
+            replacement.request_id(),
+            replacement.as_bytes(),
+        )
+        .expect("replacement tag");
+
+        let connection = Connection::open(&fixture.path).expect("open primary-key fixture");
+        connection
+            .execute(
+                "UPDATE prepared_fenced_transition_journal \
+                 SET request_id = ?1, prepared_token = ?2, integrity_tag = ?3",
+                params![
+                    replacement.request_id().as_bytes().as_slice(),
+                    replacement.as_bytes(),
+                    replacement_tag.as_slice(),
+                ],
+            )
+            .expect("replace valid row under a different primary key");
+        drop(connection);
+
+        assert_live_integrity_failure(&journal, replacement.request_id()).await;
+    }
+
+    #[tokio::test]
+    async fn prepared_journal_rejects_extra_valid_membership_row() {
+        let fixture = JournalFixture::new(0x75);
+        let journal = fixture.open();
+        let retained = prepared(0x76);
+        let extra = prepared(0x77);
+        journal.insert(&retained).await.expect("durable insert");
+        let extra_tag = entry_tag(
+            &PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
+            extra.request_id(),
+            extra.as_bytes(),
+        )
+        .expect("extra row tag");
+
+        let connection = Connection::open(&fixture.path).expect("open addition fixture");
+        connection
+            .execute(
+                "INSERT INTO prepared_fenced_transition_journal \
+                 (request_id, prepared_schema_version, prepared_token, integrity_tag) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    extra.request_id().as_bytes().as_slice(),
+                    i64::from(FENCED_TRANSITION_PREPARED_SCHEMA_V1),
+                    extra.as_bytes(),
+                    extra_tag.as_slice(),
+                ],
+            )
+            .expect("insert independently valid extra row");
+        drop(connection);
+
+        assert_live_integrity_failure(&journal, retained.request_id()).await;
+    }
+
+    #[tokio::test]
+    async fn prepared_journal_rejects_tag_globally_and_body_for_the_selected_identity() {
+        let tag_fixture = JournalFixture::new(0x78);
+        let tag_journal = tag_fixture.open();
+        let tag_retained = prepared(0x79);
+        tag_journal
+            .insert(&tag_retained)
+            .await
+            .expect("durable insert");
+        let connection = Connection::open(&tag_fixture.path).expect("open tag fixture");
+        connection
+            .execute(
+                "UPDATE prepared_fenced_transition_journal SET integrity_tag = zeroblob(32)",
+                [],
+            )
+            .expect("corrupt row tag");
+        drop(connection);
+        assert_live_integrity_failure(&tag_journal, tag_retained.request_id()).await;
+
+        let body_fixture = JournalFixture::new(0x7a);
+        let body_journal = body_fixture.open();
+        let body_retained = prepared(0x7b);
+        let substituted = prepared(0x7c);
+        body_journal
+            .insert(&body_retained)
+            .await
+            .expect("durable insert");
+        let connection = Connection::open(&body_fixture.path).expect("open body fixture");
+        connection
+            .execute(
+                "UPDATE prepared_fenced_transition_journal SET prepared_token = ?1",
+                params![substituted.as_bytes()],
+            )
+            .expect("corrupt row body");
+        drop(connection);
+        body_journal
+            .health_check()
+            .await
+            .expect("membership remains authenticated");
+        assert_coarse_unavailable(body_journal.lookup(body_retained.request_id()).await);
+        assert_coarse_unavailable(body_journal.ensure_absent(body_retained.request_id()).await);
     }
 
     #[tokio::test]
@@ -1039,8 +1606,10 @@ mod tests {
             .expect("corrupt integrity tag");
         drop(connection);
 
-        let reopened = fixture.open();
-        assert_coarse_unavailable(reopened.lookup(retained.request_id()).await);
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+            &fixture.path,
+            PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
+        ));
     }
 
     #[test]
@@ -1107,8 +1676,40 @@ mod tests {
             PreparedFencedTransitionJournalKey::from_bytes(replaced.key),
         ));
 
+        let missing_index = JournalFixture::new(0x5e);
+        drop(missing_index.open());
+        {
+            let connection = Connection::open(&missing_index.path).expect("open index fixture");
+            connection
+                .execute(&format!("DROP INDEX {JOURNAL_MEMBERSHIP_INDEX}"), [])
+                .expect("drop required membership index");
+        }
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+            &missing_index.path,
+            PreparedFencedTransitionJournalKey::from_bytes(missing_index.key),
+        ));
+
         let profile = Connection::open_in_memory().expect("open profile fixture");
         assert_coarse_unavailable(verify_connection_profile(&profile));
+    }
+
+    #[test]
+    fn prepared_journal_membership_scan_uses_the_exact_covering_index() {
+        let fixture = JournalFixture::new(0x5d);
+        drop(fixture.open());
+        let connection = Connection::open(&fixture.path).expect("open query-plan fixture");
+        let detail: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN \
+                 SELECT request_id, integrity_tag \
+                 FROM prepared_fenced_transition_journal \
+                 INDEXED BY prepared_fenced_transition_journal_membership_idx \
+                 ORDER BY request_id ASC",
+                [],
+                |row| row.get(3),
+            )
+            .expect("read membership query plan");
+        assert!(detail.contains(&format!("COVERING INDEX {JOURNAL_MEMBERSHIP_INDEX}")));
     }
 
     #[test]
@@ -1135,6 +1736,72 @@ mod tests {
             &fixture.path,
             PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
         ));
+    }
+
+    #[tokio::test]
+    async fn prepared_journal_rejects_reserved_prefix_catalog_trigger_before_profile_setup() {
+        let fixture = JournalFixture::new(0x4f);
+        drop(fixture.open());
+        {
+            let connection = Connection::open(&fixture.path).expect("open catalog fixture");
+            let journal_mode: String = connection
+                .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+                .expect("set baseline journal mode");
+            assert_eq!(journal_mode, "delete");
+            connection
+                .execute_batch(
+                    r#"
+                    PRAGMA writable_schema = ON;
+                    INSERT INTO sqlite_schema (type, name, tbl_name, rootpage, sql)
+                    VALUES (
+                        'trigger',
+                        'sqlite_prepared_journal_insert_guard',
+                        'prepared_fenced_transition_journal',
+                        0,
+                        'CREATE TRIGGER sqlite_prepared_journal_insert_guard
+                         BEFORE INSERT ON prepared_fenced_transition_journal
+                         BEGIN SELECT RAISE(ABORT, ''blocked''); END'
+                    );
+                    PRAGMA writable_schema = OFF;
+                    "#,
+                )
+                .expect("offline-craft reserved catalog trigger");
+        }
+
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+            &fixture.path,
+            PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
+        ));
+        let connection = Connection::open(&fixture.path).expect("reopen catalog fixture");
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("read unchanged journal mode");
+        assert_eq!(journal_mode, "delete");
+        drop(connection);
+
+        let live_fixture = JournalFixture::new(0x5f);
+        let live_journal = live_fixture.open();
+        let connection = Connection::open(&live_fixture.path).expect("open live catalog fixture");
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA writable_schema = ON;
+                INSERT INTO sqlite_schema (type, name, tbl_name, rootpage, sql)
+                VALUES (
+                    'trigger',
+                    'sqlite_prepared_journal_live_guard',
+                    'prepared_fenced_transition_journal',
+                    0,
+                    'CREATE TRIGGER sqlite_prepared_journal_live_guard
+                     BEFORE INSERT ON prepared_fenced_transition_journal
+                     BEGIN SELECT RAISE(ABORT, ''blocked''); END'
+                );
+                PRAGMA writable_schema = OFF;
+                "#,
+            )
+            .expect("offline-craft live reserved catalog trigger");
+        drop(connection);
+        assert_coarse_unavailable(live_journal.health_check().await);
     }
 
     #[test]
@@ -1206,8 +1873,13 @@ mod tests {
                 ))
                 .expect("bypass prepared-token check constraint");
         }
-        let token_journal = token_fixture.open();
+        let token_journal = PreparedFencedTransitionJournal::open(
+            &token_fixture.path,
+            PreparedFencedTransitionJournalKey::from_bytes(token_fixture.key),
+        )
+        .expect("open membership-only token fixture");
         assert_coarse_unavailable(token_journal.lookup(token.request_id()).await);
+        assert_coarse_unavailable(token_journal.ensure_absent(token.request_id()).await);
 
         let tag_fixture = JournalFixture::new(0x52);
         let tag = prepared(0x61);
@@ -1226,8 +1898,10 @@ mod tests {
                 )
                 .expect("bypass integrity-tag check constraint");
         }
-        let tag_journal = tag_fixture.open();
-        assert_coarse_unavailable(tag_journal.lookup(tag.request_id()).await);
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+            &tag_fixture.path,
+            PreparedFencedTransitionJournalKey::from_bytes(tag_fixture.key),
+        ));
     }
 
     #[cfg(unix)]

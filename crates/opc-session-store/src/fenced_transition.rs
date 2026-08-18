@@ -1286,6 +1286,11 @@ mod tests {
     use super::*;
     use crate::{EncryptedSessionPayload, SessionKeyType, StableId, StateClass, StateType};
     use bytes::Bytes;
+    use opc_crypto::CryptoEnvelopeV1;
+    use opc_key::{
+        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
+        AES_256_GCM_SIV_NONCE_LEN,
+    };
     use opc_types::{NetworkFunctionKind, TenantId};
 
     fn key() -> SessionKey {
@@ -1356,18 +1361,79 @@ mod tests {
         .expect("record-free request")
     }
 
-    fn prepared_wire_create_request(request_id: u8) -> FencedTransitionRequest {
+    fn prepared_wire_payload(
+        encoding: crate::SessionPayloadEncoding,
+        key: &SessionKey,
+        state_type: &StateType,
+        generation: Generation,
+        fence: FenceToken,
+    ) -> EncryptedSessionPayload {
+        match encoding {
+            crate::SessionPayloadEncoding::Plaintext => EncryptedSessionPayload::new([0x51]),
+            crate::SessionPayloadEncoding::LegacyPlaintext => {
+                EncryptedSessionPayload::legacy_plaintext([0x52])
+            }
+            crate::SessionPayloadEncoding::EnvelopeV1 => {
+                let key_id = KeyId::new("prepared-wire-test-key").expect("key ID");
+                let aad = EnvelopeAad::session(
+                    key.tenant.clone(),
+                    1,
+                    SessionAad::new(
+                        key.nf_kind.as_str(),
+                        "prepared-wire-test-keyed-session-digest",
+                        state_type.as_str(),
+                        generation.get(),
+                        fence.get(),
+                        "prepared-wire-test-backend",
+                    )
+                    .expect("session AAD"),
+                );
+                let envelope = CryptoEnvelopeV1 {
+                    algorithm: AeadAlgorithm::Aes256GcmSiv,
+                    key_id: key_id.clone(),
+                    nonce: vec![0x53; AES_256_GCM_SIV_NONCE_LEN],
+                    aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+                    ciphertext_and_tag: vec![0x54; AEAD_TAG_LEN],
+                }
+                .encode()
+                .expect("envelope encoding");
+                EncryptedSessionPayload::try_envelope(envelope).expect("valid envelope")
+            }
+            crate::SessionPayloadEncoding::Unclassified => {
+                EncryptedSessionPayload::unclassified([0x55])
+            }
+        }
+    }
+
+    fn prepared_wire_expiry(state_class: StateClass) -> Option<Timestamp> {
+        match state_class {
+            StateClass::AuthoritativeSession
+            | StateClass::DataplaneLookup
+            | StateClass::ReplicatedDr
+            | StateClass::TelemetryDerived => None,
+            StateClass::EphemeralProcedure => Some(timestamp(90)),
+        }
+    }
+
+    fn prepared_wire_create_request(
+        request_id: u8,
+        state_class: StateClass,
+        encoding: crate::SessionPayloadEncoding,
+    ) -> FencedTransitionRequest {
         let owner = OwnerId::new("prepared-wire-owner").expect("owner");
         let key = key();
+        let generation = Generation::new(1);
+        let fence = FenceToken::new(8);
+        let state_type = StateType::new("prepared-wire-state").expect("state type");
         let record = StoredSessionRecord {
             key: key.clone(),
-            generation: Generation::new(1),
+            generation,
             owner: owner.clone(),
-            fence: FenceToken::new(8),
-            state_class: StateClass::AuthoritativeSession,
-            state_type: StateType::new("prepared-wire-state").expect("state type"),
-            expires_at: None,
-            payload: EncryptedSessionPayload::new([]),
+            fence,
+            state_class,
+            state_type: state_type.clone(),
+            expires_at: prepared_wire_expiry(state_class),
+            payload: prepared_wire_payload(encoding, &key, &state_type, generation, fence),
         };
         FencedTransitionRequest::new(
             FencedTransitionRequestId::from_bytes([request_id; 16]),
@@ -1375,21 +1441,28 @@ mod tests {
                 .expect("acquire"),
             FencedTransitionMutation::create(record),
         )
-        .expect("empty-payload create request")
+        .expect("create request")
     }
 
-    fn prepared_wire_update_request(request_id: u8) -> FencedTransitionRequest {
+    fn prepared_wire_update_request(
+        request_id: u8,
+        state_class: StateClass,
+        encoding: crate::SessionPayloadEncoding,
+    ) -> FencedTransitionRequest {
         let owner = OwnerId::new("prepared-wire-owner").expect("owner");
         let key = key();
+        let generation = Generation::new(2);
+        let fence = FenceToken::new(9);
+        let state_type = StateType::new("prepared-wire-state").expect("state type");
         let record = StoredSessionRecord {
             key: key.clone(),
-            generation: Generation::new(2),
+            generation,
             owner: owner.clone(),
-            fence: FenceToken::new(9),
-            state_class: StateClass::EphemeralProcedure,
-            state_type: StateType::new("prepared-wire-state").expect("state type"),
-            expires_at: Some(timestamp(90)),
-            payload: EncryptedSessionPayload::unclassified([]),
+            fence,
+            state_class,
+            state_type: state_type.clone(),
+            expires_at: prepared_wire_expiry(state_class),
+            payload: prepared_wire_payload(encoding, &key, &state_type, generation, fence),
         };
         FencedTransitionRequest::new(
             FencedTransitionRequestId::from_bytes([request_id; 16]),
@@ -1400,7 +1473,7 @@ mod tests {
             .expect("renewal"),
             FencedTransitionMutation::update(Generation::new(1), record),
         )
-        .expect("empty-payload update request")
+        .expect("update request")
     }
 
     fn prepared_wire_refresh_request(request_id: u8) -> FencedTransitionRequest {
@@ -1478,8 +1551,8 @@ mod tests {
     #[test]
     fn protected_fenced_transition_v1_wire_compatibility_corpus_is_frozen() {
         const EXPECTED_V1_FINGERPRINT: [u8; 32] = [
-            123, 207, 182, 22, 202, 255, 98, 71, 138, 154, 18, 23, 207, 41, 199, 72, 63, 142, 188,
-            103, 49, 40, 14, 78, 237, 111, 126, 164, 124, 231, 94, 98,
+            83, 244, 20, 87, 150, 210, 30, 78, 222, 157, 39, 134, 49, 249, 93, 17, 159, 16, 188,
+            247, 244, 64, 187, 146, 48, 43, 250, 179, 31, 240, 125, 221,
         ];
 
         use sha2::{Digest, Sha256};
@@ -1501,6 +1574,8 @@ mod tests {
                 "acquire-create-record-no-expiry",
                 PreparedFencedTransition::from_unprotected_request(prepared_wire_create_request(
                     0x38,
+                    StateClass::AuthoritativeSession,
+                    crate::SessionPayloadEncoding::EnvelopeV1,
                 ))
                 .expect("prepare create V1 token"),
             ),
@@ -1508,8 +1583,37 @@ mod tests {
                 "renew-update-record-with-expiry",
                 PreparedFencedTransition::from_unprotected_request(prepared_wire_update_request(
                     0x39,
+                    StateClass::EphemeralProcedure,
+                    crate::SessionPayloadEncoding::Unclassified,
                 ))
                 .expect("prepare update V1 token"),
+            ),
+            (
+                "acquire-create-legacy-plaintext-dataplane",
+                PreparedFencedTransition::from_unprotected_request(prepared_wire_create_request(
+                    0x44,
+                    StateClass::DataplaneLookup,
+                    crate::SessionPayloadEncoding::LegacyPlaintext,
+                ))
+                .expect("prepare legacy plaintext V1 token"),
+            ),
+            (
+                "renew-update-plaintext-replicated-dr",
+                PreparedFencedTransition::from_unprotected_request(prepared_wire_update_request(
+                    0x45,
+                    StateClass::ReplicatedDr,
+                    crate::SessionPayloadEncoding::Plaintext,
+                ))
+                .expect("prepare plaintext V1 token"),
+            ),
+            (
+                "renew-update-envelope-telemetry-derived",
+                PreparedFencedTransition::from_unprotected_request(prepared_wire_update_request(
+                    0x46,
+                    StateClass::TelemetryDerived,
+                    crate::SessionPayloadEncoding::EnvelopeV1,
+                ))
+                .expect("prepare envelope V1 token"),
             ),
             ("renew-delete", prepared_wire_with_layers(0x3a, &[])),
             (
