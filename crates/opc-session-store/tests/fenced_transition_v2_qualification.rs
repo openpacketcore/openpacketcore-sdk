@@ -548,15 +548,53 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
     );
     let first_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("first epoch");
 
-    // Exercise the production contract first: exactly two distinct committed
-    // transitions for each of 50,000 durable sessions.  The second operation
-    // is a real lease renewal plus record update, not a disposable-key
-    // shortcut around the state machine. Independent sessions are admitted as
+    // Activate the versioned capability with one ordinary session before the
+    // bounded client burst. This keeps the first activation's unanimous proof
+    // and durable certificate single-valued while still sending every request
+    // through the same public three-voter consensus/apply path.
+    let first_key = key(0);
+    let first_observation = retry_exact_consensus_operation(&transient_retries, || {
+        store.observe_fenced_transition(&first_key)
+    })
+    .await
+    .expect("initial real consensus fence observation");
+    let first_request = create_request(
+        0,
+        first_epoch,
+        first_key,
+        first_observation.current_fence(),
+        &provider,
+    )
+    .await;
+    let first_outcome = retry_exact_consensus_operation(&transient_retries, || {
+        store.fenced_transition_v2(first_request.clone())
+    })
+    .await
+    .expect("initial capability-activating transition must commit through quorum apply");
+    assert!(matches!(
+        first_outcome.mutation(),
+        FencedTransitionMutationResult::Created
+    ));
+    let first_update = renew_update_request(1, first_epoch, &first_outcome, &provider).await;
+    let first_updated = retry_exact_consensus_operation(&transient_retries, || {
+        store.fenced_transition_v2(first_update.clone())
+    })
+    .await
+    .expect("initial session update must commit through quorum apply");
+    assert!(matches!(
+        first_updated.mutation(),
+        FencedTransitionMutationResult::Updated
+    ));
+
+    // Exercise the production contract: exactly two distinct committed
+    // transitions for each of 50,000 durable sessions. The second operation is
+    // a real lease renewal plus record update, not a disposable-key shortcut
+    // around the state machine. Remaining independent sessions are admitted as
     // a bounded client burst; each task still performs its observation,
     // proposal, and three-voter durable apply through the public API. Sorting
     // the completed tasks restores deterministic session indexing for the
     // delayed-retry exemplar and the subsequent headroom updates.
-    let mut session_states = futures_util::stream::iter(0..QUALIFICATION_SESSIONS)
+    let mut remaining_session_states = futures_util::stream::iter(1..QUALIFICATION_SESSIONS)
         .map(|session_index| {
             let provider = &provider;
             let transient_retries = Arc::clone(&transient_retries);
@@ -603,6 +641,8 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         .buffer_unordered(QUALIFICATION_IN_FLIGHT_CLIENTS)
         .collect::<Vec<_>>()
         .await;
+    let mut session_states = vec![(0, first_request, first_outcome, first_updated)];
+    session_states.append(&mut remaining_session_states);
     session_states.sort_unstable_by_key(|(session_index, _, _, _)| *session_index);
     assert_eq!(
         session_states.len(),
