@@ -106,11 +106,12 @@ pub const FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES: usize = 1_048_576;
 /// reaches the typed error representation.
 pub const FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES: u64 = u32::MAX as u64;
 
-/// Lowest Unix second permitted in a V2 timestamp (`-9999-01-01T00:00:00Z`).
+/// Lowest Unix second permitted in a V2 timestamp (`0000-01-01T00:00:00Z`).
 ///
-/// V2 fixes this range independently of optional `time` crate features so
-/// every voter accepts exactly the same command and receipt timestamps.
-pub const FENCED_TRANSITION_V2_MIN_TIMESTAMP_UNIX_SECONDS: i64 = -377_705_116_800;
+/// This is the minimum representable `time::Rfc3339` wire value. V2 fixes the
+/// range independently of optional `time` crate features so every voter
+/// accepts exactly the same command and receipt timestamps.
+pub const FENCED_TRANSITION_V2_MIN_TIMESTAMP_UNIX_SECONDS: i64 = -62_167_219_200;
 
 /// Highest Unix second permitted in a V2 timestamp (`9999-12-31T23:59:59Z`).
 pub const FENCED_TRANSITION_V2_MAX_TIMESTAMP_UNIX_SECONDS: i64 = 253_402_300_799;
@@ -199,6 +200,7 @@ pub const FENCED_TRANSITION_V2_VALIDATION_SCHEMA_DESCRIPTOR: &str = concat!(
     "payload-capacity=exact-max-record-payload-bytes,local-backend-mismatch-disables-v2;",
     "response-decode=length<=receipt-response-max,exact-magic-revision-tags-and-framing,",
     "payload-too-large=max:exact-max-record-payload-bytes,actual:max<actual<=max-payload-too-large-actual-bytes,",
+    "timestamp-wire=canonical-rfc3339-year[0000,9999];",
     "timestamp=secs[timestamp-min-secs,timestamp-max-secs]+nanos<=timestamp-nanos-max,",
     "derived-deadlines=lease-and-refresh(logical-time+ttl)must-satisfy-timestamp-range,",
     "key-and-guard=same-rules,",
@@ -2179,6 +2181,69 @@ mod tests {
         assert!(fenced_transition_v2_timestamp_is_in_range(minimum));
         assert!(fenced_transition_v2_timestamp_is_in_range(maximum));
 
+        let exact_minimum = FencedTransitionV2Request::new(
+            FencedTransitionV2HistoryEpoch::new(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
+                .expect("epoch"),
+            FencedTransitionV2CallerNonce::from_bytes([0x3A; 16]),
+            FencedTransitionLease::renew(
+                LeaseGuard::new(
+                    key(),
+                    OwnerId::new("v2-minimum-owner").expect("owner"),
+                    FenceToken::new(1),
+                    minimum,
+                    Timestamp::from_offset_datetime(
+                        time::OffsetDateTime::from_unix_timestamp(
+                            FENCED_TRANSITION_V2_MIN_TIMESTAMP_UNIX_SECONDS + 1,
+                        )
+                        .expect("minimum plus one"),
+                    ),
+                    1,
+                ),
+                Duration::from_secs(1),
+            )
+            .expect("minimum V2 lease"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("minimum V2 request");
+        let json = serde_json::to_string(&exact_minimum).expect("Rfc3339 JSON request");
+        assert!(json.contains("0000-01-01T00:00:00Z"));
+        let json_roundtrip: FencedTransitionV2Request =
+            serde_json::from_str(&json).expect("decode year-zero V2 request");
+        assert!(json_roundtrip.validate().is_ok());
+        let postcard = opc_consensus::encode_bounded(&exact_minimum).expect("encode V2 request");
+        let postcard_roundtrip: FencedTransitionV2Request =
+            opc_consensus::decode_bounded(&postcard).expect("decode year-zero V2 request");
+        assert!(postcard_roundtrip.validate().is_ok());
+
+        let one_below = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::from_unix_timestamp(
+                FENCED_TRANSITION_V2_MIN_TIMESTAMP_UNIX_SECONDS - 1,
+            )
+            .expect("one second below V2 minimum remains time-representable"),
+        );
+        assert!(!fenced_transition_v2_timestamp_is_in_range(one_below));
+        assert!(matches!(
+            FencedTransitionV2Request::new(
+                FencedTransitionV2HistoryEpoch::new(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
+                    .expect("epoch"),
+                FencedTransitionV2CallerNonce::from_bytes([0x3B; 16]),
+                FencedTransitionLease::renew(
+                    LeaseGuard::new(
+                        key(),
+                        OwnerId::new("v2-below-minimum-owner").expect("owner"),
+                        FenceToken::new(1),
+                        one_below,
+                        minimum,
+                        1,
+                    ),
+                    Duration::from_secs(1),
+                )
+                .expect("representable lease"),
+                FencedTransitionMutation::delete(Generation::new(1)),
+            ),
+            Err(StoreError::InvalidKey(message)) if message == "fenced_transition_v2_timestamp_invalid"
+        ));
+
         let exact = FencedTransitionV2Request::new(
             FencedTransitionV2HistoryEpoch::new(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
                 .expect("epoch"),
@@ -3109,6 +3174,14 @@ mod tests {
         );
         assert_eq!(FENCED_TRANSITION_V2_RECEIPT_RESPONSE_CODEC_REVISION, 1);
         assert_eq!(FENCED_TRANSITION_V2_VALIDATION_SCHEMA_REVISION, 1);
+        assert_eq!(
+            FENCED_TRANSITION_V2_MIN_TIMESTAMP_UNIX_SECONDS,
+            -62_167_219_200
+        );
+        assert_eq!(
+            FENCED_TRANSITION_V2_MAX_TIMESTAMP_UNIX_SECONDS,
+            253_402_300_799
+        );
         assert_eq!(FENCED_TRANSITION_V2_COMMAND_TRANSPORT_SCHEMA_REVISION, 1);
         assert_eq!(FENCED_TRANSITION_V2_CONSENSUS_SCHEMA_VERSION, 1);
         assert_eq!(
@@ -3168,6 +3241,8 @@ mod tests {
             .contains("payload-capacity=exact-max-record-payload-bytes"));
         assert!(FENCED_TRANSITION_V2_VALIDATION_SCHEMA_DESCRIPTOR
             .contains("derived-deadlines=lease-and-refresh"));
+        assert!(FENCED_TRANSITION_V2_VALIDATION_SCHEMA_DESCRIPTOR
+            .contains("timestamp-wire=canonical-rfc3339-year[0000,9999]"));
         assert_eq!(FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, 1_048_576);
         assert_eq!(
             FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
@@ -3215,9 +3290,9 @@ mod tests {
         assert_eq!(
             fenced_transition_v2_profile_digest(),
             [
-                0x0f, 0x51, 0xdb, 0x98, 0xa6, 0x69, 0x18, 0xc0, 0xb8, 0x27, 0xf7, 0x6a, 0x5d, 0xcf,
-                0xd1, 0x98, 0x23, 0x0f, 0x15, 0x8f, 0xce, 0xab, 0x0b, 0x91, 0xe1, 0x2e, 0xe9, 0xca,
-                0x47, 0x2a, 0x08, 0x4c,
+                0xbf, 0x22, 0x10, 0xe0, 0x9a, 0x84, 0xb4, 0x17, 0xb7, 0x27, 0x06, 0x46, 0x82, 0x1b,
+                0x87, 0xa7, 0x3d, 0x1a, 0x87, 0x50, 0x38, 0x21, 0xfc, 0x44, 0x92, 0x2d, 0xb2, 0x2e,
+                0x04, 0x87, 0x9d, 0x15,
             ],
             "changing V2's pinned semantics requires a new advertised profile digest"
         );

@@ -68,9 +68,19 @@ submissions through Openraft and SQLite apply, checks the exact 131,072 bound,
 and records elapsed time plus per-run database and snapshot bytes. It does not
 seed receipt rows or call private state-machine functions.
 
+The frozen pre-fix V1 RED is preserved separately by
+`sqlite::consensus::tests::frozen_v1_history_cap_is_absorbing_after_every_binding_applies`.
+It creates all 4,096 unique bindings through production state-machine apply
+(no receipt-table seeding), then proves request 4,097, its exact retry, and a
+same-ID/different-body retry all remain unbound `HistoryFull` with no business,
+lease, fence, application-sequence, or watch-visible effect. The exact command
+`cargo test --locked -p opc-session-store --lib --all-features
+sqlite::consensus::tests::frozen_v1_history_cap_is_absorbing_after_every_binding_applies
+-- --exact --nocapture` passed in 9.30 seconds on the qualification host.
+
 Capability/mixed-membership coverage pins the final published fixed V2 profile
 digest through `fenced_transition_v2_profile_digest()`:
-`0f51db98a66918c0b827f76a5dcfd198230f158fceab0b91e12ee9ca472a084c`.
+`bf2210e09a84b417b7270646821b87a73d1a87503821fc44922db22e04879d15`.
 
 ### Retirement qualification arrangement
 
@@ -108,6 +118,24 @@ a changed body must report conflict in each phase.
 | Separate format/certificate/first receipt from transition | crash/recovery sees partial activation | consensus apply + snapshot |
 | Scan receipt rows in memory for counts | capacity/status runtime grows as a full in-memory scan | instrumentation/counter assertion |
 
+### Executed fix-removal mutations
+
+All six mutations were run independently against signed checkpoint
+`814feb1a0486ccd87f7d9c83ca907a6e515e04c0`. Each mutation was a single
+compile-safe production change, produced the expected semantic RED, and was
+reversed with `apply_patch`. The post-restore SHA-256 is byte-for-byte equal to
+the pre-mutation SHA-256; `git status --porcelain=v1` was empty after every
+restore. No mutation artifact was committed.
+
+| ID / seam | Exact mutation and detector | Observed RED | Source SHA-256 before and after restore |
+| --- | --- | --- | --- |
+| M1 capacity/version gating | In `local_fenced_transition_v2_capability_for_backend_capabilities`, change the exact consensus-schema comparison from `==` to `>=`; run `cargo test --locked -p opc-session-store --lib --all-features consensus::store::membership_tests::v2_local_profile_mismatch_disables_advertisement_probe_and_activation -- --exact --nocapture` | exit 101: future schema advertised V2 instead of V1 (`left: V2`, `right: V1`) | `e12fad4015fa7d4e258ee3d48386cadc224945470118335e44b9ae6f26fc7a1d` |
+| M2 irreversible retirement floor | In `classify_fresh_v2_history_epoch`, change `request_epoch <= floor` to `<`; run `cargo test --locked -p opc-session-store --lib --all-features consensus::store::membership_tests::v2_fresh_recertification_classifies_delayed_predecessor_epochs_by_floor -- --exact --nocapture` | exit 101: epoch equal to the floor became `FencedTransitionHistoryEpochNotActive` instead of terminal `FencedTransitionHistoryEpochRetired` | `e12fad4015fa7d4e258ee3d48386cadc224945470118335e44b9ae6f26fc7a1d` |
+| M3 ordered tombstone reclamation | In `maintain_fenced_transition_v2_history_sync`, change the bounded ordinal selection from ascending to descending; run `cargo test --locked -p opc-session-store --lib --all-features sqlite::consensus::tests::fenced_transition_v2_reclaims_exactly_1024_then_opens_next_epoch -- --exact --nocapture` | exit 101: first reclaim failed closed with `fenced transition V2 reclaim order is invalid` | `df415df7b6099d510e1b03b6804c70cdd98ac4a16de1963daef8671076676f8d` |
+| M4 snapshot preservation/antirollback | Return early for every activated incoming V2 layout in `validate_attached_snapshot_preserves_fenced_transition_v2_history_sync`; run `cargo test --locked -p opc-session-store --lib --all-features sqlite::consensus::tests::fenced_transition_v2_snapshot_during_reclaim_preserves_cursor_and_rejects_regression -- --exact --nocapture` | exit 101: an earlier reclaim snapshot installed instead of being rejected (`earlier reclaim snapshot must not regress V2 history`) | `df415df7b6099d510e1b03b6804c70cdd98ac4a16de1963daef8671076676f8d` |
+| M5 follower projection/apply dispatch | Make the plain `SessionMutationIntent::FencedTransitionV2` classifier return `None`; run `cargo test --locked -p opc-session-store --lib --all-features sqlite::consensus::tests::fenced_transition_v2_projection_and_apply_share_fixed_retention_horizon -- --exact --nocapture` | exit 101: projection retained zero V2 bindings instead of one | `df415df7b6099d510e1b03b6804c70cdd98ac4a16de1963daef8671076676f8d` |
+| M6 replay/body conflict | Make a V2 body-commitment mismatch return success from `FencedTransitionV2Request::validate`; run `cargo test --locked -p opc-session-store --lib --all-features fenced_transition::tests::v2_id_is_deterministic_and_commits_the_complete_body -- --exact --nocapture` | exit 101: a changed body under the preserved full ID was accepted instead of `FencedTransitionRequestConflict` | `548bc315e9543e63945d5b3b47ccc0f9e2538ec53d768a5bc11634af9ca557bf` |
+
 ## Commands and results
 
 Results are filled only from actual runs; this record does not fabricate
@@ -115,11 +143,12 @@ duration, RSS, snapshot size, or throughput.
 
 ```text
 ACTUAL (passed, focused evidence):
-  public fenced_transition module: 26 / 26
-  consensus/store V2 subset: 43 / 43
+  public fenced_transition module: 28 / 28
+  SQLite V2 persistence/reclamation subset: 19 / 19
   crates/opc-session-store/tests/fenced_transition_v2_consensus.rs: 3 / 3
   fixed three-voter first V2 apply: 1 / 1
-  recovery current-V3 lifecycle/profile tests: 2 / 2, plus V2 cap/preflight
+  recovery suite: 38 / 38, including current-V3 lifecycle/profile and cap/preflight
+  frozen V1 4,096/4,097 apply-path RED: 1 / 1 (9.30 seconds)
   snapshot-install/reclaim/profile/topology cases listed above: passed in their
   owning source suites.
 

@@ -272,7 +272,7 @@ profile digest; the digest covers the schema, full identity layout, canonical
 body-commitment domain, active-epoch limit, operational target, and reclaim
 batch. The fixed profile digest is published by
 `fenced_transition_v2_profile_digest()` and is exactly
-`0f51db98a66918c0b827f76a5dcfd198230f158fceab0b91e12ee9ca472a084c`.
+`bf2210e09a84b417b7270646821b87a73d1a87503821fc44922db22e04879d15`.
 Before activation, every voter in the exact current voter set,
 including a prospective joining voter when it participates in the cutover,
 MUST reply to the V2 probe with that exact profile digest. A quorum, a V1
@@ -294,6 +294,13 @@ A V2 request ID is exactly 56 bytes:
 - history epoch in `1..=i64::MAX`, encoded as an 8-byte unsigned integer;
 - caller-retained 16-byte nonce; and
 - the complete 32-byte SHA-256 commitment to the canonical V2 request body.
+
+Every V2 command and receipt timestamp uses canonical RFC 3339 and the fixed
+inclusive year range `0000..=9999` (Unix seconds
+`-62167219200..=253402300799`). Optional date-range features may not widen
+this profile. Maintenance command time and every derived lease, refresh, and
+retention deadline are checked against the same range before any projection or
+durable mutation.
 
 The commitment domain includes the V2 schema, epoch, nonce, and canonical
 lease/mutation body. All 56 bytes are persisted and compared; no prefix or
