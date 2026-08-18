@@ -577,7 +577,7 @@ async fn protected_fenced_transition_local_prepares_once_and_recovers_exact_phys
     spy.delay_ambiguous_commit();
     let provider = CountingKeyProvider::with_key("local-before-rotation", 0x11);
     let journal = JournalFixture::new(0x91);
-    let backend: Arc<dyn SessionBackend> = Arc::new(
+    let wrapper = Arc::new(
         EncryptingSessionBackend::new(
             Arc::clone(&spy) as Arc<dyn SessionBackend>,
             Arc::clone(&provider),
@@ -585,6 +585,7 @@ async fn protected_fenced_transition_local_prepares_once_and_recovers_exact_phys
         )
         .with_fenced_transition_journal(journal.open()),
     );
+    let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::from_arc(wrapper));
     assert_eq!(
         backend
             .fenced_transition_capability()
@@ -716,7 +717,7 @@ async fn protected_fenced_transition_remote_prepares_create_and_update_once_with
     spy.delay_ambiguous_commit();
     let provider = CountingRemoteProvider::with_key("remote-before-rotation", 0x31);
     let journal = JournalFixture::new(0x92);
-    let backend: Arc<dyn SessionBackend> = Arc::new(
+    let wrapper = Arc::new(
         RemoteSealingSessionBackend::new(
             Arc::clone(&spy) as Arc<dyn SessionBackend>,
             Arc::clone(&provider),
@@ -724,6 +725,7 @@ async fn protected_fenced_transition_remote_prepares_create_and_update_once_with
         )
         .with_fenced_transition_journal(journal.open()),
     );
+    let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::from_arc(wrapper));
     assert_eq!(
         backend
             .fenced_transition_capability()
