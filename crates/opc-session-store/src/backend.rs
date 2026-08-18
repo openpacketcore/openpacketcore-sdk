@@ -1424,6 +1424,56 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
+    /// Advertise the explicit V2 atomic-transition contract.
+    ///
+    /// This is intentionally separate from [`Self::fenced_transition_capability`].
+    /// A caller using the original V1 API must never be upgraded to V2 merely
+    /// because a backend also implements it.
+    async fn fenced_transition_v2_capability(
+        &self,
+    ) -> Result<Option<crate::fenced_transition::AtomicFencedTransitionCapability>, StoreError>
+    {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_v2".into(),
+        ))
+    }
+
+    /// Read the active V2 receipt-history state.
+    ///
+    /// This exposes only the bounded public state needed to select a V2
+    /// request epoch; retirement and reclaim authority remain internal to the
+    /// consensus implementation.
+    async fn fenced_transition_v2_history_state(
+        &self,
+    ) -> Result<crate::fenced_transition::FencedTransitionV2HistoryState, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_v2".into(),
+        ))
+    }
+
+    /// Commit one explicit V2 atomic transition.
+    ///
+    /// V2 has its own full request-ID commitment and bounded, non-absorbing
+    /// history contract. It is never selected by the V1 method above.
+    async fn fenced_transition_v2(
+        &self,
+        _request: crate::fenced_transition::FencedTransitionV2Request,
+    ) -> Result<crate::fenced_transition::FencedTransitionOutcome, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_v2".into(),
+        ))
+    }
+
+    /// Recover the exact status of one complete V2 transition body.
+    async fn fenced_transition_v2_status(
+        &self,
+        _request: &crate::fenced_transition::FencedTransitionV2Request,
+    ) -> Result<crate::fenced_transition::FencedTransitionV2Status, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_v2".into(),
+        ))
+    }
+
     /// Atomically compare the current generation and write the new record if it
     /// matches. Implementations MUST require a current [`LeaseGuard`] and MUST
     /// reject writes whose record owner/fence do not match that lease.

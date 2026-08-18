@@ -18,10 +18,13 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
     FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
-    FencedTransitionRequestId, FencedTransitionStatus, LeaseError, LeaseGuard, OwnerId,
-    RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionConsensusIdentity,
-    SessionConsensusRequestId, SessionKey, SessionOp, SessionOpResult, StoreError,
-    StoredSessionRecord, FENCED_TRANSITION_REQUEST_ID_BYTES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2HistoryState,
+    FencedTransitionV2Request, FencedTransitionV2RequestId, FencedTransitionV2Status, LeaseError,
+    LeaseGuard, OwnerId, RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest,
+    SessionConsensusIdentity, SessionConsensusRequestId, SessionKey, SessionOp, SessionOpResult,
+    StoreError, StoredSessionRecord, FENCED_TRANSITION_REQUEST_ID_BYTES,
+    FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
+    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
 };
 
 /// Maximum batch slots admitted by one consumer request.
@@ -577,6 +580,137 @@ impl fmt::Debug for SessionConsumerRequest {
     }
 }
 
+/// Explicit revision-4-only operations for the V2 fenced-transition
+/// contract.
+///
+/// This is deliberately a distinct request family rather than variants on
+/// [`SessionConsumerOperation`]. Revision 3's JSON operation vocabulary and
+/// its V1 transition semantics therefore remain frozen byte-for-byte.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum SessionConsumerV2Operation {
+    /// Prove support for precisely the V2 fenced-transition contract.
+    FencedTransitionV2Capability,
+    /// Read the bounded public state of the active V2 history epoch.
+    FencedTransitionV2HistoryState,
+    /// Execute exactly one V2 transition under its full committed identity.
+    FencedTransitionV2 {
+        /// Complete canonical V2 transition body.
+        request: Box<FencedTransitionV2Request>,
+    },
+    /// Read status for exactly one complete V2 transition body.
+    FencedTransitionV2Status {
+        /// Complete canonical V2 transition body.
+        request: Box<FencedTransitionV2Request>,
+    },
+}
+
+impl fmt::Debug for SessionConsumerV2Operation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::FencedTransitionV2Capability => "FencedTransitionV2Capability",
+            Self::FencedTransitionV2HistoryState => "FencedTransitionV2HistoryState",
+            Self::FencedTransitionV2 { .. } => "FencedTransitionV2",
+            Self::FencedTransitionV2Status { .. } => "FencedTransitionV2Status",
+        };
+        formatter.write_str(name)
+    }
+}
+
+impl SessionConsumerV2Operation {
+    fn request_id(&self) -> Option<FencedTransitionV2RequestId> {
+        match self {
+            Self::FencedTransitionV2 { request } | Self::FencedTransitionV2Status { request } => {
+                Some(request.request_id())
+            }
+            Self::FencedTransitionV2Capability | Self::FencedTransitionV2HistoryState => None,
+        }
+    }
+
+    /// Validate the bounded V2 request body before quorum dispatch.
+    pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
+        match self {
+            Self::FencedTransitionV2 { request } | Self::FencedTransitionV2Status { request } => {
+                // A complete V2 ID commits to its body. A structurally valid
+                // body substituted under a retained full ID is therefore a
+                // typed request conflict, not a malformed wire frame. Admit
+                // it so execute/status can report their respective conflict
+                // semantics; every other validation failure remains a
+                // transport rejection.
+                match request.validate() {
+                    Ok(()) | Err(StoreError::FencedTransitionRequestConflict) => Ok(()),
+                    Err(_) => Err(SessionConsumerRejection::MalformedRequest),
+                }
+            }
+            Self::FencedTransitionV2Capability | Self::FencedTransitionV2HistoryState => Ok(()),
+        }
+    }
+}
+
+/// One scope-bound revision-4 V2 consumer request.
+///
+/// V2 execute/status retain the full 56-byte V2 request identity outside the
+/// operation body as well as inside it. The duplicated value is intentional:
+/// it closes truncated-ID and cross-body substitutions before the request can
+/// reach the consensus service. Capability and history-state reads have no
+/// mutation identity and therefore use `None`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsumerV2Request {
+    scope: SessionConsumerScope,
+    request_id: Option<FencedTransitionV2RequestId>,
+    operation: SessionConsumerV2Operation,
+}
+
+impl SessionConsumerV2Request {
+    /// Construct an exact revision-4 V2 request.
+    pub fn new(scope: SessionConsumerScope, operation: SessionConsumerV2Operation) -> Self {
+        let request_id = operation.request_id();
+        Self {
+            scope,
+            request_id,
+            operation,
+        }
+    }
+
+    /// Exact consensus scope supplied by the caller.
+    pub const fn scope(&self) -> SessionConsumerScope {
+        self.scope
+    }
+
+    /// Full V2 stable identity for execute/status, if this is an effectful
+    /// V2 operation.
+    pub const fn request_id(&self) -> Option<FencedTransitionV2RequestId> {
+        self.request_id
+    }
+
+    /// Typed revision-4-only operation.
+    pub const fn operation(&self) -> &SessionConsumerV2Operation {
+        &self.operation
+    }
+
+    /// Enforce V2's full outer-ID commitment before dispatch.
+    pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
+        self.operation.validate()?;
+        if self.request_id != self.operation.request_id() {
+            return Err(SessionConsumerRejection::MalformedRequest);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for SessionConsumerV2Request {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionConsumerV2Request")
+            .field("scope", &self.scope)
+            .field("request_id", &self.request_id)
+            .field("operation", &self.operation)
+            .finish()
+    }
+}
+
 /// Closed, wire-safe store error returned by a consumer operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -629,7 +763,13 @@ impl From<StoreError> for SessionConsumerStoreError {
             // capability response rather than widening that shared enum.
             StoreError::FencedTransitionHistoryFull
             | StoreError::FencedTransitionRetentionExhausted
-            | StoreError::FencedTransitionStorageExhausted => Self::CapabilityNotSupported,
+            | StoreError::FencedTransitionStorageExhausted
+            // These V2-only errors are unreachable through revision 3's V1
+            // dispatch. Keep the frozen V1 family closed if a faulty backend
+            // nevertheless leaks one across that boundary; revision 4 maps
+            // them with `SessionConsumerV2FencedTransitionError` instead.
+            | StoreError::FencedTransitionHistoryEpochRetired
+            | StoreError::FencedTransitionHistoryEpochNotActive => Self::CapabilityNotSupported,
             StoreError::CasIdempotencyOutcomeUnavailable
             | StoreError::FencedTransitionOutcomeUnknown
             | StoreError::FencedTransitionRequestExpired
@@ -814,6 +954,162 @@ pub enum SessionConsumerFencedTransitionError {
     StorageExhausted,
 }
 
+/// Revision-4-only safe error family for V2 execution.
+///
+/// It is separate from the frozen V1 receipt error enum: V2 can retire a
+/// bounded epoch and can be temporarily inactive while a new epoch is being
+/// established. Neither condition exists in V1's absorbing-history wire
+/// contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SessionConsumerV2FencedTransitionError {
+    /// A deterministic error represented by the common safe store set.
+    Store(SessionConsumerStoreError),
+    /// The committed topology authority no longer admits this operation.
+    TopologyAuthorityRevoked,
+    /// The V2 transition lifetime is invalid.
+    InvalidSessionTtl,
+    /// The V2 record expiry is invalid.
+    InvalidRecordExpiry,
+    /// Another owner still holds the requested lease.
+    LeaseHeld,
+    /// The presented lease has elapsed.
+    LeaseExpired,
+    /// A V2 record payload exceeded its fixed profile bound.
+    ///
+    /// Both widths remain `u64` on every platform. A retained receipt only
+    /// admits the fixed maximum and a checked actual length.
+    PayloadTooLarge {
+        /// Rejected payload size in bytes.
+        actual: u64,
+        /// Fixed V2 payload maximum in bytes.
+        max: u64,
+    },
+    /// The referenced V2 history epoch was retired and can never execute.
+    Retired,
+    /// No V2 history epoch is active at this authority yet.
+    EpochNotActive,
+    /// The complete V2 identity is permanently bound to another body.
+    RequestConflict,
+    /// The transition may have crossed its effect boundary, but its exact
+    /// outcome cannot be confirmed through this response.
+    OutcomeUnknown,
+    /// The exact retained outcome elapsed for this V2 identity.
+    Expired,
+    /// The active V2 history epoch cannot bind another identity.
+    HistoryFull,
+    /// Logical time cannot retain a complete V2 result window.
+    RetentionExhausted,
+    /// The deterministic V2 transition receipt could not be retained.
+    StorageExhausted,
+}
+
+impl From<StoreError> for SessionConsumerV2FencedTransitionError {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::TopologyAuthorityRevoked => Self::TopologyAuthorityRevoked,
+            StoreError::InvalidSessionTtl => Self::InvalidSessionTtl,
+            StoreError::InvalidRecordExpiry => Self::InvalidRecordExpiry,
+            StoreError::LeaseHeld => Self::LeaseHeld,
+            StoreError::LeaseExpired => Self::LeaseExpired,
+            StoreError::PayloadTooLarge { actual, max } => Self::PayloadTooLarge {
+                actual: actual as u64,
+                max: max as u64,
+            },
+            StoreError::FencedTransitionHistoryEpochRetired => Self::Retired,
+            StoreError::FencedTransitionHistoryEpochNotActive => Self::EpochNotActive,
+            StoreError::FencedTransitionRequestConflict => Self::RequestConflict,
+            StoreError::FencedTransitionOutcomeUnknown => Self::OutcomeUnknown,
+            StoreError::FencedTransitionRequestExpired => Self::Expired,
+            StoreError::FencedTransitionHistoryFull => Self::HistoryFull,
+            StoreError::FencedTransitionRetentionExhausted => Self::RetentionExhausted,
+            StoreError::FencedTransitionStorageExhausted => Self::StorageExhausted,
+            error => Self::Store(SessionConsumerStoreError::from(error)),
+        }
+    }
+}
+
+impl SessionConsumerV2FencedTransitionError {
+    /// Project a deterministic V2 receipt error into its closed wire form.
+    ///
+    /// Only errors that the V2 consensus command can durably retain are
+    /// admitted here. In particular, backend diagnostics and generic
+    /// validation failures must remain outside a retained status response.
+    pub fn from_recorded_store_error(error: StoreError) -> Option<Self> {
+        matches!(
+            error,
+            StoreError::TopologyAuthorityRevoked
+                | StoreError::NotFound
+                | StoreError::StaleFence
+                | StoreError::CasConflict
+                | StoreError::InvalidSessionTtl
+                | StoreError::InvalidRecordExpiry
+                | StoreError::LeaseHeld
+                | StoreError::LeaseExpired
+                | StoreError::PayloadTooLarge { .. }
+                | StoreError::FencedTransitionStorageExhausted
+        )
+        .then(|| Self::from(error))
+        .filter(|error| error.is_recorded_deterministic())
+    }
+
+    /// Whether this closed V2 error can occur in a durably retained receipt.
+    ///
+    /// This rejects transport-only categories such as `Unavailable` even
+    /// though they are representable by the shared safe store-error family.
+    pub fn is_recorded_deterministic(self) -> bool {
+        matches!(
+            self,
+            Self::Store(
+                SessionConsumerStoreError::NotFound
+                    | SessionConsumerStoreError::StaleFence
+                    | SessionConsumerStoreError::CasConflict
+            ) | Self::TopologyAuthorityRevoked
+                | Self::InvalidSessionTtl
+                | Self::InvalidRecordExpiry
+                | Self::LeaseHeld
+                | Self::LeaseExpired
+                | Self::StorageExhausted
+        ) || matches!(
+            self,
+            Self::PayloadTooLarge { actual, max }
+                if max == FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES as u64
+                    && actual > max
+                    && actual <= FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES
+        )
+    }
+
+    /// Convert this exact V2 wire error back into its storage-domain form.
+    ///
+    /// Unlike the shared consumer store-error family, each V2 fenced
+    /// execution semantic has a lossless mapping so callers can retain the
+    /// terminal/recovery distinction after crossing the consumer boundary.
+    pub fn into_store_error(self) -> StoreError {
+        match self {
+            Self::Store(error) => error.into_store_error(),
+            Self::TopologyAuthorityRevoked => StoreError::TopologyAuthorityRevoked,
+            Self::InvalidSessionTtl => StoreError::InvalidSessionTtl,
+            Self::InvalidRecordExpiry => StoreError::InvalidRecordExpiry,
+            Self::LeaseHeld => StoreError::LeaseHeld,
+            Self::LeaseExpired => StoreError::LeaseExpired,
+            Self::PayloadTooLarge { actual, max } => {
+                let (Ok(actual), Ok(max)) = (usize::try_from(actual), usize::try_from(max)) else {
+                    return StoreError::InvalidKey("invalid V2 payload-too-large receipt".into());
+                };
+                StoreError::PayloadTooLarge { actual, max }
+            }
+            Self::Retired => StoreError::FencedTransitionHistoryEpochRetired,
+            Self::EpochNotActive => StoreError::FencedTransitionHistoryEpochNotActive,
+            Self::RequestConflict => StoreError::FencedTransitionRequestConflict,
+            Self::OutcomeUnknown => StoreError::FencedTransitionOutcomeUnknown,
+            Self::Expired => StoreError::FencedTransitionRequestExpired,
+            Self::HistoryFull => StoreError::FencedTransitionHistoryFull,
+            Self::RetentionExhausted => StoreError::FencedTransitionRetentionExhausted,
+            Self::StorageExhausted => StoreError::FencedTransitionStorageExhausted,
+        }
+    }
+}
+
 impl From<StoreError> for SessionConsumerFencedTransitionError {
     fn from(error: StoreError) -> Self {
         match error {
@@ -856,6 +1152,59 @@ impl From<FencedTransitionStatus> for SessionConsumerFencedTransitionStatus {
             FencedTransitionStatus::HistoryFull => Self::HistoryFull,
             FencedTransitionStatus::RetentionExhausted => Self::RetentionExhausted,
             FencedTransitionStatus::NotFound => Self::NotFound,
+        }
+    }
+}
+
+/// Closed, wire-safe V2 status of a fenced transition request/body pair.
+///
+/// Unlike the storage-domain [`FencedTransitionV2Status`], a recorded error
+/// here cannot carry backend diagnostics, platform-sized fields, or future
+/// unconstrained store variants across the revision-4 consumer transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub enum SessionConsumerV2FencedTransitionStatus {
+    /// A success or deterministic V2 error remains recoverable.
+    Recorded(Box<Result<FencedTransitionOutcome, SessionConsumerV2FencedTransitionError>>),
+    /// The complete ID is bound to another body.
+    RequestConflict,
+    /// The exact recovery window elapsed.
+    Expired,
+    /// The request epoch is retired permanently.
+    Retired,
+    /// The active epoch cannot bind another identity.
+    HistoryFull,
+    /// No receipt exists for this complete V2 identity.
+    NotFound,
+    /// The named epoch is not active yet.
+    EpochNotActive,
+    /// Logical time cannot retain a complete result window.
+    RetentionExhausted,
+}
+
+impl TryFrom<FencedTransitionV2Status> for SessionConsumerV2FencedTransitionStatus {
+    type Error = SessionConsumerStoreError;
+
+    fn try_from(status: FencedTransitionV2Status) -> Result<Self, Self::Error> {
+        match status {
+            FencedTransitionV2Status::Recorded(result) => match *result {
+                Ok(outcome) => Ok(Self::Recorded(Box::new(Ok(outcome)))),
+                Err(error) => {
+                    SessionConsumerV2FencedTransitionError::from_recorded_store_error(error)
+                        .map(|error| Self::Recorded(Box::new(Err(error))))
+                        // Do not project untrusted backend diagnostics or an
+                        // unexpected generic store error into a durable receipt.
+                        .ok_or(SessionConsumerStoreError::Unavailable)
+                }
+            },
+            FencedTransitionV2Status::RequestConflict => Ok(Self::RequestConflict),
+            FencedTransitionV2Status::Expired => Ok(Self::Expired),
+            FencedTransitionV2Status::Retired => Ok(Self::Retired),
+            FencedTransitionV2Status::HistoryFull => Ok(Self::HistoryFull),
+            FencedTransitionV2Status::NotFound => Ok(Self::NotFound),
+            FencedTransitionV2Status::EpochNotActive => Ok(Self::EpochNotActive),
+            FencedTransitionV2Status::RetentionExhausted => Ok(Self::RetentionExhausted),
         }
     }
 }
@@ -1093,6 +1442,51 @@ pub enum SessionConsumerResponse {
     Rejected(SessionConsumerRejection),
 }
 
+/// Typed response carried only by the revision-4 V2 consumer lane.
+///
+/// This intentionally does not extend [`SessionConsumerResponse`]: adding a
+/// V2 response discriminator there would allow a revision-3 decoder to
+/// accept a new semantic contract.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "response",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum SessionConsumerV2Response {
+    /// Exact V2 capability proof result.
+    FencedTransitionV2Capability(
+        Result<AtomicFencedTransitionCapability, SessionConsumerStoreError>,
+    ),
+    /// Bounded current V2 history state.
+    FencedTransitionV2HistoryState(
+        Result<FencedTransitionV2HistoryState, SessionConsumerStoreError>,
+    ),
+    /// Exact V2 execution result.
+    FencedTransitionV2(Result<FencedTransitionOutcome, SessionConsumerV2FencedTransitionError>),
+    /// Exact V2 retained-status result.
+    FencedTransitionV2Status(
+        Result<SessionConsumerV2FencedTransitionStatus, SessionConsumerStoreError>,
+    ),
+    /// The V2 operation was rejected before dispatch.
+    Rejected(SessionConsumerRejection),
+}
+
+impl fmt::Debug for SessionConsumerV2Response {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::FencedTransitionV2Capability(_) => "FencedTransitionV2Capability",
+            Self::FencedTransitionV2HistoryState(_) => "FencedTransitionV2HistoryState",
+            Self::FencedTransitionV2(_) => "FencedTransitionV2",
+            Self::FencedTransitionV2Status(_) => "FencedTransitionV2Status",
+            Self::Rejected(_) => "Rejected",
+        };
+        formatter.write_str(name)
+    }
+}
+
 impl fmt::Debug for SessionConsumerResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -1136,6 +1530,20 @@ pub trait SessionQuorumConsumer: Send + Sync {
         identity: &SessionConsumerIdentity,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse;
+
+    /// Execute one authenticated revision-4 V2 request.
+    ///
+    /// The default does no backend work and keeps an existing V1-only quorum
+    /// implementation fail-closed on the new lane. Implementations that
+    /// advertise V2 override this method and must perform the same scope and
+    /// durable leader checks as [`Self::execute`].
+    async fn execute_v2(
+        &self,
+        _identity: &SessionConsumerIdentity,
+        _request: SessionConsumerV2Request,
+    ) -> SessionConsumerV2Response {
+        SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable)
+    }
 
     /// Open a bounded committed-change watch after authenticated scope checks.
     async fn watch(
@@ -1324,11 +1732,15 @@ mod tests {
         SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
         SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerRejection,
         SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerScope,
+        SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
+        SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation,
+        SessionConsumerV2Request,
     };
     use crate::{
         FenceToken, FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
-        FencedTransitionRequestId, FencedTransitionStatus, Generation, OwnerId,
-        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
+        FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
+        FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, FencedTransitionV2Status,
+        Generation, OwnerId, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
         SessionConsensusConfigurationId, SessionConsensusIdentity, SessionKey, SessionKeyType,
         StableId, StoreError,
     };
@@ -1513,6 +1925,102 @@ mod tests {
     }
 
     #[test]
+    fn v2_transition_requires_the_full_outer_request_commitment() {
+        let v1 = transition(0x46);
+        let v2 = FencedTransitionV2Request::new(
+            FencedTransitionV2HistoryEpoch::new(1).expect("nonzero epoch"),
+            FencedTransitionV2CallerNonce::from_bytes([0x47; 16]),
+            v1.lease().clone(),
+            v1.mutation().clone(),
+        )
+        .expect("v2 transition");
+        let request = SessionConsumerV2Request::new(
+            scope(2, 1),
+            SessionConsumerV2Operation::FencedTransitionV2 {
+                request: Box::new(v2),
+            },
+        );
+        assert!(request.validate().is_ok());
+
+        let mut encoded = serde_json::to_value(request).expect("v2 request encodes");
+        let serde_json::Value::Object(fields) = &mut encoded else {
+            panic!("v2 request is an object");
+        };
+        fields.insert("request_id".into(), serde_json::Value::Null);
+        let mismatched: SessionConsumerV2Request =
+            serde_json::from_value(encoded).expect("well-formed mismatched envelope");
+        assert_eq!(
+            mismatched.validate(),
+            Err(SessionConsumerRejection::MalformedRequest),
+            "the outer ID must retain all V2 epoch, nonce, and body-commitment bytes"
+        );
+    }
+
+    #[test]
+    fn v2_transition_retains_a_structurally_valid_body_conflict_for_dispatch() {
+        let original = FencedTransitionV2Request::new(
+            FencedTransitionV2HistoryEpoch::new(1).expect("nonzero epoch"),
+            FencedTransitionV2CallerNonce::from_bytes([0x48; 16]),
+            transition(0x49).lease().clone(),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("original V2 transition");
+        let altered = FencedTransitionV2Request::new(
+            original.request_id().epoch(),
+            original.request_id().nonce(),
+            original.lease().clone(),
+            FencedTransitionMutation::delete(Generation::new(2)),
+        )
+        .expect("altered V2 transition");
+        let original_request = SessionConsumerV2Request::new(
+            scope(2, 1),
+            SessionConsumerV2Operation::FencedTransitionV2 {
+                request: Box::new(original),
+            },
+        );
+        let altered_request = SessionConsumerV2Request::new(
+            scope(2, 1),
+            SessionConsumerV2Operation::FencedTransitionV2 {
+                request: Box::new(altered),
+            },
+        );
+
+        let mut encoded = serde_json::to_value(altered_request).expect("altered request encodes");
+        let original_id =
+            serde_json::to_value(original_request.request_id()).expect("original full ID encodes");
+        let serde_json::Value::Object(fields) = &mut encoded else {
+            panic!("V2 envelope is an object");
+        };
+        fields.insert("request_id".into(), original_id.clone());
+        let operation = fields
+            .get_mut("operation")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("V2 operation is an object");
+        let body = operation
+            .get_mut("request")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("V2 body is an object");
+        body.insert("request_id".into(), original_id);
+        let conflicted: SessionConsumerV2Request =
+            serde_json::from_value(encoded).expect("structural conflict decodes");
+
+        assert_eq!(conflicted.request_id(), original_request.request_id());
+        assert_eq!(
+            conflicted.validate(),
+            Ok(()),
+            "a same-full-ID body conflict must reach V2 execute/status dispatch"
+        );
+        let SessionConsumerV2Operation::FencedTransitionV2 { request } = conflicted.operation()
+        else {
+            panic!("V2 execute operation");
+        };
+        assert_eq!(
+            request.validate(),
+            Err(StoreError::FencedTransitionRequestConflict)
+        );
+    }
+
+    #[test]
     fn fenced_transition_status_is_safe_and_preserves_terminal_states() {
         assert_eq!(
             SessionConsumerFencedTransitionStatus::from(FencedTransitionStatus::Expired),
@@ -1527,6 +2035,194 @@ mod tests {
                 StoreError::FencedTransitionStorageExhausted
             ),
             SessionConsumerFencedTransitionError::StorageExhausted,
+        );
+    }
+
+    #[test]
+    fn v2_fenced_transition_errors_preserve_each_execution_semantic_on_the_wire() {
+        let cases = [
+            (
+                StoreError::FencedTransitionRequestConflict,
+                SessionConsumerV2FencedTransitionError::RequestConflict,
+            ),
+            (
+                StoreError::FencedTransitionOutcomeUnknown,
+                SessionConsumerV2FencedTransitionError::OutcomeUnknown,
+            ),
+            (
+                StoreError::FencedTransitionRequestExpired,
+                SessionConsumerV2FencedTransitionError::Expired,
+            ),
+            (
+                StoreError::FencedTransitionHistoryFull,
+                SessionConsumerV2FencedTransitionError::HistoryFull,
+            ),
+            (
+                StoreError::FencedTransitionRetentionExhausted,
+                SessionConsumerV2FencedTransitionError::RetentionExhausted,
+            ),
+            (
+                StoreError::FencedTransitionStorageExhausted,
+                SessionConsumerV2FencedTransitionError::StorageExhausted,
+            ),
+            (
+                StoreError::FencedTransitionHistoryEpochRetired,
+                SessionConsumerV2FencedTransitionError::Retired,
+            ),
+            (
+                StoreError::FencedTransitionHistoryEpochNotActive,
+                SessionConsumerV2FencedTransitionError::EpochNotActive,
+            ),
+            (
+                StoreError::NotFound,
+                SessionConsumerV2FencedTransitionError::Store(
+                    super::SessionConsumerStoreError::NotFound,
+                ),
+            ),
+        ];
+        let mut encodings = std::collections::BTreeSet::new();
+
+        for (store_error, wire_error) in cases {
+            assert_eq!(
+                SessionConsumerV2FencedTransitionError::from(store_error.clone()),
+                wire_error
+            );
+            assert_eq!(wire_error.into_store_error(), store_error);
+            let encoded = serde_json::to_string(&wire_error).expect("V2 error encodes");
+            assert_eq!(
+                serde_json::from_str::<SessionConsumerV2FencedTransitionError>(&encoded)
+                    .expect("V2 error decodes"),
+                wire_error
+            );
+            assert!(
+                encodings.insert(encoded),
+                "every V2 execution semantic needs a distinct wire value"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_recorded_status_projects_every_admitted_error_without_diagnostics() {
+        let payload_actual = crate::FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES + 1;
+        let cases = [
+            (
+                StoreError::TopologyAuthorityRevoked,
+                SessionConsumerV2FencedTransitionError::TopologyAuthorityRevoked,
+            ),
+            (
+                StoreError::NotFound,
+                SessionConsumerV2FencedTransitionError::Store(SessionConsumerStoreError::NotFound),
+            ),
+            (
+                StoreError::StaleFence,
+                SessionConsumerV2FencedTransitionError::Store(
+                    SessionConsumerStoreError::StaleFence,
+                ),
+            ),
+            (
+                StoreError::CasConflict,
+                SessionConsumerV2FencedTransitionError::Store(
+                    SessionConsumerStoreError::CasConflict,
+                ),
+            ),
+            (
+                StoreError::InvalidSessionTtl,
+                SessionConsumerV2FencedTransitionError::InvalidSessionTtl,
+            ),
+            (
+                StoreError::InvalidRecordExpiry,
+                SessionConsumerV2FencedTransitionError::InvalidRecordExpiry,
+            ),
+            (
+                StoreError::LeaseHeld,
+                SessionConsumerV2FencedTransitionError::LeaseHeld,
+            ),
+            (
+                StoreError::LeaseExpired,
+                SessionConsumerV2FencedTransitionError::LeaseExpired,
+            ),
+            (
+                StoreError::PayloadTooLarge {
+                    actual: payload_actual,
+                    max: crate::FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES,
+                },
+                SessionConsumerV2FencedTransitionError::PayloadTooLarge {
+                    actual: payload_actual as u64,
+                    max: crate::FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES as u64,
+                },
+            ),
+            (
+                StoreError::FencedTransitionStorageExhausted,
+                SessionConsumerV2FencedTransitionError::StorageExhausted,
+            ),
+        ];
+
+        for (store_error, wire_error) in cases {
+            let status = SessionConsumerV2FencedTransitionStatus::try_from(
+                FencedTransitionV2Status::Recorded(Box::new(Err(store_error.clone()))),
+            )
+            .expect("admitted V2 receipt error projects");
+            assert_eq!(
+                status,
+                SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Err(wire_error)))
+            );
+            assert_eq!(wire_error.into_store_error(), store_error);
+            assert!(wire_error.is_recorded_deterministic());
+            let encoded = serde_json::to_string(&status).expect("closed V2 status encodes");
+            assert_eq!(
+                serde_json::from_str::<SessionConsumerV2FencedTransitionStatus>(&encoded)
+                    .expect("closed V2 status decodes"),
+                status
+            );
+        }
+
+        let diagnostic = "backend diagnostic must never cross the consumer wire";
+        assert_eq!(
+            SessionConsumerV2FencedTransitionStatus::try_from(FencedTransitionV2Status::Recorded(
+                Box::new(Err(StoreError::BackendUnavailable(diagnostic.into(),)))
+            ),),
+            Err(SessionConsumerStoreError::Unavailable),
+            "backend diagnostics are deliberately non-projectable"
+        );
+        assert_eq!(
+            SessionConsumerV2FencedTransitionStatus::try_from(FencedTransitionV2Status::Recorded(
+                Box::new(Err(StoreError::InvalidKey(diagnostic.into(),)))
+            ),),
+            Err(SessionConsumerStoreError::Unavailable),
+            "generic non-receipt errors are deliberately non-projectable"
+        );
+        assert!(
+            !SessionConsumerV2FencedTransitionError::PayloadTooLarge { actual: 1, max: 2 }
+                .is_recorded_deterministic(),
+            "a noncanonical payload bound cannot be represented as a receipt"
+        );
+    }
+
+    #[test]
+    fn v2_error_additions_do_not_change_frozen_v1_error_shape_or_ordinal() {
+        assert_eq!(
+            serde_json::to_string(&SessionConsumerFencedTransitionError::RequestConflict)
+                .expect("V1 request conflict encodes"),
+            "\"RequestConflict\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionConsumerFencedTransitionError::Store(
+                super::SessionConsumerStoreError::NotFound,
+            ))
+            .expect("V1 store error encodes"),
+            "{\"Store\":\"NotFound\"}"
+        );
+        assert_eq!(
+            opc_consensus::encode_bounded(&SessionConsumerFencedTransitionError::RequestConflict)
+                .expect("V1 request conflict postcard encodes"),
+            vec![1],
+            "the frozen V1 RequestConflict discriminant remains ordinal one"
+        );
+        assert_eq!(
+            opc_consensus::encode_bounded(&SessionConsumerFencedTransitionError::StorageExhausted)
+                .expect("V1 storage exhausted postcard encodes"),
+            vec![5],
+            "the frozen V1 StorageExhausted discriminant remains ordinal five"
         );
     }
 }

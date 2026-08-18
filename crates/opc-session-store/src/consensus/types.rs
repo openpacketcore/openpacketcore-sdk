@@ -8,7 +8,10 @@ use sha2::{Digest, Sha256};
 
 use crate::backend::{CompareAndSet, CompareAndSetResult};
 use crate::error::StoreError;
-use crate::fenced_transition::{FencedTransitionOutcome, FencedTransitionRequest};
+use crate::fenced_transition::{
+    FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionV2HistoryEpoch,
+    FencedTransitionV2Request,
+};
 use crate::lease::LeaseGuard;
 use crate::model::{OwnerId, SessionKey};
 use crate::record::StoredSessionRecord;
@@ -31,6 +34,47 @@ pub const SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES: usize =
     opc_consensus::CONSENSUS_CLUSTER_ID_MAX_BYTES;
 
 const COMMAND_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/command/v1\0";
+const COMMAND_V2_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/command/v2-fixed\0";
+const COMMAND_V2_DIGEST_MAGIC: &[u8] = b"OPC-SC-V2-APPLIED\0";
+/// Fixed V2 applied-command digest encoding revision.
+///
+/// This applies only to commands which carry a V2 intent (directly or in the
+/// one permitted [`SessionMutationIntent::Authorized`] envelope). Older
+/// commands retain their byte-for-byte JSON digest encoding.
+pub const SESSION_CONSENSUS_V2_APPLIED_DIGEST_ENCODING_VERSION: u16 = 1;
+/// Frozen descriptor of V2's fixed applied-command digest input.
+///
+/// The V2 fenced-transition profile must bind this descriptor: changing any
+/// tag, width, field order, or domain changes the replicated digest chain.
+pub const SESSION_CONSENSUS_V2_APPLIED_DIGEST_SCHEMA_DESCRIPTOR: &str = concat!(
+    "domain=openpacketcore/session-consensus/command/v2-fixed\\0;",
+    "magic=OPC-SC-V2-APPLIED\\0;revision:u16be=1;",
+    "prefix=sequence:u64be|previous-digest:bytes32|effective-time:timestamp;",
+    "command=schema:u16be|storage-identity:identity|outer-id:bytes16|logical-time:timestamp|intent;",
+    "timestamp=unix-secs:i64be|nanos:u32be;identity=cluster:bytes32|configuration:bytes32|epoch:u64be;",
+    "intent=fenced-v2(tag=1,id:bytes56)|activate-v2(tag=2,id:bytes56,scope:identity,voters:bytes32,profile:bytes32)|",
+    "maintain-v2(tag=3,generation:u64be,active:option-tag-u8+epoch:u64be,retired:u64be,bound:u64be)|",
+    "authorized(tag=4,origin:u64be,authority:identity,mutation:intent)"
+);
+/// Frozen Postcard command-wire shape for V2 replicated intents.
+///
+/// Normal Openraft payloads and peer forwarding retain the generic bounded
+/// Postcard codec. These appended intent discriminants are therefore profile
+/// material in addition to the fixed applied-digest encoding.
+pub const SESSION_CONSENSUS_V2_COMMAND_WIRE_SCHEMA_DESCRIPTOR: &str = concat!(
+    "wire-profile=1;raft-rpc-codec=postcard;durable-log-codec=serde-json;",
+    "command-fields=schema-version,identity,request-id,logical-time,intent;",
+    "intent-discriminants=authorized:15|fenced-v1:16|activate-v1:17|",
+    "fenced-v2:18|activate-v2:19|maintain-v2:20;",
+    "postcard=derive-serde,struct-fields-declaration-order,enum-tags=varint;",
+    "json=derive-serde,struct-field-names-declaration-order,enum-names-exact;",
+    "fenced-v2=box(request-fields=request-id:epoch:u64,nonce:bytes16,commitment:bytes32|lease|mutation);",
+    "lease-discriminants=acquire:0(key,owner,fence,ttl)|renew:1(guard,ttl);",
+    "mutation-discriminants=create:0(record)|update:1(generation,record)|delete:2(generation)|refresh-ttl:3(generation,ttl);",
+    "activate-v2=box(request)|scope:identity|voters:bytes32|profile:bytes32;",
+    "maintain-v2=generation:u64|active:option(epoch:u64)|retired:u64|bound:u64;",
+    "authorized=origin:node-id|authority:identity|box(intent)"
+);
 const FENCED_TRANSITION_VOTER_SET_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-transition-voter-set/v1\0";
 
@@ -256,6 +300,49 @@ pub enum SessionMutationIntent {
         /// Canonical digest of the exact voter IDs in that scope.
         voter_set_digest: [u8; 32],
     },
+    /// Atomically apply one V2 fenced transition.
+    ///
+    /// This is deliberately a distinct replicated intent rather than a V1
+    /// command selected by local apply state.  Every replica therefore applies
+    /// the fixed V2 receipt/history semantics encoded by this log entry.
+    FencedTransitionV2(Box<FencedTransitionV2Request>),
+    /// The first V2 fenced transition for one exact voter scope and immutable
+    /// V2 history profile.
+    ///
+    /// The activation certificate, exact request receipt, and transition
+    /// effect are one replicated command.  `profile_digest` binds the fixed
+    /// V2 schema and limits that all voters freshly confirmed before proposal.
+    #[doc(hidden)]
+    ActivateFencedTransitionV2 {
+        /// Original caller-owned V2 transition.
+        request: Box<FencedTransitionV2Request>,
+        /// Exact current authority scope observed during unanimous V2 proof.
+        scope_identity: SessionConsensusIdentity,
+        /// Canonical digest of the exact voter IDs in that scope.
+        voter_set_digest: [u8; 32],
+        /// Digest of V2's fixed serialized schema and history limits.
+        profile_digest: [u8; 32],
+    },
+    /// SDK-internal bounded V2 receipt-history maintenance.
+    ///
+    /// This is an explicit replicated maintenance command with compare-and-set
+    /// state, never a local compaction side effect.  Only the existing local
+    /// operator-recovery authority may submit it.
+    #[doc(hidden)]
+    MaintainFencedTransitionV2History {
+        /// Durable V2 history generation observed before maintenance admission.
+        expected_generation: u64,
+        /// Active V2 history epoch observed before maintenance admission.
+        expected_active_epoch: Option<FencedTransitionV2HistoryEpoch>,
+        /// Highest permanently retired V2 history epoch observed before
+        /// maintenance admission.
+        expected_retired_through: u64,
+        /// Number of bound receipts observed in the active epoch before
+        /// maintenance admission. This makes the maintenance CAS fail closed
+        /// if a concurrently committed V2 request filled or extended the
+        /// active epoch without changing the lifecycle generation.
+        expected_bound_entries: u64,
+    },
 }
 
 impl fmt::Debug for SessionMutationIntent {
@@ -296,18 +383,135 @@ impl SessionConsensusCommand {
         previous_digest: SessionConsensusEntryDigest,
         effective_logical_time: opc_types::Timestamp,
     ) -> Result<SessionConsensusEntryDigest, StoreError> {
-        let encoded =
-            serde_json::to_vec(&(sequence, previous_digest, effective_logical_time, self))
-                .map_err(|_| {
-                    StoreError::Serialization("session consensus command encoding failed".into())
-                })?;
+        let (domain, encoded) = if self.intent.contains_fenced_transition_v2() {
+            (
+                COMMAND_V2_DIGEST_DOMAIN,
+                self.encode_v2_applied_digest_input(
+                    sequence,
+                    previous_digest,
+                    effective_logical_time,
+                )?,
+            )
+        } else {
+            (
+                COMMAND_DIGEST_DOMAIN,
+                serde_json::to_vec(&(sequence, previous_digest, effective_logical_time, self))
+                    .map_err(|_| {
+                        StoreError::Serialization(
+                            "session consensus command encoding failed".into(),
+                        )
+                    })?,
+            )
+        };
         let mut hasher = Sha256::new();
-        hasher.update(COMMAND_DIGEST_DOMAIN);
+        hasher.update(domain);
         hasher.update(encoded);
         Ok(SessionConsensusEntryDigest::from_bytes(
             hasher.finalize().into(),
         ))
     }
+
+    fn encode_v2_applied_digest_input(
+        &self,
+        sequence: u64,
+        previous_digest: SessionConsensusEntryDigest,
+        effective_logical_time: opc_types::Timestamp,
+    ) -> Result<Vec<u8>, StoreError> {
+        let mut encoded = Vec::with_capacity(256);
+        encoded.extend_from_slice(COMMAND_V2_DIGEST_MAGIC);
+        encoded
+            .extend_from_slice(&SESSION_CONSENSUS_V2_APPLIED_DIGEST_ENCODING_VERSION.to_be_bytes());
+        encoded.extend_from_slice(&sequence.to_be_bytes());
+        encoded.extend_from_slice(previous_digest.as_bytes());
+        append_v2_applied_timestamp(&mut encoded, effective_logical_time);
+        encoded.extend_from_slice(&self.schema_version.to_be_bytes());
+        append_v2_applied_identity(&mut encoded, self.identity);
+        encoded.extend_from_slice(self.request_id.as_bytes());
+        append_v2_applied_timestamp(&mut encoded, self.logical_time);
+        append_v2_applied_intent(&mut encoded, &self.intent)?;
+        Ok(encoded)
+    }
+}
+
+impl SessionMutationIntent {
+    fn contains_fenced_transition_v2(&self) -> bool {
+        matches!(
+            self,
+            Self::FencedTransitionV2(_)
+                | Self::ActivateFencedTransitionV2 { .. }
+                | Self::MaintainFencedTransitionV2History { .. }
+        ) || matches!(self, Self::Authorized { mutation, .. } if mutation.contains_fenced_transition_v2())
+    }
+}
+
+fn append_v2_applied_timestamp(out: &mut Vec<u8>, timestamp: opc_types::Timestamp) {
+    let timestamp = timestamp.as_offset_datetime();
+    out.extend_from_slice(&timestamp.unix_timestamp().to_be_bytes());
+    out.extend_from_slice(&timestamp.nanosecond().to_be_bytes());
+}
+
+fn append_v2_applied_identity(out: &mut Vec<u8>, identity: SessionConsensusIdentity) {
+    out.extend_from_slice(identity.cluster_id().as_bytes());
+    out.extend_from_slice(identity.configuration_id().as_bytes());
+    out.extend_from_slice(&identity.configuration_epoch().get().to_be_bytes());
+}
+
+fn append_v2_applied_intent(
+    out: &mut Vec<u8>,
+    intent: &SessionMutationIntent,
+) -> Result<(), StoreError> {
+    match intent {
+        SessionMutationIntent::FencedTransitionV2(request) => {
+            out.push(1);
+            out.extend_from_slice(&request.request_id().to_bytes());
+        }
+        SessionMutationIntent::ActivateFencedTransitionV2 {
+            request,
+            scope_identity,
+            voter_set_digest,
+            profile_digest,
+        } => {
+            out.push(2);
+            out.extend_from_slice(&request.request_id().to_bytes());
+            append_v2_applied_identity(out, *scope_identity);
+            out.extend_from_slice(voter_set_digest);
+            out.extend_from_slice(profile_digest);
+        }
+        SessionMutationIntent::MaintainFencedTransitionV2History {
+            expected_generation,
+            expected_active_epoch,
+            expected_retired_through,
+            expected_bound_entries,
+        } => {
+            out.push(3);
+            out.extend_from_slice(&expected_generation.to_be_bytes());
+            match expected_active_epoch {
+                None => out.push(0),
+                Some(epoch) => {
+                    out.push(1);
+                    out.extend_from_slice(&epoch.get().to_be_bytes());
+                }
+            }
+            out.extend_from_slice(&expected_retired_through.to_be_bytes());
+            out.extend_from_slice(&expected_bound_entries.to_be_bytes());
+        }
+        SessionMutationIntent::Authorized {
+            origin,
+            authority_identity,
+            mutation,
+        } if mutation.contains_fenced_transition_v2() => {
+            out.push(4);
+            out.extend_from_slice(&origin.get().to_be_bytes());
+            append_v2_applied_identity(out, *authority_identity);
+            append_v2_applied_intent(out, mutation)?;
+        }
+        _ => {
+            return Err(StoreError::Serialization(
+                "session consensus V2 digest intent is invalid".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Successful state-machine result returned after durable quorum commit and
@@ -419,8 +623,8 @@ mod tests {
     use super::*;
     use crate::{
         EncryptedSessionPayload, FenceToken, FencedTransitionLease, FencedTransitionMutation,
-        FencedTransitionRequestId, Generation, OwnerId, SessionKeyType, StableId, StateClass,
-        StateType, STABLE_ID_MAX_BYTES,
+        FencedTransitionMutationResult, FencedTransitionRequestId, FencedTransitionV2CallerNonce,
+        Generation, OwnerId, SessionKeyType, StableId, StateClass, StateType, STABLE_ID_MAX_BYTES,
     };
 
     #[derive(Clone, Serialize, Deserialize)]
@@ -482,6 +686,12 @@ mod tests {
             authority_identity: SessionConsensusIdentity,
             mutation: Box<LegacySessionMutationIntent684>,
         },
+        FencedTransition(Box<FencedTransitionRequest>),
+        ActivateFencedTransition {
+            request: Box<FencedTransitionRequest>,
+            scope_identity: SessionConsensusIdentity,
+            voter_set_digest: [u8; 32],
+        },
     }
 
     #[derive(Clone, Serialize, Deserialize)]
@@ -490,6 +700,7 @@ mod tests {
         ConsumerRecord(Option<StoredSessionRecord>),
         Lease(LeaseGuard),
         Unit,
+        FencedTransition(FencedTransitionOutcome),
     }
 
     fn assert_postcard_cross_decode<T, U>(label: &str, current: T, legacy: U)
@@ -551,6 +762,303 @@ mod tests {
             SessionConsensusConfigurationId::from_bytes([0x41; 32]),
             SessionConsensusConfigurationEpoch::new(2).expect("epoch"),
         )
+    }
+
+    fn v2_digest_command(intent: SessionMutationIntent) -> SessionConsensusCommand {
+        SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: legacy_identity(),
+            request_id: SessionConsensusRequestId::from_bytes([0xD1; 16]),
+            logical_time: legacy_time(37),
+            intent,
+        }
+    }
+
+    fn v2_digest_request() -> FencedTransitionV2Request {
+        let key = legacy_key();
+        let owner = OwnerId::new("v2-digest-owner").expect("owner");
+        FencedTransitionV2Request::new(
+            FencedTransitionV2HistoryEpoch::new(7).expect("epoch"),
+            FencedTransitionV2CallerNonce::from_bytes([0xD2; 16]),
+            FencedTransitionLease::acquire(key, owner, FenceToken::new(0), Duration::from_secs(60))
+                .expect("lease"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("V2 request")
+    }
+
+    fn v2_digest_variant_requests() -> [FencedTransitionV2Request; 4] {
+        let key = legacy_key();
+        let owner = OwnerId::new("v2-digest-owner").expect("owner");
+        let record = |generation, payload| StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(generation),
+            owner: owner.clone(),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("v2-digest"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(payload),
+        };
+        let renew_guard = LeaseGuard::new(
+            key.clone(),
+            owner.clone(),
+            FenceToken::new(1),
+            legacy_time(1),
+            legacy_time(61),
+            2,
+        );
+        [
+            FencedTransitionV2Request::new(
+                FencedTransitionV2HistoryEpoch::new(7).expect("epoch"),
+                FencedTransitionV2CallerNonce::from_bytes([0xD6; 16]),
+                FencedTransitionLease::acquire(
+                    key.clone(),
+                    owner.clone(),
+                    FenceToken::new(0),
+                    Duration::from_secs(60),
+                )
+                .expect("acquire"),
+                FencedTransitionMutation::create(record(1, b"create")),
+            )
+            .expect("create request"),
+            FencedTransitionV2Request::new(
+                FencedTransitionV2HistoryEpoch::new(7).expect("epoch"),
+                FencedTransitionV2CallerNonce::from_bytes([0xD7; 16]),
+                FencedTransitionLease::renew(renew_guard.clone(), Duration::from_secs(60))
+                    .expect("renew"),
+                FencedTransitionMutation::update(Generation::new(1), record(2, b"update")),
+            )
+            .expect("update request"),
+            FencedTransitionV2Request::new(
+                FencedTransitionV2HistoryEpoch::new(7).expect("epoch"),
+                FencedTransitionV2CallerNonce::from_bytes([0xD8; 16]),
+                FencedTransitionLease::renew(renew_guard.clone(), Duration::from_secs(60))
+                    .expect("renew"),
+                FencedTransitionMutation::delete(Generation::new(1)),
+            )
+            .expect("delete request"),
+            FencedTransitionV2Request::new(
+                FencedTransitionV2HistoryEpoch::new(7).expect("epoch"),
+                FencedTransitionV2CallerNonce::from_bytes([0xD9; 16]),
+                FencedTransitionLease::renew(renew_guard, Duration::from_secs(60)).expect("renew"),
+                FencedTransitionMutation::refresh_ttl(Generation::new(1), Duration::from_secs(20))
+                    .expect("refresh"),
+            )
+            .expect("refresh request"),
+        ]
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn v2_applied_digest_uses_fixed_golden_encoding_for_each_intent_shape() {
+        let previous = SessionConsensusEntryDigest::from_bytes([0xD3; 32]);
+        let effective = legacy_time(41);
+        let request = v2_digest_request();
+        let identity = legacy_identity();
+        let commands = [
+            v2_digest_command(SessionMutationIntent::FencedTransitionV2(Box::new(
+                request.clone(),
+            ))),
+            v2_digest_command(SessionMutationIntent::ActivateFencedTransitionV2 {
+                request: Box::new(request.clone()),
+                scope_identity: identity,
+                voter_set_digest: [0xD4; 32],
+                profile_digest: [0xD5; 32],
+            }),
+            v2_digest_command(SessionMutationIntent::MaintainFencedTransitionV2History {
+                expected_generation: 11,
+                expected_active_epoch: Some(FencedTransitionV2HistoryEpoch::new(7).expect("epoch")),
+                expected_retired_through: 6,
+                expected_bound_entries: 23,
+            }),
+            v2_digest_command(SessionMutationIntent::Authorized {
+                origin: SessionConsensusNodeId::new(9).expect("origin"),
+                authority_identity: identity,
+                mutation: Box::new(SessionMutationIntent::FencedTransitionV2(Box::new(request))),
+            }),
+        ];
+        let expected_digests = [
+            "81f1ae844edba53caa9a6f4cc46df55db66eef7ba53390367ea532abff9b52a2",
+            "2f7b5672a1d3f652f97468d14050449dd6c6ed7300fdf2bbcd594f3dc66e7578",
+            "0c0f7fd76cb88ae0cbf6aac1cbf5db9cb65cff499bdf27f029fae0b238091c56",
+            "44d5c5bea27a3e0f62c64a9e33e0ca7a22da4db6734ee9ce4b38f7fea1c0b551",
+        ];
+        for (index, (command, expected_digest)) in commands.iter().zip(expected_digests).enumerate()
+        {
+            let encoded = command
+                .encode_v2_applied_digest_input(5, previous, effective)
+                .expect("fixed V2 digest encoding");
+            let digest = command
+                .calculate_applied_digest(5, previous, effective)
+                .expect("V2 digest");
+            assert!(encoded.starts_with(COMMAND_V2_DIGEST_MAGIC));
+            assert_eq!(
+                hex(digest.as_bytes()),
+                expected_digest,
+                "V2 applied digest golden shape {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_applied_digest_is_domain_separated_and_rejects_non_v2_inner_intent() {
+        let previous = SessionConsensusEntryDigest::from_bytes([0xD3; 32]);
+        let effective = legacy_time(41);
+        let legacy = v2_digest_command(SessionMutationIntent::AdvanceLogicalTime);
+        let legacy_encoded =
+            serde_json::to_vec(&(5_u64, previous, effective, &legacy)).expect("legacy JSON");
+        let mut legacy_hasher = Sha256::new();
+        legacy_hasher.update(COMMAND_DIGEST_DOMAIN);
+        legacy_hasher.update(legacy_encoded);
+        assert_eq!(
+            legacy.calculate_applied_digest(5, previous, effective),
+            Ok(SessionConsensusEntryDigest::from_bytes(
+                legacy_hasher.finalize().into()
+            )),
+            "non-V2 command digest remains byte-for-byte V1 JSON"
+        );
+        let non_v2_authorized = SessionMutationIntent::Authorized {
+            origin: SessionConsensusNodeId::new(9).expect("origin"),
+            authority_identity: legacy_identity(),
+            mutation: Box::new(SessionMutationIntent::AdvanceLogicalTime),
+        };
+        let mut malformed = Vec::new();
+        assert!(matches!(
+            append_v2_applied_intent(&mut malformed, &non_v2_authorized),
+            Err(StoreError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn v2_command_json_log_wire_is_pinned() {
+        let request = v2_digest_request();
+        let identity = legacy_identity();
+        let commands = [
+            v2_digest_command(SessionMutationIntent::FencedTransitionV2(Box::new(
+                request.clone(),
+            ))),
+            v2_digest_command(SessionMutationIntent::ActivateFencedTransitionV2 {
+                request: Box::new(request.clone()),
+                scope_identity: identity,
+                voter_set_digest: [0xD4; 32],
+                profile_digest: [0xD5; 32],
+            }),
+            v2_digest_command(SessionMutationIntent::Authorized {
+                origin: SessionConsensusNodeId::new(9).expect("origin"),
+                authority_identity: identity,
+                mutation: Box::new(SessionMutationIntent::ActivateFencedTransitionV2 {
+                    request: Box::new(request),
+                    scope_identity: identity,
+                    voter_set_digest: [0xD4; 32],
+                    profile_digest: [0xD5; 32],
+                }),
+            }),
+            v2_digest_command(SessionMutationIntent::MaintainFencedTransitionV2History {
+                expected_generation: 11,
+                expected_active_epoch: Some(FencedTransitionV2HistoryEpoch::new(7).expect("epoch")),
+                expected_retired_through: 6,
+                expected_bound_entries: 23,
+            }),
+        ];
+        let expected_hashes = [
+            "1c5fcc60eca9d4b0de38c83442695b63b2693ab5eab24d6ce8ac78481fae011f",
+            "4961aaad86f407d643818d5fb963a62372ce167c1aeaa47b0f45a9dc792a7f63",
+            "eaf23c0230cffc5b3a3c62fa949a1fb3e90904dd589e4d2b09dc694ec0e2e746",
+            "4983e341ace6866148883f4c64921a2a1f252e4468a61ddd4a5da02aadff1a7d",
+        ];
+        for (index, (command, expected_hash)) in commands.iter().zip(expected_hashes).enumerate() {
+            let encoded = serde_json::to_vec(command).expect("V2 log JSON");
+            assert_eq!(
+                hex(&Sha256::digest(encoded)),
+                expected_hash,
+                "V2 durable-log JSON {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_request_variant_postcard_and_json_wire_hashes_are_pinned() {
+        let expected_postcard_hashes = [
+            "70b226d2cd91eb9d586181053af8489132ddf4f6810811b693034f6bb9e46015",
+            "226aff8df1e01e92a1a3cef0c3388bdfb9cb381d7dba1faad7ca554d84cc8f37",
+            "c0b046501b7a10a1a817e332ae36f0d8b67378077859c22c5ef339bea83a87d4",
+            "37796b2b363700ac9200dbddb49436d9757dbe69dcd66e10ae142fca4fc65b9f",
+        ];
+        let expected_json_hashes = [
+            "768ddb1eb21a40e9b6a3c46e1cfc29768be38311f05f1674205365fa5ac52499",
+            "da789ecbab52199cf546b2150222dd03cd3e05b97e9a0656b6dcce1e979f97a2",
+            "fa8b8ae5f5ca1b5dbf5ed14e7f12f8104ea9661f40b84038d96d9290de8db826",
+            "e53aa37aafb7b5e100be93d0418b43b0b719b21098e723966dc7c9286a264dfd",
+        ];
+        for (index, ((request, expected_postcard_hash), expected_json_hash)) in
+            v2_digest_variant_requests()
+                .into_iter()
+                .zip(expected_postcard_hashes)
+                .zip(expected_json_hashes)
+                .enumerate()
+        {
+            let command =
+                v2_digest_command(SessionMutationIntent::FencedTransitionV2(Box::new(request)));
+            let postcard = opc_consensus::encode_bounded(&command).expect("postcard");
+            let json = serde_json::to_vec(&command).expect("JSON");
+            assert_eq!(
+                hex(&Sha256::digest(postcard)),
+                expected_postcard_hash,
+                "V2 peer/Raft postcard request shape {index}",
+            );
+            assert_eq!(
+                hex(&Sha256::digest(json)),
+                expected_json_hash,
+                "V2 durable-log JSON request shape {index}",
+            );
+        }
+    }
+
+    #[test]
+    fn v2_command_postcard_wire_ordinals_are_pinned() {
+        let request = v2_digest_request();
+        let identity = legacy_identity();
+        let commands = [
+            v2_digest_command(SessionMutationIntent::FencedTransitionV2(Box::new(
+                request.clone(),
+            ))),
+            v2_digest_command(SessionMutationIntent::ActivateFencedTransitionV2 {
+                request: Box::new(request.clone()),
+                scope_identity: identity,
+                voter_set_digest: [0xD4; 32],
+                profile_digest: [0xD5; 32],
+            }),
+            v2_digest_command(SessionMutationIntent::Authorized {
+                origin: SessionConsensusNodeId::new(9).expect("origin"),
+                authority_identity: identity,
+                mutation: Box::new(SessionMutationIntent::ActivateFencedTransitionV2 {
+                    request: Box::new(request),
+                    scope_identity: identity,
+                    voter_set_digest: [0xD4; 32],
+                    profile_digest: [0xD5; 32],
+                }),
+            }),
+            v2_digest_command(SessionMutationIntent::MaintainFencedTransitionV2History {
+                expected_generation: 11,
+                expected_active_epoch: Some(FencedTransitionV2HistoryEpoch::new(7).expect("epoch")),
+                expected_retired_through: 6,
+                expected_bound_entries: 23,
+            }),
+        ];
+        let expected = [
+            "01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a1207d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d22ef551462247eb23931fd020dfc974ff9ff0cfc495735cf66c5bbd98b2047482000f6c65676163792d706f73746361726403736d660b7064752d73657373696f6e0a6c65676163792d6b65790f76322d6469676573742d6f776e6572003c000201",
+            "01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a1307d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d22ef551462247eb23931fd020dfc974ff9ff0cfc495735cf66c5bbd98b2047482000f6c65676163792d706f73746361726403736d660b7064752d73657373696f6e0a6c65676163792d6b65790f76322d6469676573742d6f776e6572003c000201e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5",
+            "01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a0f09e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a383864141414141414141414141414141414141414141414141414141414141414141021307d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d22ef551462247eb23931fd020dfc974ff9ff0cfc495735cf66c5bbd98b2047482000f6c65676163792d706f73746361726403736d660b7064752d73657373696f6e0a6c65676163792d6b65790f76322d6469676573742d6f776e6572003c000201e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5",
+            "01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a140b01070617",
+        ];
+        for (index, (command, expected)) in commands.iter().zip(expected).enumerate() {
+            let encoded = opc_consensus::encode_bounded(command).expect("V2 command postcard");
+            assert_eq!(hex(&encoded), expected, "V2 command postcard {index}");
+        }
     }
 
     #[test]
@@ -733,6 +1241,36 @@ mod tests {
                 mutation: Box::new(LegacySessionMutationIntent684::AdvanceLogicalTime),
             },
         );
+        let fenced_request = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x31; 16]),
+            FencedTransitionLease::acquire(
+                key.clone(),
+                owner.clone(),
+                FenceToken::new(0),
+                Duration::from_secs(20),
+            )
+            .expect("legacy fenced lease"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("legacy fenced request");
+        assert_postcard_cross_decode(
+            "FencedTransition",
+            SessionMutationIntent::FencedTransition(Box::new(fenced_request.clone())),
+            LegacySessionMutationIntent684::FencedTransition(Box::new(fenced_request.clone())),
+        );
+        assert_postcard_cross_decode(
+            "ActivateFencedTransition",
+            SessionMutationIntent::ActivateFencedTransition {
+                request: Box::new(fenced_request.clone()),
+                scope_identity: identity,
+                voter_set_digest: [0x32; 32],
+            },
+            LegacySessionMutationIntent684::ActivateFencedTransition {
+                request: Box::new(fenced_request),
+                scope_identity: identity,
+                voter_set_digest: [0x32; 32],
+            },
+        );
 
         assert_postcard_cross_decode(
             "Outcome::CompareAndSet",
@@ -747,12 +1285,31 @@ mod tests {
         assert_postcard_cross_decode(
             "Outcome::Lease",
             SessionMutationOutcome::Lease(lease),
-            LegacySessionMutationOutcome684::Lease(legacy_lease(key, owner)),
+            LegacySessionMutationOutcome684::Lease(legacy_lease(key.clone(), owner.clone())),
         );
         assert_postcard_cross_decode(
             "Outcome::Unit",
             SessionMutationOutcome::Unit,
             LegacySessionMutationOutcome684::Unit,
+        );
+        let fenced_outcome = FencedTransitionOutcome::new(
+            LeaseGuard::new(
+                key,
+                owner,
+                FenceToken::new(1),
+                legacy_time(3),
+                legacy_time(23),
+                1,
+            ),
+            Generation::new(1),
+            FencedTransitionMutationResult::Deleted,
+            legacy_time(3),
+        )
+        .expect("legacy fenced outcome");
+        assert_postcard_cross_decode(
+            "Outcome::FencedTransition",
+            SessionMutationOutcome::FencedTransition(fenced_outcome.clone()),
+            LegacySessionMutationOutcome684::FencedTransition(fenced_outcome),
         );
     }
 

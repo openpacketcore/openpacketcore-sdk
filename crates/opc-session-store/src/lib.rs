@@ -98,6 +98,11 @@ pub use capability::{
     SessionStoreHaCompatibility, SessionStorePlatformProfile,
 };
 pub use clock::{Clock, MonotonicClock, SystemClock, TokioVirtualClock};
+pub use consensus::types::{
+    SESSION_CONSENSUS_V2_APPLIED_DIGEST_ENCODING_VERSION,
+    SESSION_CONSENSUS_V2_APPLIED_DIGEST_SCHEMA_DESCRIPTOR,
+    SESSION_CONSENSUS_V2_COMMAND_WIRE_SCHEMA_DESCRIPTOR,
+};
 pub use consensus::{
     validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
     ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusClusterId,
@@ -124,6 +129,8 @@ pub use consumer::{
     SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
     SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
     SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+    SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
+    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
     SessionQuorumConsumer, StatelessSessionConsumer, MAX_SESSION_CONSUMER_BATCH_OPERATIONS,
     MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES,
     SESSION_CONSUMER_IDENTITY_MAX_BYTES, SESSION_CONSUMER_REQUEST_ID_BYTES,
@@ -131,15 +138,43 @@ pub use consumer::{
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;
 pub use fenced_transition::{
-    AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionLease,
+    fenced_transition_v2_profile_digest, AtomicFencedTransitionCapability,
+    FencedTransitionExecuteError, FencedTransitionLease,
     FencedTransitionMutation, FencedTransitionMutationResult, FencedTransitionObservation,
     FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
-    FencedTransitionStatus, PreparedFencedTransition, PreparedFencedTransitionError,
+    FencedTransitionStatus, FencedTransitionV2CallerNonce, FencedTransitionV2HistoryEpoch,
+    FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2RequestId,
+    FencedTransitionV2Status, PreparedFencedTransition, PreparedFencedTransitionError,
     PreparedFencedTransitionLookup, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
     FENCED_TRANSITION_MAX_OUTCOME_BYTES, FENCED_TRANSITION_MAX_PREPARED_BYTES,
     FENCED_TRANSITION_MAX_PREPARED_LAYERS, FENCED_TRANSITION_OUTCOME_RETENTION,
     FENCED_TRANSITION_PREPARED_SCHEMA_V1, FENCED_TRANSITION_REQUEST_ID_BYTES,
-    FENCED_TRANSITION_SCHEMA_V1,
+    FENCED_TRANSITION_SCHEMA_V1, FENCED_TRANSITION_SCHEMA_V2,
+    FENCED_TRANSITION_V2_BODY_COMMITMENT_BYTES, FENCED_TRANSITION_V2_CALLER_NONCE_BYTES,
+    FENCED_TRANSITION_V2_COMMAND_TRANSPORT_PROFILE_INPUTS,
+    FENCED_TRANSITION_V2_COMMAND_TRANSPORT_SCHEMA_DESCRIPTOR,
+    FENCED_TRANSITION_V2_COMMAND_TRANSPORT_SCHEMA_REVISION,
+    FENCED_TRANSITION_V2_CONSENSUS_SCHEMA_VERSION, FENCED_TRANSITION_V2_ERROR_STATUS_REVISION,
+    FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH, FENCED_TRANSITION_V2_MAX_DURABLE_GENERATION,
+    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_HISTORY_EPOCH,
+    FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
+    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, FENCED_TRANSITION_V2_MAX_TIMESTAMP_UNIX_SECONDS,
+    FENCED_TRANSITION_V2_MIN_CONSENSUS_RPC_PAYLOAD_BYTES,
+    FENCED_TRANSITION_V2_MIN_DURABLE_LOG_ENTRY_BYTES,
+    FENCED_TRANSITION_V2_MIN_TIMESTAMP_UNIX_SECONDS,
+    FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_DESCRIPTOR,
+    FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_REVISION,
+    FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR,
+    FENCED_TRANSITION_V2_RECEIPT_RESPONSE_CODEC_MAGIC,
+    FENCED_TRANSITION_V2_RECEIPT_RESPONSE_CODEC_REVISION,
+    FENCED_TRANSITION_V2_RECEIPT_RESPONSE_CODEC_SCHEMA_DESCRIPTOR,
+    FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES, FENCED_TRANSITION_V2_RECLAIM_BATCH,
+    FENCED_TRANSITION_V2_RECORD_ENVELOPE_SCHEMA_DESCRIPTOR,
+    FENCED_TRANSITION_V2_RECORD_ENVELOPE_SCHEMA_REVISION, FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
+    FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET,
+    FENCED_TRANSITION_V2_RETENTION_PROFILE_INPUTS, FENCED_TRANSITION_V2_VALIDATION_PROFILE_INPUTS,
+    FENCED_TRANSITION_V2_VALIDATION_SCHEMA_DESCRIPTOR,
+    FENCED_TRANSITION_V2_VALIDATION_SCHEMA_REVISION,
 };
 pub use fenced_transition_journal::{
     PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
