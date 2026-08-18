@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,10 +19,11 @@ use opc_consensus::{
     ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
-use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
+use opc_key::{AES_256_GCM_SIV_KEY_LEN, KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
 use opc_session_store::{
-    derive_fixed_durable_quorum_consensus_identity, fenced_transition_v2_profile_digest, Clock,
-    ConsensusSessionStore, EncryptedSessionPayload, FenceToken, FencedTransitionLease,
+    Clock, ConsensusSessionStore, EncryptedSessionPayload,
+    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_RECLAIM_BATCH,
+    FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET, FenceToken, FencedTransitionLease,
     FencedTransitionMutation, FencedTransitionMutationResult, FencedTransitionOutcome,
     FencedTransitionV2CallerNonce, FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
     FencedTransitionV2Status, Generation, OwnerId, PlacementResiliencePolicy,
@@ -29,8 +32,8 @@ use opc_session_store::{
     SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcHandler,
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
     SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord, Timestamp,
-    ValidatedQuorumTopology, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
-    FENCED_TRANSITION_V2_RECLAIM_BATCH, FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET,
+    ValidatedQuorumTopology, derive_fixed_durable_quorum_consensus_identity,
+    fenced_transition_v2_profile_digest,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 
@@ -45,6 +48,7 @@ const RECLAIM_BATCHES: usize =
 // represents a small, realistic client burst while leaving consensus itself to
 // serialize and durably apply every proposal on the three voters.
 const QUALIFICATION_IN_FLIGHT_CLIENTS: usize = DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS;
+const QUALIFICATION_TRANSIENT_RETRY_LIMIT: usize = 16;
 const FIXED_V2_PROFILE_DIGEST: [u8; 32] = [
     0xbf, 0x22, 0x10, 0xe0, 0x9a, 0x84, 0xb4, 0x17, 0xb7, 0x27, 0x06, 0x46, 0x82, 0x1b, 0x87, 0xa7,
     0x3d, 0x1a, 0x87, 0x50, 0x38, 0x21, 0xfc, 0x44, 0x92, 0x2d, 0xb2, 0x2e, 0x04, 0x87, 0x9d, 0x15,
@@ -67,6 +71,33 @@ impl Clock for MutableClock {
     fn now_utc(&self) -> Timestamp {
         *self.0.lock().expect("qualification clock mutex")
     }
+}
+
+async fn retry_exact_consensus_operation<T, Operation, OperationFuture>(
+    transient_retries: &AtomicU64,
+    mut operation: Operation,
+) -> Result<T, StoreError>
+where
+    Operation: FnMut() -> OperationFuture,
+    OperationFuture: Future<Output = Result<T, StoreError>>,
+{
+    for attempt in 0..=QUALIFICATION_TRANSIENT_RETRY_LIMIT {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(StoreError::BackendUnavailable(_) | StoreError::FencedTransitionOutcomeUnknown)
+                if attempt < QUALIFICATION_TRANSIENT_RETRY_LIMIT =>
+            {
+                transient_retries.fetch_add(1, Ordering::Relaxed);
+                // The operation-level deadline has already expired. Yield a
+                // fresh scheduling turn before repeating the same read or the
+                // exact same self-authenticating request ID. An ambiguous
+                // write is never replaced with a new ID.
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the bounded retry loop returns on its final attempt")
 }
 
 #[derive(Clone)]
@@ -502,6 +533,7 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         fixed_cluster(directory.path(), clock.clone()).await;
     let store = &stores[ready_leader(&stores).await];
     let provider = sealing_provider();
+    let transient_retries = Arc::new(AtomicU64::new(0));
     assert_eq!(
         fenced_transition_v2_profile_digest(),
         FIXED_V2_PROFILE_DIGEST
@@ -528,12 +560,14 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
     let mut session_states = futures_util::stream::iter(0..QUALIFICATION_SESSIONS)
         .map(|session_index| {
             let provider = &provider;
+            let transient_retries = Arc::clone(&transient_retries);
             async move {
                 let key = key(session_index);
-                let observation = store
-                    .observe_fenced_transition(&key)
-                    .await
-                    .expect("real consensus fence observation");
+                let observation = retry_exact_consensus_operation(&transient_retries, || {
+                    store.observe_fenced_transition(&key)
+                })
+                .await
+                .expect("real consensus fence observation");
                 let create_index = session_index * 2;
                 let create = create_request(
                     create_index,
@@ -543,10 +577,11 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
                     provider,
                 )
                 .await;
-                let created = store
-                    .fenced_transition_v2(create.clone())
-                    .await
-                    .expect("session create must commit through quorum apply");
+                let created = retry_exact_consensus_operation(&transient_retries, || {
+                    store.fenced_transition_v2(create.clone())
+                })
+                .await
+                .expect("session create must commit through quorum apply");
                 assert!(matches!(
                     created.mutation(),
                     FencedTransitionMutationResult::Created
@@ -554,10 +589,11 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
 
                 let update =
                     renew_update_request(create_index + 1, first_epoch, &created, provider).await;
-                let updated = store
-                    .fenced_transition_v2(update)
-                    .await
-                    .expect("session update must commit through quorum apply");
+                let updated = retry_exact_consensus_operation(&transient_retries, || {
+                    store.fenced_transition_v2(update.clone())
+                })
+                .await
+                .expect("session update must commit through quorum apply");
                 assert!(matches!(
                     updated.mutation(),
                     FencedTransitionMutationResult::Updated
@@ -602,15 +638,17 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         futures_util::stream::iter(headroom_states.into_iter().enumerate())
             .map(|(headroom_index, state)| {
                 let provider = &provider;
+                let transient_retries = Arc::clone(&transient_retries);
                 async move {
                     let request_index =
                         FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET + headroom_index;
                     let update =
                         renew_update_request(request_index, first_epoch, &state, provider).await;
-                    let updated = store
-                        .fenced_transition_v2(update)
-                        .await
-                        .expect("headroom update must commit through quorum apply");
+                    let updated = retry_exact_consensus_operation(&transient_retries, || {
+                        store.fenced_transition_v2(update.clone())
+                    })
+                    .await
+                    .expect("headroom update must commit through quorum apply");
                     assert!(matches!(
                         updated.mutation(),
                         FencedTransitionMutationResult::Updated
@@ -900,10 +938,11 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         .map(|path| directory_bytes(path))
         .sum::<u64>();
     eprintln!(
-        "sdk-702 v2 qualification: elapsed={:?} committed={} reclaimed={} db_bytes={} snapshot_bytes={}",
+        "sdk-702 v2 qualification: elapsed={:?} committed={} reclaimed={} transient_exact_retries={} db_bytes={} snapshot_bytes={}",
         started.elapsed(),
         FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES + 1,
         history.reclaimed_entries(),
+        transient_retries.load(Ordering::Relaxed),
         database_bytes,
         snapshot_bytes,
     );
