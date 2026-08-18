@@ -50,55 +50,24 @@ impl TlsMaterialEpoch {
     }
 }
 
-/// Stable, directed digest of one authenticated TLS identity edge.
-///
-/// The digest deliberately has a redacted [`Debug`] implementation and no
-/// serialization surface. Transport lifecycle code can request bounded
-/// deterministic cooperative jitter without acquiring either the digest bytes
-/// or a new API that exposes the handshake's local SPIFFE identity.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct TlsDirectedEdgeKey([u8; 32]);
+const AUTHENTICATED_CONSUMER_ROTATION_JITTER_RANGE: Duration = Duration::from_secs(30);
 
-impl fmt::Debug for TlsDirectedEdgeKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("TlsDirectedEdgeKey([redacted])")
-    }
-}
-
-impl TlsDirectedEdgeKey {
-    /// Map this private edge digest into `[0, maximum]` for cooperative
-    /// lifecycle retirement without exposing stable digest bytes.
-    pub fn bounded_jitter(self, maximum: Duration) -> Duration {
-        if maximum.is_zero() {
-            return Duration::ZERO;
-        }
-        let mut prefix = [0_u8; 16];
-        prefix.copy_from_slice(&self.0[..16]);
-        let sample = u128::from_be_bytes(prefix);
-        let ceiling = maximum.as_nanos();
-        let nanos = sample % ceiling.saturating_add(1);
-        let seconds = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
-        let subsecond_nanos = u32::try_from(nanos % 1_000_000_000).unwrap_or(999_999_999);
-        Duration::new(seconds, subsecond_nanos)
-    }
-}
-
-fn directed_authenticated_edge_key(
-    transport: &[u8],
-    initiator: &SpiffeId,
-    acceptor: &SpiffeId,
-) -> TlsDirectedEdgeKey {
+fn directed_authenticated_consumer_jitter(initiator: &SpiffeId, acceptor: &SpiffeId) -> Duration {
     let mut hasher = Sha256::new();
-    hasher.update(b"openpacketcore/tls/authenticated-lifecycle-edge/v1\0");
-    for field in [
-        transport,
-        initiator.as_str().as_bytes(),
-        acceptor.as_str().as_bytes(),
-    ] {
+    hasher.update(b"openpacketcore/tls/consumer-rotation-jitter/v1\0");
+    for field in [initiator.as_str().as_bytes(), acceptor.as_str().as_bytes()] {
         hasher.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
         hasher.update(field);
     }
-    TlsDirectedEdgeKey(hasher.finalize().into())
+    let digest = hasher.finalize();
+    let mut prefix = [0_u8; 16];
+    prefix.copy_from_slice(&digest[..16]);
+    let sample = u128::from_be_bytes(prefix);
+    let ceiling = AUTHENTICATED_CONSUMER_ROTATION_JITTER_RANGE.as_nanos();
+    let nanos = sample % ceiling.saturating_add(1);
+    let seconds = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
+    let subsecond_nanos = u32::try_from(nanos % 1_000_000_000).unwrap_or(999_999_999);
+    Duration::new(seconds, subsecond_nanos)
 }
 
 /// Availability of coherent TLS material.
@@ -1372,15 +1341,13 @@ impl TlsClientHandshake {
         self.snapshot.certificate_chain_expires_at()
     }
 
-    /// Derive a private initiator-to-acceptor key for lifecycle jitter.
+    /// Derive the one bounded initiator-to-acceptor consumer rotation jitter.
     ///
-    /// Neither authenticated identity nor the digest is rendered by this API.
-    pub fn directed_lifecycle_edge_key(
-        &self,
-        transport: &[u8],
-        peer: &SpiffeId,
-    ) -> TlsDirectedEdgeKey {
-        directed_authenticated_edge_key(transport, &self.snapshot.state.identity.spiffe_id, peer)
+    /// The private digest and local authenticated identity are never returned.
+    /// The domain and 30-second range are fixed so this is not a caller-chosen
+    /// modular digest oracle. A stricter transport policy may clamp the result.
+    pub fn consumer_rotation_jitter(&self, peer: &SpiffeId) -> Duration {
+        directed_authenticated_consumer_jitter(&self.snapshot.state.identity.spiffe_id, peer)
     }
 
     /// Verify the snapshot is still current after TLS and application negotiation.
@@ -1444,16 +1411,12 @@ impl TlsServerHandshake {
         self.snapshot.certificate_chain_expires_at()
     }
 
-    /// Derive the same initiator-to-acceptor lifecycle key as the client.
+    /// Derive the same bounded initiator-to-acceptor jitter as the client.
     ///
-    /// The authenticated peer is the initiator on a server handshake. Neither
-    /// authenticated identity nor the digest is rendered by this API.
-    pub fn directed_lifecycle_edge_key(
-        &self,
-        transport: &[u8],
-        peer: &SpiffeId,
-    ) -> TlsDirectedEdgeKey {
-        directed_authenticated_edge_key(transport, peer, &self.snapshot.state.identity.spiffe_id)
+    /// The authenticated peer is the initiator on a server handshake. The
+    /// private digest and local authenticated identity are never returned.
+    pub fn consumer_rotation_jitter(&self, peer: &SpiffeId) -> Duration {
+        directed_authenticated_consumer_jitter(peer, &self.snapshot.state.identity.spiffe_id)
     }
 
     /// Verify the snapshot is still current after TLS and application negotiation.
@@ -1541,6 +1504,34 @@ impl<E: std::error::Error + 'static> std::error::Error for TlsHandshakeRunError<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumer_rotation_jitter_is_directed_stable_distinct_and_fixed_range() {
+        let client_a = SpiffeId::new(
+            "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/client-a",
+        )
+        .expect("client A identity");
+        let client_b = SpiffeId::new(
+            "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/client-b",
+        )
+        .expect("client B identity");
+        let server = SpiffeId::new(
+            "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/server",
+        )
+        .expect("server identity");
+
+        let client_a_first = directed_authenticated_consumer_jitter(&client_a, &server);
+        let client_a_second = directed_authenticated_consumer_jitter(&client_a, &server);
+        let client_b_jitter = directed_authenticated_consumer_jitter(&client_b, &server);
+        let reverse_jitter = directed_authenticated_consumer_jitter(&server, &client_a);
+
+        assert_eq!(client_a_first, client_a_second);
+        assert_ne!(client_a_first, client_b_jitter);
+        assert_ne!(client_a_first, reverse_jitter);
+        for jitter in [client_a_first, client_b_jitter, reverse_jitter] {
+            assert!(jitter <= AUTHENTICATED_CONSUMER_ROTATION_JITTER_RANGE);
+        }
+    }
 
     #[test]
     fn material_shape_bounds_accept_exact_and_reject_each_one_over() {

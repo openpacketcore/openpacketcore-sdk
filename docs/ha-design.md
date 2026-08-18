@@ -469,8 +469,9 @@ lanes on stable, directed authenticated-edge deadlines within the bounded
 rotation jitter; they remain reusable before their deadline and retire at it.
 Explicit generation changes invalidate cached lanes immediately, while every
 fresh handshake must still match the exact current generation and epoch at its
-final publication sample. The edge digest is opaque and supplies only a bounded
-jitter operation; identities and digest bytes are unavailable to diagnostics.
+final publication sample. TLS supplies only one fixed-domain, fixed-range
+consumer jitter duration; it exposes no edge-key object, caller-selected digest
+range, identity, or digest bytes to callers or diagnostics.
 Task cardinality does not scale with lanes, subscribers, or records. A rejected
 same-epoch publication does not retire a healthy lane.
 

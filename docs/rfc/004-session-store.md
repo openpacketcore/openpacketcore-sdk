@@ -1712,9 +1712,10 @@ and reuse remain permitted before that deadline and retire at it. An explicit
 generation change MUST invalidate cached admission immediately. A fresh client
 or server handshake MUST exactly match the current generation and material
 epoch at its final pre-publication sample and MUST NOT use the cooperative
-jitter exception. The edge key MUST remain an opaque, non-serializable TLS
-digest used only for bounded-jitter calculation and MUST NOT expose either
-identity or digest bytes to session-net diagnostics. A rejected publication
+jitter exception. TLS MUST expose only the single fixed-domain, fixed-range
+consumer jitter duration needed by session-net. It MUST NOT expose a comparable
+edge-key object, caller-selected digest range, identity, or digest bytes to
+callers or session-net diagnostics. A rejected publication
 that retains the admitted epoch MUST NOT interrupt an active frame or healthy
 watch. Each logical request pool MUST use exactly one maintenance task to
 remove cached lanes autonomously at the earliest idle/lifecycle deadline.

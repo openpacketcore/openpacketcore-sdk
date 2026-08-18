@@ -2573,7 +2573,7 @@ struct ConsumerConnection {
     reader: Box<dyn AsyncRead + Unpin + Send>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
     lifecycle: ConnectionLifecycle,
-    rotation_edge_key: opc_tls::TlsDirectedEdgeKey,
+    rotation_jitter: Duration,
     next_correlation: NonZeroU32,
     calls: usize,
     idle_deadline: tokio::time::Instant,
@@ -2735,7 +2735,7 @@ impl ConsumerConnection {
             &mut self.lifecycle,
             config,
             reauthentication,
-            self.rotation_edge_key,
+            self.rotation_jitter,
         )
     }
 
@@ -2786,9 +2786,9 @@ fn observe_consumer_rotation(
     now: tokio::time::Instant,
     generation: u64,
     material_status: opc_tls::TlsMaterialStatus,
-    rotation_edge_key: opc_tls::TlsDirectedEdgeKey,
+    rotation_jitter: Duration,
 ) {
-    lifecycle.observe_authenticated_rotation(now, generation, material_status, rotation_edge_key);
+    lifecycle.observe_authenticated_rotation(now, generation, material_status, rotation_jitter);
     // Explicit reauthentication and zero-jitter material cutovers begin
     // draining immediately. Recording here keeps lifecycle gauges and reason
     // counters aligned while already-admitted bounded work uses the hard
@@ -2800,7 +2800,7 @@ fn consumer_connection_current(
     lifecycle: &mut ConnectionLifecycle,
     config: &opc_tls::AuthenticatedClientConfig,
     reauthentication: &SessionReauthenticationControl,
-    rotation_edge_key: opc_tls::TlsDirectedEdgeKey,
+    rotation_jitter: Duration,
 ) -> bool {
     let now = tokio::time::Instant::now();
     let current_generation = reauthentication.generation();
@@ -2810,7 +2810,7 @@ fn consumer_connection_current(
         now,
         current_generation,
         current_material_status,
-        rotation_edge_key,
+        rotation_jitter,
     );
     if lifecycle.retirement(now).is_some() {
         return false;
@@ -2832,7 +2832,7 @@ fn server_connection_current(
     lifecycle: &mut ConnectionLifecycle,
     config: &opc_tls::AuthenticatedServerConfig,
     reauthentication: &SessionReauthenticationControl,
-    rotation_edge_key: opc_tls::TlsDirectedEdgeKey,
+    rotation_jitter: Duration,
 ) -> bool {
     let now = tokio::time::Instant::now();
     let current_generation = reauthentication.generation();
@@ -2842,7 +2842,7 @@ fn server_connection_current(
         now,
         current_generation,
         current_material_status,
-        rotation_edge_key,
+        rotation_jitter,
     );
     if lifecycle.retirement(now).is_some() {
         return false;
@@ -3110,8 +3110,7 @@ impl StatelessSessionConsumerClient {
         if peer.spiffe_id() != &self.expected_server_identity {
             return Err(SessionConsumerClientError::Authentication);
         }
-        let rotation_edge_key =
-            handshake.directed_lifecycle_edge_key(b"consumer", peer.spiffe_id());
+        let rotation_jitter = handshake.consumer_rotation_jitter(peer.spiffe_id());
         let lifecycle = ConnectionLifecycle::new(
             self.lifecycle_policy,
             established_at,
@@ -3285,7 +3284,7 @@ impl StatelessSessionConsumerClient {
             reader,
             writer,
             lifecycle,
-            rotation_edge_key,
+            rotation_jitter,
             next_correlation: NonZeroU32::MIN,
             calls: 0,
             // A fresh lane is not idle yet. `return_idle` stamps the actual
@@ -3365,7 +3364,7 @@ impl StatelessSessionConsumerClient {
         }
         let mut reauthentication_changes = self.reauthentication.subscribe();
         let mut material_changes = Some(self.tls_config.subscribe_material_changes());
-        let rotation_edge_key = connection.rotation_edge_key;
+        let rotation_jitter = connection.rotation_jitter;
         if !connection.current(&self.tls_config, &self.reauthentication) {
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Unavailable,
@@ -3459,7 +3458,7 @@ impl StatelessSessionConsumerClient {
                             tokio::time::Instant::now(),
                             self.reauthentication.generation(),
                             self.tls_config.material_status(),
-                            rotation_edge_key,
+                            rotation_jitter,
                         );
                     }
                     _ = wait_consumer_material_change(&mut material_changes) => {
@@ -3468,7 +3467,7 @@ impl StatelessSessionConsumerClient {
                             tokio::time::Instant::now(),
                             self.reauthentication.generation(),
                             self.tls_config.material_status(),
-                            rotation_edge_key,
+                            rotation_jitter,
                         );
                     }
                 }
@@ -3543,7 +3542,7 @@ impl StatelessSessionConsumerClient {
                             tokio::time::Instant::now(),
                             self.reauthentication.generation(),
                             self.tls_config.material_status(),
-                            rotation_edge_key,
+                            rotation_jitter,
                         );
                         None
                     }
@@ -3553,7 +3552,7 @@ impl StatelessSessionConsumerClient {
                             tokio::time::Instant::now(),
                             self.reauthentication.generation(),
                             self.tls_config.material_status(),
-                            rotation_edge_key,
+                            rotation_jitter,
                         );
                         None
                     }
@@ -3966,7 +3965,7 @@ impl StatelessSessionConsumerClient {
                 SessionConsumerClientError::Unavailable,
             ));
         }
-        let rotation_edge_key = connection.rotation_edge_key;
+        let rotation_jitter = connection.rotation_jitter;
         let correlation = connection
             .take_correlation()
             .map_err(SessionConsumerCallError::BeforeCallWrite)?;
@@ -4042,7 +4041,7 @@ impl StatelessSessionConsumerClient {
                             tokio::time::Instant::now(),
                             self.reauthentication.generation(),
                             self.tls_config.material_status(),
-                            rotation_edge_key,
+                            rotation_jitter,
                         );
                         None
                     }
@@ -4052,7 +4051,7 @@ impl StatelessSessionConsumerClient {
                             tokio::time::Instant::now(),
                             self.reauthentication.generation(),
                             self.tls_config.material_status(),
-                            rotation_edge_key,
+                            rotation_jitter,
                         );
                         None
                     }
@@ -4179,7 +4178,7 @@ impl StatelessSessionConsumerClient {
                         &mut connection.lifecycle,
                         &self.tls_config,
                         &self.reauthentication,
-                        connection.rotation_edge_key,
+                        connection.rotation_jitter,
                     )
                 {
                     let _ = connection.lifecycle.retirement(now);
@@ -4198,7 +4197,7 @@ impl StatelessSessionConsumerClient {
                                 &mut connection.lifecycle,
                                 &self.tls_config,
                                 &self.reauthentication,
-                                connection.rotation_edge_key,
+                                connection.rotation_jitter,
                             )
                         {
                             let _ = connection.lifecycle.retirement(now);
@@ -4223,7 +4222,7 @@ impl StatelessSessionConsumerClient {
                             &mut connection.lifecycle,
                             &self.tls_config,
                             &self.reauthentication,
-                            connection.rotation_edge_key,
+                            connection.rotation_jitter,
                         ) {
                             return Err(SessionConsumerCallError::MayHaveSent(
                                 SessionConsumerClientError::Unavailable,
@@ -4236,7 +4235,7 @@ impl StatelessSessionConsumerClient {
                             &mut connection.lifecycle,
                             &self.tls_config,
                             &self.reauthentication,
-                            connection.rotation_edge_key,
+                            connection.rotation_jitter,
                         ) {
                             return Err(SessionConsumerCallError::MayHaveSent(
                                 SessionConsumerClientError::Unavailable,
@@ -4432,7 +4431,7 @@ impl StatelessSessionConsumerClient {
                                     &mut connection.lifecycle,
                                     &tls_config,
                                     &reauthentication,
-                                    connection.rotation_edge_key,
+                                    connection.rotation_jitter,
                                 ) {
                                     ConsumerWatchRead::Reconnect
                                 } else {
@@ -4444,7 +4443,7 @@ impl StatelessSessionConsumerClient {
                                     &mut connection.lifecycle,
                                     &tls_config,
                                     &reauthentication,
-                                    connection.rotation_edge_key,
+                                    connection.rotation_jitter,
                                 ) {
                                     ConsumerWatchRead::Reconnect
                                 } else {
@@ -7163,7 +7162,7 @@ async fn write_consumer_server_response_supervised<W>(
     reauthentication_changes: &mut watch::Receiver<u64>,
     material_changes: &mut Option<opc_tls::TlsMaterialStatusReceiver>,
     cancellation: &ConsumerServerCancellation,
-    rotation_edge_key: opc_tls::TlsDirectedEdgeKey,
+    rotation_jitter: Duration,
 ) -> Result<bool, ProtocolError>
 where
     W: AsyncWrite + Unpin,
@@ -7218,7 +7217,7 @@ where
                     tokio::time::Instant::now(),
                     reauthentication.generation(),
                     tls_config.material_status(),
-                    rotation_edge_key,
+                    rotation_jitter,
                 );
                 None
             }
@@ -7228,7 +7227,7 @@ where
                     tokio::time::Instant::now(),
                     reauthentication.generation(),
                     tls_config.material_status(),
-                    rotation_edge_key,
+                    rotation_jitter,
                 );
                 None
             }
@@ -7254,7 +7253,7 @@ async fn write_consumer_call_rejection_supervised<W>(
     reauthentication_changes: &mut watch::Receiver<u64>,
     material_changes: &mut Option<opc_tls::TlsMaterialStatusReceiver>,
     cancellation: &ConsumerServerCancellation,
-    rotation_edge_key: opc_tls::TlsDirectedEdgeKey,
+    rotation_jitter: Duration,
 ) -> Result<bool, ProtocolError>
 where
     W: AsyncWrite + Unpin,
@@ -7274,7 +7273,7 @@ where
         reauthentication_changes,
         material_changes,
         cancellation,
-        rotation_edge_key,
+        rotation_jitter,
     )
     .await
 }
@@ -7351,7 +7350,7 @@ async fn handle_server_connection(
     let identity = authorizer
         .authorize(peer.spiffe_id())
         .map_err(|_| ProtocolError::Authentication)?;
-    let rotation_edge_key = handshake.directed_lifecycle_edge_key(b"consumer", peer.spiffe_id());
+    let rotation_jitter = handshake.consumer_rotation_jitter(peer.spiffe_id());
     let mut lifecycle = ConnectionLifecycle::new(
         lifecycle_policy,
         established_at,
@@ -7574,7 +7573,7 @@ async fn handle_server_connection(
                         &mut lifecycle,
                         &tls_config,
                         &reauthentication,
-                        rotation_edge_key,
+                        rotation_jitter,
                     ) {
                         return Err(ProtocolError::Authentication);
                     }
@@ -7585,7 +7584,7 @@ async fn handle_server_connection(
                         &mut lifecycle,
                         &tls_config,
                         &reauthentication,
-                        rotation_edge_key,
+                        rotation_jitter,
                     ) {
                         return Err(ProtocolError::Authentication);
                     }
@@ -7663,7 +7662,7 @@ async fn handle_server_connection(
                             &mut lifecycle,
                             &tls_config,
                             &reauthentication,
-                            rotation_edge_key,
+                            rotation_jitter,
                         ) {
                             return Ok(());
                         }
@@ -7674,7 +7673,7 @@ async fn handle_server_connection(
                             &mut lifecycle,
                             &tls_config,
                             &reauthentication,
-                            rotation_edge_key,
+                            rotation_jitter,
                         ) {
                             return Ok(());
                         }
@@ -7700,7 +7699,7 @@ async fn handle_server_connection(
             &mut lifecycle,
             &tls_config,
             &reauthentication,
-            rotation_edge_key,
+            rotation_jitter,
         ) {
             return Ok(());
         }
@@ -7721,7 +7720,7 @@ async fn handle_server_connection(
                 &mut reauthentication_changes,
                 &mut material_changes,
                 &cancellation,
-                rotation_edge_key,
+                rotation_jitter,
             )
             .await?;
             return Ok(());
@@ -7740,7 +7739,7 @@ async fn handle_server_connection(
                 &mut reauthentication_changes,
                 &mut material_changes,
                 &cancellation,
-                rotation_edge_key,
+                rotation_jitter,
             )
             .await?;
             return Ok(());
@@ -7802,7 +7801,7 @@ async fn handle_server_connection(
                         tokio::time::Instant::now(),
                         reauthentication.generation(),
                         tls_config.material_status(),
-                        rotation_edge_key,
+                        rotation_jitter,
                     );
                     None
                 }
@@ -7812,7 +7811,7 @@ async fn handle_server_connection(
                         tokio::time::Instant::now(),
                         reauthentication.generation(),
                         tls_config.material_status(),
-                        rotation_edge_key,
+                        rotation_jitter,
                     );
                     None
                 }
@@ -7826,7 +7825,7 @@ async fn handle_server_connection(
             tokio::time::Instant::now(),
             reauthentication.generation(),
             tls_config.material_status(),
-            rotation_edge_key,
+            rotation_jitter,
         );
         let hard_deadline = lifecycle
             .hard_deadline()
@@ -7908,7 +7907,7 @@ async fn handle_server_connection(
                                 tokio::time::Instant::now(),
                                 reauthentication.generation(),
                         tls_config.material_status(),
-                        rotation_edge_key,
+                        rotation_jitter,
                     );
                             None
                         }
@@ -7918,7 +7917,7 @@ async fn handle_server_connection(
                                 tokio::time::Instant::now(),
                                 reauthentication.generation(),
                         tls_config.material_status(),
-                        rotation_edge_key,
+                        rotation_jitter,
                     );
                             None
                         }
@@ -7939,7 +7938,7 @@ async fn handle_server_connection(
                 tokio::time::Instant::now(),
                 reauthentication.generation(),
                 tls_config.material_status(),
-                rotation_edge_key,
+                rotation_jitter,
             );
             let hard_deadline = lifecycle
                 .hard_deadline()
@@ -7970,7 +7969,7 @@ async fn handle_server_connection(
             &mut reauthentication_changes,
             &mut material_changes,
             &cancellation,
-            rotation_edge_key,
+            rotation_jitter,
         )
         .await?
         {
@@ -7999,7 +7998,7 @@ async fn handle_server_connection(
                     &mut lifecycle,
                     &tls_config,
                     &reauthentication,
-                    rotation_edge_key,
+                    rotation_jitter,
                 )
             {
                 return Ok(());
@@ -8018,7 +8017,7 @@ async fn handle_server_connection(
                         &mut lifecycle,
                         &tls_config,
                         &reauthentication,
-                            rotation_edge_key,
+                            rotation_jitter,
                         ) {
                         return Ok(());
                     }
@@ -8029,7 +8028,7 @@ async fn handle_server_connection(
                         &mut lifecycle,
                         &tls_config,
                         &reauthentication,
-                            rotation_edge_key,
+                            rotation_jitter,
                         ) {
                         return Ok(());
                     }
@@ -8051,7 +8050,7 @@ async fn handle_server_connection(
                     &mut lifecycle,
                     &tls_config,
                     &reauthentication,
-                    rotation_edge_key,
+                    rotation_jitter,
                 )
             {
                 return Ok(());
@@ -8088,7 +8087,7 @@ async fn handle_server_connection(
                         &mut lifecycle,
                         &tls_config,
                         &reauthentication,
-                        rotation_edge_key,
+                        rotation_jitter,
                     )
                 {
                     return Ok(());
@@ -8122,7 +8121,7 @@ async fn handle_server_connection(
                             tokio::time::Instant::now(),
                             reauthentication.generation(),
                         tls_config.material_status(),
-                        rotation_edge_key,
+                        rotation_jitter,
                     );
                         None
                     }
@@ -8132,7 +8131,7 @@ async fn handle_server_connection(
                             tokio::time::Instant::now(),
                             reauthentication.generation(),
                         tls_config.material_status(),
-                        rotation_edge_key,
+                        rotation_jitter,
                     );
                         None
                     }
@@ -8143,7 +8142,7 @@ async fn handle_server_connection(
                         &mut lifecycle,
                         &tls_config,
                         &reauthentication,
-                        rotation_edge_key,
+                        rotation_jitter,
                     ) {
                         return Ok(());
                     }
@@ -8753,11 +8752,11 @@ mod tests {
                 reader: Box::new(tokio::io::empty()),
                 writer,
                 lifecycle,
-                rotation_edge_key: client
+                rotation_jitter: client
                     .tls_config
                     .begin_handshake()
                     .expect("test client handshake snapshot")
-                    .directed_lifecycle_edge_key(b"consumer", &client.expected_server_identity),
+                    .consumer_rotation_jitter(&client.expected_server_identity),
                 next_correlation: NonZeroU32::MIN,
                 calls: 0,
                 idle_deadline,
@@ -10239,8 +10238,7 @@ mod tests {
             let handshake = config
                 .begin_handshake()
                 .expect("server rejection handshake snapshot");
-            let rotation_edge_key =
-                handshake.directed_lifecycle_edge_key(b"consumer", &client_identity);
+            let rotation_jitter = handshake.consumer_rotation_jitter(&client_identity);
             let reauthentication = SessionReauthenticationControl::new();
             let mut reauthentication_changes = reauthentication.subscribe();
             let mut material_changes = Some(config.subscribe_material_changes());
@@ -10269,7 +10267,7 @@ mod tests {
                 &mut reauthentication_changes,
                 &mut material_changes,
                 &cancellation,
-                rotation_edge_key,
+                rotation_jitter,
             );
             tokio::pin!(write);
             std::future::poll_fn(|context| {
@@ -10480,8 +10478,7 @@ mod tests {
         let server_edge_jitter = server_config
             .begin_handshake()
             .expect("server final-admission handshake snapshot")
-            .directed_lifecycle_edge_key(b"consumer", &client_identity)
-            .bounded_jitter(ConnectionLifecyclePolicy::default().rotation_jitter());
+            .consumer_rotation_jitter(&client_identity);
         assert!(
             server_edge_jitter > Duration::from_secs(1),
             "a missing final admission check cannot retire this admitted test edge inside the observation bound"
@@ -11028,7 +11025,9 @@ mod tests {
                 + Duration::from_secs(1),
             Box::new(tokio::io::sink()),
         );
-        let material_edge_key = connection.rotation_edge_key;
+        let material_jitter = connection
+            .rotation_jitter
+            .min(persistent.pool.client.lifecycle_policy.rotation_jitter());
         persistent.pool.return_idle(connection);
         wait_for_raw_idle_count(&persistent, 1).await;
         let same_epoch_processed = persistent
@@ -11054,8 +11053,8 @@ mod tests {
         let material_rotated_at = tokio::time::Instant::now();
         material.rotate();
         material_rotation_processed.await;
-        let material_jitter = persistent.pool.client.lifecycle_policy.rotation_jitter();
-        let material_jitter = material_edge_key.bounded_jitter(material_jitter);
+        let maximum_material_jitter = persistent.pool.client.lifecycle_policy.rotation_jitter();
+        assert!(material_jitter <= maximum_material_jitter);
         assert!(
             !material_jitter.is_zero(),
             "the fixed test identity has a nonzero cooperative rotation window"
@@ -11220,38 +11219,37 @@ mod tests {
         let client_a_config = client_a_material.config();
         let client_b_config = client_b_material.config();
         let server_config = server_material.config();
-        let client_a_key = client_a_config
-            .begin_handshake()
-            .expect("client A handshake snapshot")
-            .directed_lifecycle_edge_key(b"consumer", &server_id);
-        let stable_client_a_key = client_a_config
-            .begin_handshake()
-            .expect("second client A handshake snapshot")
-            .directed_lifecycle_edge_key(b"consumer", &server_id);
-        let client_b_key = client_b_config
-            .begin_handshake()
-            .expect("client B handshake snapshot")
-            .directed_lifecycle_edge_key(b"consumer", &server_id);
-        let server_a_key = server_config
-            .begin_handshake()
-            .expect("server handshake snapshot")
-            .directed_lifecycle_edge_key(b"consumer", &client_a_id);
-        assert_eq!(client_a_key, stable_client_a_key);
-        assert_eq!(client_a_key, server_a_key);
-        assert_ne!(client_a_key, client_b_key);
-        assert_eq!(
-            format!("{client_a_key:?}"),
-            "TlsDirectedEdgeKey([redacted])"
-        );
-
         let policy = ConnectionLifecyclePolicy::try_new(
             Duration::from_secs(60),
             Duration::from_secs(2),
             Duration::from_millis(1),
             Duration::from_millis(1),
-            Duration::from_secs(10),
+            crate::lifecycle::DEFAULT_ROTATION_JITTER,
         )
         .expect("bounded edge-jitter policy");
+        let client_a_handshake = client_a_config
+            .begin_handshake()
+            .expect("client A handshake snapshot");
+        let client_a_jitter = client_a_handshake.consumer_rotation_jitter(&server_id);
+        let stable_client_a_jitter = client_a_config
+            .begin_handshake()
+            .expect("second client A handshake snapshot")
+            .consumer_rotation_jitter(&server_id);
+        let client_b_jitter = client_b_config
+            .begin_handshake()
+            .expect("client B handshake snapshot")
+            .consumer_rotation_jitter(&server_id);
+        let server_a_jitter = server_config
+            .begin_handshake()
+            .expect("server handshake snapshot")
+            .consumer_rotation_jitter(&client_a_id);
+        assert_eq!(client_a_jitter, stable_client_a_jitter);
+        assert_eq!(client_a_jitter, server_a_jitter);
+        assert_ne!(client_a_jitter, client_b_jitter);
+        assert!(
+            !format!("{client_a_handshake:?}").contains(client_a_id.as_str()),
+            "handshake diagnostics do not reveal the local authenticated identity"
+        );
         let admitted_epoch = client_a_config.material_status().epoch();
         client_a_material.rotate();
         let current_material_status = client_a_config.material_status();
@@ -11267,10 +11265,10 @@ mod tests {
             .expect("edge A lifecycle");
         let mut edge_b = ConnectionLifecycle::new(policy, now, None, None, 0, Some(admitted_epoch))
             .expect("edge B lifecycle");
-        edge_a.observe_authenticated_rotation(now, 0, current_material_status, client_a_key);
-        edge_b.observe_authenticated_rotation(now, 0, current_material_status, client_b_key);
-        let edge_a_jitter = client_a_key.bounded_jitter(policy.rotation_jitter());
-        let edge_b_jitter = client_b_key.bounded_jitter(policy.rotation_jitter());
+        edge_a.observe_authenticated_rotation(now, 0, current_material_status, client_a_jitter);
+        edge_b.observe_authenticated_rotation(now, 0, current_material_status, client_b_jitter);
+        let edge_a_jitter = client_a_jitter;
+        let edge_b_jitter = client_b_jitter;
         assert_ne!(edge_a_jitter, edge_b_jitter);
         assert_eq!(
             edge_a.retire_at(),
@@ -11315,7 +11313,7 @@ mod tests {
             &mut server_material_lifecycle,
             &server_config,
             &server_control,
-            server_a_key,
+            server_a_jitter,
         ));
         let server_retire_at = server_material_lifecycle.retire_at();
         assert_eq!(server_retire_at, now + edge_a_jitter);
@@ -11324,14 +11322,14 @@ mod tests {
             &mut server_material_lifecycle,
             &server_config,
             &server_control,
-            server_a_key,
+            server_a_jitter,
         ));
         tokio::time::advance(Duration::from_nanos(1)).await;
         assert!(!server_connection_current(
             &mut server_material_lifecycle,
             &server_config,
             &server_control,
-            server_a_key,
+            server_a_jitter,
         ));
         assert_eq!(
             server_material_lifecycle.recorded_retirement_reason(),
@@ -11355,7 +11353,7 @@ mod tests {
             &mut server_explicit_lifecycle,
             &server_config,
             &server_control,
-            server_a_key,
+            server_a_jitter,
         ));
         assert_eq!(
             server_explicit_lifecycle.recorded_retirement_reason(),
@@ -11371,14 +11369,6 @@ mod tests {
         let server_material = RotatableServerMaterial::new(server_id.as_str());
         let client_config = client_material.config();
         let server_config = server_material.config();
-        let client_key = client_config
-            .begin_handshake()
-            .expect("client handshake snapshot")
-            .directed_lifecycle_edge_key(b"consumer", &server_id);
-        let server_key = server_config
-            .begin_handshake()
-            .expect("server handshake snapshot")
-            .directed_lifecycle_edge_key(b"consumer", &client_id);
         let policy = ConnectionLifecyclePolicy::try_new(
             Duration::from_secs(60),
             Duration::from_secs(2),
@@ -11387,6 +11377,14 @@ mod tests {
             Duration::from_secs(10),
         )
         .expect("bounded late-observation policy");
+        let client_jitter = client_config
+            .begin_handshake()
+            .expect("client handshake snapshot")
+            .consumer_rotation_jitter(&server_id);
+        let server_jitter = server_config
+            .begin_handshake()
+            .expect("server handshake snapshot")
+            .consumer_rotation_jitter(&client_id);
         let started_at = tokio::time::Instant::now();
         let client_epoch = client_config.material_status().epoch();
         let server_epoch = server_config.material_status().epoch();
@@ -11421,21 +11419,21 @@ mod tests {
             &mut client_lifecycle,
             &client_config,
             &client_control,
-            client_key,
+            client_jitter,
         ));
         assert!(!server_connection_current(
             &mut server_lifecycle,
             &server_config,
             &server_control,
-            server_key,
+            server_jitter,
         ));
         assert_eq!(
             client_lifecycle.retire_at(),
-            client_published_at + client_key.bounded_jitter(policy.rotation_jitter())
+            client_published_at + client_jitter
         );
         assert_eq!(
             server_lifecycle.retire_at(),
-            server_published_at + server_key.bounded_jitter(policy.rotation_jitter())
+            server_published_at + server_jitter
         );
         assert_eq!(
             client_lifecycle.recorded_retirement_reason(),

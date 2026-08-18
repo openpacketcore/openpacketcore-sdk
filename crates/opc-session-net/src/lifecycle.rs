@@ -926,14 +926,14 @@ impl ConnectionLifecycle {
         now: tokio::time::Instant,
         current_generation: u64,
         current_material_status: opc_tls::TlsMaterialStatus,
-        edge_key: opc_tls::TlsDirectedEdgeKey,
+        material_jitter: Duration,
     ) {
         self.observe_rotation_with_jitter(
             now,
             current_generation,
             Some(current_material_status.epoch()),
             Some(current_material_status.published_at()),
-            edge_key.bounded_jitter(self.policy.rotation_jitter()),
+            material_jitter.min(self.policy.rotation_jitter()),
         );
     }
 
