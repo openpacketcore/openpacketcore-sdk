@@ -105,11 +105,16 @@ where
 /// caller-supplied request ID, so replaying it blindly after a lost reply could
 /// run the next ordered batch instead of the original one.
 async fn maintain_exact_history_batch(
-    store: &ConsensusSessionStore,
+    stores: &[ConsensusSessionStore],
     expected: FencedTransitionV2HistoryState,
     transient_retries: &AtomicU64,
 ) -> Result<FencedTransitionV2HistoryState, StoreError> {
     for attempt in 0..=QUALIFICATION_TRANSIENT_RETRY_LIMIT {
+        // Unlike ordinary application operations, operator maintenance is a
+        // deliberately local-leader-only boundary and is never forwarded.
+        // A release workload can span several election terms, so never cache
+        // the leader selected before the 131k-transition phase.
+        let store = &stores[ready_leader(stores).await];
         match store.maintain_fenced_transition_v2_history(expected).await {
             Ok(state) => return Ok(state),
             // `EpochNotActive` can be the post-commit observation of this
@@ -121,8 +126,9 @@ async fn maintain_exact_history_batch(
                 | StoreError::FencedTransitionHistoryEpochNotActive,
             ) if attempt < QUALIFICATION_TRANSIENT_RETRY_LIMIT => {
                 transient_retries.fetch_add(1, Ordering::Relaxed);
+                let observation_store = &stores[ready_leader(stores).await];
                 let observed = retry_exact_consensus_operation(transient_retries, || {
-                    store.fenced_transition_v2_history_state()
+                    observation_store.fenced_transition_v2_history_state()
                 })
                 .await?;
                 if observed != expected {
@@ -555,6 +561,67 @@ async fn fixed_quorum_first_v2_transition_activates_and_applies_on_every_voter()
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn fixed_quorum_history_maintenance_reselects_the_local_leader() {
+    let directory = tempfile::tempdir().expect("fixed-quorum V2 maintenance directory");
+    let start = Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_900_000_000)
+            .expect("fixed-quorum V2 maintenance start"),
+    );
+    let clock = Arc::new(MutableClock::new(start));
+    let (stores, _, _) = fixed_cluster(directory.path(), clock.clone()).await;
+    let leader = ready_leader(&stores).await;
+    let provider = sealing_provider();
+    let key = key(0);
+    let observation = stores[leader]
+        .observe_fenced_transition(&key)
+        .await
+        .expect("fixed-quorum maintenance fence observation");
+    let transition = create_request(
+        0,
+        FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch"),
+        key,
+        observation.current_fence(),
+        &provider,
+    )
+    .await;
+    stores[leader]
+        .fenced_transition_v2(transition)
+        .await
+        .expect("fixed-quorum maintenance transition");
+
+    clock.set(
+        start
+            .add_seconds(24 * 60 * 60 + 1)
+            .expect("maintenance retention boundary"),
+    );
+    let leader = ready_leader(&stores).await;
+    let expected = stores[leader]
+        .fenced_transition_v2_history_state()
+        .await
+        .expect("linearized maintenance history");
+    let follower = (leader + 1) % stores.len();
+    assert!(matches!(
+        stores[follower]
+            .maintain_fenced_transition_v2_history(expected)
+            .await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+
+    let transient_retries = AtomicU64::new(0);
+    let maintained = maintain_exact_history_batch(&stores, expected, &transient_retries)
+        .await
+        .expect("maintenance reselects the current local leader");
+    let first_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("retired V2 epoch");
+    let next_epoch = FencedTransitionV2HistoryEpoch::new(2).expect("successor V2 epoch");
+    assert_eq!(maintained.retired_through(), Some(first_epoch));
+    assert_eq!(maintained.active_epoch(), Some(next_epoch));
+    assert_eq!(maintained.reclaim_epoch(), None);
+    assert_eq!(maintained.reclaim_remaining(), 0);
+    assert_eq!(maintained.bound_entries(), 0);
+    assert_eq!(maintained.reclaimed_entries(), 1);
+}
+
 /// Release qualification for V2 capacity and retired-history reclamation.
 /// Its shared injected clock advances through a consensus read barrier, never
 /// by SQLite mutation or a wall-clock sleep.
@@ -870,7 +937,7 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
     })
     .await
     .expect("commit advanced logical time through a public read barrier");
-    history = maintain_exact_history_batch(store, history, &transient_retries)
+    history = maintain_exact_history_batch(&stores, history, &transient_retries)
         .await
         .expect("first fixed-quorum retirement batch");
     assert_eq!(history.active_epoch(), None);
@@ -958,7 +1025,7 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         "qualification assumes ordered full reclamation batches"
     );
     for batch in 1..RECLAIM_BATCHES {
-        history = maintain_exact_history_batch(store, history, &transient_retries)
+        history = maintain_exact_history_batch(&stores, history, &transient_retries)
             .await
             .expect("ordered fixed-quorum retirement batch");
         if batch + 1 < RECLAIM_BATCHES {

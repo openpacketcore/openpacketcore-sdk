@@ -92,6 +92,12 @@ logical time before calling `maintain_fenced_transition_v2_history` on the
 elected fixed-quorum leader. No LabSingleton authority, direct SQLite change,
 private intent, or wall-clock sleep is used.
 
+The fixture resolves the current self-reported, durably ready leader before
+every maintenance CAS and every retry. Ordinary application operations may
+forward after an election, but the operator maintenance boundary is
+deliberately local-leader-only; caching the leader selected before a multi-hour
+capacity run would test a stale caller rather than the retirement protocol.
+
 The release fixture also treats a maintenance reply loss as an ambiguous CAS,
 not as permission to submit a later batch. It reads the linearized history
 state after a transient unavailable or stale-CAS reply: a changed complete
