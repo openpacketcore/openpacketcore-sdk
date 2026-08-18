@@ -890,14 +890,14 @@ fn valid_v1_protection_stack(layers: &[Option<PreparedFencedTransitionProtection
         AuthenticatedConsumerPhysicalV1, ConsensusPhysicalV1, LocalAeadV1, RemoteSealV1,
     };
 
-    match layers {
-        [] => true,
-        [Some(_)] => true,
-        [Some(ConsensusPhysicalV1 { .. } | AuthenticatedConsumerPhysicalV1 { .. }), Some(LocalAeadV1 { .. } | RemoteSealV1 { .. })] => {
-            true
-        }
-        _ => false,
-    }
+    matches!(
+        layers,
+        [] | [Some(_)]
+            | [
+                Some(ConsensusPhysicalV1 { .. } | AuthenticatedConsumerPhysicalV1 { .. }),
+                Some(LocalAeadV1 { .. } | RemoteSealV1 { .. })
+            ]
+    )
 }
 
 fn decode_prepared_body(

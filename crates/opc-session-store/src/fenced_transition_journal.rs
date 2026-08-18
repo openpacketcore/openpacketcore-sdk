@@ -72,8 +72,7 @@ const JOURNAL_SQLITE_MAIN_MAX_BYTES: u64 = (FENCED_TRANSITION_MAX_PREPARED_BYTES
     * FENCED_TRANSITION_MAX_HISTORY_ENTRIES as u64
     + JOURNAL_SQLITE_MAIN_FILE_FIXED_OVERHEAD_BYTES;
 const JOURNAL_SQLITE_MAX_PAGE_COUNT: i64 =
-    ((JOURNAL_SQLITE_MAIN_MAX_BYTES + JOURNAL_SQLITE_PAGE_SIZE_BYTES - 1)
-        / JOURNAL_SQLITE_PAGE_SIZE_BYTES) as i64;
+    JOURNAL_SQLITE_MAIN_MAX_BYTES.div_ceil(JOURNAL_SQLITE_PAGE_SIZE_BYTES) as i64;
 // A valid long-lived read snapshot can defer checkpoints while every bounded
 // history row is appended. These format-derived caps therefore cover the full
 // protocol capacity plus repeated B-tree/metadata frames; lower steady-state
