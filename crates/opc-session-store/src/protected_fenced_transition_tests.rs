@@ -625,7 +625,8 @@ impl RemoteSealProvider for CountingRemoteProvider {
 async fn protected_fenced_transition_rejects_nonphysical_inner_token_before_journaling() {
     let local_spy = Arc::new(AtomicSpy::new());
     local_spy.emit_nonphysical_prepared_token();
-    let local_journal = JournalFixture::new(0x8d);
+    let local_journal_fixture = JournalFixture::new(0x8d);
+    let local_journal = local_journal_fixture.open();
     let local_inner: Arc<dyn SessionBackend> =
         Arc::new(SessionStore::from_arc(Arc::clone(&local_spy)));
     let local = EncryptingSessionBackend::new(
@@ -633,7 +634,7 @@ async fn protected_fenced_transition_rejects_nonphysical_inner_token_before_jour
         CountingKeyProvider::with_key("local-nonphysical", 0x14),
         NAMESPACE,
     )
-    .with_fenced_transition_journal(local_journal.open());
+    .with_fenced_transition_journal(Arc::clone(&local_journal));
     let local_request = create_request(41);
     assert!(matches!(
         local.prepare_fenced_transition(local_request.clone()).await,
@@ -641,7 +642,6 @@ async fn protected_fenced_transition_rejects_nonphysical_inner_token_before_jour
     ));
     assert!(matches!(
         local_journal
-            .open()
             .lookup(local_request.request_id())
             .await
             .expect("journal lookup"),
@@ -650,7 +650,8 @@ async fn protected_fenced_transition_rejects_nonphysical_inner_token_before_jour
 
     let remote_spy = Arc::new(AtomicSpy::new());
     remote_spy.emit_nonphysical_prepared_token();
-    let remote_journal = JournalFixture::new(0x8e);
+    let remote_journal_fixture = JournalFixture::new(0x8e);
+    let remote_journal = remote_journal_fixture.open();
     let remote_inner: Arc<dyn SessionBackend> =
         Arc::new(SessionStore::from_arc(Arc::clone(&remote_spy)));
     let remote = RemoteSealingSessionBackend::new(
@@ -658,7 +659,7 @@ async fn protected_fenced_transition_rejects_nonphysical_inner_token_before_jour
         CountingRemoteProvider::with_key("remote-nonphysical", 0x15),
         NAMESPACE,
     )
-    .with_fenced_transition_journal(remote_journal.open());
+    .with_fenced_transition_journal(Arc::clone(&remote_journal));
     let remote_request = create_request(42);
     assert!(matches!(
         remote
@@ -668,7 +669,6 @@ async fn protected_fenced_transition_rejects_nonphysical_inner_token_before_jour
     ));
     assert!(matches!(
         remote_journal
-            .open()
             .lookup(remote_request.request_id())
             .await
             .expect("journal lookup"),
@@ -694,6 +694,7 @@ async fn protected_fenced_transition_rejects_same_kind_physical_substitution_bef
         .prepare_fenced_transition(create_request(43))
         .await
         .expect("prepare local token");
+    drop(local_a_backend);
     let local_b = Arc::new(AtomicSpy::new());
     local_b.reject_physical_tokens();
     let local_b_provider = CountingKeyProvider::with_key("local-physical-b", 0x17);
@@ -737,6 +738,7 @@ async fn protected_fenced_transition_rejects_same_kind_physical_substitution_bef
         .prepare_fenced_transition(create_request(44))
         .await
         .expect("prepare remote token");
+    drop(remote_a_backend);
     let remote_b = Arc::new(AtomicSpy::new());
     remote_b.reject_physical_tokens();
     let remote_b_provider = CountingRemoteProvider::with_key("remote-physical-b", 0x19);
@@ -1099,9 +1101,10 @@ async fn protected_fenced_transition_observation_unprotects_once_preserves_fence
 {
     let spy = Arc::new(AtomicSpy::new());
     let provider = CountingKeyProvider::with_key("observe-local", 0x41);
-    let local_journal = JournalFixture::new(0x93);
+    let local_journal_fixture = JournalFixture::new(0x93);
+    let local_journal = local_journal_fixture.open();
     let backend = EncryptingSessionBackend::new(Arc::clone(&spy), Arc::clone(&provider), NAMESPACE)
-        .with_fenced_transition_journal(local_journal.open());
+        .with_fenced_transition_journal(Arc::clone(&local_journal));
     let token = backend
         .prepare_fenced_transition(create_request(4))
         .await
@@ -1114,7 +1117,7 @@ async fn protected_fenced_transition_observation_unprotects_once_preserves_fence
         Arc::clone(&unavailable_provider),
         NAMESPACE,
     )
-    .with_fenced_transition_journal(local_journal.open());
+    .with_fenced_transition_journal(Arc::clone(&local_journal));
     let error = unavailable
         .observe_fenced_transition(&key())
         .await
@@ -1208,10 +1211,11 @@ async fn protected_fenced_transition_full_surface_forwards_through_session_store
 {
     let spy = Arc::new(AtomicSpy::new());
     let provider = CountingKeyProvider::with_key("session-store-before-rotation", 0x53);
-    let journal = JournalFixture::new(0x95);
+    let journal_fixture = JournalFixture::new(0x95);
+    let journal = journal_fixture.open();
     let wrapper = Arc::new(
         EncryptingSessionBackend::new(Arc::clone(&spy), Arc::clone(&provider), NAMESPACE)
-            .with_fenced_transition_journal(journal.open()),
+            .with_fenced_transition_journal(Arc::clone(&journal)),
     );
     let store = SessionStore::from_arc(wrapper);
 
@@ -1247,7 +1251,7 @@ async fn protected_fenced_transition_full_surface_forwards_through_session_store
     let rotated = CountingKeyProvider::with_key("session-store-after-rotation", 0x54);
     let reconstructed = SessionStore::from_arc(Arc::new(
         EncryptingSessionBackend::new(Arc::clone(&spy), Arc::clone(&rotated), NAMESPACE)
-            .with_fenced_transition_journal(journal.open()),
+            .with_fenced_transition_journal(Arc::clone(&journal)),
     ));
     let restored = match reconstructed
         .recover_prepared_fenced_transition(request_id)
@@ -1534,9 +1538,10 @@ async fn protected_fenced_transition_capability_preflight_and_token_binding_fail
             .await,
         Err(StoreError::CapabilityNotSupported(_))
     ));
-    let local_journal = JournalFixture::new(0xa0);
+    let local_journal_fixture = JournalFixture::new(0xa0);
+    let local_journal = local_journal_fixture.open();
     let backend = EncryptingSessionBackend::new(Arc::clone(&spy), Arc::clone(&provider), NAMESPACE)
-        .with_fenced_transition_journal(local_journal.open());
+        .with_fenced_transition_journal(Arc::clone(&local_journal));
     assert_eq!(
         backend
             .fenced_transition_capability()
@@ -1666,7 +1671,7 @@ async fn protected_fenced_transition_capability_preflight_and_token_binding_fail
         Arc::clone(&wrong_namespace_provider),
         "other-protected-fenced-transition",
     )
-    .with_fenced_transition_journal(local_journal.open());
+    .with_fenced_transition_journal(Arc::clone(&local_journal));
     let dispatches_before = spy.dispatches();
     assert!(matches!(
         wrong_namespace.fenced_transition(&token).await,
@@ -1680,7 +1685,7 @@ async fn protected_fenced_transition_capability_preflight_and_token_binding_fail
         Arc::clone(&wrong_mode_provider),
         NAMESPACE,
     )
-    .with_fenced_transition_journal(local_journal.open());
+    .with_fenced_transition_journal(Arc::clone(&local_journal));
     assert!(matches!(
         wrong_mode.fenced_transition(&token).await,
         Err(FencedTransitionExecuteError::NotTransmitted)

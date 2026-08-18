@@ -1922,11 +1922,19 @@ regular single-link `0600` file, and revalidates the path, file, and SQLite
 main-file movement state around each operation. The deployment MUST give that
 effective user exclusive writer authority over the durable path; an actor with
 equivalent same-user replacement authority is part of the trusted storage
-boundary. Platforms without those checks fail closed for V2.
+boundary. The containing directory MUST reserve the database leaf and its
+SQLite sidecar names exclusively for this journal, on a local filesystem with
+truthful POSIX locking, `fsync`, directory-sync, and storage-barrier semantics;
+NFS-like mounts are unsupported. Within one process, callers MUST clone the
+admitted SDK journal handle instead of reopening the same inode or opening it
+directly through SQLite. The SDK enforces one live SQLite connection per
+admitted inode so its pre-open header check cannot release another connection's
+process-scoped POSIX locks. Platforms without those checks fail closed for V2.
 
-The journal uses zeroize-on-drop HMAC-SHA-256 state, SQLite WAL,
-`synchronous=EXTRA`, bounded SQLite limits and catalog/membership scans, and
-bounded opaque rows containing no plaintext. A full authenticated journal
+The journal uses zeroize-on-drop HMAC-SHA-256 state, SQLite WAL, a fixed
+pre-open page/cache-header profile, `synchronous=EXTRA`, bounded SQLite limits
+and catalog/membership scans, and bounded opaque rows containing no plaintext.
+A full authenticated journal
 rejects a new ID before expiry, provider, or inner-prepare work. Payloads,
 identities, request IDs, paths, keys, provider material, token bytes, and
 journal contents MUST NOT appear in examples, fixtures, logs, diagnostics, or
@@ -1935,16 +1943,21 @@ unknown versions, raw V1, and older binaries MUST NOT operate the protected
 journaled path. The V2 journal layer makes no journal GC, retention,
 ledger-lifetime, or capacity-lifecycle claim.
 
-The schema-2 journal also commits a fresh per-journal incarnation, bounded
+The schema-3 journal also commits a fresh per-journal incarnation, bounded
 membership count, and root over the exact retained request-ID/tag set with a
 separate HMAC. Health, lookup/recovery, and insertion verify that complete
 small bounded set; lookup authenticates the selected token, and insertion
 verifies its new row and updates the membership commitment in its single
 transaction before commit. A fixed covering index keeps the proof independent
 of token size. That authenticated index is the presence authority; the bounded
-proof cross-validates every index rowid, request ID, and tag against the table
-and compares an independently bounded table count. Divergent table, primary,
-or secondary-index state therefore fails closed instead of becoming absence.
+proof cross-validates every index rowid, request ID, and fixed tag against the
+table, and compares independently bounded table and primary-index scans. The
+schema stores the fixed tag before the potentially overflowing body, so the
+global proof never reads retained bodies. A selected row then validates its
+body against the authenticated tag. Divergent table, primary, or
+secondary-index state therefore fails closed instead of becoming absence. A
+finite VDBE-work budget applies before schema initialization and to every
+journal operation, in addition to bounded SQL, catalog, and membership limits.
 The SQLite catalog is an exact whitelist of the SDK tables, generated
 primary-key autoindex, and membership index, rejecting every other object,
 including reserved-prefix catalog entries, before setup. This detects offline

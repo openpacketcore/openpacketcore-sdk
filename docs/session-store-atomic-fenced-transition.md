@@ -282,17 +282,35 @@ never stored in the database and MUST NOT be reused for another journal. On
 Unix every existing ancestor is descriptor-walked without following symlinks.
 The immediate parent and database MUST be owned by the effective user, with no
 group or other access (normally `0700` and `0600`, respectively); the database
-MUST be a regular, single-link file. The SDK retains and revalidates the full
-ancestor chain, admitted parent/file identities, and SQLite main-file movement
-state around every operation. The journal requires a trusted private path with
-exclusive writer authority; another process running with the same effective
-user and equivalent path-replacement authority is inside that trust boundary,
-not an adversary the SDK can isolate from its own files. Platforms without the
-Unix descriptor and VFS checks fail closed rather than advertise V2.
+MUST be a regular, single-link bounded file. The containing directory MUST
+reserve the configured leaf plus its derived `-wal`, `-shm`, and `-journal`
+names exclusively for this journal. The SDK retains and revalidates the full
+ancestor chain, admitted parent/file identity, bounded sidecar metadata, and
+SQLite main-file movement state around every operation. Before the sole live
+SDK connection opens, a process-local inode admission lease permits one bounded
+main-header read; that descriptor closes before SQLite locking begins. No main
+or SHM descriptor is retained or opened while an SDK connection is live,
+because closing one could release SQLite's process-scoped POSIX locks. The
+configured raw integrity key is length-framed into a schema- and
+checked-absolute-path-derived key, without persisting or emitting the path.
+The journal requires a local filesystem with truthful POSIX locks, `fsync`,
+directory sync, and storage-barrier semantics; NFS-like mounts are unsupported.
+Another process running with the same effective user and equivalent
+path-replacement authority is inside that trust boundary, not an adversary the
+SDK can isolate from its own files. Within one process, callers MUST clone the
+admitted SDK journal handle rather than reopen the same inode or open it
+directly through SQLite. The SDK enforces one live SQLite connection per
+admitted inode so its pre-open header check cannot release another connection's
+process-scoped POSIX locks. Platforms without the Unix path and SQLite-VFS
+checks fail closed rather than advertise V2.
 
-The schema-2 journal uses an application ID, strict tables, bounded SQLite
-limits and catalog/membership scans, WAL, `synchronous=EXTRA`, and an atomic
-create-only ID binding. It assigns every
+The schema-3 journal uses an application ID, strict tables, a pre-open fixed
+page/cache-header check, bounded main/WAL/SHM files, a fixed private page cache,
+bounded SQLite limits, a tight initial schema VDBE-work budget and a
+separate full-operation budget, bounded catalog/membership scans, WAL,
+`synchronous=EXTRA`, `fullfsync`, `checkpoint_fullfsync`, and an atomic
+create-only ID binding. Successful provisioning and row insertion independently
+sync the held parent directory before returning. It assigns every
 journal incarnation a fresh bounded random value and stores an authenticated
 membership count and root over the complete request-ID/integrity-tag set. The
 membership HMAC commits that incarnation, count, and root; health, lookup,
@@ -306,8 +324,12 @@ whitelist of the SDK tables, generated primary-key autoindex, and membership
 index; every other catalog object, including a reserved-prefix object, is
 rejected before journal setup. The authenticated membership index is the
 presence authority; its bounded scan cross-validates every rowid, request ID,
-and tag against the table and compares the independently bounded table count,
-so table/primary/secondary-index divergence cannot become false absence. The
+and fixed tag against the table and compares independently bounded table and
+primary-index scans. Schema 3 stores that fixed tag before the potentially
+overflowing prepared body, so the global proof never reads retained bodies. A
+selected row separately validates its body against the authenticated tag.
+Table/primary/secondary-index divergence therefore cannot become false absence
+without making full proofs depend on retained body size. The
 journal rejects a wrong key, foreign or
 partial schema, unsupported version, corrupt metadata/row, and insecure or
 changed path with one fixed coarse availability error. An authenticated full
@@ -354,8 +376,12 @@ The prepared-token wire schema and the journal database schema are separate,
 versioned durable formats and, together with capability V2, are downgrade
 fences. The current journal can retain only canonical
 `FENCED_TRANSITION_PREPARED_SCHEMA_V1` tokens, and its current database
-`user_version` is two. Neither version is inferred from the record envelope,
-consumer wire, or consensus capability. `AtomicFencedTransitionCapability::V2`
+`user_version` is three. Schema 3 changes the physical row order and every
+journal-authentication domain, and derives the configured raw journal key from
+the checked absolute path. The unshipped schema-2 prototype is deliberately
+incompatible and has no in-place migration or downgrade path. Neither durable
+version is inferred from the record envelope, consumer wire, or consensus
+capability. `AtomicFencedTransitionCapability::V2`
 is a local composition promise over an inner V1 physical contract; it does not
 rename the consensus or revision-3 authenticated-consumer wire as V2.
 

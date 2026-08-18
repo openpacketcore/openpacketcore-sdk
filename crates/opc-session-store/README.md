@@ -1195,6 +1195,8 @@ Legacy wrapper constructors remain source compatible but their atomic surface
 stays fail closed until a journal is installed.
 
 The journal is a dedicated SQLite database on a caller-selected durable volume.
+That volume MUST be a local filesystem with truthful POSIX locking, `fsync`,
+directory-sync, and storage-barrier semantics; NFS-like mounts are unsupported.
 Its containing directory and file MUST be private, and its stable 32-byte
 `PreparedFencedTransitionJournalKey` MUST come from secret configuration
 independent of record-encryption/provider keys. Preparation rejects an already
@@ -1217,16 +1219,21 @@ path/file/key together and MUST NOT reuse that key for another journal. This is
 a trusted private durable-path boundary: the deployment MUST give the effective
 user exclusive writer authority. An actor with equivalent same-user
 path-replacement authority is inside that storage boundary because it already
-has the SDK process's file authority. Platforms without the Unix descriptor and
-VFS checks fail closed for V2.
+has the SDK process's file authority. The containing directory MUST reserve the
+database leaf and its SQLite sidecar names exclusively for this journal. One
+process MUST clone the admitted journal handle rather than reopening the same
+inode or opening it directly through SQLite. Platforms without the Unix path
+and SQLite-VFS checks fail closed for V2.
 
-The schema-2 journal authenticates more than each row: a per-journal random
+The schema-3 journal authenticates more than each row: a per-journal random
 incarnation, bounded row count, and root over the complete request-ID/tag set
 are committed by a separate HMAC. Health, lookup/recovery, and insertion scan
 and authenticate that small bounded set. The authenticated covering index is
-the presence authority, and the scan cross-validates each indexed row against
-the table plus an independently bounded table count; divergent table, primary,
-or secondary-index state therefore cannot become false absence. Lookup
+the presence authority. Its scan cross-validates each indexed row and fixed tag
+against the table, plus independently bounded table and primary-index scans;
+divergent table, primary, or secondary-index state therefore cannot become
+false absence. Schema 3 places the fixed tag before the potentially overflowing
+prepared body, so the global proof remains independent of body size. Lookup
 authenticates the selected token, while insertion re-reads its new row and
 updates the membership commitment atomically before returning success. The
 SQLite catalog is an exact whitelist of the two SDK tables, generated

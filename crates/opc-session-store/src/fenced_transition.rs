@@ -39,11 +39,12 @@ pub const FENCED_TRANSITION_SCHEMA_V1: u16 = 1;
 /// Canonical binary schema of a prepared fenced transition.
 pub const FENCED_TRANSITION_PREPARED_SCHEMA_V1: u16 = 1;
 
-/// Maximum number of SDK-owned protection boundaries in one prepared token.
+/// Reserved protection-boundary slots in the prepared-token V1 wire layout.
 ///
-/// Production composition normally has exactly one such boundary. Keeping a
-/// fixed model-wide limit makes malformed or accidentally recursive wrapper
-/// stacks fail before they can grow provider or backend work without bound.
+/// V1 validation admits only the frozen production shapes: zero or one known
+/// boundary, or one consensus/consumer physical boundary followed by exactly
+/// one local/remote payload-protection boundary. The remaining slots keep the
+/// durable layout fixed and never authorize recursive wrapper composition.
 pub const FENCED_TRANSITION_MAX_PREPARED_LAYERS: usize = 8;
 
 /// Maximum canonical byte width of one opaque prepared-transition token.
@@ -875,12 +876,28 @@ fn validate_prepared_body(
     if count > FENCED_TRANSITION_MAX_PREPARED_LAYERS
         || body.protection_layers[..count].iter().any(Option::is_none)
         || body.protection_layers[count..].iter().any(Option::is_some)
+        || !valid_v1_protection_stack(&body.protection_layers[..count])
     {
         return Err(PreparedFencedTransitionError::InvalidEncoding);
     }
     body.request
         .validate()
         .map_err(|_| PreparedFencedTransitionError::InvalidEncoding)
+}
+
+fn valid_v1_protection_stack(layers: &[Option<PreparedFencedTransitionProtection>]) -> bool {
+    use PreparedFencedTransitionProtection::{
+        AuthenticatedConsumerPhysicalV1, ConsensusPhysicalV1, LocalAeadV1, RemoteSealV1,
+    };
+
+    match layers {
+        [] => true,
+        [Some(_)] => true,
+        [Some(ConsensusPhysicalV1 { .. } | AuthenticatedConsumerPhysicalV1 { .. }), Some(LocalAeadV1 { .. } | RemoteSealV1 { .. })] => {
+            true
+        }
+        _ => false,
+    }
 }
 
 fn decode_prepared_body(
@@ -1492,6 +1509,57 @@ mod tests {
         .expect("record-free refresh request")
     }
 
+    fn prepared_wire_acquire_update_request(request_id: u8) -> FencedTransitionRequest {
+        let owner = OwnerId::new("prepared-wire-owner").expect("owner");
+        let key = key();
+        FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([request_id; 16]),
+            FencedTransitionLease::acquire(
+                key.clone(),
+                owner.clone(),
+                FenceToken::new(7),
+                Duration::from_secs(30),
+            )
+            .expect("acquire"),
+            FencedTransitionMutation::update(
+                Generation::new(1),
+                record(key, owner, FenceToken::new(8), 2),
+            ),
+        )
+        .expect("acquire-update request")
+    }
+
+    fn prepared_wire_acquire_delete_request(request_id: u8) -> FencedTransitionRequest {
+        let owner = OwnerId::new("prepared-wire-owner").expect("owner");
+        FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([request_id; 16]),
+            FencedTransitionLease::acquire(
+                key(),
+                owner,
+                FenceToken::new(7),
+                Duration::from_secs(30),
+            )
+            .expect("acquire"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("acquire-delete request")
+    }
+
+    fn prepared_wire_renew_create_request(request_id: u8) -> FencedTransitionRequest {
+        let owner = OwnerId::new("prepared-wire-owner").expect("owner");
+        let key = key();
+        FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([request_id; 16]),
+            FencedTransitionLease::renew(
+                lease_guard(key.clone(), owner.clone(), FenceToken::new(9)),
+                Duration::from_secs(30),
+            )
+            .expect("renewal"),
+            FencedTransitionMutation::create(record(key, owner, FenceToken::new(9), 1)),
+        )
+        .expect("renew-create request")
+    }
+
     fn prepared_wire_with_layers(
         request_id: u8,
         layers: &[PreparedFencedTransitionProtection],
@@ -1551,8 +1619,8 @@ mod tests {
     #[test]
     fn protected_fenced_transition_v1_wire_compatibility_corpus_is_frozen() {
         const EXPECTED_V1_FINGERPRINT: [u8; 32] = [
-            83, 244, 20, 87, 150, 210, 30, 78, 222, 157, 39, 134, 49, 249, 93, 17, 159, 16, 188,
-            247, 244, 64, 187, 146, 48, 43, 250, 179, 31, 240, 125, 221,
+            122, 121, 223, 157, 17, 215, 129, 104, 8, 61, 165, 127, 127, 130, 209, 13, 109, 0, 116,
+            25, 52, 126, 221, 158, 1, 104, 238, 233, 26, 223, 214, 247,
         ];
 
         use sha2::{Digest, Sha256};
@@ -1623,6 +1691,27 @@ mod tests {
                 ))
                 .expect("prepare refresh V1 token"),
             ),
+            (
+                "acquire-update",
+                PreparedFencedTransition::from_unprotected_request(
+                    prepared_wire_acquire_update_request(0x47),
+                )
+                .expect("prepare acquire-update V1 token"),
+            ),
+            (
+                "acquire-delete",
+                PreparedFencedTransition::from_unprotected_request(
+                    prepared_wire_acquire_delete_request(0x48),
+                )
+                .expect("prepare acquire-delete V1 token"),
+            ),
+            (
+                "renew-create",
+                PreparedFencedTransition::from_unprotected_request(
+                    prepared_wire_renew_create_request(0x49),
+                )
+                .expect("prepare renew-create V1 token"),
+            ),
             ("local-only", prepared_wire_with_layers(0x3c, &[local])),
             ("remote-only", prepared_wire_with_layers(0x3d, &[remote])),
             (
@@ -1673,7 +1762,6 @@ mod tests {
             );
         }
         let fingerprint: [u8; 32] = digest.finalize().into();
-
         assert!(
             fingerprint == EXPECTED_V1_FINGERPRINT,
             "the complete prepared-transition V1 wire compatibility corpus changed"
@@ -1782,26 +1870,30 @@ mod tests {
             Err(PreparedFencedTransitionError::TooLarge)
         );
 
-        let layer = PreparedFencedTransitionProtection::LocalAeadV1 {
+        let physical = PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+            storage_commitment: [0x44; 32],
+        };
+        let outer = PreparedFencedTransitionProtection::LocalAeadV1 {
             scope_commitment: [0x45; 32],
         };
         let mut prepared =
             PreparedFencedTransition::from_unprotected_request(prepared_request(0x36))
                 .expect("prepare exact request");
-        for _ in 0..FENCED_TRANSITION_MAX_PREPARED_LAYERS {
-            prepared = prepared
-                .with_protection(layer)
-                .expect("layer at or below ceiling");
-        }
+        prepared = prepared
+            .with_protection(physical)
+            .expect("one physical layer");
+        prepared = prepared
+            .with_protection(outer)
+            .expect("one outer protection layer");
         assert!(matches!(
-            prepared.clone().with_protection(layer),
+            prepared.clone().with_protection(outer),
             Err(StoreError::Serialization(message)) if message == INVALID_PREPARED_TRANSITION
         ));
-        for _ in 0..FENCED_TRANSITION_MAX_PREPARED_LAYERS {
-            prepared = prepared
-                .without_outer_protection(layer)
-                .expect("peel exact outer layer");
-        }
+        prepared = prepared
+            .without_outer_protection(outer)
+            .expect("peel outer layer")
+            .without_outer_protection(physical)
+            .expect("peel physical layer");
         assert_eq!(
             prepared
                 .request_for_unprotected_backend()
