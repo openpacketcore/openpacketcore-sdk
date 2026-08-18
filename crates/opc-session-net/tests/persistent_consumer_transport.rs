@@ -475,7 +475,7 @@ fn exact_watch_byte_budget_change() -> SessionConsumerChange {
         if delta > 256 {
             continue;
         }
-        let mut bytes = vec![0_u8; 128];
+        let mut bytes = [0_u8; 128];
         let three_digit = delta / 2;
         for byte in bytes.iter_mut().take(three_digit) {
             *byte = 100;

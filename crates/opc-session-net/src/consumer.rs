@@ -10293,9 +10293,8 @@ mod tests {
                 .as_mut()
                 .await
                 .expect("bounded rejection writer result");
-            drop(write);
-            assert_eq!(
-                completed, false,
+            assert!(
+                !completed,
                 "scope and validation rejection writes never outlive cancellation or lifecycle"
             );
             if force_by_rotation {
