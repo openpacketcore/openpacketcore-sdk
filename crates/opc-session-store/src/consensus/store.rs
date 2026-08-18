@@ -3012,10 +3012,8 @@ impl ConsensusSessionStore {
                             crate::fenced_transition::fenced_transition_v2_profile_digest(),
                     };
                 }
-                Err(_) => {
-                    return ForwardMutationReply::Applied(Box::new(
-                        SessionConsensusResponse::rejected(unsupported_fenced_transition_v2()),
-                    ));
+                Err(error) => {
+                    return fenced_transition_v2_capability_failure_reply(error);
                 }
             }
         }
@@ -4035,6 +4033,25 @@ fn unsupported_fenced_transition() -> StoreError {
 
 fn unsupported_fenced_transition_v2() -> StoreError {
     StoreError::CapabilityNotSupported("atomic_fenced_transition_v2".into())
+}
+
+fn fenced_transition_v2_capability_failure_reply(error: StoreError) -> ForwardMutationReply {
+    if matches!(
+        error,
+        StoreError::CapabilityNotSupported(ref reason)
+            if reason == "atomic_fenced_transition_v2"
+    ) {
+        return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
+            unsupported_fenced_transition_v2(),
+        )));
+    }
+
+    // An activated cluster can temporarily miss the shared operation deadline
+    // while rechecking its linearizable certificate under load. That is
+    // availability, not evidence that a voter implements a different V2
+    // profile. Fail before proposal without converting the transient condition
+    // into a definitive unsupported-capability result.
+    ForwardMutationReply::Unavailable
 }
 
 type FencedTransitionActivationScope<'a> = (
@@ -7631,6 +7648,28 @@ mod membership_tests {
             SessionConsumerResponse::Batch(Ok(vec![SessionConsumerBatchResult::CompareAndSet(
                 Ok(CompareAndSetResult::Success)
             ),]))
+        );
+    }
+
+    #[test]
+    fn v2_capability_recheck_preserves_transient_availability_failures() {
+        assert_eq!(
+            fenced_transition_v2_capability_failure_reply(unsupported_fenced_transition_v2()),
+            ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
+                unsupported_fenced_transition_v2()
+            )))
+        );
+        assert_eq!(
+            fenced_transition_v2_capability_failure_reply(StoreError::BackendUnavailable(
+                "linearizable certificate recheck deadline elapsed".into()
+            )),
+            ForwardMutationReply::Unavailable
+        );
+        assert_eq!(
+            fenced_transition_v2_capability_failure_reply(StoreError::CapabilityNotSupported(
+                "another_capability".into()
+            )),
+            ForwardMutationReply::Unavailable
         );
     }
 
