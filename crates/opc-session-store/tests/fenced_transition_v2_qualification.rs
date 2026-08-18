@@ -19,11 +19,10 @@ use opc_consensus::{
     ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
-use opc_key::{AES_256_GCM_SIV_KEY_LEN, KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
+use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_session_store::{
-    Clock, ConsensusSessionStore, EncryptedSessionPayload,
-    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_RECLAIM_BATCH,
-    FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET, FenceToken, FencedTransitionLease,
+    derive_fixed_durable_quorum_consensus_identity, fenced_transition_v2_profile_digest, Clock,
+    ConsensusSessionStore, EncryptedSessionPayload, FenceToken, FencedTransitionLease,
     FencedTransitionMutation, FencedTransitionMutationResult, FencedTransitionOutcome,
     FencedTransitionV2CallerNonce, FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
     FencedTransitionV2Status, Generation, OwnerId, PlacementResiliencePolicy,
@@ -32,8 +31,8 @@ use opc_session_store::{
     SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcHandler,
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
     SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord, Timestamp,
-    ValidatedQuorumTopology, derive_fixed_durable_quorum_consensus_identity,
-    fenced_transition_v2_profile_digest,
+    ValidatedQuorumTopology, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_RECLAIM_BATCH, FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 
@@ -520,7 +519,7 @@ async fn fixed_quorum_first_v2_transition_activates_and_applies_on_every_voter()
 /// Release qualification for V2 capacity and retired-history reclamation.
 /// Its shared injected clock advances through a consensus read barrier, never
 /// by SQLite mutation or a wall-clock sleep.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "131,073 real fixed-quorum consensus transitions are release qualification"]
 async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
     let started = Instant::now();
