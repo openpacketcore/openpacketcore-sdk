@@ -13,16 +13,13 @@ use std::{
     time::Duration,
 };
 
-#[cfg(not(unix))]
-use std::fs::OpenOptions;
-
-use hmac::{Hmac, Mac};
 use rand::{rngs::SysRng, TryRng};
 use rusqlite::{
     limits::Limit, params, types::ValueRef, Connection, OpenFlags, OptionalExtension,
     TransactionBehavior,
 };
-use sha2::{Digest, Sha256};
+use sha2_zeroize::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -40,6 +37,11 @@ const JOURNAL_SCHEMA_OBJECT_COUNT: i64 = 4;
 const JOURNAL_MEMBERSHIP_INDEX: &str = "prepared_fenced_transition_journal_membership_idx";
 const JOURNAL_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 const JOURNAL_UNAVAILABLE: &str = "prepared fenced-transition journal unavailable";
+const JOURNAL_CATALOG_MAX_OBJECTS: usize = 4;
+const JOURNAL_METADATA_MAX_ROWS: usize = 1;
+const JOURNAL_MEMBERSHIP_SCAN_LIMIT: usize = FENCED_TRANSITION_MAX_HISTORY_ENTRIES + 1;
+const JOURNAL_CATALOG_SCAN_LIMIT: usize = JOURNAL_CATALOG_MAX_OBJECTS + 1;
+const JOURNAL_METADATA_SCAN_LIMIT: usize = JOURNAL_METADATA_MAX_ROWS + 1;
 // SQLite's length limit applies to an entire record as well as its largest
 // BLOB. This covers the 16-byte request ID, an INTEGER schema version, the
 // 32-byte tag, and 64 bytes for SQLite record-header varints (well above the
@@ -54,7 +56,52 @@ const JOURNAL_MEMBERSHIP_ROOT_DOMAIN: &[u8] =
 const JOURNAL_MEMBERSHIP_TAG_DOMAIN: &[u8] =
     b"openpacketcore/session-store/prepared-journal/membership-tag/v1\0";
 
-type HmacSha256 = Hmac<Sha256>;
+/// HMAC-SHA-256 with its key-derived pads and intermediate digests zeroized.
+struct ZeroizingHmacSha256 {
+    inner: Sha256,
+    outer_pad: Zeroizing<[u8; 64]>,
+}
+
+impl ZeroizingHmacSha256 {
+    fn new(key: &[u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES]) -> Self {
+        let mut inner_pad = Zeroizing::new([0x36_u8; 64]);
+        let mut outer_pad = Zeroizing::new([0x5c_u8; 64]);
+        for ((inner, outer), key_byte) in inner_pad
+            .iter_mut()
+            .zip(outer_pad.iter_mut())
+            .zip(key.iter())
+        {
+            *inner ^= key_byte;
+            *outer ^= key_byte;
+        }
+        let mut inner = Sha256::new();
+        inner.update(inner_pad.as_slice());
+        Self { inner, outer_pad }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.inner.update(bytes);
+    }
+
+    fn finalize(self) -> Zeroizing<[u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES]> {
+        let mut inner_digest = self.inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(self.outer_pad.as_slice());
+        outer.update(inner_digest.as_slice());
+        zeroize::Zeroize::zeroize(inner_digest.as_mut_slice());
+        let mut digest = outer.finalize();
+        let mut output = Zeroizing::new([0_u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES]);
+        output.copy_from_slice(digest.as_slice());
+        zeroize::Zeroize::zeroize(digest.as_mut_slice());
+        output
+    }
+
+    fn verify_slice(self, stored: &[u8]) -> bool {
+        self.finalize().as_slice().ct_eq(stored).into()
+    }
+}
+
+type HmacSha256 = ZeroizingHmacSha256;
 
 /// Stable secret used only to authenticate an SDK prepared-request journal.
 ///
@@ -96,6 +143,12 @@ struct PreparedFencedTransitionJournalInner {
     path_guard: SecureJournalPathGuard,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum JournalOpenMode {
+    CreateNew,
+    OpenExisting,
+}
+
 /// The SQLite name and, on Unix, the descriptors that bind it to a checked
 /// directory entry for the lifetime of the journal.
 struct PreparedJournalPath {
@@ -106,6 +159,10 @@ struct PreparedJournalPath {
 
 #[cfg(unix)]
 struct SecureJournalPathGuard {
+    root: std::fs::File,
+    /// Each descriptor is tied to its predecessor by the stored entry name.
+    /// The last entry, when present, is the immediate parent.
+    ancestors: Vec<(std::fs::File, std::ffi::OsString)>,
     parent: std::fs::File,
     leaf: std::fs::File,
     leaf_name: std::ffi::OsString,
@@ -132,19 +189,49 @@ impl fmt::Debug for PreparedFencedTransitionJournal {
 }
 
 impl PreparedFencedTransitionJournal {
-    /// Open or create one dedicated durable journal database.
+    /// Provision one missing dedicated durable journal database.
     ///
     /// On Unix every existing ancestor is opened without following symlinks.
     /// The immediate parent and database must be owned by the effective user,
     /// deny all group and other access, and the database must be a regular,
     /// single-link file. Their descriptor-bound identity is revalidated before
-    /// every operation. Other platforms must provide equivalent access control
-    /// and stable path binding outside the SDK.
+    /// every operation. Platforms without those checks fail closed.
+    ///
+    /// The integrity key is scoped to exactly this journal storage boundary.
+    /// Reusing it for another path or file is unsupported and unsafe: a
+    /// missing or substituted path must never be authenticated as `Absent`.
+    pub fn create_new(
+        path: impl AsRef<Path>,
+        key: PreparedFencedTransitionJournalKey,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_mode(path.as_ref(), key, JournalOpenMode::CreateNew)
+    }
+
+    /// Open a fully initialized existing dedicated durable journal database.
+    ///
+    /// This never creates a leaf or initializes a pristine SQLite file.
+    pub fn open_existing(
+        path: impl AsRef<Path>,
+        key: PreparedFencedTransitionJournalKey,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_mode(path.as_ref(), key, JournalOpenMode::OpenExisting)
+    }
+
+    /// Open an existing journal.
+    #[deprecated(note = "use open_existing; provisioning must use create_new")]
     pub fn open(
         path: impl AsRef<Path>,
         key: PreparedFencedTransitionJournalKey,
     ) -> Result<Self, StoreError> {
-        let path = prepare_secure_journal_path(path.as_ref())?;
+        Self::open_existing(path, key)
+    }
+
+    fn open_with_mode(
+        path: &Path,
+        key: PreparedFencedTransitionJournalKey,
+        mode: JournalOpenMode,
+    ) -> Result<Self, StoreError> {
+        let path = prepare_secure_journal_path(path, mode)?;
         // SQLite's SQLITE_OPEN_NOFOLLOW rejects the descriptor-directory
         // anchor itself because /proc/self/fd and /dev/fd are symlinks. Unix
         // admission instead opens the final entry with O_NOFOLLOW beneath the
@@ -155,8 +242,12 @@ impl PreparedFencedTransitionJournal {
             | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
         let mut conn = Connection::open_with_flags(&path.sqlite_path, flags)
             .map_err(|_| journal_unavailable())?;
-        configure_journal_sqlite_length_limit(&conn)?;
-        initialize_connection(&mut conn, &key)?;
+        configure_journal_sqlite_limits(&conn)?;
+        #[cfg(unix)]
+        path.path_guard.verify_connection(&conn)?;
+        initialize_connection(&mut conn, &key, mode)?;
+        #[cfg(unix)]
+        path.path_guard.verify_connection(&conn)?;
         Ok(Self {
             inner: Arc::new(PreparedFencedTransitionJournalInner {
                 conn: Mutex::new(conn),
@@ -172,6 +263,7 @@ impl PreparedFencedTransitionJournal {
         self.with_connection(|conn, key| {
             let transaction = journal_read_transaction(conn)?;
             verify_metadata(&transaction, key)?;
+            verify_sqlite_main_file_binding(&transaction)?;
             transaction.commit().map_err(|_| journal_unavailable())
         })
         .await
@@ -181,12 +273,22 @@ impl PreparedFencedTransitionJournal {
         &self,
         request_id: FencedTransitionRequestId,
     ) -> Result<(), StoreError> {
-        match self.lookup(request_id).await? {
-            PreparedFencedTransitionLookup::Absent => Ok(()),
-            PreparedFencedTransitionLookup::Found(_) => {
-                Err(StoreError::FencedTransitionRequestConflict)
+        self.with_connection(move |conn, key| {
+            let transaction = journal_read_transaction(conn)?;
+            let membership = verify_metadata(&transaction, key)?;
+            if read_entry(&transaction, key, request_id)?.is_some() {
+                return Err(StoreError::FencedTransitionRequestConflict);
             }
-        }
+            if membership.count
+                >= i64::try_from(FENCED_TRANSITION_MAX_HISTORY_ENTRIES)
+                    .map_err(|_| journal_unavailable())?
+            {
+                return Err(StoreError::FencedTransitionHistoryFull);
+            }
+            verify_sqlite_main_file_binding(&transaction)?;
+            transaction.commit().map_err(|_| journal_unavailable())
+        })
+        .await
     }
 
     pub(crate) async fn insert(
@@ -236,7 +338,14 @@ impl PreparedFencedTransitionJournal {
                 return Err(journal_unavailable());
             }
 
-            let updated = scan_journal_membership(&transaction, &membership.incarnation)?;
+            let updated = scan_journal_membership(
+                &transaction,
+                &membership.incarnation,
+                membership
+                    .count
+                    .checked_add(1)
+                    .ok_or_else(journal_unavailable)?,
+            )?;
             if updated.count
                 != membership
                     .count
@@ -269,6 +378,7 @@ impl PreparedFencedTransitionJournal {
                 return Err(journal_unavailable());
             }
             verify_metadata(&transaction, key)?;
+            verify_sqlite_main_file_binding(&transaction)?;
             transaction.commit().map_err(|_| journal_unavailable())
         })
         .await
@@ -285,6 +395,7 @@ impl PreparedFencedTransitionJournal {
                 Some(prepared) => PreparedFencedTransitionLookup::Found(prepared),
                 None => PreparedFencedTransitionLookup::Absent,
             })?;
+            verify_sqlite_main_file_binding(&transaction)?;
             transaction.commit().map_err(|_| journal_unavailable())?;
             Ok(lookup)
         })
@@ -324,8 +435,11 @@ impl PreparedFencedTransitionJournal {
             let _permit = permit;
             let mut conn = inner.conn.lock().map_err(|_| journal_unavailable())?;
             #[cfg(unix)]
-            inner.path_guard.verify()?;
-            operation(&mut conn, &inner.key)
+            inner.path_guard.verify_connection(&conn)?;
+            let result = operation(&mut conn, &inner.key);
+            #[cfg(unix)]
+            inner.path_guard.verify_connection(&conn)?;
+            result
         })
         .await
         .map_err(|_| journal_unavailable())?
@@ -335,6 +449,7 @@ impl PreparedFencedTransitionJournal {
 fn initialize_connection(
     conn: &mut Connection,
     key: &PreparedFencedTransitionJournalKey,
+    mode: JournalOpenMode,
 ) -> Result<(), StoreError> {
     conn.busy_timeout(JOURNAL_BUSY_TIMEOUT)
         .map_err(|_| journal_unavailable())?;
@@ -346,6 +461,9 @@ fn initialize_connection(
             && initial_user_version == JOURNAL_SCHEMA_VERSION
             && initial_object_count == JOURNAL_SCHEMA_OBJECT_COUNT))
     {
+        return Err(journal_unavailable());
+    }
+    if mode == JournalOpenMode::OpenExisting && initial_application_id == 0 {
         return Err(journal_unavailable());
     }
     if initial_application_id == JOURNAL_APPLICATION_ID {
@@ -444,7 +562,18 @@ fn initialize_connection(
         return Err(journal_unavailable());
     }
     verify_metadata(&transaction, key)?;
+    verify_sqlite_main_file_binding(&transaction)?;
     transaction.commit().map_err(|_| journal_unavailable())
+}
+
+fn verify_sqlite_main_file_binding(conn: &Connection) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    if opc_sqlite_file_control_sys::main_file_has_moved(conn).map_err(|_| journal_unavailable())? {
+        return Err(journal_unavailable());
+    }
+    #[cfg(not(unix))]
+    let _ = conn;
+    Ok(())
 }
 
 fn verify_metadata(
@@ -459,53 +588,59 @@ fn verify_metadata(
         return Err(journal_unavailable());
     }
     verify_journal_schema(conn)?;
-    let metadata_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM prepared_fenced_transition_journal_metadata",
-            [],
-            |row| row.get(0),
-        )
+    let metadata_query = format!(
+        "SELECT singleton, schema_version, key_check, journal_incarnation, membership_count, \
+                membership_root, membership_tag \
+         FROM prepared_fenced_transition_journal_metadata LIMIT {JOURNAL_METADATA_SCAN_LIMIT}"
+    );
+    let mut statement = conn
+        .prepare(&metadata_query)
         .map_err(|_| journal_unavailable())?;
-    if metadata_count != 1 {
+    let mut rows = statement.query([]).map_err(|_| journal_unavailable())?;
+    let row = rows
+        .next()
+        .map_err(|_| journal_unavailable())?
+        .ok_or_else(journal_unavailable)?;
+    let singleton: i64 = row.get(0).map_err(|_| journal_unavailable())?;
+    if singleton != 1 {
         return Err(journal_unavailable());
     }
-    let row: Option<JournalMetadata> = conn
-        .query_row(
-            "SELECT schema_version, key_check, journal_incarnation, membership_count, \
-                    membership_root, membership_tag \
-             FROM prepared_fenced_transition_journal_metadata WHERE singleton = 1",
-            [],
-            |row| {
-                let ValueRef::Integer(schema_version) = row.get_ref(0)? else {
-                    return Err(rusqlite::Error::InvalidQuery);
-                };
-                let ValueRef::Integer(membership_count) = row.get_ref(3)? else {
-                    return Err(rusqlite::Error::InvalidQuery);
-                };
-                Ok(JournalMetadata {
-                    schema_version,
-                    key_check: fixed_blob(row.get_ref(1)?)?,
-                    membership: JournalMembership {
-                        incarnation: fixed_blob(row.get_ref(2)?)?,
-                        count: membership_count,
-                        root: fixed_blob(row.get_ref(4)?)?,
-                        tag: fixed_blob(row.get_ref(5)?)?,
-                    },
-                })
-            },
-        )
-        .optional()
-        .map_err(|_| journal_unavailable())?;
-    let Some(metadata) = row else {
+    let ValueRef::Integer(schema_version) = row.get_ref(1).map_err(|_| journal_unavailable())?
+    else {
         return Err(journal_unavailable());
     };
+    let ValueRef::Integer(membership_count) = row.get_ref(4).map_err(|_| journal_unavailable())?
+    else {
+        return Err(journal_unavailable());
+    };
+    let metadata = JournalMetadata {
+        schema_version,
+        key_check: fixed_blob(row.get_ref(2).map_err(|_| journal_unavailable())?)
+            .map_err(|_| journal_unavailable())?,
+        membership: JournalMembership {
+            incarnation: fixed_blob(row.get_ref(3).map_err(|_| journal_unavailable())?)
+                .map_err(|_| journal_unavailable())?,
+            count: membership_count,
+            root: fixed_blob(row.get_ref(5).map_err(|_| journal_unavailable())?)
+                .map_err(|_| journal_unavailable())?,
+            tag: fixed_blob(row.get_ref(6).map_err(|_| journal_unavailable())?)
+                .map_err(|_| journal_unavailable())?,
+        },
+    };
+    if rows.next().map_err(|_| journal_unavailable())?.is_some() {
+        return Err(journal_unavailable());
+    }
     if metadata.schema_version != JOURNAL_SCHEMA_VERSION
         || !valid_membership_count(metadata.membership.count)
         || verify_key_check(key, &metadata.key_check).is_err()
     {
         return Err(journal_unavailable());
     }
-    let actual = scan_journal_membership(conn, &metadata.membership.incarnation)?;
+    let actual = scan_journal_membership(
+        conn,
+        &metadata.membership.incarnation,
+        metadata.membership.count,
+    )?;
     if actual.count != metadata.membership.count || actual.root != metadata.membership.root {
         return Err(journal_unavailable());
     }
@@ -520,7 +655,7 @@ fn verify_metadata(
 }
 
 fn verify_connection_profile(conn: &Connection) -> Result<(), StoreError> {
-    verify_journal_sqlite_length_limit(conn)?;
+    verify_journal_sqlite_limits(conn)?;
     let journal_mode: String = conn
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .map_err(|_| journal_unavailable())?;
@@ -558,15 +693,32 @@ fn journal_sqlite_length_limit() -> Result<i32, StoreError> {
     i32::try_from(limit).map_err(|_| journal_unavailable())
 }
 
-fn configure_journal_sqlite_length_limit(conn: &Connection) -> Result<(), StoreError> {
-    let requested = journal_sqlite_length_limit()?;
-    conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, requested);
-    verify_journal_sqlite_length_limit(conn)
+fn configure_journal_sqlite_limits(conn: &Connection) -> Result<(), StoreError> {
+    for (limit, requested) in journal_sqlite_limits()? {
+        conn.set_limit(limit, requested);
+    }
+    verify_journal_sqlite_limits(conn)
 }
 
-fn verify_journal_sqlite_length_limit(conn: &Connection) -> Result<(), StoreError> {
-    if conn.limit(Limit::SQLITE_LIMIT_LENGTH) != journal_sqlite_length_limit()? {
-        return Err(journal_unavailable());
+fn journal_sqlite_limits() -> Result<[(Limit, i32); 9], StoreError> {
+    Ok([
+        (Limit::SQLITE_LIMIT_LENGTH, journal_sqlite_length_limit()?),
+        (Limit::SQLITE_LIMIT_SQL_LENGTH, 16_384),
+        (Limit::SQLITE_LIMIT_COLUMN, 16),
+        (Limit::SQLITE_LIMIT_EXPR_DEPTH, 32),
+        (Limit::SQLITE_LIMIT_VDBE_OP, 10_000),
+        (Limit::SQLITE_LIMIT_COMPOUND_SELECT, 4),
+        (Limit::SQLITE_LIMIT_FUNCTION_ARG, 16),
+        (Limit::SQLITE_LIMIT_ATTACHED, 0),
+        (Limit::SQLITE_LIMIT_WORKER_THREADS, 0),
+    ])
+}
+
+fn verify_journal_sqlite_limits(conn: &Connection) -> Result<(), StoreError> {
+    for (limit, requested) in journal_sqlite_limits()? {
+        if conn.limit(limit) != requested {
+            return Err(journal_unavailable());
+        }
     }
     Ok(())
 }
@@ -665,9 +817,42 @@ fn verify_journal_schema(conn: &Connection) -> Result<(), StoreError> {
 }
 
 fn canonical_schema_sql(sql: &str) -> String {
-    sql.chars()
-        .filter(|character| !character.is_ascii_whitespace() && *character != ';')
-        .collect()
+    let trimmed = sql.trim();
+    let trimmed = trimmed.strip_suffix(';').map_or(trimmed, str::trim_end);
+    let mut normalized = String::with_capacity(trimmed.len());
+    let mut quote = None;
+    let mut whitespace_pending = false;
+    let mut characters = trimmed.chars().peekable();
+    while let Some(character) = characters.next() {
+        if let Some(terminator) = quote {
+            normalized.push(character);
+            if character == terminator {
+                if terminator != ']' && characters.peek() == Some(&terminator) {
+                    if let Some(escaped) = characters.next() {
+                        normalized.push(escaped);
+                    }
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        if character.is_ascii_whitespace() {
+            whitespace_pending = true;
+            continue;
+        }
+        if whitespace_pending && !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        whitespace_pending = false;
+        normalized.push(character);
+        quote = match character {
+            '\'' | '"' | '`' => Some(character),
+            '[' => Some(']'),
+            _ => None,
+        };
+    }
+    normalized
 }
 
 fn journal_application_id(conn: &Connection) -> Result<i64, StoreError> {
@@ -681,8 +866,17 @@ fn journal_user_version(conn: &Connection) -> Result<i64, StoreError> {
 }
 
 fn journal_schema_catalog_count(conn: &Connection) -> Result<i64, StoreError> {
-    conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))
-        .map_err(|_| journal_unavailable())
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT 1 FROM sqlite_schema LIMIT {JOURNAL_CATALOG_SCAN_LIMIT}"
+        ))
+        .map_err(|_| journal_unavailable())?;
+    let mut rows = statement.query([]).map_err(|_| journal_unavailable())?;
+    let mut count = 0_i64;
+    while rows.next().map_err(|_| journal_unavailable())?.is_some() {
+        count = count.checked_add(1).ok_or_else(journal_unavailable)?;
+    }
+    Ok(count)
 }
 
 fn journal_read_transaction(
@@ -756,26 +950,30 @@ fn valid_membership_count(count: i64) -> bool {
 fn scan_journal_membership(
     conn: &Connection,
     incarnation: &[u8; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
+    expected_count: i64,
 ) -> Result<JournalMembershipSnapshot, StoreError> {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM prepared_fenced_transition_journal",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|_| journal_unavailable())?;
-    let mut root = MembershipRoot::new(incarnation, count)?;
+    if !valid_membership_count(expected_count) {
+        return Err(journal_unavailable());
+    }
+    let mut root = MembershipRoot::new(incarnation, expected_count)?;
     let mut statement = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT request_id, integrity_tag \
              FROM prepared_fenced_transition_journal \
              INDEXED BY prepared_fenced_transition_journal_membership_idx \
-             ORDER BY request_id ASC",
-        )
+             ORDER BY request_id ASC \
+             LIMIT {JOURNAL_MEMBERSHIP_SCAN_LIMIT}",
+        ))
         .map_err(|_| journal_unavailable())?;
     let mut rows = statement.query([]).map_err(|_| journal_unavailable())?;
     let mut observed_count = 0_i64;
     while let Some(row) = rows.next().map_err(|_| journal_unavailable())? {
+        if observed_count
+            >= i64::try_from(FENCED_TRANSITION_MAX_HISTORY_ENTRIES)
+                .map_err(|_| journal_unavailable())?
+        {
+            return Err(journal_unavailable());
+        }
         let request_id = FencedTransitionRequestId::from_bytes(
             fixed_blob::<FENCED_TRANSITION_REQUEST_ID_BYTES>(
                 row.get_ref(0).map_err(|_| journal_unavailable())?,
@@ -789,11 +987,11 @@ fn scan_journal_membership(
             .checked_add(1)
             .ok_or_else(journal_unavailable)?;
     }
-    if observed_count != count {
+    if observed_count != expected_count {
         return Err(journal_unavailable());
     }
     Ok(JournalMembershipSnapshot {
-        count,
+        count: expected_count,
         root: root.finalize(),
     })
 }
@@ -858,18 +1056,22 @@ fn bounded_token(value: ValueRef<'_>) -> rusqlite::Result<Zeroizing<Vec<u8>>> {
 }
 
 fn key_check(key: &PreparedFencedTransitionJournalKey) -> Result<[u8; 32], StoreError> {
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).map_err(|_| journal_unavailable())?;
+    let mut mac = HmacSha256::new(key.as_bytes());
     mac.update(JOURNAL_KEY_CHECK_DOMAIN);
-    Ok(mac.finalize().into_bytes().into())
+    Ok(*mac.finalize())
 }
 
 fn verify_key_check(
     key: &PreparedFencedTransitionJournalKey,
     stored: &[u8],
 ) -> Result<(), StoreError> {
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).map_err(|_| journal_unavailable())?;
+    let mut mac = HmacSha256::new(key.as_bytes());
     mac.update(JOURNAL_KEY_CHECK_DOMAIN);
-    mac.verify_slice(stored).map_err(|_| journal_unavailable())
+    if mac.verify_slice(stored) {
+        Ok(())
+    } else {
+        Err(journal_unavailable())
+    }
 }
 
 fn entry_tag(
@@ -878,13 +1080,13 @@ fn entry_tag(
     canonical: &[u8],
 ) -> Result<[u8; 32], StoreError> {
     let length = u32::try_from(canonical.len()).map_err(|_| journal_unavailable())?;
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).map_err(|_| journal_unavailable())?;
+    let mut mac = HmacSha256::new(key.as_bytes());
     mac.update(JOURNAL_ENTRY_DOMAIN);
     mac.update(request_id.as_bytes());
     mac.update(&FENCED_TRANSITION_PREPARED_SCHEMA_V1.to_be_bytes());
     mac.update(&length.to_be_bytes());
     mac.update(canonical);
-    Ok(mac.finalize().into_bytes().into())
+    Ok(*mac.finalize())
 }
 
 fn verify_entry_tag(
@@ -894,13 +1096,17 @@ fn verify_entry_tag(
     stored: &[u8],
 ) -> Result<(), StoreError> {
     let length = u32::try_from(canonical.len()).map_err(|_| journal_unavailable())?;
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).map_err(|_| journal_unavailable())?;
+    let mut mac = HmacSha256::new(key.as_bytes());
     mac.update(JOURNAL_ENTRY_DOMAIN);
     mac.update(request_id.as_bytes());
     mac.update(&FENCED_TRANSITION_PREPARED_SCHEMA_V1.to_be_bytes());
     mac.update(&length.to_be_bytes());
     mac.update(canonical);
-    mac.verify_slice(stored).map_err(|_| journal_unavailable())
+    if mac.verify_slice(stored) {
+        Ok(())
+    } else {
+        Err(journal_unavailable())
+    }
 }
 
 fn membership_tag(
@@ -912,7 +1118,7 @@ fn membership_tag(
     if !valid_membership_count(count) {
         return Err(journal_unavailable());
     }
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).map_err(|_| journal_unavailable())?;
+    let mut mac = HmacSha256::new(key.as_bytes());
     mac.update(JOURNAL_MEMBERSHIP_TAG_DOMAIN);
     mac.update(incarnation);
     let encoded_count = u64::try_from(count)
@@ -920,7 +1126,7 @@ fn membership_tag(
         .to_be_bytes();
     mac.update(&encoded_count);
     mac.update(root);
-    Ok(mac.finalize().into_bytes().into())
+    Ok(*mac.finalize())
 }
 
 fn verify_membership_tag(
@@ -933,7 +1139,7 @@ fn verify_membership_tag(
     if !valid_membership_count(count) {
         return Err(journal_unavailable());
     }
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).map_err(|_| journal_unavailable())?;
+    let mut mac = HmacSha256::new(key.as_bytes());
     mac.update(JOURNAL_MEMBERSHIP_TAG_DOMAIN);
     mac.update(incarnation);
     let encoded_count = u64::try_from(count)
@@ -941,34 +1147,34 @@ fn verify_membership_tag(
         .to_be_bytes();
     mac.update(&encoded_count);
     mac.update(root);
-    mac.verify_slice(stored).map_err(|_| journal_unavailable())
+    if mac.verify_slice(stored) {
+        Ok(())
+    } else {
+        Err(journal_unavailable())
+    }
 }
 
 fn journal_unavailable() -> StoreError {
     StoreError::BackendUnavailable(JOURNAL_UNAVAILABLE.into())
 }
 
-fn prepare_secure_journal_path(path: &Path) -> Result<PreparedJournalPath, StoreError> {
+fn prepare_secure_journal_path(
+    path: &Path,
+    mode: JournalOpenMode,
+) -> Result<PreparedJournalPath, StoreError> {
     if path.file_name().is_none() {
         return Err(journal_unavailable());
     }
 
     #[cfg(unix)]
     {
-        prepare_secure_journal_path_unix(path)
+        prepare_secure_journal_path_unix(path, mode)
     }
 
     #[cfg(not(unix))]
     {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)
-            .map_err(|_| journal_unavailable())?;
-        Ok(PreparedJournalPath {
-            sqlite_path: std::fs::canonicalize(path).map_err(|_| journal_unavailable())?,
-        })
+        let _ = mode;
+        Err(journal_unavailable())
     }
 }
 
@@ -980,6 +1186,28 @@ impl SecureJournalPathGuard {
             sys::stat::{fstat, fstatat},
         };
 
+        let root = fstat(&self.root).map_err(|_| journal_unavailable())?;
+        let effective_uid = nix::unistd::geteuid().as_raw();
+        if !is_trusted_ancestor(&root, effective_uid) {
+            return Err(journal_unavailable());
+        }
+        let mut prior = &self.root;
+        for (index, (directory, name)) in self.ancestors.iter().enumerate() {
+            let actual = fstat(directory).map_err(|_| journal_unavailable())?;
+            let visible = fstatat(prior, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+                .map_err(|_| journal_unavailable())?;
+            let final_parent = index + 1 == self.ancestors.len();
+            if !same_file(&actual, &visible)
+                || if final_parent {
+                    !is_private_parent(&actual, effective_uid)
+                } else {
+                    !is_trusted_ancestor(&actual, effective_uid)
+                }
+            {
+                return Err(journal_unavailable());
+            }
+            prior = directory;
+        }
         let parent = fstat(&self.parent).map_err(|_| journal_unavailable())?;
         let leaf = fstat(&self.leaf).map_err(|_| journal_unavailable())?;
         let visible = fstatat(
@@ -988,7 +1216,6 @@ impl SecureJournalPathGuard {
             AtFlags::AT_SYMLINK_NOFOLLOW,
         )
         .map_err(|_| journal_unavailable())?;
-        let effective_uid = nix::unistd::geteuid().as_raw();
         if !is_private_parent(&parent, effective_uid)
             || !is_private_leaf(&leaf, effective_uid)
             || !same_file(&leaf, &visible)
@@ -997,10 +1224,18 @@ impl SecureJournalPathGuard {
         }
         Ok(())
     }
+
+    fn verify_connection(&self, conn: &Connection) -> Result<(), StoreError> {
+        self.verify()?;
+        verify_sqlite_main_file_binding(conn)
+    }
 }
 
 #[cfg(unix)]
-fn prepare_secure_journal_path_unix(path: &Path) -> Result<PreparedJournalPath, StoreError> {
+fn prepare_secure_journal_path_unix(
+    path: &Path,
+    mode: JournalOpenMode,
+) -> Result<PreparedJournalPath, StoreError> {
     use nix::{
         fcntl::{open, openat, AtFlags, OFlag},
         sys::stat::{fstat, fstatat, Mode},
@@ -1032,6 +1267,8 @@ fn prepare_secure_journal_path_unix(path: &Path) -> Result<PreparedJournalPath, 
     let effective_uid = nix::unistd::geteuid().as_raw();
     let mut parent =
         open(Path::new("/"), directory_flags, Mode::empty()).map_err(|_| journal_unavailable())?;
+    let root = std::fs::File::from(parent.try_clone().map_err(|_| journal_unavailable())?);
+    let mut ancestors = Vec::with_capacity(parent_names.len());
     if !is_trusted_ancestor(
         &fstat(&parent).map_err(|_| journal_unavailable())?,
         effective_uid,
@@ -1050,6 +1287,10 @@ fn prepare_secure_journal_path_unix(path: &Path) -> Result<PreparedJournalPath, 
         } {
             return Err(journal_unavailable());
         }
+        ancestors.push((
+            std::fs::File::from(next.try_clone().map_err(|_| journal_unavailable())?),
+            name.clone(),
+        ));
         parent = next;
     }
     if parent_names.is_empty()
@@ -1064,6 +1305,9 @@ fn prepare_secure_journal_path_unix(path: &Path) -> Result<PreparedJournalPath, 
     let existing = fstatat(&parent, leaf_name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW);
     let leaf = match existing {
         Ok(metadata) => {
+            if mode == JournalOpenMode::CreateNew {
+                return Err(journal_unavailable());
+            }
             if !is_private_leaf(&metadata, effective_uid) {
                 return Err(journal_unavailable());
             }
@@ -1075,7 +1319,7 @@ fn prepare_secure_journal_path_unix(path: &Path) -> Result<PreparedJournalPath, 
             )
             .map_err(|_| journal_unavailable())?
         }
-        Err(nix::errno::Errno::ENOENT) => {
+        Err(nix::errno::Errno::ENOENT) if mode == JournalOpenMode::CreateNew => {
             let leaf = openat(
                 &parent,
                 leaf_name.as_os_str(),
@@ -1105,6 +1349,8 @@ fn prepare_secure_journal_path_unix(path: &Path) -> Result<PreparedJournalPath, 
     Ok(PreparedJournalPath {
         sqlite_path,
         path_guard: SecureJournalPathGuard {
+            root,
+            ancestors,
             parent: std::fs::File::from(parent),
             leaf: std::fs::File::from(leaf),
             leaf_name: leaf_name.clone(),
@@ -1221,10 +1467,12 @@ mod tests {
         }
 
         fn open(&self) -> PreparedFencedTransitionJournal {
-            PreparedFencedTransitionJournal::open(
-                &self.path,
-                PreparedFencedTransitionJournalKey::from_bytes(self.key),
-            )
+            let key = PreparedFencedTransitionJournalKey::from_bytes(self.key);
+            if self.path.exists() {
+                PreparedFencedTransitionJournal::open_existing(&self.path, key)
+            } else {
+                PreparedFencedTransitionJournal::create_new(&self.path, key)
+            }
             .expect("open journal fixture")
         }
     }
@@ -1267,6 +1515,55 @@ mod tests {
         )
         .expect("record-free request");
         PreparedFencedTransition::from_unprotected_request(request).expect("prepared request")
+    }
+
+    #[test]
+    fn open_existing_missing_journal_never_creates_a_pristine_database() {
+        let fixture = JournalFixture::new(0x11);
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
+            &fixture.path,
+            PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
+        ));
+        assert!(!fixture.path.exists());
+    }
+
+    #[tokio::test]
+    async fn create_new_provisions_once_and_open_existing_reopens() {
+        let fixture = JournalFixture::new(0x12);
+        let journal = PreparedFencedTransitionJournal::create_new(
+            &fixture.path,
+            PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
+        )
+        .expect("provision journal");
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::create_new(
+            &fixture.path,
+            PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
+        ));
+        drop(journal);
+        PreparedFencedTransitionJournal::open_existing(
+            &fixture.path,
+            PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
+        )
+        .expect("reopen provisioned journal")
+        .health_check()
+        .await
+        .expect("reopened journal health");
+    }
+
+    #[test]
+    fn open_existing_rejects_same_inode_truncate_instead_of_reinitializing() {
+        let fixture = JournalFixture::new(0x13);
+        drop(fixture.open());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.path)
+            .expect("open provisioned journal")
+            .set_len(0)
+            .expect("truncate provisioned journal");
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
+            &fixture.path,
+            PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
+        ));
     }
 
     fn assert_coarse_unavailable<T>(result: Result<T, StoreError>) {
@@ -1453,6 +1750,10 @@ mod tests {
         let journal = fixture.open();
         let overflow = prepared_with_request_id([0xff; FENCED_TRANSITION_REQUEST_ID_BYTES]);
         assert_eq!(
+            journal.ensure_absent(overflow.request_id()).await,
+            Err(StoreError::FencedTransitionHistoryFull)
+        );
+        assert_eq!(
             journal.insert(&overflow).await,
             Err(StoreError::FencedTransitionHistoryFull)
         );
@@ -1590,7 +1891,7 @@ mod tests {
         journal.insert(&retained).await.expect("durable insert");
         drop(journal);
 
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             &fixture.path,
             PreparedFencedTransitionJournalKey::from_bytes(
                 [0x43; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
@@ -1606,7 +1907,7 @@ mod tests {
             .expect("corrupt integrity tag");
         drop(connection);
 
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             &fixture.path,
             PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
         ));
@@ -1625,7 +1926,7 @@ mod tests {
                 .expect("read foreign journal mode");
             assert_eq!(journal_mode, "delete");
         }
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             &foreign.path,
             PreparedFencedTransitionJournalKey::from_bytes(foreign.key),
         ));
@@ -1645,7 +1946,7 @@ mod tests {
                 .pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION + 1)
                 .expect("advance incompatible version");
         }
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             &versioned.path,
             PreparedFencedTransitionJournalKey::from_bytes(versioned.key),
         ));
@@ -1671,7 +1972,7 @@ mod tests {
                 )
                 .expect("replace journal table with query-compatible schema");
         }
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             &replaced.path,
             PreparedFencedTransitionJournalKey::from_bytes(replaced.key),
         ));
@@ -1684,13 +1985,35 @@ mod tests {
                 .execute(&format!("DROP INDEX {JOURNAL_MEMBERSHIP_INDEX}"), [])
                 .expect("drop required membership index");
         }
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             &missing_index.path,
             PreparedFencedTransitionJournalKey::from_bytes(missing_index.key),
         ));
 
         let profile = Connection::open_in_memory().expect("open profile fixture");
         assert_coarse_unavailable(verify_connection_profile(&profile));
+    }
+
+    #[test]
+    fn prepared_journal_schema_normalization_preserves_sql_boundaries_and_literals() {
+        let expected = "CREATE TABLE journal (value TEXT CHECK (value = 'a b')) STRICT;";
+        let whitespace_variant =
+            "  CREATE   TABLE journal (value TEXT CHECK (value = 'a b')) STRICT  ;  ";
+        let statement_boundary = "CREATE TABLE journal (value TEXT CHECK (value = 'a b')); STRICT";
+        let changed_literal = "CREATE TABLE journal (value TEXT CHECK (value = 'ab')) STRICT";
+
+        assert_eq!(
+            canonical_schema_sql(expected),
+            canonical_schema_sql(whitespace_variant)
+        );
+        assert_ne!(
+            canonical_schema_sql(expected),
+            canonical_schema_sql(statement_boundary)
+        );
+        assert_ne!(
+            canonical_schema_sql(expected),
+            canonical_schema_sql(changed_literal)
+        );
     }
 
     #[test]
@@ -1732,7 +2055,7 @@ mod tests {
                 )
                 .expect("create non-internal sqliteX objects");
         }
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             &fixture.path,
             PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
         ));
@@ -1768,7 +2091,7 @@ mod tests {
                 .expect("offline-craft reserved catalog trigger");
         }
 
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             &fixture.path,
             PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
         ));
@@ -1820,7 +2143,7 @@ mod tests {
                 )
                 .expect("bypass metadata check constraint");
         }
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             &fixture.path,
             PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
         ));
@@ -1830,10 +2153,11 @@ mod tests {
     fn prepared_journal_rejects_sqlite_length_limit_drift() {
         let fixture = JournalFixture::new(0x50);
         let mut connection = Connection::open(&fixture.path).expect("open length-limit fixture");
-        configure_journal_sqlite_length_limit(&connection).expect("configure journal length limit");
+        configure_journal_sqlite_limits(&connection).expect("configure journal limits");
         initialize_connection(
             &mut connection,
             &PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
+            JournalOpenMode::CreateNew,
         )
         .expect("initialize length-limit fixture");
         let lowered_limit = journal_sqlite_length_limit()
@@ -1873,7 +2197,7 @@ mod tests {
                 ))
                 .expect("bypass prepared-token check constraint");
         }
-        let token_journal = PreparedFencedTransitionJournal::open(
+        let token_journal = PreparedFencedTransitionJournal::open_existing(
             &token_fixture.path,
             PreparedFencedTransitionJournalKey::from_bytes(token_fixture.key),
         )
@@ -1898,7 +2222,7 @@ mod tests {
                 )
                 .expect("bypass integrity-tag check constraint");
         }
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             &tag_fixture.path,
             PreparedFencedTransitionJournalKey::from_bytes(tag_fixture.key),
         ));
@@ -1915,7 +2239,7 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .expect("set public fixture permissions");
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             public_directory.path().join("prepared.sqlite3"),
             PreparedFencedTransitionJournalKey::from_bytes(
                 [0x46; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],
@@ -1926,7 +2250,7 @@ mod tests {
         let target = fixture.path.with_file_name("target.sqlite3");
         std::fs::File::create(&target).expect("create symlink target");
         symlink(&target, &fixture.path).expect("create fixture symlink");
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             &fixture.path,
             PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
         ));
@@ -1943,7 +2267,7 @@ mod tests {
         make_private(&real_parent);
         let linked_parent = symlink_fixture._directory.path().join("linked");
         symlink(&real_parent, &linked_parent).expect("create parent symlink");
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             linked_parent.join("prepared.sqlite3"),
             PreparedFencedTransitionJournalKey::from_bytes(symlink_fixture.key),
         ));
@@ -1954,7 +2278,7 @@ mod tests {
         std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o600))
             .expect("make hardlink source private");
         std::fs::hard_link(&original, &hardlink_fixture.path).expect("create hardlink leaf");
-        assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+        assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
             &hardlink_fixture.path,
             PreparedFencedTransitionJournalKey::from_bytes(hardlink_fixture.key),
         ));
@@ -1969,12 +2293,12 @@ mod tests {
             let fixture = JournalFixture::new(0x4d);
             chown(fixture._directory.path(), Some(Uid::from_raw(1)), None)
                 .expect("make parent unowned");
-            assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+            assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
                 &fixture.path,
                 PreparedFencedTransitionJournalKey::from_bytes(fixture.key),
             ));
         } else {
-            assert_coarse_unavailable(PreparedFencedTransitionJournal::open(
+            assert_coarse_unavailable(PreparedFencedTransitionJournal::open_existing(
                 Path::new("/").join("prepared.sqlite3"),
                 PreparedFencedTransitionJournalKey::from_bytes(
                     [0x4d; PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES],

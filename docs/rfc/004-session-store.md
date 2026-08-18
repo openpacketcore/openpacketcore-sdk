@@ -1910,16 +1910,30 @@ provider/key rotation can therefore use the same durable journal path, key,
 and volume. This does not claim host failover, host/volume-loss recovery,
 journal replication, or a second consensus transition.
 
-The journal path and independent stable integrity key are deployment
-secrets/configuration and MUST NOT be logged. On Unix it uses a private `0700`
-parent directory, `0600` file, no symlink path, HMAC-SHA-256 integrity,
-SQLite WAL, `synchronous=EXTRA`, and bounded opaque rows containing no
-plaintext. Payloads, identities, request IDs, paths, keys, provider material,
-token bytes, and journal contents MUST NOT appear in examples, fixtures, logs,
-diagnostics, or evidence. Prepared-token schema, journal schema, and V2 are
-downgrade fences: unknown versions, raw V1, and older binaries MUST NOT operate
-the protected journaled path. The V2 journal layer makes no journal GC,
-retention, ledger-lifetime, or capacity-lifecycle claim.
+Journal provisioning and reopening are distinct. A deployment MUST call
+`PreparedFencedTransitionJournal::create_new` exactly once for a missing path
+and `open_existing` on every restart. Reopening never creates or initializes a
+missing, pristine, truncated, reset, or partial database; the deprecated
+`open` alias is reopen-only. The independent stable integrity key is unique to
+that exact journal path/storage boundary, MUST NOT be reused for another
+journal, and MUST NOT be logged. On Unix the SDK descriptor-walks and retains
+the full path chain, requires a private effective-user-owned `0700` parent and
+regular single-link `0600` file, and revalidates the path, file, and SQLite
+main-file movement state around each operation. The deployment MUST give that
+effective user exclusive writer authority over the durable path; an actor with
+equivalent same-user replacement authority is part of the trusted storage
+boundary. Platforms without those checks fail closed for V2.
+
+The journal uses zeroize-on-drop HMAC-SHA-256 state, SQLite WAL,
+`synchronous=EXTRA`, bounded SQLite limits and catalog/membership scans, and
+bounded opaque rows containing no plaintext. A full authenticated journal
+rejects a new ID before expiry, provider, or inner-prepare work. Payloads,
+identities, request IDs, paths, keys, provider material, token bytes, and
+journal contents MUST NOT appear in examples, fixtures, logs, diagnostics, or
+evidence. Prepared-token schema, journal schema, and V2 are downgrade fences:
+unknown versions, raw V1, and older binaries MUST NOT operate the protected
+journaled path. The V2 journal layer makes no journal GC, retention,
+ledger-lifetime, or capacity-lifecycle claim.
 
 The schema-2 journal also commits a fresh per-journal incarnation, bounded
 membership count, and root over the exact retained request-ID/tag set with a

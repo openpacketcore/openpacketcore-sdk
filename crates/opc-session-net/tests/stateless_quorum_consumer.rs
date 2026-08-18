@@ -1814,7 +1814,7 @@ async fn authenticated_consumer_v2_recovers_journaled_protected_transition_after
         let journal_path = journal_directory.path().join("prepared.sqlite");
         let journal_key = [0x91; 32];
         let initial_journal = Arc::new(
-            PreparedFencedTransitionJournal::open(
+            PreparedFencedTransitionJournal::create_new(
                 &journal_path,
                 PreparedFencedTransitionJournalKey::from_bytes(journal_key),
             )
@@ -1891,7 +1891,7 @@ async fn authenticated_consumer_v2_recovers_journaled_protected_transition_after
         .await
         .expect("start replacement consumer listener");
         let replacement_journal = Arc::new(
-            PreparedFencedTransitionJournal::open(
+            PreparedFencedTransitionJournal::open_existing(
                 &journal_path,
                 PreparedFencedTransitionJournalKey::from_bytes(journal_key),
             )

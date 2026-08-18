@@ -1207,6 +1207,19 @@ token and never reseal, unseal, or reconstruct it. After a process restart,
 `FencedTransitionRequestId`; `NotFound` at the consensus status barrier never
 deletes the journal row or proves that a delayed proposal cannot commit.
 
+Provisioning and recovery are deliberately separate: callers MUST use
+`PreparedFencedTransitionJournal::create_new` exactly once to provision a
+missing journal, and MUST use `open_existing` after every restart. Opening a
+missing, truncated, reset, or partially initialized path fails closed and never
+creates an authenticated empty journal. The integrity key is unique to exactly
+one durable journal path/storage boundary: callers MUST restore the same
+path/file/key together and MUST NOT reuse that key for another journal. This is
+a trusted private durable-path boundary: the deployment MUST give the effective
+user exclusive writer authority. An actor with equivalent same-user
+path-replacement authority is inside that storage boundary because it already
+has the SDK process's file authority. Platforms without the Unix descriptor and
+VFS checks fail closed for V2.
+
 The schema-2 journal authenticates more than each row: a per-journal random
 incarnation, bounded row count, and root over the complete request-ID/tag set
 are committed by a separate HMAC. Health, lookup/recovery, and insertion scan

@@ -452,7 +452,7 @@ async fn protected_fenced_transition_survives_consensus_restart_and_key_rotation
             "prepared-fenced-transition-consensus",
         )
         .with_fenced_transition_journal(Arc::new(
-            PreparedFencedTransitionJournal::open(
+            PreparedFencedTransitionJournal::create_new(
                 &journal_path,
                 PreparedFencedTransitionJournalKey::from_bytes(journal_key),
             )
@@ -528,7 +528,7 @@ async fn protected_fenced_transition_survives_consensus_restart_and_key_rotation
             "prepared-fenced-transition-consensus",
         )
         .with_fenced_transition_journal(Arc::new(
-            PreparedFencedTransitionJournal::open(
+            PreparedFencedTransitionJournal::open_existing(
                 &journal_path,
                 PreparedFencedTransitionJournalKey::from_bytes(journal_key),
             )

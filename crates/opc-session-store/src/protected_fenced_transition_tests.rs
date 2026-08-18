@@ -57,11 +57,13 @@ impl JournalFixture {
     }
 
     fn open(&self) -> Arc<PreparedFencedTransitionJournal> {
+        let key = PreparedFencedTransitionJournalKey::from_bytes(self.key);
         Arc::new(
-            PreparedFencedTransitionJournal::open(
-                &self.path,
-                PreparedFencedTransitionJournalKey::from_bytes(self.key),
-            )
+            if self.path.exists() {
+                PreparedFencedTransitionJournal::open_existing(&self.path, key)
+            } else {
+                PreparedFencedTransitionJournal::create_new(&self.path, key)
+            }
             .expect("open prepared journal"),
         )
     }

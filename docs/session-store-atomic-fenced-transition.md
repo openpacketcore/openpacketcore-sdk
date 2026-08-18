@@ -266,19 +266,33 @@ partial observation.
 
 ### Journal persistence and security
 
-`PreparedFencedTransitionJournal::open` takes a dedicated database path and a
-stable 32-byte `PreparedFencedTransitionJournalKey`. The key and path are
-deployment secrets/configuration: the key MUST be independent of payload
-encryption, remote provider, TLS, and record keys, and MUST be restored
-unchanged after a process restart. It is never stored in the database. On Unix
-every existing ancestor is descriptor-walked without following symlinks. The
-immediate parent and database MUST be owned by the effective user, with no
+Provisioning and recovery are separate operations.
+`PreparedFencedTransitionJournal::create_new` MUST be used exactly once for a
+missing dedicated database; it creates the leaf exclusively and rejects an
+existing path. Every restart MUST use `open_existing`, which neither creates a
+leaf nor initializes a pristine, truncated, reset, or partial database. The
+deprecated `open` alias has the same fail-closed reopen behavior and never
+provisions storage.
+
+Both operations take a stable 32-byte
+`PreparedFencedTransitionJournalKey`. The key MUST be independent of payload
+encryption, remote provider, TLS, and record keys, unique to this exact journal
+path/storage boundary, and restored unchanged after a process restart. It is
+never stored in the database and MUST NOT be reused for another journal. On
+Unix every existing ancestor is descriptor-walked without following symlinks.
+The immediate parent and database MUST be owned by the effective user, with no
 group or other access (normally `0700` and `0600`, respectively); the database
-MUST be a regular, single-link file. The SDK pins and revalidates the admitted
-parent and file identities before each operation. Other platforms require
-equivalent access and stable-path controls. The schema-2 journal uses an
-application ID, strict tables, a bounded SQLite value-allocation limit, WAL,
-`synchronous=EXTRA`, and an atomic create-only ID binding. It assigns every
+MUST be a regular, single-link file. The SDK retains and revalidates the full
+ancestor chain, admitted parent/file identities, and SQLite main-file movement
+state around every operation. The journal requires a trusted private path with
+exclusive writer authority; another process running with the same effective
+user and equivalent path-replacement authority is inside that trust boundary,
+not an adversary the SDK can isolate from its own files. Platforms without the
+Unix descriptor and VFS checks fail closed rather than advertise V2.
+
+The schema-2 journal uses an application ID, strict tables, bounded SQLite
+limits and catalog/membership scans, WAL, `synchronous=EXTRA`, and an atomic
+create-only ID binding. It assigns every
 journal incarnation a fresh bounded random value and stores an authenticated
 membership count and root over the complete request-ID/integrity-tag set. The
 membership HMAC commits that incarnation, count, and root; health, lookup,
@@ -291,8 +305,9 @@ WAL snapshots rather than reserving the writer. The schema catalog is an exact
 whitelist of the SDK tables, generated primary-key autoindex, and membership
 index; every other catalog object, including a reserved-prefix object, is
 rejected before journal setup. The journal rejects a wrong key, foreign or
-partial schema, unsupported version, corrupt metadata/row, and insecure path
-with one fixed coarse availability error.
+partial schema, unsupported version, corrupt metadata/row, and insecure or
+changed path with one fixed coarse availability error. An authenticated full
+journal rejects a new ID before expiry, provider, or inner-prepare work.
 
 The journal HMAC authenticates stored bytes but does not encrypt them. A
 protected create/update row contains request metadata and ciphertext (never
@@ -312,9 +327,10 @@ rollback is outside the same-durable-file guarantee unless deployment supplies
 an external monotonic anti-rollback anchor.
 
 The SDK retains canonical token bytes and complete-body import/re-encoding
-scratch buffers in wiping allocations. This reduces allocator residue but does
-not encrypt the SQLite page cache, filesystem cache, WAL, storage media, backup,
-or copies made outside the SDK.
+scratch buffers in wiping allocations. Journal HMAC uses a zeroize-on-drop SHA
+state and wipes key-derived pads and intermediate digests. This reduces
+allocator residue but does not encrypt the SQLite page cache, filesystem cache,
+WAL, storage media, backup, or copies made outside the SDK.
 
 V2 proves process-restart recovery only while the same durable volume, path,
 journal key, protection mode/namespace, stable client identity (for the
