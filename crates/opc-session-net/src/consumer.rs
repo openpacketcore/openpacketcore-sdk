@@ -1873,8 +1873,8 @@ fn v2_response_matches_request(
         ) => outcome.matches_v2_request(request),
         (
             SessionConsumerV2Operation::FencedTransitionV2 { .. },
-            SessionConsumerV2Response::FencedTransitionV2(Err(_)),
-        ) => true,
+            SessionConsumerV2Response::FencedTransitionV2(Err(error)),
+        ) => error.is_wire_valid(),
         (
             SessionConsumerV2Operation::FencedTransitionV2Status { request },
             SessionConsumerV2Response::FencedTransitionV2Status(Ok(
@@ -10646,6 +10646,39 @@ mod tests {
             assert!(
                 super::v2_response_matches_request(&request, &response),
                 "typed V2 error {error:?} must correlate to its V2 execution request"
+            );
+        }
+
+        let canonical_payload = SessionConsumerV2FencedTransitionError::PayloadTooLarge {
+            actual: (opc_session_store::FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES + 1) as u64,
+            max: opc_session_store::FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES as u64,
+        };
+        let canonical = SessionConsumerV2Response::FencedTransitionV2(Err(canonical_payload));
+        let canonical_wire = serde_json::to_vec(&canonical).expect("canonical V2 error encodes");
+        let canonical: SessionConsumerV2Response =
+            serde_json::from_slice(&canonical_wire).expect("canonical V2 error decodes");
+        assert!(
+            super::v2_response_matches_request(&request, &canonical),
+            "the canonical fixed-width payload error remains a valid V2 execution result"
+        );
+        for error in [
+            SessionConsumerV2FencedTransitionError::PayloadTooLarge {
+                actual: u64::MAX,
+                max: 1,
+            },
+            SessionConsumerV2FencedTransitionError::PayloadTooLarge {
+                actual: opc_session_store::FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES as u64,
+                max: opc_session_store::FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES as u64,
+            },
+        ] {
+            let malformed = SessionConsumerV2Response::FencedTransitionV2(Err(error));
+            let encoded = serde_json::to_vec(&malformed)
+                .expect("a syntactically valid malformed V2 error still encodes");
+            let malformed: SessionConsumerV2Response = serde_json::from_slice(&encoded)
+                .expect("a custom server's malformed V2 error still decodes");
+            assert!(
+                !super::v2_response_matches_request(&request, &malformed),
+                "noncanonical V2 execution payload error {error:?} must close both transport matchers"
             );
         }
     }

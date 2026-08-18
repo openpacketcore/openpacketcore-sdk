@@ -1030,6 +1030,22 @@ impl From<StoreError> for SessionConsumerV2FencedTransitionError {
 }
 
 impl SessionConsumerV2FencedTransitionError {
+    /// Whether this error has the fixed revision-4 wire representation.
+    ///
+    /// All closed discriminants are wire-valid. The payload-too-large form is
+    /// the sole structured variant, so it must retain the frozen maximum and
+    /// the architecture-independent bounded actual width before transport
+    /// accepts it.
+    pub fn is_wire_valid(self) -> bool {
+        !matches!(
+            self,
+            Self::PayloadTooLarge { actual, max }
+                if max != FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES as u64
+                    || actual <= max
+                    || actual > FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES
+        )
+    }
+
     /// Project a deterministic V2 receipt error into its closed wire form.
     ///
     /// Only errors that the V2 consensus command can durably retain are
@@ -1058,25 +1074,20 @@ impl SessionConsumerV2FencedTransitionError {
     /// This rejects transport-only categories such as `Unavailable` even
     /// though they are representable by the shared safe store-error family.
     pub fn is_recorded_deterministic(self) -> bool {
-        matches!(
-            self,
-            Self::Store(
-                SessionConsumerStoreError::NotFound
-                    | SessionConsumerStoreError::StaleFence
-                    | SessionConsumerStoreError::CasConflict
-            ) | Self::TopologyAuthorityRevoked
-                | Self::InvalidSessionTtl
-                | Self::InvalidRecordExpiry
-                | Self::LeaseHeld
-                | Self::LeaseExpired
-                | Self::StorageExhausted
-        ) || matches!(
-            self,
-            Self::PayloadTooLarge { actual, max }
-                if max == FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES as u64
-                    && actual > max
-                    && actual <= FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES
-        )
+        self.is_wire_valid()
+            && (matches!(
+                self,
+                Self::Store(
+                    SessionConsumerStoreError::NotFound
+                        | SessionConsumerStoreError::StaleFence
+                        | SessionConsumerStoreError::CasConflict
+                ) | Self::TopologyAuthorityRevoked
+                    | Self::InvalidSessionTtl
+                    | Self::InvalidRecordExpiry
+                    | Self::LeaseHeld
+                    | Self::LeaseExpired
+                    | Self::StorageExhausted
+            ) || matches!(self, Self::PayloadTooLarge { .. }))
     }
 
     /// Convert this exact V2 wire error back into its storage-domain form.
@@ -2167,6 +2178,7 @@ mod tests {
                 SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Err(wire_error)))
             );
             assert_eq!(wire_error.into_store_error(), store_error);
+            assert!(wire_error.is_wire_valid());
             assert!(wire_error.is_recorded_deterministic());
             let encoded = serde_json::to_string(&status).expect("closed V2 status encodes");
             assert_eq!(
@@ -2193,8 +2205,16 @@ mod tests {
         );
         assert!(
             !SessionConsumerV2FencedTransitionError::PayloadTooLarge { actual: 1, max: 2 }
-                .is_recorded_deterministic(),
-            "a noncanonical payload bound cannot be represented as a receipt"
+                .is_wire_valid(),
+            "a noncanonical payload bound cannot be represented on the V2 wire"
+        );
+        assert!(
+            !SessionConsumerV2FencedTransitionError::PayloadTooLarge {
+                actual: u64::MAX,
+                max: 1,
+            }
+            .is_recorded_deterministic(),
+            "a platform-independent overflow cannot be represented as a receipt"
         );
     }
 

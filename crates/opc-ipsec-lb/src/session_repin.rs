@@ -4013,7 +4013,9 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         ),
         StoreError::FencedTransitionHistoryFull
         | StoreError::FencedTransitionRetentionExhausted
-        | StoreError::FencedTransitionStorageExhausted => IpsecLbError::Unsupported,
+        | StoreError::FencedTransitionStorageExhausted
+        | StoreError::FencedTransitionHistoryEpochRetired
+        | StoreError::FencedTransitionHistoryEpochNotActive => IpsecLbError::Unsupported,
         StoreError::InvalidSessionTtl => IpsecLbError::invalid_config(
             "session_repin.ttl",
             "session re-pin journal TTL is invalid",
@@ -4136,6 +4138,14 @@ mod tests {
             ),
             (
                 StoreError::FencedTransitionStorageExhausted,
+                IpsecLbError::Unsupported,
+            ),
+            (
+                StoreError::FencedTransitionHistoryEpochRetired,
+                IpsecLbError::Unsupported,
+            ),
+            (
+                StoreError::FencedTransitionHistoryEpochNotActive,
                 IpsecLbError::Unsupported,
             ),
         ] {

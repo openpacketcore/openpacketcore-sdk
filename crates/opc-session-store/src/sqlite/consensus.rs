@@ -6873,6 +6873,18 @@ pub(crate) fn validate_command_for_log(
             "session consensus authorized intent nesting is invalid",
         ));
     }
+    // Maintenance has no self-authenticated request body, but its logical
+    // time is still part of the profiled V2 command wire shape.  Reject it
+    // before follower admission can project a clock advance or lifecycle
+    // change; otherwise optional `time` date ranges could make replicas
+    // disagree about a reclamation batch.
+    if fenced_transition_v2_maintenance(semantic_intent).is_some()
+        && !fenced_transition_v2_timestamp_is_in_range(command.logical_time)
+    {
+        return Err(invalid_data(
+            "session fenced transition V2 maintenance logical time is outside the profiled range",
+        ));
+    }
     if let SessionMutationIntent::CompareAndSet(op) = semantic_intent {
         crate::ttl::validate_stored_record_expiry_at(&op.new_record, command.logical_time)
             .map_err(|_| invalid_data("session consensus record expiry is invalid"))?;
@@ -7317,6 +7329,15 @@ impl MembershipLogProjection {
         conn: &Connection,
         command: &SessionConsensusCommand,
     ) -> io::Result<()> {
+        // Unlike a transition request, maintenance has no self-authenticated
+        // body to validate first. Its command timestamp must nevertheless be
+        // admitted before this projection can advance logical time or model a
+        // reclaim lifecycle change.
+        if !fenced_transition_v2_timestamp_is_in_range(command.logical_time) {
+            return Err(invalid_data(
+                "projected fenced transition V2 maintenance logical time is outside the profiled range",
+            ));
+        }
         let (
             expected_generation,
             expected_active_epoch,
@@ -13177,6 +13198,15 @@ pub(crate) fn apply_entries_with_authority_sync(
                     expected_bound_entries,
                 )) = fenced_transition_v2_maintenance(&command.intent)
                 {
+                    // This is duplicated from follower log admission so a
+                    // direct state-machine call cannot advance the durable
+                    // clock or mutate lifecycle state for a timestamp that
+                    // falls outside the fixed V2 profile.
+                    if !fenced_transition_v2_timestamp_is_in_range(command.logical_time) {
+                        return Err(invalid_data(
+                            "fenced transition V2 maintenance logical time is outside the profiled range",
+                        ));
+                    }
                     if fenced_transition_v2_ledger_layout_sync(&tx)?
                         != FencedTransitionV2LedgerLayout::Activated
                     {
@@ -19099,6 +19129,221 @@ mod tests {
     }
 
     #[test]
+    fn frozen_v1_history_cap_is_absorbing_after_every_binding_applies() {
+        // This is the frozen V1 wire behavior at its exact lifetime boundary.
+        // Build every binding through the state machine rather than seeding the
+        // receipt table: one successful create establishes the key fence and
+        // the remaining valid requests deterministically bind StaleFence.
+        assert_eq!(
+            FENCED_TRANSITION_MAX_HISTORY_ENTRIES, 4_096,
+            "this regression exercises the published V1 history limit",
+        );
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("form membership");
+
+        let request = |ordinal: u32, owner_suffix: &str| {
+            let mut request_id = [0_u8; 16];
+            request_id[..4].copy_from_slice(&ordinal.to_be_bytes());
+            request_id[4] = 0x71;
+            let owner =
+                OwnerId::new(format!("frozen-v1-history-{ordinal}-{owner_suffix}")).expect("owner");
+            let lease = FencedTransitionLease::acquire(
+                key(),
+                owner.clone(),
+                crate::FenceToken::new(0),
+                Duration::from_secs(300),
+            )
+            .expect("valid fenced lease");
+            let mut record = sealed_record_for_key(key(), 1_024);
+            record.owner = owner;
+            record.fence = crate::FenceToken::new(1);
+            FencedTransitionRequest::new(
+                crate::FencedTransitionRequestId::from_bytes(request_id),
+                lease,
+                FencedTransitionMutation::create(record),
+            )
+            .expect("valid fenced transition")
+        };
+
+        const BATCH_SIZE: usize = 64;
+        let logical_time = timestamp(1);
+        for first_ordinal in (1_u32..=4_096).step_by(BATCH_SIZE) {
+            let last_ordinal =
+                (first_ordinal + u32::try_from(BATCH_SIZE).expect("batch fits")).min(4_097);
+            let entries = (first_ordinal..last_ordinal)
+                .map(|ordinal| {
+                    fenced_transition_entry(
+                        u64::from(ordinal),
+                        request(ordinal, "bound"),
+                        logical_time,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let applied = apply_entries_sync(&conn, identity(), &backend.caps, entries)
+                .expect("bind V1 history batch through apply");
+            assert_eq!(
+                applied.responses.len(),
+                usize::try_from(last_ordinal - first_ordinal).expect("batch length fits"),
+            );
+            for (offset, response) in applied.responses.iter().enumerate() {
+                let ordinal = first_ordinal + u32::try_from(offset).expect("batch offset fits");
+                if ordinal == 1 {
+                    assert!(matches!(
+                        response.result,
+                        Ok(SessionMutationOutcome::FencedTransition(_))
+                    ));
+                } else {
+                    assert!(matches!(response.result, Err(StoreError::StaleFence)));
+                }
+            }
+            assert_eq!(
+                applied.notifications.len(),
+                usize::from(first_ordinal == 1),
+                "only the first binding changes business state",
+            );
+        }
+        assert_eq!(
+            fenced_transition_receipt_count_sync(&conn).expect("count V1 bindings"),
+            4_096,
+            "every V1 request ID must have been durably bound by apply",
+        );
+
+        let unbound = request(4_097, "first-body");
+        let unbound_id = SessionConsensusRequestId::from_bytes(*unbound.request_id().as_bytes());
+        let business_key = key();
+        let machine_before = read_machine_sync(&conn, identity()).expect("machine at V1 cap");
+        let record_before =
+            ops::get_sync(&conn, &business_key, logical_time).expect("record at V1 cap");
+        let fence_before = ops::current_fence_sync(&conn, &business_key).expect("fence at V1 cap");
+        let lease_count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM leases", [], |row| row.get(0))
+            .expect("count leases at V1 cap");
+        type LeaseRow = (i64, i64, String, i64, i64, String, Option<String>);
+        let lease_before: Option<LeaseRow> = conn
+            .query_row(
+                "SELECT active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at, acquired_at FROM leases WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4",
+                params![
+                    business_key.tenant.as_str(),
+                    business_key.nf_kind.as_str(),
+                    business_key.key_type.to_string(),
+                    business_key.stable_id.as_ref(),
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .expect("read lease at V1 cap");
+
+        let assert_history_full_unbound = |index, candidate: FencedTransitionRequest| {
+            let applied = apply_entries_sync(
+                &conn,
+                identity(),
+                &backend.caps,
+                vec![fenced_transition_entry(index, candidate, logical_time)],
+            )
+            .expect("apply unbound V1 cap rejection");
+            assert!(matches!(
+                applied.responses.as_slice(),
+                [SessionConsensusResponse {
+                    result: Err(StoreError::FencedTransitionHistoryFull),
+                    sequence,
+                    digest: Some(digest),
+                    logical_time: Some(response_time),
+                    raft_log_index,
+                }] if *sequence == machine_before.0
+                    && *digest == machine_before.1
+                    && *response_time == logical_time
+                    && *raft_log_index == index
+            ));
+            assert!(applied.notifications.is_empty());
+            assert_eq!(
+                fenced_transition_receipt_count_sync(&conn).expect("count unchanged V1 bindings"),
+                4_096,
+            );
+            assert!(
+                read_fenced_transition_receipt_sync(&conn, identity(), unbound_id)
+                    .expect("read permanently unbound V1 request")
+                    .is_none()
+            );
+            assert!(read_outcome_sync(&conn, identity(), unbound_id)
+                .expect("read absent generic binding")
+                .is_none());
+            assert_eq!(
+                read_machine_sync(&conn, identity()).expect("machine after cap rejection"),
+                machine_before,
+                "V1 cap rejection cannot advance application or watch state",
+            );
+            assert_eq!(
+                ops::get_sync(&conn, &business_key, logical_time)
+                    .expect("record after cap rejection"),
+                record_before,
+                "V1 cap rejection cannot mutate business state",
+            );
+            assert_eq!(
+                ops::current_fence_sync(&conn, &business_key).expect("fence after cap rejection"),
+                fence_before,
+                "V1 cap rejection cannot mutate the fence",
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM leases", [], |row| row
+                    .get::<_, i64>(0))
+                    .expect("count leases after cap rejection"),
+                lease_count_before,
+                "V1 cap rejection cannot mutate leases",
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at, acquired_at FROM leases WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4",
+                    params![
+                        business_key.tenant.as_str(),
+                        business_key.nf_kind.as_str(),
+                        business_key.key_type.to_string(),
+                        business_key.stable_id.as_ref(),
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                        ))
+                    },
+                )
+                .optional()
+                .expect("read lease after cap rejection"),
+                lease_before,
+                "V1 cap rejection cannot update the live lease",
+            );
+        };
+
+        assert_history_full_unbound(4_097, unbound.clone());
+        // V1 does not reserve an unbound request ID at capacity. Therefore
+        // both its exact retry and a different valid body sharing the ID stay
+        // HistoryFull rather than acquiring a replay or conflict lifecycle.
+        assert_history_full_unbound(4_098, unbound.clone());
+        assert_history_full_unbound(4_099, request(4_097, "different-body"));
+        assert_eq!(
+            read_fenced_transition_status_sync(&conn, identity(), identity(), &unbound),
+            Ok(FencedTransitionStatus::HistoryFull),
+        );
+    }
+
+    #[test]
     fn ordered_fenced_entries_only_the_first_consumes_the_last_history_slot() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.blocking_lock();
@@ -22442,6 +22687,198 @@ LIMIT 20000;
                 .expect("records after rejection"),
             records_before,
         );
+    }
+
+    #[test]
+    fn fenced_transition_v2_maintenance_command_time_profile_is_consistent_at_the_boundary() {
+        // An exact profiled boundary remains a normal maintenance command.
+        // Its successor is representable only with `time/large-dates`; when
+        // it is representable, all follower and durable paths must reject it
+        // before advancing clock, sequence, lifecycle, business, or watch
+        // state.  Non-large-date builds reject the successor during wire
+        // decoding, which is the same admission result before consensus.
+        let maximum = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::from_unix_timestamp(
+                crate::fenced_transition::FENCED_TRANSITION_V2_MAX_TIMESTAMP_UNIX_SECONDS,
+            )
+            .expect("profile maximum timestamp"),
+        );
+        assert!(fenced_transition_v2_timestamp_is_in_range(maximum));
+        let one_over = match time::OffsetDateTime::from_unix_timestamp(
+            crate::fenced_transition::FENCED_TRANSITION_V2_MAX_TIMESTAMP_UNIX_SECONDS
+                .checked_add(1)
+                .expect("V2 maximum has a successor"),
+        ) {
+            Ok(value) => Timestamp::from_offset_datetime(value),
+            Err(_) => {
+                assert!(
+                    Timestamp::from_str("10000-01-01T00:00:00Z").is_err(),
+                    "a non-large-date build must reject year 10000 during wire decoding",
+                );
+                return;
+            }
+        };
+        assert!(
+            !fenced_transition_v2_timestamp_is_in_range(one_over),
+            "the successor must be outside the profiled V2 range",
+        );
+
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let membership = membership_entry();
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&membership))
+            .expect("append membership");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership])
+            .expect("form membership");
+        activate_v2_ledger_fixture(&conn);
+        let initial_epoch =
+            FencedTransitionV2HistoryEpoch::new(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
+                .expect("initial V2 epoch");
+        let maintenance = |index, request_byte, logical_time| Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes([request_byte; 16]),
+                logical_time,
+                intent: SessionMutationIntent::MaintainFencedTransitionV2History {
+                    expected_generation: 0,
+                    expected_active_epoch: Some(initial_epoch),
+                    expected_retired_through: 0,
+                    expected_bound_entries: 0,
+                },
+            }),
+        };
+
+        let exact = maintenance(1, 0xE1, maximum);
+        let EntryPayload::Normal(exact_command) = &exact.payload else {
+            panic!("exact-boundary maintenance must be a normal command");
+        };
+        validate_command_for_log(exact_command, identity())
+            .expect("the fixed V2 maximum remains an admissible maintenance time");
+        let before_exact_history =
+            read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+                .expect("history before exact-boundary maintenance");
+        let before_exact_machine = read_machine_sync(&conn, identity())
+            .expect("machine before exact-boundary maintenance");
+        let mut exact_projection = MembershipLogProjection::load(&conn, identity(), false)
+            .expect("load exact-boundary follower projection");
+        exact_projection
+            .project(&conn, &exact, identity())
+            .expect("project exact-boundary maintenance");
+        assert_eq!(
+            exact_projection.projected_v2_history,
+            Some(before_exact_history),
+            "an exact-empty maintenance command must not change V2 lifecycle",
+        );
+        assert_eq!(
+            exact_projection.projected_application_sequence,
+            before_exact_machine.0 + 1,
+        );
+        assert_eq!(exact_projection.projected_logical_time, Some(maximum));
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&exact))
+            .expect("follower append exact-boundary maintenance");
+        let exact_applied = apply_entries_sync(&conn, identity(), &backend.caps, vec![exact])
+            .expect("apply exact-boundary maintenance");
+        assert!(matches!(
+            exact_applied.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::Unit),
+                logical_time: Some(logical_time),
+                ..
+            }] if *logical_time == maximum
+        ));
+        assert!(exact_applied.notifications.is_empty());
+        assert_eq!(
+            read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+                .expect("history after exact-boundary maintenance"),
+            before_exact_history,
+        );
+        let after_exact_machine =
+            read_machine_sync(&conn, identity()).expect("machine after exact-boundary maintenance");
+        assert_eq!(after_exact_machine.0, before_exact_machine.0 + 1);
+        assert_eq!(after_exact_machine.2, Some(maximum));
+        assert_eq!(after_exact_machine.3, before_exact_machine.3);
+
+        let invalid = maintenance(2, 0xE2, one_over);
+        let EntryPayload::Normal(invalid_command) = &invalid.payload else {
+            panic!("out-of-profile maintenance must be a normal command");
+        };
+        assert_eq!(
+            validate_command_for_log(invalid_command, identity())
+                .expect_err("follower validation rejects out-of-profile maintenance time")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        let mut invalid_projection = MembershipLogProjection::load(&conn, identity(), false)
+            .expect("load out-of-profile follower projection");
+        let projection_before = (
+            invalid_projection.projected_v2_history,
+            invalid_projection.projected_application_sequence,
+            invalid_projection.projected_logical_time,
+        );
+        assert_eq!(
+            invalid_projection
+                .project(&conn, &invalid, identity())
+                .expect_err("projection rejects out-of-profile maintenance time")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            (
+                invalid_projection.projected_v2_history,
+                invalid_projection.projected_application_sequence,
+                invalid_projection.projected_logical_time,
+            ),
+            projection_before,
+            "projection must reject before changing V2 lifecycle, sequence, or time",
+        );
+
+        let history_before_invalid =
+            read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+                .expect("history before invalid maintenance");
+        let machine_before_invalid =
+            read_machine_sync(&conn, identity()).expect("machine before invalid maintenance");
+        for table in ["session_records", "leases", "key_fences"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .expect("count business state before invalid maintenance"),
+                0,
+            );
+        }
+        assert_eq!(
+            append_logs_sync(&conn, identity(), std::slice::from_ref(&invalid))
+                .expect_err("follower append rejects out-of-profile maintenance time")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![invalid])
+                .expect_err("durable apply rejects out-of-profile maintenance time")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+                .expect("history after invalid maintenance"),
+            history_before_invalid,
+        );
+        assert_eq!(
+            read_machine_sync(&conn, identity()).expect("machine after invalid maintenance"),
+            machine_before_invalid,
+            "out-of-profile maintenance cannot advance logical time or watch state",
+        );
+        for table in ["session_records", "leases", "key_fences"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .expect("count business state after invalid maintenance"),
+                0,
+                "out-of-profile maintenance must not mutate {table}",
+            );
+        }
     }
 
     #[test]

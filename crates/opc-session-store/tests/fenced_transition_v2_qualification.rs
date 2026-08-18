@@ -12,7 +12,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use opc_consensus::{ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity};
+use futures_util::StreamExt;
+use opc_consensus::{
+    ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+};
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_session_store::{
     derive_fixed_durable_quorum_consensus_identity, fenced_transition_v2_profile_digest, Clock,
@@ -37,9 +41,13 @@ const QUALIFICATION_HEADROOM_TRANSITIONS: usize =
     FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET;
 const RECLAIM_BATCHES: usize =
     FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES / FENCED_TRANSITION_V2_RECLAIM_BATCH;
+// Match the fixed durable quorum's bounded proposal-admission capacity. This
+// represents a small, realistic client burst while leaving consensus itself to
+// serialize and durably apply every proposal on the three voters.
+const QUALIFICATION_IN_FLIGHT_CLIENTS: usize = DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS;
 const FIXED_V2_PROFILE_DIGEST: [u8; 32] = [
-    0x0f, 0x51, 0xdb, 0x98, 0xa6, 0x69, 0x18, 0xc0, 0xb8, 0x27, 0xf7, 0x6a, 0x5d, 0xcf, 0xd1, 0x98,
-    0x23, 0x0f, 0x15, 0x8f, 0xce, 0xab, 0x0b, 0x91, 0xe1, 0x2e, 0xe9, 0xca, 0x47, 0x2a, 0x08, 0x4c,
+    0xbf, 0x22, 0x10, 0xe0, 0x9a, 0x84, 0xb4, 0x17, 0xb7, 0x27, 0x06, 0x46, 0x82, 0x1b, 0x87, 0xa7,
+    0x3d, 0x1a, 0x87, 0x50, 0x38, 0x21, 0xfc, 0x44, 0x92, 0x2d, 0xb2, 0x2e, 0x04, 0x87, 0x9d, 0x15,
 ];
 
 #[derive(Debug, Clone)]
@@ -507,54 +515,76 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         QUALIFICATION_HEADROOM_TRANSITIONS, 31_072,
         "qualification must exercise every declared transition of headroom"
     );
-    let mut first_request = None;
-    let mut headroom_states = Vec::with_capacity(QUALIFICATION_HEADROOM_TRANSITIONS);
     let first_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("first epoch");
 
     // Exercise the production contract first: exactly two distinct committed
     // transitions for each of 50,000 durable sessions.  The second operation
     // is a real lease renewal plus record update, not a disposable-key
-    // shortcut around the state machine.
-    for session_index in 0..QUALIFICATION_SESSIONS {
-        let key = key(session_index);
-        let observation = store
-            .observe_fenced_transition(&key)
-            .await
-            .expect("real consensus fence observation");
-        let create_index = session_index * 2;
-        let create = create_request(
-            create_index,
-            first_epoch,
-            key,
-            observation.current_fence(),
-            &provider,
-        )
-        .await;
-        let created = store
-            .fenced_transition_v2(create.clone())
-            .await
-            .expect("session create must commit through quorum apply");
-        assert!(matches!(
-            created.mutation(),
-            FencedTransitionMutationResult::Created
-        ));
-        if session_index == 0 {
-            first_request = Some((create, created.clone()));
-        }
+    // shortcut around the state machine. Independent sessions are admitted as
+    // a bounded client burst; each task still performs its observation,
+    // proposal, and three-voter durable apply through the public API. Sorting
+    // the completed tasks restores deterministic session indexing for the
+    // delayed-retry exemplar and the subsequent headroom updates.
+    let mut session_states = futures_util::stream::iter(0..QUALIFICATION_SESSIONS)
+        .map(|session_index| {
+            let provider = &provider;
+            async move {
+                let key = key(session_index);
+                let observation = store
+                    .observe_fenced_transition(&key)
+                    .await
+                    .expect("real consensus fence observation");
+                let create_index = session_index * 2;
+                let create = create_request(
+                    create_index,
+                    first_epoch,
+                    key,
+                    observation.current_fence(),
+                    provider,
+                )
+                .await;
+                let created = store
+                    .fenced_transition_v2(create.clone())
+                    .await
+                    .expect("session create must commit through quorum apply");
+                assert!(matches!(
+                    created.mutation(),
+                    FencedTransitionMutationResult::Created
+                ));
 
-        let update = renew_update_request(create_index + 1, first_epoch, &created, &provider).await;
-        let updated = store
-            .fenced_transition_v2(update)
-            .await
-            .expect("session update must commit through quorum apply");
-        assert!(matches!(
-            updated.mutation(),
-            FencedTransitionMutationResult::Updated
-        ));
-        if session_index < QUALIFICATION_HEADROOM_TRANSITIONS {
-            headroom_states.push(updated);
-        }
-    }
+                let update =
+                    renew_update_request(create_index + 1, first_epoch, &created, provider).await;
+                let updated = store
+                    .fenced_transition_v2(update)
+                    .await
+                    .expect("session update must commit through quorum apply");
+                assert!(matches!(
+                    updated.mutation(),
+                    FencedTransitionMutationResult::Updated
+                ));
+                (session_index, create, created, updated)
+            }
+        })
+        .buffer_unordered(QUALIFICATION_IN_FLIGHT_CLIENTS)
+        .collect::<Vec<_>>()
+        .await;
+    session_states.sort_unstable_by_key(|(session_index, _, _, _)| *session_index);
+    assert_eq!(
+        session_states.len(),
+        QUALIFICATION_SESSIONS,
+        "every session must complete its create and update through fixed quorum"
+    );
+    let (first_session_index, first_request, first_outcome, _) = &session_states[0];
+    assert_eq!(
+        *first_session_index, 0,
+        "the delayed-retry exemplar must remain the deterministic first session"
+    );
+    let (first_request, first_outcome) = (first_request.clone(), first_outcome.clone());
+    let headroom_states = session_states
+        .iter()
+        .take(QUALIFICATION_HEADROOM_TRANSITIONS)
+        .map(|(_, _, _, updated)| updated.clone())
+        .collect::<Vec<_>>();
     let target_history = store
         .fenced_transition_v2_history_state()
         .await
@@ -568,18 +598,39 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
 
     // Consume all 31,072 declared transitions of operational headroom with a
     // third real update on retained sessions.
-    for (headroom_index, state) in headroom_states.iter_mut().enumerate() {
-        let request_index = FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET + headroom_index;
-        let update = renew_update_request(request_index, first_epoch, state, &provider).await;
-        *state = store
-            .fenced_transition_v2(update)
-            .await
-            .expect("headroom update must commit through quorum apply");
-        assert!(matches!(
-            state.mutation(),
-            FencedTransitionMutationResult::Updated
-        ));
-    }
+    let mut completed_headroom_states =
+        futures_util::stream::iter(headroom_states.into_iter().enumerate())
+            .map(|(headroom_index, state)| {
+                let provider = &provider;
+                async move {
+                    let request_index =
+                        FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET + headroom_index;
+                    let update =
+                        renew_update_request(request_index, first_epoch, &state, provider).await;
+                    let updated = store
+                        .fenced_transition_v2(update)
+                        .await
+                        .expect("headroom update must commit through quorum apply");
+                    assert!(matches!(
+                        updated.mutation(),
+                        FencedTransitionMutationResult::Updated
+                    ));
+                    (headroom_index, updated)
+                }
+            })
+            .buffer_unordered(QUALIFICATION_IN_FLIGHT_CLIENTS)
+            .collect::<Vec<_>>()
+            .await;
+    completed_headroom_states.sort_unstable_by_key(|(headroom_index, _)| *headroom_index);
+    assert_eq!(
+        completed_headroom_states.len(),
+        QUALIFICATION_HEADROOM_TRANSITIONS,
+        "every declared transition of headroom must commit through fixed quorum"
+    );
+    let headroom_states = completed_headroom_states
+        .into_iter()
+        .map(|(_, state)| state)
+        .collect::<Vec<_>>();
 
     // The exact one-over request is another valid update for a live session.
     // Capacity admission must precede every lease, record, and watch-visible
@@ -644,7 +695,7 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
     );
     assert_eq!(history.active_epoch(), Some(first_epoch));
 
-    let (old_request, old_outcome) = first_request.expect("first transition retained");
+    let (old_request, old_outcome) = (first_request, first_outcome);
     let old_record_before_retries = store
         .get(old_request.lease().key())
         .await

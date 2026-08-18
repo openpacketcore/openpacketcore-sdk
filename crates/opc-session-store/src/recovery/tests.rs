@@ -1405,7 +1405,7 @@ fn current_recovery_rejects_a_regressed_lease_allocator() {
         &members,
         LogId::new(
             CommittedLeaderId::new(1, *members.iter().next().expect("member")),
-            1,
+            0,
         ),
     );
     let conn = Connection::open(&replica.database_path).expect("open current replica");
