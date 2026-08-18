@@ -65,8 +65,11 @@ an SCTP-terminating CNF is in scope:
 1. **`opc-libsctp-sys`** provides thin FFI over Linux SCTP socket UAPI and
    minimal `libsctp` helpers where required. It is the **only SCTP workspace
    crate** permitted to contain `unsafe`; follow-on Linux kernel UAPI exceptions
-   such as `opc-linux-xfrm-sys` and `opc-linux-gtpu-sys` must be separately and
-   explicitly allowlisted by the same mechanical gate. It does **not** inherit
+   such as `opc-linux-xfrm-sys` and `opc-linux-gtpu-sys`, and narrow reviewed
+   FFI boundaries such as `opc-sqlite-file-control-sys`, must be separately and
+   explicitly allowlisted by the same mechanical gate. The SQLite boundary is
+   limited to its pinned, value-free `SQLITE_FCNTL_HAS_MOVED` probe and does not
+   authorize general SQLite FFI. Each allowlisted sys crate does **not** inherit
    `[workspace.lints]` (so the workspace-wide `unsafe_code = "forbid"` stays in
    force for every other crate); it sets its own local crate policy
    (`unsafe_code = "allow"` plus `unsafe_op_in_unsafe_fn = "deny"`, or
@@ -81,9 +84,11 @@ an SCTP-terminating CNF is in scope:
 3. **Boundary is enforced mechanically.**
    `scripts/check-management-plane-policy.py --check` token-scans OpenPacketCore
    workspace crate sources and asserts `unsafe` appears only in explicitly
-   allowlisted Linux UAPI sys crates (`opc-libsctp-sys` and later, reviewed
-   kernel-UAPI boundaries such as `opc-linux-xfrm-sys` and
-   `opc-linux-gtpu-sys`); the same gate also rejects each allowed sys crate if it
+   allowlisted sys crates (`opc-libsctp-sys` and later, reviewed kernel-UAPI
+   boundaries such as `opc-linux-xfrm-sys` and `opc-linux-gtpu-sys`, plus the
+   pinned `SQLITE_FCNTL_HAS_MOVED` boundary in
+   `opc-sqlite-file-control-sys`); the same gate also rejects each allowed sys
+   crate if it
    inherits `[workspace.lints]`, rejects it if it lacks the required local unsafe
    lint policy, and requires each allowed `unsafe` token in that sys crate to be
    documented by an adjacent `SAFETY:` comment. The CI job runs this gate, so the
