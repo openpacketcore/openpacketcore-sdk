@@ -619,6 +619,13 @@ impl SqliteSessionBackend {
         capabilities
     }
 
+    /// Maximum encoded durable consensus-log entry accepted by this SQLite
+    /// build. V2 capability admission binds this concrete limit into the
+    /// advertised protocol profile before any command is proposed.
+    pub(crate) const fn consensus_log_entry_max_bytes(&self) -> usize {
+        consensus::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES
+    }
+
     /// Whether consensus state is backed by a filesystem database.
     ///
     /// Fixed durable quorums reject ephemeral in-memory stores. This is a
@@ -720,6 +727,33 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Check the exact V2 profile certificate after a caller-owned consensus
+    /// barrier. A missing or stale certificate is a normal unsupported state;
+    /// storage failure remains unavailable.
+    pub(crate) async fn consensus_fenced_transition_v2_activation_matches_scope(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        scope_identity: crate::consensus::SessionConsensusIdentity,
+        voters: std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+        profile_digest: [u8; 32],
+    ) -> Result<bool, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::fenced_transition_v2_activation_matches_scope_sync(
+                conn,
+                storage_identity,
+                scope_identity,
+                &voters,
+                profile_digest,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "fenced transition V2 activation is unavailable".into(),
+                )
+            })
+        })
+        .await
+    }
+
     /// Read at a logical timestamp already committed by the consensus state
     /// machine. This path is read-only: expiry affects visibility but never
     /// prunes physical rows outside a committed command.
@@ -807,6 +841,78 @@ impl SqliteSessionBackend {
             tx.commit()
                 .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
             Ok(status)
+        })
+        .await
+    }
+
+    /// Read one exact V2 receipt after a caller-owned barrier.
+    pub(crate) async fn consensus_fenced_transition_v2_status(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        authority_identity: crate::consensus::SessionConsensusIdentity,
+        request: &crate::FencedTransitionV2Request,
+    ) -> Result<crate::FencedTransitionV2Status, StoreError> {
+        let request = request.clone();
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let status = consensus::read_fenced_transition_v2_status_sync(
+                &tx,
+                storage_identity,
+                authority_identity,
+                &request,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(status)
+        })
+        .await
+    }
+
+    /// Report whether the durable V2 ledger layout has already been activated.
+    ///
+    /// This survives replication-authority changes even though the exact-scope
+    /// activation certificate is cleared at cutover. Callers use it to keep
+    /// prospective voters fail-closed once V2 history semantics are durable.
+    pub(crate) async fn consensus_fenced_transition_v2_history_is_activated(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+    ) -> Result<bool, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let persisted_identity = consensus::read_storage_identity_sync(conn).map_err(|_| {
+                StoreError::BackendUnavailable("fenced transition V2 history is unavailable".into())
+            })?;
+            if persisted_identity != storage_identity {
+                return Err(StoreError::BackendUnavailable(
+                    "fenced transition V2 history is unavailable".into(),
+                ));
+            }
+            consensus::fenced_transition_v2_ledger_layout_sync(conn)
+                .map(|layout| layout == consensus::FencedTransitionV2LedgerLayout::Activated)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "fenced transition V2 history is unavailable".into(),
+                    )
+                })
+        })
+        .await
+    }
+
+    /// Read the durable V2 history lifecycle after a caller-owned barrier.
+    pub(crate) async fn consensus_fenced_transition_v2_history_state(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        _authority_identity: crate::consensus::SessionConsensusIdentity,
+    ) -> Result<crate::FencedTransitionV2HistoryState, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::read_fenced_transition_v2_history_state_sync(conn, storage_identity).map_err(
+                |_| {
+                    StoreError::BackendUnavailable(
+                        "fenced transition V2 history is unavailable".into(),
+                    )
+                },
+            )
         })
         .await
     }

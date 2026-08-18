@@ -1526,12 +1526,13 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             StoreError::FencedTransitionRequestConflict => Self::CasIdempotencyConflict,
             StoreError::FencedTransitionOutcomeUnknown
             | StoreError::FencedTransitionRequestExpired => Self::CasIdempotencyOutcomeUnavailable,
-            // There is no safe legacy fallback after the permanent receipt
-            // ledger, retention horizon, or storage counter is exhausted.
-            // Represent all three as an
+            // There is no safe legacy fallback after a receipt-history,
+            // retention, epoch, or storage terminal. Represent them as an
             // unavailable capability, using the existing redaction-safe wire
             // spelling rather than extending the frozen v5 enum.
             StoreError::FencedTransitionHistoryFull
+            | StoreError::FencedTransitionHistoryEpochRetired
+            | StoreError::FencedTransitionHistoryEpochNotActive
             | StoreError::FencedTransitionRetentionExhausted
             | StoreError::FencedTransitionStorageExhausted => {
                 Self::CapabilityNotSupported("unknown_capability")

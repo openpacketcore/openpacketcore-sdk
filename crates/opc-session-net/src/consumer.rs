@@ -32,7 +32,8 @@ use opc_session_store::{
     SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
     SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
     SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionOp, SessionOpResult, SessionQuorumConsumer,
+    SessionConsumerStoreError, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionOp, SessionOpResult, SessionQuorumConsumer,
     StatelessSessionConsumer, StoreError, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use opc_types::SpiffeId;
@@ -62,8 +63,18 @@ use crate::protocol::{
 /// Dedicated ALPN for authenticated session-quorum consumers.
 pub const SESSION_QUORUM_CONSUMER_ALPN: &[u8] = b"opc-session-consumer/1";
 
+/// Dedicated ALPN for the explicit V2 fenced-transition consumer lane.
+///
+/// It is intentionally distinguishable from revision 3 at TLS negotiation;
+/// a V1-only peer therefore cannot mistake a V2 operation for a new V1
+/// operation even before the authenticated revision handshake is checked.
+pub const SESSION_QUORUM_CONSUMER_V2_ALPN: &[u8] = b"opc-session-consumer/2";
+
 /// Fixed wire revision for [`SESSION_QUORUM_CONSUMER_ALPN`].
 pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 3;
+
+/// Fixed wire revision for [`SESSION_QUORUM_CONSUMER_V2_ALPN`].
+pub const SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION: u16 = 4;
 
 /// Maximum sequential application requests processed on one consumer
 /// connection. Every request has an exact nonzero connection-local
@@ -1514,6 +1525,118 @@ enum ConsumerWireResponse {
     WatchEntry(ConsumerWatchEntry),
 }
 
+/// Revision-4-only call envelope. It intentionally has no V1 operation or
+/// response member, so a V2 frame cannot be decoded as a V1 call frame.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsumerV2Call {
+    correlation: NonZeroU32,
+    request: Box<SessionConsumerV2Request>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsumerV2CallResponse {
+    correlation: NonZeroU32,
+    response: Box<SessionConsumerV2Response>,
+}
+
+/// Private wire family admitted only after the V2 ALPN and exact revision-4
+/// handshake. Keeping it as a separate enum freezes revision 3's postcard
+/// and JSON discriminator ordering.
+#[derive(Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum ConsumerV2WireRequest {
+    Hello(ConsumerHello),
+    Call(ConsumerV2Call),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum ConsumerV2WireResponse {
+    HelloAck(ConsumerHelloAck),
+    HelloRejected(SessionConsumerRejection),
+    Response(ConsumerV2CallResponse),
+}
+
+fn v2_response_matches_operation(
+    operation: &SessionConsumerV2Operation,
+    response: &SessionConsumerV2Response,
+) -> bool {
+    matches!(
+        (operation, response),
+        (_, SessionConsumerV2Response::Rejected(_))
+            | (
+                SessionConsumerV2Operation::FencedTransitionV2Capability,
+                SessionConsumerV2Response::FencedTransitionV2Capability(_),
+            )
+            | (
+                SessionConsumerV2Operation::FencedTransitionV2HistoryState,
+                SessionConsumerV2Response::FencedTransitionV2HistoryState(_),
+            )
+            | (
+                SessionConsumerV2Operation::FencedTransitionV2 { .. },
+                SessionConsumerV2Response::FencedTransitionV2(_),
+            )
+            | (
+                SessionConsumerV2Operation::FencedTransitionV2Status { .. },
+                SessionConsumerV2Response::FencedTransitionV2Status(_),
+            )
+    )
+}
+
+/// Validate the V2 result shape after the wire discriminator has matched.
+///
+/// The full self-authenticating request ID remains part of the request passed
+/// to this function; comparing only a nonce or an old 16-byte consumer ID
+/// would allow a response from a distinct committed V2 body to be accepted.
+fn v2_response_matches_request(
+    request: &SessionConsumerV2Request,
+    response: &SessionConsumerV2Response,
+) -> bool {
+    if !v2_response_matches_operation(request.operation(), response) {
+        return false;
+    }
+    match (request.operation(), response) {
+        (
+            SessionConsumerV2Operation::FencedTransitionV2 { request },
+            SessionConsumerV2Response::FencedTransitionV2(Ok(outcome)),
+        ) => outcome.matches_v2_request(request),
+        (
+            SessionConsumerV2Operation::FencedTransitionV2 { .. },
+            SessionConsumerV2Response::FencedTransitionV2(Err(_)),
+        ) => true,
+        (
+            SessionConsumerV2Operation::FencedTransitionV2Status { request },
+            SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                opc_session_store::SessionConsumerV2FencedTransitionStatus::Recorded(result),
+            )),
+        ) => match result.as_ref() {
+            Ok(outcome) => outcome.matches_v2_request(request),
+            // A retained deterministic transition failure is already bound
+            // to the complete request by the V2 receipt codec. It contains
+            // no success outcome to correlate further, but it must still be
+            // one of the fixed V2 receipt errors.
+            Err(error) => error.is_recorded_deterministic(),
+        },
+        // Error and status variants are closed by their V2-specific wire
+        // discriminators. The authoritative service validates the complete
+        // request body before producing them; no response is a license to
+        // replay an operation.
+        _ => true,
+    }
+}
+
 #[derive(Serialize)]
 #[serde(
     tag = "kind",
@@ -2576,8 +2699,19 @@ impl fmt::Debug for ConsumerWireResponse {
 }
 
 fn consumer_client_tls_config(config: Arc<opc_tls::ClientConfig>) -> Arc<opc_tls::ClientConfig> {
+    consumer_client_tls_config_for_alpn(config, SESSION_QUORUM_CONSUMER_ALPN)
+}
+
+fn consumer_client_tls_config_v2(config: Arc<opc_tls::ClientConfig>) -> Arc<opc_tls::ClientConfig> {
+    consumer_client_tls_config_for_alpn(config, SESSION_QUORUM_CONSUMER_V2_ALPN)
+}
+
+fn consumer_client_tls_config_for_alpn(
+    config: Arc<opc_tls::ClientConfig>,
+    alpn: &[u8],
+) -> Arc<opc_tls::ClientConfig> {
     let mut config = config.as_ref().clone();
-    config.alpn_protocols = vec![SESSION_QUORUM_CONSUMER_ALPN.to_vec()];
+    config.alpn_protocols = vec![alpn.to_vec()];
     config.resumption = tokio_rustls::rustls::client::Resumption::disabled();
     config.enable_early_data = false;
     Arc::new(config)
@@ -2585,7 +2719,13 @@ fn consumer_client_tls_config(config: Arc<opc_tls::ClientConfig>) -> Arc<opc_tls
 
 fn consumer_server_tls_config(config: Arc<opc_tls::ServerConfig>) -> Arc<opc_tls::ServerConfig> {
     let mut config = config.as_ref().clone();
-    config.alpn_protocols = vec![SESSION_QUORUM_CONSUMER_ALPN.to_vec()];
+    // The client's one-element ALPN offer selects exactly one lane. Keeping
+    // both names here lets one listener serve V1/revision 3 and V2/revision 4
+    // without falling back across their semantic boundary.
+    config.alpn_protocols = vec![
+        SESSION_QUORUM_CONSUMER_V2_ALPN.to_vec(),
+        SESSION_QUORUM_CONSUMER_ALPN.to_vec(),
+    ];
     config.session_storage = Arc::new(tokio_rustls::rustls::server::NoServerSessionStorage {});
     config.ticketer = Arc::new(DisabledConsumerSessionTickets);
     config.send_tls13_tickets = 0;
@@ -3934,6 +4074,122 @@ impl StatelessSessionConsumerClient {
             .map_err(SessionConsumerCallError::into_client_error)
     }
 
+    /// Execute one explicit revision-4 V2 consumer request.
+    ///
+    /// This deliberately opens a fresh V2-ALPN connection. Persistent V1
+    /// lanes are never reused, so a caller cannot accidentally send a V2
+    /// envelope after completing the revision-3 handshake.
+    pub async fn execute_v2(
+        &self,
+        request: SessionConsumerV2Request,
+    ) -> Result<SessionConsumerV2Response, SessionConsumerClientError> {
+        if request.scope() != self.scope || request.validate().is_err() {
+            return Err(SessionConsumerClientError::Protocol);
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(effective_consumer_operation_timeout(self.operation_timeout))
+            .ok_or(SessionConsumerClientError::Deadline)?;
+        let address = tokio::time::timeout_at(deadline, (self.resolve)())
+            .await
+            .map_err(|_| SessionConsumerClientError::Unavailable)?
+            .map_err(|_| SessionConsumerClientError::Unavailable)?;
+        let stream = tokio::time::timeout_at(deadline, TcpStream::connect(address))
+            .await
+            .map_err(|_| SessionConsumerClientError::Unavailable)?
+            .map_err(|_| SessionConsumerClientError::Unavailable)?;
+        stream
+            .set_nodelay(true)
+            .map_err(|_| SessionConsumerClientError::Unavailable)?;
+        let handshake = self
+            .tls_config
+            .begin_handshake()
+            .map_err(|_| SessionConsumerClientError::Authentication)?;
+        let connector = tokio_rustls::TlsConnector::from(consumer_client_tls_config_v2(
+            handshake.rustls_config(),
+        ));
+        let tls = tokio::time::timeout_at(
+            deadline,
+            connector.connect(self.server_name.clone(), stream),
+        )
+        .await
+        .map_err(|_| SessionConsumerClientError::Unavailable)?
+        .map_err(classify_tls_io_error)
+        .map_err(SessionConsumerClientError::from)?;
+        if tls.get_ref().1.alpn_protocol() != Some(SESSION_QUORUM_CONSUMER_V2_ALPN) {
+            return Err(SessionConsumerClientError::Protocol);
+        }
+        let peer = opc_tls::peer_tls_identity_from_client_connection(tls.get_ref().1)
+            .map_err(|_| SessionConsumerClientError::Authentication)?;
+        if peer.spiffe_id() != &self.expected_server_identity {
+            return Err(SessionConsumerClientError::Authentication);
+        }
+        let (mut reader, mut writer) = tokio::io::split(tls);
+        let hello = ConsumerV2WireRequest::Hello(ConsumerHello {
+            transport_revision: SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+            scope: self.scope,
+            response_frame_size: consumer_wire_frame_size(MAX_NEGOTIATED_FRAME_SIZE)
+                .map_err(SessionConsumerClientError::from)?,
+        });
+        write_frame_bounded_until(&mut writer, &hello, MAX_NEGOTIATED_FRAME_SIZE, deadline)
+            .await
+            .map_err(SessionConsumerClientError::from)?;
+        let ack = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV2WireResponse>(
+            &mut reader,
+            MAX_NEGOTIATED_FRAME_SIZE,
+            deadline,
+            effective_consumer_idle_timeout(self.idle_timeout),
+        )
+        .await
+        .map_err(SessionConsumerClientError::from)?
+        .ok_or(SessionConsumerClientError::Unavailable)?;
+        let request_frame_size = match ack {
+            ConsumerV2WireResponse::HelloAck(ack)
+                if ack.transport_revision == SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION
+                    && ack.scope == self.scope =>
+            {
+                checked_consumer_frame_size(ack.request_frame_size)
+                    .map_err(SessionConsumerClientError::from)?
+            }
+            ConsumerV2WireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch) => {
+                return Err(SessionConsumerClientError::Scope);
+            }
+            ConsumerV2WireResponse::HelloRejected(SessionConsumerRejection::Unauthorized) => {
+                return Err(SessionConsumerClientError::Authentication);
+            }
+            _ => return Err(SessionConsumerClientError::Protocol),
+        };
+        let correlation = NonZeroU32::MIN;
+        let call = ConsumerV2WireRequest::Call(ConsumerV2Call {
+            correlation,
+            request: Box::new(request.clone()),
+        });
+        write_frame_bounded_until(&mut writer, &call, request_frame_size, deadline)
+            .await
+            .map_err(SessionConsumerClientError::from)?;
+        let response =
+            read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV2WireResponse>(
+                &mut reader,
+                MAX_NEGOTIATED_FRAME_SIZE,
+                deadline,
+                effective_consumer_idle_timeout(self.idle_timeout),
+            )
+            .await
+            .map_err(SessionConsumerClientError::from)?
+            .ok_or(SessionConsumerClientError::Unavailable)?;
+        let ConsumerV2WireResponse::Response(ConsumerV2CallResponse {
+            correlation: received,
+            response,
+        }) = response
+        else {
+            return Err(SessionConsumerClientError::Protocol);
+        };
+        exact_correlation(correlation, received).map_err(SessionConsumerClientError::from)?;
+        if !v2_response_matches_request(&request, &response) {
+            return Err(SessionConsumerClientError::Protocol);
+        }
+        Ok(*response)
+    }
+
     async fn execute_classified(
         &self,
         request: SessionConsumerRequest,
@@ -4680,7 +4936,7 @@ impl StatelessSessionConsumerClient {
             _ => {
                 return Err(SessionConsumerCallError::MayHaveSent(
                     SessionConsumerClientError::Protocol,
-                ))
+                ));
             }
         };
         match response {
@@ -4863,7 +5119,7 @@ impl StatelessSessionConsumerClient {
                         };
                         match event {
                             ConsumerWatchRead::Frame(_) | ConsumerWatchRead::Reconnect => {
-                                break event
+                                break event;
                             }
                             ConsumerWatchRead::Idle => continue 'watch_reader,
                         }
@@ -7865,6 +8121,139 @@ where
     .await
 }
 
+/// Serve the deliberately narrow revision-4 lane after mTLS selected its
+/// dedicated ALPN. No V1 DTO is decoded on this path, and a revision-4
+/// decoder cannot emit V1 responses or watch frames.
+struct ConsumerV2ServerConnectionContext {
+    service: Arc<dyn SessionQuorumConsumer>,
+    identity: SessionConsumerIdentity,
+    scope: SessionConsumerScope,
+    max_frame_size: usize,
+    idle_timeout: Duration,
+    operation_timeout: Duration,
+    setup_deadline: tokio::time::Instant,
+    cancellation: Arc<ConsumerServerCancellation>,
+}
+
+async fn handle_server_connection_v2(
+    tls: tokio_rustls::server::TlsStream<TcpStream>,
+    context: ConsumerV2ServerConnectionContext,
+) -> Result<(), ProtocolError> {
+    let ConsumerV2ServerConnectionContext {
+        service,
+        identity,
+        scope,
+        max_frame_size,
+        idle_timeout,
+        operation_timeout,
+        setup_deadline,
+        cancellation,
+    } = context;
+    let (mut reader, mut writer) = tokio::io::split(tls);
+    let hello = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Ok(()),
+        hello = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV2WireRequest>(
+            &mut reader,
+            max_frame_size,
+            setup_deadline,
+            idle_timeout,
+        ) => hello?,
+    }
+    .ok_or_else(|| consumer_setup_timeout("consumer V2 Hello deadline elapsed"))?;
+    let ConsumerV2WireRequest::Hello(hello) = hello else {
+        return Err(ProtocolError::UnexpectedResponse);
+    };
+    if hello.transport_revision != SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION {
+        return Err(ProtocolError::UnexpectedResponse);
+    }
+    let response_frame_size =
+        checked_consumer_frame_size(hello.response_frame_size)?.min(max_frame_size);
+    if hello.scope != scope {
+        write_frame_bounded_until(
+            &mut writer,
+            &ConsumerV2WireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch),
+            response_frame_size,
+            setup_deadline,
+        )
+        .await?;
+        return Ok(());
+    }
+    write_frame_bounded_until(
+        &mut writer,
+        &ConsumerV2WireResponse::HelloAck(ConsumerHelloAck {
+            transport_revision: SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+            scope,
+            request_frame_size: consumer_wire_frame_size(max_frame_size)?,
+        }),
+        response_frame_size,
+        setup_deadline,
+    )
+    .await?;
+
+    let mut expected = NonZeroU32::MIN;
+    for _ in 0..MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(operation_timeout)
+            .ok_or(ProtocolError::InvalidWireValue)?;
+        let call = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            call = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV2WireRequest>(
+                &mut reader,
+                max_frame_size,
+                deadline,
+                idle_timeout,
+            ) => call?,
+        };
+        let Some(call) = call else {
+            return Ok(());
+        };
+        let ConsumerV2WireRequest::Call(ConsumerV2Call {
+            correlation,
+            request,
+        }) = call
+        else {
+            // A second Hello, or any later control frame, is never an
+            // orderly close. In particular, do not let a cross-lane sender
+            // turn an undecodable request into a successful no-op.
+            return Err(ProtocolError::UnexpectedResponse);
+        };
+        exact_correlation(expected, correlation)?;
+        expected = NonZeroU32::new(expected.get().checked_add(1).unwrap_or(1))
+            .ok_or(ProtocolError::InvalidWireValue)?;
+        let request = *request;
+        let response = if request.scope() != scope {
+            SessionConsumerV2Response::Rejected(SessionConsumerRejection::ScopeMismatch)
+        } else if request.validate().is_err() {
+            SessionConsumerV2Response::Rejected(SessionConsumerRejection::MalformedRequest)
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Ok(()),
+                response = service.execute_v2(&identity, request.clone()) => response,
+                _ = tokio::time::sleep_until(deadline) => {
+                    SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable)
+                }
+            }
+        };
+        if !v2_response_matches_request(&request, &response) {
+            return Err(ProtocolError::UnexpectedResponse);
+        }
+        write_frame_bounded_until(
+            &mut writer,
+            &ConsumerV2WireResponse::Response(ConsumerV2CallResponse {
+                correlation,
+                response: Box::new(response),
+            }),
+            response_frame_size,
+            deadline,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_server_connection(
     stream: TcpStream,
@@ -7929,7 +8318,10 @@ async fn handle_server_connection(
         }
     }
     let established_at = tokio::time::Instant::now();
-    if tls.get_ref().1.alpn_protocol() != Some(SESSION_QUORUM_CONSUMER_ALPN) {
+    let selected_alpn = tls.get_ref().1.alpn_protocol();
+    if selected_alpn != Some(SESSION_QUORUM_CONSUMER_ALPN)
+        && selected_alpn != Some(SESSION_QUORUM_CONSUMER_V2_ALPN)
+    {
         return Err(ProtocolError::UnexpectedResponse);
     }
     let peer = opc_tls::peer_tls_identity_from_server_connection(tls.get_ref().1)
@@ -7937,6 +8329,22 @@ async fn handle_server_connection(
     let identity = authorizer
         .authorize(peer.spiffe_id())
         .map_err(|_| ProtocolError::Authentication)?;
+    if selected_alpn == Some(SESSION_QUORUM_CONSUMER_V2_ALPN) {
+        return handle_server_connection_v2(
+            tls,
+            ConsumerV2ServerConnectionContext {
+                service,
+                identity,
+                scope: authorizer.scope(),
+                max_frame_size,
+                idle_timeout,
+                operation_timeout,
+                setup_deadline,
+                cancellation,
+            },
+        )
+        .await;
+    }
     let rotation_jitter = handshake.consumer_rotation_jitter(peer.spiffe_id());
     let mut lifecycle = ConnectionLifecycle::new(
         lifecycle_policy,
@@ -8907,20 +9315,20 @@ mod tests {
         BoxStream, ConsumerCall, ConsumerCallResponse, ConsumerConnection, ConsumerHello,
         ConsumerLeaseWireContext, ConsumerOperationKind, ConsumerServerCancellation,
         ConsumerServerSetupTestHooks, ConsumerSessionResponseWire, ConsumerSetupPhase,
-        ConsumerSetupPhaseAttempt, ConsumerWatchTerminal, ConsumerWatchTerminalSlot,
-        ConsumerWireRequest, ConsumerWireResponse, PersistentCheckedOutConnection,
-        PersistentConsumerCounters, PersistentConsumerIoBarrier, PersistentConsumerShutdownReader,
-        PersistentConsumerShutdownWriter, PersistentSessionConsumerClient,
-        PersistentSessionConsumerConfig, PersistentSessionConsumerConfigError,
-        PersistentSessionConsumerExecuteError, PersistentSetupAttempt, PersistentShutdownPhase,
-        PersistentWatchRecovery, QueuedConsumerWatchItem, SessionConsumerAuthorizationError,
-        SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerChange,
-        SessionConsumerClientError, SessionConsumerFencedTransitionMutationError,
-        SessionConsumerIdentity, SessionConsumerLeaseMutationError, SessionConsumerMutationError,
-        SessionConsumerRejection, SessionQuorumConsumer, SessionQuorumConsumerServer,
-        StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
-        DEFAULT_CONSUMER_MAX_CONNECTIONS, DEFAULT_CONSUMER_OPERATION_TIMEOUT,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+        ConsumerSetupPhaseAttempt, ConsumerV2Call, ConsumerV2WireRequest, ConsumerWatchTerminal,
+        ConsumerWatchTerminalSlot, ConsumerWireRequest, ConsumerWireResponse,
+        PersistentCheckedOutConnection, PersistentConsumerCounters, PersistentConsumerIoBarrier,
+        PersistentConsumerShutdownReader, PersistentConsumerShutdownWriter,
+        PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
+        PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
+        PersistentSetupAttempt, PersistentShutdownPhase, PersistentWatchRecovery,
+        QueuedConsumerWatchItem, SessionConsumerAuthorizationError, SessionConsumerAuthorizer,
+        SessionConsumerCallError, SessionConsumerChange, SessionConsumerClientError,
+        SessionConsumerFencedTransitionMutationError, SessionConsumerIdentity,
+        SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionConsumerRejection,
+        SessionQuorumConsumer, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
+        DEFAULT_CONSUMER_IDLE_TIMEOUT, DEFAULT_CONSUMER_MAX_CONNECTIONS,
+        DEFAULT_CONSUMER_OPERATION_TIMEOUT, DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
@@ -8938,15 +9346,18 @@ mod tests {
         checked_session_deadline, BackendCapabilities, CompareAndSet, CompareAndSetResult,
         EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedTransitionLease,
         FencedTransitionMutation, FencedTransitionOutcome, FencedTransitionRequest,
-        FencedTransitionRequestId, Generation, LeaseGuard, OwnerId, RestoreScanCursorProfile,
-        RestoreScanPage, RestoreScanRequest, SessionConsensusClusterId,
-        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-        SessionConsensusIdentity, SessionConsumerBatchResult, SessionConsumerFencedTransitionError,
-        SessionConsumerFencedTransitionStatus, SessionConsumerLeaseError, SessionConsumerOperation,
-        SessionConsumerOutcomeUnknown, SessionConsumerRequest, SessionConsumerRequestId,
-        SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionKey,
-        SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType, StoreError,
-        StoredSessionRecord, MAX_SESSION_TTL,
+        FencedTransitionRequestId, FencedTransitionV2CallerNonce, FencedTransitionV2HistoryEpoch,
+        Generation, LeaseGuard, OwnerId, RestoreScanCursorProfile, RestoreScanPage,
+        RestoreScanRequest, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
+        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
+        SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+        SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+        SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+        SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
+        SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation,
+        SessionConsumerV2Request, SessionConsumerV2Response, SessionKey, SessionKeyType,
+        SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
+        MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
@@ -9015,6 +9426,102 @@ mod tests {
         }
     }
 
+    struct V2CountingRejectingTestConsumer {
+        v2_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionQuorumConsumer for V2CountingRejectingTestConsumer {
+        async fn execute(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _request: SessionConsumerRequest,
+        ) -> SessionConsumerResponse {
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+        }
+
+        async fn execute_v2(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _request: SessionConsumerV2Request,
+        ) -> SessionConsumerV2Response {
+            self.v2_calls.fetch_add(1, Ordering::SeqCst);
+            SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable)
+        }
+
+        async fn watch(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _scope: SessionConsumerScope,
+            _start_sequence: u64,
+        ) -> Result<
+            BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+            SessionConsumerRejection,
+        > {
+            Err(SessionConsumerRejection::Unavailable)
+        }
+    }
+
+    struct V2ConflictTestConsumer {
+        v2_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionQuorumConsumer for V2ConflictTestConsumer {
+        async fn execute(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _request: SessionConsumerRequest,
+        ) -> SessionConsumerResponse {
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+        }
+
+        async fn execute_v2(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            request: SessionConsumerV2Request,
+        ) -> SessionConsumerV2Response {
+            self.v2_calls.fetch_add(1, Ordering::SeqCst);
+            match request.operation() {
+                SessionConsumerV2Operation::FencedTransitionV2 { request }
+                    if matches!(
+                        request.validate(),
+                        Err(StoreError::FencedTransitionRequestConflict)
+                    ) =>
+                {
+                    SessionConsumerV2Response::FencedTransitionV2(Err(
+                        SessionConsumerV2FencedTransitionError::RequestConflict,
+                    ))
+                }
+                SessionConsumerV2Operation::FencedTransitionV2Status { request }
+                    if matches!(
+                        request.validate(),
+                        Err(StoreError::FencedTransitionRequestConflict)
+                    ) =>
+                {
+                    SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                        SessionConsumerV2FencedTransitionStatus::RequestConflict,
+                    ))
+                }
+                _ => {
+                    SessionConsumerV2Response::Rejected(SessionConsumerRejection::MalformedRequest)
+                }
+            }
+        }
+
+        async fn watch(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _scope: SessionConsumerScope,
+            _start_sequence: u64,
+        ) -> Result<
+            BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+            SessionConsumerRejection,
+        > {
+            Err(SessionConsumerRejection::Unavailable)
+        }
+    }
+
     struct AuthorityRejectingTestConsumer {
         calls: Arc<AtomicUsize>,
     }
@@ -9049,6 +9556,436 @@ mod tests {
             SessionConsensusConfigurationId::from_bytes([2; 32]),
             SessionConsensusConfigurationEpoch::new(1).expect("non-zero configuration epoch"),
         ))
+    }
+
+    fn v2_serialized_body_conflict(status: bool) -> SessionConsumerV2Request {
+        let key = SessionKey {
+            tenant: TenantId::new("v2-wire-body-conflict").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"v2-wire-body-conflict")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let original = opc_session_store::FencedTransitionV2Request::new(
+            FencedTransitionV2HistoryEpoch::new(1).expect("nonzero history epoch"),
+            FencedTransitionV2CallerNonce::from_bytes([0x75; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("v2-wire-body-conflict-owner").expect("test owner"),
+                FenceToken::new(0),
+                Duration::from_secs(30),
+            )
+            .expect("bounded acquire"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("original V2 transition");
+        let altered = opc_session_store::FencedTransitionV2Request::new(
+            original.request_id().epoch(),
+            original.request_id().nonce(),
+            original.lease().clone(),
+            FencedTransitionMutation::delete(Generation::new(2)),
+        )
+        .expect("altered V2 transition");
+        let operation = |request| {
+            if status {
+                SessionConsumerV2Operation::FencedTransitionV2Status {
+                    request: Box::new(request),
+                }
+            } else {
+                SessionConsumerV2Operation::FencedTransitionV2 {
+                    request: Box::new(request),
+                }
+            }
+        };
+        let original = SessionConsumerV2Request::new(scope(), operation(original));
+        let altered = SessionConsumerV2Request::new(scope(), operation(altered));
+        let original_id = serde_json::to_value(original.request_id()).expect("full ID encodes");
+        let mut encoded = serde_json::to_value(altered).expect("altered envelope encodes");
+        let serde_json::Value::Object(fields) = &mut encoded else {
+            panic!("V2 envelope is an object");
+        };
+        fields.insert("request_id".into(), original_id.clone());
+        let body = fields
+            .get_mut("operation")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|operation| operation.get_mut("request"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("V2 body is an object");
+        body.insert("request_id".into(), original_id);
+        serde_json::from_value(encoded).expect("structural conflict decodes")
+    }
+
+    #[test]
+    fn revision_four_call_envelope_never_decodes_as_revision_three() {
+        let v2 = ConsumerV2WireRequest::Call(ConsumerV2Call {
+            correlation: NonZeroU32::MIN,
+            request: Box::new(SessionConsumerV2Request::new(
+                scope(),
+                SessionConsumerV2Operation::FencedTransitionV2Capability,
+            )),
+        });
+        let encoded = serde_json::to_vec(&v2).expect("revision four call encodes");
+        assert!(decode_consumer_frame_payload::<ConsumerV2WireRequest>(&encoded).is_ok());
+        assert!(
+            decode_consumer_frame_payload::<ConsumerWireRequest>(&encoded).is_err(),
+            "a revision-three envelope cannot interpret a V2 operation"
+        );
+    }
+
+    #[test]
+    fn v2_alpn_and_revision_are_distinct_from_v1() {
+        assert_ne!(
+            super::SESSION_QUORUM_CONSUMER_ALPN,
+            super::SESSION_QUORUM_CONSUMER_V2_ALPN
+        );
+        assert_ne!(
+            super::SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+            super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION
+        );
+    }
+
+    #[test]
+    fn v2_fenced_transition_wire_accepts_typed_errors_without_relaxing_success_matching() {
+        let key = SessionKey {
+            tenant: TenantId::new("v2-error-correlation").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"v2-error-correlation")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let transition = opc_session_store::FencedTransitionV2Request::new(
+            FencedTransitionV2HistoryEpoch::new(1).expect("nonzero history epoch"),
+            FencedTransitionV2CallerNonce::from_bytes([0x74; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("v2-error-correlation-owner").expect("test owner"),
+                FenceToken::new(0),
+                Duration::from_secs(30),
+            )
+            .expect("bounded acquire"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("bounded V2 transition");
+        let request = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2 {
+                request: Box::new(transition),
+            },
+        );
+
+        for error in [
+            SessionConsumerV2FencedTransitionError::RequestConflict,
+            SessionConsumerV2FencedTransitionError::OutcomeUnknown,
+            SessionConsumerV2FencedTransitionError::Expired,
+            SessionConsumerV2FencedTransitionError::HistoryFull,
+            SessionConsumerV2FencedTransitionError::RetentionExhausted,
+            SessionConsumerV2FencedTransitionError::StorageExhausted,
+            SessionConsumerV2FencedTransitionError::Retired,
+            SessionConsumerV2FencedTransitionError::EpochNotActive,
+        ] {
+            let response = SessionConsumerV2Response::FencedTransitionV2(Err(error));
+            let encoded = serde_json::to_vec(&response).expect("typed V2 error encodes");
+            let decoded: SessionConsumerV2Response =
+                serde_json::from_slice(&encoded).expect("typed V2 error decodes");
+            assert_eq!(decoded, response);
+            assert!(
+                super::v2_response_matches_request(&request, &response),
+                "typed V2 error {error:?} must correlate to its V2 execution request"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_status_wire_accepts_a_retained_deterministic_error() {
+        let key = SessionKey {
+            tenant: TenantId::new("v2-status-error-correlation").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"v2-status-error-correlation")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let transition = opc_session_store::FencedTransitionV2Request::new(
+            FencedTransitionV2HistoryEpoch::new(1).expect("nonzero history epoch"),
+            FencedTransitionV2CallerNonce::from_bytes([0x77; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("v2-status-error-correlation-owner").expect("test owner"),
+                FenceToken::new(0),
+                Duration::from_secs(30),
+            )
+            .expect("bounded acquire"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("bounded V2 transition");
+        let request = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2Status {
+                request: Box::new(transition),
+            },
+        );
+        for error in [
+            SessionConsumerV2FencedTransitionError::TopologyAuthorityRevoked,
+            SessionConsumerV2FencedTransitionError::Store(SessionConsumerStoreError::NotFound),
+            SessionConsumerV2FencedTransitionError::Store(SessionConsumerStoreError::StaleFence),
+            SessionConsumerV2FencedTransitionError::Store(SessionConsumerStoreError::CasConflict),
+            SessionConsumerV2FencedTransitionError::InvalidSessionTtl,
+            SessionConsumerV2FencedTransitionError::InvalidRecordExpiry,
+            SessionConsumerV2FencedTransitionError::LeaseHeld,
+            SessionConsumerV2FencedTransitionError::LeaseExpired,
+            SessionConsumerV2FencedTransitionError::PayloadTooLarge {
+                actual: (opc_session_store::FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES + 1)
+                    as u64,
+                max: opc_session_store::FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES as u64,
+            },
+            SessionConsumerV2FencedTransitionError::StorageExhausted,
+        ] {
+            let response = SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Err(error))),
+            ));
+            let encoded = serde_json::to_vec(&response).expect("closed V2 status encodes");
+            assert_eq!(
+                serde_json::from_slice::<SessionConsumerV2Response>(&encoded)
+                    .expect("closed V2 status decodes"),
+                response
+            );
+            assert!(
+                super::v2_response_matches_request(&request, &response),
+                "a retained deterministic error has no outcome body to correlate, but is exact V2 status: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_status_wire_rejects_nonreceipt_store_errors() {
+        let request = v2_serialized_body_conflict(true);
+        let response = SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Err(
+                SessionConsumerV2FencedTransitionError::Store(
+                    SessionConsumerStoreError::Unavailable,
+                ),
+            ))),
+        ));
+
+        assert!(
+            !super::v2_response_matches_request(&request, &response),
+            "a custom server cannot turn an unavailable backend into a retained receipt"
+        );
+        let malformed_payload = SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Err(
+                SessionConsumerV2FencedTransitionError::PayloadTooLarge { actual: 1, max: 2 },
+            ))),
+        ));
+        assert!(
+            !super::v2_response_matches_request(&request, &malformed_payload),
+            "a custom server cannot use arbitrary platform-independent payload bounds"
+        );
+    }
+
+    #[tokio::test]
+    async fn revision_four_wire_dispatches_same_full_id_body_conflicts() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("v2-conflict-client");
+        let server_identity = material_spiffe("v2-conflict-server");
+        let client_material = RotatableClientMaterial::new(client_identity.as_str());
+        let v2_calls = Arc::new(AtomicUsize::new(0));
+        let service = Arc::new(V2ConflictTestConsumer {
+            v2_calls: Arc::clone(&v2_calls),
+        });
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity.clone()],
+            std::iter::empty(),
+        )
+        .expect("V2 conflict authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            service,
+            client_material.trusted_server_config(server_identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for V2 conflict lane");
+        let client = StatelessSessionConsumerClient::new(
+            address,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            server_identity,
+            scope(),
+            client_material.config(),
+        );
+
+        assert_eq!(
+            client.execute_v2(v2_serialized_body_conflict(false)).await,
+            Ok(SessionConsumerV2Response::FencedTransitionV2(Err(
+                SessionConsumerV2FencedTransitionError::RequestConflict,
+            )))
+        );
+        assert_eq!(
+            client.execute_v2(v2_serialized_body_conflict(true)).await,
+            Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                SessionConsumerV2FencedTransitionStatus::RequestConflict,
+            )))
+        );
+        assert_eq!(
+            v2_calls.load(Ordering::SeqCst),
+            2,
+            "both conflict forms reach the revision-four service"
+        );
+
+        let mut malformed =
+            serde_json::to_value(v2_serialized_body_conflict(false)).expect("conflict encodes");
+        let serde_json::Value::Object(fields) = &mut malformed else {
+            panic!("V2 envelope is an object");
+        };
+        fields.insert("request_id".into(), serde_json::Value::Null);
+        let malformed: SessionConsumerV2Request =
+            serde_json::from_value(malformed).expect("mismatched envelope decodes");
+        assert_eq!(
+            client.execute_v2(malformed).await,
+            Err(SessionConsumerClientError::Protocol)
+        );
+        assert_eq!(
+            v2_calls.load(Ordering::SeqCst),
+            2,
+            "outer-ID mismatches remain transport rejections"
+        );
+
+        assert_eq!(
+            client
+                .execute(SessionConsumerRequest::new(
+                    scope(),
+                    SessionConsumerRequestId::from_bytes([0x76; 16]),
+                    SessionConsumerOperation::Capabilities,
+                ))
+                .await,
+            Ok(SessionConsumerResponse::Rejected(
+                SessionConsumerRejection::Unavailable,
+            ))
+        );
+        assert_eq!(
+            v2_calls.load(Ordering::SeqCst),
+            2,
+            "the frozen revision-three lane never dispatches a V2 request"
+        );
+        server.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn v2_alpn_dispatches_execute_v2_and_rejects_a_revision_three_hello() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("v2-lane-client");
+        let server_identity = material_spiffe("v2-lane-server");
+        let client_material = RotatableClientMaterial::new(client_identity.as_str());
+        let v2_calls = Arc::new(AtomicUsize::new(0));
+        let service = Arc::new(V2CountingRejectingTestConsumer {
+            v2_calls: Arc::clone(&v2_calls),
+        });
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity.clone()],
+            std::iter::empty(),
+        )
+        .expect("V2 lane authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            service,
+            client_material.trusted_server_config(server_identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for V2 lane");
+        let client = StatelessSessionConsumerClient::new(
+            address,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            server_identity,
+            scope(),
+            client_material.config(),
+        );
+
+        // The established revision-3 lane remains served by the same
+        // listener and never dispatches through execute_v2.
+        let v1_request = SessionConsumerRequest::new(
+            scope(),
+            SessionConsumerRequestId::from_bytes([0x71; 16]),
+            SessionConsumerOperation::Capabilities,
+        );
+        assert_eq!(
+            client.execute(v1_request).await,
+            Ok(SessionConsumerResponse::Rejected(
+                SessionConsumerRejection::Unavailable
+            ))
+        );
+        assert_eq!(v2_calls.load(Ordering::SeqCst), 0);
+
+        let v2_request = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2Capability,
+        );
+        assert_eq!(
+            client.execute_v2(v2_request).await,
+            Ok(SessionConsumerV2Response::Rejected(
+                SessionConsumerRejection::Unavailable
+            ))
+        );
+        assert_eq!(v2_calls.load(Ordering::SeqCst), 1);
+
+        // An ALPN-V2 TLS connection that sends a revision-3 bootstrap must
+        // receive no acknowledgement. The matching Hello shape is deliberate
+        // here: it proves the authenticated revision check, rather than a
+        // decoder accident, closes the cross-revision lane.
+        let tcp = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect raw V2 TLS client");
+        let handshake = client_material
+            .config()
+            .begin_handshake()
+            .expect("V2 client handshake snapshot");
+        let connector = tokio_rustls::TlsConnector::from(super::consumer_client_tls_config_v2(
+            handshake.rustls_config(),
+        ));
+        let mut tls = connector
+            .connect(
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                tcp,
+            )
+            .await
+            .expect("complete V2 TLS handshake");
+        assert_eq!(
+            tls.get_ref().1.alpn_protocol(),
+            Some(super::SESSION_QUORUM_CONSUMER_V2_ALPN)
+        );
+        super::write_frame_bounded_until(
+            &mut tls,
+            &ConsumerWireRequest::Hello(ConsumerHello {
+                transport_revision: super::SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+                scope: scope(),
+                response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                    .expect("test frame size fits u32"),
+            }),
+            super::MAX_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("write cross-revision Hello");
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::read_consumer_frame::<_, super::ConsumerV2WireResponse>(
+                &mut tls,
+                super::MAX_NEGOTIATED_FRAME_SIZE,
+            ),
+        )
+        .await;
+        assert!(
+            !matches!(response, Ok(Ok(super::ConsumerV2WireResponse::HelloAck(_)))),
+            "revision three bootstrap cannot publish the V2 lane"
+        );
+        server.abort_and_wait().await;
     }
 
     #[tokio::test]

@@ -156,6 +156,33 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         self.backend.fenced_transition_status(request).await
     }
 
+    async fn fenced_transition_v2_capability(
+        &self,
+    ) -> Result<Option<crate::fenced_transition::AtomicFencedTransitionCapability>, StoreError>
+    {
+        self.backend.fenced_transition_v2_capability().await
+    }
+
+    async fn fenced_transition_v2_history_state(
+        &self,
+    ) -> Result<crate::fenced_transition::FencedTransitionV2HistoryState, StoreError> {
+        self.backend.fenced_transition_v2_history_state().await
+    }
+
+    async fn fenced_transition_v2(
+        &self,
+        request: crate::fenced_transition::FencedTransitionV2Request,
+    ) -> Result<crate::fenced_transition::FencedTransitionOutcome, StoreError> {
+        self.backend.fenced_transition_v2(request).await
+    }
+
+    async fn fenced_transition_v2_status(
+        &self,
+        request: &crate::fenced_transition::FencedTransitionV2Request,
+    ) -> Result<crate::fenced_transition::FencedTransitionV2Status, StoreError> {
+        self.backend.fenced_transition_v2_status(request).await
+    }
+
     fn record_expiry_reference(&self) -> Option<opc_types::Timestamp> {
         self.backend.record_expiry_reference()
     }

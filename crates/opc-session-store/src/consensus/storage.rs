@@ -1954,7 +1954,9 @@ mod tests {
             let (mut log_store, mut state_machine, database) =
                 open_fixed_raw_read_store(&directory).await;
             let connection = rusqlite::Connection::open(database).expect("open fixed raw-read db");
-            connection.execute(drift, []).expect("persist fixed raw-read drift");
+            connection
+                .execute(drift, [])
+                .expect("persist fixed raw-read drift");
             drop(connection);
 
             assert_fixed_raw_reads_fail_closed(&mut log_store, &mut state_machine).await;
