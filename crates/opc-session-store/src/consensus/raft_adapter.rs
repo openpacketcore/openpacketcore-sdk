@@ -1839,6 +1839,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_append_uniform_responds_before_apply_then_fences_predecessor() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let fixture = real_follower_fixture().await;
         apply_through_joint(&fixture).await;
         let final_log_id = LogId::new(CommittedLeaderId::new(1, fixture.leader), 6);
@@ -1911,6 +1912,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_final_snapshot_releases_own_permit_and_fences_predecessor() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let source = real_follower_fixture().await;
         apply_through_joint(&source).await;
         let uniform_log_id = LogId::new(CommittedLeaderId::new(1, source.leader), 6);

@@ -47,7 +47,8 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7,
     QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P999_MICROS_V7,
     QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P99_MICROS_V7, SESSION_HA_EVIDENCE_V6_SCHEMA_JSON,
-    SESSION_HA_EVIDENCE_V7_SCHEMA_JSON, SESSION_HA_HISTORY_SCHEMA_JSON, SESSION_HA_PROFILE_V6_JSON,
+    SESSION_HA_EVIDENCE_V7_SCHEMA_JSON, SESSION_HA_HISTORY_SCHEMA_JSON,
+    SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON, SESSION_HA_PROFILE_V6_JSON,
     SESSION_HA_PROFILE_V6_SCHEMA_JSON, SESSION_HA_PROFILE_V7_JSON,
     SESSION_HA_PROFILE_V7_SCHEMA_JSON, SESSION_HA_SCHEDULE_SCHEMA_JSON,
     SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON, SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES,
@@ -993,10 +994,7 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
     );
     let consumer = &profile.protocol.persistent_consumer;
     assert_eq!(consumer.alpn.as_bytes(), SESSION_QUORUM_CONSUMER_ALPN);
-    assert_eq!(
-        consumer.transport_revision,
-        SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION
-    );
+    assert_eq!(consumer.transport_revision, 2);
     assert_eq!(
         consumer.max_requests_per_connection,
         MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION
@@ -1272,6 +1270,53 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
     assert!(
         serde_json::from_value::<SessionHaQualificationProfileV7>(unknown_revision_2_field)
             .is_err()
+    );
+}
+
+#[test]
+fn current_persistent_consumer_head_attestation_binds_the_compiled_revision() {
+    let schema: Value =
+        serde_json::from_str(SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON)
+            .expect("v8 current-head evidence schema JSON");
+    assert_eq!(
+        schema["properties"]["execution"]["properties"]["transport_revision"]["const"],
+        serde_json::json!(SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION),
+        "the current-head schema must be changed with the compiled wire revision"
+    );
+
+    let attestation = serde_json::json!({
+        "schema_version": "opc-session-ha-persistent-consumer-head-evidence/v8",
+        "evidence_kind": "persistent-consumer-wire-binding",
+        "experimental": true,
+        "qualification_complete": false,
+        "source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "source_tree": "89abcdef0123456789abcdef0123456789abcdef",
+        "source_tree_status": "clean",
+        "execution": {
+            "client_type": "PersistentSessionConsumerClient",
+            "consumer_profile_path": "protocol.persistent_consumer",
+            "transport_revision": SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+            "authenticated_route": "authenticated-mtls-persistent"
+        },
+        "measurements": {
+            "members": 3,
+            "authenticated_setup_successes": 48,
+            "warm_reused_calls": 1000
+        },
+        "privacy": {
+            "fixed_labels_only": true,
+            "identifying_values_recorded": false
+        }
+    });
+    validate_structural_schema(&schema, &attestation)
+        .expect("current-head attestation matches the compiled wire revision");
+
+    let mut mismatched = attestation;
+    mismatched["execution"]["transport_revision"] =
+        serde_json::json!(SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION.wrapping_add(1));
+    assert!(
+        validate_structural_schema(&schema, &mismatched).is_err(),
+        "a current-head wire revision mismatch must fail closed"
     );
 }
 

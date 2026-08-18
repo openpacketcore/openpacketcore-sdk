@@ -232,6 +232,43 @@ mod tests {
         .expect("bounded request")
     }
 
+    #[test]
+    fn wire_payload_ceiling_is_inclusive_for_requests_and_responses() {
+        let template = request();
+        let exact_request = ConsensusWireRequest::try_new(
+            template.identity,
+            template.sender,
+            template.family,
+            vec![0; CONSENSUS_MAX_RPC_PAYLOAD_BYTES],
+        )
+        .expect("the exact request payload ceiling is valid");
+        assert_eq!(exact_request.validate(), Ok(()));
+
+        let over_request = ConsensusWireRequest {
+            payload: vec![0; CONSENSUS_MAX_RPC_PAYLOAD_BYTES + 1],
+            ..request()
+        };
+        assert_eq!(over_request.validate(), Err(ConsensusPeerError::Protocol));
+        assert_eq!(
+            ConsensusWireRequest::try_new(
+                over_request.identity,
+                over_request.sender,
+                over_request.family,
+                over_request.payload,
+            ),
+            Err(ConsensusPeerError::Protocol)
+        );
+
+        let exact_response = ConsensusWireResponse {
+            result: Ok(vec![0; CONSENSUS_MAX_RPC_PAYLOAD_BYTES]),
+        };
+        assert_eq!(exact_response.validate(), Ok(()));
+        let over_response = ConsensusWireResponse {
+            result: Ok(vec![0; CONSENSUS_MAX_RPC_PAYLOAD_BYTES + 1]),
+        };
+        assert_eq!(over_response.validate(), Err(ConsensusPeerError::Protocol));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn compatibility_default_does_not_add_a_soft_cancellation_boundary() {
         let peer = Arc::new(CompatibilityPeer {

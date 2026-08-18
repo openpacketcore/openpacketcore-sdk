@@ -1520,6 +1520,22 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             StoreError::CasConflict => Self::CasConflict,
             StoreError::CasIdempotencyConflict => Self::CasIdempotencyConflict,
             StoreError::CasIdempotencyOutcomeUnavailable => Self::CasIdempotencyOutcomeUnavailable,
+            // Protocol v5 has no fenced-transition operation or error-set revision
+            // for its status semantics. Preserve its legacy distinctions without
+            // making an unknown or expired outcome look like a safe retry.
+            StoreError::FencedTransitionRequestConflict => Self::CasIdempotencyConflict,
+            StoreError::FencedTransitionOutcomeUnknown
+            | StoreError::FencedTransitionRequestExpired => Self::CasIdempotencyOutcomeUnavailable,
+            // There is no safe legacy fallback after the permanent receipt
+            // ledger, retention horizon, or storage counter is exhausted.
+            // Represent all three as an
+            // unavailable capability, using the existing redaction-safe wire
+            // spelling rather than extending the frozen v5 enum.
+            StoreError::FencedTransitionHistoryFull
+            | StoreError::FencedTransitionRetentionExhausted
+            | StoreError::FencedTransitionStorageExhausted => {
+                Self::CapabilityNotSupported("unknown_capability")
+            }
             StoreError::BackendOperationOutcomeUnavailable => {
                 Self::BackendOperationOutcomeUnavailable
             }
@@ -4698,6 +4714,12 @@ mod tests {
             StoreError::CasConflict,
             StoreError::CasIdempotencyConflict,
             StoreError::CasIdempotencyOutcomeUnavailable,
+            StoreError::FencedTransitionRequestConflict,
+            StoreError::FencedTransitionOutcomeUnknown,
+            StoreError::FencedTransitionRequestExpired,
+            StoreError::FencedTransitionHistoryFull,
+            StoreError::FencedTransitionRetentionExhausted,
+            StoreError::FencedTransitionStorageExhausted,
             StoreError::BackendOperationOutcomeUnavailable,
             StoreError::TopologyAuthorityRevoked,
             StoreError::CapabilityNotSupported("capability".to_string()),
@@ -4738,6 +4760,16 @@ mod tests {
             let sanitized = match expected {
                 StoreError::CapabilityNotSupported(ref capability) => {
                     StoreError::CapabilityNotSupported(safe_capability_name(capability).to_string())
+                }
+                StoreError::FencedTransitionRequestConflict => StoreError::CasIdempotencyConflict,
+                StoreError::FencedTransitionOutcomeUnknown
+                | StoreError::FencedTransitionRequestExpired => {
+                    StoreError::CasIdempotencyOutcomeUnavailable
+                }
+                StoreError::FencedTransitionHistoryFull
+                | StoreError::FencedTransitionRetentionExhausted
+                | StoreError::FencedTransitionStorageExhausted => {
+                    StoreError::CapabilityNotSupported("unknown_capability".to_string())
                 }
                 StoreError::BackendUnavailable(_) => {
                     StoreError::BackendUnavailable("backend unavailable".to_string())
@@ -4786,6 +4818,54 @@ mod tests {
                     [SessionOpResult::Get(Err(StoreError::ReplicationOperationLimitExceeded))]
                 )
         ));
+    }
+
+    #[test]
+    fn fenced_transition_errors_use_frozen_fail_closed_v5_categories() {
+        let cases = [
+            (
+                StoreError::FencedTransitionRequestConflict,
+                r#"{"Get":{"Err":"CasIdempotencyConflict"}}"#,
+                StoreError::CasIdempotencyConflict,
+            ),
+            (
+                StoreError::FencedTransitionOutcomeUnknown,
+                r#"{"Get":{"Err":"CasIdempotencyOutcomeUnavailable"}}"#,
+                StoreError::CasIdempotencyOutcomeUnavailable,
+            ),
+            (
+                StoreError::FencedTransitionRequestExpired,
+                r#"{"Get":{"Err":"CasIdempotencyOutcomeUnavailable"}}"#,
+                StoreError::CasIdempotencyOutcomeUnavailable,
+            ),
+            (
+                StoreError::FencedTransitionHistoryFull,
+                r#"{"Get":{"Err":{"CapabilityNotSupported":"unknown_capability"}}}"#,
+                StoreError::CapabilityNotSupported("unknown_capability".to_string()),
+            ),
+            (
+                StoreError::FencedTransitionRetentionExhausted,
+                r#"{"Get":{"Err":{"CapabilityNotSupported":"unknown_capability"}}}"#,
+                StoreError::CapabilityNotSupported("unknown_capability".to_string()),
+            ),
+            (
+                StoreError::FencedTransitionStorageExhausted,
+                r#"{"Get":{"Err":{"CapabilityNotSupported":"unknown_capability"}}}"#,
+                StoreError::CapabilityNotSupported("unknown_capability".to_string()),
+            ),
+        ];
+
+        for (error, expected_wire, expected_legacy_error) in cases {
+            let encoded = serde_json::to_string(&Response::Get(Err(error)))
+                .expect("encode fenced-transition error");
+            assert_eq!(encoded, expected_wire);
+
+            let decoded: Response = serde_json::from_str(expected_wire)
+                .expect("decode frozen fenced-transition error category");
+            assert!(
+                matches!(decoded, Response::Get(Err(actual)) if actual == expected_legacy_error)
+            );
+        }
     }
 
     #[test]

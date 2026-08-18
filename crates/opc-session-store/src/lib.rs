@@ -26,6 +26,21 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+static CONSENSUS_TIMING_TEST_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Serialize unit tests whose bounded Raft deadlines are themselves the
+/// assertion while the default-parallel library suite performs heavy SQLite
+/// snapshot and recovery work in the same process.
+#[cfg(test)]
+pub(crate) async fn acquire_consensus_timing_test_permit() -> tokio::sync::SemaphorePermit<'static>
+{
+    CONSENSUS_TIMING_TEST_PERMIT
+        .acquire()
+        .await
+        .expect("consensus timing test permit remains open")
+}
+
 pub use opc_types::Timestamp;
 
 pub mod backend;
@@ -35,6 +50,7 @@ pub mod consensus;
 pub mod consumer;
 pub mod error;
 pub mod fake;
+pub mod fenced_transition;
 pub mod handover;
 mod hex;
 pub mod lease;
@@ -96,7 +112,8 @@ pub use consumer::{
     derive_consumer_consensus_request_id, session_consumer_batch_result,
     session_consumer_batch_result_into_store, SessionConsumerAuthorizationManifest,
     SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerChangeItem,
-    SessionConsumerChangeKind, SessionConsumerIdentity, SessionConsumerIdentityError,
+    SessionConsumerChangeKind, SessionConsumerFencedTransitionError,
+    SessionConsumerFencedTransitionStatus, SessionConsumerIdentity, SessionConsumerIdentityError,
     SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
     SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
     SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
@@ -106,6 +123,14 @@ pub use consumer::{
 };
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;
+pub use fenced_transition::{
+    AtomicFencedTransitionCapability, FencedTransitionLease, FencedTransitionMutation,
+    FencedTransitionMutationResult, FencedTransitionObservation, FencedTransitionOutcome,
+    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus,
+    FENCED_TRANSITION_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_MAX_OUTCOME_BYTES,
+    FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_REQUEST_ID_BYTES,
+    FENCED_TRANSITION_SCHEMA_V1,
+};
 pub use handover::{
     HandoverEnvelope, HandoverEnvelopeDecodeError, HandoverEnvelopeFormat, HandoverError,
     HandoverManager, HandoverSessionRecord, HANDOVER_ENVELOPE_MAGIC, HANDOVER_ENVELOPE_VERSION,

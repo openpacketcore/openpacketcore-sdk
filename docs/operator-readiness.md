@@ -1062,14 +1062,60 @@ test-only. `PersistentSessionConsumerClient` remains the required warm
 fixed-pool primitive for #695/ePDG latency, and production deployments
 requiring warm reuse should use it. Its mutual-TLS ALPN remains
 `opc-session-consumer/1`, while its exact transport
-revision advances from 1 to 2 with no fallback or dual mode. Drain consumer
-clients and listeners for one coordinated cutover; revision-1 and revision-2
-consumer peers must never coexist. Revision-2 private JSON DTO bytes are
+revision is now 3 with no fallback or dual mode. Drain consumer clients and
+listeners for one coordinated cutover; different consumer revisions must never
+coexist. Revision-3 private JSON DTO bytes are
 canonical; reordered or otherwise noncanonical encodings, aliases, omissions,
 and unknown fields fail closed. This does not admit the legacy
 `RemoteSessionBackend` surface or consensus, replication, snapshot, rebuild,
-membership, or admin authority, and explicitly excludes #696 atomic transition
-and product composition.
+membership, or admin authority. Revision 3 admits only #696's generic
+single-record atomic fenced-transition capability, observation, execution, and
+exact-status operations; product composition and ePDG-specific semantics remain
+excluded.
+
+Before V1 is activated for the exact current consensus voter scope, capability,
+observation, status, and first-transition admission require fresh authenticated
+V1 replies from every exact voter. A Raft quorum is not a mixed-version proof:
+an unavailable or incompatible voter fails closed. The first authorized
+transition after that proof carries internal scope identity and a canonical
+voter-set commitment in the same single user command/application position as
+its receipt and one-key lease-plus-bounded-mutation effect. Apply atomically
+installs the receipt/effects, a one-way persistent schema-version downgrade
+fence, and an optional single-row exact-current-scope certificate; it does not
+create another user mutation or log position. These internal admission fields
+are not public consumer-wire semantics.
+
+After that command commits, ordinary linearizable Raft quorum availability is
+sufficient for capability, observation, execution, and status; leader or
+minority loss must not cause an every-voter re-probe. A topology cutover deletes
+the old scope certificate but retains the schema fence and every receipt
+binding. The successor scope therefore needs a new every-voter proof and first
+activating or recovery transition, while stable request ID/body recovery
+survives the rollover. The exact #684 layout remains empty Prepared state and
+safe for predecessor readers until activation. Activated databases, snapshots,
+and recovery preserve the fence and receipts plus any exact-current
+certificate; snapshot install never regresses Activated to Prepared or
+erases/substitutes a same-scope certificate. A legitimately unactivated
+successor scope may have no certificate pending its new proof. Exact
+predecessor binaries reject the higher schema fence. Do not treat an offline
+pre-V1 minority as safe to catch
+up merely because it did not acknowledge activation: its old reader could omit
+new snapshot state, and the persistent fence closes that hole.
+
+For each fenced transition, the public consumer ID is byte-identical to the
+nested transition ID. Its internal receipt ID is domain-separated by
+authenticated consumer identity, stable cluster identity, and public ID, not
+by the body or changing configuration epoch; the receipt binds the complete
+canonical body. The current exact scope is enforced under the activation
+lifecycle above, allowing an authorized successor to recover across rollover
+while a revoked predecessor cannot observe the receipt. No separate
+`BindConsumerRequest` or log entry is created.
+`FencedTransitionStorageExhausted` is retained only after ordinary
+stale-fence/CAS/lease admission for an otherwise successful transition;
+revision 3 returns it as a closed `StorageExhausted` error inside `Recorded`
+status, with no lease, record, watch, or restore effect. Frozen legacy
+session-net v5 maps it fail-closed as an unknown capability without a wire
+enum change.
 
 Operators should size the fixed fair client pool as four request connections by
 default (at most 16 configured), 64 pending calls by default (hard maximum
@@ -1125,8 +1171,9 @@ false while any request lane is leased; isolated watch slots are non-gating.
 Any performance evidence is synthetic only and is not an ePDG production-SLO
 claim. Warm accept/reuse assertions gate only that synthetic method; elapsed
 samples are non-gating. The revision-2 persistent-consumer qualification
-contract is v7, while the published v6 profile remains the unchanged
-revision-1 contract.
+contract remains v7, while the published v6 profile remains the unchanged
+revision-1 contract. Revision-3 atomic-transition evidence must additionally
+prove typed one-shot and persistent round trips and exact ambiguity recovery.
 
 ### Legacy direct-backend session-net v5 rollout boundary
 

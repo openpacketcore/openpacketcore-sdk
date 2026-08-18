@@ -33,6 +33,7 @@ use super::raft_adapter::{
     SessionRaftPeerDirectory, SessionRaftRpcHandler,
 };
 use super::storage::{self, SessionConsensusStorageError};
+use super::types::fenced_transition_voter_set_digest;
 use super::{
     SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusIdentity,
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
@@ -52,13 +53,18 @@ use crate::capability::{BackendCapabilities, SessionStorePlatformProfile};
 use crate::clock::{Clock, SystemClock};
 use crate::consumer::{
     consumer_request_commitment, derive_consumer_consensus_request_id,
-    derive_consumer_request_binding_id, SessionConsumerAuthorizationManifest,
-    SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerIdentity,
-    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionQuorumConsumer, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    derive_consumer_fenced_transition_request, derive_consumer_request_binding_id,
+    SessionConsumerAuthorizationManifest, SessionConsumerBatchResult, SessionConsumerChange,
+    SessionConsumerFencedTransitionError, SessionConsumerIdentity, SessionConsumerOperation,
+    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
+    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+    SessionQuorumConsumer, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use crate::error::{LeaseError, StoreError};
+use crate::fenced_transition::{
+    AtomicFencedTransitionCapability, FencedTransitionObservation, FencedTransitionOutcome,
+    FencedTransitionRequest, FencedTransitionStatus, FENCED_TRANSITION_SCHEMA_V1,
+};
 use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{OwnerId, SessionKey};
 use crate::readiness::{
@@ -229,7 +235,7 @@ impl From<SessionRaftAdapterError> for ConsensusSessionStoreOpenError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ForwardMutationRequest {
     request_id: SessionConsensusRequestId,
     intent: SessionMutationIntent,
@@ -238,14 +244,26 @@ struct ForwardMutationRequest {
     required_consumer_scope: ForwardConsumerScope,
 }
 
+impl fmt::Debug for ForwardMutationRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ForwardMutationRequest(<redacted>)")
+    }
+}
+
 /// Explicitly distinguishes an internal forwarding call from one made for a
 /// stateless consumer. This is deliberately not an `Option`: a peer which
 /// does not understand consumer scope must fail decoding instead of treating a
 /// missing field as an internal request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ForwardConsumerScope {
     Internal,
     Consumer(Box<SessionConsensusIdentity>),
+}
+
+impl fmt::Debug for ForwardConsumerScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ForwardConsumerScope(<redacted>)")
+    }
 }
 
 impl ForwardConsumerScope {
@@ -265,7 +283,7 @@ impl ForwardConsumerScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ForwardRequest {
     Mutation(ForwardMutationRequest),
     RecordExpiryPreflight {
@@ -274,6 +292,12 @@ enum ForwardRequest {
         /// logical-time proposal. Internal callers do not carry this scope.
         required_consumer_scope: ForwardConsumerScope,
     },
+}
+
+impl fmt::Debug for ForwardRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ForwardRequest(<redacted>)")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -342,7 +366,7 @@ impl<'de> Deserialize<'de> for BoundedRecordExpiryPreflights {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ForwardMutationReply {
     Applied(Box<SessionConsensusResponse>),
     RecordExpiryPreflight(Result<(), StoreError>),
@@ -350,6 +374,12 @@ enum ForwardMutationReply {
         leader: Option<SessionConsensusNodeId>,
     },
     Unavailable,
+}
+
+impl fmt::Debug for ForwardMutationReply {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ForwardMutationReply(<redacted>)")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,6 +396,31 @@ struct LocalProposalAuthority {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct ReadBarrierRequest;
+
+/// Store-application feature probe carried over the already authenticated
+/// internal read family. Older peers reject this non-unit payload, which is
+/// the required fail-closed answer for a mixed-version membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FencedTransitionCapabilityProbe {
+    schema_version: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum FencedTransitionCapabilityReply {
+    V1,
+    Unsupported,
+}
+
+/// Exact V1 admission at one linearizable membership scope.
+///
+/// A fresh proof is intentionally not cached: only a committed activation
+/// certificate lets later requests use normal Raft quorum availability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FencedTransitionCapabilityAdmission {
+    Activated,
+    FreshUnanimous,
+}
 
 /// One consumer scope validated while holding the topology read gate.
 ///
@@ -443,13 +498,8 @@ impl fmt::Debug for ConsensusSessionConsumerService {
 }
 
 impl fmt::Debug for ConsensusSessionStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConsensusSessionStore")
-            .field("storage_identity", &self.inner.storage_identity)
-            .field("local_node_id", &self.inner.local_node_id)
-            .field("bootstrap_members", &self.inner.bootstrap_members.len())
-            .field("peer_directory", &self.inner.peer_directory)
-            .finish_non_exhaustive()
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConsensusSessionStore(<redacted>)")
     }
 }
 
@@ -830,6 +880,209 @@ impl ConsensusSessionStore {
         }
         self.current_scope()
             .map(|(identity, _)| SessionConsumerScope::new(identity))
+    }
+
+    fn local_fenced_transition_capability(&self) -> AtomicFencedTransitionCapability {
+        // This store owns the concrete SQLite consensus state machine that
+        // implements V1. Independent legacy capability bits do not establish
+        // this combined contract and are deliberately not consulted here.
+        AtomicFencedTransitionCapability::V1
+    }
+
+    /// Admit V1 for one exact linearizable voter scope.
+    ///
+    /// A durable certificate first permits ordinary quorum availability.  In
+    /// its absence every exact voter must answer the authenticated V1 probe;
+    /// the caller may then carry that proof only into the first transition's
+    /// same-position activation command.  An unavailable, unsupported, or
+    /// changed voter never becomes a quorum-derived compatibility proof.
+    async fn require_fenced_transition_capability_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedTransitionCapabilityAdmission, StoreError> {
+        self.require_exact_membership_admission()?;
+        self.linearizable_barrier_before(deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        let expected_scope = self.current_scope()?;
+        if self.local_fenced_transition_capability() != AtomicFencedTransitionCapability::V1 {
+            return Err(unsupported_fenced_transition());
+        }
+        if !expected_scope.1.contains(&self.inner.local_node_id) {
+            return Err(consensus_unavailable());
+        }
+        let activated = self
+            .inner
+            .backend
+            .consensus_fenced_transition_activation_matches_scope(
+                self.inner.storage_identity,
+                expected_scope.0,
+                expected_scope.1.clone(),
+            )
+            .await?;
+        if activated {
+            if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
+                return Err(consensus_unavailable());
+            }
+            return Ok(FencedTransitionCapabilityAdmission::Activated);
+        }
+        let probes = expected_scope
+            .1
+            .iter()
+            .copied()
+            .filter(|member| *member != self.inner.local_node_id)
+            .map(|member| async move {
+                self.call_peer::<_, FencedTransitionCapabilityReply>(
+                    member,
+                    SessionConsensusRpcFamily::ReadBarrier,
+                    &FencedTransitionCapabilityProbe {
+                        schema_version: FENCED_TRANSITION_SCHEMA_V1,
+                    },
+                    deadline,
+                )
+                .await
+            });
+        if futures_util::future::join_all(probes)
+            .await
+            .into_iter()
+            .any(|reply| !matches!(reply, Ok(FencedTransitionCapabilityReply::V1)))
+        {
+            return Err(unsupported_fenced_transition());
+        }
+        if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
+            return Err(consensus_unavailable());
+        }
+        Ok(FencedTransitionCapabilityAdmission::FreshUnanimous)
+    }
+
+    /// Advertise V1 after either the exact durable certificate or a fresh
+    /// unanimous proof that can immediately seed the first transition.
+    pub async fn fenced_transition_capability(
+        &self,
+    ) -> Result<Option<AtomicFencedTransitionCapability>, StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.require_fenced_transition_capability_before(deadline)
+            .await
+            .map(|_| Some(AtomicFencedTransitionCapability::V1))
+    }
+
+    /// Obtain a fresh record plus the durable fence floor for one exact key.
+    ///
+    /// This observation owns one consensus logical-time barrier. It does not
+    /// allocate a fence; a later acquire succeeds only if the observed floor
+    /// is still exact at the transition's committed position.
+    pub async fn observe_fenced_transition(
+        &self,
+        key: &SessionKey,
+    ) -> Result<FencedTransitionObservation, StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        let probed_scope = self.current_scope()?;
+        // A read-only observation is safe under a fresh exact unanimous
+        // proof.  Requiring the durable marker here would make the first
+        // Acquire impossible: callers need this fence floor to form the
+        // transition that atomically installs that marker.
+        self.require_fenced_transition_capability_before(deadline)
+            .await?;
+        if self.current_scope()? != probed_scope {
+            return Err(consensus_unavailable());
+        }
+        let logical_time = self.logical_read_time_before(None, deadline).await?;
+        let observation = self
+            .inner
+            .backend
+            .consensus_observe_fenced_transition_at(key, logical_time)
+            .await?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        if self.current_scope()? != probed_scope {
+            return Err(consensus_unavailable());
+        }
+        Ok(observation)
+    }
+
+    /// Atomically acquire or renew one exact-key fence and apply one bounded
+    /// same-record mutation at one consensus position.
+    pub async fn fenced_transition(
+        &self,
+        request: FencedTransitionRequest,
+    ) -> Result<FencedTransitionOutcome, StoreError> {
+        request.validate()?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        // Probe before any ForwardMutation transmission so an older current
+        // leader yields a definite compatibility error, never an ambiguous
+        // transition outcome. The leader repeats this proof immediately before
+        // proposal to cover a different forwarding route or intervening restart.
+        self.require_fenced_transition_capability_before(deadline)
+            .await?;
+        // Do not run the legacy finite-record expiry preflight here. That
+        // preflight may advance consensus logical time in its own entry and
+        // would turn this primitive back into a two-proposal composition. The
+        // transition has no pre-proposal provider side effect to protect.
+        // Immutable structure and protected payloads are admitted here, while
+        // time-dependent new-execution checks run only after apply has proved
+        // that no exact durable receipt exists.
+        let request_id = SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes());
+        let response = self
+            .submit_request_before(
+                request_id,
+                SessionMutationIntent::FencedTransition(Box::new(request)),
+                None,
+                deadline,
+            )
+            .await?;
+        match response.result? {
+            SessionMutationOutcome::FencedTransition(outcome) => Ok(outcome),
+            _ => Err(StoreError::FencedTransitionOutcomeUnknown),
+        }
+    }
+
+    /// Resolve the exact retained result for a possibly ambiguous transition.
+    ///
+    /// Status first advances committed logical time, then reads the durable
+    /// body binding without proposing another user mutation. `NotFound` is an
+    /// observation at that barrier, not proof that an earlier delayed proposal
+    /// cannot commit later; only the identical ID/body may be submitted again.
+    pub async fn fenced_transition_status(
+        &self,
+        request: &FencedTransitionRequest,
+    ) -> Result<FencedTransitionStatus, StoreError> {
+        request.validate()?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        // Status is read-only and uses the same exact live-voter proof as
+        // observation before the first activating transition.  It never
+        // treats a quorum as an activation certificate.
+        self.require_fenced_transition_capability_before(deadline)
+            .await?;
+        self.logical_read_time_before(None, deadline).await?;
+        let (authority_identity, _) = self.current_scope()?;
+        let status = self
+            .inner
+            .backend
+            .consensus_fenced_transition_status(
+                self.inner.storage_identity,
+                authority_identity,
+                request,
+            )
+            .await?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        if !self
+            .current_scope()
+            .is_ok_and(|(current_identity, _)| current_identity == authority_identity)
+        {
+            return Err(consensus_unavailable());
+        }
+        Ok(status)
     }
 
     async fn consumer_scope_before(
@@ -2052,7 +2305,14 @@ impl ConsensusSessionStore {
                         // request ID is safe; returning a generic unavailable
                         // error after this point is not.
                         outcome_may_be_unavailable = true;
-                        if request.required_consumer_scope.is_consumer_scoped() {
+                        // A fenced transition exposes exact status precisely
+                        // so callers never need an automatic replay after the
+                        // forwarding write boundary. Return ambiguity after
+                        // the first possibly delivered transmission; only a
+                        // proven pre-transmission failure may reroute it.
+                        if request.required_consumer_scope.is_consumer_scoped()
+                            || matches!(&request.intent, SessionMutationIntent::FencedTransition(_))
+                        {
                             return Err(consensus_outcome_unavailable(&request.intent));
                         }
                         if self.wait_for_route_refresh(leader, deadline).await.is_err() {
@@ -2222,7 +2482,7 @@ impl ConsensusSessionStore {
 
     async fn apply_on_local_leader_inner(
         &self,
-        request: ForwardMutationRequest,
+        mut request: ForwardMutationRequest,
         origin: SessionConsensusNodeId,
         deadline: tokio::time::Instant,
         allow_operator_recovery: bool,
@@ -2305,6 +2565,37 @@ impl ConsensusSessionStore {
             _ => return ForwardMutationReply::Unavailable,
         }
 
+        if matches!(&request.intent, SessionMutationIntent::FencedTransition(_)) {
+            match self
+                .require_fenced_transition_capability_before(deadline)
+                .await
+            {
+                Ok(FencedTransitionCapabilityAdmission::Activated) => {}
+                Ok(FencedTransitionCapabilityAdmission::FreshUnanimous) => {
+                    let (scope_identity, voters) = match self.current_scope() {
+                        Ok(scope) => scope,
+                        Err(_) => return ForwardMutationReply::Unavailable,
+                    };
+                    let SessionMutationIntent::FencedTransition(transition) = request.intent else {
+                        return ForwardMutationReply::Unavailable;
+                    };
+                    request.intent = SessionMutationIntent::ActivateFencedTransition {
+                        request: transition,
+                        scope_identity,
+                        voter_set_digest: fenced_transition_voter_set_digest(
+                            scope_identity,
+                            &voters,
+                        ),
+                    };
+                }
+                Err(_) => {
+                    return ForwardMutationReply::Applied(Box::new(
+                        SessionConsensusResponse::rejected(unsupported_fenced_transition()),
+                    ));
+                }
+            }
+        }
+
         let logical_time = match tokio::time::timeout_at(
             deadline,
             self.inner
@@ -2326,6 +2617,26 @@ impl ConsensusSessionStore {
                 .is_err()
         {
             return ForwardMutationReply::Unavailable;
+        }
+        // A fresh unanimity proof is intentionally never cached.  Recheck
+        // the exact scope immediately before proposal as well, so a topology
+        // hand-off between probing and logical-time admission cannot leave a
+        // stale activation wrapper in the replicated log.
+        if let SessionMutationIntent::ActivateFencedTransition {
+            scope_identity,
+            voter_set_digest,
+            ..
+        } = &request.intent
+        {
+            let Ok((current_identity, current_voters)) = self.current_scope() else {
+                return ForwardMutationReply::Unavailable;
+            };
+            if *scope_identity != current_identity
+                || *voter_set_digest
+                    != fenced_transition_voter_set_digest(current_identity, &current_voters)
+            {
+                return ForwardMutationReply::Unavailable;
+            }
         }
         self.propose_on_local_leader(
             request,
@@ -2351,9 +2662,21 @@ impl ConsensusSessionStore {
         deadline: tokio::time::Instant,
     ) -> ForwardMutationReply {
         let outcome_unavailable = consensus_outcome_unavailable(&request.intent);
-        let Ok((identity, _)) = self.current_scope() else {
+        let Ok((identity, voters)) = self.current_scope() else {
             return ForwardMutationReply::Unavailable;
         };
+        if let SessionMutationIntent::ActivateFencedTransition {
+            scope_identity,
+            voter_set_digest,
+            ..
+        } = &request.intent
+        {
+            if *scope_identity != identity
+                || *voter_set_digest != fenced_transition_voter_set_digest(identity, &voters)
+            {
+                return ForwardMutationReply::Unavailable;
+            }
+        }
         let intent = match request.intent {
             intent @ SessionMutationIntent::FinalizeOperatorRecovery { .. }
                 if authority.allows_operator_recovery =>
@@ -2983,6 +3306,151 @@ impl ConsensusSessionStore {
         Ok(record)
     }
 
+    async fn consumer_fenced_transition_capability(
+        &self,
+        scope: SessionConsumerScope,
+        deadline: tokio::time::Instant,
+    ) -> Result<AtomicFencedTransitionCapability, StoreError> {
+        // Scope admission is intentionally repeated around the fresh
+        // unanimous exact-voter probe. A capability answer must not be reused after an
+        // authority rollover, even though its receipt IDs deliberately survive
+        // one.
+        let admission = self
+            .admit_consumer_scope(scope, deadline)
+            .await
+            .map_err(|rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            })?;
+        drop(admission);
+        let capability = self
+            .require_fenced_transition_capability_before(deadline)
+            .await
+            .map(|_| AtomicFencedTransitionCapability::V1)?;
+        let admission = self
+            .admit_consumer_scope(scope, deadline)
+            .await
+            .map_err(|rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            })?;
+        drop(admission);
+        Ok(capability)
+    }
+
+    async fn consumer_observe_fenced_transition(
+        &self,
+        scope: SessionConsumerScope,
+        key: &SessionKey,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedTransitionObservation, StoreError> {
+        let admission = self
+            .admit_consumer_scope(scope, deadline)
+            .await
+            .map_err(|rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            })?;
+        drop(admission);
+        self.require_fenced_transition_capability_before(deadline)
+            .await?;
+        let logical_time = self
+            .logical_read_time_before(Some(scope.consensus_identity()), deadline)
+            .await?;
+        // Retain the exact-scope gate through the final authority check so a
+        // topology writer cannot roll authority between the durable read and
+        // the successful consumer response.
+        let _admission = self
+            .admit_consumer_scope(scope, deadline)
+            .await
+            .map_err(|rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            })?;
+        let observation = self
+            .inner
+            .backend
+            .consensus_observe_fenced_transition_at(key, logical_time)
+            .await?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        Ok(observation)
+    }
+
+    async fn consumer_fenced_transition(
+        &self,
+        scope: SessionConsumerScope,
+        request: FencedTransitionRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedTransitionOutcome, StoreError> {
+        request.validate()?;
+        if let Some(record) = request.mutation().record() {
+            crate::sqlite::validate_consensus_record(record)?;
+        }
+        self.consumer_fenced_transition_capability(scope, deadline)
+            .await?;
+        // Unlike legacy consumer mutations this does not submit a separate
+        // BindConsumerRequest marker. The transition's durable receipt binds
+        // its complete body at the same single consensus position as lease and
+        // record effects.
+        let request_id = SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes());
+        let response = self
+            .submit_request_before(
+                request_id,
+                SessionMutationIntent::FencedTransition(Box::new(request)),
+                Some(scope.consensus_identity()),
+                deadline,
+            )
+            .await?;
+        match response.result? {
+            SessionMutationOutcome::FencedTransition(outcome) => Ok(outcome),
+            _ => Err(StoreError::FencedTransitionOutcomeUnknown),
+        }
+    }
+
+    async fn consumer_fenced_transition_status(
+        &self,
+        scope: SessionConsumerScope,
+        request: &FencedTransitionRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedTransitionStatus, StoreError> {
+        request.validate()?;
+        let admission = self
+            .admit_consumer_scope(scope, deadline)
+            .await
+            .map_err(|rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            })?;
+        drop(admission);
+        self.require_fenced_transition_capability_before(deadline)
+            .await?;
+        self.logical_read_time_before(Some(scope.consensus_identity()), deadline)
+            .await?;
+        // Retain the exact-scope gate through the final authority check so a
+        // topology writer cannot roll authority between the durable status
+        // lookup and the successful consumer response.
+        let _admission = self
+            .admit_consumer_scope(scope, deadline)
+            .await
+            .map_err(|rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            })?;
+        let status = self
+            .inner
+            .backend
+            .consensus_fenced_transition_status(
+                self.inner.storage_identity,
+                scope.consensus_identity(),
+                request,
+            )
+            .await?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        Ok(status)
+    }
+
     async fn consumer_scan_restore_records(
         &self,
         scope: SessionConsumerScope,
@@ -3089,11 +3557,18 @@ fn consensus_unavailable() -> StoreError {
     StoreError::BackendUnavailable("session consensus quorum is unavailable".into())
 }
 
+fn unsupported_fenced_transition() -> StoreError {
+    StoreError::CapabilityNotSupported("atomic_fenced_transition_v1".into())
+}
+
 fn consensus_outcome_unavailable(intent: &SessionMutationIntent) -> StoreError {
-    if matches!(intent, SessionMutationIntent::CompareAndSet(_)) {
-        StoreError::CasIdempotencyOutcomeUnavailable
-    } else {
-        StoreError::BackendOperationOutcomeUnavailable
+    match intent {
+        SessionMutationIntent::CompareAndSet(_) => StoreError::CasIdempotencyOutcomeUnavailable,
+        SessionMutationIntent::FencedTransition(_)
+        | SessionMutationIntent::ActivateFencedTransition { .. } => {
+            StoreError::FencedTransitionOutcomeUnknown
+        }
+        _ => StoreError::BackendOperationOutcomeUnavailable,
     }
 }
 
@@ -3115,7 +3590,22 @@ fn committed_response_matches_intent(
     intent: &SessionMutationIntent,
     response: &SessionConsensusResponse,
 ) -> bool {
-    if response.sequence == 0
+    // Retention exhaustion is an absorbing replay-style no-effect result. It
+    // can be the first application command, so its committed response may
+    // legitimately retain the genesis application sequence while still
+    // carrying the committed logical-time, digest, and Raft position. A stale
+    // authority at that same horizon is deliberately masked as authority
+    // revocation without changing those no-effect sequence semantics.
+    let genesis_safe_fenced_rejection = matches!(
+        (&response.result, intent),
+        (
+            Err(StoreError::FencedTransitionRetentionExhausted
+                | StoreError::TopologyAuthorityRevoked),
+            SessionMutationIntent::FencedTransition(_)
+                | SessionMutationIntent::ActivateFencedTransition { .. }
+        )
+    );
+    if (!genesis_safe_fenced_rejection && response.sequence == 0)
         || response.digest.is_none()
         || response.logical_time.is_none()
         || response.raft_log_index == 0
@@ -3187,8 +3677,20 @@ fn committed_response_matches_intent(
                 && checked_session_deadline(logical_time, *ttl)
                     .is_ok_and(|expires_at| renewed.expires_at() == expires_at)
         }
+        (
+            Ok(SessionMutationOutcome::FencedTransition(outcome)),
+            SessionMutationIntent::FencedTransition(request),
+        ) => fenced_transition_outcome_matches_request(request, outcome, logical_time),
         _ => false,
     }
+}
+
+fn fenced_transition_outcome_matches_request(
+    request: &FencedTransitionRequest,
+    outcome: &FencedTransitionOutcome,
+    logical_time: Timestamp,
+) -> bool {
+    outcome.matches_request_at(request, logical_time)
 }
 
 fn rejected_response_matches_intent(
@@ -3220,6 +3722,13 @@ fn rejected_error_matches_intent(intent: &SessionMutationIntent, error: &StoreEr
                 StoreError::InvalidRecordExpiry
             )
         )
+        || matches!(
+            (intent, error),
+            (
+                SessionMutationIntent::FencedTransition(_),
+                StoreError::CapabilityNotSupported(reason)
+            ) if reason == "atomic_fenced_transition_v1"
+        )
 }
 
 fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreError) -> bool {
@@ -3236,6 +3745,8 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
                 | SessionMutationIntent::RenewLease { .. }
                 | SessionMutationIntent::ReleaseLease(_)
                 | SessionMutationIntent::ReadConsumerRecord { .. }
+                | SessionMutationIntent::FencedTransition(_)
+                | SessionMutationIntent::ActivateFencedTransition { .. }
         );
     }
     match intent {
@@ -3279,6 +3790,21 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
             error,
             StoreError::NotFound | StoreError::StaleFence | StoreError::LeaseHeld
         ),
+        SessionMutationIntent::FencedTransition(_) => matches!(
+            error,
+            StoreError::NotFound
+                | StoreError::StaleFence
+                | StoreError::CasConflict
+                | StoreError::InvalidSessionTtl
+                | StoreError::InvalidRecordExpiry
+                | StoreError::LeaseHeld
+                | StoreError::LeaseExpired
+                | StoreError::FencedTransitionRequestConflict
+                | StoreError::FencedTransitionRequestExpired
+                | StoreError::FencedTransitionHistoryFull
+                | StoreError::FencedTransitionRetentionExhausted
+                | StoreError::FencedTransitionStorageExhausted
+        ),
         SessionMutationIntent::FinalizeOperatorRecovery { .. } => {
             matches!(error, StoreError::InvalidKey(reason) if reason == "operator_recovery_epoch_rejected")
         }
@@ -3287,6 +3813,7 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
         | SessionMutationIntent::FenceTopologyAuthority { .. }
         | SessionMutationIntent::AbortTopologyTransition { .. }
         | SessionMutationIntent::FinalizeTopologyTransition { .. }
+        | SessionMutationIntent::ActivateFencedTransition { .. }
         | SessionMutationIntent::Authorized { .. } => false,
     }
 }
@@ -3330,6 +3857,21 @@ fn validate_consensus_command_preproposal(
         validate_stored_record_expiry_at(&op.new_record, command.logical_time)?;
         validate_sealed_payload(op)?;
     }
+    if let SessionMutationIntent::FencedTransition(request)
+    | SessionMutationIntent::ActivateFencedTransition { request, .. } = intent
+    {
+        if command.request_id
+            != SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes())
+        {
+            return Err(StoreError::InvalidKey(
+                "fenced_transition_request_id_mismatch".into(),
+            ));
+        }
+        request.validate()?;
+        if let Some(record) = request.mutation().record() {
+            crate::sqlite::validate_consensus_record(record)?;
+        }
+    }
     Ok(())
 }
 
@@ -3353,6 +3895,7 @@ fn validate_consensus_intent_with_recovery(
             | SessionMutationIntent::FenceTopologyAuthority { .. }
             | SessionMutationIntent::AbortTopologyTransition { .. }
             | SessionMutationIntent::FinalizeTopologyTransition { .. }
+            | SessionMutationIntent::ActivateFencedTransition { .. }
             | SessionMutationIntent::Authorized { .. }
     ) {
         return Err(StoreError::CapabilityNotSupported(
@@ -3361,6 +3904,12 @@ fn validate_consensus_intent_with_recovery(
     }
     if let SessionMutationIntent::CompareAndSet(op) = intent {
         validate_sealed_payload(op)?;
+    }
+    if let SessionMutationIntent::FencedTransition(request) = intent {
+        request.validate()?;
+        if let Some(record) = request.mutation().record() {
+            crate::sqlite::validate_consensus_record(record)?;
+        }
     }
     Ok(())
 }
@@ -3385,6 +3934,13 @@ fn validate_consumer_operation(operation: &SessionConsumerOperation) -> Result<(
     match operation {
         SessionConsumerOperation::CompareAndSet { op } => validate_sealed_payload(op),
         SessionConsumerOperation::Batch { ops } => validate_consensus_batch(ops),
+        SessionConsumerOperation::FencedTransition { request }
+        | SessionConsumerOperation::FencedTransitionStatus { request } => {
+            if let Some(record) = request.mutation().record() {
+                crate::sqlite::validate_consensus_record(record)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -3485,13 +4041,26 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                         result: Err(SessionConsensusPeerError::ScopeMismatch),
                     };
                 }
-                if decode_bounded::<ReadBarrierRequest>(&request.payload).is_err() {
-                    return protocol_rejection();
+                if decode_bounded::<ReadBarrierRequest>(&request.payload).is_ok() {
+                    let deadline = tokio::time::Instant::now()
+                        .checked_add(self.store.inner.operation_timeout)
+                        .unwrap_or_else(tokio::time::Instant::now);
+                    return encode_service_reply(&self.store.local_read_barrier(deadline).await);
                 }
-                let deadline = tokio::time::Instant::now()
-                    .checked_add(self.store.inner.operation_timeout)
-                    .unwrap_or_else(tokio::time::Instant::now);
-                encode_service_reply(&self.store.local_read_barrier(deadline).await)
+                let probe =
+                    match decode_bounded::<FencedTransitionCapabilityProbe>(&request.payload) {
+                        Ok(probe) => probe,
+                        Err(_) => return protocol_rejection(),
+                    };
+                let reply = if probe.schema_version == FENCED_TRANSITION_SCHEMA_V1
+                    && self.store.local_fenced_transition_capability()
+                        == AtomicFencedTransitionCapability::V1
+                {
+                    FencedTransitionCapabilityReply::V1
+                } else {
+                    FencedTransitionCapabilityReply::Unsupported
+                };
+                encode_service_reply(&reply)
             }
             SessionConsensusRpcFamily::TopologyAdmissionBarrier => {
                 let barrier = match decode_bounded(&request.payload) {
@@ -3529,6 +4098,58 @@ fn protocol_rejection() -> SessionConsensusWireResponse {
 }
 
 impl ConsensusSessionConsumerService {
+    async fn execute_fenced_transition(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: &SessionConsumerRequest,
+        transition: FencedTransitionRequest,
+        deadline: tokio::time::Instant,
+    ) -> SessionConsumerResponse {
+        let internal =
+            match derive_consumer_fenced_transition_request(identity, request.scope(), &transition)
+            {
+                Ok(internal) => internal,
+                Err(rejection) => return SessionConsumerResponse::Rejected(rejection),
+            };
+        match self
+            .store
+            .consumer_fenced_transition(request.scope(), internal, deadline)
+            .await
+        {
+            Ok(outcome) if outcome.matches_request(&transition) => {
+                SessionConsumerResponse::FencedTransition(Ok(outcome))
+            }
+            Ok(_) | Err(StoreError::FencedTransitionOutcomeUnknown) => {
+                SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Mutation {
+                    request_id: request.request_id(),
+                })
+            }
+            Err(error) => SessionConsumerResponse::FencedTransition(Err(error.into())),
+        }
+    }
+
+    async fn fenced_transition_status(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: &SessionConsumerRequest,
+        transition: FencedTransitionRequest,
+        deadline: tokio::time::Instant,
+    ) -> SessionConsumerResponse {
+        let internal =
+            match derive_consumer_fenced_transition_request(identity, request.scope(), &transition)
+            {
+                Ok(internal) => internal,
+                Err(rejection) => return SessionConsumerResponse::Rejected(rejection),
+            };
+        SessionConsumerResponse::FencedTransitionStatus(
+            self.store
+                .consumer_fenced_transition_status(request.scope(), &internal, deadline)
+                .await
+                .map(Into::into)
+                .map_err(SessionConsumerStoreError::from),
+        )
+    }
+
     fn operation_deadline(&self) -> Result<tokio::time::Instant, SessionConsumerRejection> {
         tokio::time::Instant::now()
             .checked_add(self.store.inner.operation_timeout)
@@ -3618,8 +4239,16 @@ impl ConsensusSessionConsumerService {
             | SessionConsumerOperation::Get { .. }
             | SessionConsumerOperation::PreflightRecordExpiry { .. }
             | SessionConsumerOperation::ScanRestoreRecords { .. }
-            | SessionConsumerOperation::Watch { .. } => {
+            | SessionConsumerOperation::Watch { .. }
+            | SessionConsumerOperation::FencedTransitionCapability
+            | SessionConsumerOperation::ObserveFencedTransition { .. }
+            | SessionConsumerOperation::FencedTransitionStatus { .. } => {
                 SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
+            }
+            SessionConsumerOperation::FencedTransition { .. } => {
+                SessionConsumerResponse::FencedTransition(Err(
+                    SessionConsumerFencedTransitionError::RequestConflict,
+                ))
             }
         }
     }
@@ -3641,6 +4270,13 @@ impl ConsensusSessionConsumerService {
                 SessionConsumerOperation::Batch { .. } => {
                     SessionConsumerResponse::Batch(Err(SessionConsumerStoreError::PayloadTooLarge))
                 }
+                SessionConsumerOperation::FencedTransition { .. } => {
+                    SessionConsumerResponse::FencedTransition(Err(
+                        SessionConsumerFencedTransitionError::Store(
+                            SessionConsumerStoreError::PayloadTooLarge,
+                        ),
+                    ))
+                }
                 _ => SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest),
             };
         }
@@ -3653,7 +4289,10 @@ impl ConsensusSessionConsumerService {
             | SessionConsumerOperation::Get { .. }
             | SessionConsumerOperation::PreflightRecordExpiry { .. }
             | SessionConsumerOperation::ScanRestoreRecords { .. }
-            | SessionConsumerOperation::Watch { .. } => false,
+            | SessionConsumerOperation::Watch { .. }
+            | SessionConsumerOperation::FencedTransitionCapability
+            | SessionConsumerOperation::ObserveFencedTransition { .. }
+            | SessionConsumerOperation::FencedTransitionStatus { .. } => false,
             SessionConsumerOperation::Batch { ops } => ops
                 .iter()
                 .any(|operation| !matches!(operation, SessionOp::Get { .. })),
@@ -3662,7 +4301,8 @@ impl ConsensusSessionConsumerService {
             | SessionConsumerOperation::RefreshTtl { .. }
             | SessionConsumerOperation::AcquireLease { .. }
             | SessionConsumerOperation::RenewLease { .. }
-            | SessionConsumerOperation::ReleaseLease { .. } => true,
+            | SessionConsumerOperation::ReleaseLease { .. }
+            | SessionConsumerOperation::FencedTransition { .. } => true,
         }
     }
 
@@ -3781,7 +4421,9 @@ impl ConsensusSessionConsumerService {
                     if consumer_mutation_unknown(&result) {
                         return if contains_mutation {
                             SessionConsumerResponse::OutcomeUnknown(
-                                SessionConsumerOutcomeUnknown::Mutation,
+                                SessionConsumerOutcomeUnknown::Mutation {
+                                    request_id: request.request_id(),
+                                },
                             )
                         } else {
                             SessionConsumerResponse::Batch(Err(
@@ -3807,7 +4449,9 @@ impl ConsensusSessionConsumerService {
                         });
                     if consumer_mutation_unknown(&result) {
                         return SessionConsumerResponse::OutcomeUnknown(
-                            SessionConsumerOutcomeUnknown::Mutation,
+                            SessionConsumerOutcomeUnknown::Mutation {
+                                request_id: request.request_id(),
+                            },
                         );
                     }
                     SessionConsumerBatchResult::CompareAndSet(
@@ -3830,7 +4474,9 @@ impl ConsensusSessionConsumerService {
                         });
                     if consumer_mutation_unknown(&result) {
                         return SessionConsumerResponse::OutcomeUnknown(
-                            SessionConsumerOutcomeUnknown::Mutation,
+                            SessionConsumerOutcomeUnknown::Mutation {
+                                request_id: request.request_id(),
+                            },
                         );
                     }
                     SessionConsumerBatchResult::DeleteFenced(
@@ -3853,7 +4499,9 @@ impl ConsensusSessionConsumerService {
                         });
                     if consumer_mutation_unknown(&result) {
                         return SessionConsumerResponse::OutcomeUnknown(
-                            SessionConsumerOutcomeUnknown::Mutation,
+                            SessionConsumerOutcomeUnknown::Mutation {
+                                request_id: request.request_id(),
+                            },
                         );
                     }
                     SessionConsumerBatchResult::RefreshTtl(
@@ -3907,6 +4555,14 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
             // while entering that path: Tokio's fair RwLock would otherwise
             // allow a queued writer to self-block this consumer request.
             drop(admission);
+            if let SessionConsumerOperation::FencedTransition {
+                request: transition,
+            } = operation
+            {
+                return self
+                    .execute_fenced_transition(identity, &request, *transition, deadline)
+                    .await;
+            }
             if let SessionConsumerOperation::Batch { ops } = &operation {
                 if !self.batch_response_is_admitted(ops) {
                     return SessionConsumerResponse::Batch(Err(
@@ -3937,7 +4593,9 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                         });
                     if consumer_mutation_unknown(&result) {
                         SessionConsumerResponse::OutcomeUnknown(
-                            SessionConsumerOutcomeUnknown::Mutation,
+                            SessionConsumerOutcomeUnknown::Mutation {
+                                request_id: request.request_id(),
+                            },
                         )
                     } else {
                         SessionConsumerResponse::CompareAndSet(
@@ -3961,7 +4619,9 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                         });
                     if consumer_mutation_unknown(&result) {
                         SessionConsumerResponse::OutcomeUnknown(
-                            SessionConsumerOutcomeUnknown::Mutation,
+                            SessionConsumerOutcomeUnknown::Mutation {
+                                request_id: request.request_id(),
+                            },
                         )
                     } else {
                         SessionConsumerResponse::DeleteFenced(
@@ -3985,7 +4645,9 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                         });
                     if consumer_mutation_unknown(&result) {
                         SessionConsumerResponse::OutcomeUnknown(
-                            SessionConsumerOutcomeUnknown::Mutation,
+                            SessionConsumerOutcomeUnknown::Mutation {
+                                request_id: request.request_id(),
+                            },
                         )
                     } else {
                         SessionConsumerResponse::RefreshTtl(
@@ -4071,6 +4733,9 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                         )
                     }
                 }
+                SessionConsumerOperation::FencedTransition { .. } => {
+                    unreachable!("fenced transition bypasses the legacy binding marker")
+                }
                 _ => unreachable!("mutation classifier and operation variant disagree"),
             };
         }
@@ -4078,6 +4743,31 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
         match operation {
             SessionConsumerOperation::Capabilities => {
                 SessionConsumerResponse::Capabilities(self.store.capabilities().await)
+            }
+            SessionConsumerOperation::FencedTransitionCapability => {
+                drop(admission);
+                SessionConsumerResponse::FencedTransitionCapability(
+                    self.store
+                        .consumer_fenced_transition_capability(request.scope(), deadline)
+                        .await
+                        .map_err(SessionConsumerStoreError::from),
+                )
+            }
+            SessionConsumerOperation::ObserveFencedTransition { key } => {
+                drop(admission);
+                SessionConsumerResponse::ObserveFencedTransition(
+                    self.store
+                        .consumer_observe_fenced_transition(request.scope(), &key, deadline)
+                        .await
+                        .map_err(SessionConsumerStoreError::from),
+                )
+            }
+            SessionConsumerOperation::FencedTransitionStatus {
+                request: transition,
+            } => {
+                drop(admission);
+                self.fenced_transition_status(identity, &request, *transition, deadline)
+                    .await
             }
             SessionConsumerOperation::Get { key } => {
                 drop(admission);
@@ -4106,7 +4796,8 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
             | SessionConsumerOperation::RefreshTtl { .. }
             | SessionConsumerOperation::AcquireLease { .. }
             | SessionConsumerOperation::RenewLease { .. }
-            | SessionConsumerOperation::ReleaseLease { .. } => {
+            | SessionConsumerOperation::ReleaseLease { .. }
+            | SessionConsumerOperation::FencedTransition { .. } => {
                 unreachable!("mutation classifier and operation variant disagree")
             }
             SessionConsumerOperation::ScanRestoreRecords { request: scan } => {
@@ -4219,6 +4910,33 @@ impl SessionBackend for ConsensusSessionStore {
         self.require_application_traffic_authority_before(deadline)
             .await?;
         Ok(record)
+    }
+
+    async fn observe_fenced_transition(
+        &self,
+        key: &SessionKey,
+    ) -> Result<FencedTransitionObservation, StoreError> {
+        ConsensusSessionStore::observe_fenced_transition(self, key).await
+    }
+
+    async fn fenced_transition_capability(
+        &self,
+    ) -> Result<Option<AtomicFencedTransitionCapability>, StoreError> {
+        ConsensusSessionStore::fenced_transition_capability(self).await
+    }
+
+    async fn fenced_transition(
+        &self,
+        request: FencedTransitionRequest,
+    ) -> Result<FencedTransitionOutcome, StoreError> {
+        ConsensusSessionStore::fenced_transition(self, request).await
+    }
+
+    async fn fenced_transition_status(
+        &self,
+        request: &FencedTransitionRequest,
+    ) -> Result<FencedTransitionStatus, StoreError> {
+        ConsensusSessionStore::fenced_transition_status(self, request).await
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
@@ -4495,6 +5213,10 @@ mod membership_tests {
         QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
         ReplicaId, ReplicaTlsIdentity,
     };
+    use crate::{
+        FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequestId,
+        SessionConsumerRequestId,
+    };
     use opc_types::{NetworkFunctionKind, TenantId};
 
     fn node(value: u64) -> SessionConsensusNodeId {
@@ -4574,6 +5296,49 @@ mod membership_tests {
             ConsensusIdentity::new(cluster_id, configuration_id, epoch),
         )
         .expect("singleton topology")
+    }
+
+    #[tokio::test]
+    async fn consensus_session_store_debug_is_fixed_and_redacts_topology_identity() {
+        let directory = tempfile::tempdir().expect("debug canary directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("debug canary SQLite backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open debug canary store");
+        let node_ordinal = store.inner.local_node_id.get().to_string();
+        let configuration_epoch = store
+            .inner
+            .storage_identity
+            .configuration_epoch()
+            .get()
+            .to_string();
+
+        let rendered = format!("{store:?}");
+        assert!(
+            rendered == "ConsensusSessionStore(<redacted>)",
+            "consensus store Debug must remain fixed and redacted"
+        );
+        for canary in [
+            "storage_identity",
+            "ConsensusIdentity",
+            "local_node_id",
+            "ConsensusNodeId",
+            "configuration_epoch",
+            "peer_directory",
+            node_ordinal.as_str(),
+            configuration_epoch.as_str(),
+        ] {
+            assert!(
+                !rendered.contains(canary),
+                "consensus store Debug exposed a topology identity canary"
+            );
+        }
     }
 
     fn forged_operator_recovery_intent(seed: u8) -> SessionMutationIntent {
@@ -5064,6 +5829,136 @@ mod membership_tests {
     }
 
     #[test]
+    fn preproposal_binds_the_outer_request_id_to_the_complete_fenced_transition() {
+        let logical_time = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let key = SessionKey {
+            tenant: TenantId::new("fenced-request-binding").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"fenced-request-binding")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let owner = OwnerId::new("fenced-request-binding-owner").expect("owner");
+        let request = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x41; 16]),
+            FencedTransitionLease::acquire(
+                key.clone(),
+                owner.clone(),
+                FenceToken::new(0),
+                Duration::from_secs(60),
+            )
+            .expect("lease action"),
+            FencedTransitionMutation::create(StoredSessionRecord {
+                key,
+                generation: Generation::new(1),
+                owner,
+                fence: FenceToken::new(1),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::from_static("fenced-request-binding"),
+                expires_at: None,
+                payload: EncryptedSessionPayload::new([]),
+            }),
+        )
+        .expect("transition request");
+        let identity = singleton_topology()
+            .consensus_identity()
+            .expect("consensus identity");
+        let command = crate::consensus::SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity,
+            request_id: SessionConsensusRequestId::from_bytes([0x42; 16]),
+            logical_time,
+            intent: SessionMutationIntent::Authorized {
+                origin: node(1),
+                authority_identity: identity,
+                mutation: Box::new(SessionMutationIntent::FencedTransition(Box::new(request))),
+            },
+        };
+
+        assert_eq!(
+            validate_consensus_command_preproposal(&command),
+            Err(StoreError::InvalidKey(
+                "fenced_transition_request_id_mismatch".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn committed_fenced_rejections_match_the_apply_time_contract() {
+        let logical_time = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let key = SessionKey {
+            tenant: TenantId::new("fenced-committed-rejection").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"fenced-committed-rejection")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let request = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x43; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("fenced-committed-owner").expect("owner"),
+                FenceToken::new(0),
+                Duration::from_secs(60),
+            )
+            .expect("lease action"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("fenced intent");
+        let intent = SessionMutationIntent::FencedTransition(Box::new(request));
+        let committed = |error| SessionConsensusResponse {
+            result: Err(error),
+            sequence: 1,
+            digest: Some(crate::consensus::SessionConsensusEntryDigest::from_bytes(
+                [0x44; 32],
+            )),
+            logical_time: Some(logical_time),
+            raft_log_index: 1,
+        };
+
+        for error in [
+            StoreError::InvalidSessionTtl,
+            StoreError::InvalidRecordExpiry,
+            StoreError::FencedTransitionHistoryFull,
+            StoreError::FencedTransitionRetentionExhausted,
+        ] {
+            assert!(committed_response_matches_intent(
+                &intent,
+                &committed(error)
+            ));
+        }
+        let mut genesis_exhausted = committed(StoreError::FencedTransitionRetentionExhausted);
+        genesis_exhausted.sequence = 0;
+        assert!(committed_response_matches_intent(
+            &intent,
+            &genesis_exhausted,
+        ));
+        let mut genesis_revoked = committed(StoreError::TopologyAuthorityRevoked);
+        genesis_revoked.sequence = 0;
+        assert!(committed_response_matches_intent(&intent, &genesis_revoked));
+        assert!(!committed_response_matches_intent(
+            &SessionMutationIntent::AdvanceLogicalTime,
+            &genesis_revoked,
+        ));
+        let mut invalid_genesis = committed(StoreError::FencedTransitionHistoryFull);
+        invalid_genesis.sequence = 0;
+        assert!(!committed_response_matches_intent(
+            &intent,
+            &invalid_genesis,
+        ));
+        assert!(!committed_response_matches_intent(
+            &intent,
+            &committed(StoreError::PayloadTooLarge { actual: 2, max: 1 }),
+        ));
+        assert!(!rejected_response_matches_intent(
+            &intent,
+            &SessionConsensusResponse::rejected(StoreError::InvalidRecordExpiry),
+        ));
+    }
+
+    #[test]
     fn preproposal_rejects_nested_authorized_consensus_record() {
         let logical_time = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
         let key = SessionKey {
@@ -5407,6 +6302,7 @@ mod membership_tests {
 
     #[tokio::test]
     async fn oversized_consumer_batch_does_not_bind_request_id() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let (_directory, store, scope, identity, key, lease) = consumer_boundary_store().await;
         let service = store.consumer_service();
         let request_id = crate::SessionConsumerRequestId::from_bytes([0x92; 16]);
@@ -5659,6 +6555,7 @@ mod membership_tests {
 
     #[tokio::test]
     async fn typed_consumer_service_deduplicates_and_fences_competing_leases() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let directory = tempfile::tempdir().expect("consumer service directory");
         let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
             .expect("consumer service SQLite backend");
@@ -5751,6 +6648,81 @@ mod membership_tests {
                 ))
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn consumer_fenced_transition_bypasses_the_legacy_binding_proposal() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("consumer transition directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("consumer transition SQLite backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open consumer transition store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize consumer transition store");
+
+        let scope = store.consumer_scope().expect("current consumer scope");
+        let identity = SessionConsumerIdentity::new("spiffe://test.example/consumer/transition")
+            .expect("consumer identity");
+        let key = SessionKey {
+            tenant: TenantId::new("consumer-transition").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"one-proposal")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let owner = OwnerId::new("consumer-transition-owner").expect("owner");
+        let transition_id = FencedTransitionRequestId::from_bytes([0x91; 16]);
+        let transition = FencedTransitionRequest::new(
+            transition_id,
+            FencedTransitionLease::acquire(
+                key.clone(),
+                owner.clone(),
+                FenceToken::new(0),
+                Duration::from_secs(30),
+            )
+            .expect("lease"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("transition");
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .expect("initialized log index");
+        let response = store
+            .consumer_service()
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    SessionConsumerRequestId::from_bytes(*transition_id.as_bytes()),
+                    SessionConsumerOperation::FencedTransition {
+                        request: Box::new(transition),
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            response,
+            SessionConsumerResponse::FencedTransition(_)
+        ));
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before + 1),
+            "the consumer transition must not append a BindConsumerRequest marker"
+        );
     }
 
     #[tokio::test]
@@ -5869,6 +6841,7 @@ mod membership_tests {
 
     #[tokio::test]
     async fn committed_expiry_floor_is_idempotent_and_survives_leader_clock_rollback() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let directory = tempfile::tempdir().expect("expiry floor directory");
         let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
             .expect("expiry floor SQLite backend");
@@ -5958,6 +6931,7 @@ mod membership_tests {
 
     #[tokio::test]
     async fn watch_exposes_only_state_machine_applied_application_entries() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let directory = tempfile::tempdir().expect("watch commit gate directory");
         let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
             .expect("watch commit gate SQLite backend");

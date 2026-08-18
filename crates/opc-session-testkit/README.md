@@ -403,6 +403,12 @@ It routes to a separate closed v7 foundation-evidence schema, which is bound
 only to profile v7. The retained v6 evidence schema remains bound only to the
 v6 profile, so neither artifact can be presented as evidence for the other.
 
+`qualification/v8/session-ha-persistent-consumer-head-evidence.schema.json`
+is a separate exact-head attestation for the live persistent-consumer wire
+revision. It records the compiled revision and bounded generic harness counters
+without claiming conformance to the frozen v7 revision-2 profile or any
+downstream production SLO.
+
 Schedule v6 also binds `terminal-stage-elapsed-millis/v1`. If an accepted
 recovery operation finishes after its fixed deadline, the campaign remains
 failed and reports only the closed deadline code, the terminal operation stage,

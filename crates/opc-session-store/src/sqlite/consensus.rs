@@ -11,7 +11,7 @@ use std::io;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
 use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
@@ -28,13 +28,21 @@ use crate::backend::{
 use crate::capability::BackendCapabilities;
 use crate::consensus::storage::{ConsensusAuthorityProfile, SessionConsensusStorageError};
 use crate::consensus::types::{
-    SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+    fenced_transition_voter_set_digest, SessionConsensusCommand,
+    SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
     SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusNodeId,
     SessionConsensusRequestId, SessionConsensusResponse, SessionMutationIntent,
     SessionMutationOutcome, SessionTopologyMemberBinding, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::consensus::SessionRaftTypeConfig;
 use crate::error::{LeaseError, StoreError};
+use crate::fenced_transition::{
+    FencedTransitionLease, FencedTransitionMutation, FencedTransitionMutationResult,
+    FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionStatus,
+    FENCED_TRANSITION_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_MAX_OUTCOME_BYTES,
+    FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_REQUEST_ID_BYTES,
+    FENCED_TRANSITION_SCHEMA_V1,
+};
 use crate::readiness::PlacementResiliencePolicy;
 use crate::record::SessionPayloadEncoding;
 
@@ -48,6 +56,26 @@ const MEMBERSHIP_SCOPE_BINDINGS_MAX_BYTES: usize = 32 * 1_024;
 const MEMBERSHIP_HISTORY_MAX_ENTRIES: usize = 4_096;
 const MEMBERSHIP_TRANSITION_ID_BYTES: usize = 16;
 const OUTCOME_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/outcome-payload/v1\0";
+const FENCED_TRANSITION_RECEIPT_BINDING_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/fenced-transition-receipt-binding/v1\0";
+const FENCED_TRANSITION_RECEIPT_RESPONSE_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/fenced-transition-receipt-response/v1\0";
+/// The full fenced-transition receipt is short lived, but it is still bounded
+/// independently of the generic consensus outcome table.  Once the recovery
+/// window closes the row is compacted to its fixed-size ID/body tombstone.
+/// Full outcome envelope allowance in addition to the public outcome bound.
+pub(crate) const FENCED_TRANSITION_RECEIPT_MAX_RESPONSE_BYTES: usize =
+    FENCED_TRANSITION_MAX_OUTCOME_BYTES + 1_024;
+/// Exact byte width emitted by `format_rfc3339_normalized` for every RFC 3339
+/// timestamp accepted by `Timestamp::from_str`.
+pub(crate) const FENCED_TRANSITION_RECEIPT_TIMESTAMP_BYTES: usize = 30;
+const FENCED_TRANSITION_RECEIPT_SCHEMA_SQL_MAX_BYTES: i64 = 4_096;
+const CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES: i64 = 16 * 1024;
+// These immutable expected DDL products are independent of every replica and
+// are compared against each durable activation boundary. Building them from a
+// canonical in-memory schema is deliberately one-time: append and apply run
+// this classifier for every command, including snapshot catch-up logs.
+static ACTIVATED_CONSENSUS_IDENTITY_SCHEMA_FORMS: OnceLock<BTreeSet<String>> = OnceLock::new();
 const OPERATOR_RECOVERY_LATCH_MAGIC: &[u8; 8] = b"OPCRL001";
 const OPERATOR_RECOVERY_LATCH_BYTES: usize = 8 + 32 + 32 + 8 + 8 + 32 + 1;
 
@@ -655,7 +683,10 @@ CREATE TABLE consensus_identity (
     configuration_id BLOB NOT NULL CHECK (length(configuration_id) = 32),
     configuration_epoch INTEGER NOT NULL UNIQUE CHECK (configuration_epoch > 0),
     authority_profile INTEGER NOT NULL DEFAULT 1 CHECK (authority_profile IN (1, 2)),
-    fixed_placement_policy INTEGER CHECK (fixed_placement_policy IN (1, 2))
+    fixed_placement_policy INTEGER CHECK (fixed_placement_policy IN (1, 2)),
+    fenced_transition_receipt_ledger_activated INTEGER NOT NULL DEFAULT 0 CHECK (
+        fenced_transition_receipt_ledger_activated IN (0, 1)
+    )
 );
 
 CREATE TABLE consensus_membership_scope (
@@ -1043,6 +1074,43 @@ CREATE TABLE consensus_request_outcomes (
     payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
     response_json BLOB NOT NULL,
     FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+
+CREATE TABLE consensus_fenced_transition_receipts (
+    request_id BLOB NOT NULL PRIMARY KEY CHECK (
+        length(request_id) = 16
+        AND request_id != X'00000000000000000000000000000000'
+    ),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
+    retained_until TEXT NOT NULL CHECK (octet_length(retained_until) = 30),
+    binding_digest BLOB NOT NULL CHECK (length(binding_digest) = 32),
+    response_json BLOB CHECK (
+        response_json IS NULL
+        OR length(response_json) BETWEEN 1 AND 17408
+    ),
+    response_digest BLOB CHECK (
+        response_digest IS NULL OR length(response_digest) = 32
+    ),
+    CHECK (
+        (response_json IS NULL AND response_digest IS NULL)
+        OR (response_json IS NOT NULL AND response_digest IS NOT NULL)
+    ),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+
+CREATE INDEX consensus_fenced_transition_receipts_due
+    ON consensus_fenced_transition_receipts (retained_until, request_id)
+    WHERE response_json IS NOT NULL;
+
+CREATE TABLE consensus_fenced_transition_activation (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    storage_configuration_epoch INTEGER NOT NULL CHECK (storage_configuration_epoch > 0),
+    scope_configuration_id BLOB NOT NULL CHECK (length(scope_configuration_id) = 32),
+    scope_configuration_epoch INTEGER NOT NULL CHECK (scope_configuration_epoch > 0),
+    voter_set_digest BLOB NOT NULL CHECK (length(voter_set_digest) = 32),
+    FOREIGN KEY(storage_configuration_epoch)
+        REFERENCES consensus_identity(configuration_epoch)
 );
 
 CREATE TABLE consensus_snapshot (
@@ -1450,7 +1518,7 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
         let epoch = checked_positive_i64(storage_identity.configuration_epoch().get())
             .map_err(|_| SessionConsensusStorageError::InvalidIdentity)?;
         tx.execute(
-            "INSERT INTO consensus_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch, authority_profile, fixed_placement_policy) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO consensus_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch, authority_profile, fixed_placement_policy, fenced_transition_receipt_ledger_activated) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, 0)",
             params![
                 i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
                 storage_identity.cluster_id().as_bytes().as_slice(),
@@ -1495,6 +1563,15 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     }
     ensure_operator_recovery_schema_sync(&tx, storage_identity)
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    ensure_fenced_transition_receipt_ledger_activation_sync(&tx, storage_identity).map_err(
+        |error| {
+            if error.kind() == io::ErrorKind::InvalidData {
+                SessionConsensusStorageError::CorruptState
+            } else {
+                SessionConsensusStorageError::BackendUnavailable
+            }
+        },
+    )?;
     ensure_membership_scope_schema_sync(
         &tx,
         storage_identity,
@@ -1924,7 +2001,9 @@ pub(crate) fn read_storage_identity_sync(
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
         .ok_or(SessionConsensusStorageError::CorruptState)?;
     let (schema, cluster, configuration, epoch) = row;
-    if schema != i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) {
+    if schema != i64::from(SESSION_CONSENSUS_SCHEMA_VERSION)
+        && schema != i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 1
+    {
         return Err(SessionConsensusStorageError::SchemaVersionMismatch);
     }
     let cluster: [u8; 32] = cluster
@@ -3801,6 +3880,7 @@ pub(crate) fn fence_application_authority_in_tx(
     Ok(MembershipScopeMutation::Applied)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_application_authority_sync(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
@@ -3808,6 +3888,19 @@ pub(crate) fn validate_application_authority_sync(
     authority_identity: SessionConsensusIdentity,
 ) -> io::Result<()> {
     let scope = read_membership_scope_sync(conn, storage_identity)?;
+    if !application_authority_matches(&scope, origin, authority_identity) {
+        return Err(invalid_data(
+            "session consensus application origin is not authoritative",
+        ));
+    }
+    Ok(())
+}
+
+fn application_authority_matches(
+    scope: &MembershipValidationScope,
+    origin: SessionConsensusNodeId,
+    authority_identity: SessionConsensusIdentity,
+) -> bool {
     let durable_authority_identity = if scope.application_authority_epoch
         == scope.current_identity.configuration_epoch()
     {
@@ -3818,14 +3911,8 @@ pub(crate) fn validate_application_authority_sync(
                 .then_some(pending.desired_identity)
         })
     };
-    if durable_authority_identity != Some(authority_identity)
-        || !scope.application_authority_members.contains(&origin)
-    {
-        return Err(invalid_data(
-            "session consensus application origin is not authoritative",
-        ));
-    }
-    Ok(())
+    durable_authority_identity == Some(authority_identity)
+        && scope.application_authority_members.contains(&origin)
 }
 
 #[cfg(test)]
@@ -4136,6 +4223,19 @@ fn promote_membership_scope_at_in_tx(
     if changed != 1 {
         return Err(MembershipScopeMutationError::ConflictingTransition);
     }
+    // Schema V2 remains permanently fenced against an older reader, but its
+    // sole certificate is scoped to the voter set that just lost authority.
+    // Delete it in this same cutover transaction so reopen/snapshot/recovery
+    // can never retain a stale proof into the successor configuration.
+    let deleted_activation = conn
+        .execute(
+            "DELETE FROM consensus_fenced_transition_activation WHERE singleton = 1",
+            [],
+        )
+        .map_err(|_| MembershipScopeMutationError::BackendUnavailable)?;
+    if deleted_activation > 1 {
+        return Err(MembershipScopeMutationError::CorruptState);
+    }
     conn.execute(
         "DELETE FROM consensus_candidate_bootstrap WHERE singleton = 1 AND transition_id = ?1 AND transition_digest = ?2",
         params![transition_id.as_slice(), transition_digest.as_slice()],
@@ -4341,6 +4441,8 @@ fn validate_existing_schema(
         "consensus_membership",
         "consensus_machine",
         "consensus_request_outcomes",
+        "consensus_fenced_transition_receipts",
+        "consensus_fenced_transition_activation",
         "consensus_snapshot",
         "consensus_operator_recovery",
     ] {
@@ -4370,6 +4472,8 @@ fn validate_existing_schema(
     }
     validate_persisted_membership_sync(conn, storage_identity)
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    validate_fenced_transition_receipts_sync(conn, storage_identity)
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
     Ok(())
 }
 
@@ -4391,6 +4495,865 @@ CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
     FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
 );
 "#;
+
+const FENCED_TRANSITION_RECEIPT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS consensus_fenced_transition_receipts (
+    request_id BLOB NOT NULL PRIMARY KEY CHECK (
+        length(request_id) = 16
+        AND request_id != X'00000000000000000000000000000000'
+    ),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
+    retained_until TEXT NOT NULL CHECK (octet_length(retained_until) = 30),
+    binding_digest BLOB NOT NULL CHECK (length(binding_digest) = 32),
+    response_json BLOB CHECK (
+        response_json IS NULL
+        OR length(response_json) BETWEEN 1 AND 17408
+    ),
+    response_digest BLOB CHECK (
+        response_digest IS NULL OR length(response_digest) = 32
+    ),
+    CHECK (
+        (response_json IS NULL AND response_digest IS NULL)
+        OR (response_json IS NOT NULL AND response_digest IS NOT NULL)
+    ),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+
+CREATE INDEX IF NOT EXISTS consensus_fenced_transition_receipts_due
+    ON consensus_fenced_transition_receipts (retained_until, request_id)
+    WHERE response_json IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS consensus_fenced_transition_activation (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    storage_configuration_epoch INTEGER NOT NULL CHECK (storage_configuration_epoch > 0),
+    scope_configuration_id BLOB NOT NULL CHECK (length(scope_configuration_id) = 32),
+    scope_configuration_epoch INTEGER NOT NULL CHECK (scope_configuration_epoch > 0),
+    voter_set_digest BLOB NOT NULL CHECK (length(voter_set_digest) = 32),
+    FOREIGN KEY(storage_configuration_epoch)
+        REFERENCES consensus_identity(configuration_epoch)
+);
+"#;
+
+const FENCED_TRANSITION_RECEIPT_LEDGER_ACTIVATION_COLUMN: &str =
+    "fenced_transition_receipt_ledger_activated";
+const FENCED_TRANSITION_RECEIPT_LEDGER_ACTIVATION_MIGRATION: &str = r#"
+ALTER TABLE consensus_identity
+    ADD COLUMN fenced_transition_receipt_ledger_activated INTEGER NOT NULL DEFAULT 0 CHECK (
+        fenced_transition_receipt_ledger_activated IN (0, 1)
+    );
+"#;
+
+/// The receipt ledger has a durable, one-way activation fence.  The only
+/// markerless state accepted on a writable open is the exact published #684
+/// schema, which had no receipt ledger at all.  In particular, a missing
+/// ledger is never treated as a generic add-on after activation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FencedTransitionReceiptLedgerLayout {
+    Published684,
+    Prepared,
+    Activated,
+}
+
+fn ensure_fenced_transition_receipt_ledger_activation_sync(
+    conn: &Connection,
+    _identity: SessionConsensusIdentity,
+) -> io::Result<()> {
+    match fenced_transition_receipt_ledger_layout_sync(conn)? {
+        FencedTransitionReceiptLedgerLayout::Prepared
+        | FencedTransitionReceiptLedgerLayout::Activated => Ok(()),
+        FencedTransitionReceiptLedgerLayout::Published684 => {
+            // A writable migration prepares the bounded ledger, but it must
+            // not activate V1.  The one-way schema fence is committed only by
+            // the first unanimously-proven fenced transition at its own log
+            // position.
+            conn.execute_batch(FENCED_TRANSITION_RECEIPT_SCHEMA)
+                .map_err(db_error)?;
+            if !fenced_transition_receipt_table_schema_is_exact_sync(conn)?
+                || fenced_transition_receipt_aux_schema_sync(conn)?
+                    != FencedTransitionReceiptAuxSchema::Exact
+            {
+                return Err(invalid_data(
+                    "persisted fenced transition receipt schema is unsupported",
+                ));
+            }
+            conn.execute_batch(FENCED_TRANSITION_RECEIPT_LEDGER_ACTIVATION_MIGRATION)
+                .map_err(db_error)?;
+            if fenced_transition_receipt_ledger_layout_sync(conn)?
+                != FencedTransitionReceiptLedgerLayout::Prepared
+            {
+                return Err(invalid_data(
+                    "persisted fenced transition receipt activation is invalid",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Prepare a copied #684 database inside its caller's immediate transaction.
+/// Recovery uses this only for its staged writable copy; V1 remains inactive
+/// until a first fenced transition carries the unanimous scope certificate.
+pub(crate) fn activate_fenced_transition_receipt_ledger_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<()> {
+    ensure_fenced_transition_receipt_ledger_activation_sync(conn, identity)
+}
+
+pub(crate) fn fenced_transition_receipt_ledger_layout_sync(
+    conn: &Connection,
+) -> io::Result<FencedTransitionReceiptLedgerLayout> {
+    fenced_transition_receipt_ledger_layout_in_sync(conn, false)
+}
+
+/// Return whether the one bounded durable certificate authorizes V1 for this
+/// exact current authority scope.  A certificate from any predecessor or
+/// successor topology is deliberately just stale, never inherited.
+pub(crate) fn fenced_transition_activation_matches_scope_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    scope_identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<bool> {
+    if fenced_transition_receipt_ledger_layout_sync(conn)?
+        != FencedTransitionReceiptLedgerLayout::Activated
+    {
+        return Ok(false);
+    }
+    if scope_identity.cluster_id() != storage_identity.cluster_id() || voters.is_empty() {
+        return Ok(false);
+    }
+    let Some((certificate_scope, certificate_voters)) =
+        read_fenced_transition_activation_certificate_sync(conn, storage_identity, false)?
+    else {
+        return Ok(false);
+    };
+    Ok(certificate_scope == scope_identity
+        && certificate_voters == fenced_transition_voter_set_digest(scope_identity, voters))
+}
+
+/// Read the one optional activation certificate after validating every field
+/// that a pre-feature reader would otherwise ignore.  Schema V2 deliberately
+/// permits no certificate during a topology cutover; it may never preserve a
+/// certificate for a non-current scope.
+fn read_fenced_transition_activation_certificate_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    attached: bool,
+) -> io::Result<Option<(SessionConsensusIdentity, [u8; 32])>> {
+    let source = if attached {
+        "consensus_incoming.consensus_fenced_transition_activation"
+    } else {
+        "main.consensus_fenced_transition_activation"
+    };
+    let rows: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM {source}"), [], |row| {
+            row.get(0)
+        })
+        .map_err(db_error)?;
+    if rows == 0 {
+        return Ok(None);
+    }
+    if rows != 1 {
+        return Err(invalid_data(
+            "fenced transition activation certificate count is invalid",
+        ));
+    }
+    let (storage_epoch, configuration_id, scope_epoch, voter_digest) = conn
+        .query_row(
+            &format!(
+                "SELECT storage_configuration_epoch, scope_configuration_id, scope_configuration_epoch, voter_set_digest FROM {source} WHERE singleton = 1"
+            ),
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .map_err(db_error)?;
+    if checked_positive_u64(storage_epoch)? != storage_identity.configuration_epoch().get() {
+        return Err(invalid_data(
+            "fenced transition activation certificate storage identity is invalid",
+        ));
+    }
+    let configuration_id: [u8; 32] = configuration_id.try_into().map_err(|_| {
+        invalid_data("fenced transition activation certificate identity is invalid")
+    })?;
+    let voter_digest: [u8; 32] = voter_digest.try_into().map_err(|_| {
+        invalid_data("fenced transition activation certificate voter set is invalid")
+    })?;
+    let scope_epoch = SessionConsensusConfigurationEpoch::new(checked_positive_u64(scope_epoch)?)
+        .map_err(|_| {
+        invalid_data("fenced transition activation certificate epoch is invalid")
+    })?;
+    Ok(Some((
+        SessionConsensusIdentity::new(
+            storage_identity.cluster_id(),
+            SessionConsensusConfigurationId::from_bytes(configuration_id),
+            scope_epoch,
+        ),
+        voter_digest,
+    )))
+}
+
+/// Activated schema V2 contains either no certificate during an authority
+/// cutover or exactly the certificate for the current exact voter scope.
+/// Keeping this validation separate from matching lets open/recovery/snapshot
+/// reject a stale row instead of silently treating it as merely unavailable.
+fn validate_fenced_transition_activation_certificate_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    attached: bool,
+) -> io::Result<()> {
+    let Some((certificate_scope, certificate_voters)) =
+        read_fenced_transition_activation_certificate_sync(conn, storage_identity, attached)?
+    else {
+        return Ok(());
+    };
+    let scope = read_membership_scope_sync(conn, storage_identity)?;
+    if certificate_scope != scope.current_identity
+        || certificate_voters
+            != fenced_transition_voter_set_digest(scope.current_identity, &scope.current_members)
+    {
+        return Err(invalid_data(
+            "fenced transition activation certificate scope is stale",
+        ));
+    }
+    Ok(())
+}
+
+/// Persist or replace the bounded certificate at the first transition of an
+/// exact scope.  The caller has already validated the authenticated authority
+/// envelope and the command's certificate against the scope visible at this
+/// apply position.  Marker/schema update and certificate write share the
+/// transition's SQLite transaction with its receipt and record effect.
+fn activate_fenced_transition_scope_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    scope_identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    if scope_identity.cluster_id() != storage_identity.cluster_id() || voters.is_empty() {
+        return Err(invalid_data(
+            "fenced transition activation scope is invalid",
+        ));
+    }
+    let storage_epoch = epoch_i64(storage_identity)?;
+    let scope_epoch = epoch_i64(scope_identity)?;
+    let voter_digest = fenced_transition_voter_set_digest(scope_identity, voters);
+    match fenced_transition_receipt_ledger_layout_sync(conn)? {
+        FencedTransitionReceiptLedgerLayout::Published684 => {
+            return Err(invalid_data(
+                "fenced transition activation ledger is not prepared",
+            ));
+        }
+        FencedTransitionReceiptLedgerLayout::Prepared => {
+            let changed = conn
+                .execute(
+                    "UPDATE consensus_identity SET schema_version = ?1, fenced_transition_receipt_ledger_activated = 1 WHERE singleton = 1 AND schema_version = ?2 AND fenced_transition_receipt_ledger_activated = 0",
+                    params![
+                        i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 1,
+                        i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
+                    ],
+                )
+                .map_err(db_error)?;
+            if changed != 1 {
+                return Err(invalid_data(
+                    "fenced transition activation schema fence is invalid",
+                ));
+            }
+        }
+        FencedTransitionReceiptLedgerLayout::Activated => {}
+    }
+    conn.execute(
+        "INSERT INTO consensus_fenced_transition_activation (singleton, storage_configuration_epoch, scope_configuration_id, scope_configuration_epoch, voter_set_digest) VALUES (1, ?1, ?2, ?3, ?4) ON CONFLICT(singleton) DO UPDATE SET storage_configuration_epoch = excluded.storage_configuration_epoch, scope_configuration_id = excluded.scope_configuration_id, scope_configuration_epoch = excluded.scope_configuration_epoch, voter_set_digest = excluded.voter_set_digest",
+        params![
+            storage_epoch,
+            scope_identity.configuration_id().as_bytes().as_slice(),
+            scope_epoch,
+            voter_digest.as_slice(),
+        ],
+    )
+    .map_err(db_error)?;
+    if !fenced_transition_activation_matches_scope_sync(
+        conn,
+        storage_identity,
+        scope_identity,
+        voters,
+    )? {
+        return Err(invalid_data(
+            "fenced transition activation certificate is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn fenced_transition_receipt_ledger_layout_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<FencedTransitionReceiptLedgerLayout> {
+    match fenced_transition_receipt_ledger_marker_in_sync(conn, attached)? {
+        Some(marker) => {
+            if !fenced_transition_receipt_table_schema_is_exact_in_sync(conn, attached)?
+                || fenced_transition_receipt_aux_schema_in_sync(conn, attached)?
+                    != FencedTransitionReceiptAuxSchema::Exact
+                || !fenced_transition_activation_table_schema_is_exact_in_sync(conn, attached)?
+            {
+                return Err(invalid_data(
+                    "persisted fenced transition receipt schema is unsupported",
+                ));
+            }
+            let schema_version = persisted_schema_version_in_sync(conn, attached)?;
+            match (marker, schema_version) {
+                (false, version) if version == i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) => {
+                    Ok(FencedTransitionReceiptLedgerLayout::Prepared)
+                }
+                (true, version) if version == i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 1 => {
+                    Ok(FencedTransitionReceiptLedgerLayout::Activated)
+                }
+                _ => Err(invalid_data(
+                    "persisted fenced transition receipt activation is invalid",
+                )),
+            }
+        }
+        None => {
+            let has_table = if attached {
+                attached_snapshot_table_exists(conn, "consensus_fenced_transition_receipts")?
+            } else {
+                table_exists(conn, "consensus_fenced_transition_receipts").map_err(db_error)?
+            };
+            let exact_markerless_predecessor =
+                published_684_schema_is_exact_in_sync(conn, attached)?
+                    || (attached && pre_authority_dynamic_snapshot_schema_is_exact_in_sync(conn)?);
+            if has_table
+                || fenced_transition_receipt_aux_schema_in_sync(conn, attached)?
+                    != FencedTransitionReceiptAuxSchema::Missing
+                || !exact_markerless_predecessor
+            {
+                return Err(invalid_data(
+                    "persisted fenced transition receipt activation is invalid",
+                ));
+            }
+            Ok(FencedTransitionReceiptLedgerLayout::Published684)
+        }
+    }
+}
+
+/// A present marker is a strict two-state preparation/activation fence.  Its
+/// value is coupled to the persisted schema version, so an exact predecessor
+/// reader rejects an activated database before it can ignore receipt state.
+fn fenced_transition_receipt_ledger_marker_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<Option<bool>> {
+    let pragma = if attached {
+        "pragma_table_info('consensus_identity', 'consensus_incoming')"
+    } else {
+        "pragma_table_info('consensus_identity')"
+    };
+    let marker_columns: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {pragma} WHERE name = '{FENCED_TRANSITION_RECEIPT_LEDGER_ACTIVATION_COLUMN}'"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    match marker_columns {
+        0 => Ok(None),
+        1 => {
+            if !activated_consensus_identity_schema_is_exact_in_sync(conn, attached)? {
+                return Err(invalid_data(
+                    "persisted fenced transition receipt activation is invalid",
+                ));
+            }
+            let source = if attached {
+                "consensus_incoming.consensus_identity"
+            } else {
+                "main.consensus_identity"
+            };
+            let (marker_type, marker): (String, i64) = conn
+                .query_row(
+                    &format!(
+                        "SELECT typeof({FENCED_TRANSITION_RECEIPT_LEDGER_ACTIVATION_COLUMN}), {FENCED_TRANSITION_RECEIPT_LEDGER_ACTIVATION_COLUMN} FROM {source} WHERE singleton = 1"
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(db_error)?;
+            match (marker_type.as_str(), marker) {
+                ("integer", 0) => Ok(Some(false)),
+                ("integer", 1) => Ok(Some(true)),
+                _ => Err(invalid_data(
+                    "persisted fenced transition receipt activation is invalid",
+                )),
+            }
+        }
+        _ => Err(invalid_data(
+            "persisted fenced transition receipt activation is invalid",
+        )),
+    }
+}
+
+/// The activation bit is a one-way schema fence, so accepting its column name
+/// alone would let a weakened identity table authorize receipt-ledger repair.
+/// There are exactly two emitted forms: a fresh table and the table SQLite
+/// records after adding the marker to an exact published-#684 identity table.
+fn activated_consensus_identity_schema_is_exact_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<bool> {
+    let master = if attached {
+        "consensus_incoming.sqlite_master"
+    } else {
+        "main.sqlite_master"
+    };
+    let observed = conn
+        .query_row(
+            &format!(
+                "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) \
+                 FROM {master} WHERE type = 'table' AND name = 'consensus_identity'"
+            ),
+            [CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((Some(observed), observed_len)) = observed else {
+        return Ok(false);
+    };
+    if observed_len > CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES {
+        return Ok(false);
+    }
+
+    Ok(expected_activated_consensus_identity_schema_forms()?
+        .contains(&normalize_schema_sql(&observed)))
+}
+
+fn expected_activated_consensus_identity_schema_forms() -> io::Result<&'static BTreeSet<String>> {
+    if let Some(expected) = ACTIVATED_CONSENSUS_IDENTITY_SCHEMA_FORMS.get() {
+        return Ok(expected);
+    }
+
+    let mut expected = BTreeSet::new();
+    for migrated in [false, true] {
+        let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .map_err(|_| invalid_data("published session consensus schema is unavailable"))?;
+        canonical
+            .execute_batch(CONSENSUS_SCHEMA)
+            .map_err(db_error)?;
+        if migrated {
+            canonical
+                .execute_batch(
+                    "ALTER TABLE consensus_identity \
+                     DROP COLUMN fenced_transition_receipt_ledger_activated;",
+                )
+                .map_err(db_error)?;
+            canonical
+                .execute_batch(FENCED_TRANSITION_RECEIPT_LEDGER_ACTIVATION_MIGRATION)
+                .map_err(db_error)?;
+        }
+        let sql: String = canonical
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        expected.insert(normalize_schema_sql(&sql));
+    }
+    // A concurrent first-use may have populated the same immutable forms
+    // while this thread built them. Either form is equivalent and the stored
+    // value is never mutable after publication.
+    let _ = ACTIVATED_CONSENSUS_IDENTITY_SCHEMA_FORMS.set(expected);
+    ACTIVATED_CONSENSUS_IDENTITY_SCHEMA_FORMS
+        .get()
+        .ok_or_else(|| invalid_data("published session consensus schema is unavailable"))
+}
+
+/// Compare against the one released markerless format, including the current
+/// nullable `leases.acquired_at` add-on.  Read-only recovery also recognizes
+/// the original pre-acquisition lease DDL, whose `NULL` projection is already
+/// a canonical recovery commitment.
+fn published_684_schema_is_exact_in_sync(conn: &Connection, attached: bool) -> io::Result<bool> {
+    markerless_pre_fenced_schema_is_exact_in_sync(conn, attached, false)
+}
+
+/// Snapshots emitted before the authority-profile columns predate both the
+/// fenced receipt ledger and the lease acquisition timestamp.  They remain a
+/// supported Dynamic-only import, but only as this exact attached, markerless
+/// schema; a writable database or an activated snapshot never gets this
+/// compatibility path.
+fn pre_authority_dynamic_snapshot_schema_is_exact_in_sync(conn: &Connection) -> io::Result<bool> {
+    markerless_pre_fenced_schema_is_exact_in_sync(conn, true, true)
+}
+
+fn markerless_pre_fenced_schema_is_exact_in_sync(
+    conn: &Connection,
+    attached: bool,
+    pre_authority_dynamic: bool,
+) -> io::Result<bool> {
+    let observed = schema_manifest_in_sync(conn, attached)?;
+    for pre_acquisition_timestamp in [false, true] {
+        if pre_authority_dynamic && !pre_acquisition_timestamp {
+            continue;
+        }
+        for operator_recovery in [
+            Published684OperatorRecoverySchema::Direct,
+            Published684OperatorRecoverySchema::AddOn,
+            Published684OperatorRecoverySchema::Migrated,
+        ] {
+            for restore_scan in [
+                Published684RestoreScanSchema::Direct,
+                Published684RestoreScanSchema::Migrated,
+            ] {
+                let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+                    .map_err(|_| {
+                        invalid_data("published session consensus schema is unavailable")
+                    })?;
+                if pre_acquisition_timestamp {
+                    canonical
+                        .execute_batch("ALTER TABLE leases DROP COLUMN acquired_at")
+                        .map_err(db_error)?;
+                }
+                canonical
+                    .execute_batch(CONSENSUS_SCHEMA)
+                    .map_err(db_error)?;
+                canonical
+                    .execute_batch(
+                        "DROP TABLE consensus_fenced_transition_receipts; \
+                         DROP TABLE consensus_fenced_transition_activation; \
+                         ALTER TABLE consensus_identity \
+                         DROP COLUMN fenced_transition_receipt_ledger_activated;",
+                    )
+                    .map_err(db_error)?;
+                if pre_authority_dynamic {
+                    canonical
+                        .execute_batch(
+                            "ALTER TABLE consensus_identity DROP COLUMN authority_profile; \
+                             ALTER TABLE consensus_identity DROP COLUMN fixed_placement_policy;",
+                        )
+                        .map_err(db_error)?;
+                }
+                install_published_684_operator_recovery_schema(&canonical, operator_recovery)?;
+                install_published_684_restore_scan_schema(&canonical, restore_scan)?;
+                if observed == schema_manifest_in_sync(&canonical, false)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Published684OperatorRecoverySchema {
+    /// O0: emitted directly with the current consensus schema.
+    Direct,
+    /// O1: introduced as a standalone add-on, retaining its DEFAULT clause.
+    AddOn,
+    /// O2: cursor added to the pre-cursor table, so SQLite appends it after
+    /// the original table-level CHECK and foreign-key constraints.
+    Migrated,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Published684RestoreScanSchema {
+    /// R0: emitted directly by the standalone schema constructor.
+    Direct,
+    /// R1: cursor added to the original table and consequently nullable.
+    Migrated,
+}
+
+fn install_published_684_operator_recovery_schema(
+    conn: &Connection,
+    schema: Published684OperatorRecoverySchema,
+) -> io::Result<()> {
+    if matches!(schema, Published684OperatorRecoverySchema::Direct) {
+        return Ok(());
+    }
+    conn.execute_batch("DROP TABLE consensus_operator_recovery;")
+        .map_err(db_error)?;
+    match schema {
+        Published684OperatorRecoverySchema::Direct => Ok(()),
+        Published684OperatorRecoverySchema::AddOn => conn
+            .execute_batch(OPERATOR_RECOVERY_SCHEMA)
+            .map_err(db_error),
+        Published684OperatorRecoverySchema::Migrated => {
+            install_migrated_operator_recovery_validation_schema_sync(conn)
+        }
+    }
+}
+
+const PRE_CURSOR_RESTORE_SCAN_SCHEMA: &str = r#"
+CREATE TABLE restore_scan_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    epoch BLOB NOT NULL CHECK (length(epoch) = 16),
+    revision INTEGER NOT NULL CHECK (revision >= 0)
+);
+"#;
+
+const RESTORE_SCAN_CURSOR_MIGRATION: &str =
+    "ALTER TABLE restore_scan_state ADD COLUMN cursor_key BLOB CHECK (cursor_key IS NULL OR length(cursor_key) = 32);";
+
+fn install_published_684_restore_scan_schema(
+    conn: &Connection,
+    schema: Published684RestoreScanSchema,
+) -> io::Result<()> {
+    if matches!(schema, Published684RestoreScanSchema::Direct) {
+        return Ok(());
+    }
+    conn.execute_batch("DROP TABLE restore_scan_state;")
+        .map_err(db_error)?;
+    conn.execute_batch(PRE_CURSOR_RESTORE_SCAN_SCHEMA)
+        .map_err(db_error)?;
+    conn.execute_batch(RESTORE_SCAN_CURSOR_MIGRATION)
+        .map_err(db_error)
+}
+
+fn schema_manifest_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<BTreeMap<(String, String), String>> {
+    const MAX_OBJECTS: usize = 32;
+    let master = if attached {
+        "consensus_incoming.sqlite_master"
+    } else {
+        "main.sqlite_master"
+    };
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT type, name, CASE WHEN octet_length(sql) <= ?1 THEN sql END \
+             FROM {master} WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        ))
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut manifest = BTreeMap::new();
+    for row in rows {
+        if manifest.len() >= MAX_OBJECTS {
+            return Ok(BTreeMap::new());
+        }
+        let (kind, name, sql) = row.map_err(db_error)?;
+        let Some(sql) = sql else {
+            return Ok(BTreeMap::new());
+        };
+        if !matches!(kind.as_str(), "table" | "index" | "trigger" | "view")
+            || manifest
+                .insert((kind, name), normalize_schema_sql(&sql))
+                .is_some()
+        {
+            return Ok(BTreeMap::new());
+        }
+    }
+    Ok(manifest)
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+/// Require the complete activated V1 receipt layout, not merely a pair of
+/// column names.  Once the activation marker exists, rows under weaker
+/// primary-key, CHECK, foreign-key, or due-index constraints are never trusted
+/// or silently repaired on writable reopen.
+const FENCED_TRANSITION_RECEIPT_TABLE_SCHEMA_SQL: &str = r#"
+        CREATE TABLE consensus_fenced_transition_receipts (
+            request_id BLOB NOT NULL PRIMARY KEY CHECK (
+                length(request_id) = 16
+                AND request_id != X'00000000000000000000000000000000'
+            ),
+            configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+            payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
+            retained_until TEXT NOT NULL CHECK (octet_length(retained_until) = 30),
+            binding_digest BLOB NOT NULL CHECK (length(binding_digest) = 32),
+            response_json BLOB CHECK (
+                response_json IS NULL
+                OR length(response_json) BETWEEN 1 AND 17408
+            ),
+            response_digest BLOB CHECK (
+                response_digest IS NULL OR length(response_digest) = 32
+            ),
+            CHECK (
+                (response_json IS NULL AND response_digest IS NULL)
+                OR (response_json IS NOT NULL AND response_digest IS NOT NULL)
+            ),
+            FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+        )
+    "#;
+
+const FENCED_TRANSITION_RECEIPT_DUE_INDEX_SCHEMA_SQL: &str = r#"
+        CREATE INDEX consensus_fenced_transition_receipts_due
+            ON consensus_fenced_transition_receipts (retained_until, request_id)
+            WHERE response_json IS NOT NULL
+    "#;
+
+const FENCED_TRANSITION_ACTIVATION_TABLE_SCHEMA_SQL: &str = r#"
+        CREATE TABLE consensus_fenced_transition_activation (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            storage_configuration_epoch INTEGER NOT NULL CHECK (storage_configuration_epoch > 0),
+            scope_configuration_id BLOB NOT NULL CHECK (length(scope_configuration_id) = 32),
+            scope_configuration_epoch INTEGER NOT NULL CHECK (scope_configuration_epoch > 0),
+            voter_set_digest BLOB NOT NULL CHECK (length(voter_set_digest) = 32),
+            FOREIGN KEY(storage_configuration_epoch)
+                REFERENCES consensus_identity(configuration_epoch)
+        )
+    "#;
+
+const CONSENSUS_REQUEST_OUTCOME_TABLE_SCHEMA_SQL: &str = r#"
+        CREATE TABLE consensus_request_outcomes (
+            request_id BLOB PRIMARY KEY CHECK (length(request_id) = 16),
+            configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+            payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
+            response_json BLOB NOT NULL,
+            FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+        )
+    "#;
+
+fn fenced_transition_receipt_table_schema_is_exact_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<bool> {
+    let query = if attached {
+        "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) FROM consensus_incoming.sqlite_master WHERE type = 'table' AND name = 'consensus_fenced_transition_receipts'"
+    } else {
+        "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) FROM main.sqlite_master WHERE type = 'table' AND name = 'consensus_fenced_transition_receipts'"
+    };
+    let table_sql = conn
+        .query_row(
+            query,
+            [FENCED_TRANSITION_RECEIPT_SCHEMA_SQL_MAX_BYTES],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((Some(table_sql), encoded_len)) = table_sql else {
+        return Ok(false);
+    };
+    Ok(
+        encoded_len <= FENCED_TRANSITION_RECEIPT_SCHEMA_SQL_MAX_BYTES
+            && normalize_schema_sql(&table_sql)
+                == normalize_schema_sql(FENCED_TRANSITION_RECEIPT_TABLE_SCHEMA_SQL),
+    )
+}
+
+fn fenced_transition_receipt_table_schema_is_exact_sync(conn: &Connection) -> io::Result<bool> {
+    fenced_transition_receipt_table_schema_is_exact_in_sync(conn, false)
+}
+
+fn fenced_transition_activation_table_schema_is_exact_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<bool> {
+    let query = if attached {
+        "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) FROM consensus_incoming.sqlite_master WHERE type = 'table' AND name = 'consensus_fenced_transition_activation'"
+    } else {
+        "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) FROM main.sqlite_master WHERE type = 'table' AND name = 'consensus_fenced_transition_activation'"
+    };
+    let table_sql = conn
+        .query_row(
+            query,
+            [FENCED_TRANSITION_RECEIPT_SCHEMA_SQL_MAX_BYTES],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((Some(table_sql), encoded_len)) = table_sql else {
+        return Ok(false);
+    };
+    Ok(
+        encoded_len <= FENCED_TRANSITION_RECEIPT_SCHEMA_SQL_MAX_BYTES
+            && normalize_schema_sql(&table_sql)
+                == normalize_schema_sql(FENCED_TRANSITION_ACTIVATION_TABLE_SCHEMA_SQL),
+    )
+}
+
+fn persisted_schema_version_in_sync(conn: &Connection, attached: bool) -> io::Result<i64> {
+    let source = if attached {
+        "consensus_incoming.consensus_identity"
+    } else {
+        "main.consensus_identity"
+    };
+    conn.query_row(
+        &format!("SELECT schema_version FROM {source} WHERE singleton = 1"),
+        [],
+        |row| row.get(0),
+    )
+    .map_err(db_error)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FencedTransitionReceiptAuxSchema {
+    Missing,
+    Exact,
+    Invalid,
+}
+
+fn fenced_transition_receipt_aux_schema_sync(
+    conn: &Connection,
+) -> io::Result<FencedTransitionReceiptAuxSchema> {
+    fenced_transition_receipt_aux_schema_in_sync(conn, false)
+}
+
+fn fenced_transition_receipt_aux_schema_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<FencedTransitionReceiptAuxSchema> {
+    let count_query = if attached {
+        "SELECT COUNT(*) FROM (SELECT 1 FROM consensus_incoming.sqlite_master WHERE ((tbl_name = 'consensus_fenced_transition_receipts' AND type IN ('index', 'trigger')) OR name = 'consensus_fenced_transition_receipts_due') AND sql IS NOT NULL LIMIT 2)"
+    } else {
+        "SELECT COUNT(*) FROM (SELECT 1 FROM main.sqlite_master WHERE ((tbl_name = 'consensus_fenced_transition_receipts' AND type IN ('index', 'trigger')) OR name = 'consensus_fenced_transition_receipts_due') AND sql IS NOT NULL LIMIT 2)"
+    };
+    let object_count: i64 = conn
+        .query_row(count_query, [], |row| row.get(0))
+        .map_err(db_error)?;
+    if object_count == 0 {
+        return Ok(FencedTransitionReceiptAuxSchema::Missing);
+    }
+    if object_count != 1 {
+        return Ok(FencedTransitionReceiptAuxSchema::Invalid);
+    }
+
+    let index_query = if attached {
+        "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) FROM consensus_incoming.sqlite_master WHERE type = 'index' AND name = 'consensus_fenced_transition_receipts_due' AND tbl_name = 'consensus_fenced_transition_receipts' AND sql IS NOT NULL"
+    } else {
+        "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) FROM main.sqlite_master WHERE type = 'index' AND name = 'consensus_fenced_transition_receipts_due' AND tbl_name = 'consensus_fenced_transition_receipts' AND sql IS NOT NULL"
+    };
+    let index_sql = conn
+        .query_row(
+            index_query,
+            [FENCED_TRANSITION_RECEIPT_SCHEMA_SQL_MAX_BYTES],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    Ok(match index_sql {
+        Some((Some(sql), encoded_len))
+            if encoded_len <= FENCED_TRANSITION_RECEIPT_SCHEMA_SQL_MAX_BYTES
+                && normalize_schema_sql(&sql)
+                    == normalize_schema_sql(FENCED_TRANSITION_RECEIPT_DUE_INDEX_SCHEMA_SQL) =>
+        {
+            FencedTransitionReceiptAuxSchema::Exact
+        }
+        _ => FencedTransitionReceiptAuxSchema::Invalid,
+    })
+}
 
 const PRE_CURSOR_OPERATOR_RECOVERY_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
@@ -4944,6 +5907,38 @@ pub(crate) fn validate_command_for_log(
             Err(_) => return Err(invalid_data("session consensus record envelope is invalid")),
         }
     }
+    if let Some(request) = fenced_transition_request(semantic_intent) {
+        if command.request_id
+            != SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes())
+        {
+            return Err(invalid_data(
+                "session fenced transition request identity mismatch",
+            ));
+        }
+        request
+            .validate()
+            .map_err(|_| invalid_data("session fenced transition request is invalid"))?;
+        if let Some(record) = request.mutation().record() {
+            match super::validate_consensus_record(record) {
+                Ok(()) => {}
+                Err(StoreError::PayloadTooLarge { .. }) => {
+                    return Err(invalid_data(
+                        "session consensus record payload exceeds the consensus limit",
+                    ));
+                }
+                Err(StoreError::Crypto(_))
+                    if record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 =>
+                {
+                    return Err(invalid_data(
+                        "session consensus requires a sealed record payload",
+                    ));
+                }
+                Err(_) => {
+                    return Err(invalid_data("session consensus record envelope is invalid"));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4974,16 +5969,60 @@ fn validate_entry_for_apply(
 struct MembershipLogProjection {
     scope: MembershipValidationScope,
     membership: StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
-    projected_requests: BTreeMap<[u8; 16], [u8; 32]>,
+    projected_bound_requests: BTreeSet<[u8; 16]>,
+    projected_fenced_receipt_count: usize,
+    fenced_receipt_ledger_has_commitments: bool,
+    fenced_transition_scope_activated: bool,
+    projected_logical_time: Option<Timestamp>,
 }
 
 impl MembershipLogProjection {
-    fn load(conn: &Connection, storage_identity: SessionConsensusIdentity) -> io::Result<Self> {
+    fn load(
+        conn: &Connection,
+        storage_identity: SessionConsensusIdentity,
+        allow_published_684_recovery_layout: bool,
+    ) -> io::Result<Self> {
+        let (_, _, logical_time, _) = read_machine_sync(conn, storage_identity)?;
+        let scope = read_membership_scope_sync(conn, storage_identity)?;
+        let (fenced_receipt_ledger_has_commitments, projected_fenced_receipt_count) =
+            match fenced_transition_receipt_ledger_layout_sync(conn)? {
+                FencedTransitionReceiptLedgerLayout::Activated => {
+                    (true, fenced_transition_receipt_count_sync(conn)?)
+                }
+                FencedTransitionReceiptLedgerLayout::Prepared => (false, 0),
+                FencedTransitionReceiptLedgerLayout::Published684
+                    if allow_published_684_recovery_layout =>
+                {
+                    (false, 0)
+                }
+                FencedTransitionReceiptLedgerLayout::Published684 => {
+                    return Err(invalid_data(
+                        "persisted fenced transition receipt activation is invalid",
+                    ));
+                }
+            };
+        let fenced_transition_scope_activated = fenced_transition_activation_matches_scope_sync(
+            conn,
+            storage_identity,
+            scope.current_identity,
+            &scope.current_members,
+        )?;
         Ok(Self {
-            scope: read_membership_scope_sync(conn, storage_identity)?,
+            scope,
             membership: read_membership_sync(conn, storage_identity)?,
-            projected_requests: BTreeMap::new(),
+            projected_bound_requests: BTreeSet::new(),
+            projected_fenced_receipt_count,
+            fenced_receipt_ledger_has_commitments,
+            fenced_transition_scope_activated,
+            projected_logical_time: logical_time,
         })
+    }
+
+    fn advance_projected_logical_time(&mut self, command_time: Timestamp) {
+        self.projected_logical_time = Some(
+            self.projected_logical_time
+                .map_or(command_time, |logical_time| logical_time.max(command_time)),
+        );
     }
 
     fn project(
@@ -5050,30 +6089,126 @@ impl MembershipLogProjection {
                 self.membership = stored;
                 if promote {
                     self.promote_at(entry.log_id.index)?;
+                    self.fenced_transition_scope_activated = false;
                 }
                 Ok(())
             }
             EntryPayload::Normal(command) => {
-                let digest = payload_digest(command)?;
                 let request_id = *command.request_id.as_bytes();
-                if self.projected_requests.contains_key(&request_id) {
+                let is_fenced_transition = fenced_transition_request(&command.intent).is_some();
+                if is_fenced_transition {
+                    let access_is_authorized = fenced_transition_access_is_authorized_sync(
+                        &self.scope,
+                        storage_identity,
+                        &command.intent,
+                    )?;
+                    // Before the first valid V1 activation, an outer
+                    // authority rejection has no ledger in which it can be
+                    // bound. It is nevertheless a committed no-effect log
+                    // entry: it must not be rejected merely because an old
+                    // scope has no current certificate or activation body.
+                    if !access_is_authorized && !self.fenced_receipt_ledger_has_commitments {
+                        self.advance_projected_logical_time(command.logical_time);
+                        return Ok(());
+                    }
+                    match fenced_transition_activation(&command.intent) {
+                        Some((scope_identity, voter_set_digest)) if access_is_authorized => {
+                            if scope_identity != self.scope.current_identity
+                                || voter_set_digest
+                                    != fenced_transition_voter_set_digest(
+                                        self.scope.current_identity,
+                                        &self.scope.current_members,
+                                    )
+                            {
+                                return Err(invalid_data(
+                                    "projected fenced transition activation scope is stale",
+                                ));
+                            }
+                            self.fenced_transition_scope_activated = true;
+                            self.fenced_receipt_ledger_has_commitments = true;
+                        }
+                        None if access_is_authorized && !self.fenced_transition_scope_activated => {
+                            return Err(invalid_data(
+                                "projected fenced transition lacks an exact activation certificate",
+                            ));
+                        }
+                        // A V2 store may deliberately have no current
+                        // certificate while a topology cutover is in
+                        // progress. A stale wrapper is still a valid log
+                        // shape in that state: apply will retain no
+                        // certificate and execute the outer authority
+                        // envelope first, yielding only the deterministic
+                        // `TopologyAuthorityRevoked` receipt. In particular
+                        // it cannot execute the inner body or make a later
+                        // scope appear activated.
+                        Some(_) | None => {}
+                    }
+                }
+                if self.projected_bound_requests.contains(&request_id) {
                     // A request-ID collision is a valid, deterministically
                     // rejected command. The state-machine apply path returns
                     // `CasIdempotencyConflict`; treating the log as corrupt
                     // here would instead turn untrusted caller reuse into a
                     // replica-fatal storage error.
-                    return Ok(());
-                }
-                if let Some((persisted, _)) =
-                    read_outcome_sync(conn, storage_identity, command.request_id)?
-                {
-                    if persisted != digest {
-                        return Ok(());
+                    if is_fenced_transition {
+                        self.advance_projected_logical_time(command.logical_time);
                     }
-                    self.projected_requests.insert(request_id, digest);
                     return Ok(());
                 }
-                self.projected_requests.insert(request_id, digest);
+                if self.fenced_receipt_ledger_has_commitments
+                    && read_fenced_transition_receipt_sync(
+                        conn,
+                        storage_identity,
+                        command.request_id,
+                    )?
+                    .is_some()
+                {
+                    // The fenced and generic outcome ledgers form one durable
+                    // request-ID namespace.  Apply deterministically rejects
+                    // any generic/topology command that collides with a fenced
+                    // receipt, so projection must not provisionally apply that
+                    // topology intent and admit dependent membership entries.
+                    if is_fenced_transition {
+                        self.advance_projected_logical_time(command.logical_time);
+                    }
+                    return Ok(());
+                }
+                if read_outcome_sync(conn, storage_identity, command.request_id)?.is_some() {
+                    if is_fenced_transition {
+                        self.advance_projected_logical_time(command.logical_time);
+                    }
+                    return Ok(());
+                }
+
+                self.advance_projected_logical_time(command.logical_time);
+                if is_fenced_transition {
+                    let can_bind = self.projected_fenced_receipt_count
+                        < FENCED_TRANSITION_MAX_HISTORY_ENTRIES
+                        && self.projected_logical_time.is_some_and(|logical_time| {
+                            crate::ttl::checked_session_deadline(
+                                logical_time,
+                                FENCED_TRANSITION_OUTCOME_RETENTION,
+                            )
+                            .is_ok()
+                        });
+                    if can_bind {
+                        self.projected_bound_requests.insert(request_id);
+                        self.projected_fenced_receipt_count = self
+                            .projected_fenced_receipt_count
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                invalid_data("projected fenced transition receipt count exhausted")
+                            })?;
+                    }
+                    // Fenced transitions are opaque application operations and
+                    // never project membership state.  At cap/horizon their ID
+                    // deliberately remains unbound, allowing a later topology
+                    // command using that ID to be projected exactly as apply
+                    // will execute it.
+                    return Ok(());
+                }
+
+                self.projected_bound_requests.insert(request_id);
                 self.project_intent(&command.intent, entry.log_id.index)
             }
         }
@@ -5383,6 +6518,8 @@ impl MembershipLogProjection {
             SessionMutationIntent::AdvanceLogicalTime
             | SessionMutationIntent::BindConsumerRequest { .. }
             | SessionMutationIntent::ReadConsumerRecord { .. }
+            | SessionMutationIntent::FencedTransition(_)
+            | SessionMutationIntent::ActivateFencedTransition { .. }
             | SessionMutationIntent::CompareAndSet(_)
             | SessionMutationIntent::DeleteFenced(_)
             | SessionMutationIntent::RefreshTtl { .. }
@@ -5710,7 +6847,20 @@ pub(crate) fn read_log_range_sync(
     end: Option<u64>,
     limit: Option<usize>,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
-    read_log_range_with_batch_sync(conn, identity, start, end, limit, false)
+    read_log_range_with_batch_sync(conn, identity, start, end, limit, false, false)
+}
+
+/// Read a bounded persisted log range during offline recovery. Callers must
+/// first validate the recovery schema; only that path may interpret the exact
+/// markerless published-#684 layout as an empty fenced-receipt ledger.
+pub(crate) fn read_log_range_for_recovery_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    start: u64,
+    end: Option<u64>,
+    limit: Option<usize>,
+) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
+    read_log_range_with_batch_sync(conn, identity, start, end, limit, false, true)
 }
 
 pub(crate) fn read_limited_log_range_sync(
@@ -5721,7 +6871,7 @@ pub(crate) fn read_limited_log_range_sync(
     limit: usize,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
     let entries =
-        read_log_range_with_batch_sync(conn, identity, start, Some(end), Some(limit), true)?;
+        read_log_range_with_batch_sync(conn, identity, start, Some(end), Some(limit), true, false)?;
     let purged = read_purged_sync(conn, identity)?;
     let expected_start = match purged {
         Some(purged) if start <= purged.index => purged.index.checked_add(1),
@@ -5762,6 +6912,7 @@ fn read_log_range_with_batch_sync(
     end: Option<u64>,
     limit: Option<usize>,
     append_entries_batch: bool,
+    allow_published_684_recovery_layout: bool,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
     let start_u64 = start;
     let start = checked_i64(start)?;
@@ -5772,7 +6923,8 @@ fn read_log_range_with_batch_sync(
                 .map_err(|_| invalid_data("session consensus log limit exceeds SQLite range"))
         })
         .transpose()?;
-    let mut projection = MembershipLogProjection::load(conn, identity)?;
+    let mut projection =
+        MembershipLogProjection::load(conn, identity, allow_published_684_recovery_layout)?;
     let applied_index =
         replay_unapplied_log_prefix_sync(conn, identity, start_u64, &mut projection)?;
     let mut entries = Vec::new();
@@ -5892,7 +7044,7 @@ fn append_logs_in_tx(
     identity: SessionConsensusIdentity,
     entries: &[Entry<SessionRaftTypeConfig>],
 ) -> io::Result<()> {
-    let mut projection = MembershipLogProjection::load(tx, identity)?;
+    let mut projection = MembershipLogProjection::load(tx, identity, false)?;
     let expected = last_log_sync(tx, identity)?
         .map(|log| {
             log.index
@@ -6398,15 +7550,31 @@ pub(crate) fn read_membership_sync(
     Ok(membership)
 }
 
-fn payload_digest(command: &SessionConsensusCommand) -> io::Result<[u8; 32]> {
+fn payload_digest(
+    storage_identity: SessionConsensusIdentity,
+    command: &SessionConsensusCommand,
+) -> io::Result<[u8; 32]> {
     // Idempotency binds caller-owned semantics, not leader-owned sequence,
     // predecessor, or logical-time metadata. A retry after a committed
     // response is lost will be proposed by a new leader with new metadata but
-    // must still recover the original durable outcome. The authenticated
-    // origin may change across that retry, but its exact admitted topology
-    // authority may not: carrying a request ID into a new epoch must conflict
-    // instead of recovering an outcome authorized by the old epoch.
+    // must still recover the original durable outcome. Generic application
+    // commands retain their historical authorized-authority binding below.
+    // Fenced transitions are deliberately different: their complete caller
+    // request is retained across a dynamic authority rollover, while every
+    // access remains independently authorized at its own admission boundary.
     let encoded = match &command.intent {
+        SessionMutationIntent::Authorized { mutation, .. }
+            if fenced_transition_request(mutation).is_some() =>
+        {
+            return fenced_transition_payload_digest(
+                storage_identity,
+                fenced_transition_request(mutation).expect("checked above"),
+            );
+        }
+        SessionMutationIntent::FencedTransition(request)
+        | SessionMutationIntent::ActivateFencedTransition { request, .. } => {
+            return fenced_transition_payload_digest(storage_identity, request);
+        }
         SessionMutationIntent::Authorized {
             authority_identity,
             mutation,
@@ -6425,6 +7593,906 @@ fn payload_digest(command: &SessionConsensusCommand) -> io::Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
+/// Return the sole fenced-transition request carried by an application
+/// intent. Authority wrappers convey per-access admission, not caller request
+/// semantics, so fenced receipt binding deliberately excludes the wrapper.
+fn fenced_transition_request(intent: &SessionMutationIntent) -> Option<&FencedTransitionRequest> {
+    match intent {
+        SessionMutationIntent::FencedTransition(request) => Some(request),
+        SessionMutationIntent::ActivateFencedTransition { request, .. } => Some(request),
+        SessionMutationIntent::Authorized { mutation, .. } => match mutation.as_ref() {
+            SessionMutationIntent::FencedTransition(request)
+            | SessionMutationIntent::ActivateFencedTransition { request, .. } => Some(request),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn fenced_transition_activation(
+    intent: &SessionMutationIntent,
+) -> Option<(SessionConsensusIdentity, [u8; 32])> {
+    match intent {
+        SessionMutationIntent::ActivateFencedTransition {
+            scope_identity,
+            voter_set_digest,
+            ..
+        } => Some((*scope_identity, *voter_set_digest)),
+        SessionMutationIntent::Authorized { mutation, .. } => match mutation.as_ref() {
+            SessionMutationIntent::ActivateFencedTransition {
+                scope_identity,
+                voter_set_digest,
+                ..
+            } => Some((*scope_identity, *voter_set_digest)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Compute the stable fenced receipt binding used by application and status.
+/// It binds the complete canonical request to the stable storage/consensus
+/// identity, but intentionally excludes changing authority, leader timestamp,
+/// and log metadata.
+fn fenced_transition_payload_digest(
+    storage_identity: SessionConsensusIdentity,
+    request: &FencedTransitionRequest,
+) -> io::Result<[u8; 32]> {
+    let intent = SessionMutationIntent::FencedTransition(Box::new(request.clone()));
+    let encoded = encode_json(&(FENCED_TRANSITION_SCHEMA_V1, storage_identity, intent))?;
+    let mut hasher = Sha256::new();
+    hasher.update(OUTCOME_DIGEST_DOMAIN);
+    hasher.update(encoded);
+    Ok(hasher.finalize().into())
+}
+
+fn fenced_transition_receipt_binding_digest(
+    identity: SessionConsensusIdentity,
+    request_id: SessionConsensusRequestId,
+    payload_digest: [u8; 32],
+    retained_until: &str,
+) -> io::Result<[u8; 32]> {
+    let encoded = encode_json(&(
+        FENCED_TRANSITION_SCHEMA_V1,
+        identity,
+        request_id.as_bytes(),
+        payload_digest,
+        retained_until,
+    ))?;
+    let mut hasher = Sha256::new();
+    hasher.update(FENCED_TRANSITION_RECEIPT_BINDING_DIGEST_DOMAIN);
+    hasher.update(encoded);
+    Ok(hasher.finalize().into())
+}
+
+fn fenced_transition_receipt_response_digest(
+    binding_digest: [u8; 32],
+    response: &SessionConsensusResponse,
+) -> io::Result<[u8; 32]> {
+    let encoded = encode_json(response)?;
+    let mut hasher = Sha256::new();
+    hasher.update(FENCED_TRANSITION_RECEIPT_RESPONSE_DIGEST_DOMAIN);
+    hasher.update(binding_digest);
+    hasher.update(encoded);
+    Ok(hasher.finalize().into())
+}
+
+struct FencedTransitionReceipt {
+    payload_digest: [u8; 32],
+    retained_until: Timestamp,
+    response: Option<SessionConsensusResponse>,
+}
+
+fn validate_fenced_transition_receipt(
+    retained_until: Timestamp,
+    response: &SessionConsensusResponse,
+) -> io::Result<()> {
+    if response.sequence == 0 || response.digest.is_none() || response.raft_log_index == 0 {
+        return Err(invalid_data(
+            "persisted fenced transition receipt metadata is invalid",
+        ));
+    }
+    let logical_time = response.logical_time.ok_or_else(|| {
+        invalid_data("persisted fenced transition receipt logical time is invalid")
+    })?;
+    let expected_retained_until =
+        crate::ttl::checked_session_deadline(logical_time, FENCED_TRANSITION_OUTCOME_RETENTION)
+            .map_err(|_| {
+                invalid_data("persisted fenced transition receipt retention is invalid")
+            })?;
+    if retained_until != expected_retained_until {
+        return Err(invalid_data(
+            "persisted fenced transition receipt retention is invalid",
+        ));
+    }
+    match &response.result {
+        Ok(SessionMutationOutcome::FencedTransition(outcome)) => {
+            outcome
+                .validate()
+                .map_err(|_| invalid_data("persisted fenced transition outcome is invalid"))?;
+            if outcome.recorded_at() != logical_time || outcome.retained_until() != retained_until {
+                return Err(invalid_data(
+                    "persisted fenced transition outcome metadata is invalid",
+                ));
+            }
+        }
+        Err(error) if is_persistable_fenced_transition_error(error) => {}
+        Err(_) => {
+            return Err(invalid_data(
+                "persisted fenced transition receipt error is invalid",
+            ));
+        }
+        _ => {
+            return Err(invalid_data(
+                "persisted fenced transition receipt outcome is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Only fixed deterministic results the fenced executor can durably record.
+/// In particular, no caller-authored diagnostic string or node-local failure
+/// may enter a receipt that status/reopen later deserializes.
+fn is_persistable_fenced_transition_error(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::TopologyAuthorityRevoked
+            | StoreError::NotFound
+            | StoreError::StaleFence
+            | StoreError::CasConflict
+            | StoreError::InvalidSessionTtl
+            | StoreError::InvalidRecordExpiry
+            | StoreError::LeaseHeld
+            | StoreError::LeaseExpired
+            | StoreError::PayloadTooLarge { .. }
+            | StoreError::FencedTransitionStorageExhausted
+    )
+}
+
+fn validate_fenced_transition_response_for_request(
+    request: &FencedTransitionRequest,
+    response: &SessionConsensusResponse,
+) -> io::Result<()> {
+    let logical_time = response.logical_time.ok_or_else(|| {
+        invalid_data("persisted fenced transition receipt logical time is invalid")
+    })?;
+    match &response.result {
+        Ok(SessionMutationOutcome::FencedTransition(outcome))
+            if outcome.matches_request_at(request, logical_time) =>
+        {
+            Ok(())
+        }
+        Err(error) if is_persistable_fenced_transition_error(error) => Ok(()),
+        _ => Err(invalid_data(
+            "persisted fenced transition receipt does not match its request",
+        )),
+    }
+}
+
+/// Validate SQLite storage classes and byte widths without returning any
+/// attacker-sized value to rusqlite. `octet_length` reads the stored byte count
+/// from SQLite's value metadata, and the inner LIMIT keeps even corrupt ledgers
+/// within the lifetime protocol bound plus one.
+pub(crate) fn validate_fenced_transition_receipt_storage_bounds_sync(
+    conn: &Connection,
+) -> io::Result<()> {
+    let scan_limit = i64::try_from(
+        FENCED_TRANSITION_MAX_HISTORY_ENTRIES
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("fenced transition receipt bound is invalid"))?,
+    )
+    .map_err(|_| invalid_data("fenced transition receipt bound is invalid"))?;
+    let request_id_bytes = i64::try_from(FENCED_TRANSITION_REQUEST_ID_BYTES)
+        .map_err(|_| invalid_data("fenced transition receipt bound is invalid"))?;
+    let timestamp_bytes = i64::try_from(FENCED_TRANSITION_RECEIPT_TIMESTAMP_BYTES)
+        .map_err(|_| invalid_data("fenced transition receipt bound is invalid"))?;
+    let response_bytes = i64::try_from(FENCED_TRANSITION_RECEIPT_MAX_RESPONSE_BYTES)
+        .map_err(|_| invalid_data("fenced transition receipt bound is invalid"))?;
+    let invalid_storage: bool = conn
+        .query_row(
+            r#"
+SELECT EXISTS (
+    SELECT 1
+    FROM (
+        SELECT request_id, configuration_epoch, payload_digest, retained_until,
+               binding_digest, response_json, response_digest
+        FROM consensus_fenced_transition_receipts
+        LIMIT ?1
+    ) AS bounded
+    WHERE CASE WHEN
+           typeof(request_id) = 'blob'
+       AND octet_length(request_id) = ?2
+       AND typeof(configuration_epoch) = 'integer'
+       AND configuration_epoch > 0
+       AND typeof(payload_digest) = 'blob'
+       AND octet_length(payload_digest) = 32
+       AND typeof(retained_until) = 'text'
+       AND octet_length(retained_until) = ?3
+       AND typeof(binding_digest) = 'blob'
+       AND octet_length(binding_digest) = 32
+       AND (
+              (response_json IS NULL AND response_digest IS NULL)
+           OR (
+                  typeof(response_json) = 'blob'
+              AND octet_length(response_json) BETWEEN 1 AND ?4
+              AND typeof(response_digest) = 'blob'
+              AND octet_length(response_digest) = 32
+           )
+       )
+       THEN 0 ELSE 1 END = 1
+    LIMIT 1
+)
+"#,
+            params![
+                scan_limit,
+                request_id_bytes,
+                timestamp_bytes,
+                response_bytes
+            ],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if invalid_storage {
+        return Err(invalid_data(
+            "persisted fenced transition receipt storage is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn fenced_transition_receipt_storage_is_bounded_for_request_sync(
+    conn: &Connection,
+    request_id: SessionConsensusRequestId,
+) -> io::Result<Option<bool>> {
+    let request_id_bytes = i64::try_from(FENCED_TRANSITION_REQUEST_ID_BYTES)
+        .map_err(|_| invalid_data("fenced transition receipt bound is invalid"))?;
+    let timestamp_bytes = i64::try_from(FENCED_TRANSITION_RECEIPT_TIMESTAMP_BYTES)
+        .map_err(|_| invalid_data("fenced transition receipt bound is invalid"))?;
+    let response_bytes = i64::try_from(FENCED_TRANSITION_RECEIPT_MAX_RESPONSE_BYTES)
+        .map_err(|_| invalid_data("fenced transition receipt bound is invalid"))?;
+    conn.query_row(
+        r#"
+SELECT CASE WHEN
+       typeof(request_id) = 'blob'
+   AND octet_length(request_id) = ?2
+   AND typeof(configuration_epoch) = 'integer'
+   AND configuration_epoch > 0
+   AND typeof(payload_digest) = 'blob'
+   AND octet_length(payload_digest) = 32
+   AND typeof(retained_until) = 'text'
+   AND octet_length(retained_until) = ?3
+   AND typeof(binding_digest) = 'blob'
+   AND octet_length(binding_digest) = 32
+   AND (
+          (response_json IS NULL AND response_digest IS NULL)
+       OR (
+              typeof(response_json) = 'blob'
+          AND octet_length(response_json) BETWEEN 1 AND ?4
+          AND typeof(response_digest) = 'blob'
+          AND octet_length(response_digest) = 32
+       )
+   )
+   THEN 1 ELSE 0 END
+FROM consensus_fenced_transition_receipts
+WHERE request_id = ?1
+"#,
+        params![
+            request_id.as_bytes().as_slice(),
+            request_id_bytes,
+            timestamp_bytes,
+            response_bytes,
+        ],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_error)
+}
+
+fn read_fenced_transition_receipt_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request_id: SessionConsensusRequestId,
+) -> io::Result<Option<FencedTransitionReceipt>> {
+    match fenced_transition_receipt_storage_is_bounded_for_request_sync(conn, request_id)? {
+        None => return Ok(None),
+        Some(false) => {
+            return Err(invalid_data(
+                "persisted fenced transition receipt storage is invalid",
+            ));
+        }
+        Some(true) => {}
+    }
+    let row = conn
+        .query_row(
+            "SELECT request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest FROM consensus_fenced_transition_receipts WHERE request_id = ?1",
+            [request_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((
+        stored_request_id,
+        epoch,
+        digest,
+        retained_until,
+        binding_digest,
+        response,
+        response_digest,
+    )) = row
+    else {
+        return Err(invalid_data(
+            "persisted fenced transition receipt disappeared during validation",
+        ));
+    };
+    validate_epoch(epoch, identity)?;
+    let stored_request_id: [u8; 16] = stored_request_id
+        .try_into()
+        .map_err(|_| invalid_data("persisted fenced transition receipt ID is invalid"))?;
+    if stored_request_id != *request_id.as_bytes()
+        || stored_request_id.iter().all(|byte| *byte == 0)
+    {
+        return Err(invalid_data(
+            "persisted fenced transition receipt ID is invalid",
+        ));
+    }
+    let payload_digest = digest.try_into().map_err(|_| {
+        invalid_data("persisted fenced transition receipt digest has invalid length")
+    })?;
+    let retained_until_raw = retained_until;
+    let retained_until = Timestamp::from_str(&retained_until_raw)
+        .map_err(|_| invalid_data("persisted fenced transition receipt retention is invalid"))?;
+    let normalized_retained_until = ops::format_rfc3339_normalized(retained_until);
+    if normalized_retained_until != retained_until_raw {
+        return Err(invalid_data(
+            "persisted fenced transition receipt retention is invalid",
+        ));
+    }
+    let binding_digest: [u8; 32] = binding_digest
+        .try_into()
+        .map_err(|_| invalid_data("persisted fenced transition receipt binding is invalid"))?;
+    if binding_digest
+        != fenced_transition_receipt_binding_digest(
+            identity,
+            request_id,
+            payload_digest,
+            &normalized_retained_until,
+        )?
+    {
+        return Err(invalid_data(
+            "persisted fenced transition receipt binding is invalid",
+        ));
+    }
+    let response = match (response, response_digest) {
+        (Some(encoded), Some(response_digest)) => {
+            if encoded.len() > FENCED_TRANSITION_RECEIPT_MAX_RESPONSE_BYTES {
+                return Err(invalid_data(
+                    "persisted fenced transition receipt is invalid",
+                ));
+            }
+            let response: SessionConsensusResponse = decode_json(&encoded)?;
+            validate_fenced_transition_receipt(retained_until, &response)?;
+            let response_digest: [u8; 32] = response_digest.try_into().map_err(|_| {
+                invalid_data("persisted fenced transition receipt response is invalid")
+            })?;
+            if response_digest
+                != fenced_transition_receipt_response_digest(binding_digest, &response)?
+            {
+                return Err(invalid_data(
+                    "persisted fenced transition receipt response is invalid",
+                ));
+            }
+            Some(response)
+        }
+        (None, None) => None,
+        _ => {
+            return Err(invalid_data(
+                "persisted fenced transition receipt response is invalid",
+            ));
+        }
+    };
+    Ok(Some(FencedTransitionReceipt {
+        payload_digest,
+        retained_until,
+        response,
+    }))
+}
+
+/// Count only up to one more than the protocol cap. The receipt ledger is a
+/// permanent lifetime namespace, so no caller path may perform an unbounded
+/// scan merely to learn whether it can bind another request ID.
+fn fenced_transition_receipt_count_sync(conn: &Connection) -> io::Result<usize> {
+    let limit = i64::try_from(
+        FENCED_TRANSITION_MAX_HISTORY_ENTRIES
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("fenced transition receipt bound is invalid"))?,
+    )
+    .map_err(|_| invalid_data("fenced transition receipt bound is invalid"))?;
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (SELECT request_id FROM consensus_fenced_transition_receipts LIMIT ?1)",
+            [limit],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    usize::try_from(count).map_err(|_| invalid_data("fenced transition receipt count is invalid"))
+}
+
+fn attached_snapshot_validation_views_are_active_sync(conn: &Connection) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM temp.sqlite_master WHERE type = 'view' AND name = 'consensus_fenced_transition_receipts')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(db_error)
+}
+
+fn validate_generic_request_outcome_point_index_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<()> {
+    let table_query = if attached {
+        "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) FROM consensus_incoming.sqlite_master WHERE type = 'table' AND name = 'consensus_request_outcomes'"
+    } else {
+        "SELECT CASE WHEN octet_length(sql) <= ?1 THEN sql END, octet_length(sql) FROM main.sqlite_master WHERE type = 'table' AND name = 'consensus_request_outcomes'"
+    };
+    let table_sql = conn
+        .query_row(
+            table_query,
+            [FENCED_TRANSITION_RECEIPT_SCHEMA_SQL_MAX_BYTES],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let exact_table = table_sql.is_some_and(|(sql, encoded_len)| {
+        encoded_len <= FENCED_TRANSITION_RECEIPT_SCHEMA_SQL_MAX_BYTES
+            && sql.is_some_and(|sql| {
+                normalize_schema_sql(&sql)
+                    == normalize_schema_sql(CONSENSUS_REQUEST_OUTCOME_TABLE_SCHEMA_SQL)
+            })
+    });
+    let index_query = if attached {
+        "SELECT EXISTS(SELECT 1 FROM consensus_incoming.sqlite_master WHERE type = 'index' AND name = 'sqlite_autoindex_consensus_request_outcomes_1' AND tbl_name = 'consensus_request_outcomes' AND sql IS NULL)"
+    } else {
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE type = 'index' AND name = 'sqlite_autoindex_consensus_request_outcomes_1' AND tbl_name = 'consensus_request_outcomes' AND sql IS NULL)"
+    };
+    let exact_index: bool = conn
+        .query_row(index_query, [], |row| row.get(0))
+        .map_err(db_error)?;
+    if !exact_table || !exact_index {
+        return Err(invalid_data(
+            "persisted session consensus outcome point index is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn generic_request_outcome_exists_for_receipt_sync(
+    conn: &Connection,
+    attached: bool,
+    request_id: SessionConsensusRequestId,
+) -> io::Result<bool> {
+    let query = if attached {
+        "SELECT EXISTS(SELECT 1 FROM consensus_incoming.consensus_request_outcomes INDEXED BY sqlite_autoindex_consensus_request_outcomes_1 WHERE request_id = ?1 LIMIT 1)"
+    } else {
+        "SELECT EXISTS(SELECT 1 FROM main.consensus_request_outcomes INDEXED BY sqlite_autoindex_consensus_request_outcomes_1 WHERE request_id = ?1 LIMIT 1)"
+    };
+    conn.query_row(query, [request_id.as_bytes().as_slice()], |row| row.get(0))
+        .map_err(db_error)
+}
+
+pub(crate) fn validate_fenced_transition_receipts_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<()> {
+    let attached = attached_snapshot_validation_views_are_active_sync(conn)?;
+    match fenced_transition_receipt_ledger_layout_in_sync(conn, attached)? {
+        FencedTransitionReceiptLedgerLayout::Activated => {
+            validate_fenced_transition_activation_certificate_sync(conn, identity, attached)?;
+        }
+        FencedTransitionReceiptLedgerLayout::Prepared => {
+            let activation_rows: i64 = conn
+                .query_row(
+                    if attached {
+                        "SELECT COUNT(*) FROM consensus_incoming.consensus_fenced_transition_activation"
+                    } else {
+                        "SELECT COUNT(*) FROM consensus_fenced_transition_activation"
+                    },
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            let receipt_rows: i64 = conn
+                .query_row(
+                    if attached {
+                        "SELECT COUNT(*) FROM consensus_incoming.consensus_fenced_transition_receipts"
+                    } else {
+                        "SELECT COUNT(*) FROM consensus_fenced_transition_receipts"
+                    },
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if activation_rows != 0 || receipt_rows != 0 {
+                return Err(invalid_data(
+                    "unactivated fenced transition ledger contains durable state",
+                ));
+            }
+            return Ok(());
+        }
+        // The accepted markerless attached layouts are the exact published
+        // #684 products and the exact older Dynamic snapshot shape. Their
+        // missing ledger is canonically empty, so no receipt rows remain to
+        // validate through the temporary projection.
+        FencedTransitionReceiptLedgerLayout::Published684 if attached => return Ok(()),
+        FencedTransitionReceiptLedgerLayout::Published684 => {
+            return Err(invalid_data(
+                "persisted fenced transition receipt activation is invalid",
+            ));
+        }
+    }
+    let receipt_count = fenced_transition_receipt_count_sync(conn)?;
+    if receipt_count > FENCED_TRANSITION_MAX_HISTORY_ENTRIES {
+        return Err(invalid_data(
+            "persisted fenced transition receipt history exceeds protocol bound",
+        ));
+    }
+    validate_fenced_transition_receipt_storage_bounds_sync(conn)?;
+    let (machine_sequence, _, machine_logical_time, _) = read_machine_sync(conn, identity)?;
+    if u64::try_from(receipt_count)
+        .map_err(|_| invalid_data("persisted fenced transition receipt count is invalid"))?
+        > machine_sequence
+    {
+        return Err(invalid_data(
+            "persisted fenced transition receipt history exceeds application sequence",
+        ));
+    }
+    if receipt_count != 0 {
+        validate_generic_request_outcome_point_index_sync(conn, attached)?;
+    }
+    let applied_index = read_applied_sync(conn, identity)?.map(|log_id| log_id.index);
+    let mut statement = conn
+        .prepare(
+            "SELECT request_id FROM consensus_fenced_transition_receipts ORDER BY request_id LIMIT ?1",
+        )
+        .map_err(db_error)?;
+    let request_ids = statement
+        .query_map(
+            [i64::try_from(FENCED_TRANSITION_MAX_HISTORY_ENTRIES)
+                .map_err(|_| invalid_data("fenced transition receipt bound is invalid"))?],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .map_err(db_error)?;
+    for request_id in request_ids {
+        let request_id: [u8; 16] = request_id
+            .map_err(db_error)?
+            .try_into()
+            .map_err(|_| invalid_data("persisted fenced transition receipt ID is invalid"))?;
+        if request_id.iter().all(|byte| *byte == 0) {
+            return Err(invalid_data(
+                "persisted fenced transition receipt ID is invalid",
+            ));
+        }
+        let request_id = SessionConsensusRequestId::from_bytes(request_id);
+        if generic_request_outcome_exists_for_receipt_sync(conn, attached, request_id)? {
+            return Err(invalid_data(
+                "persisted session consensus request receipt namespace is invalid",
+            ));
+        }
+        let receipt = read_fenced_transition_receipt_sync(conn, identity, request_id)?
+            .ok_or_else(|| invalid_data("persisted fenced transition receipt is missing"))?;
+        validate_fenced_transition_receipt_against_floors(
+            &receipt,
+            machine_sequence,
+            machine_logical_time,
+            applied_index,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_fenced_transition_receipt_against_floors(
+    receipt: &FencedTransitionReceipt,
+    machine_sequence: u64,
+    machine_logical_time: Option<Timestamp>,
+    applied_index: Option<u64>,
+) -> io::Result<()> {
+    match receipt.response.as_ref() {
+        Some(response) => {
+            let response_logical_time = response.logical_time.ok_or_else(|| {
+                invalid_data("persisted fenced transition receipt logical time is invalid")
+            })?;
+            if response.sequence > machine_sequence
+                || machine_logical_time
+                    .is_none_or(|logical_time| response_logical_time > logical_time)
+                || applied_index.is_none_or(|index| response.raft_log_index > index)
+            {
+                return Err(invalid_data(
+                    "persisted fenced transition receipt exceeds applied state",
+                ));
+            }
+        }
+        None if machine_logical_time
+            .is_none_or(|logical_time| receipt.retained_until > logical_time) =>
+        {
+            return Err(invalid_data(
+                "persisted fenced transition receipt was compacted before expiry",
+            ));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn store_fenced_transition_receipt_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request_id: SessionConsensusRequestId,
+    payload_digest: [u8; 32],
+    retained_until: Timestamp,
+    response: &SessionConsensusResponse,
+) -> io::Result<()> {
+    validate_fenced_transition_receipt(retained_until, response)?;
+    let encoded = encode_json(response)?;
+    if encoded.len() > FENCED_TRANSITION_RECEIPT_MAX_RESPONSE_BYTES {
+        return Err(invalid_data("fenced transition receipt is too large"));
+    }
+    let retained_until = ops::format_rfc3339_normalized(retained_until);
+    let binding_digest = fenced_transition_receipt_binding_digest(
+        identity,
+        request_id,
+        payload_digest,
+        &retained_until,
+    )?;
+    let response_digest = fenced_transition_receipt_response_digest(binding_digest, response)?;
+    conn.execute(
+        "INSERT INTO consensus_fenced_transition_receipts (request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            request_id.as_bytes().as_slice(),
+            epoch_i64(identity)?,
+            payload_digest.as_slice(),
+            retained_until,
+            binding_digest.as_slice(),
+            encoded,
+            response_digest.as_slice(),
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// Compact only the receipt being replayed. This is deterministic bounded
+/// work and retains the request/body tombstone indefinitely.
+fn compact_fenced_transition_receipt_sync(
+    conn: &Connection,
+    request_id: SessionConsensusRequestId,
+    logical_time: Timestamp,
+) -> io::Result<()> {
+    conn.execute(
+        "UPDATE consensus_fenced_transition_receipts SET response_json = NULL, response_digest = NULL WHERE request_id = ?1 AND retained_until <= ?2 AND response_json IS NOT NULL",
+        params![
+            request_id.as_bytes().as_slice(),
+            ops::format_rfc3339_normalized(logical_time),
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// Tombstone no more than one expired receipt per newly executed command.
+/// The partial index makes the selection bounded and deterministic without a
+/// full-ledger sweep; the permanent ID/body digest remains in the row.
+fn compact_one_due_fenced_transition_receipt_sync(
+    conn: &Connection,
+    logical_time: Timestamp,
+) -> io::Result<()> {
+    conn.execute(
+        "UPDATE consensus_fenced_transition_receipts SET response_json = NULL, response_digest = NULL WHERE request_id = (SELECT request_id FROM consensus_fenced_transition_receipts WHERE response_json IS NOT NULL AND retained_until <= ?1 ORDER BY retained_until ASC, request_id ASC LIMIT 1)",
+        [ops::format_rfc3339_normalized(logical_time)],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// Read one durable fenced-transition receipt without changing ledger state.
+/// The caller has already linearized and authorized its current authority
+/// context. That changing authority is not part of the durable receipt
+/// binding, which instead uses the stable consensus identity.
+pub(crate) fn read_fenced_transition_status_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    _command_identity: SessionConsensusIdentity,
+    request: &FencedTransitionRequest,
+) -> Result<FencedTransitionStatus, StoreError> {
+    request.validate()?;
+    let request_id = SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes());
+    let digest = fenced_transition_payload_digest(storage_identity, request).map_err(|_| {
+        StoreError::BackendUnavailable("fenced transition status is unavailable".into())
+    })?;
+    let machine = read_machine_sync(conn, storage_identity).map_err(|_| {
+        StoreError::BackendUnavailable("fenced transition status is unavailable".into())
+    })?;
+    let applied_index = read_applied_sync(conn, storage_identity)
+        .map_err(|_| {
+            StoreError::BackendUnavailable("fenced transition status is unavailable".into())
+        })?
+        .map(|log_id| log_id.index);
+    if let Some(receipt) = read_fenced_transition_receipt_sync(conn, storage_identity, request_id)
+        .map_err(|_| {
+        StoreError::BackendUnavailable("fenced transition status is unavailable".into())
+    })? {
+        // A fenced receipt is authoritative even if an incompatible generic
+        // outcome also exists; reopen validation rejects that persisted
+        // namespace collision, but status must never invert receipt precedence.
+        validate_fenced_transition_receipt_against_floors(
+            &receipt,
+            machine.0,
+            machine.2,
+            applied_index,
+        )
+        .map_err(|_| {
+            StoreError::BackendUnavailable("fenced transition status is unavailable".into())
+        })?;
+        if receipt.payload_digest != digest {
+            return Ok(FencedTransitionStatus::RequestConflict);
+        }
+        if let Some(response) = receipt.response.as_ref() {
+            validate_fenced_transition_response_for_request(request, response).map_err(|_| {
+                StoreError::BackendUnavailable("fenced transition status is unavailable".into())
+            })?;
+        }
+        if machine.2.is_some_and(|now| receipt.retained_until <= now) || receipt.response.is_none()
+        {
+            return Ok(FencedTransitionStatus::Expired);
+        }
+        return match receipt.response.expect("checked above").result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => {
+                Ok(FencedTransitionStatus::Recorded(Box::new(Ok(outcome))))
+            }
+            Err(error) => Ok(FencedTransitionStatus::Recorded(Box::new(Err(error)))),
+            Ok(_) => Err(StoreError::BackendUnavailable(
+                "fenced transition status is unavailable".into(),
+            )),
+        };
+    }
+
+    // Fenced and generic consensus outcomes share one request-ID namespace.
+    // An absent fenced receipt therefore must consult the generic ledger
+    // before reporting either capacity or absence.
+    if read_outcome_sync(conn, storage_identity, request_id)
+        .map_err(|_| {
+            StoreError::BackendUnavailable("fenced transition status is unavailable".into())
+        })?
+        .is_some()
+    {
+        return Ok(FencedTransitionStatus::RequestConflict);
+    }
+    if fenced_transition_receipt_count_sync(conn).map_err(|_| {
+        StoreError::BackendUnavailable("fenced transition status is unavailable".into())
+    })? >= FENCED_TRANSITION_MAX_HISTORY_ENTRIES
+    {
+        return Ok(FencedTransitionStatus::HistoryFull);
+    }
+    if machine.2.is_some_and(|logical_time| {
+        crate::ttl::checked_session_deadline(logical_time, FENCED_TRANSITION_OUTCOME_RETENTION)
+            .is_err()
+    }) {
+        return Ok(FencedTransitionStatus::RetentionExhausted);
+    }
+    Ok(FencedTransitionStatus::NotFound)
+}
+
+fn replay_conflict_response(
+    machine: &(u64, SessionConsensusEntryDigest, Option<Timestamp>, u64),
+    raft_log_index: u64,
+    error: StoreError,
+) -> SessionConsensusResponse {
+    SessionConsensusResponse {
+        result: Err(error),
+        sequence: machine.0,
+        digest: Some(machine.1),
+        logical_time: machine.2,
+        raft_log_index,
+    }
+}
+
+/// Advance only the committed logical clock for a fenced replay-style result.
+/// Such results keep the current application/digest/watch state while still
+/// consuming their ordered log entry through the applied pointer.
+fn advance_fenced_replay_logical_time_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    command_logical_time: Timestamp,
+    machine: &mut (u64, SessionConsensusEntryDigest, Option<Timestamp>, u64),
+) -> io::Result<()> {
+    if machine
+        .2
+        .is_none_or(|logical_time| command_logical_time > logical_time)
+    {
+        let changed = conn
+            .execute(
+                "UPDATE consensus_machine SET logical_time = ?1 WHERE singleton = 1 AND configuration_epoch = ?2",
+                params![
+                    ops::format_rfc3339_normalized(command_logical_time),
+                    epoch_i64(identity)?,
+                ],
+            )
+            .map_err(db_error)?;
+        if changed != 1 {
+            return Err(invalid_data("session consensus machine state is missing"));
+        }
+        machine.2 = Some(command_logical_time);
+    }
+    Ok(())
+}
+
+fn replay_fenced_transition_receipt_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    command: &SessionConsensusCommand,
+    digest: [u8; 32],
+    machine: &(u64, SessionConsensusEntryDigest, Option<Timestamp>, u64),
+    raft_log_index: u64,
+) -> io::Result<Option<SessionConsensusResponse>> {
+    let Some(receipt) = read_fenced_transition_receipt_sync(conn, identity, command.request_id)?
+    else {
+        // Request IDs are a single durable namespace. A generic receipt is a
+        // closed conflict for a later fenced transition even though it lives
+        // in the legacy outcome ledger.
+        return Ok(
+            read_outcome_sync(conn, identity, command.request_id)?.map(|_| {
+                replay_conflict_response(
+                    machine,
+                    raft_log_index,
+                    StoreError::FencedTransitionRequestConflict,
+                )
+            }),
+        );
+    };
+    validate_fenced_transition_receipt_against_floors(
+        &receipt,
+        machine.0,
+        machine.2,
+        Some(raft_log_index.saturating_sub(1)),
+    )?;
+    if receipt.payload_digest != digest {
+        return Ok(Some(replay_conflict_response(
+            machine,
+            raft_log_index,
+            StoreError::FencedTransitionRequestConflict,
+        )));
+    }
+    if let Some(response) = receipt.response.as_ref() {
+        validate_fenced_transition_response_for_request(
+            fenced_transition_request(&command.intent)
+                .ok_or_else(|| invalid_data("fenced transition replay request is missing"))?,
+            response,
+        )?;
+    }
+    let replay_time = machine.2.map_or(command.logical_time, |last_time| {
+        last_time.max(command.logical_time)
+    });
+    if receipt.retained_until <= replay_time || receipt.response.is_none() {
+        compact_fenced_transition_receipt_sync(conn, command.request_id, replay_time)?;
+        return Ok(Some(replay_conflict_response(
+            machine,
+            raft_log_index,
+            StoreError::FencedTransitionRequestExpired,
+        )));
+    }
+    Ok(receipt.response)
+}
+
 fn lease_error_to_store(error: LeaseError) -> StoreError {
     match error {
         LeaseError::AlreadyHeld => StoreError::LeaseHeld,
@@ -6437,6 +8505,364 @@ fn lease_error_to_store(error: LeaseError) -> StoreError {
             StoreError::BackendUnavailable("session consensus lease application failed".into())
         }
     }
+}
+
+fn execute_fenced_transition_sync(
+    conn: &Connection,
+    request: &FencedTransitionRequest,
+    caps: &BackendCapabilities,
+    logical_time: Timestamp,
+) -> Result<(FencedTransitionOutcome, ReplicationOp), StoreError> {
+    // Apply reaches this point only after the durable fenced-receipt lookup
+    // has missed. Keep all admission-time arithmetic here so an exact replay
+    // can return its original result even after its finite record, lease, or
+    // a newly calculated retention deadline would no longer be representable.
+    request.validate_at(logical_time)?;
+    if !caps.monotonic_fencing_token {
+        return Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition".into(),
+        ));
+    }
+    if matches!(
+        request.mutation(),
+        FencedTransitionMutation::Create { .. } | FencedTransitionMutation::Update { .. }
+    ) && !caps.atomic_compare_and_set
+    {
+        return Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition".into(),
+        ));
+    }
+    if matches!(
+        request.mutation(),
+        FencedTransitionMutation::RefreshTtl { .. }
+    ) && !caps.per_key_ttl
+    {
+        return Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition".into(),
+        ));
+    }
+
+    if let Some(record) = request.mutation().record() {
+        super::validate_consensus_record(record)?;
+    }
+
+    // Fence/credential authority is checked before the record expectation.
+    // These reads do not prune or otherwise mutate state.
+    match request.lease() {
+        FencedTransitionLease::Acquire {
+            key,
+            expected_fence,
+            ..
+        } => {
+            if ops::current_fence_sync(conn, key)? != expected_fence.get() {
+                return Err(StoreError::StaleFence);
+            }
+        }
+        FencedTransitionLease::Renew { lease, .. } => {
+            ops::validate_fenced_mutation_sync(conn, lease, logical_time)?;
+        }
+    }
+
+    let current = ops::get_sync(conn, request.lease().key(), logical_time)?;
+    match (request.mutation().expected_generation(), current.as_ref()) {
+        (None, None) => {}
+        (Some(expected), Some(record)) if record.generation == expected => {}
+        _ => return Err(StoreError::CasConflict),
+    }
+
+    // Renew keeps the existing fence. Every mutation of a live record must
+    // therefore prove that the record itself is still owned by that exact
+    // guard; a matching generation alone is not authorization. Acquire is
+    // different by design: it may take over and replace/delete an old-owner
+    // record after minting the observed fence successor.
+    if matches!(request.lease(), FencedTransitionLease::Renew { .. })
+        && request.mutation().expected_generation().is_some()
+    {
+        let record = current.as_ref().ok_or(StoreError::CasConflict)?;
+        if record.owner != *request.lease().owner()
+            || record.fence != request.lease().committed_fence()?
+        {
+            return Err(StoreError::StaleFence);
+        }
+    }
+
+    if let FencedTransitionLease::Acquire { key, .. } = request.lease() {
+        validate_exact_fenced_acquire_live_lease_sync(conn, key, logical_time)?;
+    }
+
+    // All checks above establish the ordinary request semantics first.  Only
+    // an otherwise-admissible transition is allowed to observe SQLite's
+    // signed-counter horizon, so stale-fence, CAS, and live-lease outcomes
+    // retain their established deterministic precedence.
+    fenced_transition_counter_admission_sync(conn, request)?;
+
+    let (guard, lease_replication) = match request.lease() {
+        FencedTransitionLease::Acquire {
+            key,
+            owner,
+            expected_fence,
+            ttl,
+        } => {
+            let guard = lease::acquire_exact_sync(
+                conn,
+                key,
+                owner.clone(),
+                *expected_fence,
+                *ttl,
+                logical_time,
+            )
+            .map_err(lease_error_to_store)?;
+            let replication = ReplicationOp::AcquireLease {
+                key: key.clone(),
+                owner: owner.clone(),
+                fence: guard.fence(),
+                credential_id: guard.credential_id(),
+                ttl: *ttl,
+                expires_at: guard.expires_at(),
+            };
+            (guard, replication)
+        }
+        FencedTransitionLease::Renew {
+            lease: existing,
+            ttl,
+        } => {
+            let guard = lease::renew_exact_sync(conn, existing, *ttl, logical_time)
+                .map_err(lease_error_to_store)?;
+            let replication = ReplicationOp::RenewLease {
+                key: guard.key().clone(),
+                owner: guard.owner().clone(),
+                fence: guard.fence(),
+                credential_id: guard.credential_id(),
+                ttl: *ttl,
+                expires_at: guard.expires_at(),
+            };
+            (guard, replication)
+        }
+    };
+
+    let (committed_generation, mutation_result, mutation_replication) = match request.mutation() {
+        FencedTransitionMutation::Create { record } => {
+            ops::insert_or_replace_record_sync(conn, record)?;
+            ops::insert_or_replace_fence_sync(conn, &record.key, record.fence.get())?;
+            (
+                record.generation,
+                FencedTransitionMutationResult::Created,
+                ReplicationOp::CompareAndSet {
+                    key: record.key.clone(),
+                    expected_generation: None,
+                    credential_id: guard.credential_id(),
+                    guard_expires_at: guard.expires_at(),
+                    new_record: record.as_ref().clone(),
+                },
+            )
+        }
+        FencedTransitionMutation::Update {
+            expected_generation,
+            record,
+        } => {
+            ops::insert_or_replace_record_sync(conn, record)?;
+            ops::insert_or_replace_fence_sync(conn, &record.key, record.fence.get())?;
+            (
+                record.generation,
+                FencedTransitionMutationResult::Updated,
+                ReplicationOp::CompareAndSet {
+                    key: record.key.clone(),
+                    expected_generation: Some(*expected_generation),
+                    credential_id: guard.credential_id(),
+                    guard_expires_at: guard.expires_at(),
+                    new_record: record.as_ref().clone(),
+                },
+            )
+        }
+        FencedTransitionMutation::Delete {
+            expected_generation,
+        } => {
+            let removed = conn
+                    .execute(
+                        "DELETE FROM session_records WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4",
+                        params![
+                            guard.key().tenant.as_str(),
+                            guard.key().nf_kind.as_str(),
+                            guard.key().key_type.to_string(),
+                            guard.key().stable_id.as_ref(),
+                        ],
+                    )
+                    .map_err(|_| {
+                        StoreError::BackendUnavailable(
+                            "session fenced transition persistence failed".into(),
+                        )
+                    })?;
+            if removed != 1 {
+                return Err(StoreError::BackendUnavailable(
+                    "session fenced transition persistence failed".into(),
+                ));
+            }
+            ops::advance_restore_scan_revision_sync(conn)?;
+            ops::insert_or_replace_fence_sync(conn, guard.key(), guard.fence().get())?;
+            (
+                *expected_generation,
+                FencedTransitionMutationResult::Deleted,
+                ReplicationOp::DeleteFenced {
+                    key: guard.key().clone(),
+                    owner: guard.owner().clone(),
+                    fence: guard.fence(),
+                },
+            )
+        }
+        FencedTransitionMutation::RefreshTtl {
+            expected_generation,
+            ttl,
+        } => {
+            let expires_at = crate::ttl::checked_session_deadline(logical_time, *ttl)?;
+            let mut record = current.ok_or(StoreError::CasConflict)?;
+            record.expires_at = Some(expires_at);
+            ops::insert_or_replace_record_sync(conn, &record)?;
+            ops::insert_or_replace_fence_sync(conn, guard.key(), guard.fence().get())?;
+            (
+                *expected_generation,
+                FencedTransitionMutationResult::TtlRefreshed { expires_at },
+                ReplicationOp::RefreshTtl {
+                    key: guard.key().clone(),
+                    owner: guard.owner().clone(),
+                    fence: guard.fence(),
+                    ttl: *ttl,
+                    expires_at,
+                },
+            )
+        }
+    };
+
+    let outcome =
+        FencedTransitionOutcome::new(guard, committed_generation, mutation_result, logical_time)?;
+    let replication = ReplicationOp::Batch {
+        ops: vec![lease_replication, mutation_replication],
+    };
+    replication.validate_structure()?;
+    Ok((outcome, replication))
+}
+
+/// Mirror the exact-acquire live-lease admission before the counter gate.
+/// `lease::acquire_exact_sync` performs the authoritative check again before
+/// writing; this read-only copy prevents a terminal counter from masking the
+/// established `LeaseHeld` result.
+fn validate_exact_fenced_acquire_live_lease_sync(
+    conn: &Connection,
+    key: &crate::model::SessionKey,
+    logical_time: Timestamp,
+) -> Result<(), StoreError> {
+    let lease = conn
+        .query_row(
+            "SELECT active, guard_expires_at FROM leases WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4",
+            params![
+                key.tenant.as_str(),
+                key.nf_kind.as_str(),
+                key.key_type.to_string(),
+                key.stable_id.as_ref(),
+            ],
+            |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|_| StoreError::BackendUnavailable("session fenced transition persistence failed".into()))?;
+    let Some((active, expires_at)) = lease else {
+        return Ok(());
+    };
+    if active != 0
+        && Timestamp::from_str(&expires_at)
+            .ok()
+            .is_some_and(|expires_at| expires_at > logical_time)
+    {
+        return Err(StoreError::LeaseHeld);
+    }
+    if active != 0 && Timestamp::from_str(&expires_at).is_err() {
+        return Err(StoreError::BackendUnavailable(
+            "session fenced transition persistence failed".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Ensure every counter a successful fenced transition would advance remains
+/// representable by SQLite's signed INTEGER storage. This runs after the
+/// read-only lease/CAS admission in `execute_fenced_transition_sync` and
+/// before its first write, making exhaustion a fixed no-effect result.
+fn fenced_transition_counter_admission_sync(
+    conn: &Connection,
+    request: &FencedTransitionRequest,
+) -> Result<(), StoreError> {
+    const SQLITE_COUNTER_MAX: u64 = i64::MAX as u64;
+
+    if let Some(record) = request.mutation().record() {
+        if record.generation.get() > SQLITE_COUNTER_MAX || record.fence.get() > SQLITE_COUNTER_MAX {
+            return Err(StoreError::FencedTransitionStorageExhausted);
+        }
+    }
+
+    if let FencedTransitionLease::Acquire { expected_fence, .. } = request.lease() {
+        // Exact acquire issues expected+1 and records a global successor of
+        // at least expected+2. Both values must fit SQLite even if the global
+        // high-water is already larger (and therefore remains unchanged).
+        if expected_fence.get() > SQLITE_COUNTER_MAX.saturating_sub(2) {
+            return Err(StoreError::FencedTransitionStorageExhausted);
+        }
+        let next_fence: i64 = conn
+            .query_row(
+                "SELECT val FROM lease_globals WHERE key = 'next_fence'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "session fenced transition persistence failed".into(),
+                )
+            })?;
+        if next_fence <= 0 {
+            return Err(StoreError::BackendUnavailable(
+                "session fenced transition persistence failed".into(),
+            ));
+        }
+        let next_credential_id: i64 = conn
+            .query_row(
+                "SELECT val FROM lease_globals WHERE key = 'next_credential_id'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "session fenced transition persistence failed".into(),
+                )
+            })?;
+        if next_credential_id <= 0 {
+            return Err(StoreError::BackendUnavailable(
+                "session fenced transition persistence failed".into(),
+            ));
+        }
+        if next_credential_id as u64 >= SQLITE_COUNTER_MAX {
+            return Err(StoreError::FencedTransitionStorageExhausted);
+        }
+    }
+
+    let (_, revision, _) = ops::read_restore_scan_state_sync(conn)?;
+    if revision >= SQLITE_COUNTER_MAX {
+        return Err(StoreError::FencedTransitionStorageExhausted);
+    }
+    let watch_sequence: i64 = conn
+        .query_row(
+            "SELECT watch_sequence FROM consensus_machine WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            StoreError::BackendUnavailable("session fenced transition persistence failed".into())
+        })?;
+    if watch_sequence < 0 {
+        return Err(StoreError::BackendUnavailable(
+            "session fenced transition persistence failed".into(),
+        ));
+    }
+    if watch_sequence as u64 >= SQLITE_COUNTER_MAX {
+        return Err(StoreError::FencedTransitionStorageExhausted);
+    }
+    Ok(())
 }
 
 /// Whether a state-machine rejection is a deterministic result of the
@@ -6458,10 +8884,16 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         | StoreError::InvalidRecordExpiry
         | StoreError::LeaseHeld
         | StoreError::LeaseExpired
-        | StoreError::PayloadTooLarge { .. } => true,
+        | StoreError::PayloadTooLarge { .. }
+        | StoreError::FencedTransitionRequestExpired
+        | StoreError::FencedTransitionStorageExhausted => true,
         StoreError::CapabilityNotSupported(_)
         | StoreError::CasIdempotencyConflict
         | StoreError::CasIdempotencyOutcomeUnavailable
+        | StoreError::FencedTransitionRequestConflict
+        | StoreError::FencedTransitionOutcomeUnknown
+        | StoreError::FencedTransitionHistoryFull
+        | StoreError::FencedTransitionRetentionExhausted
         | StoreError::BackendOperationOutcomeUnavailable
         | StoreError::BackendUnavailable(_)
         | StoreError::InvalidReplicationSequence
@@ -6551,6 +8983,7 @@ pub(crate) fn validate_consensus_outcome_records(
         | SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Conflict {
             current: Some(record),
         }) => super::validate_consensus_record(record),
+        SessionMutationOutcome::FencedTransition(outcome) => outcome.validate(),
         SessionMutationOutcome::CompareAndSet(_)
         | SessionMutationOutcome::ConsumerRecord(None)
         | SessionMutationOutcome::Lease(_)
@@ -6644,6 +9077,15 @@ fn execute_application_intent_sync(
                 super::validate_consensus_record(record)?;
             }
             Ok((SessionMutationOutcome::ConsumerRecord(record), None))
+        }
+        SessionMutationIntent::FencedTransition(request)
+        | SessionMutationIntent::ActivateFencedTransition { request, .. } => {
+            let (outcome, replication) =
+                execute_fenced_transition_sync(conn, request, caps, logical_time)?;
+            Ok((
+                SessionMutationOutcome::FencedTransition(outcome),
+                Some(replication),
+            ))
         }
         SessionMutationIntent::CompareAndSet(op) => {
             if op.new_record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
@@ -6800,6 +9242,42 @@ fn untouched_initial_membership_scope(
         && scope.terminal.is_none()
 }
 
+/// Validate the authority envelope for this exact fenced access without
+/// executing its lease/record intent. Receipt binding deliberately survives a
+/// topology rollover, but a predecessor process must not recover the retained
+/// result, conflict state, or ledger terminal after its authority is revoked.
+fn fenced_transition_access_is_authorized_sync(
+    scope: &MembershipValidationScope,
+    storage_identity: SessionConsensusIdentity,
+    intent: &SessionMutationIntent,
+) -> io::Result<bool> {
+    match intent {
+        SessionMutationIntent::Authorized {
+            origin,
+            authority_identity,
+            mutation,
+        } if matches!(
+            mutation.as_ref(),
+            SessionMutationIntent::FencedTransition(_)
+                | SessionMutationIntent::ActivateFencedTransition { .. }
+        ) =>
+        {
+            Ok(application_authority_matches(
+                scope,
+                *origin,
+                *authority_identity,
+            ))
+        }
+        SessionMutationIntent::FencedTransition(_)
+        | SessionMutationIntent::ActivateFencedTransition { .. } => {
+            Ok(untouched_initial_membership_scope(scope, storage_identity))
+        }
+        _ => Err(invalid_data(
+            "fenced transition authority envelope is invalid",
+        )),
+    }
+}
+
 fn execute_intent_sync(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
@@ -6879,6 +9357,9 @@ fn execute_intent_sync(
             authority_identity,
             mutation,
         } => {
+            let scope = read_membership_scope_sync(conn, storage_identity).map_err(|_| {
+                StoreError::BackendUnavailable("session topology authority is unavailable".into())
+            })?;
             if matches!(
                 mutation.as_ref(),
                 SessionMutationIntent::PrepareTopologyTransition { .. }
@@ -6888,13 +9369,7 @@ fn execute_intent_sync(
                     | SessionMutationIntent::FinalizeTopologyTransition { .. }
                     | SessionMutationIntent::FinalizeOperatorRecovery { .. }
                     | SessionMutationIntent::Authorized { .. }
-            ) || validate_application_authority_sync(
-                conn,
-                storage_identity,
-                *origin,
-                *authority_identity,
-            )
-            .is_err()
+            ) || !application_authority_matches(&scope, *origin, *authority_identity)
             {
                 return Err(StoreError::TopologyAuthorityRevoked);
             }
@@ -7108,8 +9583,328 @@ pub(crate) fn apply_entries_with_authority_sync(
                 }
             }
             EntryPayload::Normal(command) => {
-                let digest = payload_digest(&command)?;
-                if let Some((persisted_digest, persisted_response)) =
+                let digest = payload_digest(identity, &command)?;
+                let is_fenced_transition = fenced_transition_request(&command.intent).is_some();
+                if is_fenced_transition {
+                    let access_is_authorized = fenced_transition_access_is_authorized_sync(
+                        &scope,
+                        identity,
+                        &command.intent,
+                    )?;
+                    let receipt_ledger_layout = fenced_transition_receipt_ledger_layout_sync(&tx)?;
+                    let preactivation_revoked_no_effect = !access_is_authorized
+                        && receipt_ledger_layout == FencedTransitionReceiptLedgerLayout::Prepared;
+                    if !preactivation_revoked_no_effect {
+                        match fenced_transition_activation(&command.intent) {
+                            Some((scope_identity, voter_set_digest)) if access_is_authorized => {
+                                if scope_identity != scope.current_identity
+                                    || voter_set_digest
+                                        != fenced_transition_voter_set_digest(
+                                            scope.current_identity,
+                                            &scope.current_members,
+                                        )
+                                {
+                                    return Err(invalid_data(
+                                        "fenced transition activation scope is stale",
+                                    ));
+                                }
+                                // A current, authenticated activation is the
+                                // only path that may publish a certificate.
+                                activate_fenced_transition_scope_sync(
+                                    &tx,
+                                    identity,
+                                    scope.current_identity,
+                                    &scope.current_members,
+                                )?;
+                            }
+                            None if access_is_authorized
+                                && !fenced_transition_activation_matches_scope_sync(
+                                    &tx,
+                                    identity,
+                                    scope.current_identity,
+                                    &scope.current_members,
+                                )? =>
+                            {
+                                return Err(invalid_data(
+                                    "fenced transition lacks an exact activation certificate",
+                                ));
+                            }
+                            // A revoked envelope cannot publish a certificate
+                            // or execute its body. In V2 it may still bind the
+                            // deterministic rejection; before V1 activates it
+                            // is intentionally left unbound below.
+                            Some(_) | None => {}
+                        }
+                    }
+                    if preactivation_revoked_no_effect {
+                        advance_fenced_replay_logical_time_sync(
+                            &tx,
+                            identity,
+                            command.logical_time,
+                            &mut machine,
+                        )?;
+                        replay_conflict_response(
+                            &machine,
+                            entry.log_id.index,
+                            StoreError::TopologyAuthorityRevoked,
+                        )
+                    } else if let Some(replayed) = replay_fenced_transition_receipt_sync(
+                        &tx,
+                        identity,
+                        &command,
+                        digest,
+                        &machine,
+                        entry.log_id.index,
+                    )? {
+                        // A historical request never advances the application
+                        // sequence or produces another record/lease effect,
+                        // but its committed admission time still advances the
+                        // state-machine clock. Receipt expiry/compaction is
+                        // evaluated against that same clock, so the time and
+                        // any resulting tombstone must commit atomically.
+                        advance_fenced_replay_logical_time_sync(
+                            &tx,
+                            identity,
+                            command.logical_time,
+                            &mut machine,
+                        )?;
+                        if access_is_authorized {
+                            replayed
+                        } else {
+                            replay_conflict_response(
+                                &machine,
+                                entry.log_id.index,
+                                StoreError::TopologyAuthorityRevoked,
+                            )
+                        }
+                    } else if fenced_transition_receipt_count_sync(&tx)?
+                        >= FENCED_TRANSITION_MAX_HISTORY_ENTRIES
+                    {
+                        // The permanent tombstone namespace is absorbing.
+                        // This ID was not bound, so the deterministic capacity
+                        // rejection must neither execute nor record a receipt.
+                        // It follows replay semantics: only logical time and
+                        // the unconditional applied pointer advance.
+                        advance_fenced_replay_logical_time_sync(
+                            &tx,
+                            identity,
+                            command.logical_time,
+                            &mut machine,
+                        )?;
+                        compact_one_due_fenced_transition_receipt_sync(
+                            &tx,
+                            machine.2.ok_or_else(|| {
+                                invalid_data("session consensus machine logical time is missing")
+                            })?,
+                        )?;
+                        replay_conflict_response(
+                            &machine,
+                            entry.log_id.index,
+                            if access_is_authorized {
+                                StoreError::FencedTransitionHistoryFull
+                            } else {
+                                StoreError::TopologyAuthorityRevoked
+                            },
+                        )
+                    } else {
+                        let logical_time = machine.2.map_or(command.logical_time, |last_time| {
+                            last_time.max(command.logical_time)
+                        });
+                        match crate::ttl::checked_session_deadline(
+                            logical_time,
+                            FENCED_TRANSITION_OUTCOME_RETENTION,
+                        ) {
+                            Err(_) => {
+                                // The exact V1 retention window is no longer
+                                // representable. This is an absorbing global
+                                // no-effect condition for every still-unbound
+                                // ID because committed logical time cannot
+                                // regress. Keep receipt/generic/cap precedence
+                                // above and do not create a request binding.
+                                advance_fenced_replay_logical_time_sync(
+                                    &tx,
+                                    identity,
+                                    logical_time,
+                                    &mut machine,
+                                )?;
+                                compact_one_due_fenced_transition_receipt_sync(&tx, logical_time)?;
+                                replay_conflict_response(
+                                    &machine,
+                                    entry.log_id.index,
+                                    if access_is_authorized {
+                                        StoreError::FencedTransitionRetentionExhausted
+                                    } else {
+                                        StoreError::TopologyAuthorityRevoked
+                                    },
+                                )
+                            }
+                            Ok(retained_until) => {
+                                if machine.0 >= i64::MAX as u64 {
+                                    // The receipt itself remains representable at the
+                                    // terminal application sequence. Probe the normal
+                                    // admission in a savepoint solely to preserve the
+                                    // established stale/CAS/lease/authority precedence;
+                                    // an otherwise successful transition is converted
+                                    // into the fixed exhaustion receipt without any
+                                    // lease, record, fence, restore, or watch effect.
+                                    let result = {
+                                        let mut savepoint = tx.savepoint().map_err(db_error)?;
+                                        let result = match execute_intent_sync(
+                                            &savepoint,
+                                            identity,
+                                            entry.log_id.index,
+                                            &command.intent,
+                                            caps,
+                                            logical_time,
+                                        ) {
+                                            Ok(_) => {
+                                                Err(StoreError::FencedTransitionStorageExhausted)
+                                            }
+                                            Err(error)
+                                                if is_deterministic_intent_rejection(&error) =>
+                                            {
+                                                Err(error)
+                                            }
+                                            Err(_) => {
+                                                savepoint.rollback().map_err(db_error)?;
+                                                return Err(state_machine_intent_fault());
+                                            }
+                                        };
+                                        savepoint.rollback().map_err(db_error)?;
+                                        result
+                                    };
+                                    let response = SessionConsensusResponse {
+                                        result,
+                                        sequence: machine.0,
+                                        digest: Some(machine.1),
+                                        logical_time: Some(logical_time),
+                                        raft_log_index: entry.log_id.index,
+                                    };
+                                    store_fenced_transition_receipt_sync(
+                                        &tx,
+                                        identity,
+                                        command.request_id,
+                                        digest,
+                                        retained_until,
+                                        &response,
+                                    )?;
+                                    compact_one_due_fenced_transition_receipt_sync(
+                                        &tx,
+                                        logical_time,
+                                    )?;
+                                    advance_fenced_replay_logical_time_sync(
+                                        &tx,
+                                        identity,
+                                        logical_time,
+                                        &mut machine,
+                                    )?;
+                                    response
+                                } else {
+                                    let sequence = machine.0.checked_add(1).ok_or_else(|| {
+                                        invalid_data(
+                                            "session consensus application sequence exhausted",
+                                        )
+                                    })?;
+                                    let command_digest = command
+                                        .calculate_applied_digest(sequence, machine.1, logical_time)
+                                        .map_err(|_| {
+                                            invalid_data("session consensus command digest failed")
+                                        })?;
+
+                                    let (result, replication) = {
+                                        let mut savepoint = tx.savepoint().map_err(db_error)?;
+                                        match execute_intent_sync(
+                                            &savepoint,
+                                            identity,
+                                            entry.log_id.index,
+                                            &command.intent,
+                                            caps,
+                                            logical_time,
+                                        ) {
+                                            Ok((outcome, replication)) => {
+                                                savepoint.commit().map_err(db_error)?;
+                                                (Ok(outcome), replication)
+                                            }
+                                            Err(error)
+                                                if is_deterministic_intent_rejection(&error) =>
+                                            {
+                                                savepoint.rollback().map_err(db_error)?;
+                                                (Err(error), None)
+                                            }
+                                            Err(_) => {
+                                                savepoint.rollback().map_err(db_error)?;
+                                                return Err(state_machine_intent_fault());
+                                            }
+                                        }
+                                    };
+
+                                    let response = SessionConsensusResponse {
+                                        result,
+                                        sequence,
+                                        digest: Some(command_digest),
+                                        logical_time: Some(logical_time),
+                                        raft_log_index: entry.log_id.index,
+                                    };
+                                    store_fenced_transition_receipt_sync(
+                                        &tx,
+                                        identity,
+                                        command.request_id,
+                                        digest,
+                                        retained_until,
+                                        &response,
+                                    )?;
+                                    compact_one_due_fenced_transition_receipt_sync(
+                                        &tx,
+                                        logical_time,
+                                    )?;
+                                    let changed = tx
+                                    .execute(
+                                        "UPDATE consensus_machine SET application_sequence = ?1, last_digest = ?2, logical_time = ?3 WHERE singleton = 1 AND configuration_epoch = ?4",
+                                        params![
+                                            checked_positive_i64(sequence)?,
+                                            command_digest.as_bytes().as_slice(),
+                                            ops::format_rfc3339_normalized(logical_time),
+                                            epoch_i64(identity)?,
+                                        ],
+                                    )
+                                    .map_err(db_error)?;
+                                    if changed != 1 {
+                                        return Err(invalid_data(
+                                            "session consensus machine state is missing",
+                                        ));
+                                    }
+                                    machine.0 = sequence;
+                                    machine.1 = command_digest;
+                                    machine.2 = Some(logical_time);
+                                    if let Some(replication) = replication {
+                                        machine.3 = machine.3.checked_add(1).ok_or_else(|| {
+                                            invalid_data(
+                                                "session consensus watch sequence exhausted",
+                                            )
+                                        })?;
+                                        notifications.push(store_replication_notification_sync(
+                                            &tx,
+                                            identity,
+                                            machine.3,
+                                            command.request_id,
+                                            replication,
+                                            logical_time,
+                                        )?);
+                                    }
+                                    response
+                                }
+                            }
+                        }
+                    }
+                } else if read_fenced_transition_receipt_sync(&tx, identity, command.request_id)?
+                    .is_some()
+                {
+                    replay_conflict_response(
+                        &machine,
+                        entry.log_id.index,
+                        StoreError::CasIdempotencyConflict,
+                    )
+                } else if let Some((persisted_digest, persisted_response)) =
                     read_outcome_sync(&tx, identity, command.request_id)?
                 {
                     if persisted_digest != digest {
@@ -7117,18 +9912,11 @@ pub(crate) fn apply_entries_with_authority_sync(
                         // another payload. That must be a closed domain
                         // conflict, never a storage fault that prevents the
                         // replicated log from applying.
-                        SessionConsensusResponse {
-                            result: Err(StoreError::CasIdempotencyConflict),
-                            // This log entry is committed but intentionally
-                            // has no application effect. Return the last
-                            // committed state metadata so callers can prove
-                            // it is a durable conflict rather than a local
-                            // preproposal rejection.
-                            sequence: machine.0,
-                            digest: Some(machine.1),
-                            logical_time: machine.2,
-                            raft_log_index: entry.log_id.index,
-                        }
+                        replay_conflict_response(
+                            &machine,
+                            entry.log_id.index,
+                            StoreError::CasIdempotencyConflict,
+                        )
                     } else {
                         persisted_response
                     }
@@ -7185,6 +9973,7 @@ pub(crate) fn apply_entries_with_authority_sync(
                         ],
                     )
                     .map_err(db_error)?;
+                    compact_one_due_fenced_transition_receipt_sync(&tx, logical_time)?;
                     let changed = tx
                         .execute(
                             "UPDATE consensus_machine SET application_sequence = ?1, last_digest = ?2, logical_time = ?3 WHERE singleton = 1 AND configuration_epoch = ?4",
@@ -7759,7 +10548,7 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
         .prepare(
             r#"
             SELECT tenant, nf_kind, key_type, stable_id, active, credential_id,
-                   owner, fence, expires_at_unix_ms, guard_expires_at
+                   owner, fence, acquired_at, expires_at_unix_ms, guard_expires_at
             FROM leases
             "#,
         )
@@ -7775,8 +10564,9 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
                 row.get::<_, i64>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, i64>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, String>(10)?,
             ))
         })
         .map_err(db_error)?;
@@ -7790,6 +10580,7 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
             credential,
             owner,
             fence,
+            acquired_at,
             expires_at_unix_ms,
             guard_expires_at,
         ) = row.map_err(db_error)?;
@@ -7805,6 +10596,15 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
         let guard_expires_at =
             Timestamp::from_str(&guard_expires_at_text).map_err(|_| invalid_lease_state())?;
         if ops::format_rfc3339_normalized(guard_expires_at) != guard_expires_at_text {
+            return Err(invalid_lease_state());
+        }
+        // `NULL` is the bounded marker for rows migrated from the pre-V1
+        // schema. They remain recoverable, but no V1 guard operation accepts
+        // them because it cannot prove the serialized acquisition timestamp.
+        if acquired_at.is_some_and(|acquired_at| {
+            ops::persisted_normalized_timestamp(Some(acquired_at))
+                .is_none_or(|acquired_at| acquired_at > guard_expires_at)
+        }) {
             return Err(invalid_lease_state());
         }
         let guard_expires_at_unix_ms =
@@ -7947,6 +10747,7 @@ pub(crate) fn build_snapshot_database_sync(
 ) -> io::Result<ConsensusAppliedMembership> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
     validate_sealed_state_sync(&tx)?;
+    validate_fenced_transition_receipts_sync(&tx, identity)?;
     let destination = create_pinned_snapshot_database(path)?;
     let (snapshot, _) = build_snapshot_database_from_pinned_sync(&tx, identity, destination)?;
     tx.commit().map_err(db_error)?;
@@ -7975,6 +10776,7 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
         fixed_placement_policy,
     )?;
     validate_sealed_state_sync(&tx)?;
+    validate_fenced_transition_receipts_sync(&tx, identity)?;
     // Do not create even an empty snapshot artifact until the durable fixed
     // authority check has succeeded under the source read transaction.
     let destination = create_pinned_snapshot_database(path)?;
@@ -8636,17 +11438,245 @@ const ATTACHED_SNAPSHOT_VALIDATION_TABLES: &[&str] = &[
     "consensus_membership",
     "consensus_machine",
     "consensus_request_outcomes",
+    "consensus_fenced_transition_receipts",
+    "consensus_fenced_transition_activation",
     "consensus_snapshot",
     "consensus_operator_recovery",
     "restore_scan_state",
 ];
 
-fn create_attached_snapshot_validation_views(conn: &Connection) -> io::Result<()> {
+const LEASE_COLUMNS_WITH_ACQUIRED_AT: &[&str] = &[
+    "tenant",
+    "nf_kind",
+    "key_type",
+    "stable_id",
+    "active",
+    "credential_id",
+    "owner",
+    "fence",
+    "expires_at_unix_ms",
+    "guard_expires_at",
+    "acquired_at",
+];
+
+const LEASE_COLUMNS_BEFORE_ACQUIRED_AT: &[&str] = &[
+    "tenant",
+    "nf_kind",
+    "key_type",
+    "stable_id",
+    "active",
+    "credential_id",
+    "owner",
+    "fence",
+    "expires_at_unix_ms",
+    "guard_expires_at",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttachedSnapshotLeaseSchema {
+    Current,
+    PreAcquisitionTimestamp,
+}
+
+fn attached_snapshot_table_exists(conn: &Connection, table: &str) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM consensus_incoming.sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+    .map_err(db_error)
+}
+
+/// Classify the attached ledger before any validation view can hide its raw
+/// schema. Markerless snapshots are accepted only as an exact published #684
+/// product or the exact older Dynamic attached-snapshot shape, and are
+/// projected as the canonical empty ledger.
+fn attached_snapshot_has_committed_fenced_receipts(conn: &Connection) -> io::Result<bool> {
+    Ok(matches!(
+        fenced_transition_receipt_ledger_layout_in_sync(conn, true)?,
+        FencedTransitionReceiptLedgerLayout::Activated
+    ))
+}
+
+fn validate_attached_snapshot_fenced_receipt_schema_sync(conn: &Connection) -> io::Result<()> {
+    if fenced_transition_receipt_ledger_layout_in_sync(conn, true)?
+        != FencedTransitionReceiptLedgerLayout::Activated
+    {
+        return Err(invalid_data(
+            "session consensus snapshot receipt schema is unsupported",
+        ));
+    }
+    Ok(())
+}
+
+/// Compare at most the lifetime receipt cap, and force both sides through their
+/// request-ID primary-key indexes. The incoming ledger has already passed full
+/// schema, value, commitment, and floor validation before this helper runs.
+fn validate_attached_snapshot_preserves_fenced_receipts_sync(conn: &Connection) -> io::Result<()> {
+    let local_count = fenced_transition_receipt_count_sync(conn)?;
+    if local_count > FENCED_TRANSITION_MAX_HISTORY_ENTRIES {
+        return Err(invalid_data(
+            "persisted fenced transition receipt history exceeds protocol bound",
+        ));
+    }
+    validate_fenced_transition_receipt_storage_bounds_sync(conn)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT request_id FROM main.consensus_fenced_transition_receipts ORDER BY request_id LIMIT ?1",
+        )
+        .map_err(db_error)?;
+    let request_ids = statement
+        .query_map(
+            [i64::try_from(FENCED_TRANSITION_MAX_HISTORY_ENTRIES)
+                .map_err(|_| invalid_data("fenced transition receipt bound is invalid"))?],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .map_err(db_error)?;
+    for request_id in request_ids {
+        let request_id: [u8; FENCED_TRANSITION_REQUEST_ID_BYTES] = request_id
+            .map_err(db_error)?
+            .try_into()
+            .map_err(|_| invalid_data("persisted fenced transition receipt ID is invalid"))?;
+        let preserved = conn
+            .query_row(
+                r#"
+SELECT CASE WHEN
+       incoming.configuration_epoch = local.configuration_epoch
+   AND incoming.payload_digest = local.payload_digest
+   AND incoming.retained_until = local.retained_until
+   AND incoming.binding_digest = local.binding_digest
+   AND (
+          (local.response_json IS NULL AND incoming.response_json IS NULL)
+       OR (
+              local.response_json IS NOT NULL
+          AND incoming.response_json IS NOT NULL
+          AND incoming.response_digest = local.response_digest
+       )
+       OR (
+              local.response_json IS NOT NULL
+          AND incoming.response_json IS NULL
+          AND (SELECT logical_time
+               FROM consensus_incoming.consensus_machine
+               WHERE singleton = 1) >= local.retained_until
+       )
+   )
+   THEN 1 ELSE 0 END
+FROM main.consensus_fenced_transition_receipts AS local
+     INDEXED BY sqlite_autoindex_consensus_fenced_transition_receipts_1
+JOIN consensus_incoming.consensus_fenced_transition_receipts AS incoming
+     INDEXED BY sqlite_autoindex_consensus_fenced_transition_receipts_1
+  ON incoming.request_id = local.request_id
+WHERE local.request_id = ?1
+"#,
+                [request_id.as_slice()],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(db_error)?
+            .unwrap_or(false);
+        if !preserved {
+            return Err(invalid_data(
+                "session consensus snapshot rewrites retained fenced transition receipts",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// An activation certificate turns the otherwise one-time live-unanimity
+/// admission check into ordinary Raft quorum availability for one exact
+/// current voter scope.  A same-scope snapshot may never erase or substitute
+/// that proof: doing so would make a healthy activated replica fall back to
+/// all-voter availability after a minority failure.  A successor scope is
+/// different by definition and is allowed to carry no certificate until its
+/// own unanimously-proven first transition.
+fn validate_snapshot_preserves_current_fenced_transition_activation_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    local_layout: FencedTransitionReceiptLedgerLayout,
+    incoming_layout: FencedTransitionReceiptLedgerLayout,
+    local_scope: &MembershipValidationScope,
+    incoming_scope: &MembershipValidationScope,
+) -> io::Result<()> {
+    if local_layout != FencedTransitionReceiptLedgerLayout::Activated
+        || incoming_layout != FencedTransitionReceiptLedgerLayout::Activated
+        || local_scope.current_identity != incoming_scope.current_identity
+        || local_scope.current_members != incoming_scope.current_members
+    {
+        return Ok(());
+    }
+
+    let local = read_fenced_transition_activation_certificate_sync(conn, storage_identity, false)?;
+    let incoming =
+        read_fenced_transition_activation_certificate_sync(conn, storage_identity, true)?;
+    match (local, incoming) {
+        (Some(local), Some(incoming)) if local == incoming => Ok(()),
+        (Some(_), None) => Err(invalid_data(
+            "session consensus snapshot erases current fenced transition activation",
+        )),
+        (Some(_), Some(_)) => Err(invalid_data(
+            "session consensus snapshot rewrites current fenced transition activation",
+        )),
+        (None, _) => Ok(()),
+    }
+}
+
+/// Classify only the two complete lease layouts that this adapter can safely
+/// interpret. In particular, an arbitrary partially-migrated input must not
+/// be made to look valid by projecting a `NULL` authority field over it.
+fn attached_snapshot_lease_schema(conn: &Connection) -> io::Result<AttachedSnapshotLeaseSchema> {
+    // The table-valued PRAGMA takes the schema name as its second argument.
+    // Qualifying the function name itself still introspects `main`, which
+    // would classify the destination layout instead of this pinned source.
+    let mut statement = conn
+        .prepare("SELECT name FROM pragma_table_info('leases', 'consensus_incoming') ORDER BY cid")
+        .map_err(db_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(db_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error)?;
+    if columns == LEASE_COLUMNS_WITH_ACQUIRED_AT {
+        Ok(AttachedSnapshotLeaseSchema::Current)
+    } else if columns == LEASE_COLUMNS_BEFORE_ACQUIRED_AT {
+        Ok(AttachedSnapshotLeaseSchema::PreAcquisitionTimestamp)
+    } else {
+        Err(invalid_data(
+            "session consensus snapshot lease schema is invalid",
+        ))
+    }
+}
+
+fn create_attached_snapshot_validation_views(
+    conn: &Connection,
+    lease_schema: AttachedSnapshotLeaseSchema,
+) -> io::Result<()> {
     for table in ATTACHED_SNAPSHOT_VALIDATION_TABLES {
-        if let Err(error) = conn.execute(
-            &format!("CREATE TEMP VIEW {table} AS SELECT * FROM consensus_incoming.{table}"),
-            [],
-        ) {
+        let source_exists = attached_snapshot_table_exists(conn, table)?;
+        let sql = if *table == "leases"
+            && lease_schema == AttachedSnapshotLeaseSchema::PreAcquisitionTimestamp
+        {
+            // A raw pre-column snapshot has no safe source for acquisition
+            // time. Keep its rows recoverable but make them non-authoritative
+            // for every V1 guard operation after install.
+            "CREATE TEMP VIEW leases AS SELECT tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at, CAST(NULL AS TEXT) AS acquired_at FROM consensus_incoming.leases".to_owned()
+        } else if *table == "consensus_fenced_transition_receipts"
+            && (!source_exists || !attached_snapshot_has_committed_fenced_receipts(conn)?)
+        {
+            // This is the sole additive ledger table. Pre-receipt snapshots
+            // are valid only as an empty ledger; the destination creates the
+            // table before install and never mutates the pinned source.
+            "CREATE TEMP VIEW consensus_fenced_transition_receipts AS SELECT CAST(NULL AS BLOB) AS request_id, CAST(NULL AS INTEGER) AS configuration_epoch, CAST(NULL AS BLOB) AS payload_digest, CAST(NULL AS TEXT) AS retained_until, CAST(NULL AS BLOB) AS binding_digest, CAST(NULL AS BLOB) AS response_json, CAST(NULL AS BLOB) AS response_digest WHERE 0".to_owned()
+        } else if *table == "consensus_fenced_transition_activation" && !source_exists {
+            // The markerless predecessor has no certificate table.  It is
+            // canonically an empty unactivated ledger during snapshot
+            // validation; a V2 destination never projects a certificate
+            // into that source.
+            "CREATE TEMP VIEW consensus_fenced_transition_activation AS SELECT CAST(NULL AS INTEGER) AS singleton, CAST(NULL AS INTEGER) AS storage_configuration_epoch, CAST(NULL AS BLOB) AS scope_configuration_id, CAST(NULL AS INTEGER) AS scope_configuration_epoch, CAST(NULL AS BLOB) AS voter_set_digest WHERE 0".to_owned()
+        } else {
+            format!("CREATE TEMP VIEW {table} AS SELECT * FROM consensus_incoming.{table}")
+        };
+        if let Err(error) = conn.execute(&sql, []) {
             let _ = drop_attached_snapshot_validation_views(conn);
             return Err(db_error(error));
         }
@@ -8672,7 +11702,7 @@ fn read_attached_snapshot_authority_profile_sync(
 ) -> io::Result<Option<ConsensusAuthorityProfile>> {
     let has_column: bool = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM consensus_incoming.pragma_table_info('consensus_identity') WHERE name = 'authority_profile')",
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_identity', 'consensus_incoming') WHERE name = 'authority_profile')",
             [],
             |row| row.get(0),
         )
@@ -8720,7 +11750,7 @@ fn validate_attached_snapshot_database_sync(
         SessionConsensusNodeId,
         opc_consensus::engine::EmptyNode,
     >,
-) -> io::Result<()> {
+) -> io::Result<MembershipValidationScope> {
     let integrity: String = conn
         .query_row("PRAGMA consensus_incoming.integrity_check", [], |row| {
             row.get(0)
@@ -8791,6 +11821,7 @@ fn validate_attached_snapshot_database_sync(
     ops::read_restore_scan_state_sync(conn)
         .map_err(|_| invalid_data("session consensus snapshot restore metadata is invalid"))?;
     validate_sealed_state_sync(conn)?;
+    validate_fenced_transition_receipts_sync(conn, identity)?;
     let applied = read_applied_sync(conn, identity)?;
     let membership = read_membership_sync(conn, identity)?;
     if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
@@ -8823,7 +11854,7 @@ fn validate_attached_snapshot_database_sync(
             ));
         }
     }
-    Ok(())
+    Ok(incoming_scope)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8977,6 +12008,7 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
         // validation and replacement even though deployment admission already
         // requires one writer per backing store.
         validate_snapshot_floor(&tx, identity, incoming_last_log_id)?;
+        let local_monotonic_state = snapshot_monotonic_state_sync(&tx, identity)?;
         if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
             if let (Some(expected_members), Some(expected_bindings)) =
                 (expected_members, expected_bindings)
@@ -8999,21 +12031,86 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
         // lets the existing read-only validators inspect that exact attached
         // source under the transaction that will copy it. A pathname swap or
         // later writer therefore cannot substitute bytes after validation.
-        create_attached_snapshot_validation_views(&tx)?;
-        let validation = validate_attached_snapshot_database_sync(
-            &tx,
-            identity,
-            authority_profile,
-            &expected_scope,
-            expected_members,
-            expected_bindings,
-            fixed_placement_policy,
-            local_candidate_marker,
-            meta,
-        );
+        let incoming_fenced_layout = fenced_transition_receipt_ledger_layout_in_sync(&tx, true)?;
+        let local_fenced_layout = fenced_transition_receipt_ledger_layout_sync(&tx)?;
+        // The V2 schema version is a one-way downgrade fence.  A snapshot
+        // from before activation cannot replace an activated replica even if
+        // its receipt table happens to be empty: an exact predecessor reader
+        // must continue to reject the installed database.
+        if local_fenced_layout == FencedTransitionReceiptLedgerLayout::Activated
+            && incoming_fenced_layout != FencedTransitionReceiptLedgerLayout::Activated
+        {
+            return Err(invalid_data(
+                "session consensus snapshot regresses fenced transition activation",
+            ));
+        }
+        let incoming_has_fenced_receipts =
+            incoming_fenced_layout == FencedTransitionReceiptLedgerLayout::Activated;
+        if incoming_has_fenced_receipts {
+            validate_attached_snapshot_fenced_receipt_schema_sync(&tx)?;
+        }
+        let incoming_lease_schema = attached_snapshot_lease_schema(&tx)?;
+        create_attached_snapshot_validation_views(&tx, incoming_lease_schema)?;
+        let validation: io::Result<()> = (|| {
+            let incoming_scope = validate_attached_snapshot_database_sync(
+                &tx,
+                identity,
+                authority_profile,
+                &expected_scope,
+                expected_members,
+                expected_bindings,
+                fixed_placement_policy,
+                local_candidate_marker,
+                meta,
+            )?;
+            let incoming_monotonic_state = snapshot_monotonic_state_sync(&tx, identity)?;
+            validate_snapshot_monotonic_state(&local_monotonic_state, &incoming_monotonic_state)?;
+            validate_snapshot_preserves_current_fenced_transition_activation_sync(
+                &tx,
+                identity,
+                local_fenced_layout,
+                incoming_fenced_layout,
+                &expected_scope,
+                &incoming_scope,
+            )?;
+            Ok(())
+        })();
         let drop_views = drop_attached_snapshot_validation_views(&tx);
         validation?;
         drop_views?;
+
+        // Only a fully validated incoming ledger may participate in the
+        // anti-rollback comparison. A snapshot may add receipts or compact an
+        // exact result after its deadline, but it must never erase or rewrite
+        // a durable request/body binding.
+        if !incoming_has_fenced_receipts {
+            let local_has_receipt: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM main.consensus_fenced_transition_receipts LIMIT 1)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if local_has_receipt {
+                return Err(invalid_data(
+                    "session consensus snapshot omits retained fenced transition receipts",
+                ));
+            }
+        } else {
+            validate_attached_snapshot_preserves_fenced_receipts_sync(&tx)?;
+        }
+        // Identity itself is adapter-owned and otherwise intentionally remains
+        // local on snapshot install.  These two fields are replicated
+        // compatibility state, however: copy them before the V1 receipt and
+        // certificate rows so an exact predecessor reader rejects the full
+        // installed image atomically.
+        if incoming_fenced_layout != FencedTransitionReceiptLedgerLayout::Published684 {
+            tx.execute(
+                "UPDATE main.consensus_identity SET schema_version = (SELECT schema_version FROM consensus_incoming.consensus_identity WHERE singleton = 1), fenced_transition_receipt_ledger_activated = (SELECT fenced_transition_receipt_ledger_activated FROM consensus_incoming.consensus_identity WHERE singleton = 1) WHERE singleton = 1",
+                [],
+            )
+            .map_err(db_error)?;
+        }
         for (table, columns) in [
             (
                 "session_records",
@@ -9021,7 +12118,7 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             ),
             (
                 "leases",
-                "tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at",
+                "tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, acquired_at, expires_at_unix_ms, guard_expires_at",
             ),
             (
                 "key_fences",
@@ -9035,6 +12132,14 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             (
                 "consensus_request_outcomes",
                 "request_id, configuration_epoch, payload_digest, response_json",
+            ),
+            (
+                "consensus_fenced_transition_receipts",
+                "request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest",
+            ),
+            (
+                "consensus_fenced_transition_activation",
+                "singleton, storage_configuration_epoch, scope_configuration_id, scope_configuration_epoch, voter_set_digest",
             ),
             (
                 "consensus_machine",
@@ -9069,16 +12174,33 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
                 "singleton, epoch, revision, cursor_key",
             ),
         ] {
+            if (table == "consensus_fenced_transition_receipts" && !incoming_has_fenced_receipts)
+                || (table == "consensus_fenced_transition_activation"
+                    && incoming_fenced_layout
+                        == FencedTransitionReceiptLedgerLayout::Published684)
+            {
+                continue;
+            }
             tx.execute(&format!("DELETE FROM {table}"), [])
                 .map_err(db_error)?;
+            let source_columns = if table == "leases"
+                && incoming_lease_schema == AttachedSnapshotLeaseSchema::PreAcquisitionTimestamp
+            {
+                "tenant, nf_kind, key_type, stable_id, active, credential_id, owner, fence, NULL, expires_at_unix_ms, guard_expires_at"
+            } else {
+                columns
+            };
             tx.execute(
                 &format!(
-                    "INSERT INTO {table} ({columns}) SELECT {columns} FROM consensus_incoming.{table}"
+                    "INSERT INTO {table} ({columns}) SELECT {source_columns} FROM consensus_incoming.{table}"
                 ),
                 [],
             )
             .map_err(db_error)?;
         }
+        validate_existing_schema(&tx, identity)
+            .map_err(|_| invalid_data("installed session consensus schema is invalid"))?;
+        validate_fenced_transition_receipts_sync(&tx, identity)?;
         // Restore cursors are local evidence, not replicated state-machine
         // authority. Every snapshot destination gets a fresh incarnation so
         // two nodes installing the same coherent snapshot cannot consume one
@@ -9133,6 +12255,91 @@ fn validate_snapshot_floor(
         if incoming.index < floor.index || (incoming.index == floor.index && incoming != &floor) {
             return Err(invalid_data(
                 "session consensus snapshot regresses durable state",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotMonotonicState {
+    logical_time: Option<Timestamp>,
+    application_sequence: u64,
+    last_digest: [u8; 32],
+    watch_sequence: u64,
+    recovery_epoch: u64,
+    last_plan_digest: [u8; 32],
+    pending_epoch: Option<u64>,
+    pending_plan_digest: Option<[u8; 32]>,
+    watch_cursor_invalidation_floor: u64,
+}
+
+fn snapshot_monotonic_state_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<SnapshotMonotonicState> {
+    let (application_sequence, last_digest, logical_time, watch_sequence) =
+        read_machine_sync(conn, identity)?;
+    let recovery = read_operator_recovery_sync(conn, identity)?;
+    Ok(SnapshotMonotonicState {
+        logical_time,
+        application_sequence,
+        last_digest: *last_digest.as_bytes(),
+        watch_sequence,
+        recovery_epoch: recovery.recovery_epoch,
+        last_plan_digest: recovery.last_plan_digest,
+        pending_epoch: recovery.pending_epoch,
+        pending_plan_digest: recovery.pending_plan_digest,
+        watch_cursor_invalidation_floor: recovery.watch_cursor_invalidation_floor,
+    })
+}
+
+/// Snapshot log pointers do not cover lease expiry, deduplication, watches, or
+/// recovery state.  Reject every incoming state that would move one of those
+/// durable floors backwards before the installation transaction deletes a
+/// single local row.
+fn validate_snapshot_monotonic_state(
+    local: &SnapshotMonotonicState,
+    incoming: &SnapshotMonotonicState,
+) -> io::Result<()> {
+    let logical_time_regressed = match (local.logical_time, incoming.logical_time) {
+        (Some(_), None) => true,
+        (Some(local), Some(incoming)) => incoming < local,
+        (None, _) => false,
+    };
+    if logical_time_regressed
+        || incoming.application_sequence < local.application_sequence
+        || (incoming.application_sequence == local.application_sequence
+            && incoming.last_digest != local.last_digest)
+        || incoming.watch_sequence < local.watch_sequence
+        || incoming.recovery_epoch < local.recovery_epoch
+        || (incoming.recovery_epoch == local.recovery_epoch
+            && incoming.last_plan_digest != local.last_plan_digest)
+        || incoming.watch_cursor_invalidation_floor < local.watch_cursor_invalidation_floor
+    {
+        return Err(invalid_data(
+            "session consensus snapshot regresses durable state",
+        ));
+    }
+
+    match (local.pending_epoch, local.pending_plan_digest) {
+        (Some(pending_epoch), Some(pending_plan_digest)) => {
+            let preserves_pending = incoming.pending_epoch == Some(pending_epoch)
+                && incoming.pending_plan_digest == Some(pending_plan_digest);
+            let exact_finalized = incoming.pending_epoch.is_none()
+                && incoming.pending_plan_digest.is_none()
+                && incoming.recovery_epoch == pending_epoch
+                && incoming.last_plan_digest == pending_plan_digest;
+            if !preserves_pending && !exact_finalized {
+                return Err(invalid_data(
+                    "session consensus snapshot regresses durable recovery state",
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(invalid_data(
+                "session consensus snapshot recovery state is invalid",
             ));
         }
     }
@@ -9302,7 +12509,7 @@ pub(crate) fn read_current_snapshot_sync(
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -9340,6 +12547,65 @@ mod tests {
 
     fn expected_members() -> BTreeSet<SessionConsensusNodeId> {
         BTreeSet::from([node_id()])
+    }
+
+    #[test]
+    fn snapshot_monotonic_state_rejects_each_non_log_rollback() {
+        let local = SnapshotMonotonicState {
+            logical_time: Some(timestamp(9)),
+            application_sequence: 9,
+            last_digest: [0x91; 32],
+            watch_sequence: 9,
+            recovery_epoch: 9,
+            last_plan_digest: [0x92; 32],
+            pending_epoch: None,
+            pending_plan_digest: None,
+            watch_cursor_invalidation_floor: 9,
+        };
+
+        for rollback in [
+            "logical-time",
+            "application-sequence",
+            "application-digest",
+            "watch-sequence",
+            "recovery-epoch",
+            "recovery-plan",
+            "watch-cursor-floor",
+            "pending-erasure",
+        ] {
+            let mut incoming = local;
+            let mut local = local;
+            match rollback {
+                "logical-time" => incoming.logical_time = None,
+                "application-sequence" => incoming.application_sequence -= 1,
+                "application-digest" => incoming.last_digest = [0x93; 32],
+                "watch-sequence" => incoming.watch_sequence -= 1,
+                "recovery-epoch" => incoming.recovery_epoch -= 1,
+                "recovery-plan" => incoming.last_plan_digest = [0x94; 32],
+                "watch-cursor-floor" => incoming.watch_cursor_invalidation_floor -= 1,
+                "pending-erasure" => {
+                    local.pending_epoch = Some(10);
+                    local.pending_plan_digest = Some([0x95; 32]);
+                }
+                _ => unreachable!("fixed rollback case"),
+            }
+            assert!(
+                validate_snapshot_monotonic_state(&local, &incoming).is_err(),
+                "{rollback}"
+            );
+        }
+
+        let finalized = SnapshotMonotonicState {
+            recovery_epoch: 10,
+            last_plan_digest: [0x95; 32],
+            ..local
+        };
+        let pending_local = SnapshotMonotonicState {
+            pending_epoch: Some(10),
+            pending_plan_digest: Some([0x95; 32]),
+            ..local
+        };
+        assert!(validate_snapshot_monotonic_state(&pending_local, &finalized).is_ok());
     }
 
     fn member(value: u64) -> SessionConsensusNodeId {
@@ -9518,70 +12784,227 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn origin_main_fixed_membership_reopens_into_final_scope_without_rewriting_state() {
+    async fn activated_database_with_dropped_receipt_ledger_rejects_reopen() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.lock().await;
         let identity = identity();
         let members = expected_members();
         initialize_schema(&conn, identity, &members).expect("initial consensus schema");
+        activate_fenced_transition_scope_sync(&conn, identity, identity, &members)
+            .expect("form activated V2 fixture");
+        conn.execute_batch("DROP TABLE consensus_fenced_transition_receipts")
+            .expect("remove activated receipt ledger");
 
-        let entries = vec![
-            membership_entry(),
-            acquire_entry(1, [0x91; 16], "owner-before-upgrade"),
-        ];
-        append_logs_sync(&conn, identity, &entries).expect("append pre-upgrade state");
-        apply_entries_sync(&conn, identity, &backend.caps, entries)
-            .expect("apply pre-upgrade state");
-        let before: (Vec<u8>, Vec<u8>, i64, i64) = conn
-            .query_row(
-                "SELECT m.membership_json, a.log_id_json, machine.application_sequence, (SELECT COUNT(*) FROM leases) FROM consensus_membership AS m JOIN consensus_applied AS a ON a.singleton = m.singleton JOIN consensus_machine AS machine ON machine.singleton = m.singleton WHERE m.singleton = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .expect("capture pre-upgrade authority state");
-
-        // These four tables do not exist on origin/main. Removing them from
-        // an otherwise current fixture proves the production upgrade path
-        // without admitting any unpublished intermediate schema shape.
-        conn.execute_batch(
-            "DROP TABLE consensus_candidate_bootstrap; DROP TABLE consensus_membership_terminal_history; DROP TABLE consensus_membership_history; DROP TABLE consensus_membership_scope;",
-        )
-        .expect("restore origin/main fixed-membership shape");
-        let legacy_scope =
-            read_membership_scope_sync(&conn, identity).expect("read origin/main fixed membership");
-        assert_eq!(identity, legacy_scope.current_identity);
-        assert_eq!(members, legacy_scope.current_members);
-        assert!(legacy_scope.current_bindings.is_empty());
-
-        initialize_schema(&conn, identity, &members).expect("upgrade fixed membership schema");
-        let after: (Vec<u8>, Vec<u8>, i64, i64) = conn
-            .query_row(
-                "SELECT m.membership_json, a.log_id_json, machine.application_sequence, (SELECT COUNT(*) FROM leases) FROM consensus_membership AS m JOIN consensus_applied AS a ON a.singleton = m.singleton JOIN consensus_machine AS machine ON machine.singleton = m.singleton WHERE m.singleton = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .expect("capture upgraded authority state");
+        let error = initialize_schema(&conn, identity, &members)
+            .expect_err("an activated receipt ledger cannot be recreated");
+        assert_eq!(error, SessionConsensusStorageError::CorruptState);
         assert_eq!(
-            before, after,
-            "upgrade must not rewrite consensus application state"
+            conn.query_row(
+                "SELECT fenced_transition_receipt_ledger_activated FROM consensus_identity WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("preserve activation marker"),
+            1,
+        );
+    }
+
+    #[test]
+    fn fenced_receipt_add_on_schema_matches_fresh_schema_and_rejects_null_ids() {
+        let fresh = SqliteSessionBackend::in_memory().expect("fresh backend");
+        let fresh_conn = fresh.conn.blocking_lock();
+        initialize_schema(&fresh_conn, identity(), &expected_members())
+            .expect("fresh consensus schema");
+        let fresh_table: String = fresh_conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_fenced_transition_receipts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fresh receipt table SQL");
+        let fresh_index: String = fresh_conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'consensus_fenced_transition_receipts_due'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fresh receipt index SQL");
+        assert!(fresh_table.contains(&format!(
+            "octet_length(retained_until) = {FENCED_TRANSITION_RECEIPT_TIMESTAMP_BYTES}"
+        )));
+        assert!(fresh_conn
+            .execute(
+                "INSERT INTO consensus_fenced_transition_receipts (request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (NULL, ?1, ?2, ?3, ?4, NULL, NULL)",
+                params![
+                    epoch_i64(identity()).expect("epoch"),
+                    [0x11_u8; 32].as_slice(),
+                    ops::format_rfc3339_normalized(timestamp(1)),
+                    [0x12_u8; 32].as_slice(),
+                ],
+            )
+            .is_err());
+
+        let add_on = SqliteSessionBackend::in_memory().expect("add-on backend");
+        let add_on_conn = add_on.conn.blocking_lock();
+        initialize_schema(&add_on_conn, identity(), &expected_members())
+            .expect("initial add-on fixture");
+        add_on_conn
+            .execute_batch(
+                r#"
+                DROP TABLE consensus_fenced_transition_receipts;
+                DROP TABLE consensus_fenced_transition_activation;
+                ALTER TABLE consensus_identity
+                DROP COLUMN fenced_transition_receipt_ledger_activated;
+                "#,
+            )
+            .expect("restore the published #684 receipt shape");
+        initialize_schema(&add_on_conn, identity(), &expected_members())
+            .expect("prepare the published #684 receipt ledger");
+        let add_on_table: String = add_on_conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_fenced_transition_receipts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("add-on receipt table SQL");
+        let add_on_index: String = add_on_conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'consensus_fenced_transition_receipts_due'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("add-on receipt index SQL");
+        assert_eq!(
+            normalize_schema_sql(&fresh_table),
+            normalize_schema_sql(&add_on_table)
+        );
+        assert_eq!(
+            normalize_schema_sql(&fresh_index),
+            normalize_schema_sql(&add_on_index)
+        );
+        assert_eq!(
+            add_on_conn
+                .query_row(
+                    "SELECT fenced_transition_receipt_ledger_activated FROM consensus_identity WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read activation marker"),
+            0,
+        );
+    }
+
+    #[test]
+    fn writable_reopen_rejects_partial_receipt_table_and_wrong_due_index() {
+        let empty_precommit = SqliteSessionBackend::in_memory().expect("precommit backend");
+        let empty_precommit_conn = empty_precommit.conn.blocking_lock();
+        initialize_schema(&empty_precommit_conn, identity(), &expected_members())
+            .expect("initial precommit fixture");
+        empty_precommit_conn
+            .execute_batch(
+                r#"
+                DROP TABLE consensus_fenced_transition_receipts;
+                CREATE TABLE consensus_fenced_transition_receipts (
+                    request_id BLOB PRIMARY KEY,
+                    configuration_epoch INTEGER NOT NULL,
+                    payload_digest BLOB NOT NULL,
+                    retained_until TEXT NOT NULL,
+                    response_json BLOB
+                );
+                "#,
+            )
+            .expect("install empty precommitment table");
+        assert!(
+            initialize_schema(&empty_precommit_conn, identity(), &expected_members()).is_err(),
+            "an activated partial ledger must not be replaced"
         );
 
-        let upgraded_scope =
-            read_membership_scope_sync(&conn, identity).expect("read upgraded membership scope");
-        assert_eq!(identity, upgraded_scope.current_identity);
-        assert_eq!(members, upgraded_scope.current_members);
-        assert_eq!(
-            test_member_bindings(&members),
-            upgraded_scope.current_bindings
+        let populated_precommit =
+            SqliteSessionBackend::in_memory().expect("populated precommit backend");
+        let populated_precommit_conn = populated_precommit.conn.blocking_lock();
+        initialize_schema(&populated_precommit_conn, identity(), &expected_members())
+            .expect("initial populated precommit fixture");
+        populated_precommit_conn
+            .execute_batch(
+                r#"
+                DROP TABLE consensus_fenced_transition_receipts;
+                CREATE TABLE consensus_fenced_transition_receipts (
+                    request_id BLOB PRIMARY KEY,
+                    configuration_epoch INTEGER NOT NULL,
+                    payload_digest BLOB NOT NULL,
+                    retained_until TEXT NOT NULL,
+                    response_json BLOB
+                );
+                INSERT INTO consensus_fenced_transition_receipts
+                    (request_id, configuration_epoch, payload_digest, retained_until, response_json)
+                VALUES
+                    (X'11111111111111111111111111111111', 1,
+                     X'2222222222222222222222222222222222222222222222222222222222222222',
+                     '2026-07-13T00:00:01Z', NULL);
+                "#,
+            )
+            .expect("install populated precommitment table");
+        assert!(
+            initialize_schema(&populated_precommit_conn, identity(), &expected_members(),).is_err()
         );
-        for table in [
-            "consensus_membership_scope",
-            "consensus_membership_history",
-            "consensus_membership_terminal_history",
-            "consensus_candidate_bootstrap",
-        ] {
-            assert!(table_exists(&conn, table).expect("read upgraded table shape"));
-        }
+
+        let malformed = SqliteSessionBackend::in_memory().expect("malformed backend");
+        let malformed_conn = malformed.conn.blocking_lock();
+        initialize_schema(&malformed_conn, identity(), &expected_members())
+            .expect("initial malformed fixture");
+        malformed_conn
+            .execute_batch(
+                r#"
+                DROP TABLE consensus_fenced_transition_receipts;
+                CREATE TABLE consensus_fenced_transition_receipts (
+                    request_id BLOB PRIMARY KEY,
+                    configuration_epoch INTEGER,
+                    payload_digest BLOB,
+                    retained_until TEXT,
+                    binding_digest BLOB,
+                    response_json BLOB,
+                    response_digest BLOB
+                );
+                "#,
+            )
+            .expect("install partial current-looking table");
+        assert!(initialize_schema(&malformed_conn, identity(), &expected_members()).is_err());
+
+        let wrong_index = SqliteSessionBackend::in_memory().expect("wrong-index backend");
+        let wrong_index_conn = wrong_index.conn.blocking_lock();
+        initialize_schema(&wrong_index_conn, identity(), &expected_members())
+            .expect("initial wrong-index fixture");
+        wrong_index_conn
+            .execute_batch(
+                "DROP INDEX consensus_fenced_transition_receipts_due; CREATE INDEX consensus_fenced_transition_receipts_due ON consensus_fenced_transition_receipts (request_id);",
+            )
+            .expect("install wrong due index");
+        assert!(initialize_schema(&wrong_index_conn, identity(), &expected_members()).is_err());
+
+        let missing_index = SqliteSessionBackend::in_memory().expect("missing-index backend");
+        let missing_index_conn = missing_index.conn.blocking_lock();
+        initialize_schema(&missing_index_conn, identity(), &expected_members())
+            .expect("initial missing-index fixture");
+        missing_index_conn
+            .execute_batch("DROP INDEX consensus_fenced_transition_receipts_due")
+            .expect("remove due index");
+        assert!(
+            initialize_schema(&missing_index_conn, identity(), &expected_members()).is_err(),
+            "an activated missing index must not be recreated"
+        );
+
+        let global_collision = SqliteSessionBackend::in_memory().expect("global-collision backend");
+        let global_collision_conn = global_collision.conn.blocking_lock();
+        initialize_schema(&global_collision_conn, identity(), &expected_members())
+            .expect("initial global-collision fixture");
+        global_collision_conn
+            .execute_batch(
+                "DROP TABLE consensus_fenced_transition_receipts; CREATE TABLE receipt_index_collision (request_id BLOB); CREATE INDEX consensus_fenced_transition_receipts_due ON receipt_index_collision (request_id);",
+            )
+            .expect("install global due-index collision");
+        assert!(
+            initialize_schema(&global_collision_conn, identity(), &expected_members(),).is_err()
+        );
     }
 
     #[tokio::test]
@@ -9668,6 +13091,3749 @@ mod tests {
                     ttl: Duration::from_secs(300),
                 },
             }),
+        }
+    }
+
+    fn fenced_transition_request_with_payload(
+        request_byte: u8,
+        owner: &'static str,
+        payload_len: usize,
+    ) -> FencedTransitionRequest {
+        let owner = OwnerId::new(owner).expect("owner");
+        let lease = FencedTransitionLease::acquire(
+            key(),
+            owner.clone(),
+            crate::FenceToken::new(0),
+            Duration::from_secs(300),
+        )
+        .expect("valid fenced lease");
+        let mut record = sealed_record_for_key(key(), payload_len);
+        record.owner = owner;
+        record.fence = crate::FenceToken::new(1);
+        FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([request_byte; 16]),
+            lease,
+            FencedTransitionMutation::create(record),
+        )
+        .expect("valid fenced transition")
+    }
+
+    fn fenced_transition_request(request_byte: u8, owner: &'static str) -> FencedTransitionRequest {
+        fenced_transition_request_with_payload(request_byte, owner, 1_024)
+    }
+
+    fn finite_fenced_transition_create_request(
+        request_byte: u8,
+        owner: &'static str,
+        expires_at: Timestamp,
+    ) -> FencedTransitionRequest {
+        let owner = OwnerId::new(owner).expect("owner");
+        let lease = FencedTransitionLease::acquire(
+            key(),
+            owner.clone(),
+            crate::FenceToken::new(0),
+            Duration::from_secs(300),
+        )
+        .expect("valid fenced lease");
+        let mut record = sealed_record_for_key(key(), 1_024);
+        record.owner = owner;
+        record.fence = lease.committed_fence().expect("committed fence");
+        record.expires_at = Some(expires_at);
+        record.payload = sealed_payload_for_record(&record, 1_024);
+        FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([request_byte; 16]),
+            lease,
+            FencedTransitionMutation::create(record),
+        )
+        .expect("finite fenced transition")
+    }
+
+    fn fenced_transition_entry(
+        index: u64,
+        request: FencedTransitionRequest,
+        logical_time: Timestamp,
+    ) -> Entry<SessionRaftTypeConfig> {
+        fenced_transition_entry_for_voters(index, request, logical_time, &expected_members())
+    }
+
+    fn fenced_transition_entry_for_voters(
+        index: u64,
+        request: FencedTransitionRequest,
+        logical_time: Timestamp,
+        voters: &BTreeSet<SessionConsensusNodeId>,
+    ) -> Entry<SessionRaftTypeConfig> {
+        activating_fenced_transition_authorized_entry(
+            index,
+            request,
+            logical_time,
+            node_id(),
+            identity(),
+            identity(),
+            voters,
+        )
+    }
+
+    fn fenced_transition_authorized_entry(
+        index: u64,
+        request: FencedTransitionRequest,
+        logical_time: Timestamp,
+        origin: SessionConsensusNodeId,
+        authority_identity: SessionConsensusIdentity,
+    ) -> Entry<SessionRaftTypeConfig> {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes()),
+                logical_time,
+                intent: SessionMutationIntent::Authorized {
+                    origin,
+                    authority_identity,
+                    mutation: Box::new(SessionMutationIntent::FencedTransition(Box::new(request))),
+                },
+            }),
+        }
+    }
+
+    fn activating_fenced_transition_authorized_entry(
+        index: u64,
+        request: FencedTransitionRequest,
+        logical_time: Timestamp,
+        origin: SessionConsensusNodeId,
+        authority_identity: SessionConsensusIdentity,
+        scope_identity: SessionConsensusIdentity,
+        voters: &BTreeSet<SessionConsensusNodeId>,
+    ) -> Entry<SessionRaftTypeConfig> {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes()),
+                logical_time,
+                intent: SessionMutationIntent::Authorized {
+                    origin,
+                    authority_identity,
+                    mutation: Box::new(SessionMutationIntent::ActivateFencedTransition {
+                        request: Box::new(request),
+                        scope_identity,
+                        voter_set_digest: fenced_transition_voter_set_digest(
+                            scope_identity,
+                            voters,
+                        ),
+                    }),
+                },
+            }),
+        }
+    }
+
+    /// Seed compacted, structurally valid permanent bindings without paying
+    /// for thousands of record/lease state transitions. The fixture first
+    /// forms V2 for the exact persisted membership scope, because a prepared
+    /// ledger may not contain receipts. The machine clock is set to the
+    /// tombstone retention floor so reopen and snapshot validators see the
+    /// same durable invariants as a compacted production ledger.
+    fn seed_fenced_transition_tombstones(conn: &Connection, count: usize, machine_time: Timestamp) {
+        let scope = read_membership_scope_sync(conn, identity()).expect("fixture membership scope");
+        activate_fenced_transition_scope_sync(
+            conn,
+            identity(),
+            scope.current_identity,
+            &scope.current_members,
+        )
+        .expect("activate fenced receipt fixture");
+        conn.execute(
+            "UPDATE consensus_machine SET application_sequence = ?1, logical_time = ?2 WHERE singleton = 1 AND configuration_epoch = ?3",
+            params![
+                checked_i64(u64::try_from(count).expect("fixture count"))
+                    .expect("fixture machine sequence"),
+                ops::format_rfc3339_normalized(machine_time),
+                epoch_i64(identity()).expect("epoch"),
+            ],
+        )
+        .expect("set tombstone machine floor");
+        for ordinal in 0..count {
+            let ordinal = u64::try_from(ordinal + 1).expect("fixture ordinal");
+            let mut request_id = [0xA5_u8; 16];
+            request_id[8..].copy_from_slice(&ordinal.to_be_bytes());
+            let request_id = SessionConsensusRequestId::from_bytes(request_id);
+            let retained_until = ops::format_rfc3339_normalized(machine_time);
+            let binding_digest = fenced_transition_receipt_binding_digest(
+                identity(),
+                request_id,
+                [0xC3_u8; 32],
+                &retained_until,
+            )
+            .expect("tombstone binding");
+            conn.execute(
+                "INSERT INTO consensus_fenced_transition_receipts (request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+                params![
+                    request_id.as_bytes().as_slice(),
+                    epoch_i64(identity()).expect("epoch"),
+                    [0xC3_u8; 32].as_slice(),
+                    retained_until,
+                    binding_digest.as_slice(),
+                ],
+            )
+            .expect("insert valid tombstone");
+        }
+    }
+
+    #[test]
+    fn membership_projection_treats_a_persisted_fenced_id_as_a_topology_no_effect() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        let current = members(&[7, 8, 9]);
+        initialize_schema(&conn, identity(), &current).expect("consensus schema");
+        let initial = membership_entry_at(0, vec![current.clone()], current.clone());
+        let fenced = fenced_transition_entry_for_voters(
+            1,
+            fenced_transition_request(0xC7, "projection-owner"),
+            timestamp(1),
+            &current,
+        );
+        append_logs_sync(&conn, identity(), &[initial.clone(), fenced.clone()])
+            .expect("append receipt fixture");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![initial, fenced])
+            .expect("apply receipt fixture");
+
+        let desired = members(&[7, 8, 9, 10, 11]);
+        let prepare = topology_entry_at(
+            2,
+            0xC7,
+            SessionMutationIntent::PrepareTopologyTransition {
+                transition_id: [0xC7; MEMBERSHIP_TRANSITION_ID_BYTES],
+                request_digest: [0xC8; 32],
+                desired_identity: identity_at(2, 0xC9),
+                desired_members: desired.clone(),
+                desired_bindings: test_member_bindings(&desired),
+            },
+        );
+        let dependent_membership = membership_entry_at(3, vec![current.clone()], desired.clone());
+        assert!(append_logs_sync(&conn, identity(), &[prepare, dependent_membership]).is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_log WHERE log_index >= 2",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count rejected dependent log"),
+            0,
+        );
+        assert!(read_membership_scope_sync(&conn, identity())
+            .expect("unchanged scope")
+            .pending
+            .is_none());
+    }
+
+    #[test]
+    fn membership_projection_does_not_reserve_unbound_fenced_ids_at_cap_or_horizon() {
+        for terminal in ["history-full", "retention-exhausted"] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.blocking_lock();
+            let current = members(&[7, 8, 9]);
+            initialize_schema(&conn, identity(), &current).expect("consensus schema");
+            let initial = membership_entry_at(0, vec![current.clone()], current.clone());
+            append_logs_sync(&conn, identity(), std::slice::from_ref(&initial))
+                .expect("append membership");
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![initial])
+                .expect("apply membership");
+            let fenced_time = if terminal == "history-full" {
+                seed_fenced_transition_tombstones(
+                    &conn,
+                    FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+                    timestamp(0),
+                );
+                timestamp(1)
+            } else {
+                Timestamp::from_str("9999-12-31T00:00:00Z").expect("retention horizon timestamp")
+            };
+            let request_byte = if terminal == "history-full" {
+                0xC1
+            } else {
+                0xC2
+            };
+            let fenced = fenced_transition_entry_for_voters(
+                1,
+                fenced_transition_request(request_byte, "unbound-projection-owner"),
+                fenced_time,
+                &current,
+            );
+            let desired = members(&[7, 8, 9, 10, 11]);
+            let prepare = topology_entry_at(
+                2,
+                request_byte,
+                SessionMutationIntent::PrepareTopologyTransition {
+                    transition_id: [request_byte; MEMBERSHIP_TRANSITION_ID_BYTES],
+                    request_digest: [0xCA; 32],
+                    desired_identity: identity_at(2, 0xCB),
+                    desired_members: desired.clone(),
+                    desired_bindings: test_member_bindings(&desired),
+                },
+            );
+            let learners = membership_entry_at(3, vec![current.clone()], desired.clone());
+            append_logs_sync(
+                &conn,
+                identity(),
+                &[fenced.clone(), prepare.clone(), learners.clone()],
+            )
+            .unwrap_or_else(|error| panic!("{terminal} projection must match apply: {error}"));
+            let applied = apply_entries_sync(
+                &conn,
+                identity(),
+                &backend.caps,
+                vec![fenced, prepare, learners],
+            )
+            .unwrap_or_else(|error| panic!("{terminal} batch applies: {error}"));
+            assert!(matches!(
+                &applied.responses[0].result,
+                Err(StoreError::FencedTransitionHistoryFull)
+                    | Err(StoreError::FencedTransitionRetentionExhausted)
+            ));
+            assert!(matches!(
+                &applied.responses[1].result,
+                Ok(SessionMutationOutcome::Unit)
+            ));
+            assert!(read_membership_scope_sync(&conn, identity())
+                .expect("projected topology scope")
+                .pending
+                .is_some());
+            let request_id = SessionConsensusRequestId::from_bytes([request_byte; 16]);
+            assert!(
+                read_fenced_transition_receipt_sync(&conn, identity(), request_id)
+                    .expect("unbound fenced receipt read")
+                    .is_none()
+            );
+            assert!(read_outcome_sync(&conn, identity(), request_id)
+                .expect("topology outcome read")
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn membership_projection_matches_same_batch_fenced_topology_request_id_permutations() {
+        for fenced_first in [true, false] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.blocking_lock();
+            let current = members(&[7, 8, 9]);
+            initialize_schema(&conn, identity(), &current).expect("consensus schema");
+            let initial = membership_entry_at(0, vec![current.clone()], current.clone());
+            append_logs_sync(&conn, identity(), std::slice::from_ref(&initial))
+                .expect("append initial membership");
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![initial])
+                .expect("apply initial membership");
+
+            let request_byte = 0xC9;
+            let request = fenced_transition_request(request_byte, "same-batch-owner");
+            let desired = members(&[7, 8, 9, 10, 11]);
+            let topology = |index| {
+                topology_entry_at(
+                    index,
+                    request_byte,
+                    SessionMutationIntent::PrepareTopologyTransition {
+                        transition_id: [0xCA; MEMBERSHIP_TRANSITION_ID_BYTES],
+                        request_digest: [0xCB; 32],
+                        desired_identity: identity_at(2, 0xCC),
+                        desired_members: desired.clone(),
+                        desired_bindings: test_member_bindings(&desired),
+                    },
+                )
+            };
+            let (first, second) = if fenced_first {
+                (
+                    fenced_transition_entry_for_voters(1, request.clone(), timestamp(1), &current),
+                    topology(2),
+                )
+            } else {
+                (
+                    topology(1),
+                    fenced_transition_entry_for_voters(2, request.clone(), timestamp(2), &current),
+                )
+            };
+            append_logs_sync(&conn, identity(), &[first.clone(), second.clone()]).unwrap_or_else(
+                |error| panic!("same-batch request-ID collision must project: {error}"),
+            );
+            let applied = apply_entries_sync(&conn, identity(), &backend.caps, vec![first, second])
+                .unwrap_or_else(|error| {
+                    panic!("same-batch request-ID collision must apply: {error}")
+                });
+            assert_eq!(
+                read_applied_sync(&conn, identity()).expect("read applied collision batch"),
+                Some(log_id(2)),
+            );
+            let request_id = SessionConsensusRequestId::from_bytes([request_byte; 16]);
+
+            if fenced_first {
+                assert!(matches!(
+                    applied.responses.as_slice(),
+                    [
+                        SessionConsensusResponse {
+                            result: Ok(SessionMutationOutcome::FencedTransition(_)),
+                            ..
+                        },
+                        SessionConsensusResponse {
+                            result: Err(StoreError::CasIdempotencyConflict),
+                            ..
+                        }
+                    ]
+                ));
+                assert!(
+                    read_fenced_transition_receipt_sync(&conn, identity(), request_id)
+                        .expect("read fenced binding")
+                        .is_some()
+                );
+                assert!(read_outcome_sync(&conn, identity(), request_id)
+                    .expect("read generic outcome")
+                    .is_none());
+                assert!(read_membership_scope_sync(&conn, identity())
+                    .expect("read unprojected topology scope")
+                    .pending
+                    .is_none());
+            } else {
+                assert!(matches!(
+                    applied.responses.as_slice(),
+                    [
+                        SessionConsensusResponse {
+                            result: Ok(SessionMutationOutcome::Unit),
+                            ..
+                        },
+                        SessionConsensusResponse {
+                            result: Err(StoreError::FencedTransitionRequestConflict),
+                            ..
+                        }
+                    ]
+                ));
+                assert!(
+                    read_fenced_transition_receipt_sync(&conn, identity(), request_id)
+                        .expect("read absent fenced binding")
+                        .is_none()
+                );
+                assert!(read_outcome_sync(&conn, identity(), request_id)
+                    .expect("read topology outcome")
+                    .is_some());
+                assert!(read_membership_scope_sync(&conn, identity())
+                    .expect("read projected topology scope")
+                    .pending
+                    .is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn fenced_transition_receipt_replays_conflicts_and_expires_to_a_tombstone() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let request = fenced_transition_request(0xE1, "fenced-owner");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, request.clone(), timestamp(1)),
+            ],
+        )
+        .expect("first transition");
+
+        let replay = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(2, request.clone(), timestamp(2))],
+        )
+        .expect("exact replay");
+        assert!(matches!(
+            replay.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::FencedTransition(_)),
+                ..
+            }]
+        ));
+
+        let conflict = fenced_transition_request(0xE1, "different-owner");
+        let conflict = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(3, conflict, timestamp(3))],
+        )
+        .expect("body conflict is a committed no-op");
+        assert!(matches!(
+            conflict.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionRequestConflict),
+                ..
+            }]
+        ));
+
+        let expiry = Timestamp::from_str("2026-07-13T00:00:01Z").expect("expiry timestamp");
+        let expired = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(4, request.clone(), expiry)],
+        )
+        .expect("expired replay is a committed no-op");
+        assert!(matches!(
+            expired.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionRequestExpired),
+                ..
+            }]
+        ));
+        let post_expiry_conflict = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(
+                5,
+                fenced_transition_request(0xE1, "post-expiry-owner"),
+                expiry,
+            )],
+        )
+        .expect("post-expiry body conflict is a committed no-op");
+        assert!(matches!(
+            post_expiry_conflict.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionRequestConflict),
+                ..
+            }]
+        ));
+        assert_eq!(
+            1,
+            proposal_state_sync(&conn, identity())
+                .expect("machine state")
+                .0,
+            "historical receipts never execute a second transition",
+        );
+        let stored: (Option<Vec<u8>>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT response_json, response_digest FROM consensus_fenced_transition_receipts WHERE request_id = ?1",
+                [request.request_id().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("receipt row");
+        assert_eq!(stored, (None, None), "expiry retains only the tombstone");
+        assert!(matches!(
+            read_fenced_transition_status_sync(&conn, identity(), identity(), &request),
+            Ok(FencedTransitionStatus::Expired)
+        ));
+    }
+
+    #[test]
+    fn full_fenced_history_keeps_existing_receipt_replay_and_conflict_authoritative() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply membership");
+        seed_fenced_transition_tombstones(
+            &conn,
+            FENCED_TRANSITION_MAX_HISTORY_ENTRIES - 1,
+            timestamp(0),
+        );
+        let request = fenced_transition_request(0xD1, "full-history-owner");
+        let first = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(1, request.clone(), timestamp(1))],
+        )
+        .expect("last history slot executes");
+        let recorded = first.responses[0].clone();
+        assert!(matches!(
+            &recorded.result,
+            Ok(SessionMutationOutcome::FencedTransition(_))
+        ));
+        assert_eq!(
+            fenced_transition_receipt_count_sync(&conn).expect("bounded receipt count"),
+            FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+        );
+
+        let replay = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(2, request.clone(), timestamp(2))],
+        )
+        .expect("exact replay at capacity");
+        assert_eq!(replay.responses.as_slice(), &[recorded]);
+        let conflict = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(
+                3,
+                fenced_transition_request(0xD1, "full-history-other-owner"),
+                timestamp(3),
+            )],
+        )
+        .expect("body conflict at capacity");
+        assert!(matches!(
+            conflict.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionRequestConflict),
+                ..
+            }]
+        ));
+        assert!(matches!(
+            read_fenced_transition_status_sync(&conn, identity(), identity(), &request),
+            Ok(FencedTransitionStatus::Recorded(result)) if result.as_ref().is_ok()
+        ));
+    }
+
+    #[test]
+    fn fenced_status_checks_generic_namespace_before_history_capacity() {
+        for (seed_count, expected) in [
+            (0, FencedTransitionStatus::RequestConflict),
+            (
+                FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+                FencedTransitionStatus::RequestConflict,
+            ),
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+                .expect("apply membership");
+            if seed_count != 0 {
+                seed_fenced_transition_tombstones(&conn, seed_count, timestamp(0));
+            }
+            let request = fenced_transition_request(0xD2, "generic-conflict-owner");
+            apply_entries_sync(
+                &conn,
+                identity(),
+                &backend.caps,
+                vec![acquire_entry(
+                    1,
+                    *request.request_id().as_bytes(),
+                    "generic-owner",
+                )],
+            )
+            .expect("generic outcome fixture");
+            assert_eq!(
+                read_fenced_transition_status_sync(&conn, identity(), identity(), &request)
+                    .expect("status resolves generic namespace collision"),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn absent_fenced_status_reports_history_full_only_at_the_protocol_cap() {
+        for (seed_count, expected) in [
+            (
+                FENCED_TRANSITION_MAX_HISTORY_ENTRIES - 1,
+                FencedTransitionStatus::NotFound,
+            ),
+            (
+                FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+                FencedTransitionStatus::HistoryFull,
+            ),
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+                .expect("apply membership");
+            seed_fenced_transition_tombstones(&conn, seed_count, timestamp(0));
+            let request = fenced_transition_request(0xD3, "absent-status-owner");
+            assert_eq!(
+                read_fenced_transition_status_sync(&conn, identity(), identity(), &request)
+                    .expect("read absent status"),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn full_fenced_history_is_a_replay_style_no_effect_and_never_binds_the_request() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply membership");
+        seed_fenced_transition_tombstones(
+            &conn,
+            FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+            timestamp(0),
+        );
+        let before = read_machine_sync(&conn, identity()).expect("machine state before full");
+        let request = fenced_transition_request(0xD4, "full-rejection-owner");
+        let first = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(1, request.clone(), timestamp(1))],
+        )
+        .expect("apply full-history rejection");
+        assert!(matches!(
+            first.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionHistoryFull),
+                sequence,
+                digest: Some(digest),
+                logical_time: Some(logical_time),
+                raft_log_index: 1,
+            }] if *sequence == before.0 && *digest == before.1 && *logical_time == timestamp(1)
+        ));
+        assert!(first.notifications.is_empty());
+        let after_first = read_machine_sync(&conn, identity()).expect("machine state after full");
+        assert_eq!(
+            after_first.0, before.0,
+            "full rejection has no application sequence"
+        );
+        assert_eq!(
+            after_first.1, before.1,
+            "full rejection has no digest effect"
+        );
+        assert_eq!(
+            after_first.2,
+            Some(timestamp(1)),
+            "full rejection advances logical time"
+        );
+        assert_eq!(
+            after_first.3, before.3,
+            "full rejection has no watch effect"
+        );
+        assert_eq!(
+            read_applied_sync(&conn, identity()).expect("applied full rejection"),
+            Some(log_id(1)),
+        );
+        for table in ["session_records", "leases"] {
+            let query = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(
+                conn.query_row(&query, [], |row| row.get::<_, i64>(0))
+                    .expect("count full rejection effects"),
+                0,
+                "full rejection must not mutate {table}",
+            );
+        }
+        assert_eq!(
+            fenced_transition_receipt_count_sync(&conn).expect("bounded receipt count"),
+            FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+        );
+        assert!(read_fenced_transition_receipt_sync(
+            &conn,
+            identity(),
+            SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes()),
+        )
+        .expect("read absent full request")
+        .is_none());
+
+        let different = fenced_transition_request(0xD4, "full-rejection-different-owner");
+        let repeated = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                fenced_transition_entry(2, request.clone(), timestamp(2)),
+                fenced_transition_entry(3, different, timestamp(3)),
+            ],
+        )
+        .expect("full-history retries apply as no effects");
+        assert!(repeated.responses.iter().all(|response| {
+            matches!(
+                &response.result,
+                Err(StoreError::FencedTransitionHistoryFull)
+            )
+        }));
+        assert!(matches!(
+            read_fenced_transition_status_sync(&conn, identity(), identity(), &request),
+            Ok(FencedTransitionStatus::HistoryFull)
+        ));
+    }
+
+    #[test]
+    fn ordered_fenced_entries_only_the_first_consumes_the_last_history_slot() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply membership");
+        seed_fenced_transition_tombstones(
+            &conn,
+            FENCED_TRANSITION_MAX_HISTORY_ENTRIES - 1,
+            timestamp(0),
+        );
+        let first = fenced_transition_request(0xD5, "last-slot-first-owner");
+        let second = fenced_transition_request(0xD6, "last-slot-second-owner");
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                fenced_transition_entry(1, first, timestamp(1)),
+                fenced_transition_entry(2, second.clone(), timestamp(2)),
+            ],
+        )
+        .expect("ordered last-slot entries");
+        assert!(matches!(
+            &applied.responses[0].result,
+            Ok(SessionMutationOutcome::FencedTransition(_))
+        ));
+        assert!(matches!(
+            &applied.responses[1].result,
+            Err(StoreError::FencedTransitionHistoryFull)
+        ));
+        assert_eq!(
+            applied.notifications.len(),
+            1,
+            "only first entry replicates"
+        );
+        let machine = read_machine_sync(&conn, identity()).expect("machine state");
+        assert_eq!(
+            machine.0,
+            u64::try_from(FENCED_TRANSITION_MAX_HISTORY_ENTRIES).expect("cap fits u64"),
+            "only first entry advances application sequence",
+        );
+        assert_eq!(machine.3, 1, "only first entry advances watch sequence");
+        assert_eq!(
+            fenced_transition_receipt_count_sync(&conn).expect("bounded receipt count"),
+            FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+        );
+        assert!(matches!(
+            read_fenced_transition_status_sync(&conn, identity(), identity(), &second),
+            Ok(FencedTransitionStatus::HistoryFull)
+        ));
+    }
+
+    #[test]
+    fn deterministic_fenced_rejection_claims_the_last_history_slot() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply membership");
+        seed_fenced_transition_tombstones(
+            &conn,
+            FENCED_TRANSITION_MAX_HISTORY_ENTRIES - 1,
+            timestamp(0),
+        );
+        ops::insert_or_replace_fence_sync(&conn, &key(), 1).expect("seed stale fence");
+        let rejected = fenced_transition_request(0xD7, "last-slot-rejection-owner");
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(1, rejected.clone(), timestamp(1))],
+        )
+        .expect("deterministic rejection is recorded");
+        assert!(matches!(
+            applied.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::StaleFence),
+                ..
+            }]
+        ));
+        assert_eq!(
+            fenced_transition_receipt_count_sync(&conn).expect("bounded receipt count"),
+            FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+        );
+        assert!(matches!(
+            read_fenced_transition_status_sync(&conn, identity(), identity(), &rejected),
+            Ok(FencedTransitionStatus::Recorded(result))
+                if matches!(result.as_ref(), Err(StoreError::StaleFence))
+        ));
+    }
+
+    #[test]
+    fn oversized_fenced_history_fails_validation_reopen_and_snapshot() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply membership");
+        seed_fenced_transition_tombstones(
+            &conn,
+            FENCED_TRANSITION_MAX_HISTORY_ENTRIES + 1,
+            timestamp(0),
+        );
+
+        assert!(validate_fenced_transition_receipts_sync(&conn, identity()).is_err());
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        assert!(build_snapshot_database_sync(
+            &conn,
+            identity(),
+            &directory.path().join("oversized-fenced-history.sqlite"),
+        )
+        .is_err());
+        assert!(matches!(
+            initialize_schema(&conn, identity(), &expected_members()),
+            Err(SessionConsensusStorageError::CorruptState)
+        ));
+    }
+
+    #[test]
+    fn capped_fenced_history_round_trips_through_snapshot_as_history_full() {
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.blocking_lock();
+        initialize_schema(&source_conn, identity(), &expected_members())
+            .expect("source consensus schema");
+        apply_entries_sync(
+            &source_conn,
+            identity(),
+            &source.caps,
+            vec![membership_entry()],
+        )
+        .expect("source membership");
+        seed_fenced_transition_tombstones(
+            &source_conn,
+            FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+            timestamp(0),
+        );
+        validate_fenced_transition_receipts_sync(&source_conn, identity())
+            .expect("capped receipt history remains valid");
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("capped-fenced-history.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                .expect("build capped history snapshot");
+        drop(source_conn);
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.blocking_lock();
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("target consensus schema");
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "capped-fenced-history".into(),
+        };
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "capped-fenced-history.opc",
+            [0xD8; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("snapshot metadata")
+                .len(),
+        )
+        .expect("install capped history snapshot");
+        assert!(matches!(
+            read_fenced_transition_status_sync(
+                &target_conn,
+                identity(),
+                identity(),
+                &fenced_transition_request(0xD9, "snapshot-history-full-owner"),
+            ),
+            Ok(FencedTransitionStatus::HistoryFull)
+        ));
+    }
+
+    #[test]
+    fn finite_fenced_create_replays_after_record_expiry_without_an_application_effect() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let recorded_at = timestamp(1);
+        let record_expires_at =
+            crate::ttl::checked_session_deadline(recorded_at, Duration::from_secs(60))
+                .expect("finite record deadline");
+        let request =
+            finite_fenced_transition_create_request(0xE1, "finite-create-owner", record_expires_at);
+        let first = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, request.clone(), recorded_at),
+            ],
+        )
+        .expect("finite create");
+        let recorded = first.responses[1].clone();
+        let machine_before_replay = read_machine_sync(&conn, identity()).expect("machine state");
+
+        let replay_time =
+            crate::ttl::checked_session_deadline(recorded_at, Duration::from_secs(6 * 60))
+                .expect("post-expiry replay time");
+        let replay_entry = fenced_transition_entry(2, request.clone(), replay_time);
+        let EntryPayload::Normal(command) = &replay_entry.payload else {
+            panic!("replay must be a normal command");
+        };
+        validate_command_for_log(command, identity())
+            .expect("follower admits an exact receipt after record expiry");
+        let replay = apply_entries_sync(&conn, identity(), &backend.caps, vec![replay_entry])
+            .expect("expired-record exact replay");
+        assert_eq!(replay.responses.as_slice(), &[recorded]);
+        assert!(
+            replay.notifications.is_empty(),
+            "replay emits no watch effect"
+        );
+        assert_eq!(
+            read_machine_sync(&conn, identity()).expect("machine after replay"),
+            (
+                machine_before_replay.0,
+                machine_before_replay.1,
+                Some(replay_time),
+                machine_before_replay.3,
+            ),
+            "exact replay advances only the committed logical-time pointer",
+        );
+        assert_eq!(
+            Some(log_id(2)),
+            read_applied_sync(&conn, identity()).expect("applied replay")
+        );
+
+        let retained_until = match &first.responses[1].result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome.retained_until(),
+            _ => panic!("finite create must record a transition outcome"),
+        };
+        let expiry_entry = fenced_transition_entry(3, request.clone(), retained_until);
+        let EntryPayload::Normal(command) = &expiry_entry.payload else {
+            panic!("expiry replay must be a normal command");
+        };
+        validate_command_for_log(command, identity())
+            .expect("follower admits a receipt at exact retention equality");
+        let expired = apply_entries_sync(&conn, identity(), &backend.caps, vec![expiry_entry])
+            .expect("retention-equality replay");
+        assert!(matches!(
+            expired.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionRequestExpired),
+                ..
+            }]
+        ));
+        assert!(
+            expired.notifications.is_empty(),
+            "expiry replay emits no watch effect"
+        );
+        assert_eq!(
+            proposal_state_sync(&conn, identity())
+                .expect("machine after retention equality")
+                .0,
+            machine_before_replay.0,
+            "receipt expiry is a tombstone transition, never a second application effect",
+        );
+        let stored: (Option<Vec<u8>>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT response_json, response_digest FROM consensus_fenced_transition_receipts WHERE request_id = ?1",
+                [request.request_id().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("receipt tombstone");
+        assert!(
+            stored.0.is_none() && stored.1.is_none(),
+            "retention equality compacts to a tombstone"
+        );
+    }
+
+    #[test]
+    fn finite_fenced_update_replays_after_record_expiry_without_an_application_effect() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let created_at = timestamp(1);
+        let create_expires_at =
+            crate::ttl::checked_session_deadline(created_at, Duration::from_secs(120))
+                .expect("finite create deadline");
+        let create =
+            finite_fenced_transition_create_request(0xE2, "finite-update-owner", create_expires_at);
+        let created = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, create, created_at),
+            ],
+        )
+        .expect("finite create before update");
+        let created_outcome = match &created.responses[1].result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome.clone(),
+            _ => panic!("finite create must commit"),
+        };
+
+        let update_lease =
+            FencedTransitionLease::renew(created_outcome.lease().clone(), Duration::from_secs(300))
+                .expect("update renewal");
+        let update_expires_at =
+            crate::ttl::checked_session_deadline(created_at, Duration::from_secs(180))
+                .expect("finite update deadline");
+        let mut update_record = sealed_record_for_key(key(), 1_024);
+        update_record.generation = crate::Generation::new(2);
+        update_record.owner = created_outcome.lease().owner().clone();
+        update_record.fence = update_lease.committed_fence().expect("renewed fence");
+        update_record.expires_at = Some(update_expires_at);
+        update_record.payload = sealed_payload_for_record(&update_record, 1_024);
+        let update = FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([0xE3; 16]),
+            update_lease,
+            FencedTransitionMutation::update(crate::Generation::new(1), update_record),
+        )
+        .expect("finite update request");
+        let update_at = timestamp(2);
+        let applied_update = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(2, update.clone(), update_at)],
+        )
+        .expect("finite update");
+        let recorded = applied_update.responses[0].clone();
+        let machine_before_replay = read_machine_sync(&conn, identity()).expect("machine state");
+
+        let replay_time =
+            crate::ttl::checked_session_deadline(created_at, Duration::from_secs(6 * 60))
+                .expect("post-expiry replay time");
+        let replay_entry = fenced_transition_entry(3, update, replay_time);
+        let EntryPayload::Normal(command) = &replay_entry.payload else {
+            panic!("replay must be a normal command");
+        };
+        validate_command_for_log(command, identity())
+            .expect("follower admits an exact update receipt after record expiry");
+        let replay = apply_entries_sync(&conn, identity(), &backend.caps, vec![replay_entry])
+            .expect("expired-update exact replay");
+        assert_eq!(replay.responses.as_slice(), &[recorded]);
+        assert!(
+            replay.notifications.is_empty(),
+            "replay emits no watch effect"
+        );
+        assert_eq!(
+            read_machine_sync(&conn, identity()).expect("machine after replay"),
+            (
+                machine_before_replay.0,
+                machine_before_replay.1,
+                Some(replay_time),
+                machine_before_replay.3,
+            ),
+            "exact update replay advances only the committed logical-time pointer",
+        );
+        assert_eq!(
+            Some(log_id(3)),
+            read_applied_sync(&conn, identity()).expect("applied replay")
+        );
+    }
+
+    #[test]
+    fn fresh_fenced_record_expired_at_admission_is_a_no_effect_rejection() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("form membership");
+        let logical_time = timestamp(1);
+        let request =
+            finite_fenced_transition_create_request(0xE4, "expired-fresh-owner", logical_time);
+        let entry = fenced_transition_entry(1, request, logical_time);
+        let EntryPayload::Normal(command) = &entry.payload else {
+            panic!("fresh request must be a normal command");
+        };
+        validate_command_for_log(command, identity())
+            .expect("follower admits structural validation before receipt lookup");
+        let rejected = apply_entries_sync(&conn, identity(), &backend.caps, vec![entry])
+            .expect("fresh expired request is a committed deterministic rejection");
+        assert!(matches!(
+            rejected.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::InvalidRecordExpiry),
+                ..
+            }]
+        ));
+        assert!(
+            rejected.notifications.is_empty(),
+            "rejection emits no watch effect"
+        );
+        for table in ["session_records", "leases", "key_fences"] {
+            let query = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(
+                conn.query_row(&query, [], |row| row.get::<_, i64>(0))
+                    .expect("count rejected state"),
+                0,
+                "expired fresh request must not mutate {table}",
+            );
+        }
+        assert_eq!(
+            read_machine_sync(&conn, identity())
+                .expect("machine after rejected request")
+                .3,
+            0,
+            "rejected fresh request does not advance the watch sequence",
+        );
+    }
+
+    #[test]
+    fn near_timestamp_max_exact_fenced_replay_does_not_revalidate_new_deadlines() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let recorded_at = Timestamp::from_str("9999-12-30T23:59:59.999999999Z")
+            .expect("near-maximum recorded time");
+        let replay_time = Timestamp::from_str("9999-12-31T00:59:59.999999999Z")
+            .expect("near-maximum replay time");
+        let request = fenced_transition_request(0xE5, "near-maximum-owner");
+        let first = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, request.clone(), recorded_at),
+            ],
+        )
+        .expect("near-maximum transition");
+        let recorded = first.responses[1].clone();
+        let machine_before_replay = read_machine_sync(&conn, identity()).expect("machine state");
+
+        let replay_entry = fenced_transition_entry(2, request.clone(), replay_time);
+        let EntryPayload::Normal(command) = &replay_entry.payload else {
+            panic!("replay must be a normal command");
+        };
+        validate_command_for_log(command, identity())
+            .expect("follower must not calculate an overflowing new retention deadline");
+        let replay = apply_entries_sync(&conn, identity(), &backend.caps, vec![replay_entry])
+            .expect("near-maximum exact replay");
+        assert_eq!(replay.responses.as_slice(), &[recorded]);
+        assert!(
+            replay.notifications.is_empty(),
+            "replay emits no watch effect"
+        );
+        assert_eq!(
+            read_machine_sync(&conn, identity()).expect("machine after replay"),
+            (
+                machine_before_replay.0,
+                machine_before_replay.1,
+                Some(replay_time),
+                machine_before_replay.3,
+            ),
+            "near-maximum replay advances only committed logical time",
+        );
+
+        let conflicting = fenced_transition_request(0xE5, "near-maximum-other-owner");
+        let conflict = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(3, conflicting.clone(), replay_time)],
+        )
+        .expect("near-maximum different-body conflict");
+        assert!(matches!(
+            conflict.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionRequestConflict),
+                ..
+            }]
+        ));
+        assert_eq!(
+            read_fenced_transition_status_sync(&conn, identity(), identity(), &conflicting,),
+            Ok(FencedTransitionStatus::RequestConflict),
+        );
+    }
+
+    #[test]
+    fn fresh_fenced_transition_beyond_retention_horizon_is_absorbing_and_no_effect() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("form membership");
+        let machine_before = read_machine_sync(&conn, identity()).expect("machine before horizon");
+        let horizon = Timestamp::from_str("9999-12-31T00:00:00Z")
+            .expect("first time beyond exact retention horizon");
+        let later = Timestamp::from_str("9999-12-31T00:00:01Z").expect("later exhausted time");
+        let request = fenced_transition_request(0xE6, "horizon-owner");
+        let entry = fenced_transition_entry(1, request.clone(), horizon);
+        let EntryPayload::Normal(command) = &entry.payload else {
+            panic!("horizon request must be a normal command");
+        };
+        validate_command_for_log(command, identity())
+            .expect("follower admission remains structural at the horizon");
+
+        let exhausted = apply_entries_sync(&conn, identity(), &backend.caps, vec![entry])
+            .expect("horizon rejection must not poison apply");
+        assert!(matches!(
+            exhausted.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionRetentionExhausted),
+                sequence: 0,
+                logical_time: Some(committed),
+                raft_log_index: 1,
+                ..
+            }] if *committed == horizon
+        ));
+        assert!(exhausted.notifications.is_empty());
+        assert_eq!(
+            read_fenced_transition_status_sync(&conn, identity(), identity(), &request,),
+            Ok(FencedTransitionStatus::RetentionExhausted),
+        );
+
+        let different_body = fenced_transition_request(0xE6, "horizon-other-owner");
+        let retries = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                fenced_transition_entry(2, request.clone(), later),
+                fenced_transition_entry(3, different_body.clone(), later),
+            ],
+        )
+        .expect("same and different bodies remain no-effect at the horizon");
+        assert!(retries.responses.iter().all(|response| matches!(
+            &response.result,
+            Err(StoreError::FencedTransitionRetentionExhausted)
+        )));
+        assert!(retries.notifications.is_empty());
+        assert_eq!(
+            read_fenced_transition_status_sync(&conn, identity(), identity(), &different_body,),
+            Ok(FencedTransitionStatus::RetentionExhausted),
+        );
+        for table in [
+            "session_records",
+            "leases",
+            "key_fences",
+            "consensus_fenced_transition_receipts",
+        ] {
+            let query = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(
+                conn.query_row(&query, [], |row| row.get::<_, i64>(0))
+                    .expect("count horizon state"),
+                0,
+                "horizon rejection must not mutate {table}",
+            );
+        }
+        let machine_after = read_machine_sync(&conn, identity()).expect("machine after horizon");
+        assert_eq!(machine_after.0, machine_before.0);
+        assert_eq!(machine_after.1, machine_before.1);
+        assert_eq!(machine_after.2, Some(later));
+        assert_eq!(machine_after.3, machine_before.3);
+        assert_eq!(
+            read_applied_sync(&conn, identity()).expect("applied horizon entries"),
+            Some(log_id(3)),
+        );
+
+        let ordinary = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![acquire_entry(4, [0xE7; 16], "post-horizon-owner")],
+        )
+        .expect("a later ordinary command still applies");
+        assert!(matches!(
+            ordinary.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::Lease(_)),
+                ..
+            }]
+        ));
+        assert_eq!(
+            read_applied_sync(&conn, identity()).expect("applied ordinary entry"),
+            Some(log_id(4)),
+        );
+    }
+
+    #[test]
+    fn fenced_transition_receipt_binding_survives_dynamic_authority_rollover() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        let storage_identity = identity();
+        let predecessor_members = members(&[7, 8, 9]);
+        let successor_members = members(&[7, 8, 9, 10, 11]);
+        let successor_identity = identity_at(2, 0xE7);
+        let transition_id = [0xE8; MEMBERSHIP_TRANSITION_ID_BYTES];
+        let transition_digest = [0xE9; 32];
+        initialize_schema(&conn, storage_identity, &predecessor_members).expect("consensus schema");
+
+        let request = fenced_transition_request(0xEA, "rollover-owner");
+        let first_entry = activating_fenced_transition_authorized_entry(
+            1,
+            request.clone(),
+            timestamp(1),
+            member(7),
+            storage_identity,
+            storage_identity,
+            &predecessor_members,
+        );
+        let first_digest = match &first_entry.payload {
+            EntryPayload::Normal(command) => {
+                payload_digest(identity(), command).expect("first digest")
+            }
+            _ => panic!("fenced transition fixture must be a normal command"),
+        };
+        let first = apply_entries_sync(
+            &conn,
+            storage_identity,
+            &backend.caps,
+            vec![
+                membership_entry_at(
+                    0,
+                    vec![predecessor_members.clone()],
+                    predecessor_members.clone(),
+                ),
+                first_entry,
+            ],
+        )
+        .expect("predecessor-authority transition");
+        let recorded = match &first.responses[1].result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome.clone(),
+            _ => panic!("predecessor-authority transition must commit"),
+        };
+
+        stage_membership_scope_sync(
+            &conn,
+            storage_identity,
+            transition_id,
+            transition_digest,
+            successor_identity,
+            &successor_members,
+        )
+        .expect("stage successor authority");
+        let learners = membership_entry_at(2, vec![predecessor_members], successor_members.clone());
+        let ready = topology_entry_at(
+            3,
+            0xE8,
+            SessionMutationIntent::MarkTopologyLearnersReady {
+                transition_id,
+                request_digest: transition_digest,
+            },
+        );
+        apply_entries_sync(
+            &conn,
+            storage_identity,
+            &backend.caps,
+            vec![learners, ready],
+        )
+        .expect("make successor authority eligible");
+        fence_application_authority_sync(&conn, storage_identity, transition_id, transition_digest)
+            .expect("roll application authority forward");
+        assert!(validate_application_authority_sync(
+            &conn,
+            storage_identity,
+            member(10),
+            successor_identity,
+        )
+        .is_ok());
+        assert!(validate_application_authority_sync(
+            &conn,
+            storage_identity,
+            member(7),
+            storage_identity,
+        )
+        .is_err());
+
+        let sequence_before_revoked_replays = proposal_state_sync(&conn, storage_identity)
+            .expect("state before revoked replay")
+            .0;
+        let revoked_exact = apply_entries_sync(
+            &conn,
+            storage_identity,
+            &backend.caps,
+            vec![fenced_transition_authorized_entry(
+                4,
+                request.clone(),
+                timestamp(4),
+                member(7),
+                storage_identity,
+            )],
+        )
+        .expect("revoked predecessor exact access is a committed no-op");
+        assert!(matches!(
+            revoked_exact.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::TopologyAuthorityRevoked),
+                ..
+            }]
+        ));
+        let revoked_different_body = apply_entries_sync(
+            &conn,
+            storage_identity,
+            &backend.caps,
+            vec![fenced_transition_authorized_entry(
+                5,
+                fenced_transition_request(0xEA, "revoked-rollover-conflict"),
+                timestamp(5),
+                member(7),
+                storage_identity,
+            )],
+        )
+        .expect("revoked predecessor conflict access is a committed no-op");
+        assert!(matches!(
+            revoked_different_body.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::TopologyAuthorityRevoked),
+                ..
+            }]
+        ));
+        assert_eq!(
+            proposal_state_sync(&conn, storage_identity)
+                .expect("state after revoked replays")
+                .0,
+            sequence_before_revoked_replays,
+            "revoked receipt access neither exposes nor alters the binding",
+        );
+
+        let replay_entry = fenced_transition_authorized_entry(
+            6,
+            request.clone(),
+            timestamp(6),
+            member(10),
+            successor_identity,
+        );
+        let replay_digest = match &replay_entry.payload {
+            EntryPayload::Normal(command) => {
+                payload_digest(identity(), command).expect("successor digest")
+            }
+            _ => panic!("fenced transition fixture must be a normal command"),
+        };
+        assert_eq!(
+            first_digest, replay_digest,
+            "authority rollover must not rebind the request"
+        );
+        assert_eq!(
+            read_fenced_transition_status_sync(&conn, storage_identity, storage_identity, &request),
+            Ok(FencedTransitionStatus::Recorded(Box::new(Ok(
+                recorded.clone()
+            )))),
+            "the successor authority resolves the original durable result"
+        );
+        let sequence_before_replay = proposal_state_sync(&conn, storage_identity)
+            .expect("state before successor replay")
+            .0;
+        let replay = apply_entries_sync(&conn, storage_identity, &backend.caps, vec![replay_entry])
+            .expect("successor-authority exact replay");
+        assert_eq!(
+            replay.responses[0].result,
+            Ok(SessionMutationOutcome::FencedTransition(recorded)),
+            "exact successor replay returns the recorded result"
+        );
+        assert_eq!(
+            proposal_state_sync(&conn, storage_identity)
+                .expect("state after successor replay")
+                .0,
+            sequence_before_replay,
+            "exact replay performs no second application effect"
+        );
+
+        let conflicting_request = fenced_transition_request(0xEA, "rollover-conflict");
+        let conflict_entry = fenced_transition_authorized_entry(
+            7,
+            conflicting_request.clone(),
+            timestamp(7),
+            member(10),
+            successor_identity,
+        );
+        let conflict_digest = match &conflict_entry.payload {
+            EntryPayload::Normal(command) => {
+                payload_digest(identity(), command).expect("conflict digest")
+            }
+            _ => panic!("fenced transition fixture must be a normal command"),
+        };
+        assert_ne!(
+            first_digest, conflict_digest,
+            "different request body must rebind the ID"
+        );
+        let conflict_response =
+            apply_entries_sync(&conn, storage_identity, &backend.caps, vec![conflict_entry])
+                .expect("successor-authority body conflict");
+        assert!(matches!(
+            conflict_response.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionRequestConflict),
+                ..
+            }]
+        ));
+        assert_eq!(
+            proposal_state_sync(&conn, storage_identity)
+                .expect("state after successor conflict")
+                .0,
+            sequence_before_replay,
+            "a successor-authority body conflict performs no effect"
+        );
+        assert_eq!(
+            read_fenced_transition_status_sync(
+                &conn,
+                storage_identity,
+                storage_identity,
+                &conflicting_request,
+            ),
+            Ok(FencedTransitionStatus::RequestConflict),
+            "status retains the body conflict across the authority rollover"
+        );
+    }
+
+    #[test]
+    fn fenced_transition_v1_request_digest_has_a_pinned_protocol_vector() {
+        let request = fenced_transition_request(0xA9, "digest-vector-owner");
+        let entry = fenced_transition_authorized_entry(
+            1,
+            request.clone(),
+            timestamp(1),
+            member(7),
+            identity(),
+        );
+        let EntryPayload::Normal(command) = entry.payload else {
+            panic!("digest fixture must be a normal command");
+        };
+        let digest = payload_digest(identity(), &command).expect("V1 request digest");
+        assert_eq!(
+            digest,
+            [
+                0xA6, 0x6D, 0xB3, 0xC2, 0xAF, 0xB0, 0xC1, 0x76, 0xD6, 0x3D, 0x2F, 0x52, 0x8F, 0x14,
+                0x66, 0xE3, 0x3C, 0x73, 0x17, 0xC8, 0x1B, 0x3A, 0x61, 0xEF, 0xB1, 0xF3, 0xAE, 0xD5,
+                0xBF, 0xE0, 0xCE, 0x08,
+            ],
+            "the canonical fenced-transition V1 digest is a protocol commitment"
+        );
+
+        let mut changed_envelope = command.clone();
+        changed_envelope.schema_version = command.schema_version.saturating_add(1);
+        changed_envelope.logical_time = timestamp(2);
+        changed_envelope.identity = identity_at(2, 0xAA);
+        if let SessionMutationIntent::Authorized {
+            origin,
+            authority_identity,
+            ..
+        } = &mut changed_envelope.intent
+        {
+            *origin = member(10);
+            *authority_identity = identity_at(3, 0xAB);
+        }
+        assert_eq!(
+            payload_digest(identity(), &changed_envelope).expect("metadata-independent digest"),
+            digest,
+            "outer envelope, authority, and leader time are not V1 caller semantics",
+        );
+
+        let changed_body = fenced_transition_authorized_entry(
+            2,
+            fenced_transition_request(0xA9, "digest-vector-other-owner"),
+            timestamp(2),
+            member(7),
+            identity(),
+        );
+        let EntryPayload::Normal(changed_body) = changed_body.payload else {
+            panic!("changed digest fixture must be a normal command");
+        };
+        assert_ne!(
+            payload_digest(identity(), &changed_body).expect("body-bound digest"),
+            digest,
+            "changing one canonical request field changes the V1 binding",
+        );
+    }
+
+    #[test]
+    fn fenced_transition_live_owner_expiry_equality_and_new_owner_takeover_are_exact() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let original = fenced_transition_request(0xD8, "old-owner");
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, original, timestamp(1)),
+            ],
+        )
+        .expect("initial transition");
+        let original_outcome = match &applied.responses[1].result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome.clone(),
+            _ => panic!("initial transition must commit"),
+        };
+
+        let live_takeover_owner = OwnerId::new("new-owner").expect("owner");
+        let live_takeover_lease = FencedTransitionLease::acquire(
+            key(),
+            live_takeover_owner.clone(),
+            original_outcome.lease().fence(),
+            Duration::from_secs(300),
+        )
+        .expect("takeover action");
+        let mut live_takeover_record = sealed_record_for_key(key(), 1_024);
+        live_takeover_record.generation = crate::Generation::new(2);
+        live_takeover_record.owner = live_takeover_owner;
+        live_takeover_record.fence = live_takeover_lease
+            .committed_fence()
+            .expect("takeover fence");
+        live_takeover_record.payload = sealed_payload_for_record(&live_takeover_record, 1_024);
+        let live_takeover = FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([0xD9; 16]),
+            live_takeover_lease,
+            FencedTransitionMutation::update(crate::Generation::new(1), live_takeover_record),
+        )
+        .expect("live takeover request");
+        let rejected = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(2, live_takeover, timestamp(2))],
+        )
+        .expect("live takeover rejection is recorded");
+        assert!(matches!(
+            rejected.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::LeaseHeld),
+                ..
+            }]
+        ));
+        assert_eq!(
+            ops::current_fence_sync(&conn, &key()).expect("fence after live rejection"),
+            original_outcome.lease().fence().get()
+        );
+
+        let expires_at = original_outcome.lease().expires_at();
+        let expiry_equal = FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([0xDA; 16]),
+            FencedTransitionLease::renew(
+                original_outcome.lease().clone(),
+                Duration::from_secs(300),
+            )
+            .expect("renew action"),
+            FencedTransitionMutation::delete(crate::Generation::new(1)),
+        )
+        .expect("expiry-equality request");
+        let expired = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(3, expiry_equal, expires_at)],
+        )
+        .expect("expiry-equality rejection is recorded");
+        assert!(matches!(
+            expired.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::LeaseExpired),
+                ..
+            }]
+        ));
+        assert!(ops::get_sync(&conn, &key(), expires_at)
+            .expect("record after expiry rejection")
+            .is_some());
+
+        let new_owner = OwnerId::new("new-owner").expect("owner");
+        let takeover_lease = FencedTransitionLease::acquire(
+            key(),
+            new_owner.clone(),
+            original_outcome.lease().fence(),
+            Duration::from_secs(300),
+        )
+        .expect("expired takeover action");
+        let mut takeover_record = sealed_record_for_key(key(), 1_024);
+        takeover_record.generation = crate::Generation::new(2);
+        takeover_record.owner = new_owner.clone();
+        takeover_record.fence = takeover_lease
+            .committed_fence()
+            .expect("expired takeover fence");
+        takeover_record.payload = sealed_payload_for_record(&takeover_record, 1_024);
+        let takeover = FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([0xDB; 16]),
+            takeover_lease,
+            FencedTransitionMutation::update(crate::Generation::new(1), takeover_record),
+        )
+        .expect("expired takeover request");
+        let takeover_time =
+            crate::ttl::checked_session_deadline(expires_at, Duration::from_secs(1))
+                .expect("takeover time");
+        let taken_over = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(4, takeover, takeover_time)],
+        )
+        .expect("expired takeover applies");
+        let outcome = match &taken_over.responses[0].result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome,
+            _ => panic!("expired takeover must commit"),
+        };
+        assert_eq!(outcome.lease().owner(), &new_owner);
+        assert_eq!(outcome.committed_generation(), crate::Generation::new(2));
+        assert_eq!(
+            outcome.lease().fence().get(),
+            original_outcome.lease().fence().get() + 1
+        );
+    }
+
+    #[test]
+    fn malformed_fenced_transition_receipt_fails_closed_on_lookup_and_reopen() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let request_id = SessionConsensusRequestId::from_bytes([0xE2; 16]);
+        let malformed = SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::Unit),
+            sequence: 1,
+            digest: Some(SessionConsensusEntryDigest::from_bytes([0xE3; 32])),
+            logical_time: Some(timestamp(1)),
+            raft_log_index: 1,
+        };
+        let retained_until =
+            crate::ttl::checked_session_deadline(timestamp(1), FENCED_TRANSITION_OUTCOME_RETENTION)
+                .expect("retention deadline");
+        conn.execute(
+            "INSERT INTO consensus_fenced_transition_receipts (request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                request_id.as_bytes().as_slice(),
+                epoch_i64(identity()).expect("epoch"),
+                [0xE4_u8; 32].as_slice(),
+                ops::format_rfc3339_normalized(retained_until),
+                [0xE5_u8; 32].as_slice(),
+                encode_json(&malformed).expect("encode malformed receipt"),
+                [0xE6_u8; 32].as_slice(),
+            ],
+        )
+        .expect("inject malformed receipt");
+        assert!(read_fenced_transition_receipt_sync(&conn, identity(), request_id).is_err());
+        assert!(matches!(
+            initialize_schema(&conn, identity(), &expected_members()),
+            Err(SessionConsensusStorageError::CorruptState)
+        ));
+    }
+
+    #[test]
+    fn all_zero_fenced_transition_receipt_id_fails_closed_on_reopen() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let request = fenced_transition_request(0xEB, "fenced-owner");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, request, timestamp(1)),
+            ],
+        )
+        .expect("transition fixture");
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("permit legacy receipt corruption");
+        conn.execute(
+            "UPDATE consensus_fenced_transition_receipts SET request_id = ?1",
+            [[0_u8; 16].as_slice()],
+        )
+        .expect("inject invalid receipt ID");
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore receipt constraints");
+
+        assert!(validate_fenced_transition_receipts_sync(&conn, identity()).is_err());
+        assert!(matches!(
+            initialize_schema(&conn, identity(), &expected_members()),
+            Err(SessionConsensusStorageError::CorruptState)
+        ));
+    }
+
+    #[test]
+    fn fenced_transition_receipt_response_json_cap_is_exact_and_enforced_by_schema() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let request = fenced_transition_request(0xF3, "fenced-owner");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, request.clone(), timestamp(1)),
+            ],
+        )
+        .expect("valid transition receipt");
+
+        let encoded: Vec<u8> = conn
+            .query_row(
+                "SELECT response_json FROM consensus_fenced_transition_receipts WHERE request_id = ?1",
+                [request.request_id().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read valid receipt response");
+        let response: SessionConsensusResponse =
+            decode_json(&encoded).expect("decode valid receipt response");
+        assert!(
+            conn.execute(
+                "UPDATE consensus_fenced_transition_receipts SET response_digest = NULL WHERE request_id = ?1",
+                [request.request_id().as_bytes().as_slice()],
+            )
+            .is_err(),
+            "SQLite CHECK must reject an uncommitted live response"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE consensus_fenced_transition_receipts SET response_json = NULL WHERE request_id = ?1",
+                [request.request_id().as_bytes().as_slice()],
+            )
+            .is_err(),
+            "SQLite CHECK must reject a live digest without its response"
+        );
+        let mut exact = encoded;
+        exact.resize(FENCED_TRANSITION_RECEIPT_MAX_RESPONSE_BYTES, b' ');
+        assert_eq!(
+            exact.len(),
+            FENCED_TRANSITION_RECEIPT_MAX_RESPONSE_BYTES,
+            "trailing ASCII whitespace remains valid JSON"
+        );
+        assert_eq!(
+            decode_json::<SessionConsensusResponse>(&exact).expect("decode padded receipt"),
+            response
+        );
+        let mut one_over = exact.clone();
+        one_over.push(b' ');
+
+        let binding_digest: [u8; 32] = conn
+            .query_row(
+                "SELECT binding_digest FROM consensus_fenced_transition_receipts WHERE request_id = ?1",
+                [request.request_id().as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .expect("read receipt binding")
+            .try_into()
+            .expect("receipt binding length");
+        let response_digest = fenced_transition_receipt_response_digest(binding_digest, &response)
+            .expect("canonical padded receipt digest");
+        conn.execute(
+            "UPDATE consensus_fenced_transition_receipts SET response_json = ?1, response_digest = ?2 WHERE request_id = ?3",
+            params![
+                exact.as_slice(),
+                response_digest.as_slice(),
+                request.request_id().as_bytes().as_slice(),
+            ],
+        )
+        .expect("store exact receipt response boundary");
+        let receipt = read_fenced_transition_receipt_sync(
+            &conn,
+            identity(),
+            SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes()),
+        )
+        .expect("read exact receipt response boundary")
+        .expect("exact receipt remains present");
+        assert_eq!(receipt.response.expect("exact receipt response"), response);
+
+        let ddl: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_fenced_transition_receipts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read receipt DDL");
+        assert!(
+            ddl.contains(&format!(
+                "length(response_json) BETWEEN 1 AND {FENCED_TRANSITION_RECEIPT_MAX_RESPONSE_BYTES}"
+            )),
+            "receipt DDL must enforce the Rust response-byte limit"
+        );
+
+        assert!(
+            conn.execute(
+                "UPDATE consensus_fenced_transition_receipts SET response_json = ?1 WHERE request_id = ?2",
+                params![one_over.as_slice(), request.request_id().as_bytes().as_slice()],
+            )
+            .is_err(),
+            "SQLite CHECK must reject a response one byte over the receipt cap"
+        );
+    }
+
+    #[test]
+    fn fenced_transition_receipt_storage_widths_fail_before_value_materialization() {
+        struct ReceiptStorageFields {
+            request_id: Vec<u8>,
+            payload_digest: Vec<u8>,
+            retained_until: String,
+            binding_digest: Vec<u8>,
+            response_json: Option<Vec<u8>>,
+            response_digest: Option<Vec<u8>>,
+        }
+
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let request = fenced_transition_request(0xF4, "fenced-owner");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, request.clone(), timestamp(1)),
+            ],
+        )
+        .expect("valid transition receipt");
+        let original: ReceiptStorageFields = conn
+            .query_row(
+                "SELECT request_id, payload_digest, retained_until, binding_digest, response_json, response_digest FROM consensus_fenced_transition_receipts",
+                [],
+                |row| {
+                    Ok(ReceiptStorageFields {
+                        request_id: row.get(0)?,
+                        payload_digest: row.get(1)?,
+                        retained_until: row.get(2)?,
+                        binding_digest: row.get(3)?,
+                        response_json: row.get(4)?,
+                        response_digest: row.get(5)?,
+                    })
+                },
+            )
+            .expect("read canonical receipt fields");
+        assert_eq!(
+            original.request_id.len(),
+            FENCED_TRANSITION_REQUEST_ID_BYTES
+        );
+        assert_eq!(original.payload_digest.len(), 32);
+        assert_eq!(
+            original.retained_until.len(),
+            FENCED_TRANSITION_RECEIPT_TIMESTAMP_BYTES
+        );
+        assert_eq!(original.binding_digest.len(), 32);
+        assert!(validate_fenced_transition_receipt_storage_bounds_sync(&conn).is_ok());
+
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow bounded corruption fixtures");
+        for corruption in [
+            "short-id",
+            "long-id",
+            "long-payload-digest",
+            "short-retention",
+            "long-retention",
+            "large-retention",
+            "long-binding-digest",
+            "empty-response",
+            "long-response",
+            "long-response-digest",
+        ] {
+            match corruption {
+                "short-id" => conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET request_id = ?1",
+                    [vec![0xA1_u8; FENCED_TRANSITION_REQUEST_ID_BYTES - 1]],
+                ),
+                "long-id" => conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET request_id = ?1",
+                    [vec![0xA2_u8; FENCED_TRANSITION_REQUEST_ID_BYTES + 1]],
+                ),
+                "long-payload-digest" => conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET payload_digest = ?1",
+                    [vec![0xA3_u8; 33]],
+                ),
+                "short-retention" => conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET retained_until = ?1",
+                    ["0".repeat(FENCED_TRANSITION_RECEIPT_TIMESTAMP_BYTES - 1)],
+                ),
+                "long-retention" => conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET retained_until = ?1",
+                    ["0".repeat(FENCED_TRANSITION_RECEIPT_TIMESTAMP_BYTES + 1)],
+                ),
+                "large-retention" => conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET retained_until = ?1",
+                    ["0".repeat(64 * 1_024)],
+                ),
+                "long-binding-digest" => conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET binding_digest = ?1",
+                    [vec![0xA4_u8; 33]],
+                ),
+                "empty-response" => conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET response_json = ?1",
+                    [Vec::<u8>::new()],
+                ),
+                "long-response" => conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET response_json = ?1",
+                    [vec![
+                        0xA5_u8;
+                        FENCED_TRANSITION_RECEIPT_MAX_RESPONSE_BYTES + 1
+                    ]],
+                ),
+                "long-response-digest" => conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET response_digest = ?1",
+                    [vec![0xA6_u8; 33]],
+                ),
+                _ => unreachable!("fixed corruption fixture"),
+            }
+            .expect("inject receipt storage corruption");
+
+            assert!(
+                validate_fenced_transition_receipt_storage_bounds_sync(&conn).is_err(),
+                "{corruption}"
+            );
+            assert!(
+                validate_fenced_transition_receipts_sync(&conn, identity()).is_err(),
+                "{corruption}"
+            );
+            if !matches!(corruption, "short-id" | "long-id") {
+                assert!(
+                    read_fenced_transition_receipt_sync(
+                        &conn,
+                        identity(),
+                        SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes()),
+                    )
+                    .is_err(),
+                    "{corruption}"
+                );
+            }
+
+            conn.execute(
+                "UPDATE consensus_fenced_transition_receipts SET request_id = ?1, payload_digest = ?2, retained_until = ?3, binding_digest = ?4, response_json = ?5, response_digest = ?6",
+                params![
+                    original.request_id.as_slice(),
+                    original.payload_digest.as_slice(),
+                    original.retained_until.as_str(),
+                    original.binding_digest.as_slice(),
+                    original.response_json.as_deref(),
+                    original.response_digest.as_deref(),
+                ],
+            )
+            .expect("restore canonical receipt fields");
+            assert!(
+                validate_fenced_transition_receipt_storage_bounds_sync(&conn).is_ok(),
+                "{corruption} restore"
+            );
+        }
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore receipt constraints");
+    }
+
+    #[test]
+    fn fenced_transition_receipt_cannot_share_a_generic_outcome_request_id() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let request = fenced_transition_request(0xEC, "fenced-owner");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, request.clone(), timestamp(1)),
+            ],
+        )
+        .expect("transition fixture");
+        let (payload_digest, response): (Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT payload_digest, response_json FROM consensus_fenced_transition_receipts WHERE request_id = ?1",
+                [request.request_id().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read receipt binding");
+        conn.execute(
+            "INSERT INTO consensus_request_outcomes (request_id, configuration_epoch, payload_digest, response_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                request.request_id().as_bytes().as_slice(),
+                epoch_i64(identity()).expect("epoch"),
+                payload_digest,
+                response,
+            ],
+        )
+        .expect("inject shared request ID");
+
+        assert!(validate_fenced_transition_receipts_sync(&conn, identity()).is_err());
+        assert!(matches!(
+            initialize_schema(&conn, identity(), &expected_members()),
+            Err(SessionConsensusStorageError::CorruptState)
+        ));
+    }
+
+    #[test]
+    fn fenced_transition_namespace_validation_rejects_missing_point_index_without_scanning_rows() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let request = fenced_transition_request(0xF5, "fenced-owner");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, request, timestamp(1)),
+            ],
+        )
+        .expect("transition fixture");
+        conn.execute_batch(
+            r#"
+DROP TABLE consensus_request_outcomes;
+CREATE TABLE consensus_request_outcomes (
+    request_id BLOB,
+    configuration_epoch INTEGER,
+    payload_digest BLOB,
+    response_json BLOB
+);
+WITH digits(value) AS (
+    VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)
+)
+INSERT INTO consensus_request_outcomes
+    (request_id, configuration_epoch, payload_digest, response_json)
+SELECT zeroblob(16), 1, zeroblob(32), X'00'
+FROM digits AS a
+CROSS JOIN digits AS b
+CROSS JOIN digits AS c
+CROSS JOIN digits AS d
+CROSS JOIN digits AS e
+LIMIT 20000;
+"#,
+        )
+        .expect("install large generic ledger without its point index");
+
+        let vm_steps = Arc::new(AtomicUsize::new(0));
+        let observed_steps = Arc::clone(&vm_steps);
+        conn.progress_handler(
+            1,
+            Some(move || {
+                observed_steps.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        let validation = validate_fenced_transition_receipts_sync(&conn, identity());
+        conn.progress_handler(0, None::<fn() -> bool>);
+
+        assert!(validation.is_err());
+        assert!(
+            vm_steps.load(Ordering::Relaxed) < 10_000,
+            "missing point index must be rejected before scanning 20,000 generic outcomes"
+        );
+    }
+
+    #[test]
+    fn fenced_transition_receipts_cannot_exceed_machine_or_applied_floors() {
+        for corruption in [
+            "premature-tombstone",
+            "nonnormalized-retention",
+            "future-sequence",
+            "future-log",
+            "valid-persistable-error",
+        ] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+            let request = fenced_transition_request(0xF2, "fenced-owner");
+            apply_entries_sync(
+                &conn,
+                identity(),
+                &backend.caps,
+                vec![
+                    membership_entry(),
+                    fenced_transition_entry(1, request.clone(), timestamp(1)),
+                ],
+            )
+            .expect("transition fixture");
+
+            if corruption == "premature-tombstone" {
+                conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET response_json = NULL, response_digest = NULL",
+                    [],
+                )
+                .expect("inject premature tombstone");
+            } else if corruption == "nonnormalized-retention" {
+                conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+                    .expect("allow noncanonical retention fixture");
+                conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET retained_until = replace(retained_until, 'Z', '+00:00')",
+                    [],
+                )
+                .expect("inject nonnormalized receipt retention");
+                conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+                    .expect("restore receipt constraints");
+            } else {
+                let encoded: Vec<u8> = conn
+                    .query_row(
+                        "SELECT response_json FROM consensus_fenced_transition_receipts",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read receipt response");
+                let mut response: SessionConsensusResponse =
+                    decode_json(&encoded).expect("decode receipt response");
+                match corruption {
+                    "future-sequence" => response.sequence += 1,
+                    "future-log" => response.raft_log_index += 1,
+                    "valid-persistable-error" => response.result = Err(StoreError::LeaseHeld),
+                    _ => unreachable!("fixed corruption fixture"),
+                }
+                conn.execute(
+                    "UPDATE consensus_fenced_transition_receipts SET response_json = ?1",
+                    [encode_json(&response).expect("encode corrupt response")],
+                )
+                .expect("inject future receipt metadata");
+            }
+
+            assert!(
+                validate_fenced_transition_receipts_sync(&conn, identity()).is_err(),
+                "{corruption}",
+            );
+            assert!(
+                matches!(
+                    read_fenced_transition_status_sync(&conn, identity(), identity(), &request,),
+                    Err(StoreError::BackendUnavailable(_))
+                ),
+                "{corruption}",
+            );
+            let directory = tempfile::tempdir().expect("snapshot directory");
+            assert!(
+                build_snapshot_database_sync(
+                    &conn,
+                    identity(),
+                    &directory.path().join("corrupt-receipt.sqlite"),
+                )
+                .is_err(),
+                "{corruption}",
+            );
+            assert!(
+                matches!(
+                    initialize_schema(&conn, identity(), &expected_members()),
+                    Err(SessionConsensusStorageError::CorruptState)
+                ),
+                "{corruption}",
+            );
+        }
+    }
+
+    #[test]
+    fn fenced_transition_payload_cap_is_exact_at_follower_and_apply_boundaries() {
+        for (request_byte, payload_len, accepted) in
+            [(0xE5, 1_048_576, true), (0xE6, 1_048_577, false)]
+        {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+                .expect("form membership");
+            let request =
+                fenced_transition_request_with_payload(request_byte, "fenced-owner", payload_len);
+            let entry = fenced_transition_entry(1, request, timestamp(1));
+            let command = match &entry.payload {
+                EntryPayload::Normal(command) => command,
+                _ => panic!("transition fixture must be a normal command"),
+            };
+            let follower_admission = validate_command_for_log(command, identity());
+            let applied = apply_entries_sync(&conn, identity(), &backend.caps, vec![entry]);
+            if accepted {
+                follower_admission.expect("exact-cap transition enters the follower log");
+                applied.expect("exact-cap transition applies");
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM session_records", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("count exact-cap records"),
+                    1
+                );
+            } else {
+                assert_eq!(
+                    follower_admission
+                        .expect_err("one-over transition must not enter the follower log")
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert_eq!(
+                    applied
+                        .expect_err("one-over transition must not apply")
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+                for table in [
+                    "session_records",
+                    "leases",
+                    "consensus_fenced_transition_receipts",
+                ] {
+                    let query = format!("SELECT COUNT(*) FROM {table}");
+                    assert_eq!(
+                        conn.query_row(&query, [], |row| row.get::<_, i64>(0))
+                            .expect("count rejected transition state"),
+                        0,
+                        "one-over admission must leave transition state empty",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fenced_transition_outer_request_id_mismatch_fails_follower_and_apply_admission() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("form membership");
+        let request = fenced_transition_request(0xED, "fenced-owner");
+        let mut entry = fenced_transition_entry(1, request, timestamp(1));
+        let EntryPayload::Normal(command) = &mut entry.payload else {
+            panic!("transition fixture must be a normal command");
+        };
+        command.request_id = SessionConsensusRequestId::from_bytes([0xEE; 16]);
+
+        assert_eq!(
+            validate_command_for_log(command, identity())
+                .expect_err("mismatched identity must not enter a follower log")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![entry])
+                .expect_err("mismatched identity must not apply")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        for table in [
+            "session_records",
+            "leases",
+            "consensus_fenced_transition_receipts",
+        ] {
+            let query = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(
+                conn.query_row(&query, [], |row| row.get::<_, i64>(0))
+                    .expect("count rejected transition state"),
+                0,
+                "request-ID mismatch must leave transition state empty",
+            );
+        }
+    }
+
+    #[test]
+    fn fenced_transition_receipt_and_tombstone_survive_snapshot_restore() {
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.blocking_lock();
+        initialize_schema(&source_conn, identity(), &expected_members())
+            .expect("source consensus schema");
+        let request = fenced_transition_request(0xE7, "fenced-owner");
+        let first = apply_entries_sync(
+            &source_conn,
+            identity(),
+            &source.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, request.clone(), timestamp(1)),
+            ],
+        )
+        .expect("source transition");
+        let expected = first.responses[1].clone();
+        let expected_acquired_at: String = source_conn
+            .query_row("SELECT acquired_at FROM leases", [], |row| row.get(0))
+            .expect("source lease acquisition timestamp");
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("fenced-transition.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                .expect("build transition snapshot");
+        drop(source_conn);
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.blocking_lock();
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("target consensus schema");
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "fenced-transition-receipt".into(),
+        };
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "fenced-transition.opc",
+            [0xE8; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("snapshot metadata")
+                .len(),
+        )
+        .expect("install transition snapshot");
+        assert!(matches!(
+            read_fenced_transition_status_sync(&target_conn, identity(), identity(), &request,),
+            Ok(FencedTransitionStatus::Recorded(result)) if result.as_ref().is_ok()
+        ));
+        let replay = apply_entries_sync(
+            &target_conn,
+            identity(),
+            &target.caps,
+            vec![fenced_transition_entry(2, request, timestamp(2))],
+        )
+        .expect("replay restored transition");
+        assert_eq!(replay.responses.as_slice(), &[expected]);
+        assert!(replay.notifications.is_empty());
+        assert_eq!(
+            proposal_state_sync(&target_conn, identity())
+                .expect("restored machine state")
+                .0,
+            1
+        );
+        assert_eq!(
+            target_conn
+                .query_row("SELECT acquired_at FROM leases", [], |row| row
+                    .get::<_, String>(0))
+                .expect("restored lease acquisition timestamp"),
+            expected_acquired_at,
+            "snapshot restore must retain the exact lease acquisition authority"
+        );
+    }
+
+    #[test]
+    fn activated_snapshot_preserves_a_current_certificate_but_accepts_successor_without_one() {
+        let storage_identity = identity();
+        let current = members(&[7, 8, 9]);
+        let successor_members = members(&[7, 8, 9, 10, 11]);
+        let successor_identity = identity_at(2, 0xE8);
+        let transition_id = [0xE9; MEMBERSHIP_TRANSITION_ID_BYTES];
+        let transition_digest = [0xEA; 32];
+        let request = fenced_transition_request(0xEB, "snapshot-activation-owner");
+
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.blocking_lock();
+        initialize_schema(&source_conn, storage_identity, &current)
+            .expect("initialize activated source");
+        apply_entries_sync(
+            &source_conn,
+            storage_identity,
+            &source.caps,
+            vec![
+                membership_entry_at(0, vec![current.clone()], current.clone()),
+                activating_fenced_transition_authorized_entry(
+                    1,
+                    request.clone(),
+                    timestamp(1),
+                    member(7),
+                    storage_identity,
+                    storage_identity,
+                    &current,
+                ),
+            ],
+        )
+        .expect("activate source scope");
+        assert!(fenced_transition_activation_matches_scope_sync(
+            &source_conn,
+            storage_identity,
+            storage_identity,
+            &current,
+        )
+        .expect("source current certificate"));
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.blocking_lock();
+        initialize_schema(&target_conn, storage_identity, &current)
+            .expect("initialize activated target");
+        apply_entries_sync(
+            &target_conn,
+            storage_identity,
+            &target.caps,
+            vec![
+                membership_entry_at(0, vec![current.clone()], current.clone()),
+                activating_fenced_transition_authorized_entry(
+                    1,
+                    request.clone(),
+                    timestamp(1),
+                    member(7),
+                    storage_identity,
+                    storage_identity,
+                    &current,
+                ),
+            ],
+        )
+        .expect("activate target scope");
+        assert!(fenced_transition_activation_matches_scope_sync(
+            &target_conn,
+            storage_identity,
+            storage_identity,
+            &current,
+        )
+        .expect("target current certificate"));
+
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let same_scope_path = directory.path().join("same-scope-zero-cert.sqlite");
+        let (same_scope_last_log, same_scope_membership) =
+            build_snapshot_database_sync(&source_conn, storage_identity, &same_scope_path)
+                .expect("build same-scope snapshot");
+        Connection::open(&same_scope_path)
+            .expect("open same-scope snapshot")
+            .execute(
+                "DELETE FROM consensus_fenced_transition_activation WHERE singleton = 1",
+                [],
+            )
+            .expect("form certificate-free same-scope snapshot");
+        let same_scope_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: same_scope_last_log,
+            last_membership: same_scope_membership,
+            snapshot_id: "same-scope-zero-certificate".into(),
+        };
+        let error = install_snapshot_database_sync(
+            &target_conn,
+            storage_identity,
+            &same_scope_path,
+            &same_scope_meta,
+            "same-scope-zero-certificate.opc",
+            [0xEB; 32],
+            std::fs::metadata(&same_scope_path)
+                .expect("same-scope snapshot metadata")
+                .len(),
+        )
+        .expect_err("same-scope snapshot must not erase the local certificate");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(fenced_transition_activation_matches_scope_sync(
+            &target_conn,
+            storage_identity,
+            storage_identity,
+            &current,
+        )
+        .expect("failed snapshot preserves local certificate"));
+
+        // A real membership promotion removes the predecessor certificate in
+        // the promotion transaction.  Its V2 snapshot is valid, but the
+        // successor must re-prove all of its own exact voters before it can
+        // regain quorum-only availability.
+        stage_membership_scope_sync(
+            &source_conn,
+            storage_identity,
+            transition_id,
+            transition_digest,
+            successor_identity,
+            &successor_members,
+        )
+        .expect("stage successor scope");
+        let learners = membership_entry_at(2, vec![current.clone()], successor_members.clone());
+        let ready = topology_entry_at(
+            3,
+            0xEC,
+            SessionMutationIntent::MarkTopologyLearnersReady {
+                transition_id,
+                request_digest: transition_digest,
+            },
+        );
+        apply_entries_sync(
+            &source_conn,
+            storage_identity,
+            &source.caps,
+            vec![learners, ready],
+        )
+        .expect("make successor eligible");
+        fence_application_authority_sync(
+            &source_conn,
+            storage_identity,
+            transition_id,
+            transition_digest,
+        )
+        .expect("fence predecessor authority");
+        let joint = membership_entry_at(
+            4,
+            vec![current.clone(), successor_members.clone()],
+            successor_members.clone(),
+        );
+        let uniform = membership_entry_at(
+            5,
+            vec![successor_members.clone()],
+            successor_members.clone(),
+        );
+        apply_entries_sync(
+            &source_conn,
+            storage_identity,
+            &source.caps,
+            vec![joint, uniform],
+        )
+        .expect("promote successor scope");
+        assert!(!fenced_transition_activation_matches_scope_sync(
+            &source_conn,
+            storage_identity,
+            successor_identity,
+            &successor_members,
+        )
+        .expect("promotion clears predecessor certificate"));
+
+        let successor_path = directory.path().join("successor-zero-cert.sqlite");
+        let (successor_last_log, successor_membership) =
+            build_snapshot_database_sync(&source_conn, storage_identity, &successor_path)
+                .expect("build successor snapshot");
+        let successor_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: successor_last_log,
+            last_membership: successor_membership,
+            snapshot_id: "successor-zero-certificate".into(),
+        };
+        install_snapshot_database_sync(
+            &target_conn,
+            storage_identity,
+            &successor_path,
+            &successor_meta,
+            "successor-zero-certificate.opc",
+            [0xED; 32],
+            std::fs::metadata(&successor_path)
+                .expect("successor snapshot metadata")
+                .len(),
+        )
+        .expect("a certificate-free successor snapshot remains admissible");
+        let installed_scope = read_membership_scope_sync(&target_conn, storage_identity)
+            .expect("read installed successor scope");
+        assert_eq!(installed_scope.current_identity, successor_identity);
+        assert_eq!(installed_scope.current_members, successor_members);
+        assert_eq!(
+            fenced_transition_receipt_ledger_layout_sync(&target_conn)
+                .expect("read installed V2 layout"),
+            FencedTransitionReceiptLedgerLayout::Activated,
+        );
+        assert!(!fenced_transition_activation_matches_scope_sync(
+            &target_conn,
+            storage_identity,
+            successor_identity,
+            &successor_members,
+        )
+        .expect("successor remains deliberately unactivated"));
+    }
+
+    #[test]
+    fn fenced_transition_renew_rejects_forged_acquired_at_without_state_or_watch_effect() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let acquired = fenced_transition_request(0xC8, "fenced-owner");
+        let first = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, acquired, timestamp(1)),
+            ],
+        )
+        .expect("initial transition");
+        let lease = match &first.responses[1].result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome.lease().clone(),
+            other => panic!("unexpected initial transition result: {other:?}"),
+        };
+        let record_before = ops::get_sync(&conn, &key(), timestamp(2))
+            .expect("read initial record")
+            .expect("initial record");
+        let lease_before: (String, i64, String) = conn
+            .query_row(
+                "SELECT acquired_at, expires_at_unix_ms, guard_expires_at FROM leases",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read initial lease");
+        let forged = crate::LeaseGuard::new(
+            lease.key().clone(),
+            lease.owner().clone(),
+            lease.fence(),
+            timestamp(2),
+            lease.expires_at(),
+            lease.credential_id(),
+        );
+        let renewal = FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([0xC9; 16]),
+            FencedTransitionLease::renew(forged, Duration::from_secs(300))
+                .expect("forged renewal shape remains structurally valid"),
+            FencedTransitionMutation::delete(crate::Generation::new(1)),
+        )
+        .expect("forged renewal request");
+
+        let rejected = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(2, renewal, timestamp(2))],
+        )
+        .expect("fenced rejection is an applied no-op");
+        assert!(matches!(
+            rejected.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::StaleFence),
+                ..
+            }]
+        ));
+        assert!(rejected.notifications.is_empty());
+        assert_eq!(
+            ops::get_sync(&conn, &key(), timestamp(2)).expect("read preserved record"),
+            Some(record_before)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT acquired_at, expires_at_unix_ms, guard_expires_at FROM leases",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read preserved lease"),
+            lease_before
+        );
+    }
+
+    #[test]
+    fn fenced_transition_exact_renewal_preserves_acquired_at() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let acquired = fenced_transition_request(0xCA, "fenced-owner");
+        let first = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, acquired, timestamp(1)),
+            ],
+        )
+        .expect("initial transition");
+        let lease = match &first.responses[1].result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome.lease().clone(),
+            other => panic!("unexpected initial transition result: {other:?}"),
+        };
+        let renewal = FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([0xCB; 16]),
+            FencedTransitionLease::renew(lease.clone(), Duration::from_secs(300))
+                .expect("exact renewal"),
+            FencedTransitionMutation::refresh_ttl(
+                crate::Generation::new(1),
+                Duration::from_secs(300),
+            )
+            .expect("valid record refresh"),
+        )
+        .expect("exact renewal request");
+
+        let renewed = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(2, renewal, timestamp(2))],
+        )
+        .expect("exact renewal transition");
+        let renewed_lease = match &renewed.responses[0].result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome.lease(),
+            other => panic!("unexpected renewal result: {other:?}"),
+        };
+        assert_eq!(renewed_lease.acquired_at(), lease.acquired_at());
+        assert_eq!(
+            conn.query_row("SELECT acquired_at FROM leases", [], |row| row
+                .get::<_, String>(0))
+                .expect("persisted renewal acquisition timestamp"),
+            ops::format_rfc3339_normalized(lease.acquired_at())
+        );
+    }
+
+    #[test]
+    fn pre_acquisition_timestamp_snapshots_install_as_non_authoritative_lease_rows() {
+        for state in ["empty", "active", "released"] {
+            let source = SqliteSessionBackend::in_memory().expect("source backend");
+            let source_conn = source.conn.blocking_lock();
+            initialize_schema(&source_conn, identity(), &expected_members())
+                .expect("source consensus schema");
+            apply_entries_sync(
+                &source_conn,
+                identity(),
+                &source.caps,
+                vec![membership_entry()],
+            )
+            .expect("source membership");
+            if state != "empty" {
+                let lease = lease::acquire_sync(
+                    &source_conn,
+                    &key(),
+                    OwnerId::new("legacy-snapshot-owner").expect("owner"),
+                    Duration::from_secs(60),
+                    timestamp(1),
+                )
+                .expect("source lease");
+                if state == "released" {
+                    lease::release_sync(&source_conn, lease, timestamp(2))
+                        .expect("source released lease");
+                }
+            }
+            let directory = tempfile::tempdir().expect("snapshot directory");
+            let snapshot_path = directory.path().join(format!("legacy-{state}.sqlite"));
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                    .expect("build source snapshot");
+            drop(source_conn);
+            let legacy_snapshot = Connection::open(&snapshot_path).expect("open snapshot fixture");
+            legacy_snapshot
+                .execute_batch("ALTER TABLE leases DROP COLUMN acquired_at")
+                .expect("form exact pre-acquisition snapshot layout");
+            drop(legacy_snapshot);
+
+            let target = SqliteSessionBackend::in_memory().expect("target backend");
+            let target_conn = target.conn.blocking_lock();
+            initialize_schema(&target_conn, identity(), &expected_members())
+                .expect("target consensus schema");
+            let meta = opc_consensus::engine::SnapshotMeta {
+                last_log_id,
+                last_membership,
+                snapshot_id: format!("legacy-acquired-at-{state}"),
+            };
+            install_snapshot_database_sync(
+                &target_conn,
+                identity(),
+                &snapshot_path,
+                &meta,
+                "legacy-acquired-at.opc",
+                [0xCC; 32],
+                std::fs::metadata(&snapshot_path)
+                    .expect("legacy snapshot metadata")
+                    .len(),
+            )
+            .expect("exact legacy lease snapshot installs");
+            validate_sealed_state_sync(&target_conn)
+                .expect("installed nullable marker remains reopen-valid");
+            initialize_schema(&target_conn, identity(), &expected_members())
+                .expect("reopen accepts bounded legacy marker");
+            let (rows, persisted_acquired_at): (i64, i64) = target_conn
+                .query_row(
+                    "SELECT COUNT(*), COUNT(acquired_at) FROM leases",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read installed legacy leases");
+            assert_eq!(rows, if state == "empty" { 0 } else { 1 }, "{state}");
+            assert_eq!(persisted_acquired_at, 0, "{state}");
+        }
+    }
+
+    #[test]
+    fn snapshot_near_miss_lease_schema_is_rejected_without_installing_state() {
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.blocking_lock();
+        initialize_schema(&source_conn, identity(), &expected_members())
+            .expect("source consensus schema");
+        apply_entries_sync(
+            &source_conn,
+            identity(),
+            &source.caps,
+            vec![membership_entry()],
+        )
+        .expect("source membership");
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("legacy-near-miss.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                .expect("build source snapshot");
+        drop(source_conn);
+        let malformed = Connection::open(&snapshot_path).expect("open snapshot fixture");
+        malformed
+            .execute_batch(
+                "ALTER TABLE leases DROP COLUMN acquired_at;\
+                 ALTER TABLE leases ADD COLUMN acquired_at_legacy TEXT;",
+            )
+            .expect("form near-miss lease schema");
+        drop(malformed);
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.blocking_lock();
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("target consensus schema");
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "legacy-acquired-at-near-miss".into(),
+        };
+        let error = install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "legacy-acquired-at-near-miss.opc",
+            [0xCD; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("malformed snapshot metadata")
+                .len(),
+        )
+        .expect_err("near-miss snapshot schema must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            target_conn
+                .query_row("SELECT COUNT(*) FROM leases", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("preserved target leases"),
+            0
+        );
+    }
+
+    #[test]
+    fn published_684_schema_classifier_accepts_all_bounded_operator_restore_products() {
+        for pre_acquisition_timestamp in [false, true] {
+            for operator_recovery in [
+                Published684OperatorRecoverySchema::Direct,
+                Published684OperatorRecoverySchema::AddOn,
+                Published684OperatorRecoverySchema::Migrated,
+            ] {
+                for restore_scan in [
+                    Published684RestoreScanSchema::Direct,
+                    Published684RestoreScanSchema::Migrated,
+                ] {
+                    let conn = SqliteSessionBackend::canonical_schema_connection()
+                        .expect("canonical published schema fixture");
+                    if pre_acquisition_timestamp {
+                        conn.execute_batch("ALTER TABLE leases DROP COLUMN acquired_at")
+                            .expect("pre-acquisition lease fixture");
+                    }
+                    conn.execute_batch(CONSENSUS_SCHEMA)
+                        .expect("current consensus fixture");
+                    conn.execute_batch(
+                        "DROP TABLE consensus_fenced_transition_receipts; \
+                         DROP TABLE consensus_fenced_transition_activation; \
+                         ALTER TABLE consensus_identity \
+                         DROP COLUMN fenced_transition_receipt_ledger_activated;",
+                    )
+                    .expect("markerless #684 fixture");
+                    install_published_684_operator_recovery_schema(&conn, operator_recovery)
+                        .expect("operator recovery fixture");
+                    install_published_684_restore_scan_schema(&conn, restore_scan)
+                        .expect("restore scan fixture");
+                    assert!(
+                        published_684_schema_is_exact_in_sync(&conn, false)
+                            .expect("classify published #684 schema"),
+                        "lease={pre_acquisition_timestamp}, operator={operator_recovery:?}, restore={restore_scan:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_direct_published_684_layout_activates_and_classifies_read_only_and_attached() {
+        let directory = tempfile::tempdir().expect("published schema directory");
+        let database = directory.path().join("published-684-nondirect.sqlite");
+        let source = SqliteSessionBackend::open(&database).expect("published schema source");
+        let source_conn = source.conn.blocking_lock();
+        initialize_schema(&source_conn, identity(), &expected_members())
+            .expect("initialize published schema source");
+        source_conn
+            .execute_batch(
+                "DROP TABLE consensus_fenced_transition_receipts; \
+                 DROP TABLE consensus_fenced_transition_activation; \
+                 ALTER TABLE consensus_identity \
+                 DROP COLUMN fenced_transition_receipt_ledger_activated;",
+            )
+            .expect("form markerless published layout");
+        install_published_684_operator_recovery_schema(
+            &source_conn,
+            Published684OperatorRecoverySchema::Migrated,
+        )
+        .expect("install migrated operator layout");
+        install_published_684_restore_scan_schema(
+            &source_conn,
+            Published684RestoreScanSchema::Migrated,
+        )
+        .expect("install migrated restore layout");
+        assert_eq!(
+            fenced_transition_receipt_ledger_layout_sync(&source_conn)
+                .expect("classify writable non-direct layout"),
+            FencedTransitionReceiptLedgerLayout::Published684,
+        );
+        ensure_fenced_transition_receipt_ledger_activation_sync(&source_conn, identity())
+            .expect("writable activation accepts non-direct layout");
+        drop(source_conn);
+        drop(source);
+
+        let activated = Connection::open(&database).expect("open activated fixture");
+        activated
+            .execute_batch(
+                "DROP TABLE consensus_fenced_transition_receipts; \
+                 DROP TABLE consensus_fenced_transition_activation; \
+                 ALTER TABLE consensus_identity \
+                 DROP COLUMN fenced_transition_receipt_ledger_activated;",
+            )
+            .expect("restore markerless published layout");
+        drop(activated);
+
+        let read_only =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open read-only published fixture");
+        assert_eq!(
+            fenced_transition_receipt_ledger_layout_sync(&read_only)
+                .expect("read-only recovery classifier accepts non-direct layout"),
+            FencedTransitionReceiptLedgerLayout::Published684,
+        );
+        drop(read_only);
+
+        let attached = Connection::open_in_memory().expect("attached classifier target");
+        attached
+            .execute(
+                "ATTACH DATABASE ?1 AS consensus_incoming",
+                [database.to_string_lossy().as_ref()],
+            )
+            .expect("attach published fixture");
+        assert_eq!(
+            fenced_transition_receipt_ledger_layout_in_sync(&attached, true)
+                .expect("attached snapshot classifier accepts non-direct layout"),
+            FencedTransitionReceiptLedgerLayout::Published684,
+        );
+    }
+
+    #[test]
+    fn pre_authority_dynamic_layout_is_attached_only_and_rejects_later_artifacts() {
+        let directory = tempfile::tempdir().expect("legacy snapshot directory");
+        let database = directory.path().join("pre-authority-dynamic.sqlite");
+        let source = SqliteSessionBackend::open(&database).expect("legacy snapshot source");
+        let source_conn = source.conn.blocking_lock();
+        initialize_schema(&source_conn, identity(), &expected_members())
+            .expect("initialize legacy snapshot source");
+        source_conn
+            .execute_batch(
+                "DROP TABLE consensus_fenced_transition_receipts; \
+                 DROP TABLE consensus_fenced_transition_activation; \
+                 ALTER TABLE consensus_identity \
+                    DROP COLUMN fenced_transition_receipt_ledger_activated; \
+                 ALTER TABLE leases DROP COLUMN acquired_at; \
+                 ALTER TABLE consensus_identity DROP COLUMN authority_profile; \
+                 ALTER TABLE consensus_identity DROP COLUMN fixed_placement_policy;",
+            )
+            .expect("form exact pre-authority dynamic layout");
+        drop(source_conn);
+        drop(source);
+
+        let read_only =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open legacy snapshot as main");
+        assert_eq!(
+            fenced_transition_receipt_ledger_layout_sync(&read_only)
+                .expect_err("pre-authority layout is not a writable/main predecessor")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        drop(read_only);
+
+        let attached = Connection::open_in_memory().expect("attached classifier target");
+        attached
+            .execute(
+                "ATTACH DATABASE ?1 AS consensus_incoming",
+                [database.to_string_lossy().as_ref()],
+            )
+            .expect("attach exact legacy snapshot");
+        assert_eq!(
+            fenced_transition_receipt_ledger_layout_in_sync(&attached, true)
+                .expect("exact pre-authority snapshot is supported"),
+            FencedTransitionReceiptLedgerLayout::Published684,
+        );
+        drop(attached);
+
+        for (name, mutation) in [
+            (
+                "activation-marker",
+                FENCED_TRANSITION_RECEIPT_LEDGER_ACTIVATION_MIGRATION,
+            ),
+            ("receipt-ledger", FENCED_TRANSITION_RECEIPT_SCHEMA),
+            (
+                "acquisition-timestamp",
+                "ALTER TABLE leases ADD COLUMN acquired_at TEXT;",
+            ),
+        ] {
+            let near_miss = directory
+                .path()
+                .join(format!("pre-authority-{name}.sqlite"));
+            std::fs::copy(&database, &near_miss).expect("copy exact legacy snapshot");
+            let mutate = Connection::open(&near_miss).expect("open legacy near-miss");
+            mutate
+                .execute_batch(mutation)
+                .expect("install post-era artifact");
+            drop(mutate);
+
+            let attached = Connection::open_in_memory().expect("near-miss classifier target");
+            attached
+                .execute(
+                    "ATTACH DATABASE ?1 AS consensus_incoming",
+                    [near_miss.to_string_lossy().as_ref()],
+                )
+                .expect("attach legacy near-miss");
+            assert_eq!(
+                fenced_transition_receipt_ledger_layout_in_sync(&attached, true)
+                    .expect_err("post-era artifact must fail the legacy exception")
+                    .kind(),
+                io::ErrorKind::InvalidData,
+                "{name}",
+            );
+        }
+    }
+
+    #[test]
+    fn published_684_schema_classifier_rejects_near_misses_and_extra_objects() {
+        for (name, mutation) in [
+            (
+                "operator-default",
+                "DROP TABLE consensus_operator_recovery; \
+                 CREATE TABLE consensus_operator_recovery (\
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1), \
+                    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0), \
+                    recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0), \
+                    last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32), \
+                    pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch), \
+                    pending_plan_digest BLOB CHECK (pending_plan_digest IS NULL OR length(pending_plan_digest) = 32), \
+                    watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 1 CHECK (watch_cursor_invalidation_floor >= 0), \
+                    CHECK ((pending_epoch IS NULL AND pending_plan_digest IS NULL) OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)), \
+                    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)\
+                 );",
+            ),
+            (
+                "restore-weakened",
+                "DROP TABLE restore_scan_state; \
+                 CREATE TABLE restore_scan_state (\
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1), \
+                    epoch BLOB NOT NULL CHECK (length(epoch) = 16), \
+                    revision INTEGER NOT NULL CHECK (revision >= 0), \
+                    cursor_key BLOB NOT NULL\
+                 );",
+            ),
+            (
+                "extra-object",
+                "CREATE VIEW published_684_extra AS SELECT singleton FROM consensus_identity;",
+            ),
+        ] {
+            let conn = SqliteSessionBackend::canonical_schema_connection()
+                .expect("canonical published schema fixture");
+            conn.execute_batch(CONSENSUS_SCHEMA)
+                .expect("current consensus fixture");
+            conn.execute_batch(
+                "DROP TABLE consensus_fenced_transition_receipts; \
+                 DROP TABLE consensus_fenced_transition_activation; \
+                 ALTER TABLE consensus_identity \
+                 DROP COLUMN fenced_transition_receipt_ledger_activated;",
+            )
+            .expect("markerless #684 fixture");
+            conn.execute_batch(mutation).expect("near-miss fixture");
+            assert!(
+                !published_684_schema_is_exact_in_sync(&conn, false)
+                    .expect("classify near-miss published schema"),
+                "{name}",
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_activation_marker_requires_exact_identity_ddl_and_integer_singleton() {
+        let mut normalized_identity_forms = BTreeSet::new();
+        for migrated in [false, true] {
+            let conn = SqliteSessionBackend::canonical_schema_connection()
+                .expect("canonical activated schema fixture");
+            conn.execute_batch(CONSENSUS_SCHEMA)
+                .expect("current consensus fixture");
+            let storage_identity = identity();
+            conn.execute(
+                "INSERT INTO consensus_identity \
+                 (singleton, schema_version, cluster_id, configuration_id, \
+                  configuration_epoch, authority_profile) \
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+                params![
+                    i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
+                    storage_identity.cluster_id().as_bytes().as_slice(),
+                    storage_identity.configuration_id().as_bytes().as_slice(),
+                    epoch_i64(storage_identity).expect("valid fixture epoch"),
+                    authority_profile_i64(ConsensusAuthorityProfile::Dynamic),
+                ],
+            )
+            .expect("insert activated identity singleton");
+            if migrated {
+                conn.execute_batch(
+                    "ALTER TABLE consensus_identity \
+                     DROP COLUMN fenced_transition_receipt_ledger_activated;",
+                )
+                .expect("published #684 identity fixture");
+                conn.execute_batch(FENCED_TRANSITION_RECEIPT_LEDGER_ACTIVATION_MIGRATION)
+                    .expect("activation migration fixture");
+            }
+            assert_eq!(
+                fenced_transition_receipt_ledger_marker_in_sync(&conn, false)
+                    .expect("inspect exact activation marker"),
+                Some(false),
+                "migrated={migrated}",
+            );
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read identity DDL");
+            normalized_identity_forms.insert(normalize_schema_sql(&sql));
+        }
+        assert!(!normalized_identity_forms.is_empty());
+
+        for (name, marker_definition) in [
+            ("nullable", "INTEGER CHECK (fenced_transition_receipt_ledger_activated = 1)"),
+            ("missing-check", "INTEGER NOT NULL DEFAULT 1"),
+            (
+                "weakened-check",
+                "INTEGER NOT NULL DEFAULT 1 CHECK (fenced_transition_receipt_ledger_activated IN (0, 1))",
+            ),
+            (
+                "wrong-type",
+                "TEXT NOT NULL DEFAULT 1 CHECK (fenced_transition_receipt_ledger_activated = 1)",
+            ),
+        ] {
+            let conn = Connection::open_in_memory().expect("weak marker fixture");
+            conn.execute_batch(&format!(
+                "CREATE TABLE consensus_identity (\
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1), \
+                    fenced_transition_receipt_ledger_activated {marker_definition}\
+                 ); \
+                 INSERT INTO consensus_identity \
+                    (singleton, fenced_transition_receipt_ledger_activated) VALUES (1, 1);"
+            ))
+            .expect("install weak marker fixture");
+            assert_eq!(
+                fenced_transition_receipt_ledger_marker_in_sync(&conn, false)
+                    .expect_err("weak marker DDL must fail closed")
+                    .kind(),
+                io::ErrorKind::InvalidData,
+                "{name}",
+            );
+        }
+    }
+
+    #[test]
+    fn weak_receipt_activation_marker_rejects_reopen_and_snapshot_without_mutation() {
+        let reopened = SqliteSessionBackend::in_memory().expect("writable reopen fixture");
+        let reopened_conn = reopened.conn.blocking_lock();
+        initialize_schema(&reopened_conn, identity(), &expected_members())
+            .expect("initialize writable reopen fixture");
+        reopened_conn
+            .execute_batch(
+                "ALTER TABLE consensus_identity \
+                 DROP COLUMN fenced_transition_receipt_ledger_activated; \
+                 ALTER TABLE consensus_identity \
+                 ADD COLUMN fenced_transition_receipt_ledger_activated INTEGER NOT NULL DEFAULT 1;",
+            )
+            .expect("weaken writable marker");
+        assert_eq!(
+            initialize_schema(&reopened_conn, identity(), &expected_members())
+                .expect_err("writable reopen must reject weak marker"),
+            SessionConsensusStorageError::CorruptState,
+        );
+
+        let source = SqliteSessionBackend::in_memory().expect("snapshot source");
+        let source_conn = source.conn.blocking_lock();
+        initialize_schema(&source_conn, identity(), &expected_members())
+            .expect("initialize snapshot source");
+        apply_entries_sync(
+            &source_conn,
+            identity(),
+            &source.caps,
+            vec![membership_entry()],
+        )
+        .expect("source membership");
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("weak-marker.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                .expect("build snapshot");
+        drop(source_conn);
+        Connection::open(&snapshot_path)
+            .expect("open snapshot fixture")
+            .execute_batch(
+                "ALTER TABLE consensus_identity \
+                 DROP COLUMN fenced_transition_receipt_ledger_activated; \
+                 ALTER TABLE consensus_identity \
+                 ADD COLUMN fenced_transition_receipt_ledger_activated INTEGER NOT NULL DEFAULT 1;",
+            )
+            .expect("weaken snapshot marker");
+
+        let target = SqliteSessionBackend::in_memory().expect("snapshot target");
+        let target_conn = target.conn.blocking_lock();
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("initialize snapshot target");
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "weak-activation-marker".into(),
+        };
+        assert_eq!(
+            install_snapshot_database_sync(
+                &target_conn,
+                identity(),
+                &snapshot_path,
+                &meta,
+                "weak-activation-marker.opc",
+                [0xD1; 32],
+                std::fs::metadata(&snapshot_path)
+                    .expect("weak snapshot metadata")
+                    .len(),
+            )
+            .expect_err("weak snapshot marker must fail before copying state")
+            .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert!(read_applied_sync(&target_conn, identity())
+            .expect("read unchanged target pointer")
+            .is_none());
+        assert_eq!(
+            fenced_transition_receipt_count_sync(&target_conn).expect("read unchanged receipts"),
+            0,
+        );
+    }
+
+    #[test]
+    fn pre_receipt_snapshot_is_empty_ledger_compatible_but_cannot_erase_a_binding() {
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.blocking_lock();
+        initialize_schema(&source_conn, identity(), &expected_members())
+            .expect("source consensus schema");
+        apply_entries_sync(
+            &source_conn,
+            identity(),
+            &source.caps,
+            vec![membership_entry()],
+        )
+        .expect("source membership");
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("pre-receipt.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                .expect("build source snapshot");
+        drop(source_conn);
+        let activated_missing_ledger =
+            Connection::open(&snapshot_path).expect("open activated snapshot fixture");
+        activated_missing_ledger
+            .execute_batch("DROP TABLE consensus_fenced_transition_receipts")
+            .expect("remove activated receipt ledger");
+        drop(activated_missing_ledger);
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "pre-receipt".into(),
+        };
+
+        let activated_target = SqliteSessionBackend::in_memory().expect("activated target");
+        let activated_conn = activated_target.conn.blocking_lock();
+        initialize_schema(&activated_conn, identity(), &expected_members())
+            .expect("activated target schema");
+        let error = install_snapshot_database_sync(
+            &activated_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "activated-missing-ledger.opc",
+            [0xE8; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("activated snapshot metadata")
+                .len(),
+        )
+        .expect_err("a #696 snapshot missing its activated ledger must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let legacy = Connection::open(&snapshot_path).expect("open snapshot fixture");
+        legacy
+            .execute_batch(
+                r#"
+                DROP TABLE consensus_fenced_transition_activation;
+                ALTER TABLE consensus_identity
+                DROP COLUMN fenced_transition_receipt_ledger_activated;
+                "#,
+            )
+            .expect("restore the published #684 receipt shape");
+        drop(legacy);
+        let byte_length = std::fs::metadata(&snapshot_path)
+            .expect("legacy snapshot metadata")
+            .len();
+
+        let empty_target = SqliteSessionBackend::in_memory().expect("empty target");
+        let empty_conn = empty_target.conn.blocking_lock();
+        initialize_schema(&empty_conn, identity(), &expected_members())
+            .expect("empty target schema");
+        install_snapshot_database_sync(
+            &empty_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "pre-receipt-empty.opc",
+            [0xE9; 32],
+            byte_length,
+        )
+        .expect("pre-receipt snapshot installs into an empty ledger");
+        assert_eq!(
+            empty_conn
+                .query_row(
+                    "SELECT fenced_transition_receipt_ledger_activated FROM consensus_identity WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("retain local prepared marker"),
+            0,
+        );
+
+        let bound_target = SqliteSessionBackend::in_memory().expect("bound target");
+        let bound_conn = bound_target.conn.blocking_lock();
+        initialize_schema(&bound_conn, identity(), &expected_members())
+            .expect("bound target schema");
+        bound_conn
+            .execute(
+                "INSERT INTO consensus_fenced_transition_receipts (request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+                params![
+                    [0xEA_u8; 16].as_slice(),
+                    epoch_i64(identity()).expect("epoch"),
+                    [0xEB_u8; 32].as_slice(),
+                    ops::format_rfc3339_normalized(timestamp(2)),
+                    [0xEC_u8; 32].as_slice(),
+                ],
+            )
+            .expect("persist binding tombstone");
+        let error = install_snapshot_database_sync(
+            &bound_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "pre-receipt-bound.opc",
+            [0xEC; 32],
+            byte_length,
+        )
+        .expect_err("pre-receipt snapshot cannot erase a durable binding");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            bound_conn
+                .query_row(
+                    "SELECT COUNT(*) FROM consensus_fenced_transition_receipts",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count preserved binding"),
+            1
+        );
+    }
+
+    #[test]
+    fn snapshot_with_one_receipt_commitment_column_fails_closed() {
+        for partial_column in ["binding_digest", "response_digest"] {
+            let source = SqliteSessionBackend::in_memory().expect("source backend");
+            let source_conn = source.conn.blocking_lock();
+            initialize_schema(&source_conn, identity(), &expected_members())
+                .expect("source consensus schema");
+            apply_entries_sync(
+                &source_conn,
+                identity(),
+                &source.caps,
+                vec![membership_entry()],
+            )
+            .expect("source membership");
+            let directory = tempfile::tempdir().expect("snapshot directory");
+            let snapshot_path = directory.path().join("partial-receipt-schema.sqlite");
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                    .expect("build source snapshot");
+            drop(source_conn);
+
+            let snapshot = Connection::open(&snapshot_path).expect("open snapshot fixture");
+            snapshot
+                .execute_batch("DROP TABLE consensus_fenced_transition_receipts")
+                .expect("remove canonical receipt table");
+            let partial_schema = format!(
+                "CREATE TABLE consensus_fenced_transition_receipts (request_id BLOB PRIMARY KEY, configuration_epoch INTEGER, payload_digest BLOB, retained_until TEXT, {partial_column} BLOB, response_json BLOB)"
+            );
+            snapshot
+                .execute_batch(&partial_schema)
+                .expect("install partial receipt schema");
+            drop(snapshot);
+
+            let target = SqliteSessionBackend::in_memory().expect("target backend");
+            let target_conn = target.conn.blocking_lock();
+            initialize_schema(&target_conn, identity(), &expected_members())
+                .expect("target consensus schema");
+            let meta = opc_consensus::engine::SnapshotMeta {
+                last_log_id,
+                last_membership,
+                snapshot_id: "partial-receipt-schema".into(),
+            };
+            let error = install_snapshot_database_sync(
+                &target_conn,
+                identity(),
+                &snapshot_path,
+                &meta,
+                "partial-receipt-schema.opc",
+                [0xED; 32],
+                std::fs::metadata(&snapshot_path)
+                    .expect("snapshot metadata")
+                    .len(),
+            )
+            .expect_err("partial receipt commitment schema must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{partial_column}");
+        }
+    }
+
+    #[test]
+    fn snapshot_receipt_schema_and_cap_are_rejected_before_preservation_probes() {
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.blocking_lock();
+        initialize_schema(&source_conn, identity(), &expected_members())
+            .expect("source consensus schema");
+        let request = fenced_transition_request(0xF6, "fenced-owner");
+        apply_entries_sync(
+            &source_conn,
+            identity(),
+            &source.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, request.clone(), timestamp(1)),
+            ],
+        )
+        .expect("source transition");
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("uncapped-no-index-receipts.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                .expect("build source snapshot");
+        drop(source_conn);
+
+        let snapshot = Connection::open(&snapshot_path).expect("open snapshot fixture");
+        snapshot
+            .execute_batch(
+                r#"
+DROP TABLE consensus_fenced_transition_receipts;
+CREATE TABLE consensus_fenced_transition_receipts (
+    request_id BLOB,
+    configuration_epoch INTEGER,
+    payload_digest BLOB,
+    retained_until TEXT,
+    binding_digest BLOB,
+    response_json BLOB,
+    response_digest BLOB
+);
+BEGIN IMMEDIATE;
+"#,
+            )
+            .expect("install unindexed receipt fixture");
+        let mut insert = snapshot
+            .prepare(
+                "INSERT INTO consensus_fenced_transition_receipts (request_id, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, 1, ?2, ?3, ?4, NULL, NULL)",
+            )
+            .expect("prepare malformed receipt insert");
+        for ordinal in 1..=FENCED_TRANSITION_MAX_HISTORY_ENTRIES + 1 {
+            let mut request_id = [0xA7_u8; FENCED_TRANSITION_REQUEST_ID_BYTES];
+            request_id[8..].copy_from_slice(
+                &u64::try_from(ordinal)
+                    .expect("fixture ordinal")
+                    .to_be_bytes(),
+            );
+            insert
+                .execute(params![
+                    request_id.as_slice(),
+                    [0xA8_u8; 32].as_slice(),
+                    ops::format_rfc3339_normalized(timestamp(2)),
+                    [0xA9_u8; 32].as_slice(),
+                ])
+                .expect("insert malformed receipt");
+        }
+        drop(insert);
+        snapshot
+            .execute_batch("COMMIT")
+            .expect("commit malformed receipt fixture");
+        drop(snapshot);
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.blocking_lock();
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("target consensus schema");
+        apply_entries_sync(
+            &target_conn,
+            identity(),
+            &target.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, request, timestamp(1)),
+            ],
+        )
+        .expect("target transition");
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "uncapped-no-index-receipts".into(),
+        };
+        let error = install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "uncapped-no-index-receipts.opc",
+            [0xAA; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("snapshot metadata")
+                .len(),
+        )
+        .expect_err("unindexed cap+1 receipt ledger must fail before preservation comparison");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fenced_transition_receipt_count_sync(&target_conn).expect("target receipt count"),
+            1,
+            "rejected snapshot must not mutate the target ledger"
+        );
+    }
+
+    #[test]
+    fn current_snapshot_cannot_erase_rebind_or_prematurely_expire_a_retained_receipt() {
+        for corruption in ["missing", "rebound", "prematurely-expired"] {
+            let source = SqliteSessionBackend::in_memory().expect("source backend");
+            let source_conn = source.conn.blocking_lock();
+            initialize_schema(&source_conn, identity(), &expected_members())
+                .expect("source consensus schema");
+            let request = fenced_transition_request(0xEF, "fenced-owner");
+            apply_entries_sync(
+                &source_conn,
+                identity(),
+                &source.caps,
+                vec![
+                    membership_entry(),
+                    fenced_transition_entry(1, request.clone(), timestamp(1)),
+                ],
+            )
+            .expect("source transition");
+            let directory = tempfile::tempdir().expect("snapshot directory");
+            let snapshot_path = directory.path().join("rewritten-receipt.sqlite");
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                    .expect("build transition snapshot");
+            drop(source_conn);
+
+            let snapshot = Connection::open(&snapshot_path).expect("open snapshot fixture");
+            match corruption {
+                "missing" => {
+                    snapshot
+                        .execute("DELETE FROM consensus_fenced_transition_receipts", [])
+                        .expect("erase snapshot receipt");
+                }
+                "rebound" => {
+                    snapshot
+                        .execute(
+                            "UPDATE consensus_fenced_transition_receipts SET payload_digest = ?1",
+                            [[0xF0_u8; 32].as_slice()],
+                        )
+                        .expect("rewrite snapshot binding");
+                }
+                "prematurely-expired" => {
+                    snapshot
+                        .execute(
+                            "UPDATE consensus_fenced_transition_receipts SET response_json = NULL, response_digest = NULL",
+                            [],
+                        )
+                        .expect("erase retained snapshot result");
+                }
+                _ => unreachable!("fixed corruption fixture"),
+            }
+            drop(snapshot);
+
+            let target = SqliteSessionBackend::in_memory().expect("target backend");
+            let target_conn = target.conn.blocking_lock();
+            initialize_schema(&target_conn, identity(), &expected_members())
+                .expect("target consensus schema");
+            apply_entries_sync(
+                &target_conn,
+                identity(),
+                &target.caps,
+                vec![
+                    membership_entry(),
+                    fenced_transition_entry(1, request.clone(), timestamp(1)),
+                ],
+            )
+            .expect("target transition");
+            let receipt_before: (Vec<u8>, String, Option<Vec<u8>>) = target_conn
+                .query_row(
+                    "SELECT payload_digest, retained_until, response_json FROM consensus_fenced_transition_receipts WHERE request_id = ?1",
+                    [request.request_id().as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("target receipt before install");
+            let meta = opc_consensus::engine::SnapshotMeta {
+                last_log_id,
+                last_membership,
+                snapshot_id: "rewritten-fenced-transition-receipt".into(),
+            };
+
+            let error = install_snapshot_database_sync(
+                &target_conn,
+                identity(),
+                &snapshot_path,
+                &meta,
+                "rewritten-fenced-transition-receipt.opc",
+                [0xF1; 32],
+                std::fs::metadata(&snapshot_path)
+                    .expect("snapshot metadata")
+                    .len(),
+            )
+            .expect_err("snapshot must preserve every retained request binding and result");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{corruption}");
+            let receipt_after: (Vec<u8>, String, Option<Vec<u8>>) = target_conn
+                .query_row(
+                    "SELECT payload_digest, retained_until, response_json FROM consensus_fenced_transition_receipts WHERE request_id = ?1",
+                    [request.request_id().as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("target receipt after rejected install");
+            assert_eq!(receipt_after, receipt_before, "{corruption}");
         }
     }
 
@@ -9808,6 +16974,10 @@ mod tests {
             (
                 "lease-timestamp",
                 "UPDATE leases SET guard_expires_at = 'not-a-timestamp'",
+            ),
+            (
+                "lease-acquired-at",
+                "UPDATE leases SET acquired_at = 'not-a-timestamp'",
             ),
             (
                 "lease-noncanonical-timestamp",
@@ -10997,6 +18167,7 @@ mod tests {
             StoreError::Serialization("corrupt local row".into()),
             StoreError::CapabilityNotSupported("local capability".into()),
             StoreError::Crypto("invalid persisted envelope".into()),
+            StoreError::FencedTransitionHistoryFull,
         ] {
             assert!(!is_deterministic_intent_rejection(&error));
         }
@@ -13214,6 +20385,302 @@ mod tests {
                 .expect("count unchanged leases"),
             "the new authority epoch must not recover or repeat the old effect"
         );
+
+        let fenced_collision = apply_entries_sync(
+            &conn,
+            storage_identity,
+            &backend.caps,
+            vec![fenced_transition_authorized_entry(
+                3,
+                fenced_transition_request(0xB3, "revoked-generic-collision"),
+                timestamp(3),
+                node_id(),
+                identity_at(2, 0x5c),
+            )],
+        )
+        .expect("revoked fenced access cannot expose a generic binding");
+        assert!(matches!(
+            fenced_collision.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::TopologyAuthorityRevoked),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn unbound_revoked_fenced_transition_is_recorded_before_valid_successor_replay() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("membership fixture");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(
+                1,
+                fenced_transition_request(0xB5, "activation-fixture-owner"),
+                timestamp(1),
+            )],
+        )
+        .expect("activate fenced transition receipt ledger");
+        let request = fenced_transition_request(0xB6, "revoked-unbound-owner");
+        let rejected = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_authorized_entry(
+                2,
+                request.clone(),
+                timestamp(2),
+                node_id(),
+                identity_at(2, 0x5d),
+            )],
+        )
+        .expect("unbound revoked request is recorded");
+        assert!(matches!(
+            rejected.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::TopologyAuthorityRevoked),
+                ..
+            }]
+        ));
+        assert_eq!(
+            fenced_transition_receipt_count_sync(&conn).expect("receipt count"),
+            2
+        );
+        let sequence_after_rejection = proposal_state_sync(&conn, identity())
+            .expect("machine after rejection")
+            .0;
+
+        let replay = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(3, request.clone(), timestamp(3))],
+        )
+        .expect("valid authority replays recorded rejection");
+        assert_eq!(replay.responses[0].result, rejected.responses[0].result);
+        let conflict = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(
+                4,
+                fenced_transition_request(0xB6, "valid-different-body"),
+                timestamp(4),
+            )],
+        )
+        .expect("valid authority sees durable body conflict");
+        assert!(matches!(
+            conflict.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionRequestConflict),
+                ..
+            }]
+        ));
+        assert_eq!(
+            proposal_state_sync(&conn, identity())
+                .expect("machine after replay and conflict")
+                .0,
+            sequence_after_rejection,
+        );
+        assert!(matches!(
+            read_fenced_transition_status_sync(&conn, identity(), identity(), &request),
+            Ok(FencedTransitionStatus::Recorded(result))
+                if matches!(result.as_ref(), Err(StoreError::TopologyAuthorityRevoked))
+        ));
+    }
+
+    #[test]
+    fn revoked_activation_wrapper_after_cutover_is_no_effect_and_does_not_poison_successor() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        let voters = expected_members();
+        initialize_schema(&conn, identity(), &voters).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("membership fixture");
+
+        // Form V2 with a valid certificate, then emulate the exact
+        // certificate-free state left by a topology promotion. The marker is
+        // one-way, but promotion deletes this one bounded row before the
+        // successor's first activation.
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![activating_fenced_transition_authorized_entry(
+                1,
+                fenced_transition_request(0xBA, "activation-fixture-owner"),
+                timestamp(1),
+                node_id(),
+                identity(),
+                identity(),
+                &voters,
+            )],
+        )
+        .expect("activate V2 fixture");
+        conn.execute(
+            "DELETE FROM consensus_fenced_transition_activation WHERE singleton = 1",
+            [],
+        )
+        .expect("emulate promotion certificate invalidation");
+        assert!(!fenced_transition_activation_matches_scope_sync(
+            &conn,
+            identity(),
+            identity(),
+            &voters,
+        )
+        .expect("certificate is absent after cutover"));
+
+        let request = fenced_transition_request(0xBB, "cutover-revoked-owner");
+        let revoked = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![activating_fenced_transition_authorized_entry(
+                2,
+                request.clone(),
+                timestamp(2),
+                node_id(),
+                identity_at(2, 0xBA),
+                identity(),
+                &voters,
+            )],
+        )
+        .expect("revoked wrapper remains a deterministic no-effect command");
+        assert!(matches!(
+            revoked.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::TopologyAuthorityRevoked),
+                ..
+            }]
+        ));
+        assert!(!fenced_transition_activation_matches_scope_sync(
+            &conn,
+            identity(),
+            identity(),
+            &voters,
+        )
+        .expect("revoked wrapper cannot publish a certificate"));
+        assert_eq!(
+            1_i64,
+            conn.query_row("SELECT COUNT(*) FROM session_records", [], |row| row
+                .get::<_, i64>(0))
+                .expect("revoked wrapper leaves its body unexecuted"),
+        );
+
+        // The receipt binding deliberately excludes both the old authority
+        // envelope and this activation wrapper. A valid successor replay of
+        // the same caller request installs the current certificate while
+        // retaining its earlier deterministic result and no second effect.
+        let successor = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![activating_fenced_transition_authorized_entry(
+                3,
+                request.clone(),
+                timestamp(3),
+                node_id(),
+                identity(),
+                identity(),
+                &voters,
+            )],
+        )
+        .expect("authorized successor can activate and replay");
+        assert_eq!(successor.responses[0].result, revoked.responses[0].result);
+        assert!(fenced_transition_activation_matches_scope_sync(
+            &conn,
+            identity(),
+            identity(),
+            &voters,
+        )
+        .expect("successor activation restores the exact certificate"));
+        assert!(matches!(
+            read_fenced_transition_status_sync(&conn, identity(), identity(), &request),
+            Ok(FencedTransitionStatus::Recorded(result))
+                if matches!(result.as_ref(), Err(StoreError::TopologyAuthorityRevoked))
+        ));
+        assert_eq!(
+            1_i64,
+            conn.query_row("SELECT COUNT(*) FROM session_records", [], |row| row
+                .get::<_, i64>(0))
+                .expect("successor replay remains no-effect"),
+        );
+    }
+
+    #[test]
+    fn unbound_revoked_fenced_access_masks_terminal_state_without_binding() {
+        for terminal in ["history-full", "retention-exhausted"] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+                .expect("membership fixture");
+            let command_time = if terminal == "history-full" {
+                seed_fenced_transition_tombstones(
+                    &conn,
+                    FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+                    timestamp(0),
+                );
+                timestamp(1)
+            } else {
+                Timestamp::from_str("9999-12-31T00:00:00Z").expect("retention horizon timestamp")
+            };
+            let request_byte = if terminal == "history-full" {
+                0xB7
+            } else {
+                0xB8
+            };
+            let request = fenced_transition_request(request_byte, "revoked-terminal-owner");
+            let receipt_count_before =
+                fenced_transition_receipt_count_sync(&conn).expect("receipt count before");
+            let sequence_before = proposal_state_sync(&conn, identity())
+                .expect("sequence before")
+                .0;
+            let rejected = apply_entries_sync(
+                &conn,
+                identity(),
+                &backend.caps,
+                vec![fenced_transition_authorized_entry(
+                    1,
+                    request.clone(),
+                    command_time,
+                    node_id(),
+                    identity_at(2, 0x5e),
+                )],
+            )
+            .unwrap_or_else(|error| panic!("{terminal} revoked apply: {error}"));
+            assert!(matches!(
+                rejected.responses.as_slice(),
+                [SessionConsensusResponse {
+                    result: Err(StoreError::TopologyAuthorityRevoked),
+                    ..
+                }]
+            ));
+            assert_eq!(
+                fenced_transition_receipt_count_sync(&conn).expect("receipt count after"),
+                receipt_count_before,
+            );
+            assert_eq!(
+                proposal_state_sync(&conn, identity())
+                    .expect("sequence after")
+                    .0,
+                sequence_before,
+            );
+            assert_eq!(
+                read_fenced_transition_status_sync(&conn, identity(), identity(), &request)
+                    .expect("authorized status after revoked terminal"),
+                if terminal == "history-full" {
+                    FencedTransitionStatus::HistoryFull
+                } else {
+                    FencedTransitionStatus::RetentionExhausted
+                },
+            );
+        }
     }
 
     #[tokio::test]
@@ -14589,10 +22056,15 @@ mod tests {
         let legacy_snapshot = Connection::open(&snapshot_path).expect("open snapshot fixture");
         legacy_snapshot
             .execute_batch(
-                "ALTER TABLE consensus_identity DROP COLUMN authority_profile;\
+                "DROP TABLE consensus_fenced_transition_receipts;\
+                 DROP TABLE consensus_fenced_transition_activation;\
+                 ALTER TABLE consensus_identity \
+                    DROP COLUMN fenced_transition_receipt_ledger_activated;\
+                 ALTER TABLE leases DROP COLUMN acquired_at;\
+                 ALTER TABLE consensus_identity DROP COLUMN authority_profile;\
                  ALTER TABLE consensus_identity DROP COLUMN fixed_placement_policy;",
             )
-            .expect("remove post-release authority columns");
+            .expect("form exact pre-authority dynamic snapshot");
         drop(legacy_snapshot);
 
         let target = SqliteSessionBackend::in_memory().expect("target backend");
@@ -14767,5 +22239,547 @@ mod tests {
             verify_pinned_snapshot_descriptor(&pinned, &retained)
                 .expect("retained descriptor must still be A before mutation");
         }
+    }
+
+    #[test]
+    fn fenced_transition_at_sqlite_application_sequence_limit_binds_replayable_exhaustion() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("form membership");
+        conn.execute(
+            "UPDATE consensus_machine SET application_sequence = ?1, last_digest = ?2, logical_time = ?3 WHERE singleton = 1",
+            params![
+                i64::MAX,
+                [0xE1_u8; 32].as_slice(),
+                ops::format_rfc3339_normalized(timestamp(0)),
+            ],
+        )
+        .expect("seed terminal application sequence");
+        let before = read_machine_sync(&conn, identity()).expect("terminal machine state");
+        let request = fenced_transition_request(0xE2, "terminal-sequence-owner");
+        let first = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(1, request.clone(), timestamp(1))],
+        )
+        .expect("bind terminal exhaustion receipt");
+        let recorded = first.responses[0].clone();
+        assert!(matches!(
+            &recorded,
+            SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionStorageExhausted),
+                sequence,
+                digest: Some(digest),
+                logical_time: Some(logical_time),
+                raft_log_index: 1,
+            } if *sequence == before.0 && *digest == before.1 && *logical_time == timestamp(1)
+        ));
+        assert!(first.notifications.is_empty());
+        for table in ["session_records", "leases", "key_fences"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count no-effect state");
+            assert_eq!(count, 0, "terminal receipt must not mutate {table}");
+        }
+        assert_eq!(
+            read_fenced_transition_status_sync(&conn, identity(), identity(), &request),
+            Ok(FencedTransitionStatus::Recorded(Box::new(Err(
+                StoreError::FencedTransitionStorageExhausted
+            ))))
+        );
+        let replay = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(2, request.clone(), timestamp(2))],
+        )
+        .expect("exact terminal replay");
+        assert_eq!(replay.responses.as_slice(), &[recorded]);
+        let conflict = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(
+                3,
+                fenced_transition_request(0xE2, "terminal-sequence-other-owner"),
+                timestamp(3),
+            )],
+        )
+        .expect("terminal body conflict");
+        assert!(matches!(
+            conflict.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionRequestConflict),
+                ..
+            }]
+        ));
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![blank_entry(4)])
+            .expect("a following blank entry still applies");
+    }
+
+    #[test]
+    fn fenced_transition_sqlite_counter_boundaries_are_deterministic_no_effect_receipts() {
+        enum Boundary {
+            Generation,
+            ExactFence,
+            Credential,
+            Watch,
+            Restore,
+        }
+
+        for (ordinal, boundary) in [
+            Boundary::Generation,
+            Boundary::ExactFence,
+            Boundary::Credential,
+            Boundary::Watch,
+            Boundary::Restore,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+                .expect("form membership");
+            let request_byte = 0xD0 + u8::try_from(ordinal).expect("fixture ordinal");
+            let request = match boundary {
+                Boundary::Generation => {
+                    let prior_owner = OwnerId::new("counter-generation-prior").expect("owner");
+                    let mut prior = sealed_record_for_key(key(), 1_024);
+                    prior.owner = prior_owner;
+                    prior.generation = crate::Generation::new(i64::MAX as u64);
+                    prior.fence = crate::FenceToken::new(1);
+                    prior.payload = sealed_payload_for_record(&prior, 1_024);
+                    ops::insert_or_replace_record_sync(&conn, &prior).expect("seed max generation");
+                    ops::insert_or_replace_fence_sync(&conn, &key(), 1).expect("seed key fence");
+                    let owner = OwnerId::new("counter-generation-owner").expect("owner");
+                    let lease = FencedTransitionLease::acquire(
+                        key(),
+                        owner.clone(),
+                        crate::FenceToken::new(1),
+                        Duration::from_secs(300),
+                    )
+                    .expect("lease");
+                    let mut record = sealed_record_for_key(key(), 1_024);
+                    record.owner = owner;
+                    record.generation = crate::Generation::new(i64::MAX as u64 + 1);
+                    record.fence = crate::FenceToken::new(2);
+                    record.payload = sealed_payload_for_record(&record, 1_024);
+                    FencedTransitionRequest::new(
+                        crate::FencedTransitionRequestId::from_bytes([request_byte; 16]),
+                        lease,
+                        FencedTransitionMutation::update(
+                            crate::Generation::new(i64::MAX as u64),
+                            record,
+                        ),
+                    )
+                    .expect("request")
+                }
+                Boundary::ExactFence => {
+                    ops::insert_or_replace_fence_sync(&conn, &key(), i64::MAX as u64 - 1)
+                        .expect("seed key fence");
+                    let owner = OwnerId::new("counter-fence-owner").expect("owner");
+                    let lease = FencedTransitionLease::acquire(
+                        key(),
+                        owner.clone(),
+                        crate::FenceToken::new(i64::MAX as u64 - 1),
+                        Duration::from_secs(300),
+                    )
+                    .expect("lease");
+                    let mut record = sealed_record_for_key(key(), 1_024);
+                    record.owner = owner;
+                    record.fence = crate::FenceToken::new(i64::MAX as u64);
+                    record.payload = sealed_payload_for_record(&record, 1_024);
+                    FencedTransitionRequest::new(
+                        crate::FencedTransitionRequestId::from_bytes([request_byte; 16]),
+                        lease,
+                        FencedTransitionMutation::create(record),
+                    )
+                    .expect("request")
+                }
+                Boundary::Credential => {
+                    conn.execute(
+                        "UPDATE lease_globals SET val = ?1 WHERE key = 'next_credential_id'",
+                        [i64::MAX],
+                    )
+                    .expect("seed credential horizon");
+                    fenced_transition_request(request_byte, "counter-credential-owner")
+                }
+                Boundary::Watch => {
+                    conn.execute(
+                        "UPDATE consensus_machine SET watch_sequence = ?1",
+                        [i64::MAX],
+                    )
+                    .expect("seed watch horizon");
+                    fenced_transition_request(request_byte, "counter-watch-owner")
+                }
+                Boundary::Restore => {
+                    conn.execute("UPDATE restore_scan_state SET revision = ?1", [i64::MAX])
+                        .expect("seed restore horizon");
+                    fenced_transition_request(request_byte, "counter-restore-owner")
+                }
+            };
+            let before = read_machine_sync(&conn, identity()).expect("machine before boundary");
+            let records_before: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_records", [], |row| row.get(0))
+                .expect("count records before boundary");
+            let applied = apply_entries_sync(
+                &conn,
+                identity(),
+                &backend.caps,
+                vec![fenced_transition_entry(1, request, timestamp(1))],
+            )
+            .expect("apply boundary receipt");
+            assert!(matches!(
+                applied.responses.as_slice(),
+                [SessionConsensusResponse {
+                    result: Err(StoreError::FencedTransitionStorageExhausted),
+                    ..
+                }]
+            ));
+            assert!(applied.notifications.is_empty());
+            assert_eq!(
+                read_machine_sync(&conn, identity())
+                    .expect("machine after boundary")
+                    .3,
+                before.3,
+                "boundary receipt must not advance watch"
+            );
+            for (table, expected) in [("session_records", records_before), ("leases", 0)] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                        .expect("count no-effect table"),
+                    expected,
+                    "boundary receipt must not mutate {table}",
+                );
+            }
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![blank_entry(2)])
+                .expect("following blank applies");
+        }
+
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("form membership");
+        conn.execute(
+            "UPDATE lease_globals SET val = ?1 WHERE key = 'next_fence'",
+            [i64::MAX],
+        )
+        .expect("seed global fence horizon");
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(
+                1,
+                fenced_transition_request(0xDE, "safe-exact-owner"),
+                timestamp(1),
+            )],
+        )
+        .expect("safe exact acquire below global horizon");
+        assert!(matches!(
+            applied.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::FencedTransition(_)),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn fenced_transition_batch_reaches_sqlite_sequence_max_then_records_exhaustion() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("form membership");
+        conn.execute(
+            "UPDATE consensus_machine SET application_sequence = ?1, last_digest = ?2, logical_time = ?3 WHERE singleton = 1",
+            params![
+                i64::MAX - 1,
+                [0xE4_u8; 32].as_slice(),
+                ops::format_rfc3339_normalized(timestamp(0)),
+            ],
+        )
+        .expect("seed penultimate application sequence");
+        let second_key = SessionKey {
+            tenant: TenantId::from_static("state-machine-fault-tenant"),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"state-machine-fault-other-session")
+                .try_into()
+                .expect("valid stable ID"),
+        };
+        let owner = OwnerId::new("terminal-batch-second-owner").expect("owner");
+        let lease = FencedTransitionLease::acquire(
+            second_key.clone(),
+            owner.clone(),
+            crate::FenceToken::new(0),
+            Duration::from_secs(300),
+        )
+        .expect("second lease");
+        let mut record = sealed_record_for_key(second_key.clone(), 1_024);
+        record.owner = owner;
+        record.fence = crate::FenceToken::new(1);
+        record.payload = sealed_payload_for_record(&record, 1_024);
+        let second = FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([0xE6; 16]),
+            lease,
+            FencedTransitionMutation::create(record),
+        )
+        .expect("second transition");
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                fenced_transition_entry(
+                    1,
+                    fenced_transition_request(0xE5, "terminal-batch-first-owner"),
+                    timestamp(1),
+                ),
+                fenced_transition_entry(2, second.clone(), timestamp(2)),
+            ],
+        )
+        .expect("apply terminal batch");
+        assert!(matches!(
+            applied.responses.as_slice(),
+            [SessionConsensusResponse { result: Ok(SessionMutationOutcome::FencedTransition(_)), sequence, .. },
+             SessionConsensusResponse { result: Err(StoreError::FencedTransitionStorageExhausted), sequence: exhausted_sequence, .. }]
+                if *sequence == i64::MAX as u64 && *exhausted_sequence == i64::MAX as u64
+        ));
+        assert_eq!(
+            applied.notifications.len(),
+            1,
+            "only the first entry watches"
+        );
+        assert!(ops::get_sync(&conn, &second_key, timestamp(2))
+            .expect("read second key")
+            .is_none());
+        assert_eq!(
+            read_fenced_transition_status_sync(&conn, identity(), identity(), &second),
+            Ok(FencedTransitionStatus::Recorded(Box::new(Err(
+                StoreError::FencedTransitionStorageExhausted
+            ))))
+        );
+        let replay = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(3, second.clone(), timestamp(3))],
+        )
+        .expect("exact terminal receipt replay");
+        assert!(replay.notifications.is_empty());
+        let conflict_owner = OwnerId::new("terminal-batch-conflict-owner").expect("owner");
+        let mut conflict_record = sealed_record_for_key(second_key.clone(), 1_024);
+        conflict_record.owner = conflict_owner.clone();
+        conflict_record.fence = crate::FenceToken::new(1);
+        conflict_record.payload = sealed_payload_for_record(&conflict_record, 1_024);
+        let conflict = FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([0xE6; 16]),
+            FencedTransitionLease::acquire(
+                second_key.clone(),
+                conflict_owner,
+                crate::FenceToken::new(0),
+                Duration::from_secs(300),
+            )
+            .expect("conflict lease"),
+            FencedTransitionMutation::create(conflict_record),
+        )
+        .expect("conflict request");
+        let conflict = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(4, conflict, timestamp(4))],
+        )
+        .expect("terminal body conflict");
+        assert!(matches!(
+            conflict.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionRequestConflict),
+                ..
+            }]
+        ));
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![blank_entry(5)])
+            .expect("following blank applies");
+    }
+
+    #[test]
+    fn fenced_transition_consumer_watch_projection_preserves_order_and_suppresses_replays() {
+        fn assert_projection(
+            entry: &ReplicationEntry,
+            sequence: u64,
+            kinds: &[crate::consumer::SessionConsumerChangeKind],
+        ) {
+            let change =
+                crate::consumer::session_consumer_change(entry).expect("consumer projection");
+            assert_eq!(change.sequence(), sequence);
+            assert_eq!(
+                change
+                    .changes()
+                    .iter()
+                    .map(|item| item.kind())
+                    .collect::<Vec<_>>(),
+                kinds,
+                "lease leaf must precede the record leaf",
+            );
+        }
+
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let create = fenced_transition_request(0xB8, "projection-owner");
+        let created = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(1, create, timestamp(1)),
+            ],
+        )
+        .expect("acquire/create transition");
+        assert_eq!(created.notifications.len(), 1);
+        assert_projection(
+            &created.notifications[0],
+            1,
+            &[
+                crate::consumer::SessionConsumerChangeKind::LeaseAcquired,
+                crate::consumer::SessionConsumerChangeKind::RecordWritten,
+            ],
+        );
+        let lease = match &created.responses[1].result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome.lease().clone(),
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+
+        let update_lease = FencedTransitionLease::renew(lease, Duration::from_secs(300))
+            .expect("renew update lease");
+        let mut update_record = sealed_record_for_key(key(), 1_024);
+        update_record.owner = update_lease.owner().clone();
+        update_record.fence = update_lease.committed_fence().expect("renew fence");
+        update_record.generation = crate::Generation::new(2);
+        update_record.payload = sealed_payload_for_record(&update_record, 1_024);
+        let update = FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([0xB9; 16]),
+            update_lease,
+            FencedTransitionMutation::update(crate::Generation::new(1), update_record),
+        )
+        .expect("renew/update request");
+        let updated = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(2, update, timestamp(2))],
+        )
+        .expect("renew/update transition");
+        assert_eq!(updated.notifications.len(), 1);
+        assert_projection(
+            &updated.notifications[0],
+            2,
+            &[
+                crate::consumer::SessionConsumerChangeKind::LeaseRenewed,
+                crate::consumer::SessionConsumerChangeKind::RecordWritten,
+            ],
+        );
+        let updated_lease = match &updated.responses[0].result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome.lease().clone(),
+            other => panic!("unexpected update outcome: {other:?}"),
+        };
+
+        let refresh = FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([0xBA; 16]),
+            FencedTransitionLease::renew(updated_lease, Duration::from_secs(300))
+                .expect("renew refresh lease"),
+            FencedTransitionMutation::refresh_ttl(
+                crate::Generation::new(2),
+                Duration::from_secs(300),
+            )
+            .expect("refresh mutation"),
+        )
+        .expect("renew/refresh request");
+        let refreshed = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(3, refresh, timestamp(3))],
+        )
+        .expect("renew/refresh transition");
+        assert_eq!(refreshed.notifications.len(), 1);
+        assert_projection(
+            &refreshed.notifications[0],
+            3,
+            &[
+                crate::consumer::SessionConsumerChangeKind::LeaseRenewed,
+                crate::consumer::SessionConsumerChangeKind::RecordTtlRefreshed,
+            ],
+        );
+        let refreshed_lease = match &refreshed.responses[0].result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome.lease().clone(),
+            other => panic!("unexpected refresh outcome: {other:?}"),
+        };
+
+        let delete = FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([0xBB; 16]),
+            FencedTransitionLease::renew(refreshed_lease.clone(), Duration::from_secs(300))
+                .expect("renew delete lease"),
+            FencedTransitionMutation::delete(crate::Generation::new(2)),
+        )
+        .expect("renew/delete request");
+        let deleted = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(4, delete.clone(), timestamp(4))],
+        )
+        .expect("renew/delete transition");
+        assert_eq!(deleted.notifications.len(), 1);
+        assert_projection(
+            &deleted.notifications[0],
+            4,
+            &[
+                crate::consumer::SessionConsumerChangeKind::LeaseRenewed,
+                crate::consumer::SessionConsumerChangeKind::RecordDeleted,
+            ],
+        );
+        let replay = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(5, delete, timestamp(5))],
+        )
+        .expect("exact delete replay");
+        assert!(replay.notifications.is_empty());
+        let rejected = FencedTransitionRequest::new(
+            crate::FencedTransitionRequestId::from_bytes([0xBC; 16]),
+            FencedTransitionLease::renew(refreshed_lease, Duration::from_secs(300))
+                .expect("renew rejected lease"),
+            FencedTransitionMutation::delete(crate::Generation::new(2)),
+        )
+        .expect("rejected request");
+        let rejected = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_entry(6, rejected, timestamp(6))],
+        )
+        .expect("rejected transition");
+        assert!(matches!(
+            rejected.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::CasConflict | StoreError::StaleFence),
+                ..
+            }]
+        ));
+        assert!(rejected.notifications.is_empty());
     }
 }

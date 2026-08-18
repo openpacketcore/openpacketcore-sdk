@@ -3095,6 +3095,12 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::CasConflict => "cas_conflict",
         StoreError::CasIdempotencyConflict => "cas_idempotency_conflict",
         StoreError::CasIdempotencyOutcomeUnavailable => "cas_idempotency_outcome_unavailable",
+        StoreError::FencedTransitionRequestConflict => "fenced_transition_request_conflict",
+        StoreError::FencedTransitionOutcomeUnknown => "fenced_transition_outcome_unknown",
+        StoreError::FencedTransitionRequestExpired => "fenced_transition_request_expired",
+        StoreError::FencedTransitionHistoryFull => "fenced_transition_history_full",
+        StoreError::FencedTransitionRetentionExhausted => "fenced_transition_retention_exhausted",
+        StoreError::FencedTransitionStorageExhausted => "fenced_transition_storage_exhausted",
         StoreError::BackendOperationOutcomeUnavailable => "backend_operation_outcome_unavailable",
         StoreError::TopologyAuthorityRevoked => "topology_authority_revoked",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
@@ -3170,6 +3176,38 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn fenced_transition_errors_have_distinct_redaction_safe_kinds() {
+        for (error, kind) in [
+            (
+                StoreError::FencedTransitionRequestConflict,
+                "fenced_transition_request_conflict",
+            ),
+            (
+                StoreError::FencedTransitionOutcomeUnknown,
+                "fenced_transition_outcome_unknown",
+            ),
+            (
+                StoreError::FencedTransitionRequestExpired,
+                "fenced_transition_request_expired",
+            ),
+            (
+                StoreError::FencedTransitionHistoryFull,
+                "fenced_transition_history_full",
+            ),
+            (
+                StoreError::FencedTransitionRetentionExhausted,
+                "fenced_transition_retention_exhausted",
+            ),
+            (
+                StoreError::FencedTransitionStorageExhausted,
+                "fenced_transition_storage_exhausted",
+            ),
+        ] {
+            assert_eq!(store_error_kind(&error), kind);
+        }
+    }
 
     fn successful_hello_ack(hello: &Request) -> Response {
         let requested = match hello {

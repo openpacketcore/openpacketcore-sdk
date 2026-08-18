@@ -118,6 +118,19 @@ fn lease_and_record_entry(
     )
 }
 
+#[test]
+fn replication_debug_redacts_transition_metadata() {
+    let timestamp = Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_777_777_777).expect("timestamp"),
+    );
+    let owner = OwnerId::new("debug-canary-owner").expect("owner");
+    let operation = acquire(key(b"debug-canary-key"), &owner, 9_191, 8_282, timestamp);
+    let entry = entry(7_373, "debug-canary-request", timestamp, operation.clone());
+
+    assert_eq!(format!("{operation:?}"), "ReplicationOp(<redacted>)");
+    assert_eq!(format!("{entry:?}"), "ReplicationEntry(<redacted>)");
+}
+
 fn cross_key_lease_and_record_entry(
     sequence: u64,
     op_key: SessionKey,

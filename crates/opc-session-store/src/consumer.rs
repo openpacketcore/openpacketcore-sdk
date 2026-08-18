@@ -16,10 +16,12 @@ use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BackendCapabilities, CompareAndSet, CompareAndSetResult, LeaseError, LeaseGuard, OwnerId,
+    AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
+    FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
+    FencedTransitionRequestId, FencedTransitionStatus, LeaseError, LeaseGuard, OwnerId,
     RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionConsensusIdentity,
     SessionConsensusRequestId, SessionKey, SessionOp, SessionOpResult, StoreError,
-    StoredSessionRecord, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    StoredSessionRecord, FENCED_TRANSITION_REQUEST_ID_BYTES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
 };
 
 /// Maximum batch slots admitted by one consumer request.
@@ -258,6 +260,24 @@ pub enum SessionConsumerOperation {
         /// Requested bounded TTL.
         ttl: Duration,
     },
+    /// Prove the exact atomic fenced-transition capability across the current
+    /// admitted voter set.
+    FencedTransitionCapability,
+    /// Observe one exact record key and its durable fence floor.
+    ObserveFencedTransition {
+        /// Exact key to observe.
+        key: SessionKey,
+    },
+    /// Atomically acquire or renew one lease and mutate its exact record.
+    FencedTransition {
+        /// Complete canonical transition body.
+        request: Box<FencedTransitionRequest>,
+    },
+    /// Recover the exact status of one previously submitted transition.
+    FencedTransitionStatus {
+        /// Complete canonical transition body.
+        request: Box<FencedTransitionRequest>,
+    },
     /// Release an existing lease.
     ReleaseLease {
         /// Existing lease credential.
@@ -280,6 +300,10 @@ impl fmt::Debug for SessionConsumerOperation {
             Self::AcquireLease { .. } => "AcquireLease",
             Self::RenewLease { .. } => "RenewLease",
             Self::ReleaseLease { .. } => "ReleaseLease",
+            Self::FencedTransitionCapability => "FencedTransitionCapability",
+            Self::ObserveFencedTransition { .. } => "ObserveFencedTransition",
+            Self::FencedTransition { .. } => "FencedTransition",
+            Self::FencedTransitionStatus { .. } => "FencedTransitionStatus",
         };
         formatter.write_str(name)
     }
@@ -317,7 +341,16 @@ impl SessionConsumerOperation {
             }
             Self::AcquireLease { ttl, .. } => crate::validate_session_ttl(*ttl)
                 .map_err(|_| SessionConsumerRejection::MalformedRequest),
-            Self::Capabilities | Self::Get { .. } | Self::Watch { .. } => Ok(()),
+            Self::FencedTransition { request } | Self::FencedTransitionStatus { request } => {
+                request
+                    .validate()
+                    .map_err(|_| SessionConsumerRejection::MalformedRequest)
+            }
+            Self::Capabilities
+            | Self::Get { .. }
+            | Self::Watch { .. }
+            | Self::FencedTransitionCapability
+            | Self::ObserveFencedTransition { .. } => Ok(()),
         }
     }
 }
@@ -362,7 +395,16 @@ impl SessionConsumerRequest {
 
     /// Validate the operation before dispatch.
     pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
-        self.operation.validate()
+        self.operation.validate()?;
+        match &self.operation {
+            SessionConsumerOperation::FencedTransition { request }
+            | SessionConsumerOperation::FencedTransitionStatus { request }
+                if request.request_id().as_bytes() != self.request_id.as_bytes() =>
+            {
+                Err(SessionConsumerRejection::MalformedRequest)
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -421,8 +463,18 @@ impl From<StoreError> for SessionConsumerStoreError {
             StoreError::NotFound => Self::NotFound,
             StoreError::StaleFence | StoreError::TopologyAuthorityRevoked => Self::StaleFence,
             StoreError::CasConflict => Self::CasConflict,
-            StoreError::CasIdempotencyConflict => Self::RequestConflict,
+            StoreError::CasIdempotencyConflict | StoreError::FencedTransitionRequestConflict => {
+                Self::RequestConflict
+            }
+            // The closed generic store-error family has no specialized
+            // fenced-transition exhaustion category. Preserve a fail-closed
+            // capability response rather than widening that shared enum.
+            StoreError::FencedTransitionHistoryFull
+            | StoreError::FencedTransitionRetentionExhausted
+            | StoreError::FencedTransitionStorageExhausted => Self::CapabilityNotSupported,
             StoreError::CasIdempotencyOutcomeUnavailable
+            | StoreError::FencedTransitionOutcomeUnknown
+            | StoreError::FencedTransitionRequestExpired
             | StoreError::BackendOperationOutcomeUnavailable => Self::OutcomeUnavailable,
             StoreError::BackendUnavailable(_) => Self::Unavailable,
             StoreError::CapabilityNotSupported(_) => Self::CapabilityNotSupported,
@@ -539,9 +591,80 @@ impl SessionConsumerLeaseError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionConsumerOutcomeUnknown {
     /// An application state mutation may have committed.
-    Mutation,
+    Mutation {
+        /// Stable caller-retained identity used for exact status recovery.
+        request_id: SessionConsumerRequestId,
+    },
     /// A lease mutation may have committed; the current guard is lost.
     Lease,
+}
+
+/// Safe deterministic error retained by a fenced-transition receipt.
+///
+/// This is intentionally a closed projection rather than `StoreError`: a
+/// receipt must never serialize backend-provided diagnostic text to a
+/// consumer transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SessionConsumerFencedTransitionError {
+    /// A deterministic store result represented by the safe consumer error set.
+    Store(SessionConsumerStoreError),
+    /// The public identity is permanently bound to another body.
+    RequestConflict,
+    /// The exact retained outcome elapsed.
+    Expired,
+    /// The permanent receipt ledger cannot bind a new identity.
+    HistoryFull,
+    /// Logical time cannot retain a complete result window.
+    RetentionExhausted,
+    /// The deterministic transition receipt could not be retained.
+    StorageExhausted,
+}
+
+impl From<StoreError> for SessionConsumerFencedTransitionError {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::FencedTransitionRequestConflict => Self::RequestConflict,
+            StoreError::FencedTransitionRequestExpired => Self::Expired,
+            StoreError::FencedTransitionHistoryFull => Self::HistoryFull,
+            StoreError::FencedTransitionRetentionExhausted => Self::RetentionExhausted,
+            StoreError::FencedTransitionStorageExhausted => Self::StorageExhausted,
+            error => Self::Store(SessionConsumerStoreError::from(error)),
+        }
+    }
+}
+
+/// Exact consumer-safe status of a fenced transition request/body pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SessionConsumerFencedTransitionStatus {
+    /// A success or deterministic error remains recoverable.
+    Recorded(Box<Result<FencedTransitionOutcome, SessionConsumerFencedTransitionError>>),
+    /// The identity is bound to another body.
+    RequestConflict,
+    /// The exact recovery window elapsed.
+    Expired,
+    /// The receipt ledger is full for a fresh identity.
+    HistoryFull,
+    /// The retention horizon is exhausted for a fresh identity.
+    RetentionExhausted,
+    /// No request/body receipt existed at the read barrier.
+    NotFound,
+}
+
+impl From<FencedTransitionStatus> for SessionConsumerFencedTransitionStatus {
+    fn from(status: FencedTransitionStatus) -> Self {
+        match status {
+            FencedTransitionStatus::Recorded(result) => Self::Recorded(Box::new(
+                result.map_err(SessionConsumerFencedTransitionError::from),
+            )),
+            FencedTransitionStatus::RequestConflict => Self::RequestConflict,
+            FencedTransitionStatus::Expired => Self::Expired,
+            FencedTransitionStatus::HistoryFull => Self::HistoryFull,
+            FencedTransitionStatus::RetentionExhausted => Self::RetentionExhausted,
+            FencedTransitionStatus::NotFound => Self::NotFound,
+        }
+    }
 }
 
 /// Least-authority committed-change projection for application consumers.
@@ -759,6 +882,16 @@ pub enum SessionConsumerResponse {
     RenewLease(Result<LeaseGuard, SessionConsumerLeaseError>),
     /// Lease release result.
     ReleaseLease(Result<(), SessionConsumerLeaseError>),
+    /// Exact unanimous atomic-transition capability result.
+    FencedTransitionCapability(Result<AtomicFencedTransitionCapability, SessionConsumerStoreError>),
+    /// Exact-key record and fence-floor observation.
+    ObserveFencedTransition(Result<FencedTransitionObservation, SessionConsumerStoreError>),
+    /// Atomic lease-and-record transition result.
+    FencedTransition(Result<FencedTransitionOutcome, SessionConsumerFencedTransitionError>),
+    /// Exact retained transition status.
+    FencedTransitionStatus(
+        Result<SessionConsumerFencedTransitionStatus, SessionConsumerStoreError>,
+    ),
     /// A mutation outcome is ambiguous and must never be automatically replayed.
     OutcomeUnknown(SessionConsumerOutcomeUnknown),
     /// A request was rejected before dispatch.
@@ -780,6 +913,10 @@ impl fmt::Debug for SessionConsumerResponse {
             Self::AcquireLease(_) => "AcquireLease",
             Self::RenewLease(_) => "RenewLease",
             Self::ReleaseLease(_) => "ReleaseLease",
+            Self::FencedTransitionCapability(_) => "FencedTransitionCapability",
+            Self::ObserveFencedTransition(_) => "ObserveFencedTransition",
+            Self::FencedTransition(_) => "FencedTransition",
+            Self::FencedTransitionStatus(_) => "FencedTransitionStatus",
             Self::OutcomeUnknown(_) => "OutcomeUnknown",
             Self::Rejected(_) => "Rejected",
         };
@@ -928,6 +1065,52 @@ pub fn derive_consumer_consensus_request_id(
     Ok(SessionConsensusRequestId::from_bytes(request_bytes))
 }
 
+/// Rebuild a transition for the internal receipt ledger without exposing that
+/// ledger's global identity domain to consumers.
+///
+/// The outer scope is still enforced at every proposal/read boundary. Its
+/// stable cluster component isolates unrelated deployments while deliberately
+/// excluding changing configuration and epoch values: a retry or status read
+/// remains recoverable after an authorized authority rollover. The body is
+/// excluded so the existing transition receipt binding can reject a reused ID
+/// with a different body as `RequestConflict`.
+pub(crate) fn derive_consumer_fenced_transition_request(
+    identity: &SessionConsumerIdentity,
+    scope: SessionConsumerScope,
+    request: &FencedTransitionRequest,
+) -> Result<FencedTransitionRequest, SessionConsumerRejection> {
+    use sha2::{Digest, Sha256};
+
+    request
+        .validate()
+        .map_err(|_| SessionConsumerRejection::MalformedRequest)?;
+    let mut digest = Sha256::new();
+    digest.update(b"openpacketcore/session-consumer/fenced-transition-id/v1\0");
+    digest.update(
+        u16::try_from(identity.as_str().len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes(),
+    );
+    digest.update(identity.as_str().as_bytes());
+    digest.update(scope.consensus_identity().cluster_id().as_bytes());
+    digest.update(request.request_id().as_bytes());
+    let hash: [u8; 32] = digest.finalize().into();
+    let mut internal_id = [0_u8; FENCED_TRANSITION_REQUEST_ID_BYTES];
+    internal_id.copy_from_slice(&hash[..FENCED_TRANSITION_REQUEST_ID_BYTES]);
+    // The public transition contract reserves the all-zero ID. A truncated
+    // digest can equal that value in principle, so keep the derivation total
+    // instead of probabilistically rejecting an otherwise valid request.
+    if internal_id.iter().all(|byte| *byte == 0) {
+        internal_id[FENCED_TRANSITION_REQUEST_ID_BYTES - 1] = 1;
+    }
+    FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes(internal_id),
+        request.lease().clone(),
+        request.mutation().clone(),
+    )
+    .map_err(|_| SessionConsumerRejection::MalformedRequest)
+}
+
 /// Marker imported by stateless clients to make accidental use of
 /// [`crate::SessionBackend`] explicit at composition time.
 ///
@@ -941,13 +1124,50 @@ pub trait StatelessSessionConsumer: Send + Sync {}
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_consumer_consensus_request_id, SessionConsumerIdentity, SessionConsumerOperation,
+        derive_consumer_consensus_request_id, derive_consumer_fenced_transition_request,
+        SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+        SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerRejection,
         SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerScope,
     };
     use crate::{
+        FenceToken, FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
+        FencedTransitionRequestId, FencedTransitionStatus, Generation, OwnerId,
         SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-        SessionConsensusConfigurationId, SessionConsensusIdentity,
+        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionKey, SessionKeyType,
+        StableId, StoreError,
     };
+    use bytes::Bytes;
+    use opc_types::{NetworkFunctionKind, TenantId};
+    use std::time::Duration;
+
+    fn scope(configuration: u8, epoch: u64) -> SessionConsumerScope {
+        SessionConsumerScope::new(SessionConsensusIdentity::new(
+            SessionConsensusClusterId::from_bytes([1; 32]),
+            SessionConsensusConfigurationId::from_bytes([configuration; 32]),
+            SessionConsensusConfigurationEpoch::new(epoch).expect("non-zero configuration epoch"),
+        ))
+    }
+
+    fn transition(id: u8) -> FencedTransitionRequest {
+        let key = SessionKey {
+            tenant: TenantId::from_static("consumer-transition-test"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: StableId::new(Bytes::from_static(b"transition-id")).expect("stable ID"),
+        };
+        FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([id; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("consumer-transition-owner").expect("owner"),
+                FenceToken::new(0),
+                Duration::from_secs(30),
+            )
+            .expect("lease"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("transition")
+    }
 
     #[test]
     fn durable_request_identity_is_stable_and_consumer_bound() {
@@ -1036,5 +1256,81 @@ mod tests {
             .expect("operation is an object");
         operation.insert("unexpected".into(), serde_json::Value::Bool(true));
         assert!(serde_json::from_value::<SessionConsumerRequest>(operation_unknown).is_err());
+    }
+
+    #[test]
+    fn fenced_transition_identity_is_consumer_bound_and_rollover_stable() {
+        let first = SessionConsumerIdentity::new("spiffe://test.example/consumer/first")
+            .expect("first identity");
+        let second = SessionConsumerIdentity::new("spiffe://test.example/consumer/second")
+            .expect("second identity");
+        let request = transition(0x55);
+        let successor_scope = scope(3, 2);
+        let first_scope = scope(2, 1);
+
+        let first_internal =
+            derive_consumer_fenced_transition_request(&first, first_scope, &request)
+                .expect("first internal request");
+        assert_eq!(
+            first_internal.request_id(),
+            derive_consumer_fenced_transition_request(&first, successor_scope, &request)
+                .expect("successor internal request")
+                .request_id(),
+            "an authorized successor scope must recover the same receipt"
+        );
+        assert_ne!(
+            first_internal.request_id(),
+            derive_consumer_fenced_transition_request(&second, first_scope, &request)
+                .expect("second internal request")
+                .request_id(),
+            "different authenticated consumers must not share a receipt domain"
+        );
+        let changed_body = FencedTransitionRequest::new(
+            request.request_id(),
+            request.lease().clone(),
+            FencedTransitionMutation::delete(Generation::new(2)),
+        )
+        .expect("changed transition body");
+        assert_eq!(
+            first_internal.request_id(),
+            derive_consumer_fenced_transition_request(&first, first_scope, &changed_body)
+                .expect("changed-body internal request")
+                .request_id(),
+            "the receipt ledger, not the derivation, must bind conflicting bodies"
+        );
+    }
+
+    #[test]
+    fn fenced_transition_requires_matching_outer_and_nested_identity() {
+        let request = transition(0x44);
+        let consumer = SessionConsumerRequest::new(
+            scope(2, 1),
+            SessionConsumerRequestId::from_bytes([0x45; 16]),
+            SessionConsumerOperation::FencedTransition {
+                request: Box::new(request),
+            },
+        );
+        assert_eq!(
+            consumer.validate(),
+            Err(SessionConsumerRejection::MalformedRequest)
+        );
+    }
+
+    #[test]
+    fn fenced_transition_status_is_safe_and_preserves_terminal_states() {
+        assert_eq!(
+            SessionConsumerFencedTransitionStatus::from(FencedTransitionStatus::Expired),
+            SessionConsumerFencedTransitionStatus::Expired
+        );
+        assert_eq!(
+            SessionConsumerFencedTransitionStatus::from(FencedTransitionStatus::HistoryFull),
+            SessionConsumerFencedTransitionStatus::HistoryFull
+        );
+        assert_eq!(
+            SessionConsumerFencedTransitionError::from(
+                StoreError::FencedTransitionStorageExhausted
+            ),
+            SessionConsumerFencedTransitionError::StorageExhausted,
+        );
     }
 }

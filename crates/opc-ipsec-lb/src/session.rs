@@ -1574,6 +1574,10 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
             "session_store.idempotency",
             "session-store mutation identity was reused",
         ),
+        StoreError::FencedTransitionRequestConflict => IpsecLbError::invalid_config(
+            "session_store.fenced_transition",
+            "session-store fenced transition identity was reused",
+        ),
         StoreError::CasIdempotencyOutcomeUnavailable => IpsecLbError::io(
             "session_store_compare_and_set",
             io::Error::new(
@@ -1581,6 +1585,18 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
                 "session-store mutation outcome is unavailable",
             ),
         ),
+        StoreError::FencedTransitionOutcomeUnknown | StoreError::FencedTransitionRequestExpired => {
+            IpsecLbError::io(
+                "session_store_fenced_transition",
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "session-store fenced transition outcome is unavailable",
+                ),
+            )
+        }
+        StoreError::FencedTransitionHistoryFull
+        | StoreError::FencedTransitionRetentionExhausted
+        | StoreError::FencedTransitionStorageExhausted => IpsecLbError::Unsupported,
         StoreError::BackendOperationOutcomeUnavailable => IpsecLbError::io(
             "session_store_mutation",
             io::Error::new(
@@ -1639,6 +1655,7 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -3438,6 +3455,47 @@ mod tests {
                 map_store_error(error),
                 IpsecLbError::OwnershipConflict { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn fenced_transition_errors_preserve_ambiguity_and_definite_rejections() {
+        for (error, expected) in [
+            (
+                StoreError::FencedTransitionRequestConflict,
+                IpsecLbError::invalid_config(
+                    "session_store.fenced_transition",
+                    "session-store fenced transition identity was reused",
+                ),
+            ),
+            (
+                StoreError::FencedTransitionOutcomeUnknown,
+                IpsecLbError::io(
+                    "session_store_fenced_transition",
+                    io::Error::new(io::ErrorKind::ConnectionAborted, "outcome unavailable"),
+                ),
+            ),
+            (
+                StoreError::FencedTransitionRequestExpired,
+                IpsecLbError::io(
+                    "session_store_fenced_transition",
+                    io::Error::new(io::ErrorKind::ConnectionAborted, "outcome unavailable"),
+                ),
+            ),
+            (
+                StoreError::FencedTransitionHistoryFull,
+                IpsecLbError::Unsupported,
+            ),
+            (
+                StoreError::FencedTransitionRetentionExhausted,
+                IpsecLbError::Unsupported,
+            ),
+            (
+                StoreError::FencedTransitionStorageExhausted,
+                IpsecLbError::Unsupported,
+            ),
+        ] {
+            assert_eq!(map_store_error(error), expected);
         }
     }
 

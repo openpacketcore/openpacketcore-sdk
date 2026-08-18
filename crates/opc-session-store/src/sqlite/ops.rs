@@ -170,6 +170,14 @@ pub(crate) fn format_rfc3339_normalized(ts: Timestamp) -> String {
     )
 }
 
+/// Parse the exact normalized timestamp representation used for persisted
+/// lease authority. `None` is reserved for migrated pre-acquisition rows.
+pub(crate) fn persisted_normalized_timestamp(value: Option<String>) -> Option<Timestamp> {
+    let value = value?;
+    let timestamp = Timestamp::from_str(value.as_str()).ok()?;
+    (format_rfc3339_normalized(timestamp) == value).then_some(timestamp)
+}
+
 pub(crate) fn initialize_restore_scan_metadata_sync(conn: &Connection) -> Result<(), StoreError> {
     let tx = conn
         .unchecked_transaction()
@@ -347,7 +355,7 @@ pub(crate) fn validate_fenced_mutation_sync(
     let mut stmt = conn
         .prepare(
             r#"
-            SELECT active, credential_id, owner, fence, guard_expires_at
+            SELECT active, credential_id, owner, fence, acquired_at, guard_expires_at
             FROM leases
             WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4
             "#,
@@ -368,14 +376,17 @@ pub(crate) fn validate_fenced_mutation_sync(
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
         .optional()
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
-    let Some((active, credential_id, owner_str, fence, guard_expires_at_str)) = row else {
+    let Some((active, credential_id, owner_str, fence, acquired_at_str, guard_expires_at_str)) =
+        row
+    else {
         return Err(StoreError::StaleFence);
     };
 
@@ -395,10 +406,13 @@ pub(crate) fn validate_fenced_mutation_sync(
         return Err(StoreError::StaleFence);
     }
 
-    let guard_expires_at = opc_types::Timestamp::from_str(guard_expires_at_str.as_str())
-        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+    let guard_expires_at =
+        persisted_normalized_timestamp(Some(guard_expires_at_str)).ok_or(StoreError::StaleFence)?;
+    let acquired_at = persisted_normalized_timestamp(acquired_at_str)
+        .filter(|acquired_at| *acquired_at <= guard_expires_at)
+        .ok_or(StoreError::StaleFence)?;
 
-    if guard_expires_at != lease.expires_at() {
+    if guard_expires_at != lease.expires_at() || acquired_at != lease.acquired_at() {
         return Err(StoreError::StaleFence);
     }
 

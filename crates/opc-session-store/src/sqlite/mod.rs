@@ -365,12 +365,14 @@ impl SqliteSessionBackend {
                 fence INTEGER NOT NULL,
                 expires_at_unix_ms INTEGER NOT NULL,
                 guard_expires_at TEXT NOT NULL,
+                acquired_at TEXT,
                 PRIMARY KEY (tenant, nf_kind, key_type, stable_id)
             );
             "#,
             [],
         )
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        migrate_lease_acquired_at_schema(&conn)?;
 
         // Create table for key fences
         conn.execute(
@@ -695,6 +697,29 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Check the bounded V1 activation certificate after a caller-owned
+    /// consensus barrier.  A missing or stale certificate is a normal
+    /// unsupported state; storage failure remains unavailable.
+    pub(crate) async fn consensus_fenced_transition_activation_matches_scope(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        scope_identity: crate::consensus::SessionConsensusIdentity,
+        voters: std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+    ) -> Result<bool, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::fenced_transition_activation_matches_scope_sync(
+                conn,
+                storage_identity,
+                scope_identity,
+                &voters,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable("fenced transition activation is unavailable".into())
+            })
+        })
+        .await
+    }
+
     /// Read at a logical timestamp already committed by the consensus state
     /// machine. This path is read-only: expiry affects visibility but never
     /// prunes physical rows outside a committed command.
@@ -715,6 +740,73 @@ impl SqliteSessionBackend {
             tx.commit()
                 .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
             Ok(result)
+        })
+        .await
+    }
+
+    /// Read one live record and its durable per-key fence floor together.
+    ///
+    /// The caller owns the preceding consensus barrier. This local read is a
+    /// single SQLite transaction and never allocates a fence or prunes expiry.
+    pub(crate) async fn consensus_observe_fenced_transition_at(
+        &self,
+        key: &SessionKey,
+        logical_time: opc_types::Timestamp,
+    ) -> Result<crate::FencedTransitionObservation, StoreError> {
+        let key = key.clone();
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let record = ops::get_sync(&tx, &key, logical_time)?;
+            if let Some(record) = record.as_ref() {
+                validate_consensus_record(record)?;
+                if record.key != key {
+                    return Err(StoreError::Serialization(
+                        "fenced_transition_observation_invalid".into(),
+                    ));
+                }
+            }
+            let current_fence = crate::FenceToken::new(ops::current_fence_sync(&tx, &key)?);
+            let observation = crate::FencedTransitionObservation::new(record, current_fence)?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(observation)
+        })
+        .await
+        // This observation is returned to fenced-transition callers. Persisted
+        // rows and SQLite diagnostics can contain session data or local schema
+        // details, so its entire failure surface is intentionally one fixed,
+        // SDK-controlled availability error.
+        .map_err(|_| {
+            StoreError::BackendUnavailable("fenced transition observation is unavailable".into())
+        })
+    }
+
+    /// Read one exact fenced-transition receipt after a caller-owned barrier.
+    ///
+    /// The complete request is required so a reused identity can be reported
+    /// as a body conflict. This operation never mutates or compacts the ledger.
+    pub(crate) async fn consensus_fenced_transition_status(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        _authority_identity: crate::consensus::SessionConsensusIdentity,
+        request: &crate::FencedTransitionRequest,
+    ) -> Result<crate::FencedTransitionStatus, StoreError> {
+        let request = request.clone();
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let status = consensus::read_fenced_transition_status_sync(
+                &tx,
+                storage_identity,
+                storage_identity,
+                &request,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(status)
         })
         .await
     }
@@ -1118,6 +1210,111 @@ fn consensus_value_cap_stays_below_unexpanded_transport_contract() {
     assert!(backend.consensus_capabilities().max_value_bytes < SQLITE_SESSION_MAX_VALUE_BYTES);
 }
 
+#[cfg(test)]
+mod fenced_transition_observation_redaction_tests {
+    use super::*;
+    use crate::model::SessionKeyType;
+    use bytes::Bytes;
+    use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+
+    const FIXED_MESSAGE: &str = "fenced transition observation is unavailable";
+
+    fn key() -> SessionKey {
+        SessionKey {
+            tenant: TenantId::new("sqlite-observe-tenant").expect("tenant"),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"key-canary")
+                .try_into()
+                .expect("stable ID"),
+        }
+    }
+
+    fn assert_fixed_redacted_error(error: StoreError) {
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable(FIXED_MESSAGE.into()),
+            "observation errors use one fixed SDK category"
+        );
+        assert_eq!(
+            display,
+            format!("backend unavailable: {FIXED_MESSAGE}"),
+            "observation display is fixed"
+        );
+        assert_eq!(
+            debug,
+            format!("BackendUnavailable(\"{FIXED_MESSAGE}\")"),
+            "observation debug is fixed"
+        );
+        for forbidden in [
+            "key-canary",
+            "owner-canary",
+            "request-canary",
+            "state-class-canary",
+            "timestamp-canary",
+            "session_records",
+            "key_fences",
+            "state_class",
+            "no such table",
+            "SQLite",
+            "/",
+        ] {
+            assert!(
+                !display.contains(forbidden) && !debug.contains(forbidden),
+                "observation error leaked {forbidden:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_persisted_record_is_redacted_from_fenced_transition_observation() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite backend");
+        let key = key();
+        {
+            let conn = backend.conn.lock().await;
+            conn.execute(
+                "INSERT INTO session_records (tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding) VALUES (?1, ?2, ?3, ?4, 1, ?5, 1, ?6, ?7, ?8, X'00', 2)",
+                rusqlite::params![
+                    key.tenant.as_str(),
+                    key.nf_kind.as_str(),
+                    key.key_type.to_string(),
+                    key.stable_id.as_ref(),
+                    "owner-canary",
+                    "state-class-canary",
+                    "request-canary",
+                    "timestamp-canary",
+                ],
+            )
+            .expect("insert corrupt persisted record");
+        }
+
+        let error = backend
+            .consensus_observe_fenced_transition_at(&key, Timestamp::now_utc())
+            .await
+            .expect_err("corrupt persisted record must fail observation");
+        assert_fixed_redacted_error(error);
+    }
+
+    #[tokio::test]
+    async fn schema_failure_is_redacted_from_fenced_transition_observation() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite backend");
+        let key = key();
+        {
+            let conn = backend.conn.lock().await;
+            conn.execute_batch("DROP TABLE session_records")
+                .expect("remove observation table");
+        }
+
+        let error = backend
+            .consensus_observe_fenced_transition_at(&key, Timestamp::now_utc())
+            .await
+            .expect_err("missing table must fail observation");
+        assert_fixed_redacted_error(error);
+    }
+}
+
 fn sqlite_store_outcome_unavailable(kind: SqliteStoreWorkKind) -> StoreError {
     match kind {
         SqliteStoreWorkKind::Read => {
@@ -1140,6 +1337,61 @@ fn session_op_result_has_backend_unavailable(result: &SessionOpResult) -> bool {
         | SessionOpResult::RefreshTtl(Ok(())) => None,
     };
     matches!(error, Some(StoreError::BackendUnavailable(_)))
+}
+
+/// Add the durable lease-acquisition binding without minting history for
+/// already-issued credentials.
+///
+/// A pre-column row has no authoritative acquisition timestamp: lease TTLs
+/// record only an expiry, so deriving an acquisition instant from it would
+/// make caller-supplied guard metadata authoritative. SQLite fills the
+/// nullable column with `NULL` for those rows. The lease authority checks
+/// treat that value as a legacy, non-renewable/non-mutable marker while the
+/// existing expiry continues to bound its lifetime. New acquisitions always
+/// write a normalized timestamp.
+fn migrate_lease_acquired_at_schema(conn: &Connection) -> Result<(), StoreError> {
+    let mut statement = conn.prepare("PRAGMA table_info(leases)").map_err(|_| {
+        StoreError::BackendUnavailable("session lease schema is unavailable".into())
+    })?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(|_| StoreError::BackendUnavailable("session lease schema is unavailable".into()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            StoreError::BackendUnavailable("session lease schema is unavailable".into())
+        })?;
+
+    let acquired_at = columns
+        .iter()
+        .filter(|(name, ..)| name == "acquired_at")
+        .collect::<Vec<_>>();
+    match acquired_at.as_slice() {
+        [] => conn
+            .execute("ALTER TABLE leases ADD COLUMN acquired_at TEXT", [])
+            .map(|_| ())
+            .map_err(|_| {
+                StoreError::BackendUnavailable("session lease schema migration failed".into())
+            }),
+        [(_, column_type, not_null, default, primary_key)]
+            if column_type.eq_ignore_ascii_case("TEXT")
+                && *not_null == 0
+                && default.is_none()
+                && *primary_key == 0 =>
+        {
+            Ok(())
+        }
+        _ => Err(StoreError::BackendUnavailable(
+            "session lease authority schema is invalid".into(),
+        )),
+    }
 }
 
 fn apply_pragma_profile(conn: &Connection, in_memory: bool) -> Result<(), StoreError> {
@@ -2000,6 +2252,7 @@ mod consensus_readiness_deadline_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn readiness_recovery_and_barrier_share_one_complete_operation_deadline() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let snapshots = tempfile::tempdir().expect("snapshot directory");
         let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite backend");
         let apply_gate = Arc::clone(&backend.consensus_apply_gate);
