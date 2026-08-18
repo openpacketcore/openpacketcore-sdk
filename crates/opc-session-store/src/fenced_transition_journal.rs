@@ -1849,7 +1849,7 @@ fn validate_existing_sqlite_header(
     .map_err(|_| journal_unavailable())?;
     let metadata = fstat(&descriptor).map_err(|_| journal_unavailable())?;
     if !expected_identity.matches(&metadata)
-        || metadata.st_size < JOURNAL_SQLITE_HEADER_BYTES as i64
+        || i64::from(metadata.st_size) < JOURNAL_SQLITE_HEADER_BYTES as i64
         || u64::try_from(metadata.st_size).map_err(|_| journal_unavailable())?
             % JOURNAL_SQLITE_PAGE_SIZE_BYTES
             != 0
