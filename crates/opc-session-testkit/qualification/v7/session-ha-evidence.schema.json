@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-ha-evidence/v7",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "experimental",
+    "qualification_complete",
+    "source_revision",
+    "source_tree",
+    "source_tree_status",
+    "execution",
+    "topology",
+    "observations",
+    "warm_latency",
+    "privacy",
+    "coverage",
+    "remaining_acceptance"
+  ],
+  "properties": {
+    "schema_version": { "const": "opc-session-ha-evidence/v7" },
+    "profile_id": { "const": "opc-session-openraft-ha/v7" },
+    "experimental": { "const": true },
+    "qualification_complete": { "const": false },
+    "source_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "source_tree": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "source_tree_status": { "enum": ["clean", "dirty_unqualified"] },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_sha256",
+        "transcript_digest_domain",
+        "transcript_sha256",
+        "client_type",
+        "consumer_profile_path",
+        "transport_revision",
+        "authenticated_route"
+      ],
+      "properties": {
+        "profile_sha256": { "const": "sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7" },
+        "transcript_digest_domain": { "const": "opc-session-ha/persistent-consumer-run/v1" },
+        "transcript_sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "client_type": { "const": "PersistentSessionConsumerClient" },
+        "consumer_profile_path": { "const": "protocol.persistent_consumer" },
+        "transport_revision": { "const": 2 },
+        "authenticated_route": { "const": "authenticated-mtls-persistent" }
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "members",
+        "independent_processes",
+        "transport_mode",
+        "configured_clients",
+        "prewarmed_clients"
+      ],
+      "properties": {
+        "members": { "enum": [3, 5] },
+        "independent_processes": { "const": true },
+        "transport_mode": { "const": "authenticated-mtls-persistent" },
+        "configured_clients": { "const": 12 },
+        "prewarmed_clients": { "const": 12 }
+      }
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authenticated_setup_successes",
+        "warm_reused_calls",
+        "exact_request_id_recovery",
+        "leader_loss_recovery",
+        "voter_loss_recovery",
+        "outcome_unknown_recovery"
+      ],
+      "properties": {
+        "authenticated_setup_successes": { "type": "integer", "minimum": 48 },
+        "warm_reused_calls": { "type": "integer", "minimum": 1000 },
+        "exact_request_id_recovery": { "const": true },
+        "leader_loss_recovery": { "const": true },
+        "voter_loss_recovery": { "const": true },
+        "outcome_unknown_recovery": { "const": true }
+      }
+    },
+    "warm_latency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "methodology",
+        "clock",
+        "sample_count",
+        "raw_samples_micros",
+        "p99_micros",
+        "p999_micros",
+        "claim_boundary"
+      ],
+      "properties": {
+        "methodology": { "const": "sequential-capabilities-round-robin-after-prewarm" },
+        "clock": { "const": "std::time::Instant" },
+        "sample_count": { "type": "integer", "minimum": 1000, "maximum": 2000 },
+        "raw_samples_micros": {
+          "type": "array",
+          "minItems": 1000,
+          "maxItems": 2000,
+          "items": { "type": "integer", "minimum": 0, "maximum": 10000000 }
+        },
+        "p99_micros": { "type": "integer", "minimum": 0 },
+        "p999_micros": { "type": "integer", "minimum": 0 },
+        "claim_boundary": { "const": "sdk-loopback-real-mtls-synthetic-not-epdg-production-slo" }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixed_labels_only", "identifying_values_recorded"],
+      "properties": {
+        "fixed_labels_only": { "const": true },
+        "identifying_values_recorded": { "const": false }
+      }
+    },
+    "coverage": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "persistent_prewarm",
+          "warm_connection_reuse",
+          "real_mtls",
+          "multi_process",
+          "three_voter_latency",
+          "five_voter_composition",
+          "leader_loss",
+          "voter_loss"
+        ]
+      }
+    },
+    "remaining_acceptance": {
+      "const": [
+        "downstream_epdg_production_slo",
+        "deployed_kubernetes_platform_matrix",
+        "resource_soak",
+        "signed_release_bundle"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "required": ["topology", "coverage"],
+      "properties": {
+        "topology": {
+          "properties": { "members": { "const": 3 } },
+          "required": ["members"]
+        },
+        "coverage": {
+          "const": [
+            "persistent_prewarm",
+            "warm_connection_reuse",
+            "real_mtls",
+            "multi_process",
+            "three_voter_latency",
+            "leader_loss",
+            "voter_loss"
+          ]
+        }
+      }
+    },
+    {
+      "required": ["topology", "coverage"],
+      "properties": {
+        "topology": {
+          "properties": { "members": { "const": 5 } },
+          "required": ["members"]
+        },
+        "coverage": {
+          "const": [
+            "persistent_prewarm",
+            "warm_connection_reuse",
+            "real_mtls",
+            "multi_process",
+            "five_voter_composition",
+            "leader_loss",
+            "voter_loss"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -296,6 +296,7 @@ impl ReconnectGate {
         }
     }
 
+    #[cfg(any(feature = "legacy-session-net-compat", test))]
     pub(crate) async fn acquire(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
@@ -911,6 +912,39 @@ impl ConnectionLifecycle {
         current_material_epoch: Option<opc_tls::TlsMaterialEpoch>,
         peer_key: &[u8],
     ) {
+        self.observe_rotation_with_jitter(
+            now,
+            current_generation,
+            current_material_epoch,
+            None,
+            self.policy.deterministic_jitter(peer_key),
+        );
+    }
+
+    pub(crate) fn observe_authenticated_rotation(
+        &mut self,
+        now: tokio::time::Instant,
+        current_generation: u64,
+        current_material_status: opc_tls::TlsMaterialStatus,
+        material_jitter: Duration,
+    ) {
+        self.observe_rotation_with_jitter(
+            now,
+            current_generation,
+            Some(current_material_status.epoch()),
+            Some(current_material_status.published_at()),
+            material_jitter.min(self.policy.rotation_jitter()),
+        );
+    }
+
+    fn observe_rotation_with_jitter(
+        &mut self,
+        now: tokio::time::Instant,
+        current_generation: u64,
+        current_material_epoch: Option<opc_tls::TlsMaterialEpoch>,
+        material_published_at: Option<tokio::time::Instant>,
+        material_jitter: Duration,
+    ) {
         let retirement = if current_generation != self.generation {
             // Explicit reauthentication is an operator command to prove a
             // current-generation handshake now. Material publications use
@@ -920,7 +954,9 @@ impl ConnectionLifecycle {
             Some((now, RetirementReason::Explicit))
         } else if current_material_epoch != self.evidence.material_epoch {
             Some((
-                now.checked_add(self.policy.deterministic_jitter(peer_key))
+                material_published_at
+                    .unwrap_or(now)
+                    .checked_add(material_jitter)
                     .unwrap_or(now),
                 RetirementReason::MaterialEpoch,
             ))
@@ -1055,6 +1091,11 @@ impl ConnectionLifecycle {
 
     pub(crate) fn record_hard_overrun(&self) {
         self.metrics.record_hard_overrun();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hard_overrun_recorded(&self) -> bool {
+        self.metrics.hard_overrun_recorded.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
