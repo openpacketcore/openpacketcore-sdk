@@ -288,6 +288,11 @@ impl fmt::Debug for SessionConsumerOperation {
 impl SessionConsumerOperation {
     /// Check fixed consumer-side operation bounds before quorum dispatch.
     pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
+        let validate_lease = |lease: &LeaseGuard| {
+            lease
+                .validate_profile()
+                .map_err(|_| SessionConsumerRejection::MalformedRequest)
+        };
         match self {
             Self::PreflightRecordExpiry { preflights } => {
                 crate::validate_record_expiry_preflights_profile(preflights)
@@ -303,15 +308,16 @@ impl SessionConsumerOperation {
             Self::ScanRestoreRecords { request } => request
                 .validate()
                 .map_err(|_| SessionConsumerRejection::MalformedRequest),
-            Self::Capabilities
-            | Self::Get { .. }
-            | Self::CompareAndSet { .. }
-            | Self::DeleteFenced { .. }
-            | Self::RefreshTtl { .. }
-            | Self::Watch { .. }
-            | Self::AcquireLease { .. }
-            | Self::RenewLease { .. }
-            | Self::ReleaseLease { .. } => Ok(()),
+            Self::CompareAndSet { op } => validate_lease(&op.lease),
+            Self::DeleteFenced { lease } | Self::ReleaseLease { lease } => validate_lease(lease),
+            Self::RefreshTtl { lease, ttl } | Self::RenewLease { lease, ttl } => {
+                validate_lease(lease)?;
+                crate::validate_session_ttl(*ttl)
+                    .map_err(|_| SessionConsumerRejection::MalformedRequest)
+            }
+            Self::AcquireLease { ttl, .. } => crate::validate_session_ttl(*ttl)
+                .map_err(|_| SessionConsumerRejection::MalformedRequest),
+            Self::Capabilities | Self::Get { .. } | Self::Watch { .. } => Ok(()),
         }
     }
 }

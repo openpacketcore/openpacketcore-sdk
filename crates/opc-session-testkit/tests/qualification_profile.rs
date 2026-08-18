@@ -6,12 +6,26 @@ use std::process::{Command, Output};
 use opc_consensus::{DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_PROFILE};
 use opc_session_net::{
     CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE, DEFAULT_MAX_AUTHENTICATION_AGE,
-    DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW,
-    DEFAULT_ROTATION_JITTER, MAX_NEGOTIATED_FRAME_SIZE,
-    MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION, MIN_SESSION_CONSENSUS_FRAME_SIZE,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS, DEFAULT_RECONNECT_BACKOFF_MAX,
+    DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
+    MAX_NEGOTIATED_FRAME_SIZE, MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
+    MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+    MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+    MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION,
+    MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION,
+    MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+    MAX_STATELESS_SESSION_CONSUMER_WATCH_CONNECTIONS, MIN_SESSION_CONSENSUS_FRAME_SIZE,
+    PERSISTENT_SESSION_CONSUMER_MAINTENANCE_TASKS_PER_POOL,
     RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES, SESSION_CONSENSUS_ALPN,
     SESSION_CONSENSUS_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_ALPN,
-    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+    SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, MAX_REPLICATION_LOG_PAGE_ENTRIES,
@@ -26,15 +40,24 @@ use opc_session_store::{
 };
 use opc_session_testkit::qualification::{
     session_mtls_candidate_evidence_v2_schema_sha256, session_mtls_candidate_schedule_sha256,
-    SessionHaQualificationProfile, SessionMtlsCandidateCampaign, SessionMtlsCandidateEvidenceError,
-    SessionMtlsCandidateEvidenceV2, SESSION_HA_EVIDENCE_SCHEMA_JSON,
-    SESSION_HA_HISTORY_SCHEMA_JSON, SESSION_HA_PROFILE_JSON, SESSION_HA_PROFILE_SCHEMA_JSON,
-    SESSION_HA_SCHEDULE_SCHEMA_JSON, SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON,
-    SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES, SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
+    SessionHaPersistentConsumerEvidenceV7, SessionHaQualificationProfile,
+    SessionHaQualificationProfileV7, SessionMtlsCandidateCampaign,
+    SessionMtlsCandidateEvidenceError, SessionMtlsCandidateEvidenceV2,
+    QUALIFICATION_PERSISTENT_CONSUMER_MAX_SAMPLE_MICROS_V7,
+    QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7,
+    QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P999_MICROS_V7,
+    QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P99_MICROS_V7, SESSION_HA_EVIDENCE_V6_SCHEMA_JSON,
+    SESSION_HA_EVIDENCE_V7_SCHEMA_JSON, SESSION_HA_HISTORY_SCHEMA_JSON, SESSION_HA_PROFILE_V6_JSON,
+    SESSION_HA_PROFILE_V6_SCHEMA_JSON, SESSION_HA_PROFILE_V7_JSON,
+    SESSION_HA_PROFILE_V7_SCHEMA_JSON, SESSION_HA_SCHEDULE_SCHEMA_JSON,
+    SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON, SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES,
+    SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const EVIDENCE_FIXTURE: &str = include_str!("fixtures/session-ha/evidence-fixture-v6.json");
+const V7_EVIDENCE_FIXTURE: &str = include_str!("fixtures/session-ha/evidence-fixture-v7.json");
 const HISTORY_FIXTURE: &str = include_str!("fixtures/session-ha/history-valid.jsonl");
 const SCHEDULE_FIXTURE: &str = include_str!("fixtures/session-ha/schedule-valid.jsonl");
 const OMITTED_HISTORY_FIXTURE: &str =
@@ -131,7 +154,7 @@ fn assert_canonical_invalid_input(output: &Output) {
 fn structural_schema_for_lightweight_validator(mut schema: Value) -> Value {
     match &mut schema {
         Value::Object(object) => {
-            for unsupported in ["maxItems", "maxLength", "maximum", "pattern", "uniqueItems"] {
+            for unsupported in ["maxItems", "maxLength", "pattern", "uniqueItems"] {
                 object.remove(unsupported);
             }
             for value in object.values_mut() {
@@ -293,7 +316,7 @@ fn validate_exact_evidence_fields(evidence: &Value) -> Result<(), String> {
         return Err("execution timestamps are malformed or reversed".to_owned());
     }
 
-    let profile: SessionHaQualificationProfile = serde_json::from_str(SESSION_HA_PROFILE_JSON)
+    let profile: SessionHaQualificationProfile = serde_json::from_str(SESSION_HA_PROFILE_V6_JSON)
         .map_err(|_| "profile unavailable".to_owned())?;
     let results = &evidence["results"];
     let startup_within_bound = results["startup_millis"]
@@ -497,10 +520,11 @@ fn validate_history_shape(history: &str, schema: &Value) -> Result<(), String> {
 }
 
 #[test]
-fn current_v6_profile_matches_its_declared_consensus_and_store_contract() {
-    let profile_value: Value = serde_json::from_str(SESSION_HA_PROFILE_JSON).expect("profile JSON");
+fn frozen_v6_profile_matches_its_declared_consensus_and_store_contract() {
+    let profile_value: Value =
+        serde_json::from_str(SESSION_HA_PROFILE_V6_JSON).expect("profile JSON");
     let profile_schema: Value =
-        serde_json::from_str(SESSION_HA_PROFILE_SCHEMA_JSON).expect("profile schema JSON");
+        serde_json::from_str(SESSION_HA_PROFILE_V6_SCHEMA_JSON).expect("profile schema JSON");
     validate_structural_schema(&profile_schema, &profile_value)
         .expect("profile satisfies its committed schema");
     let profile: SessionHaQualificationProfile =
@@ -579,17 +603,11 @@ fn current_v6_profile_matches_its_declared_consensus_and_store_contract() {
         .protocol
         .stateless_consumer
         .as_ref()
-        .expect("current v6 profile has the stateless consumer contract");
+        .expect("frozen v6 profile has the stateless consumer contract");
     assert_eq!(consumer.alpn.as_bytes(), SESSION_QUORUM_CONSUMER_ALPN);
-    assert_eq!(
-        consumer.transport_revision,
-        SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION
-    );
+    assert_eq!(consumer.transport_revision, 1);
     assert!(!consumer.fallback_or_dual_mode_enabled);
-    assert_eq!(
-        consumer.max_requests_per_connection,
-        MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION
-    );
+    assert_eq!(consumer.max_requests_per_connection, 1);
     assert_eq!(consumer.default_max_connections, 256);
     assert_eq!(
         consumer.min_response_frame_bytes,
@@ -906,6 +924,358 @@ fn current_v6_profile_matches_its_declared_consensus_and_store_contract() {
 }
 
 #[test]
+fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(SESSION_HA_PROFILE_V6_JSON.as_bytes())
+        ),
+        "4ba6d641d3ed7f03badf2759efa8d1135a4e64f126496423493fbe613ad8d107"
+    );
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(SESSION_HA_PROFILE_V6_SCHEMA_JSON.as_bytes())
+        ),
+        "3e4429f2f2abc8ac535a8bed2c0b99ac5913d009694e42812bdbdb282a1ce794"
+    );
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(SESSION_HA_EVIDENCE_V6_SCHEMA_JSON.as_bytes())
+        ),
+        "4e85242efe548f9c9612e3802cf51371b713a2fcd4120765afce7bfe91666532"
+    );
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(SESSION_HA_PROFILE_V7_JSON.as_bytes())
+        ),
+        "875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7"
+    );
+
+    let schema: Value =
+        serde_json::from_str(SESSION_HA_PROFILE_V7_SCHEMA_JSON).expect("v7 profile schema JSON");
+    let value: Value = serde_json::from_str(SESSION_HA_PROFILE_V7_JSON).expect("v7 profile JSON");
+    validate_structural_schema(&schema, &value).expect("v7 profile satisfies its closed schema");
+    let profile: SessionHaQualificationProfileV7 =
+        serde_json::from_value(value.clone()).expect("strict typed v7 profile");
+
+    assert_eq!(profile.schema_version, "opc-session-ha-profile/v7");
+    assert_eq!(profile.profile_id, "opc-session-openraft-ha/v7");
+    assert_eq!(
+        profile
+            .persistent_consumer_thresholds
+            .minimum_warm_call_samples,
+        QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7
+    );
+    assert_eq!(
+        profile
+            .persistent_consumer_thresholds
+            .reference_warm_call_p99_micros,
+        QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P99_MICROS_V7
+    );
+    assert_eq!(
+        profile
+            .persistent_consumer_thresholds
+            .reference_warm_call_p999_micros,
+        QUALIFICATION_PERSISTENT_CONSUMER_REFERENCE_P999_MICROS_V7
+    );
+    assert_eq!(
+        profile
+            .persistent_consumer_thresholds
+            .real_mtls_latency_members,
+        3
+    );
+    assert_eq!(
+        profile.evidence.evidence_schema,
+        "qualification/v7/session-ha-evidence.schema.json"
+    );
+    let consumer = &profile.protocol.persistent_consumer;
+    assert_eq!(consumer.alpn.as_bytes(), SESSION_QUORUM_CONSUMER_ALPN);
+    assert_eq!(
+        consumer.transport_revision,
+        SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION
+    );
+    assert_eq!(
+        consumer.max_requests_per_connection,
+        MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION
+    );
+    assert_eq!(
+        consumer.correlation_id_bytes,
+        SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES
+    );
+    assert_eq!(
+        consumer.max_in_flight_per_connection,
+        MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION
+    );
+    assert_eq!(
+        consumer.default_persistent_request_connections,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.max_persistent_request_connections,
+        MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.default_persistent_pending_calls,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS
+    );
+    assert_eq!(
+        consumer.max_persistent_pending_calls,
+        MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS
+    );
+    assert_eq!(
+        consumer.default_persistent_pool_wait_timeout_millis,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT.as_millis() as u64
+    );
+    assert_eq!(
+        consumer.default_persistent_watch_connections,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.max_persistent_watch_connections,
+        MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.stateless_lineage_max_request_connections,
+        MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.stateless_lineage_max_watch_connections,
+        MAX_STATELESS_SESSION_CONSUMER_WATCH_CONNECTIONS
+    );
+    assert_eq!(
+        consumer.maintenance_tasks_per_request_pool,
+        PERSISTENT_SESSION_CONSUMER_MAINTENANCE_TASKS_PER_POOL
+    );
+    assert!(consumer.watch_cancellation_event_driven);
+    assert_eq!(
+        consumer.default_persistent_setup_timeout_millis,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT.as_millis() as u64
+    );
+    assert_eq!(
+        consumer.default_persistent_connect_attempts,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS
+    );
+    assert_eq!(
+        consumer.default_persistent_reconnect_jitter_millis,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER.as_millis() as u64
+    );
+    assert_eq!(
+        consumer.default_persistent_shutdown_drain_millis,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN.as_millis() as u64
+    );
+
+    assert!(
+        serde_json::from_str::<SessionHaQualificationProfile>(SESSION_HA_PROFILE_V7_JSON).is_err()
+    );
+    assert!(
+        serde_json::from_str::<SessionHaQualificationProfileV7>(SESSION_HA_PROFILE_V6_JSON)
+            .is_err()
+    );
+
+    let v6_evidence_schema: Value =
+        serde_json::from_str(SESSION_HA_EVIDENCE_V6_SCHEMA_JSON).expect("v6 evidence schema JSON");
+    let v7_evidence_schema: Value =
+        serde_json::from_str(SESSION_HA_EVIDENCE_V7_SCHEMA_JSON).expect("v7 evidence schema JSON");
+    let v6_evidence: Value = serde_json::from_str(EVIDENCE_FIXTURE).expect("v6 evidence JSON");
+    validate_structural_schema(&v6_evidence_schema, &v6_evidence)
+        .expect("v6 evidence remains valid only for v6");
+    assert!(validate_structural_schema(&v7_evidence_schema, &v6_evidence).is_err());
+    let mut relabeled_v6_evidence = v6_evidence.clone();
+    relabeled_v6_evidence["schema_version"] = "opc-session-ha-evidence/v7".into();
+    relabeled_v6_evidence["profile_id"] = "opc-session-openraft-ha/v7".into();
+    assert!(validate_structural_schema(&v7_evidence_schema, &relabeled_v6_evidence).is_err());
+
+    let v7_evidence: Value = serde_json::from_str(V7_EVIDENCE_FIXTURE).expect("v7 evidence JSON");
+    validate_structural_schema(&v7_evidence_schema, &v7_evidence)
+        .expect("genuine v7 evidence satisfies its v7-only binding");
+    assert!(validate_structural_schema(&v6_evidence_schema, &v7_evidence).is_err());
+    assert_eq!(
+        v7_evidence["execution"]["profile_sha256"],
+        "sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7"
+    );
+    assert_eq!(
+        v7_evidence["execution"]["client_type"],
+        "PersistentSessionConsumerClient"
+    );
+    let typed_v7: SessionHaPersistentConsumerEvidenceV7 =
+        serde_json::from_value(v7_evidence.clone()).expect("strict typed v7 evidence");
+    typed_v7
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
+        .expect("fixture satisfies computed v7 evidence relationships");
+    let rendered_v7 = format!("{typed_v7:?}\n{:?}", typed_v7.execution);
+    for sensitive in [
+        typed_v7.source_revision.as_str(),
+        typed_v7.source_tree.as_str(),
+        typed_v7.execution.profile_sha256.as_str(),
+        typed_v7.execution.transcript_sha256.as_str(),
+    ] {
+        assert!(
+            !rendered_v7.contains(sensitive),
+            "v7 Debug must redact stable source and digest bindings"
+        );
+    }
+    assert!(rendered_v7.contains("[redacted]"));
+
+    for (label, mut changed) in [
+        ("source", typed_v7.clone()),
+        ("topology", typed_v7.clone()),
+        ("observations", typed_v7.clone()),
+        ("latency", typed_v7.clone()),
+        ("coverage", typed_v7.clone()),
+        ("remaining", typed_v7.clone()),
+    ] {
+        match label {
+            "source" => changed.source_tree.replace_range(..1, "3"),
+            "topology" => changed.topology.configured_clients = 11,
+            "observations" => changed.observations.warm_reused_calls += 1,
+            "latency" => changed.warm_latency.raw_samples_micros[0] += 1,
+            "coverage" => changed.coverage.swap(0, 1),
+            "remaining" => changed.remaining_acceptance.swap(0, 1),
+            _ => unreachable!(),
+        }
+        assert!(
+            changed
+                .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
+                .is_err(),
+            "{label} mutation with the retained transcript digest must reject"
+        );
+    }
+
+    let mut wrong_topology_claim = typed_v7.clone();
+    wrong_topology_claim.topology.members = 5;
+    wrong_topology_claim.execution.transcript_sha256 = wrong_topology_claim
+        .canonical_transcript_sha256()
+        .expect("mutated transcript remains encodable");
+    assert!(wrong_topology_claim
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
+        .is_err());
+    assert!(validate_structural_schema(
+        &v7_evidence_schema,
+        &serde_json::to_value(&wrong_topology_claim).expect("wrong topology encodes"),
+    )
+    .is_err());
+
+    let mut reordered_coverage = typed_v7.clone();
+    reordered_coverage.coverage.swap(0, 1);
+    reordered_coverage.execution.transcript_sha256 = reordered_coverage
+        .canonical_transcript_sha256()
+        .expect("reordered transcript remains encodable");
+    assert!(reordered_coverage
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
+        .is_err());
+    assert!(validate_structural_schema(
+        &v7_evidence_schema,
+        &serde_json::to_value(&reordered_coverage).expect("reordered coverage encodes"),
+    )
+    .is_err());
+
+    let mut missing_remaining = v7_evidence.clone();
+    missing_remaining["remaining_acceptance"]
+        .as_array_mut()
+        .expect("remaining acceptance array")
+        .pop();
+    assert!(
+        serde_json::from_value::<SessionHaPersistentConsumerEvidenceV7>(missing_remaining.clone())
+            .is_err()
+    );
+    assert!(validate_structural_schema(&v7_evidence_schema, &missing_remaining).is_err());
+
+    let mut oversized_sample = typed_v7.clone();
+    *oversized_sample
+        .warm_latency
+        .raw_samples_micros
+        .last_mut()
+        .expect("fixture has samples") = QUALIFICATION_PERSISTENT_CONSUMER_MAX_SAMPLE_MICROS_V7 + 1;
+    // With exactly 1,000 samples, one high outlier does not change nearest-rank
+    // p99 or p99.9. This isolates the raw-sample schema maximum itself.
+    oversized_sample.execution.transcript_sha256 = oversized_sample
+        .canonical_transcript_sha256()
+        .expect("oversized transcript remains encodable");
+    assert!(oversized_sample
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
+        .is_err());
+    assert!(validate_structural_schema(
+        &v7_evidence_schema,
+        &serde_json::to_value(&oversized_sample).expect("oversized evidence encodes"),
+    )
+    .is_err());
+    let mut wrong_v7_profile_digest = v7_evidence.clone();
+    wrong_v7_profile_digest["execution"]["profile_sha256"] =
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into();
+    assert!(validate_structural_schema(&v7_evidence_schema, &wrong_v7_profile_digest).is_err());
+    let mut wrong_v7_client_binding = v7_evidence.clone();
+    wrong_v7_client_binding["execution"]["client_type"] = "StatelessSessionConsumerClient".into();
+    assert!(validate_structural_schema(&v7_evidence_schema, &wrong_v7_client_binding).is_err());
+
+    let mut sentinel_revision = typed_v7.clone();
+    sentinel_revision.source_revision = "0000000000000000000000000000000000000000".into();
+    assert!(sentinel_revision
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
+        .is_err());
+    let mut sentinel_tree = typed_v7.clone();
+    sentinel_tree.source_tree = "0000000000000000000000000000000000000000".into();
+    assert!(sentinel_tree
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
+        .is_err());
+    let mut forged_percentile = typed_v7.clone();
+    forged_percentile.warm_latency.p99_micros += 1;
+    assert!(forged_percentile
+        .validate("sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7")
+        .is_err());
+
+    let mut augmented_v6 = v6_evidence;
+    augmented_v6["schema_version"] = "opc-session-ha-evidence/v7".into();
+    augmented_v6["profile_id"] = "opc-session-openraft-ha/v7".into();
+    augmented_v6["source_tree"] = typed_v7.source_tree.clone().into();
+    augmented_v6["execution"] = serde_json::to_value(&typed_v7.execution).expect("execution");
+    augmented_v6["topology"] = serde_json::to_value(&typed_v7.topology).expect("topology");
+    augmented_v6["observations"] =
+        serde_json::to_value(&typed_v7.observations).expect("observations");
+    augmented_v6["warm_latency"] = serde_json::to_value(&typed_v7.warm_latency).expect("latency");
+    augmented_v6["privacy"] = serde_json::to_value(&typed_v7.privacy).expect("privacy");
+    augmented_v6["coverage"] = serde_json::to_value(typed_v7.coverage).expect("coverage");
+    augmented_v6["remaining_acceptance"] =
+        serde_json::to_value(typed_v7.remaining_acceptance).expect("remaining");
+    assert!(
+        validate_structural_schema(&v7_evidence_schema, &augmented_v6).is_err(),
+        "a v6 run cannot become v7 by appending persistent labels"
+    );
+
+    let mut missing_persistent_consumer = value.clone();
+    missing_persistent_consumer["protocol"]
+        .as_object_mut()
+        .expect("protocol object")
+        .remove("persistent_consumer");
+    assert!(validate_structural_schema(&schema, &missing_persistent_consumer).is_err());
+    assert!(
+        serde_json::from_value::<SessionHaQualificationProfileV7>(missing_persistent_consumer)
+            .is_err()
+    );
+
+    let mut missing_revision_2_field = value.clone();
+    missing_revision_2_field["protocol"]["persistent_consumer"]
+        .as_object_mut()
+        .expect("consumer object")
+        .remove("correlation_id_bytes");
+    assert!(validate_structural_schema(&schema, &missing_revision_2_field).is_err());
+    assert!(
+        serde_json::from_value::<SessionHaQualificationProfileV7>(missing_revision_2_field)
+            .is_err()
+    );
+
+    let mut unknown_revision_2_field = value;
+    unknown_revision_2_field["protocol"]["persistent_consumer"]["unknown"] = true.into();
+    assert!(validate_structural_schema(&schema, &unknown_revision_2_field).is_err());
+    assert!(
+        serde_json::from_value::<SessionHaQualificationProfileV7>(unknown_revision_2_field)
+            .is_err()
+    );
+}
+
+#[test]
 fn inventory_pins_workspace_msrv_source_build_gate_and_openraft_revision() {
     let workspace = include_str!("../../../Cargo.toml");
     assert!(workspace.contains("rust-version = \"1.88\""));
@@ -1092,7 +1462,7 @@ fn history_and_evidence_fixtures_satisfy_strict_schemas() {
     }
 
     let evidence_schema: Value =
-        serde_json::from_str(SESSION_HA_EVIDENCE_SCHEMA_JSON).expect("evidence schema JSON");
+        serde_json::from_str(SESSION_HA_EVIDENCE_V6_SCHEMA_JSON).expect("evidence schema JSON");
     let evidence: Value = serde_json::from_str(EVIDENCE_FIXTURE).expect("evidence fixture JSON");
     validate_structural_schema(&evidence_schema, &evidence)
         .expect("evidence fixture satisfies schema");
@@ -1206,13 +1576,14 @@ fn checker_rejects_equal_and_descending_scheduled_cas_generations() {
 #[test]
 fn schemas_prevent_premature_production_or_tls_rotation_claims() {
     let profile_schema: Value =
-        serde_json::from_str(SESSION_HA_PROFILE_SCHEMA_JSON).expect("profile schema JSON");
-    let mut profile: Value = serde_json::from_str(SESSION_HA_PROFILE_JSON).expect("profile JSON");
+        serde_json::from_str(SESSION_HA_PROFILE_V6_SCHEMA_JSON).expect("profile schema JSON");
+    let mut profile: Value =
+        serde_json::from_str(SESSION_HA_PROFILE_V6_JSON).expect("profile JSON");
     profile["maturity"] = "production".into();
     assert!(validate_structural_schema(&profile_schema, &profile).is_err());
 
     let evidence_schema: Value =
-        serde_json::from_str(SESSION_HA_EVIDENCE_SCHEMA_JSON).expect("evidence schema JSON");
+        serde_json::from_str(SESSION_HA_EVIDENCE_V6_SCHEMA_JSON).expect("evidence schema JSON");
     let mut evidence: Value =
         serde_json::from_str(EVIDENCE_FIXTURE).expect("evidence fixture JSON");
     evidence["topology"]["counts_for_tls_rotation"] = true.into();

@@ -137,7 +137,8 @@ fn validate_schema_keywords(schema: &Value, path: &str) -> Result<(), String> {
             | "items"
             | "minLength"
             | "format"
-            | "minimum" => {
+            | "minimum"
+            | "maximum" => {
                 if keyword == "items" && value.is_array() {
                     return Err(format!(
                         "{path}: unsupported schema keyword 'items' tuple form"
@@ -147,8 +148,7 @@ fn validate_schema_keywords(schema: &Value, path: &str) -> Result<(), String> {
             "allOf" | "$ref" | "not" | "if" | "then" | "else" | "multipleOf" | "uniqueItems"
             | "patternProperties" | "contains" | "dependencies" | "dependentRequired"
             | "dependentSchemas" | "propertyNames" | "prefixItems" | "additionalItems"
-            | "maxLength" | "pattern" | "maxItems" | "maximum" | "exclusiveMinimum"
-            | "exclusiveMaximum" => {
+            | "maxLength" | "pattern" | "maxItems" | "exclusiveMinimum" | "exclusiveMaximum" => {
                 return Err(format!("{path}: unsupported schema keyword '{keyword}'"));
             }
             _ => return Err(format!("{path}: unsupported schema keyword '{keyword}'")),
@@ -310,9 +310,6 @@ fn validate_string(
 }
 
 fn validate_number(schema: &Value, number: &serde_json::Number, path: &str) -> Result<(), String> {
-    if schema.get("maximum").is_some() {
-        return Err(format!("{path}: unsupported schema keyword 'maximum'"));
-    }
     if schema.get("exclusiveMinimum").is_some() {
         return Err(format!(
             "{path}: unsupported schema keyword 'exclusiveMinimum'"
@@ -330,6 +327,15 @@ fn validate_number(schema: &Value, number: &serde_json::Number, path: &str) -> R
             .ok_or_else(|| format!("{path}: unsupported numeric value"))?;
         if value < minimum {
             return Err(format!("{path}: expected number >= {minimum}, got {value}"));
+        }
+    }
+
+    if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
+        let value = number
+            .as_f64()
+            .ok_or_else(|| format!("{path}: unsupported numeric value"))?;
+        if value > maximum {
+            return Err(format!("{path}: expected number <= {maximum}, got {value}"));
         }
     }
 
@@ -409,5 +415,15 @@ mod tests {
                 "error for {keyword} should name the unsupported keyword: {err}"
             );
         }
+    }
+
+    #[test]
+    fn inclusive_numeric_maximum_is_enforced() {
+        let schema = json!({"type": "integer", "minimum": 0, "maximum": 10_000_000});
+
+        validate(&schema, &json!(0)).expect("minimum is accepted");
+        validate(&schema, &json!(10_000_000)).expect("maximum is inclusive");
+        let err = validate(&schema, &json!(10_000_001)).expect_err("one over must reject");
+        assert!(err.contains("<= 10000000"), "unexpected error: {err}");
     }
 }

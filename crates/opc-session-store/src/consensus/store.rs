@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::stream::{BoxStream, StreamExt};
+use futures_util::stream::{self, BoxStream, StreamExt};
 use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError};
 use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
 use opc_consensus::{
@@ -3676,6 +3676,9 @@ fn validate_sealed_payload(op: &CompareAndSet) -> Result<(), StoreError> {
 }
 
 fn validate_consumer_operation(operation: &SessionConsumerOperation) -> Result<(), StoreError> {
+    operation
+        .validate()
+        .map_err(|_| StoreError::InvalidKey("consumer request rejected".into()))?;
     match operation {
         SessionConsumerOperation::CompareAndSet { op } => validate_sealed_payload(op),
         SessionConsumerOperation::Batch { ops } => validate_consensus_batch(ops),
@@ -3955,16 +3958,22 @@ impl ConsensusSessionConsumerService {
     }
 
     fn operation_mutates(operation: &SessionConsumerOperation) -> bool {
-        matches!(
-            operation,
+        match operation {
+            SessionConsumerOperation::Capabilities
+            | SessionConsumerOperation::Get { .. }
+            | SessionConsumerOperation::PreflightRecordExpiry { .. }
+            | SessionConsumerOperation::ScanRestoreRecords { .. }
+            | SessionConsumerOperation::Watch { .. } => false,
+            SessionConsumerOperation::Batch { ops } => ops
+                .iter()
+                .any(|operation| !matches!(operation, SessionOp::Get { .. })),
             SessionConsumerOperation::CompareAndSet { .. }
-                | SessionConsumerOperation::DeleteFenced { .. }
-                | SessionConsumerOperation::RefreshTtl { .. }
-                | SessionConsumerOperation::Batch { .. }
-                | SessionConsumerOperation::AcquireLease { .. }
-                | SessionConsumerOperation::RenewLease { .. }
-                | SessionConsumerOperation::ReleaseLease { .. }
-        )
+            | SessionConsumerOperation::DeleteFenced { .. }
+            | SessionConsumerOperation::RefreshTtl { .. }
+            | SessionConsumerOperation::AcquireLease { .. }
+            | SessionConsumerOperation::RenewLease { .. }
+            | SessionConsumerOperation::ReleaseLease { .. } => true,
+        }
     }
 
     /// Bound the response before binding or applying a batch request.
@@ -4028,6 +4037,9 @@ impl ConsensusSessionConsumerService {
         deadline: tokio::time::Instant,
         ops: Vec<SessionOp>,
     ) -> SessionConsumerResponse {
+        let contains_mutation = ops
+            .iter()
+            .any(|operation| !matches!(operation, SessionOp::Get { .. }));
         if let Err(error) = validate_consensus_batch(&ops) {
             return if matches!(error, StoreError::PayloadTooLarge { .. }) {
                 SessionConsumerResponse::Batch(Err(SessionConsumerStoreError::PayloadTooLarge))
@@ -4077,9 +4089,15 @@ impl ConsensusSessionConsumerService {
                             _ => Err(StoreError::BackendOperationOutcomeUnavailable),
                         });
                     if consumer_mutation_unknown(&result) {
-                        return SessionConsumerResponse::OutcomeUnknown(
-                            SessionConsumerOutcomeUnknown::Mutation,
-                        );
+                        return if contains_mutation {
+                            SessionConsumerResponse::OutcomeUnknown(
+                                SessionConsumerOutcomeUnknown::Mutation,
+                            )
+                        } else {
+                            SessionConsumerResponse::Batch(Err(
+                                SessionConsumerStoreError::Unavailable,
+                            ))
+                        };
                     }
                     SessionConsumerBatchResult::Get(result.map_err(SessionConsumerStoreError::from))
                 }
@@ -4389,10 +4407,13 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                         .map_err(SessionConsumerStoreError::from),
                 )
             }
+            SessionConsumerOperation::Batch { ops } => {
+                drop(admission);
+                self.execute_batch(identity, &request, deadline, ops).await
+            }
             SessionConsumerOperation::CompareAndSet { .. }
             | SessionConsumerOperation::DeleteFenced { .. }
             | SessionConsumerOperation::RefreshTtl { .. }
-            | SessionConsumerOperation::Batch { .. }
             | SessionConsumerOperation::AcquireLease { .. }
             | SessionConsumerOperation::RenewLease { .. }
             | SessionConsumerOperation::ReleaseLease { .. } => {
@@ -4423,13 +4444,38 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
         let deadline = self.operation_deadline()?;
         let admission = self.store.admit_consumer_scope(scope, deadline).await?;
         drop(admission);
-        self.store
+        match self
+            .store
             .consumer_watch(scope, start_sequence, deadline)
             .await
-            .map_err(|error| match error {
-                StoreError::TopologyAuthorityRevoked => SessionConsumerRejection::ScopeMismatch,
-                _ => SessionConsumerRejection::Unavailable,
-            })
+        {
+            Ok(watch) => Ok(watch),
+            Err(StoreError::TopologyAuthorityRevoked) => {
+                Err(SessionConsumerRejection::ScopeMismatch)
+            }
+            Err(error @ StoreError::ReplicationWatchCatchUpRequired)
+            | Err(error @ StoreError::ReplicationLogCursorCompacted { .. }) => {
+                // These are coherent cursor decisions, not transient setup
+                // failures. Open the watch and deliver one typed terminal so
+                // callers can catch up without a blind reconnect loop.
+                Ok(stream::once(async move {
+                    Err(consumer_watch_setup_terminal(error)
+                        .expect("matched permanent watch setup error"))
+                })
+                .boxed())
+            }
+            Err(_) => Err(SessionConsumerRejection::Unavailable),
+        }
+    }
+}
+
+fn consumer_watch_setup_terminal(error: StoreError) -> Option<SessionConsumerStoreError> {
+    match error {
+        error @ (StoreError::ReplicationWatchCatchUpRequired
+        | StoreError::ReplicationLogCursorCompacted { .. }) => {
+            Some(SessionConsumerStoreError::from(error))
+        }
+        _ => None,
     }
 }
 
@@ -4791,6 +4837,27 @@ mod membership_tests {
 
     fn node(value: u64) -> SessionConsensusNodeId {
         SessionConsensusNodeId::new(value).expect("valid test consensus node ID")
+    }
+
+    #[test]
+    fn permanent_consumer_watch_setup_errors_remain_typed_terminals() {
+        assert_eq!(
+            consumer_watch_setup_terminal(StoreError::ReplicationWatchCatchUpRequired),
+            Some(SessionConsumerStoreError::WatchCatchUpRequired)
+        );
+        assert_eq!(
+            consumer_watch_setup_terminal(StoreError::ReplicationLogCursorCompacted {
+                resume_from: 7,
+            }),
+            Some(SessionConsumerStoreError::InvalidInput)
+        );
+        assert_eq!(
+            consumer_watch_setup_terminal(StoreError::BackendUnavailable(
+                "fixed test unavailable".into(),
+            )),
+            None,
+            "only coherent permanent cursor decisions bypass transient setup rejection"
+        );
     }
 
     #[derive(Debug)]

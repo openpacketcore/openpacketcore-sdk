@@ -24,6 +24,7 @@ x509-parser = { workspace = true }
 rustls-pki-types = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+sha2 = { workspace = true }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }

@@ -431,6 +431,79 @@ This is payload-envelope encryption, not full-database encryption. Membership,
 indexes, routing fields, owners, fences, timestamps, and envelope key IDs remain
 visible unless a separate approved storage layer protects them.
 
+### Persistent consumer transport (#695)
+
+#695 extends only the existing least-authority `SessionQuorumConsumer` application
+boundary. `StatelessSessionConsumerClient` remains a public,
+source-compatible production/compatibility fresh-authentication typed
+least-authority surface required by #649, #688, and #691; it is neither hidden,
+deprecated, nor test-only. `PersistentSessionConsumerClient` remains the
+required warm fixed-pool primitive for #695/ePDG latency, so production
+deployments requiring warm reuse should use it. It retains the
+`opc-session-consumer/1` ALPN and advances the exact
+consumer transport revision from 1 to 2. There is no fallback, dual mode, or
+mixed-revision path: clients and listeners must be drained and cut over
+coordinately. Revision-2 private JSON DTO bytes are canonical; reordered or
+otherwise noncanonical encodings, aliases, omissions, and unknown fields fail
+closed. This boundary remains separate from consensus and the quarantined
+legacy backend protocol; it exposes no `RemoteSessionBackend`, consensus,
+replication, snapshot, rebuild, membership, or admin API, and does not include
+#696 atomic transition or product composition.
+
+Request connections are deliberately sequential: a nonzero connection-local
+monotonic `u32` correlation never wraps, retires after at most 4,096 calls, and
+permits only one in-flight call. This is required for cancellation/late-response
+isolation and to avoid write-position ambiguity. The fair request pool defaults
+to four connections (at most 16 configured), with 64 pending calls by default,
+256 absolutely, and a 250 ms queue wait/age limit. Two default watch slots (at
+most 16 configured) are separate from request capacity. An establishment is
+limited to 1,500 ms and at most two pre-write attempts; resolution happens only
+on establishment/re-establishment. With two attempts there is one
+between-attempt delay: the lifecycle backoff floor (50 ms by default) plus at
+most 25 ms jitter, clipped to its logical deadline. Existing 5-second idle,
+10-second operation, 16 MiB frame, 256 listener-connection, and TLS lifecycle
+bounds are retained; consumer shutdown drain is at most 5 seconds.
+Exactly one pool-wide maintenance task autonomously removes cached lanes at the
+earliest idle/lifecycle deadline. An accepted material epoch schedules cached
+lanes on stable, directed authenticated-edge deadlines within the bounded
+rotation jitter; they remain reusable before their deadline and retire at it.
+Explicit generation changes invalidate cached lanes immediately, while every
+fresh handshake must still match the exact current generation and epoch at its
+final publication sample. TLS supplies only one fixed-domain, fixed-range
+consumer jitter duration; it exposes no edge-key object, caller-selected digest
+range, identity, or digest bytes to callers or diagnostics.
+Task cardinality does not scale with lanes, subscribers, or records. A rejected
+same-epoch publication does not retire a healthy lane.
+
+Each stateless clone lineage shares fail-fast physical-admission caps of 16
+request and 16 watch connections. A permit is acquired before resolve/TCP and
+held for the physical connection lifetime, including by a persistent client
+derived from that lineage. Independent stateless constructors create
+independent logical clients, just as independent persistent constructors do.
+
+The complete operation timeout is validated as greater than zero and no greater
+than 10 seconds. The configured idle bound (at most 5 seconds) caps every
+active partial frame on client bootstrap, unary, and watch reads without being
+reset by partial bytes; a no-byte healthy watch may remain quiet. Saturated,
+canceled, and rotated watch retirement never blocks while holding the watch
+lease. Each discarded checked-out request lane has exactly one
+reconnect/replacement accounting outcome. Concurrent shutdown calls advance a
+monotonic phase only (running, draining, then forced) and cannot regress it.
+
+Only `NotTransmitted` may automatically retry, with an identical request ID and
+body. A possibly written call is `OutcomeUnknown`, evicts its lane, and is never
+replayed. Prewarm/readiness proves authenticated transport capacity only, never
+quorum or product readiness. Diagnostics are fixed and nonidentifying (setup
+phase, pool wait, active/maximum/idle, reuse/reconnect,
+queue/in-flight/oldest-age, and bounded outcome class); they exclude endpoints,
+identities, scopes, credentials, keys, payloads, request/correlation IDs,
+owners, and fences. Readiness deliberately becomes false while a request lane
+is leased; isolated watch slots are non-gating. Performance evidence is
+synthetic only and makes no ePDG production-SLO claim. Its warm accept/reuse
+checks gate only the synthetic transport method; elapsed samples are
+non-gating. The revision-2 persistent-consumer qualification contract is v7;
+the published v6 profile remains the unchanged revision-1 contract.
+
 ### Legacy backend and restore transport (protocol v5)
 
 The opt-in `opc-session-net` protocol v5 carries validated restore-scan

@@ -388,12 +388,20 @@ backend operation after joining their owned task. Normal status commands remain
 authoritative, and a recovered watcher must still reconcile the bounded durable
 journal before subscribing at `head + 1`.
 
-`qualification/v6/session-ha-profile.json` is the current experimental
-foundation inventory. It binds consensus transport and wire-schema revision 4
-and deterministic error-set revision 6. All earlier v1 through v5 profile and
-evidence artifacts remain byte-for-byte frozen; new runtime contract revisions
-receive a new profile namespace instead of rewriting retained qualification
-evidence.
+`qualification/v6/session-ha-profile.json` and its schema are the published,
+byte-for-byte frozen stateless-consumer contract: consumer transport revision
+1, one request per connection, and no revision-2 persistent-consumer fields.
+The explicit `SESSION_HA_PROFILE_V6_*` exports retain that contract for
+existing qualification and evidence tooling.
+
+`qualification/v7/session-ha-profile.json` is the separate experimental
+revision-2 persistent-consumer inventory. Its distinct schema `$id`, profile
+identifier, and `persistent_consumer` field close the revision-2 field set,
+including correlation IDs,
+per-connection in-flight bounds, and persistent request/watch pool limits.
+It routes to a separate closed v7 foundation-evidence schema, which is bound
+only to profile v7. The retained v6 evidence schema remains bound only to the
+v6 profile, so neither artifact can be presented as evidence for the other.
 
 Schedule v6 also binds `terminal-stage-elapsed-millis/v1`. If an accepted
 recovery operation finishes after its fixed deadline, the campaign remains

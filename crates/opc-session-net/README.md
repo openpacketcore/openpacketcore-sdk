@@ -237,6 +237,105 @@ ALPN replaces the legacy backend ALPN. Restore now consumes the local
 Openraft-applied state after a linearizable barrier rather than reopening raw
 mutation or rebuild authority beside Openraft.
 
+## Persistent session-consumer transport (#695)
+
+#695 extends the existing least-authority `SessionQuorumConsumer` boundary only.
+`StatelessSessionConsumerClient` remains a public, source-compatible production
+and compatibility fresh-authentication typed least-authority surface required by
+#649, #688, and #691; it is neither hidden, deprecated, nor test-only.
+`PersistentSessionConsumerClient` with `SessionQuorumConsumerServer` is the
+required warm fixed-pool primitive for #695/ePDG latency. Production deployments
+that require warm reuse should use it. Both use mutual TLS with the unchanged
+`opc-session-consumer/1` ALPN and exact consumer transport revision 2. Revision
+1 will not fall back or interoperate. The
+unreleased SDK requires one coordinated, drained client/listener cutover; there
+is no dual mode. Revision-2 private JSON DTO bytes are canonical; reordered or
+otherwise noncanonical encodings, aliases, omissions, and unknown fields fail
+closed. This does not add `RemoteSessionBackend` or any
+consensus/replication/snapshot/rebuild/membership/admin authority, and it
+explicitly excludes #696 atomic transition and product composition.
+
+Each request connection carries a nonzero, monotonically increasing
+connection-local `u32` correlation with no wrap and at most 4,096 sequential
+calls. It will admit only one in-flight call: no multiplexing is permitted,
+because cancellation/late-response isolation and write-position ambiguity are
+structural. The fair request pool defaults to four connections, allows at most
+16 configured connections, and bounds pending calls to 64 by default and 256
+absolutely; queue wait/age is at most 250 ms. Watches have two separate slots
+by default and at most 16 configured slots, so they cannot consume request
+capacity.
+
+An establishment has a 1,500 ms setup limit and a call makes at most two
+pre-write attempts. Resolution occurs only when establishing or
+re-establishing a connection. With two attempts there is one between-attempt
+delay: the lifecycle backoff floor (50 ms by default) plus bounded jitter of
+at most 25 ms, clipped to its logical deadline. The existing 5-second idle,
+10-second operation, 16 MiB frame, 256-server-connection, and TLS lifecycle
+bounds remain in force; shutdown drain is at most 5 seconds.
+One constant pool-wide maintenance task (not one task per lane or subscriber)
+physically retires cached lanes at the earliest idle/lifecycle deadline.
+An accepted material-epoch change schedules each already-admitted lane on a
+stable directed authenticated-edge deadline within the configured rotation
+jitter; the lane remains eligible before that deadline and retires at it.
+Explicit-generation invalidation remains immediate, and every fresh handshake
+must match the exact current generation and material epoch at its final
+publication boundary. The directed key is an opaque, non-serializable TLS
+digest used only to compute bounded jitter; neither identities nor digest bytes
+enter diagnostics. A rejected same-epoch material publication retains the
+authenticated lane.
+
+One stateless client lineage shares fail-fast physical-admission caps of 16
+request connections and 16 watch connections across its clones. The permits are
+acquired before resolve/TCP and remain held for the physical connection
+lifetime, including for persistent clients derived from that lineage.
+Independent stateless constructors create independent logical clients, as
+independent persistent constructors do. The typed persistent watch surface
+preserves physical-cap exhaustion as fail-fast `Overloaded` and records the
+bounded overload outcome; it does not relabel intentional load shedding as
+endpoint unavailability.
+
+A persistent watch keeps one isolated watch lease and one reader task across
+its bounded reconnect sequence. On authenticated retirement or a clean peer
+transport loss it closes the old socket, resolves again, completes a fresh
+mutual-TLS/Hello handshake, and resumes from the successor of the last item
+accepted by its bounded caller-visible queue. A disconnect before that
+boundary reuses the prior cursor. Duplicate, gap, mismatched-correlation,
+unknown-frame, malformed, partial-frame, and permanent store outcomes are
+ambiguous or invalid and therefore terminate fail-closed rather than replaying
+the cursor. Reconnect attempts use the configured finite setup-attempt and
+jitter bounds; shutdown, a closed caller stream, or exhausted recovery returns
+the fixed redaction-safe unavailable outcome. A decoded item blocked on the
+fixed local byte/item queue is also terminal: it has not crossed delivery and
+must release the isolated lease rather than reconnect behind a slow consumer.
+
+The configured complete operation timeout is validated strictly greater than
+zero and no greater than 10 seconds. The configured idle timeout is at most 5
+seconds and caps every active partial frame on client bootstrap, unary, and
+watch reads; it is not reset by received partial bytes. A healthy watch with no
+bytes in flight may remain quiet. Retirement of a saturated, canceled, or
+rotated watch never waits while holding its watch lease. Every discarded
+checked-out request lane has exactly one reconnect/replacement accounting
+outcome. Shutdown phase is monotonic under concurrent callers: it can move
+from running to draining to forced, never backwards.
+
+Only `NotTransmitted` may be automatically retried, and only with the identical
+request ID and body. Anything possibly written is `OutcomeUnknown`, evicts the
+lane, and is never replayed. Prewarm and readiness establish authenticated
+transport capacity only, not quorum or product readiness. Diagnostics are
+fixed and nonidentifying: setup phase, pool wait, active/maximum/idle counts,
+reuse/reconnect, queue/in-flight/oldest age, and bounded outcome classes. They
+never contain endpoints, identities, scopes, credentials, keys, payloads,
+request/correlation IDs, owners, or fences. Readiness deliberately becomes
+false while a request lane is leased; isolated watch slots are non-gating.
+Performance evidence is synthetic only and is not an ePDG production-SLO
+claim. Synthetic warm evidence gates only the structural accept/reuse method;
+its elapsed samples are explicitly non-gating. The exact method and bounded raw
+samples are retained in
+[`qualification-695-persistent-consumer.md`](../../docs/qualification-695-persistent-consumer.md).
+
+The revision-2 persistent-consumer qualification contract is recorded in the
+v7 profile. The published v6 profile remains the unchanged revision-1 contract.
+
 ## API Shape
 
 - `SessionReplicationManifest::try_new_with_epoch` validates one cluster ID,

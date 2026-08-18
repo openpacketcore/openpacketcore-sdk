@@ -806,7 +806,11 @@ pub(crate) fn validate_request_payload_limit(
     }
 }
 
-fn validate_lease_profile(lease: &LeaseGuard) -> Result<(), WireConversionError> {
+/// Enforce the structural invariants of a lease guard wherever it crosses the
+/// wire.  The consumer also uses this for successful lease responses: mTLS
+/// authenticates the peer, but does not make an impossible guard safe to hand
+/// to a caller.
+pub(crate) fn validate_lease_profile(lease: &LeaseGuard) -> Result<(), WireConversionError> {
     validate_session_key_profile(lease.key())?;
     if lease.fence().get() == 0 {
         return Err(WireConversionError(
@@ -1366,7 +1370,7 @@ pub(crate) fn validate_restore_scan_wire_payload_bytes(
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct WireBackendCapabilities {
+pub(crate) struct WireBackendCapabilities {
     atomic_compare_and_set: bool,
     monotonic_fencing_token: bool,
     per_key_ttl: bool,
@@ -3419,13 +3423,83 @@ fn write_timeout_error() -> ProtocolError {
 
 /// Effect boundary for one framed write.
 ///
-/// `BeforeWrite` proves that no length-prefix byte was offered to the
-/// transport. `MayHaveWritten` means the prefix write was entered, so callers
-/// must conservatively recover an outcome rather than issue a new mutation.
+/// `BeforeWrite` proves that no length-prefix byte was accepted by the
+/// transport. `MayHaveWritten` means at least one prefix or payload byte was
+/// accepted, so callers must conservatively recover an outcome rather than
+/// issue a new mutation.
 #[derive(Debug)]
 pub(crate) enum FrameWriteError {
     BeforeWrite(ProtocolError),
     MayHaveWritten(ProtocolError),
+}
+
+/// Shared positive-byte observation for a framed transport write.
+///
+/// Callers that select an in-progress frame write against lifecycle or
+/// shutdown signals use this token to preserve the exact transport boundary:
+/// cancellation before any byte is accepted remains `BeforeWrite`, while any
+/// accepted prefix or payload byte is permanently `MayHaveWritten`.
+pub(crate) struct FrameWriteProgress(AtomicBool);
+
+impl FrameWriteProgress {
+    pub(crate) const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    pub(crate) fn accepted_any(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn classify(&self, error: ProtocolError) -> FrameWriteError {
+        if self.accepted_any() {
+            FrameWriteError::MayHaveWritten(error)
+        } else {
+            FrameWriteError::BeforeWrite(error)
+        }
+    }
+}
+
+struct WriteProgress<'a, W> {
+    writer: &'a mut W,
+    progress: &'a FrameWriteProgress,
+}
+
+impl<W> tokio::io::AsyncWrite for WriteProgress<'_, W>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut *this.writer).poll_write(context, bytes) {
+            std::task::Poll::Ready(Ok(accepted)) => {
+                if accepted != 0 {
+                    this.progress.0.store(true, Ordering::Release);
+                }
+                std::task::Poll::Ready(Ok(accepted))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut *this.writer).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut *this.writer).poll_shutdown(context)
+    }
 }
 
 impl FrameWriteError {
@@ -3474,12 +3548,37 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     T: Serialize,
 {
-    write_frame_bounded_until_cancellable_classified(
+    let progress = FrameWriteProgress::new();
+    write_frame_bounded_until_cancellable_classified_with_progress(
         writer,
         frame,
         max_frame_size,
         deadline,
         &NEVER_CANCELLED,
+        &progress,
+    )
+    .await
+}
+
+/// Classified frame write with progress visible to an outer lifecycle select.
+pub(crate) async fn write_frame_bounded_until_classified_with_progress<W, T>(
+    writer: &mut W,
+    frame: &T,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+    progress: &FrameWriteProgress,
+) -> Result<(), FrameWriteError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: Serialize,
+{
+    write_frame_bounded_until_cancellable_classified_with_progress(
+        writer,
+        frame,
+        max_frame_size,
+        deadline,
+        &NEVER_CANCELLED,
+        progress,
     )
     .await
 }
@@ -3501,23 +3600,26 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     T: Serialize,
 {
-    write_frame_bounded_until_cancellable_classified(
+    let progress = FrameWriteProgress::new();
+    write_frame_bounded_until_cancellable_classified_with_progress(
         writer,
         frame,
         max_frame_size,
         deadline,
         cancellation,
+        &progress,
     )
     .await
     .map_err(FrameWriteError::into_protocol_error)
 }
 
-async fn write_frame_bounded_until_cancellable_classified<W, T>(
+async fn write_frame_bounded_until_cancellable_classified_with_progress<W, T>(
     writer: &mut W,
     frame: &T,
     max_frame_size: usize,
     deadline: tokio::time::Instant,
     cancellation: &AtomicBool,
+    progress: &FrameWriteProgress,
 ) -> Result<(), FrameWriteError>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -3536,6 +3638,7 @@ where
     let len = u32::try_from(json.encoded_len)
         .map_err(|_| ProtocolError::FrameTooLarge(json.encoded_len))
         .map_err(FrameWriteError::BeforeWrite)?;
+    let mut writer = WriteProgress { writer, progress };
     let write = async {
         writer
             .write_all(&len.to_be_bytes())
@@ -3550,8 +3653,20 @@ where
         writer.flush().await.map_err(ProtocolError::Io)
     };
     match tokio::time::timeout_at(deadline, write).await {
-        Ok(result) => result.map_err(FrameWriteError::MayHaveWritten),
-        Err(_elapsed) => Err(FrameWriteError::MayHaveWritten(write_timeout_error())),
+        Ok(result) => {
+            result.map_err(|error| progress.classify(error))?;
+            // Tokio polls the inner write before its deadline future. A task
+            // resumed at or after the absolute boundary must not publish a
+            // late success. Preserve whether this exact frame crossed the
+            // transport boundary rather than treating a zero-byte pending
+            // writer as ambiguous.
+            if tokio::time::Instant::now() >= deadline {
+                Err(progress.classify(write_timeout_error()))
+            } else {
+                Ok(())
+            }
+        }
+        Err(_elapsed) => Err(progress.classify(write_timeout_error())),
     }
 }
 
@@ -3847,7 +3962,7 @@ where
         .map_err(ProtocolError::Serialization)
 }
 
-async fn read_authenticated_frame_payload_within<R>(
+pub(crate) async fn read_authenticated_frame_payload_within<R>(
     reader: &mut R,
     max_frame_size: usize,
     timeout: std::time::Duration,
@@ -3858,10 +3973,24 @@ where
     let deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .ok_or(ProtocolError::InvalidWireValue)?;
+    read_authenticated_frame_payload_until(reader, max_frame_size, deadline).await
+}
+
+pub(crate) async fn read_authenticated_frame_payload_until<R>(
+    reader: &mut R,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+) -> Result<Option<Vec<u8>>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut len_bytes = [0_u8; 4];
     match tokio::time::timeout_at(deadline, reader.read_exact(&mut len_bytes[..1])).await {
         Ok(result) => {
             result.map_err(ProtocolError::Io)?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(active_frame_timeout_error());
+            }
         }
         Err(_) => return Ok(None),
     }
@@ -3876,6 +4005,50 @@ where
     Ok(Some(payload))
 }
 
+/// Read one authenticated frame with a separate no-byte setup deadline and
+/// absolute active-frame timeout.
+///
+/// Quiet bootstrap may consume the full setup budget. Once the first length
+/// prefix byte is accepted, every remaining prefix/payload byte must arrive by
+/// `min(setup_deadline, first_byte_at + active_timeout)`; later bytes never
+/// renew that deadline.
+pub(crate) async fn read_authenticated_frame_payload_with_active_timeout_until<R>(
+    reader: &mut R,
+    max_frame_size: usize,
+    setup_deadline: tokio::time::Instant,
+    active_timeout: std::time::Duration,
+) -> Result<Option<Vec<u8>>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    if active_timeout.is_zero() {
+        return Err(ProtocolError::InvalidWireValue);
+    }
+    let mut len_bytes = [0_u8; 4];
+    match tokio::time::timeout_at(setup_deadline, reader.read_exact(&mut len_bytes[..1])).await {
+        Ok(result) => {
+            result.map_err(ProtocolError::Io)?;
+            if tokio::time::Instant::now() >= setup_deadline {
+                return Err(active_frame_timeout_error());
+            }
+        }
+        Err(_) => return Ok(None),
+    }
+    let active_deadline = tokio::time::Instant::now()
+        .checked_add(active_timeout)
+        .ok_or(ProtocolError::InvalidWireValue)?
+        .min(setup_deadline);
+    read_exact_frame_bytes_until(reader, &mut len_bytes[1..], active_deadline).await?;
+    let len = usize::try_from(u32::from_be_bytes(len_bytes))
+        .map_err(|_| ProtocolError::InvalidWireValue)?;
+    if len > max_frame_size {
+        return Err(ProtocolError::FrameTooLarge(len));
+    }
+    let mut payload = vec![0_u8; len];
+    read_exact_frame_bytes_until(reader, &mut payload, active_deadline).await?;
+    Ok(Some(payload))
+}
+
 async fn read_exact_frame_bytes_until<R>(
     reader: &mut R,
     bytes: &mut [u8],
@@ -3887,13 +4060,20 @@ where
     match tokio::time::timeout_at(deadline, reader.read_exact(bytes)).await {
         Ok(result) => {
             result.map_err(ProtocolError::Io)?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(active_frame_timeout_error());
+            }
             Ok(())
         }
-        Err(_) => Err(ProtocolError::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timed out reading active frame from peer",
-        ))),
+        Err(_) => Err(active_frame_timeout_error()),
     }
+}
+
+fn active_frame_timeout_error() -> ProtocolError {
+    ProtocolError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out reading active frame from peer",
+    ))
 }
 
 /// Post-authentication request decoder that distinguishes a no-byte idle
@@ -5553,6 +5733,47 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct LateReadyWriteState {
+        flush_waiting: AtomicBool,
+        flush_ready: AtomicBool,
+    }
+
+    struct LateReadyWriter {
+        bytes: Vec<u8>,
+        state: std::sync::Arc<LateReadyWriteState>,
+    }
+
+    impl tokio::io::AsyncWrite for LateReadyWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.bytes.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.state.flush_waiting.store(true, Ordering::Release);
+            if self.state.flush_ready.load(Ordering::Acquire) {
+                std::task::Poll::Ready(Ok(()))
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
     #[tokio::test]
     async fn bounded_storage_and_counter_stop_cooperatively_with_distinct_errors() {
         let storage_cancellation = AtomicBool::new(false);
@@ -5646,6 +5867,41 @@ mod tests {
             .expect_err("unrepresentable relative deadline must fail without panicking");
         assert!(matches!(error, ProtocolError::InvalidWireValue));
         assert!(writer.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_at_bounded_write_deadline_is_never_success() {
+        let state = std::sync::Arc::new(LateReadyWriteState::default());
+        let mut writer = LateReadyWriter {
+            bytes: Vec::new(),
+            state: std::sync::Arc::clone(&state),
+        };
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(10))
+            .expect("test deadline");
+        let classified = {
+            let write = write_frame_bounded_until_classified(
+                &mut writer,
+                &Response::WatchStream,
+                MIN_NEGOTIATED_FRAME_SIZE,
+                deadline,
+            );
+            tokio::pin!(write);
+            assert!(futures_util::poll!(&mut write).is_pending());
+            assert!(state.flush_waiting.load(Ordering::Acquire));
+
+            tokio::time::advance(Duration::from_millis(10)).await;
+            state.flush_ready.store(true, Ordering::Release);
+            write
+                .await
+                .expect_err("a write completing at its boundary must stay ambiguous")
+        };
+        assert!(matches!(
+            classified,
+            FrameWriteError::MayHaveWritten(ProtocolError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(!writer.bytes.is_empty(), "the write boundary was crossed");
     }
 
     #[tokio::test]
