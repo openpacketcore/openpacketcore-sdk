@@ -17,16 +17,17 @@ use opc_key::{
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
 use crate::{
-    checked_session_deadline, AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet,
-    CompareAndSetResult, EncryptedSessionPayload, EncryptingSessionBackend, FenceToken,
-    FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,
-    FencedTransitionMutationResult, FencedTransitionObservation, FencedTransitionOutcome,
-    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus, Generation,
-    LeaseError, LeaseGuard, OwnerId, PreparedFencedTransition, PreparedFencedTransitionJournal,
-    PreparedFencedTransitionJournalKey, PreparedFencedTransitionLookup,
-    RemoteSealingSessionBackend, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager,
-    SessionOp, SessionOpResult, SessionPayloadEncoding, SessionStore, StateClass, StateType,
-    StoreError, StoredSessionRecord, FENCED_TRANSITION_MAX_PREPARED_BYTES,
+    checked_session_deadline, validate_consensus_physical_fenced_transition_request,
+    AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
+    EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
+    FencedTransitionLease, FencedTransitionMutation, FencedTransitionMutationResult,
+    FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
+    FencedTransitionRequestId, FencedTransitionStatus, Generation, LeaseError, LeaseGuard, OwnerId,
+    PreparedFencedTransition, PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
+    PreparedFencedTransitionLookup, RemoteSealingSessionBackend, SessionBackend, SessionKey,
+    SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult, SessionPayloadEncoding,
+    SessionStore, StateClass, StateType, StoreError, StoredSessionRecord,
+    FENCED_TRANSITION_MAX_PREPARED_BYTES,
 };
 
 const NAMESPACE: &str = "protected-fenced-transition";
@@ -244,6 +245,7 @@ struct SpyState {
     dispatches: usize,
     delay_ambiguous_commit: bool,
     emit_nonphysical_prepared_token: bool,
+    enforce_physical_admission: bool,
     pending: Option<FencedTransitionRequest>,
     receipt: Option<(FencedTransitionRequest, FencedTransitionOutcome)>,
 }
@@ -324,6 +326,13 @@ impl AtomicSpy {
             .lock()
             .expect("spy lock")
             .emit_nonphysical_prepared_token = true;
+    }
+
+    fn enforce_physical_admission(&self) {
+        self.state
+            .lock()
+            .expect("spy lock")
+            .enforce_physical_admission = true;
     }
 
     fn reject_physical_tokens(&self) {
@@ -437,6 +446,9 @@ impl SessionBackend for AtomicSpy {
     ) -> Result<PreparedFencedTransition, StoreError> {
         let emit_nonphysical_prepared_token = {
             let mut state = self.state.lock().expect("spy lock");
+            if state.enforce_physical_admission {
+                validate_consensus_physical_fenced_transition_request(&request)?;
+            }
             state.prepared.push(request.clone());
             state.emit_nonphysical_prepared_token
         };
@@ -695,6 +707,69 @@ async fn protected_fenced_transition_rejects_nonphysical_inner_token_before_jour
             .await,
         Err(StoreError::CapabilityNotSupported(_))
     ));
+    assert!(matches!(
+        remote_journal
+            .lookup(remote_request.request_id())
+            .await
+            .expect("journal lookup"),
+        PreparedFencedTransitionLookup::Absent
+    ));
+}
+
+#[tokio::test]
+async fn protected_fenced_transition_rejects_oversized_physical_envelopes_before_journaling() {
+    let payload = vec![0x91; crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES];
+
+    let local_spy = Arc::new(AtomicSpy::new());
+    local_spy.enforce_physical_admission();
+    let local_provider = CountingKeyProvider::with_key("local-oversized-physical", 0x19);
+    let local_fixture = JournalFixture::new(0x95);
+    let local_journal = local_fixture.open();
+    let local = EncryptingSessionBackend::new(
+        Arc::clone(&local_spy),
+        Arc::clone(&local_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_journal(Arc::clone(&local_journal));
+    let local_request = create_request_with_payload(0x51, &payload);
+    assert!(matches!(
+        local.prepare_fenced_transition(local_request.clone()).await,
+        Err(StoreError::PayloadTooLarge { .. })
+    ));
+    assert_eq!(local_provider.calls(), 1);
+    assert!(local_spy.prepared().is_empty());
+    assert!(local_spy.executed().is_empty());
+    assert_eq!(local_spy.dispatches(), 0);
+    assert!(matches!(
+        local_journal
+            .lookup(local_request.request_id())
+            .await
+            .expect("journal lookup"),
+        PreparedFencedTransitionLookup::Absent
+    ));
+
+    let remote_spy = Arc::new(AtomicSpy::new());
+    remote_spy.enforce_physical_admission();
+    let remote_provider = CountingRemoteProvider::with_key("remote-oversized-physical", 0x1a);
+    let remote_fixture = JournalFixture::new(0x96);
+    let remote_journal = remote_fixture.open();
+    let remote = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_spy),
+        Arc::clone(&remote_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_journal(Arc::clone(&remote_journal));
+    let remote_request = create_request_with_payload(0x52, &payload);
+    assert!(matches!(
+        remote
+            .prepare_fenced_transition(remote_request.clone())
+            .await,
+        Err(StoreError::PayloadTooLarge { .. })
+    ));
+    assert_eq!(remote_provider.calls(), 1);
+    assert!(remote_spy.prepared().is_empty());
+    assert!(remote_spy.executed().is_empty());
+    assert_eq!(remote_spy.dispatches(), 0);
     assert!(matches!(
         remote_journal
             .lookup(remote_request.request_id())

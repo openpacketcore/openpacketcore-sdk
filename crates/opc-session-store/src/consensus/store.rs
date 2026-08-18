@@ -84,6 +84,23 @@ use crate::ttl::{
     checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at,
 };
 
+/// Validate a physical fenced-transition request before it crosses the
+/// consensus boundary.
+///
+/// This is deliberately narrower than the SQLite implementation: consumers
+/// and protection adapters need the same physical-record admission rule
+/// without gaining access to SQLite internals.
+#[doc(hidden)]
+pub fn validate_consensus_physical_fenced_transition_request(
+    request: &FencedTransitionRequest,
+) -> Result<(), StoreError> {
+    request.validate()?;
+    if let Some(record) = request.mutation().record() {
+        crate::sqlite::validate_consensus_record(record)?;
+    }
+    Ok(())
+}
+
 mod membership;
 
 use membership::SessionTopologyCoordinatorState;
@@ -4957,10 +4974,7 @@ impl SessionBackend for ConsensusSessionStore {
         &self,
         request: FencedTransitionRequest,
     ) -> Result<PreparedFencedTransition, StoreError> {
-        request.validate()?;
-        if let Some(record) = request.mutation().record() {
-            crate::sqlite::validate_consensus_record(record)?;
-        }
+        validate_consensus_physical_fenced_transition_request(&request)?;
         PreparedFencedTransition::from_unprotected_request(request)?.with_protection(
             PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
                 storage_commitment: prepared_fenced_transition_storage_commitment(
@@ -6320,6 +6334,79 @@ mod membership_tests {
         record.payload =
             EncryptedSessionPayload::try_envelope(encoded).expect("bounded envelope fixture");
         record
+    }
+
+    #[test]
+    fn physical_fenced_transition_admission_enforces_exact_record_cap_only() {
+        let logical_time = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let key = SessionKey {
+            tenant: TenantId::new("physical-fenced-admission").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"physical-fenced-admission")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let owner = OwnerId::new("physical-fenced-admission-owner").expect("owner");
+        let lease = LeaseGuard::new(
+            key.clone(),
+            owner,
+            FenceToken::new(1),
+            logical_time,
+            checked_session_deadline(logical_time, Duration::from_secs(60))
+                .expect("lease deadline"),
+            1,
+        );
+        let make_request = |request_id, mutation| {
+            FencedTransitionRequest::new(
+                FencedTransitionRequestId::from_bytes([request_id; 16]),
+                FencedTransitionLease::renew(lease.clone(), Duration::from_secs(30))
+                    .expect("renewal"),
+                mutation,
+            )
+            .expect("fenced transition")
+        };
+
+        let exact = make_request(
+            0x31,
+            FencedTransitionMutation::update(
+                Generation::new(0),
+                consumer_record_with_payload_len(
+                    &key,
+                    &lease,
+                    crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+                ),
+            ),
+        );
+        assert!(validate_consensus_physical_fenced_transition_request(&exact).is_ok());
+
+        let oversized = make_request(
+            0x32,
+            FencedTransitionMutation::update(
+                Generation::new(0),
+                consumer_record_with_payload_len(
+                    &key,
+                    &lease,
+                    crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 1,
+                ),
+            ),
+        );
+        assert_eq!(
+            validate_consensus_physical_fenced_transition_request(&oversized),
+            Err(StoreError::PayloadTooLarge {
+                actual: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 1,
+                max: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+            })
+        );
+
+        let delete = make_request(0x33, FencedTransitionMutation::delete(Generation::new(1)));
+        let refresh = make_request(
+            0x34,
+            FencedTransitionMutation::refresh_ttl(Generation::new(1), Duration::from_secs(30))
+                .expect("refresh"),
+        );
+        assert!(validate_consensus_physical_fenced_transition_request(&delete).is_ok());
+        assert!(validate_consensus_physical_fenced_transition_request(&refresh).is_ok());
     }
 
     async fn consumer_boundary_store() -> (

@@ -99,18 +99,19 @@ pub use capability::{
 };
 pub use clock::{Clock, MonotonicClock, SystemClock, TokioVirtualClock};
 pub use consensus::{
-    ConsensusSessionConsumerService, ConsensusSessionStore, ConsensusSessionStoreOpenError,
-    SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
-    SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusIdentity,
-    SessionConsensusIdentityError, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRequestId, SessionConsensusResponse,
-    SessionConsensusRpc, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
-    SessionConsensusStatus, SessionConsensusStorageAnchor, SessionConsensusWireRequest,
-    SessionConsensusWireResponse, SessionMutationIntent, SessionMutationOutcome,
-    SessionTopologyCandidateBootstrap, SessionTopologyTransitionPeers,
-    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
-    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
-    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
+    validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
+    ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusClusterId,
+    SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+    SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusIdentityError,
+    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpc,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusStatus,
+    SessionConsensusStorageAnchor, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionMutationIntent, SessionMutationOutcome, SessionTopologyCandidateBootstrap,
+    SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
+    SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 pub use consumer::{
     derive_consumer_consensus_request_id, session_consumer_batch_result,
