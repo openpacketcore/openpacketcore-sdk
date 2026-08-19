@@ -397,11 +397,25 @@ const FENCED_TRANSITION_V2_OUTER_REQUEST_ID_DOMAIN: &[u8] =
 pub enum AtomicFencedTransitionCapability {
     /// One exact-key lease acquire/renew and one same-record mutation.
     V1,
-    /// V2's epoch-fenced, reclaimable receipt history with the fixed profile
-    /// identified by [`fenced_transition_v2_profile_digest`].
+    /// Caller-side durable recovery of an exact protected request by its
+    /// stable transition identity before any ambiguous dispatch.
     ///
-    /// This is not a reinterpretation of `V1`: callers must submit V2
-    /// requests and use V2 status/history types when this variant is offered.
+    /// This is an SDK-owned protected composition over an inner V1 physical
+    /// transition. It does not advertise epoch-fenced receipt history; that
+    /// separate protocol contract uses [`FencedTransitionV2Capability`].
+    V2,
+}
+
+/// Exact epoch-fenced, non-absorbing V2 receipt-history contract.
+///
+/// This capability is separate from [`AtomicFencedTransitionCapability`]: it
+/// proves the immutable V2 consensus profile and history lifecycle, but makes
+/// no caller-side prepared-token journal recovery promise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum FencedTransitionV2Capability {
+    /// Epoch-fenced, reclaimable receipt history with the fixed profile
+    /// identified by [`fenced_transition_v2_profile_digest`].
     V2,
 }
 
@@ -1736,7 +1750,7 @@ impl fmt::Debug for FencedTransitionV2Request {
 /// bounds, receipt codec, command codecs, status meanings, initial history
 /// epoch, capacity, operational target, and reclaim batch. V2 intentionally
 /// has no negotiable history-limit fields: two implementations advertising
-/// [`AtomicFencedTransitionCapability::V2`] must report the same digest.
+/// [`FencedTransitionV2Capability::V2`] must report the same digest.
 pub fn fenced_transition_v2_profile_digest() -> [u8; FENCED_TRANSITION_V2_BODY_COMMITMENT_BYTES] {
     fenced_transition_v2_profile_digest_with_retention_inputs(
         FENCED_TRANSITION_V2_RETENTION_PROFILE_INPUTS,

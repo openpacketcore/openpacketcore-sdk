@@ -506,8 +506,10 @@ the V1 limit, locally delete V1 tombstones, or silently route V1 callers to
 V2. The V1 capability continues to mean exactly the contract above.
 
 V2 is an explicit, separately probed protocol with schema version 2 and
-`AtomicFencedTransitionCapability::V2`. A V2 proof carries the immutable V2
-profile digest; the digest covers the schema, full identity layout, canonical
+`FencedTransitionV2Capability::V2`. This capability is distinct from
+`AtomicFencedTransitionCapability::V2`, which only promises protected
+prepared-token journal recovery. A V2 proof carries the immutable V2 profile
+digest; the digest covers the schema, full identity layout, canonical
 body-commitment domain, active-epoch limit, operational target, and reclaim
 batch. The fixed profile digest is published by
 `fenced_transition_v2_profile_digest()` and is exactly

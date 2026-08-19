@@ -68,10 +68,9 @@ use crate::error::{LeaseError, StoreError};
 use crate::fenced_transition::{
     AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionObservation,
     FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionStatus,
-    FencedTransitionV2HistoryEpoch,
-    FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2Status,
-    PreparedFencedTransition, PreparedFencedTransitionProtection, FENCED_TRANSITION_SCHEMA_V1,
-    FENCED_TRANSITION_SCHEMA_V2,
+    FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, FencedTransitionV2HistoryState,
+    FencedTransitionV2Request, FencedTransitionV2Status, PreparedFencedTransition,
+    PreparedFencedTransitionProtection, FENCED_TRANSITION_SCHEMA_V1, FENCED_TRANSITION_SCHEMA_V2,
     FENCED_TRANSITION_V2_CONSENSUS_SCHEMA_VERSION, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
     FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES,
     FENCED_TRANSITION_V2_MIN_CONSENSUS_RPC_PAYLOAD_BYTES,
@@ -482,12 +481,12 @@ enum FencedTransitionV2CapabilityReply {
 
 fn fenced_transition_v2_capability_probe_reply(
     probe: FencedTransitionV2CapabilityProbe,
-    local_capability: AtomicFencedTransitionCapability,
+    local_capability: Option<FencedTransitionV2Capability>,
 ) -> FencedTransitionV2CapabilityReply {
     let local_profile = crate::fenced_transition::fenced_transition_v2_profile_digest();
     if probe.schema_version == FENCED_TRANSITION_SCHEMA_V2
         && probe.profile_digest == local_profile
-        && local_capability == AtomicFencedTransitionCapability::V2
+        && local_capability == Some(FencedTransitionV2Capability::V2)
     {
         FencedTransitionV2CapabilityReply::V2 {
             profile_digest: local_profile,
@@ -1009,7 +1008,7 @@ impl ConsensusSessionStore {
         AtomicFencedTransitionCapability::V1
     }
 
-    fn local_fenced_transition_v2_capability(&self) -> AtomicFencedTransitionCapability {
+    fn local_fenced_transition_v2_capability(&self) -> Option<FencedTransitionV2Capability> {
         // V2 is a separate concrete SQLite state-machine profile.  Do not
         // infer it from V1 or from any individual backend feature bit. The
         // profile-bound payload, command-schema, RPC, and durable-log limits
@@ -1106,7 +1105,7 @@ impl ConsensusSessionStore {
         self.require_application_traffic_authority_before(deadline)
             .await?;
         let expected_scope = self.current_scope()?;
-        if self.local_fenced_transition_v2_capability() != AtomicFencedTransitionCapability::V2 {
+        if self.local_fenced_transition_v2_capability() != Some(FencedTransitionV2Capability::V2) {
             return Err(unsupported_fenced_transition_v2());
         }
         if !expected_scope.1.contains(&self.inner.local_node_id) {
@@ -1183,13 +1182,13 @@ impl ConsensusSessionStore {
     /// unanimous exact-profile proof that can seed the first V2 transition.
     pub async fn fenced_transition_v2_capability(
         &self,
-    ) -> Result<Option<AtomicFencedTransitionCapability>, StoreError> {
+    ) -> Result<Option<FencedTransitionV2Capability>, StoreError> {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
         self.require_fenced_transition_v2_capability_before(deadline)
             .await
-            .map(|_| Some(AtomicFencedTransitionCapability::V2))
+            .map(|_| Some(FencedTransitionV2Capability::V2))
     }
 
     /// Obtain a fresh record plus the durable fence floor for one exact key.
@@ -4089,7 +4088,7 @@ fn local_fenced_transition_v2_capability_for_backend_capabilities(
     consensus_schema_version: u16,
     rpc_payload_capacity: usize,
     durable_log_entry_capacity: usize,
-) -> AtomicFencedTransitionCapability {
+) -> Option<FencedTransitionV2Capability> {
     // V2's record-envelope and command-transport limits are hashed into the
     // immutable V2 validation profile. This check deliberately precedes every
     // local V2 advertisement, probe acknowledgement, and activation path.
@@ -4102,11 +4101,12 @@ fn local_fenced_transition_v2_capability_for_backend_capabilities(
         && rpc_payload_capacity >= FENCED_TRANSITION_V2_MIN_CONSENSUS_RPC_PAYLOAD_BYTES
         && durable_log_entry_capacity >= FENCED_TRANSITION_V2_MIN_DURABLE_LOG_ENTRY_BYTES
     {
-        AtomicFencedTransitionCapability::V2
+        Some(FencedTransitionV2Capability::V2)
     } else {
-        // Keep V1's frozen semantics and its independent capability probe
-        // available when the V2-only profile cannot be honored locally.
-        AtomicFencedTransitionCapability::V1
+        // The separate V1 capability/probe remains available through
+        // `fenced_transition_capability`, but this V2-only profile is not
+        // advertised when any exact input does not match.
+        None
     }
 }
 
@@ -4140,14 +4140,14 @@ fn unsupported_fenced_transition() -> StoreError {
 }
 
 fn unsupported_fenced_transition_v2() -> StoreError {
-    StoreError::CapabilityNotSupported("atomic_fenced_transition_v2".into())
+    StoreError::CapabilityNotSupported("atomic_fenced_transition_epoch_history_v2".into())
 }
 
 fn fenced_transition_v2_capability_failure_reply(error: StoreError) -> ForwardMutationReply {
     if matches!(
         error,
         StoreError::CapabilityNotSupported(ref reason)
-            if reason == "atomic_fenced_transition_v2"
+            if reason == "atomic_fenced_transition_epoch_history_v2"
     ) {
         return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
             unsupported_fenced_transition_v2(),
@@ -4384,7 +4384,7 @@ fn rejected_error_matches_intent(intent: &SessionMutationIntent, error: &StoreEr
                 SessionMutationIntent::FencedTransitionV2(_)
                     | SessionMutationIntent::ActivateFencedTransitionV2 { .. },
                 StoreError::CapabilityNotSupported(reason)
-            ) if reason == "atomic_fenced_transition_v2"
+            ) if reason == "atomic_fenced_transition_epoch_history_v2"
         )
         || matches!(
             (intent, error),
@@ -5812,7 +5812,7 @@ impl SessionBackend for ConsensusSessionStore {
 
     async fn fenced_transition_v2_capability(
         &self,
-    ) -> Result<Option<AtomicFencedTransitionCapability>, StoreError> {
+    ) -> Result<Option<FencedTransitionV2Capability>, StoreError> {
         ConsensusSessionStore::fenced_transition_v2_capability(self).await
     }
 
@@ -7207,7 +7207,7 @@ mod membership_tests {
                 exact_transport().1,
                 exact_transport().2,
             ),
-            AtomicFencedTransitionCapability::V2,
+            Some(FencedTransitionV2Capability::V2),
             "the concrete SQLite consensus cap exactly matches V2's profile"
         );
         let probe = FencedTransitionV2CapabilityProbe {
@@ -7237,8 +7237,7 @@ mod membership_tests {
             exact_transport().2,
         );
         assert_eq!(
-            capability,
-            AtomicFencedTransitionCapability::V1,
+            capability, None,
             "a local cap drift must not advertise V2 or permit V2 activation"
         );
         assert_eq!(
@@ -7254,7 +7253,7 @@ mod membership_tests {
                 exact_transport().1,
                 exact_transport().2,
             ),
-            AtomicFencedTransitionCapability::V1,
+            None,
             "V2 refuses a consensus command schema other than its pinned schema one"
         );
         assert_eq!(
@@ -7264,7 +7263,7 @@ mod membership_tests {
                 FENCED_TRANSITION_V2_MIN_CONSENSUS_RPC_PAYLOAD_BYTES - 1,
                 exact_transport().2,
             ),
-            AtomicFencedTransitionCapability::V1,
+            None,
             "V2 refuses a Postcard RPC transport below its profiled command minimum"
         );
         assert_eq!(
@@ -7274,7 +7273,7 @@ mod membership_tests {
                 exact_transport().1,
                 FENCED_TRANSITION_V2_MIN_DURABLE_LOG_ENTRY_BYTES - 1,
             ),
-            AtomicFencedTransitionCapability::V1,
+            None,
             "V2 refuses a durable JSON command log below its profiled entry minimum"
         );
     }

@@ -139,10 +139,10 @@ pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;
 pub use fenced_transition::{
     fenced_transition_v2_profile_digest, AtomicFencedTransitionCapability,
-    FencedTransitionExecuteError, FencedTransitionLease,
-    FencedTransitionMutation, FencedTransitionMutationResult, FencedTransitionObservation,
-    FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
-    FencedTransitionStatus, FencedTransitionV2CallerNonce, FencedTransitionV2HistoryEpoch,
+    FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,
+    FencedTransitionMutationResult, FencedTransitionObservation, FencedTransitionOutcome,
+    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus,
+    FencedTransitionV2CallerNonce, FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch,
     FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2RequestId,
     FencedTransitionV2Status, PreparedFencedTransition, PreparedFencedTransitionError,
     PreparedFencedTransitionLookup, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
