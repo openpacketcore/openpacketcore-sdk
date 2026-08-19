@@ -2,8 +2,8 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,23 +11,33 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
+use opc_key::{
+    KeyHandle, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider, Zeroizing,
+    AES_256_GCM_SIV_KEY_LEN,
+};
 use opc_session_net::{
-    conservative_payload_budget, PersistentSessionConsumerClient, RemoteAddrResolver,
-    SessionConsumerAuthorizer, SessionConsumerClientError, SessionConsumerLeaseMutationError,
+    conservative_payload_budget, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
+    RemoteAddrResolver, SessionConsumerAuthorizer, SessionConsumerClientError,
+    SessionConsumerFencedTransitionBackend, SessionConsumerLeaseMutationError,
     SessionConsumerMutationError, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
     MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
     SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
-    BackendCapabilities, ConsensusSessionStore, EncryptedSessionPayload, FenceToken, Generation,
-    OwnerId, QuorumReplicaDescriptor, RecordExpiryPreflight, ReplicaBackingIdentity,
-    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest,
-    SessionConsensusIdentity, SessionConsumerChange, SessionConsumerIdentity,
-    SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
-    SessionLeaseManager, SessionOp, SessionQuorumConsumer, SqliteSessionBackend, StateClass,
-    StateType, StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    AtomicFencedTransitionCapability, BackendCapabilities, ConsensusSessionStore,
+    EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
+    FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
+    FencedTransitionRequestId, FencedTransitionStatus, Generation, OwnerId,
+    PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
+    PreparedFencedTransitionLookup, QuorumReplicaDescriptor, RecordExpiryPreflight,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    RestoreScanRequest, SessionBackend, SessionConsensusIdentity, SessionConsumerChange,
+    SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
+    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
+    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionPayloadEncoding, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
+    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
@@ -257,6 +267,231 @@ fn test_key() -> SessionKey {
             .try_into()
             .expect("stable ID"),
     }
+}
+
+struct CountingKeyProvider {
+    inner: MemoryKeyProvider,
+    calls: AtomicUsize,
+}
+
+impl CountingKeyProvider {
+    fn with_active_session_key() -> Arc<Self> {
+        let provider = Arc::new(Self {
+            inner: MemoryKeyProvider::new(),
+            calls: AtomicUsize::new(0),
+        });
+        provider
+            .inner
+            .insert_active_key(
+                KeyId::new("consumer-v2-test-key").expect("test key ID"),
+                KeyPurpose::Session,
+                TenantId::new("consumer-test").expect("test tenant"),
+                Zeroizing::new([0x61; AES_256_GCM_SIV_KEY_LEN]),
+            )
+            .expect("install test key");
+        provider
+    }
+
+    fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryKeyProvider::new(),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl KeyProvider for CountingKeyProvider {
+    async fn get_active_key(
+        &self,
+        purpose: KeyPurpose,
+        tenant: &TenantId,
+    ) -> Result<KeyHandle, opc_key::KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_active_key(purpose, tenant).await
+    }
+
+    async fn get_key_by_id(&self, key_id: &KeyId) -> Result<KeyHandle, opc_key::KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_key_by_id(key_id).await
+    }
+
+    async fn rotate_key(
+        &self,
+        purpose: KeyPurpose,
+        tenant: &TenantId,
+    ) -> Result<KeyId, opc_key::KeyError> {
+        self.inner.rotate_key(purpose, tenant).await
+    }
+}
+
+/// For one successful physical transition, retain only the protected request
+/// shape and deliberately replace the confirmed response with ambiguity.
+struct OneShotOutcomeUnknownConsumer {
+    inner: Arc<dyn SessionQuorumConsumer>,
+    armed: AtomicBool,
+    physical_payload_encoding: Mutex<Option<SessionPayloadEncoding>>,
+    physical_payload_is_logical: AtomicBool,
+}
+
+impl OneShotOutcomeUnknownConsumer {
+    fn new(inner: Arc<dyn SessionQuorumConsumer>) -> Self {
+        Self {
+            inner,
+            armed: AtomicBool::new(true),
+            physical_payload_encoding: Mutex::new(None),
+            physical_payload_is_logical: AtomicBool::new(false),
+        }
+    }
+
+    fn physical_payload_encoding(&self) -> Option<SessionPayloadEncoding> {
+        *self
+            .physical_payload_encoding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn physical_payload_is_logical(&self) -> bool {
+        self.physical_payload_is_logical.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl SessionQuorumConsumer for OneShotOutcomeUnknownConsumer {
+    async fn execute(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: SessionConsumerRequest,
+    ) -> SessionConsumerResponse {
+        let physical_evidence = match request.operation() {
+            SessionConsumerOperation::FencedTransition { request } => {
+                request.mutation().record().map(|record| {
+                    (
+                        record.payload.encoding(),
+                        record.payload.as_bytes() == [0xa1],
+                    )
+                })
+            }
+            _ => None,
+        };
+        let request_id = request.request_id();
+        let response = self.inner.execute(identity, request).await;
+        if let Some((encoding, is_logical)) = physical_evidence {
+            *self
+                .physical_payload_encoding
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(encoding);
+            self.physical_payload_is_logical
+                .store(is_logical, Ordering::SeqCst);
+            if matches!(response, SessionConsumerResponse::FencedTransition(Ok(_)))
+                && self
+                    .armed
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                return SessionConsumerResponse::OutcomeUnknown(
+                    SessionConsumerOutcomeUnknown::Mutation { request_id },
+                );
+            }
+        }
+        response
+    }
+
+    async fn watch(
+        &self,
+        identity: &SessionConsumerIdentity,
+        scope: SessionConsumerScope,
+        start_sequence: u64,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+        SessionConsumerRejection,
+    > {
+        self.inner.watch(identity, scope, start_sequence).await
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FencedConsumerClientKind {
+    Stateless,
+    Persistent,
+}
+
+struct FencedConsumerClientHandle {
+    backend: Arc<dyn SessionBackend>,
+    persistent: Option<PersistentSessionConsumerClient>,
+}
+
+impl FencedConsumerClientHandle {
+    async fn shutdown(self) {
+        if let Some(client) = self.persistent {
+            let _ = client.shutdown().await;
+        }
+    }
+}
+
+fn fenced_consumer_backend(
+    kind: FencedConsumerClientKind,
+    pki: &TestPki,
+    address: SocketAddr,
+    server_spiffe: &str,
+    client_spiffe: &str,
+    scope: SessionConsumerScope,
+) -> FencedConsumerClientHandle {
+    let stateless = consumer_client(pki, address, server_spiffe, client_spiffe, scope);
+    match kind {
+        FencedConsumerClientKind::Stateless => FencedConsumerClientHandle {
+            backend: Arc::new(
+                SessionConsumerFencedTransitionBackend::stateless(stateless)
+                    .expect("stateless fenced-transition adapter"),
+            ),
+            persistent: None,
+        },
+        FencedConsumerClientKind::Persistent => {
+            let persistent = PersistentSessionConsumerClient::try_from_stateless(
+                stateless,
+                PersistentSessionConsumerConfig::default(),
+            )
+            .expect("persistent fenced-transition client");
+            FencedConsumerClientHandle {
+                backend: Arc::new(
+                    SessionConsumerFencedTransitionBackend::persistent(persistent.clone())
+                        .expect("persistent fenced-transition adapter"),
+                ),
+                persistent: Some(persistent),
+            }
+        }
+    }
+}
+
+fn fenced_create_request(payload: u8) -> FencedTransitionRequest {
+    let key = test_key();
+    let owner = OwnerId::new("x").expect("test owner");
+    let lease = FencedTransitionLease::acquire(
+        key.clone(),
+        owner.clone(),
+        FenceToken::new(0),
+        Duration::from_secs(30),
+    )
+    .expect("test acquire lease");
+    FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0x71; 16]),
+        lease.clone(),
+        FencedTransitionMutation::create(StoredSessionRecord {
+            key,
+            generation: Generation::new(1),
+            owner,
+            fence: lease.committed_fence().expect("committed fence"),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("x"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([payload]),
+        }),
+    )
+    .expect("test create request")
 }
 
 async fn test_lease() -> opc_session_store::LeaseGuard {
@@ -1539,4 +1774,192 @@ async fn stateless_and_persistent_consumers_accept_shorter_and_zero_ttl_renewals
 
     persistent.shutdown().await;
     handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn authenticated_consumer_v2_recovers_journaled_protected_transition_after_tls_ambiguity() {
+    for client_kind in [
+        FencedConsumerClientKind::Stateless,
+        FencedConsumerClientKind::Persistent,
+    ] {
+        let pki = TestPki::new();
+        let server_spiffe = spiffe("v2-server");
+        let client_spiffe = spiffe("v2-client");
+        let (snapshots, store, scope, authorizer) =
+            admitted_store_and_authorizer([client_spiffe.clone()]).await;
+        let initial_service = Arc::new(OneShotOutcomeUnknownConsumer::new(Arc::new(
+            store.consumer_service(),
+        )));
+        let initial_service_for_server: Arc<dyn SessionQuorumConsumer> = initial_service.clone();
+        let (initial_handle, initial_address) = SessionQuorumConsumerServer::new(
+            initial_service_for_server,
+            pki.server_config(&server_spiffe),
+            authorizer.clone(),
+        )
+        .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+        .await
+        .expect("start initial consumer listener");
+
+        let journal_directory = tempfile::tempdir().expect("journal directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(
+                journal_directory.path(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .expect("private journal directory");
+        }
+        let journal_path = journal_directory.path().join("prepared.sqlite");
+        let journal_key = [0x91; 32];
+        let initial_journal = Arc::new(
+            PreparedFencedTransitionJournal::create_new(
+                &journal_path,
+                PreparedFencedTransitionJournalKey::from_bytes(journal_key),
+            )
+            .expect("open prepared journal"),
+        );
+        let initial_client = fenced_consumer_backend(
+            client_kind,
+            &pki,
+            initial_address,
+            &server_spiffe,
+            &client_spiffe,
+            scope,
+        );
+        let initial_physical = Arc::clone(&initial_client.backend);
+        let initial_provider = CountingKeyProvider::with_active_session_key();
+        let initial_outer: Arc<dyn SessionBackend> = Arc::new(
+            EncryptingSessionBackend::new(
+                Arc::clone(&initial_physical),
+                Arc::clone(&initial_provider),
+                "consumer-v2-protected",
+            )
+            .with_fenced_transition_journal(Arc::clone(&initial_journal)),
+        );
+
+        assert!(matches!(
+            initial_outer
+                .fenced_transition_capability()
+                .await
+                .expect("capability"),
+            Some(AtomicFencedTransitionCapability::V2)
+        ));
+        let prepared = initial_outer
+            .prepare_fenced_transition(fenced_create_request(0xa1))
+            .await
+            .expect("prepare protected transition");
+        assert_eq!(
+            initial_provider.calls(),
+            1,
+            "preparation uses exactly one provider operation"
+        );
+        let request_id = prepared.request_id();
+        let expected_token = Zeroizing::new(prepared.as_bytes().to_vec());
+        assert!(matches!(
+            initial_outer.fenced_transition(&prepared).await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { request_id: recovered_id })
+                if recovered_id == request_id
+        ));
+        assert_eq!(
+            initial_service
+                .physical_payload_encoding()
+                .expect("initial service observed physical transition"),
+            SessionPayloadEncoding::EnvelopeV1
+        );
+        assert!(
+            !initial_service.physical_payload_is_logical(),
+            "the physical consumer request remains sealed"
+        );
+
+        drop(initial_outer);
+        drop(initial_physical);
+        drop(initial_journal);
+        initial_client.shutdown().await;
+        drop(initial_provider);
+        drop(prepared);
+        initial_handle.abort_and_wait().await;
+
+        let replacement_service = Arc::new(store.consumer_service());
+        let (replacement_handle, replacement_address) = SessionQuorumConsumerServer::new(
+            replacement_service,
+            pki.server_config(&server_spiffe),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+        .await
+        .expect("start replacement consumer listener");
+        let replacement_journal = Arc::new(
+            PreparedFencedTransitionJournal::open_existing(
+                &journal_path,
+                PreparedFencedTransitionJournalKey::from_bytes(journal_key),
+            )
+            .expect("reopen prepared journal"),
+        );
+        let replacement_client = fenced_consumer_backend(
+            client_kind,
+            &pki,
+            replacement_address,
+            &server_spiffe,
+            &client_spiffe,
+            scope,
+        );
+        let replacement_physical = Arc::clone(&replacement_client.backend);
+        let replacement_provider = CountingKeyProvider::empty();
+        let replacement_outer: Arc<dyn SessionBackend> = Arc::new(
+            EncryptingSessionBackend::new(
+                Arc::clone(&replacement_physical),
+                Arc::clone(&replacement_provider),
+                "consumer-v2-protected",
+            )
+            .with_fenced_transition_journal(replacement_journal),
+        );
+        let recovered = match replacement_outer
+            .recover_prepared_fenced_transition(request_id)
+            .await
+            .expect("recover prepared transition")
+        {
+            PreparedFencedTransitionLookup::Found(prepared) => prepared,
+            PreparedFencedTransitionLookup::Absent => panic!("prepared transition was lost"),
+            _ => panic!("prepared transition lookup was unsupported"),
+        };
+        let recovered_is_exact = recovered.as_bytes() == expected_token.as_slice();
+        assert!(recovered_is_exact, "recovered token is exact");
+
+        let _outcome = replacement_outer
+            .fenced_transition(&recovered)
+            .await
+            .expect("recover exact transition");
+        assert!(matches!(
+            replacement_outer
+                .fenced_transition_status(&recovered)
+                .await
+                .expect("recover transition status"),
+            FencedTransitionStatus::Recorded(_)
+        ));
+        assert_eq!(
+            replacement_provider.calls(),
+            0,
+            "recovery never invokes the fresh provider"
+        );
+        assert!(matches!(
+            replacement_outer
+                .prepare_fenced_transition(fenced_create_request(0xa2))
+                .await,
+            Err(StoreError::FencedTransitionRequestConflict)
+        ));
+        assert_eq!(
+            replacement_provider.calls(),
+            0,
+            "same-ID replacement is rejected before provider work"
+        );
+
+        drop(replacement_outer);
+        drop(replacement_physical);
+        replacement_client.shutdown().await;
+        replacement_handle.abort_and_wait().await;
+        drop(store);
+        drop(snapshots);
+    }
 }

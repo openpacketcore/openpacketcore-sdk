@@ -51,6 +51,7 @@ pub mod consumer;
 pub mod error;
 pub mod fake;
 pub mod fenced_transition;
+pub mod fenced_transition_journal;
 pub mod handover;
 mod hex;
 pub mod lease;
@@ -70,6 +71,9 @@ pub mod store;
 pub mod topology;
 pub mod topology_attestation;
 pub mod ttl;
+
+#[cfg(test)]
+mod protected_fenced_transition_tests;
 
 pub use backend::{
     next_replication_sequence, record_expiry_preflights, validate_record_expiry_preflights_at,
@@ -95,18 +99,19 @@ pub use capability::{
 };
 pub use clock::{Clock, MonotonicClock, SystemClock, TokioVirtualClock};
 pub use consensus::{
-    ConsensusSessionConsumerService, ConsensusSessionStore, ConsensusSessionStoreOpenError,
-    SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
-    SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusIdentity,
-    SessionConsensusIdentityError, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRequestId, SessionConsensusResponse,
-    SessionConsensusRpc, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
-    SessionConsensusStatus, SessionConsensusStorageAnchor, SessionConsensusWireRequest,
-    SessionConsensusWireResponse, SessionMutationIntent, SessionMutationOutcome,
-    SessionTopologyCandidateBootstrap, SessionTopologyTransitionPeers,
-    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
-    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
-    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
+    validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
+    ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusClusterId,
+    SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+    SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusIdentityError,
+    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpc,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusStatus,
+    SessionConsensusStorageAnchor, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionMutationIntent, SessionMutationOutcome, SessionTopologyCandidateBootstrap,
+    SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
+    SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 pub use consumer::{
     derive_consumer_consensus_request_id, session_consumer_batch_result,
@@ -124,12 +129,19 @@ pub use consumer::{
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;
 pub use fenced_transition::{
-    AtomicFencedTransitionCapability, FencedTransitionLease, FencedTransitionMutation,
-    FencedTransitionMutationResult, FencedTransitionObservation, FencedTransitionOutcome,
-    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus,
-    FENCED_TRANSITION_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_MAX_OUTCOME_BYTES,
-    FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_REQUEST_ID_BYTES,
+    AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionLease,
+    FencedTransitionMutation, FencedTransitionMutationResult, FencedTransitionObservation,
+    FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
+    FencedTransitionStatus, PreparedFencedTransition, PreparedFencedTransitionError,
+    PreparedFencedTransitionLookup, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_MAX_OUTCOME_BYTES, FENCED_TRANSITION_MAX_PREPARED_BYTES,
+    FENCED_TRANSITION_MAX_PREPARED_LAYERS, FENCED_TRANSITION_OUTCOME_RETENTION,
+    FENCED_TRANSITION_PREPARED_SCHEMA_V1, FENCED_TRANSITION_REQUEST_ID_BYTES,
     FENCED_TRANSITION_SCHEMA_V1,
+};
+pub use fenced_transition_journal::{
+    PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
+    PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES,
 };
 pub use handover::{
     HandoverEnvelope, HandoverEnvelopeDecodeError, HandoverEnvelopeFormat, HandoverError,

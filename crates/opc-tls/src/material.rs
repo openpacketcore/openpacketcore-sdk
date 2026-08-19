@@ -612,6 +612,33 @@ impl TlsMaterialController {
         *self.inner.status_tx.borrow()
     }
 
+    /// Return a fixed-domain opaque commitment to the pinned local SPIFFE
+    /// identity.
+    ///
+    /// The commitment remains stable when that identity rotates certificates
+    /// or keys. It never exposes identity text, certificates, or key material,
+    /// and is absent until this controller has accepted or was configured with
+    /// a local identity pin.
+    pub fn local_spiffe_identity_commitment(&self) -> Option<[u8; 32]> {
+        self.refresh();
+        let state = lock_unpoisoned(&self.inner.state);
+        let identity = state.pinned_spiffe_id.as_ref().or_else(|| {
+            state
+                .snapshot
+                .as_ref()
+                .map(|snapshot| &snapshot.state.identity.spiffe_id)
+        })?;
+        let mut digest = Sha256::new();
+        digest.update(b"openpacketcore/tls/local-spiffe-identity-commitment/v1\0");
+        digest.update(
+            u16::try_from(identity.as_str().len())
+                .expect("validated SPIFFE identity length fits commitment encoding")
+                .to_be_bytes(),
+        );
+        digest.update(identity.as_str().as_bytes());
+        Some(digest.finalize().into())
+    }
+
     /// Subscribe to status changes driven by snapshot/status access.
     pub fn subscribe_status(&self) -> watch::Receiver<TlsMaterialStatus> {
         self.refresh();

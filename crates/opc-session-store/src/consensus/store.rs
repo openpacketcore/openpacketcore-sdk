@@ -62,8 +62,9 @@ use crate::consumer::{
 };
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_transition::{
-    AtomicFencedTransitionCapability, FencedTransitionObservation, FencedTransitionOutcome,
-    FencedTransitionRequest, FencedTransitionStatus, FENCED_TRANSITION_SCHEMA_V1,
+    AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionObservation,
+    FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionStatus,
+    PreparedFencedTransition, PreparedFencedTransitionProtection, FENCED_TRANSITION_SCHEMA_V1,
 };
 use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{OwnerId, SessionKey};
@@ -82,6 +83,23 @@ use crate::topology_attestation::{
 use crate::ttl::{
     checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at,
 };
+
+/// Validate a physical fenced-transition request before it crosses the
+/// consensus boundary.
+///
+/// This is deliberately narrower than the SQLite implementation: consumers
+/// and protection adapters need the same physical-record admission rule
+/// without gaining access to SQLite internals.
+#[doc(hidden)]
+pub fn validate_consensus_physical_fenced_transition_request(
+    request: &FencedTransitionRequest,
+) -> Result<(), StoreError> {
+    request.validate()?;
+    if let Some(record) = request.mutation().record() {
+        crate::sqlite::validate_consensus_record(record)?;
+    }
+    Ok(())
+}
 
 mod membership;
 
@@ -4860,8 +4878,35 @@ fn consumer_watch_setup_terminal(error: StoreError) -> Option<SessionConsumerSto
     }
 }
 
+fn prepared_fenced_transition_storage_commitment(identity: SessionConsensusIdentity) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"openpacketcore/session-store/prepared-consensus-storage/v1\0");
+    digest.update(identity.cluster_id().as_bytes());
+    digest.update(identity.configuration_id().as_bytes());
+    digest.update(identity.configuration_epoch().get().to_be_bytes());
+    digest.finalize().into()
+}
+
 #[async_trait]
 impl SessionBackend for ConsensusSessionStore {
+    fn fenced_transition_preserves_protected_payloads(&self) -> bool {
+        true
+    }
+
+    fn fenced_transition_accepts_prepared_physical_token(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> bool {
+        prepared
+            .without_outer_protection(PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+                storage_commitment: prepared_fenced_transition_storage_commitment(
+                    self.inner.storage_identity,
+                ),
+            })
+            .and_then(|inner| inner.request_for_unprotected_backend())
+            .is_ok()
+    }
+
     fn restore_scan_cursor_profile(&self) -> Option<crate::RestoreScanCursorProfile> {
         Some(crate::RestoreScanCursorProfile::DurableOpaqueV1)
     }
@@ -4925,18 +4970,57 @@ impl SessionBackend for ConsensusSessionStore {
         ConsensusSessionStore::fenced_transition_capability(self).await
     }
 
-    async fn fenced_transition(
+    async fn prepare_fenced_transition(
         &self,
         request: FencedTransitionRequest,
-    ) -> Result<FencedTransitionOutcome, StoreError> {
-        ConsensusSessionStore::fenced_transition(self, request).await
+    ) -> Result<PreparedFencedTransition, StoreError> {
+        validate_consensus_physical_fenced_transition_request(&request)?;
+        PreparedFencedTransition::from_unprotected_request(request)?.with_protection(
+            PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+                storage_commitment: prepared_fenced_transition_storage_commitment(
+                    self.inner.storage_identity,
+                ),
+            },
+        )
+    }
+
+    async fn fenced_transition(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
+        let request_id = prepared.request_id();
+        let prepared = prepared
+            .without_outer_protection(PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+                storage_commitment: prepared_fenced_transition_storage_commitment(
+                    self.inner.storage_identity,
+                ),
+            })
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        let request = prepared
+            .request_for_unprotected_backend()
+            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?;
+        match ConsensusSessionStore::fenced_transition(self, request).await {
+            Ok(outcome) => Ok(outcome),
+            Err(StoreError::FencedTransitionOutcomeUnknown) => {
+                Err(FencedTransitionExecuteError::OutcomeUnknown { request_id })
+            }
+            Err(error) => Err(FencedTransitionExecuteError::Rejected(error)),
+        }
     }
 
     async fn fenced_transition_status(
         &self,
-        request: &FencedTransitionRequest,
+        prepared: &PreparedFencedTransition,
     ) -> Result<FencedTransitionStatus, StoreError> {
-        ConsensusSessionStore::fenced_transition_status(self, request).await
+        let prepared = prepared.without_outer_protection(
+            PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+                storage_commitment: prepared_fenced_transition_storage_commitment(
+                    self.inner.storage_identity,
+                ),
+            },
+        )?;
+        let request = prepared.request_for_unprotected_backend()?;
+        ConsensusSessionStore::fenced_transition_status(self, &request).await
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
@@ -5884,6 +5968,62 @@ mod membership_tests {
         );
     }
 
+    #[tokio::test]
+    async fn consensus_physical_token_hook_rejects_a_marker_for_another_storage_identity() {
+        let directory = tempfile::tempdir().expect("physical token directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("physical token SQLite backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open physical token store");
+        let key = SessionKey {
+            tenant: TenantId::new("physical-token").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"physical-token")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let request = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x45; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("physical-token-owner").expect("owner"),
+                FenceToken::new(0),
+                Duration::from_secs(30),
+            )
+            .expect("lease"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("transition");
+        let prepared = SessionBackend::prepare_fenced_transition(&store, request)
+            .await
+            .expect("prepare physical token");
+        let expected = prepared_fenced_transition_storage_commitment(store.inner.storage_identity);
+        let mut foreign = expected;
+        foreign[0] ^= 1;
+        let foreign_prepared = prepared
+            .without_outer_protection(PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+                storage_commitment: expected,
+            })
+            .expect("strip local marker")
+            .with_protection(PreparedFencedTransitionProtection::ConsensusPhysicalV1 {
+                storage_commitment: foreign,
+            })
+            .expect("attach foreign marker");
+
+        assert!(!store.fenced_transition_accepts_prepared_physical_token(&foreign_prepared));
+        assert!(matches!(
+            SessionBackend::fenced_transition(&store, &foreign_prepared).await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        ));
+    }
+
     #[test]
     fn committed_fenced_rejections_match_the_apply_time_contract() {
         let logical_time = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
@@ -6194,6 +6334,79 @@ mod membership_tests {
         record.payload =
             EncryptedSessionPayload::try_envelope(encoded).expect("bounded envelope fixture");
         record
+    }
+
+    #[test]
+    fn physical_fenced_transition_admission_enforces_exact_record_cap_only() {
+        let logical_time = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let key = SessionKey {
+            tenant: TenantId::new("physical-fenced-admission").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"physical-fenced-admission")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let owner = OwnerId::new("physical-fenced-admission-owner").expect("owner");
+        let lease = LeaseGuard::new(
+            key.clone(),
+            owner,
+            FenceToken::new(1),
+            logical_time,
+            checked_session_deadline(logical_time, Duration::from_secs(60))
+                .expect("lease deadline"),
+            1,
+        );
+        let make_request = |request_id, mutation| {
+            FencedTransitionRequest::new(
+                FencedTransitionRequestId::from_bytes([request_id; 16]),
+                FencedTransitionLease::renew(lease.clone(), Duration::from_secs(30))
+                    .expect("renewal"),
+                mutation,
+            )
+            .expect("fenced transition")
+        };
+
+        let exact = make_request(
+            0x31,
+            FencedTransitionMutation::update(
+                Generation::new(0),
+                consumer_record_with_payload_len(
+                    &key,
+                    &lease,
+                    crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+                ),
+            ),
+        );
+        assert!(validate_consensus_physical_fenced_transition_request(&exact).is_ok());
+
+        let oversized = make_request(
+            0x32,
+            FencedTransitionMutation::update(
+                Generation::new(0),
+                consumer_record_with_payload_len(
+                    &key,
+                    &lease,
+                    crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 1,
+                ),
+            ),
+        );
+        assert_eq!(
+            validate_consensus_physical_fenced_transition_request(&oversized),
+            Err(StoreError::PayloadTooLarge {
+                actual: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES + 1,
+                max: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+            })
+        );
+
+        let delete = make_request(0x33, FencedTransitionMutation::delete(Generation::new(1)));
+        let refresh = make_request(
+            0x34,
+            FencedTransitionMutation::refresh_ttl(Generation::new(1), Duration::from_secs(30))
+                .expect("refresh"),
+        );
+        assert!(validate_consensus_physical_fenced_transition_request(&delete).is_ok());
+        assert!(validate_consensus_physical_fenced_transition_request(&refresh).is_ok());
     }
 
     async fn consumer_boundary_store() -> (

@@ -1,8 +1,8 @@
 //! Unified session-store handle.
 //!
-//! [`SessionStore`] bundles a [`SessionBackend`] and a [`SessionLeaseManager`]
-//! behind a single handle so consumers do not have to pass two trait objects
-//! around for the same physical backend.
+//! [`SessionStore`] is a shared handle for a [`SessionBackend`]. When the
+//! physical backend also implements [`SessionLeaseManager`], the same handle
+//! forwards lease operations without granting them to backend-only adapters.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,12 +26,11 @@ use crate::record::StoredSessionRecord;
 use crate::restore::{RestoreScanPage, RestoreScanRequest};
 use crate::ttl::validate_session_ttl;
 
-/// A single handle that owns one backend and exposes both storage and lease
-/// operations.
+/// A single shared handle that owns one backend.
 ///
-/// Construct a store from anything that implements both [`SessionBackend`] and
-/// [`SessionLeaseManager`]. The handle is cheap to clone: clones share the same
-/// backend.
+/// Construct a store from any [`SessionBackend`]. Lease operations are exposed
+/// only when that backend also implements [`SessionLeaseManager`]. The handle
+/// is cheap to clone: clones share the same backend.
 ///
 /// # Example
 ///
@@ -56,17 +55,17 @@ use crate::ttl::validate_session_ttl;
 /// # Ok(())
 /// # }
 /// ```
-pub struct SessionStore<B: SessionBackend + SessionLeaseManager> {
+pub struct SessionStore<B: SessionBackend> {
     backend: Arc<B>,
 }
 
-impl<B: SessionBackend + SessionLeaseManager> std::fmt::Debug for SessionStore<B> {
+impl<B: SessionBackend> std::fmt::Debug for SessionStore<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionStore").finish_non_exhaustive()
     }
 }
 
-impl<B: SessionBackend + SessionLeaseManager> Clone for SessionStore<B> {
+impl<B: SessionBackend> Clone for SessionStore<B> {
     fn clone(&self) -> Self {
         Self {
             backend: self.backend.clone(),
@@ -74,7 +73,7 @@ impl<B: SessionBackend + SessionLeaseManager> Clone for SessionStore<B> {
     }
 }
 
-impl<B: SessionBackend + SessionLeaseManager> SessionStore<B> {
+impl<B: SessionBackend> SessionStore<B> {
     /// Wrap `backend` in a shared handle.
     pub fn new(backend: B) -> Self {
         Self {
@@ -111,7 +110,7 @@ impl<B: ProtectedSessionBackend> SessionStore<B> {
 }
 
 #[async_trait]
-impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B> {
+impl<B: SessionBackend> SessionBackend for SessionStore<B> {
     fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
         self.backend.backend_instance_identity()
     }
@@ -122,6 +121,19 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
 
     fn restore_scan_cursor_profile(&self) -> Option<crate::RestoreScanCursorProfile> {
         self.backend.restore_scan_cursor_profile()
+    }
+
+    fn fenced_transition_preserves_protected_payloads(&self) -> bool {
+        self.backend
+            .fenced_transition_preserves_protected_payloads()
+    }
+
+    fn fenced_transition_accepts_prepared_physical_token(
+        &self,
+        prepared: &crate::fenced_transition::PreparedFencedTransition,
+    ) -> bool {
+        self.backend
+            .fenced_transition_accepts_prepared_physical_token(prepared)
     }
 
     async fn capabilities(&self) -> BackendCapabilities {
@@ -142,18 +154,37 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         self.backend.fenced_transition_capability().await
     }
 
-    async fn fenced_transition(
+    async fn prepare_fenced_transition(
         &self,
         request: crate::fenced_transition::FencedTransitionRequest,
-    ) -> Result<crate::fenced_transition::FencedTransitionOutcome, StoreError> {
-        self.backend.fenced_transition(request).await
+    ) -> Result<crate::fenced_transition::PreparedFencedTransition, StoreError> {
+        self.backend.prepare_fenced_transition(request).await
+    }
+
+    async fn recover_prepared_fenced_transition(
+        &self,
+        request_id: crate::fenced_transition::FencedTransitionRequestId,
+    ) -> Result<crate::fenced_transition::PreparedFencedTransitionLookup, StoreError> {
+        self.backend
+            .recover_prepared_fenced_transition(request_id)
+            .await
+    }
+
+    async fn fenced_transition(
+        &self,
+        prepared: &crate::fenced_transition::PreparedFencedTransition,
+    ) -> Result<
+        crate::fenced_transition::FencedTransitionOutcome,
+        crate::fenced_transition::FencedTransitionExecuteError,
+    > {
+        self.backend.fenced_transition(prepared).await
     }
 
     async fn fenced_transition_status(
         &self,
-        request: &crate::fenced_transition::FencedTransitionRequest,
+        prepared: &crate::fenced_transition::PreparedFencedTransition,
     ) -> Result<crate::fenced_transition::FencedTransitionStatus, StoreError> {
-        self.backend.fenced_transition_status(request).await
+        self.backend.fenced_transition_status(prepared).await
     }
 
     fn record_expiry_reference(&self) -> Option<opc_types::Timestamp> {

@@ -18,8 +18,9 @@ pub use network::{
 };
 pub(crate) use store::OperatorRecoveryCommitError;
 pub use store::{
-    ConsensusSessionConsumerService, ConsensusSessionStore, ConsensusSessionStoreOpenError,
-    SessionConsensusStatus, SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
+    validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
+    ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusStatus,
+    SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
     SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
     SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };

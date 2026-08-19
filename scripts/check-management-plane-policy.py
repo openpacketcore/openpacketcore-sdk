@@ -30,6 +30,7 @@ UNSAFE_ALLOWED_ROOTS = {
     "opc-linux-gtpu-sys",
     "opc-linux-route-sys",
     "opc-linux-xfrm-sys",
+    "opc-sqlite-file-control-sys",
 }
 
 

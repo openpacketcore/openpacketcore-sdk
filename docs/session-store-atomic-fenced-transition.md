@@ -1,10 +1,10 @@
 # Atomic Fenced Transition Contract
 
-This document defines the generic store-side contract for issue #696. It is
-the contract exposed by `AtomicFencedTransitionCapability::V1`,
-`FencedTransitionRequest`, `FencedTransitionOutcome`, and
-`FencedTransitionStatus` in `opc-session-store`. It is not a product workflow
-or a network protocol.
+This document defines the generic V1 store-side contract from issue #696 and
+the protected V2 composition from issue #701. It covers
+`AtomicFencedTransitionCapability`, `FencedTransitionRequest`,
+`FencedTransitionOutcome`, and `FencedTransitionStatus` in `opc-session-store`.
+It is not a product workflow or a network protocol.
 
 ## Scope and linearization
 
@@ -169,6 +169,245 @@ or durable apply:
   strictly below that ceiling under the public field bounds, and its
   payload-free shape makes the response bound independent of the record
   payload.
+- `PreparedFencedTransition` uses
+  `FENCED_TRANSITION_PREPARED_SCHEMA_V1`, has at most
+  `FENCED_TRANSITION_MAX_PREPARED_LAYERS` (8) SDK-owned protection frames, and
+  is at most `FENCED_TRANSITION_MAX_PREPARED_BYTES` (2 MiB). Import rejects an
+  over-limit, corrupt, noncanonical, trailing, or unsupported token before
+  backend or provider work. A fixed magic/version/body-length header is parsed
+  before the frozen V1 body, so an unknown schema is rejected without trying
+  to decode it as the current layout. A golden compatibility corpus pins both
+  lease forms, every mutation, no-expiry and finite-expiry record shapes, and
+  every supported local/remote/consensus protection-stack shape and order.
+
+## Protected preparation and exact retry bodies
+
+The raw physical store and authenticated-consumer transport contract is exactly
+`AtomicFencedTransitionCapability::V1`. The production protected API is a
+separate V2 composition: it advertises
+`AtomicFencedTransitionCapability::V2` only when the outer
+`EncryptingSessionBackend` or `RemoteSealingSessionBackend` owns an open,
+SDK-owned caller-side `PreparedFencedTransitionJournal` and its exact inner
+physical boundary advertises V1. It does not reinterpret an inner V1 as V2.
+Constructing either protection wrapper without that journal remains source
+compatible, but its protected observation, prepare, execute, status, recovery,
+and capability paths fail closed. Raw V1 stores, raw consumer transport, and
+older binaries MUST NOT operate the journaled protected atomic path.
+
+The application supplies one caller-stable `FencedTransitionRequestId` that it
+can reproduce after restart. It MUST represent the same logical operation for
+the operation's whole recovery lifetime and MUST NOT be replaced merely because
+status returned `NotFound`. The SDK journal is the sole durable recovery copy
+of the complete protected token. A legacy prepared token retained only by the
+application, application persistence of request state, plaintext, record keys,
+provider state, or a second intent transition is insufficient and does not
+enable V2 recovery.
+
+Preparation validates the logical request and exact V1 capability across the
+complete wrapper stack, and rejects an ID already present in the journal before
+expiry preflight or provider work. For create and update it then obtains the
+authoritative, payload-free record-expiry preflight before any payload-provider
+call, protects the record exactly once, validates the resulting physical
+request, lets the inner V1 backend add its bounded physical marker, and commits
+the final outer opaque token to SQLite before returning. Delete and refresh
+carry no record and perform no seal or unseal. The wrapper preserves request
+identity and all non-payload fields; only the create/update payload encoding
+changes. A concurrent race for the same previously absent ID may perform more
+than one pre-dispatch provider call, but exactly one immutable journal binding
+wins and every loser is a conflict before transport dispatch.
+
+`recover_prepared_fenced_transition(id)` reads that immutable binding after a
+process restart and returns `Found(exact_token)` or `Absent`. `Absent` describes
+only this journal, never excludes an earlier delayed transport/consensus
+request, and never permits deletion of the retained binding or reuse of the
+ID. Execute and status first reload the row, authenticate it, and compare the
+complete canonical bytes with the supplied token; only that journal copy may
+be dispatched. A missing, wrong-key, locked, incompatible, corrupt, or
+byte-mismatched journal fails before transport and performs no provider or
+transport I/O. Execute reports a condition that proves this invocation did not
+dispatch—including a local binding mismatch—as `NotTransmitted`. `Rejected`
+is reserved for a confirmed rejection returned by the inner effect boundary;
+status and recovery have no `NotTransmitted` result variant and instead return
+their typed local fail-closed result without dispatch.
+
+The inner backend must explicitly attest that it preserves already protected
+payload bytes unchanged through preparation and observation. Raw consensus
+does so. The explicit authenticated-consumer physical bridge is only for use
+beneath a protected journaled wrapper, serves the atomic subset only, and fails
+every unrelated `SessionBackend` operation without I/O; it never implements
+`SessionLeaseManager`. Its token marker binds an opaque commitment to the local
+authenticated consumer SPIFFE identity and stable consensus-cluster ID only. It
+excludes endpoint/address, TLS server name or identity, current leader or node,
+configuration ID/epoch, transport lane, certificate/key, and material epoch, so
+a retained token survives authorized endpoint, leader, topology, and credential
+rotation. Each new call still performs ordinary current-scope mTLS
+authentication and authorization. Payload-transforming adapters do not forward
+the witness: nesting local and remote protection wrappers in either order
+therefore advertises no atomic capability and fails before preflight, provider,
+observation, or dispatch work.
+
+The consensus receipt digest continues to bind the complete physical request,
+including the exact `EnvelopeV1` bytes. A fresh nonce, active key, or remote
+provider result therefore creates a different body and correctly conflicts
+under the same request ID. Preparation never tries to recover a physical body
+from readback, process memory, plaintext persistence, or an application-local
+retry cache. After successful preparation, execute and status use the retained
+physical bytes without provider I/O, so process restart and active-key/provider
+rotation cannot change the submitted body. `FencedTransitionExecuteError`
+separates `NotTransmitted`, `OutcomeUnknown { request_id }`, and confirmed
+`Rejected` results. Any lower-layer may-have-sent ambiguity, including an
+invalid returned identity, remains `OutcomeUnknown` under the expected prepared
+identity. `NotFound` still does not prove that a delayed proposal cannot commit.
+
+Fenced observation delegates the authority-consistent record/fence read and
+then unprotects only a present record. It preserves `current_fence` exactly; an
+absent record performs no provider call, and any protection failure returns no
+partial observation.
+
+### Journal persistence and security
+
+Provisioning and recovery are separate operations.
+`PreparedFencedTransitionJournal::create_new` MUST be used exactly once for a
+missing dedicated database; it creates the leaf exclusively and rejects an
+existing path. Every restart MUST use `open_existing`, which neither creates a
+leaf nor initializes a pristine, truncated, reset, or partial database. The
+deprecated `open` alias has the same fail-closed reopen behavior and never
+provisions storage.
+
+Both operations take a stable 32-byte
+`PreparedFencedTransitionJournalKey`. The key MUST be independent of payload
+encryption, remote provider, TLS, and record keys, unique to this exact journal
+path/storage boundary, and restored unchanged after a process restart. It is
+never stored in the database and MUST NOT be reused for another journal. On
+Unix every existing ancestor is descriptor-walked without following symlinks.
+The immediate parent and database MUST be owned by the effective user, with no
+group or other access (normally `0700` and `0600`, respectively); the database
+MUST be a regular, single-link bounded file. The containing directory MUST
+reserve the configured leaf plus its derived `-wal`, `-shm`, and `-journal`
+names exclusively for this journal. The SDK retains and revalidates the full
+ancestor chain, admitted parent/file identity, bounded sidecar metadata, and
+SQLite main-file movement state around every operation. Before the sole live
+SDK connection opens, a process-local inode admission lease permits one bounded
+main-header read; that descriptor closes before SQLite locking begins. No main
+or SHM descriptor is retained or opened while an SDK connection is live,
+because closing one could release SQLite's process-scoped POSIX locks. The
+configured raw integrity key is length-framed into a schema- and
+checked-absolute-path-derived key, without persisting or emitting the path.
+The journal requires a local filesystem with truthful POSIX locks, `fsync`,
+directory sync, and storage-barrier semantics; NFS-like mounts are unsupported.
+Another process running with the same effective user and equivalent
+path-replacement authority is inside that trust boundary, not an adversary the
+SDK can isolate from its own files. Within one process, callers MUST clone the
+admitted SDK journal handle rather than reopen the same inode or open it
+directly through SQLite. The SDK enforces one live SQLite connection per
+admitted inode so its pre-open header check cannot release another connection's
+process-scoped POSIX locks. Platforms without the Unix path and SQLite-VFS
+checks fail closed rather than advertise V2.
+
+The schema-3 journal uses an application ID, strict tables, a pre-open fixed
+page/cache-header check, bounded main/WAL/SHM files, a fixed private page cache,
+bounded SQLite limits, a tight initial schema VDBE-work budget and a
+separate full-operation budget, bounded catalog/membership scans, WAL,
+`synchronous=EXTRA`, `fullfsync`, `checkpoint_fullfsync`, and an atomic
+create-only ID binding. Successful provisioning and row insertion independently
+sync the held parent directory before returning. It assigns every
+journal incarnation a fresh bounded random value and stores an authenticated
+membership count and root over the complete request-ID/integrity-tag set. The
+membership HMAC commits that incarnation, count, and root; health, lookup,
+recovery, and insertion validate the complete small bounded set. Lookup
+authenticates the selected token, while insertion re-authenticates its new row,
+updates membership metadata in the same transaction, and verifies the result
+before commit. A fixed `(request_id, integrity_tag)` covering index keeps a full
+membership proof independent of retained token size, and read-only proofs use
+WAL snapshots rather than reserving the writer. The schema catalog is an exact
+whitelist of the SDK tables, generated primary-key autoindex, and membership
+index; every other catalog object, including a reserved-prefix object, is
+rejected before journal setup. The authenticated membership index is the
+presence authority; its bounded scan cross-validates every rowid, request ID,
+and fixed tag against the table and compares independently bounded table and
+primary-index scans. Schema 3 stores that fixed tag before the potentially
+overflowing prepared body, so the global proof never reads retained bodies. A
+selected row separately validates its body against the authenticated tag.
+Table/primary/secondary-index divergence therefore cannot become false absence
+without making full proofs depend on retained body size. The
+journal rejects a wrong key, foreign or
+partial schema, unsupported version, corrupt metadata/row, and insecure or
+changed path with one fixed coarse availability error. An authenticated full
+journal rejects a new ID before expiry, provider, or inner-prepare work.
+
+The journal HMAC authenticates stored bytes but does not encrypt them. A
+protected create/update row contains request metadata and ciphertext (never
+payload plaintext); record-free transitions still contain their metadata.
+The journal therefore belongs on the same trusted private durability boundary
+as other sensitive SDK metadata. Token bytes, rows, payloads, identities,
+request IDs, paths, keys, request metadata, and provider material MUST NOT be
+emitted in examples, fixtures, logs, metrics, errors, diagnostics, crash
+evidence, or PR evidence.
+
+This integrity proof detects offline row deletion, addition, primary-key
+replacement, and tag corruption within the same durable journal file. A
+corrupt selected body fails its exact row authentication and cannot be treated
+as absent or rebound. It cannot distinguish restoration of an older complete,
+internally valid database snapshot from that older state itself. Whole-database
+rollback is outside the same-durable-file guarantee unless deployment supplies
+an external monotonic anti-rollback anchor.
+
+The SDK retains canonical token bytes and complete-body import/re-encoding
+scratch buffers in wiping allocations. Journal HMAC uses a zeroize-on-drop SHA
+state and wipes key-derived pads and intermediate digests. This reduces
+allocator residue but does not encrypt the SQLite page cache, filesystem cache,
+WAL, storage media, backup, or copies made outside the SDK.
+
+V2 proves process-restart recovery only while the same durable volume, path,
+journal key, protection mode/namespace, stable client identity (for the
+consumer bridge), and stable consensus cluster remain available. A resolver may
+select another authenticated endpoint and a successor configuration may have a
+different leader, members, server identity, configuration ID, and epoch. V2
+does not claim host failover, host or volume-loss recovery, a replicated
+journal, or a second consensus transition. Deployments that reschedule
+processes MUST mount the same durable volume and secret. If that boundary is
+unavailable before this invocation can dispatch, execute returns
+`NotTransmitted`; loss after an earlier ambiguous dispatch is outside the V2
+guarantee and must not be described as recovered.
+
+## Prepared-token compatibility and upgrades
+
+The prepared-token wire schema and the journal database schema are separate,
+versioned durable formats and, together with capability V2, are downgrade
+fences. The current journal can retain only canonical
+`FENCED_TRANSITION_PREPARED_SCHEMA_V1` tokens, and its current database
+`user_version` is three. Schema 3 changes the physical row order and every
+journal-authentication domain, and derives the configured raw journal key from
+the checked absolute path. The unshipped schema-2 prototype is deliberately
+incompatible and has no in-place migration or downgrade path. Neither durable
+version is inferred from the record envelope, consumer wire, or consensus
+capability. `AtomicFencedTransitionCapability::V2`
+is a local composition promise over an inner V1 physical contract; it does not
+rename the consensus or revision-3 authenticated-consumer wire as V2.
+
+A rolling upgrade MUST ensure every process that may execute or query a retained
+request understands both schemas and uses the same journal key/path and bound
+composition before a new writer is enabled. Unknown journal/token versions,
+partial schemas, and unsupported protection markers fail closed before
+provider, readback, or transport work. The old reader and original compatible
+stack MUST remain available until every retained request is resolved and every
+possible delayed proposal is accounted for. A rollback image that predates V2
+cannot recover this journal and MUST NOT be deployed until a complete drain; a
+compatible rollback must retain every emitted reader plus the same journal and
+key. There is no automatic downgrade, token rewrite, journal copy/rekey,
+reseal, reconstruction, or in-flight migration path. The V2 journal layer
+supplies no journal garbage collection, retention policy, ledger-lifetime
+extension, or capacity solution: its fixed bounded row limit is an admission
+fence, not a lifecycle claim.
+
+The prepared-token trait surface is intentionally source breaking for custom
+backends that previously accepted a raw request at execute or status time. A
+third-party backend must implement preparation, exact-token execution, and
+exact-token status explicitly, and may attest protected-payload preservation
+only when every forwarding and durable layer preserves those bytes unchanged.
+Unmodified or partially upgraded adapters retain the trait's fail-closed
+defaults and do not advertise V1. There is no compatibility shim that can
+safely infer an exact protected body after an ambiguous dispatch.
 
 ## Idempotency, retention, and uncertainty
 
@@ -263,12 +502,14 @@ Only an explicit submission of the identical ID and complete body is
 idempotency-safe: it may create the first binding, replay or expire an existing
 binding, or return an absorbing unbound rejection. The SDK does not
 automatically resubmit after a possibly delivered forwarding write.
-If `fenced_transition` returns `StoreError::FencedTransitionOutcomeUnknown`,
-the caller MUST retain the exact ID and canonical body and use the bounded,
-exact status operation. `HistoryFull` and `RetentionExhausted` are definitive
-no-effect rejections, not unknown outcomes. Callers MUST NOT replay under a new ID,
-infer an unknown outcome from local intent, continue writes under an uncertain
-lease, or derive a next mutation until they have an authoritative observation.
+If `fenced_transition` returns
+`FencedTransitionExecuteError::OutcomeUnknown { request_id }`, the caller MUST
+retain that stable ID, recover the SDK-journal token, and use the bounded exact
+status operation. `HistoryFull` and `RetentionExhausted` are definitive
+no-effect rejections, not unknown outcomes. Callers MUST NOT replay under a new
+ID, infer an unknown outcome from local intent, continue writes under an
+uncertain lease, or derive a next mutation until they have an authoritative
+observation.
 A post-retention history must likewise be re-derived from current authoritative
 state under a fresh ID; the old transition is never revived. The consumer wire
 revision-3 contract preserves every status distinction, including
