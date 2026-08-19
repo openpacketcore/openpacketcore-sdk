@@ -18,12 +18,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
     FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
-    FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2HistoryState,
-    FencedTransitionV2Request, FencedTransitionV2RequestId, FencedTransitionV2Status, LeaseError,
-    LeaseGuard, OwnerId, RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest,
-    SessionConsensusIdentity, SessionConsensusRequestId, SessionKey, SessionOp, SessionOpResult,
-    StoreError, StoredSessionRecord, FENCED_TRANSITION_REQUEST_ID_BYTES,
-    FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
+    FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2Capability,
+    FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2RequestId,
+    FencedTransitionV2Status, LeaseError, LeaseGuard, OwnerId, RecordExpiryPreflight,
+    RestoreScanPage, RestoreScanRequest, SessionConsensusIdentity, SessionConsensusRequestId,
+    SessionKey, SessionOp, SessionOpResult, StoreError, StoredSessionRecord,
+    FENCED_TRANSITION_REQUEST_ID_BYTES, FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
     FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
 };
 
@@ -1273,9 +1273,7 @@ pub enum SessionConsumerResponse {
 #[non_exhaustive]
 pub enum SessionConsumerV2Response {
     /// Exact V2 capability proof result.
-    FencedTransitionV2Capability(
-        Result<AtomicFencedTransitionCapability, SessionConsumerStoreError>,
-    ),
+    FencedTransitionV2Capability(Result<FencedTransitionV2Capability, SessionConsumerStoreError>),
     /// Bounded current V2 history state.
     FencedTransitionV2HistoryState(
         Result<FencedTransitionV2HistoryState, SessionConsumerStoreError>,
@@ -1549,11 +1547,12 @@ mod tests {
         SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerScope,
         SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
         SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation,
-        SessionConsumerV2Request,
+        SessionConsumerV2Request, SessionConsumerV2Response,
     };
     use crate::{
-        FenceToken, FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
-        FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
+        AtomicFencedTransitionCapability, FenceToken, FencedTransitionLease,
+        FencedTransitionMutation, FencedTransitionRequest, FencedTransitionRequestId,
+        FencedTransitionStatus, FencedTransitionV2CallerNonce, FencedTransitionV2Capability,
         FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, FencedTransitionV2Status,
         Generation, OwnerId, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
         SessionConsensusConfigurationId, SessionConsensusIdentity, SessionKey, SessionKeyType,
@@ -1569,6 +1568,30 @@ mod tests {
             SessionConsensusConfigurationId::from_bytes([configuration; 32]),
             SessionConsensusConfigurationEpoch::new(epoch).expect("non-zero configuration epoch"),
         ))
+    }
+
+    #[test]
+    fn revision_four_epoch_capability_keeps_the_v2_wire_shape_but_not_the_journal_type() {
+        let response = SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
+            FencedTransitionV2Capability::V2,
+        ));
+        let encoded = serde_json::to_string(&response).expect("revision-four capability encodes");
+        assert_eq!(
+            encoded, r#"{"response":"fenced_transition_v2_capability","body":{"Ok":"V2"}}"#,
+            "the established revision-four V2 capability JSON remains frozen"
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionConsumerV2Response>(&encoded)
+                .expect("revision-four capability decodes"),
+            response
+        );
+
+        let epoch_capability: FencedTransitionV2Capability =
+            serde_json::from_str("\"V2\"").expect("epoch capability decodes");
+        let journal_capability: AtomicFencedTransitionCapability =
+            serde_json::from_str("\"V2\"").expect("journal capability decodes");
+        assert_eq!(epoch_capability, FencedTransitionV2Capability::V2);
+        assert_eq!(journal_capability, AtomicFencedTransitionCapability::V2);
     }
 
     fn transition(id: u8) -> FencedTransitionRequest {

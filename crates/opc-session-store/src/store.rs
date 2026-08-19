@@ -189,8 +189,7 @@ impl<B: SessionBackend> SessionBackend for SessionStore<B> {
 
     async fn fenced_transition_v2_capability(
         &self,
-    ) -> Result<Option<crate::fenced_transition::AtomicFencedTransitionCapability>, StoreError>
-    {
+    ) -> Result<Option<crate::fenced_transition::FencedTransitionV2Capability>, StoreError> {
         self.backend.fenced_transition_v2_capability().await
     }
 

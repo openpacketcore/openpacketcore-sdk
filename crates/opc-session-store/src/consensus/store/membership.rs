@@ -1814,7 +1814,9 @@ impl ConsensusSessionStore {
         // membership change merely because every prospective peer happens to
         // reply with the public digest: it could otherwise admit the change
         // and subsequently reject the replicated V2 command it certified.
-        if self.local_fenced_transition_v2_capability() != AtomicFencedTransitionCapability::V2 {
+        if self.local_fenced_transition_v2_capability()
+            != Some(crate::FencedTransitionV2Capability::V2)
+        {
             return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
         }
         let profile_digest = crate::fenced_transition::fenced_transition_v2_profile_digest();
@@ -1825,7 +1827,7 @@ impl ConsensusSessionStore {
                 // learner. Keep this explicit so a future coordinator shape
                 // cannot accidentally make local capability implicit.
                 if self.local_fenced_transition_v2_capability()
-                    != AtomicFencedTransitionCapability::V2
+                    != Some(crate::FencedTransitionV2Capability::V2)
                 {
                     return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                 }
@@ -3180,7 +3182,7 @@ impl ConsensusSessionStore {
                         current_identity,
                         current_members.contains(&authenticated_sender)
                             && self.local_fenced_transition_v2_capability()
-                                == AtomicFencedTransitionCapability::V2
+                                == Some(crate::FencedTransitionV2Capability::V2)
                             && profile_digest
                                 == crate::fenced_transition::fenced_transition_v2_profile_digest(),
                     ),

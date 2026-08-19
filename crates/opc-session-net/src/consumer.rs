@@ -9695,18 +9695,19 @@ mod tests {
         EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedTransitionExecuteError,
         FencedTransitionLease, FencedTransitionMutation, FencedTransitionObservation,
         FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
-        FencedTransitionStatus, FencedTransitionV2CallerNonce, FencedTransitionV2HistoryEpoch,
-        Generation, LeaseGuard, OwnerId, PreparedFencedTransition, RestoreScanCursorProfile,
-        RestoreScanPage, RestoreScanRequest, SessionBackend, SessionConsensusClusterId,
-        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-        SessionConsensusIdentity, SessionConsumerBatchResult, SessionConsumerFencedTransitionError,
-        SessionConsumerFencedTransitionStatus, SessionConsumerLeaseError, SessionConsumerOperation,
-        SessionConsumerOutcomeUnknown, SessionConsumerRequest, SessionConsumerRequestId,
-        SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
-        SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
-        SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
-        SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType,
-        StoreError, StoredSessionRecord, MAX_SESSION_TTL,
+        FencedTransitionStatus, FencedTransitionV2CallerNonce, FencedTransitionV2Capability,
+        FencedTransitionV2HistoryEpoch, Generation, LeaseGuard, OwnerId, PreparedFencedTransition,
+        RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, SessionBackend,
+        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
+        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
+        SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+        SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+        SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+        SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
+        SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation,
+        SessionConsumerV2Request, SessionConsumerV2Response, SessionKey, SessionKeyType,
+        SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
+        MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
@@ -9980,6 +9981,18 @@ mod tests {
             decode_consumer_frame_payload::<ConsumerWireRequest>(&encoded).is_err(),
             "a revision-three envelope cannot interpret a V2 operation"
         );
+    }
+
+    #[test]
+    fn revision_four_epoch_capability_response_matches_its_typed_request() {
+        let request = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2Capability,
+        );
+        let response = SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
+            FencedTransitionV2Capability::V2,
+        ));
+        assert!(super::v2_response_matches_request(&request, &response));
     }
 
     #[test]

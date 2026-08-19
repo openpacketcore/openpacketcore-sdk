@@ -14,9 +14,9 @@ use opc_consensus::{
 };
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_session_store::{
-    fenced_transition_v2_profile_digest, AtomicFencedTransitionCapability, ConsensusSessionStore,
-    EncryptedSessionPayload, FenceToken, FencedTransitionLease, FencedTransitionMutation,
-    FencedTransitionMutationResult, FencedTransitionV2CallerNonce, FencedTransitionV2HistoryEpoch,
+    fenced_transition_v2_profile_digest, ConsensusSessionStore, EncryptedSessionPayload,
+    FenceToken, FencedTransitionLease, FencedTransitionMutation, FencedTransitionMutationResult,
+    FencedTransitionV2CallerNonce, FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch,
     FencedTransitionV2Request, FencedTransitionV2Status, Generation, OwnerId,
     QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
     ReplicaId, ReplicaTlsIdentity, SessionBackend, SessionKey, SessionKeyType,
@@ -173,8 +173,16 @@ async fn v2_first_transition_activates_through_consensus_and_replays_exactly() {
             .fenced_transition_v2_capability()
             .await
             .expect("V2 unanimous singleton capability"),
-        Some(AtomicFencedTransitionCapability::V2)
+        Some(FencedTransitionV2Capability::V2)
     );
+    assert!(matches!(
+        store
+            .recover_prepared_fenced_transition(
+                opc_session_store::FencedTransitionRequestId::from_bytes([0xE2; 16]),
+            )
+            .await,
+        Err(StoreError::CapabilityNotSupported(reason)) if reason == "atomic_fenced_transition_v2"
+    ));
 
     let key = key(b"first-v2-transition");
     let owner = owner();

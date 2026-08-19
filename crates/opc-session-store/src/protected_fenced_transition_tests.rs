@@ -968,6 +968,11 @@ async fn protected_fenced_transition_local_prepares_once_and_recovers_exact_phys
         Some(AtomicFencedTransitionCapability::V2),
         "dynamic local composition must expose durable protected recovery"
     );
+    assert!(matches!(
+        backend.fenced_transition_v2_capability().await,
+        Err(StoreError::CapabilityNotSupported(reason))
+            if reason == "atomic_fenced_transition_epoch_history_v2"
+    ));
 
     let prepared = backend
         .prepare_fenced_transition(create_request(1))

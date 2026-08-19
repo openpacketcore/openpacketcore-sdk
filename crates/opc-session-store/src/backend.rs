@@ -1424,17 +1424,16 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
-    /// Advertise the explicit V2 atomic-transition contract.
+    /// Advertise the explicit epoch-fenced V2 receipt-history contract.
     ///
     /// This is intentionally separate from [`Self::fenced_transition_capability`].
     /// A caller using the original V1 API must never be upgraded to V2 merely
     /// because a backend also implements it.
     async fn fenced_transition_v2_capability(
         &self,
-    ) -> Result<Option<crate::fenced_transition::AtomicFencedTransitionCapability>, StoreError>
-    {
+    ) -> Result<Option<crate::fenced_transition::FencedTransitionV2Capability>, StoreError> {
         Err(StoreError::CapabilityNotSupported(
-            "atomic_fenced_transition_v2".into(),
+            "atomic_fenced_transition_epoch_history_v2".into(),
         ))
     }
 
@@ -1447,7 +1446,7 @@ pub trait SessionBackend: Send + Sync {
         &self,
     ) -> Result<crate::fenced_transition::FencedTransitionV2HistoryState, StoreError> {
         Err(StoreError::CapabilityNotSupported(
-            "atomic_fenced_transition_v2".into(),
+            "atomic_fenced_transition_epoch_history_v2".into(),
         ))
     }
 
@@ -1460,7 +1459,7 @@ pub trait SessionBackend: Send + Sync {
         _request: crate::fenced_transition::FencedTransitionV2Request,
     ) -> Result<crate::fenced_transition::FencedTransitionOutcome, StoreError> {
         Err(StoreError::CapabilityNotSupported(
-            "atomic_fenced_transition_v2".into(),
+            "atomic_fenced_transition_epoch_history_v2".into(),
         ))
     }
 
@@ -1470,7 +1469,7 @@ pub trait SessionBackend: Send + Sync {
         _request: &crate::fenced_transition::FencedTransitionV2Request,
     ) -> Result<crate::fenced_transition::FencedTransitionV2Status, StoreError> {
         Err(StoreError::CapabilityNotSupported(
-            "atomic_fenced_transition_v2".into(),
+            "atomic_fenced_transition_epoch_history_v2".into(),
         ))
     }
 
