@@ -29,9 +29,9 @@ use opc_session_store::{
     PlacementResiliencePolicy, QuorumReplicaDescriptor, QuorumTopologyConfig,
     ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
     SessionBackend, SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionKey, SessionKeyType, SqliteSessionBackend, StateClass, StateType, StoreError,
-    StoredSessionRecord, Timestamp, ValidatedQuorumTopology,
+    SessionConsensusRpcHandler, SessionConsensusStatus, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionKey, SessionKeyType, SqliteSessionBackend, StateClass,
+    StateType, StoreError, StoredSessionRecord, Timestamp, ValidatedQuorumTopology,
     FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_RECLAIM_BATCH,
     FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET,
 };
@@ -114,7 +114,7 @@ async fn maintain_exact_history_batch(
         // deliberately local-leader-only boundary and is never forwarded.
         // A release workload can span several election terms, so never cache
         // the leader selected before the 131k-transition phase.
-        let store = &stores[ready_leader(stores).await];
+        let store = &stores[current_local_maintenance_leader(stores).await];
         match store.maintain_fenced_transition_v2_history(expected).await {
             Ok(state) => return Ok(state),
             // `EpochNotActive` can be the post-commit observation of this
@@ -126,7 +126,7 @@ async fn maintain_exact_history_batch(
                 | StoreError::FencedTransitionHistoryEpochNotActive,
             ) if attempt < QUALIFICATION_TRANSIENT_RETRY_LIMIT => {
                 transient_retries.fetch_add(1, Ordering::Relaxed);
-                let observation_store = &stores[ready_leader(stores).await];
+                let observation_store = &stores[current_local_maintenance_leader(stores).await];
                 let observed = retry_exact_consensus_operation(transient_retries, || {
                     observation_store.fenced_transition_v2_history_state()
                 })
@@ -142,6 +142,45 @@ async fn maintain_exact_history_batch(
         }
     }
     unreachable!("the bounded maintenance retry loop returns on its final attempt")
+}
+
+/// Select the store that can perform local-only maintenance from the newest
+/// Openraft observations.  A former leader can retain a self-report briefly,
+/// so only a self-report in the highest observed admitted term is eligible.
+fn current_local_maintenance_leader_from_statuses(
+    statuses: &[SessionConsensusStatus],
+) -> Option<usize> {
+    let highest_term = statuses
+        .iter()
+        .filter(|status| status.admitted)
+        .map(|status| status.term)
+        .max()?;
+    let mut leaders = statuses.iter().enumerate().filter(|(_, status)| {
+        status.admitted && status.term == highest_term && status.leader_id == Some(status.node_id)
+    });
+    let (leader_index, _) = leaders.next()?;
+    leaders.next().is_none().then_some(leader_index)
+}
+
+/// Wait only for an unambiguous, current-term local leader.  The maintenance
+/// call itself still enforces fixed-quorum admission and local leadership; this
+/// selector merely avoids invoking that intentionally non-forwarding API on a
+/// cached former leader.
+async fn current_local_maintenance_leader(stores: &[ConsensusSessionStore]) -> usize {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let statuses = stores
+                .iter()
+                .map(ConsensusSessionStore::status)
+                .collect::<Vec<_>>();
+            if let Some(leader) = current_local_maintenance_leader_from_statuses(&statuses) {
+                return leader;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixed quorum reports an unambiguous current-term local maintenance leader")
 }
 
 #[derive(Clone)]
@@ -361,6 +400,50 @@ async fn ready_leader(stores: &[ConsensusSessionStore]) -> usize {
     })
     .await
     .expect("fixed quorum reaches durable readiness and elects a leader")
+}
+
+#[test]
+fn maintenance_leader_selection_replaces_a_stale_self_reported_three_voter_leader() {
+    let placement_policy = PlacementResiliencePolicy::default();
+    let quorum_members = members();
+    let node_ids = (0..VOTERS)
+        .map(|index| {
+            fixed_topology(index, quorum_members.clone(), placement_policy)
+                .local_consensus_node_id()
+                .expect("fixed voter node ID")
+        })
+        .collect::<Vec<_>>();
+    let status = |node_id, term, leader_id| SessionConsensusStatus {
+        node_id,
+        term,
+        leader_id: Some(leader_id),
+        last_log_index: None,
+        applied_index: None,
+        admitted: true,
+    };
+
+    let initial_term = [
+        status(node_ids[0], 7, node_ids[0]),
+        status(node_ids[1], 7, node_ids[0]),
+        status(node_ids[2], 7, node_ids[0]),
+    ];
+    assert_eq!(
+        current_local_maintenance_leader_from_statuses(&initial_term),
+        Some(0)
+    );
+
+    // This is the deterministic status shape during a term change: voter 0
+    // has a stale self-report, while the newly elected voter 1 and its peer
+    // have observed the later term. The selector must not retain voter 0.
+    let reselected_term = [
+        status(node_ids[0], 7, node_ids[0]),
+        status(node_ids[1], 8, node_ids[1]),
+        status(node_ids[2], 8, node_ids[1]),
+    ];
+    assert_eq!(
+        current_local_maintenance_leader_from_statuses(&reselected_term),
+        Some(1)
+    );
 }
 
 fn key(index: usize) -> SessionKey {

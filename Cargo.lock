@@ -3693,13 +3693,17 @@ dependencies = [
  "opc-key",
  "opc-mgmt-audit",
  "opc-redaction",
+ "opc-sqlite-file-control-sys",
  "opc-types",
+ "postcard",
  "proptest",
  "rand 0.10.2",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sha2 0.11.0",
+ "subtle",
  "tempfile",
  "thiserror 2.0.19",
  "time",
@@ -3737,6 +3741,13 @@ dependencies = [
  "tokio",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "opc-sqlite-file-control-sys"
+version = "0.2.0"
+dependencies = [
+ "rusqlite",
 ]
 
 [[package]]

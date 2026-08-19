@@ -1183,6 +1183,103 @@ authoritative re-read rules before retrying. Diagnostics use fixed
 operation-family/reason categories and never record keys, owners, payloads,
 transaction IDs, peer identities, or backend/peer-controlled error text.
 
+## Atomic fenced transitions
+
+The exact V1 atomic surface combines one lease acquire/renew and one same-key
+create/update/delete/TTL mutation at a single capable backend linearization
+point. V1 alone does not promise local restart recovery. A protected production
+composition MUST add an SDK-owned `PreparedFencedTransitionJournal` to the
+outer `EncryptingSessionBackend` or `RemoteSealingSessionBackend`; only that
+journaled composition advertises `AtomicFencedTransitionCapability::V2`.
+Legacy wrapper constructors remain source compatible but their atomic surface
+stays fail closed until a journal is installed.
+
+The journal is a dedicated SQLite database on a caller-selected durable volume.
+That volume MUST be a local filesystem with truthful POSIX locking, `fsync`,
+directory-sync, and storage-barrier semantics; NFS-like mounts are unsupported.
+Its containing directory and file MUST be private, and its stable 32-byte
+`PreparedFencedTransitionJournalKey` MUST come from secret configuration
+independent of record-encryption/provider keys. Preparation rejects an already
+bound request ID before expiry/provider work, protects create/update exactly
+once after the authoritative expiry preflight, and commits the complete opaque
+prepared token to the journal before returning. Delete/refresh remain
+body- and provider-free. Execute/status reload and byte-compare the journaled
+token and never reseal, unseal, or reconstruct it. After a process restart,
+`recover_prepared_fenced_transition` looks it up by the same caller-stable
+`FencedTransitionRequestId`; `NotFound` at the consensus status barrier never
+deletes the journal row or proves that a delayed proposal cannot commit.
+
+Provisioning and recovery are deliberately separate: callers MUST use
+`PreparedFencedTransitionJournal::create_new` exactly once to provision a
+missing journal, and MUST use `open_existing` after every restart. Opening a
+missing, truncated, reset, or partially initialized path fails closed and never
+creates an authenticated empty journal. The integrity key is unique to exactly
+one durable journal path/storage boundary: callers MUST restore the same
+path/file/key together and MUST NOT reuse that key for another journal. This is
+a trusted private durable-path boundary: the deployment MUST give the effective
+user exclusive writer authority. An actor with equivalent same-user
+path-replacement authority is inside that storage boundary because it already
+has the SDK process's file authority. The containing directory MUST reserve the
+database leaf and its SQLite sidecar names exclusively for this journal. One
+process MUST clone the admitted journal handle rather than reopening the same
+inode or opening it directly through SQLite. Platforms without the Unix path
+and SQLite-VFS checks fail closed for V2.
+
+The schema-3 journal authenticates more than each row: a per-journal random
+incarnation, bounded row count, and root over the complete request-ID/tag set
+are committed by a separate HMAC. Health, lookup/recovery, and insertion scan
+and authenticate that small bounded set. The authenticated covering index is
+the presence authority. Its scan cross-validates each indexed row and fixed tag
+against the table, plus independently bounded table and primary-index scans;
+divergent table, primary, or secondary-index state therefore cannot become
+false absence. Schema 3 places the fixed tag before the potentially overflowing
+prepared body, so the global proof remains independent of body size. Lookup
+authenticates the selected token, while insertion re-reads its new row and
+updates the membership commitment atomically before returning success. The
+SQLite catalog is an exact whitelist of the two SDK tables, generated
+primary-key autoindex, and membership index, so any other object, including a
+reserved-prefix object, fails closed before journal setup. These checks detect
+offline row deletion, addition, primary-key replacement, index divergence, and
+tag corruption in the same durable file.
+A corrupt selected body fails its exact row authentication and cannot be
+treated as absent or rebound. Restoring an older complete valid database
+snapshot cannot be detected without an external monotonic anti-rollback anchor
+and is outside the same-durable-file guarantee.
+
+`FencedTransitionExecuteError` separates a definitely pre-dispatch
+`NotTransmitted`, a possibly delivered `OutcomeUnknown { request_id }`, and a
+confirmed `Rejected` store result. Journal absence, corruption, wrong key, or
+unavailability prevents a new dispatch. Any ambiguity returned by an inner
+layer remains ambiguity under the expected outer request ID. Observation
+unprotects only a returned record and preserves the authority fence.
+
+This is a breaking replacement for passing a logical request directly to
+execute/status. Custom backends must implement the prepare/execute/status trio;
+transparent adapters must forward it and may forward the protected-byte
+preservation witness only when the complete durable path retains bytes exactly.
+Defaults fail closed. Nested local/remote protection wrappers are unsupported.
+The explicit authenticated-consumer physical bridge implements only this
+atomic subset below a protected wrapper; all unrelated `SessionBackend`
+authority fails closed and it does not implement lease coordination.
+
+Prepared tokens use a bounded, versioned magic/version/length frame and wiping
+in-memory storage. A golden V1 compatibility corpus covers both lease forms,
+every mutation, record/expiry shapes, and each supported protection-stack
+shape/order. Journal rows contain request metadata and, for protected writes,
+ciphertext; the HMAC authenticates them but does not encrypt them. Never log,
+diagnose, export, or place token/journal contents in fixtures or metrics.
+
+V2 guarantees recovery after loss of the process while the same durable
+volume, path, journal key, protection namespace/mode, authenticated consumer
+identity (when used), and stable consensus cluster remain available. It does
+not claim recovery after volume/host loss. Endpoint, leader, certificate/key,
+provider key, and consensus configuration-epoch rotation do not change the
+binding. A rolling upgrade MUST deploy readers for the prepared-token and
+journal schema everywhere recovery may run before enabling V2. Rollback
+requires draining every unresolved/delayed request or retaining a compatible
+reader and the same journal; never re-encode, reseal, reconstruct, copy into a
+fresh journal identity, or migrate an in-flight token.
+
 ## Fenced ownership
 
 The ownership facade does not add a database, sequencer, election, encryption,

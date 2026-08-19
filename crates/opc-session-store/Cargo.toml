@@ -24,6 +24,7 @@ opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
 opc-mgmt-audit = { path = "../opc-mgmt-audit", version = "0.2.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+postcard = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "io-util", "fs", "rt"] }
 tracing = { workspace = true }
@@ -32,16 +33,21 @@ uuid = { workspace = true }
 time = { workspace = true, features = ["serde"] }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
+sha2-zeroize = { workspace = true }
 hmac = { workspace = true }
+subtle = { workspace = true }
 zeroize = { workspace = true }
 libc = "0.2"
-nix = { workspace = true, features = ["fs"] }
+nix = { workspace = true, features = ["fs", "user"] }
 aes-gcm-siv = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
 # rusqlite 0.40 pulls libsqlite3-sys 0.38, whose build script needs cfg_select!
 # (Rust 1.91); held at 0.32 while the workspace MSRV is 1.88.
-rusqlite = { version = "0.32", features = ["backup", "bundled", "hooks"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled", "hooks", "limits"] }
+
+[target.'cfg(unix)'.dependencies]
+opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

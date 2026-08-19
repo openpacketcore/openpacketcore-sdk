@@ -1,0 +1,21 @@
+[package]
+name = "opc-sqlite-file-control-sys"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Narrow SQLite file-control boundary for OpenPacketCore"
+readme = "README.md"
+documentation = "https://docs.rs/opc-sqlite-file-control-sys"
+keywords = ["sqlite", "vfs", "ffi", "durability", "security"]
+categories = ["database", "external-ffi-bindings"]
+publish = false
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
