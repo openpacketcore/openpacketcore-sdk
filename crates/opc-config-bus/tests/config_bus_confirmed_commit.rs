@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 use std::str::FromStr;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -12,7 +12,8 @@ use tokio::{sync::Notify, time::timeout};
 
 use opc_alarm::{Alarm, AlarmState, ProbableCause, Severity, SharedAlarmManager};
 use opc_config_bus::{
-    ConfigBus, ConfigEvent, ConfigSnapshot, DriftState, ManagedDatastore, MockManagedDatastore,
+    ConfigAuthorityOperation, ConfigAuthorityOutcome, ConfigAuthorityPort, ConfigBus, ConfigEvent,
+    ConfigProjectionHead, ConfigSnapshot, DriftState, ManagedDatastore, MockManagedDatastore,
     StoreError, StoreErrorCode, StoredConfig, SubscriberLagPolicy,
 };
 use opc_config_model::{
@@ -24,6 +25,25 @@ use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp};
 
 mod config_bus_common;
 use config_bus_common::*;
+
+struct ToggleAuthority {
+    available: AtomicBool,
+}
+
+#[async_trait]
+impl ConfigAuthorityPort for ToggleAuthority {
+    async fn ensure_local_authority(
+        &self,
+        _operation: ConfigAuthorityOperation,
+        _projection: ConfigProjectionHead,
+    ) -> ConfigAuthorityOutcome {
+        if self.available.load(Ordering::Acquire) {
+            ConfigAuthorityOutcome::LocalAuthority
+        } else {
+            ConfigAuthorityOutcome::Unavailable
+        }
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_confirmed_stores_deadline_and_publishes() {
@@ -435,6 +455,54 @@ async fn commit_confirmed_expiry_rollback_restores_previous() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_confirmed_expiry_fails_closed_after_authority_loss() {
+    let store = Arc::new(MockManagedDatastore::new());
+    store
+        .seed(StoredConfig::new(
+            opc_types::TxId::new(),
+            ConfigVersion::new(1),
+            principal(),
+            RequestSource::Northbound,
+            TestConfig::new("initial"),
+        ))
+        .await;
+
+    let bus = ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds");
+    let authority = Arc::new(ToggleAuthority {
+        available: AtomicBool::new(true),
+    });
+    bus.set_authority_port(Some(authority.clone()));
+    bus.submit(
+        CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_millis(50),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        )
+        .with_base_version(bus.version()),
+    )
+    .await
+    .expect("commit-confirmed succeeds while local authority is proven");
+
+    authority.available.store(false, Ordering::Release);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(bus.version(), ConfigVersion::new(2));
+    assert_eq!(bus.load().name, "tentative");
+    assert_eq!(bus.drift_state(), DriftState::RecoveryRequired);
+    assert_eq!(store.history().await.len(), 2);
 }
 
 #[tokio::test(start_paused = true)]

@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -164,6 +165,15 @@ fn config_projection_head_matches(
             durable.record.tx_id == projected_tx_id && durable.record.version == projected_version
         }
         (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
+fn config_projection_head_from_durable(
+    durable: Option<&StoredConfig>,
+) -> (Option<opc_types::TxId>, opc_types::ConfigVersion) {
+    match durable {
+        Some(durable) => (Some(durable.record.tx_id), durable.record.version),
+        None => (None, opc_types::ConfigVersion::INITIAL),
     }
 }
 
@@ -627,6 +637,84 @@ impl ConsensusConfigStore {
         ConfigLocalAuthorityOutcome::LocalAuthority
     }
 
+    /// Holds the existing proposal-admission cohort while a consumer rebuilds
+    /// its local projection to the canonical applied config head.
+    ///
+    /// The callback receives only payload-free head metadata. This store
+    /// remains the sole source of quorum, term, apply, and proposal admission:
+    /// it takes a same-term local barrier before the callback, verifies the
+    /// durable head, and repeats both checks after the callback before
+    /// releasing the cohort. Any timeout, callback failure, leadership change,
+    /// or head movement fails closed.
+    pub async fn open_local_authority_projection<F, Fut>(
+        &self,
+        reconcile: F,
+    ) -> ConfigLocalAuthorityOutcome
+    where
+        F: FnOnce(Option<opc_types::TxId>, opc_types::ConfigVersion) -> Fut,
+        Fut: Future<Output = Result<(Option<opc_types::TxId>, opc_types::ConfigVersion), ()>>,
+    {
+        let Some(deadline) = tokio::time::Instant::now().checked_add(self.inner.operation_timeout)
+        else {
+            return ConfigLocalAuthorityOutcome::Unavailable;
+        };
+        let Ok(slot_count) = u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS) else {
+            return ConfigLocalAuthorityOutcome::Unavailable;
+        };
+        let _proposal_guard = match tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.inner.proposal_admission).acquire_many_owned(slot_count),
+        )
+        .await
+        {
+            Ok(Ok(guard)) => guard,
+            Ok(Err(_)) | Err(_) => return ConfigLocalAuthorityOutcome::Unavailable,
+        };
+        let barrier = self.local_authority_barrier();
+        let before = match barrier.admit(deadline).await {
+            Ok(admit)
+                if self.require_admission().is_ok() && self.exact_membership_is_admitted() =>
+            {
+                admit
+            }
+            Ok(_) => return ConfigLocalAuthorityOutcome::Unavailable,
+            Err(error) => return map_local_authority_error(error),
+        };
+        let target = match tokio::time::timeout_at(deadline, self.inner.backend.load_latest()).await
+        {
+            Ok(Ok(durable)) => config_projection_head_from_durable(durable.as_ref()),
+            Ok(Err(_)) | Err(_) => return ConfigLocalAuthorityOutcome::Unavailable,
+        };
+        let rebuilt = match tokio::time::timeout_at(deadline, reconcile(target.0, target.1)).await {
+            Ok(Ok(head)) => head,
+            Ok(Err(())) | Err(_) => return ConfigLocalAuthorityOutcome::Unavailable,
+        };
+        if rebuilt != target {
+            return ConfigLocalAuthorityOutcome::Unavailable;
+        }
+        let after = match barrier.admit(deadline).await {
+            Ok(admit)
+                if self.require_admission().is_ok() && self.exact_membership_is_admitted() =>
+            {
+                admit
+            }
+            Ok(_) => return ConfigLocalAuthorityOutcome::Unavailable,
+            Err(error) => return map_local_authority_error(error),
+        };
+        if before.term() != after.term() || before.read_log_id() != after.read_log_id() {
+            return ConfigLocalAuthorityOutcome::Unavailable;
+        }
+        let durable =
+            match tokio::time::timeout_at(deadline, self.inner.backend.load_latest()).await {
+                Ok(Ok(durable)) => config_projection_head_from_durable(durable.as_ref()),
+                Ok(Err(_)) | Err(_) => return ConfigLocalAuthorityOutcome::Unavailable,
+            };
+        if durable != target || tokio::time::Instant::now() >= deadline {
+            return ConfigLocalAuthorityOutcome::Unavailable;
+        }
+        ConfigLocalAuthorityOutcome::LocalAuthority
+    }
+
     fn local_authority_barrier(&self) -> LinearizableReadBarrier<ConfigRaftTypeConfig> {
         LinearizableReadBarrier::new(
             self.inner.local_node_id,
@@ -687,6 +775,44 @@ impl ConsensusConfigStore {
         self.submit_request(request_id, intent).await?.into_result()
     }
 
+    /// Append an authenticated config commit only when this node remains the
+    /// local Openraft leader. Unlike [`Self::append_commit_idempotent`], this
+    /// method never forwards the mutation to another voter.
+    pub async fn append_commit_local_idempotent(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        commit: AttestedConfigCommit,
+    ) -> Result<(), PersistError> {
+        let (record, audit, resolution) = commit.into_parts();
+        let prepared =
+            PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
+        let intent = match resolution {
+            Some(resolution) => ConfigMutationIntent::ResolveConfirmedAndAppend {
+                commit: Box::new(prepared),
+                resolution,
+            },
+            None => ConfigMutationIntent::AppendCommit(Box::new(prepared)),
+        };
+        self.submit_request_on_local_leader(request_id, intent)
+            .await?
+            .into_result()
+    }
+
+    /// Append an authenticated commit on this local leader using the same
+    /// deterministic request identity as the [`ConfigStore`] adapter.
+    pub async fn append_attested_commit_local(
+        &self,
+        commit: AttestedConfigCommit,
+    ) -> Result<(), PersistError> {
+        let request_id = derive_durable_request_id(
+            self.inner.identity,
+            b"append",
+            commit.record().tx_id.as_uuid().as_bytes(),
+        );
+        self.append_commit_local_idempotent(request_id, commit)
+            .await
+    }
+
     /// Confirm with a caller-retained durable request ID.
     pub async fn mark_confirmed_idempotent(
         &self,
@@ -696,6 +822,30 @@ impl ConsensusConfigStore {
         self.submit_request(request_id, ConfigMutationIntent::MarkConfirmed { tx_id })
             .await?
             .into_result()
+    }
+
+    /// Confirm a pending commit only on the current local leader, without
+    /// forwarding to another voter.
+    pub async fn mark_confirmed_local_idempotent(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        tx_id: opc_types::TxId,
+    ) -> Result<(), PersistError> {
+        self.submit_request_on_local_leader(
+            request_id,
+            ConfigMutationIntent::MarkConfirmed { tx_id },
+        )
+        .await?
+        .into_result()
+    }
+
+    /// Confirm a pending commit on this local leader using the deterministic
+    /// lifecycle request identity.
+    pub async fn mark_confirmed_local(&self, tx_id: opc_types::TxId) -> Result<(), PersistError> {
+        let request_id =
+            derive_durable_request_id(self.inner.identity, b"confirm", tx_id.as_uuid().as_bytes());
+        self.mark_confirmed_local_idempotent(request_id, tx_id)
+            .await
     }
 
     /// Clear a config-bus recovery marker with a caller-retained durable
@@ -713,6 +863,36 @@ impl ConsensusConfigStore {
         .into_result()
     }
 
+    /// Clear a recovery marker only on the current local leader, without
+    /// forwarding to another voter.
+    pub async fn clear_recovery_required_local_idempotent(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        tx_id: opc_types::TxId,
+    ) -> Result<(), PersistError> {
+        self.submit_request_on_local_leader(
+            request_id,
+            ConfigMutationIntent::ClearRecoveryRequired { tx_id },
+        )
+        .await?
+        .into_result()
+    }
+
+    /// Clear a recovery marker on this local leader using the deterministic
+    /// lifecycle request identity.
+    pub async fn clear_recovery_required_local(
+        &self,
+        tx_id: opc_types::TxId,
+    ) -> Result<(), PersistError> {
+        let request_id = derive_durable_request_id(
+            self.inner.identity,
+            b"clear-recovery",
+            tx_id.as_uuid().as_bytes(),
+        );
+        self.clear_recovery_required_local_idempotent(request_id, tx_id)
+            .await
+    }
+
     /// Create a rollback point with a caller-retained durable request ID.
     pub async fn create_rollback_point_idempotent(
         &self,
@@ -727,6 +907,43 @@ impl ConsensusConfigStore {
         )
         .await?
         .into_result()
+    }
+
+    /// Create a rollback point only on the current local leader, without
+    /// forwarding to another voter.
+    pub async fn create_rollback_point_local_idempotent(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        tx_id: opc_types::TxId,
+        label: Option<String>,
+    ) -> Result<(), PersistError> {
+        let label = label.map(ValidatedRollbackLabel::try_new).transpose()?;
+        self.submit_request_on_local_leader(
+            request_id,
+            ConfigMutationIntent::CreateRollbackPoint { tx_id, label },
+        )
+        .await?
+        .into_result()
+    }
+
+    /// Create a rollback point on this local leader using the deterministic
+    /// lifecycle request identity.
+    pub async fn create_rollback_point_local(
+        &self,
+        tx_id: opc_types::TxId,
+        label: Option<String>,
+    ) -> Result<(), PersistError> {
+        let mut operation_identity = tx_id.as_uuid().as_bytes().to_vec();
+        if let Some(label) = &label {
+            operation_identity.extend_from_slice(&(label.len() as u32).to_be_bytes());
+            operation_identity.extend_from_slice(label.as_bytes());
+        } else {
+            operation_identity.extend_from_slice(&0_u32.to_be_bytes());
+        }
+        let request_id =
+            derive_durable_request_id(self.inner.identity, b"rollback-point", &operation_identity);
+        self.create_rollback_point_local_idempotent(request_id, tx_id, label)
+            .await
     }
 
     /// Re-assert the immutable configured voter set.
@@ -860,6 +1077,44 @@ impl ConsensusConfigStore {
         intent: ConfigMutationIntent,
     ) -> Result<ConfigConsensusResponse, PersistError> {
         let result = self.submit_request_inner(request_id, intent).await;
+        let metric = if result.is_ok() {
+            &opc_redaction::metrics::METRICS.persist_quorum_write_success
+        } else {
+            &opc_redaction::metrics::METRICS.persist_quorum_write_failure
+        };
+        metric.fetch_add(1, Ordering::Relaxed);
+        self.publish_global_metrics();
+        result
+    }
+
+    async fn submit_request_on_local_leader(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        intent: ConfigMutationIntent,
+    ) -> Result<ConfigConsensusResponse, PersistError> {
+        let result = async {
+            preflight_config_command_replication_budget(self.inner.identity, request_id, &intent)
+                .map_err(ForwardMutationRejection::into_persist_error)?;
+            self.require_admission()?;
+            let deadline = tokio::time::Instant::now()
+                .checked_add(self.inner.operation_timeout)
+                .ok_or_else(consensus_unavailable)?;
+            let request = ForwardMutationRequest {
+                request_id,
+                intent,
+                compatibility: self.peer_compatibility(),
+                budget: ForwardedBudget::from_deadline(deadline)?,
+            };
+            match self.apply_on_local_leader(request, deadline).await {
+                ForwardMutationReply::Applied(response) => Ok(*response),
+                ForwardMutationReply::Rejected(rejection) => Err(rejection.into_persist_error()),
+                ForwardMutationReply::OutcomeUnknown => Err(PersistError::outcome_unknown()),
+                ForwardMutationReply::NotLeader { .. } | ForwardMutationReply::Unavailable => {
+                    Err(consensus_unavailable())
+                }
+            }
+        }
+        .await;
         let metric = if result.is_ok() {
             &opc_redaction::metrics::METRICS.persist_quorum_write_success
         } else {
@@ -1879,6 +2134,88 @@ mod tests {
             DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
             "authority checks must release every drained proposal permit"
         );
+        store.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn leader_open_callback_must_return_the_exact_canonical_head() {
+        let (store, _snapshots) = singleton_store().await;
+        assert_eq!(
+            store
+                .open_local_authority_projection(
+                    |tx_id, version| async move { Ok((tx_id, version)) }
+                )
+                .await,
+            ConfigLocalAuthorityOutcome::LocalAuthority
+        );
+        assert_eq!(
+            store
+                .open_local_authority_projection(|_tx_id, version| async move {
+                    Ok((Some(opc_types::TxId::new()), version))
+                })
+                .await,
+            ConfigLocalAuthorityOutcome::Unavailable
+        );
+        assert_eq!(
+            store.inner.proposal_admission.available_permits(),
+            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+            "leader-open callback must release every proposal permit"
+        );
+        store.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn leader_open_holds_proposal_admission_until_reconciliation_acknowledges() {
+        let (store, _snapshots) = singleton_store().await;
+        let store = Arc::new(store);
+        let callback_started = Arc::new(tokio::sync::Notify::new());
+        let release_callback = Arc::new(tokio::sync::Notify::new());
+        let started_wait = callback_started.notified();
+        let opening_store = Arc::clone(&store);
+        let opening_started = Arc::clone(&callback_started);
+        let opening_release = Arc::clone(&release_callback);
+        let opening = tokio::spawn(async move {
+            opening_store
+                .open_local_authority_projection(move |tx_id, version| {
+                    opening_started.notify_one();
+                    async move {
+                        opening_release.notified().await;
+                        Ok((tx_id, version))
+                    }
+                })
+                .await
+        });
+        started_wait.await;
+        assert_eq!(
+            store.inner.proposal_admission.available_permits(),
+            0,
+            "leader-open drains the existing proposal cohort before invoking reconciliation"
+        );
+
+        let append_store = Arc::clone(&store);
+        let append = tokio::spawn(async move {
+            append_store
+                .append_commit_idempotent(
+                    opc_consensus::ConsensusRequestId::from_bytes([0xD5; 16]),
+                    sized_attested_commit(128),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !append.is_finished(),
+            "a concurrent config head advance waits until leader-open releases admission"
+        );
+
+        release_callback.notify_one();
+        assert_eq!(
+            opening.await.expect("leader-open task joins"),
+            ConfigLocalAuthorityOutcome::LocalAuthority
+        );
+        append
+            .await
+            .expect("append task joins")
+            .expect("append proceeds after leader-open completion");
         store.shutdown().await.expect("shutdown");
     }
 
