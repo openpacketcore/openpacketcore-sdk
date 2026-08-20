@@ -2648,6 +2648,7 @@ dependencies = [
  "futures-util",
  "opc-config-bus",
  "opc-config-model",
+ "opc-consensus",
  "opc-identity",
  "opc-key",
  "opc-persist",
