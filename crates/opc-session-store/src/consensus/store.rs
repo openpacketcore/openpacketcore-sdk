@@ -5762,7 +5762,13 @@ fn rejected_error_matches_intent(intent: &SessionMutationIntent, error: &StoreEr
             (
                 SessionMutationIntent::AdmitFencedMutationRoster { .. }
                     | SessionMutationIntent::TerminalizeFencedMutationRoster { .. }
-                    | SessionMutationIntent::ReserveFencedMutationRosterV4VerifierDispatch { .. },
+                    | SessionMutationIntent::ReserveFencedMutationRosterV4VerifierDispatch { .. }
+                    | SessionMutationIntent::EnsureManagedProviderJob { .. }
+                    | SessionMutationIntent::StartManagedProviderMember { .. }
+                    | SessionMutationIntent::RecordManagedProviderReceipt { .. }
+                    | SessionMutationIntent::RequireManagedProviderReconciliation { .. }
+                    | SessionMutationIntent::AbortManagedProviderNotApplied { .. }
+                    | SessionMutationIntent::FinalizeManagedProviderJob { .. },
                 StoreError::CapabilityNotSupported(reason)
             ) if reason == "fenced_mutation_roster_v1"
         )
@@ -6286,21 +6292,36 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                         .unwrap_or_else(tokio::time::Instant::now);
                     return encode_service_reply(&self.store.local_read_barrier(deadline).await);
                 }
-                if let Ok(probe) =
-                    decode_bounded::<FencedTransitionCapabilityProbe>(&request.payload)
+                if let Ok(
+                    probe @ ManagedProviderV5CapabilityProbe {
+                        magic: MANAGED_PROVIDER_V5_CAPABILITY_PROBE_MAGIC,
+                        ..
+                    },
+                ) = decode_bounded::<ManagedProviderV5CapabilityProbe>(&request.payload)
                 {
-                    let reply = if probe.schema_version == FENCED_TRANSITION_SCHEMA_V1
-                        && self.store.local_fenced_transition_capability()
-                            == AtomicFencedTransitionCapability::V1
-                    {
-                        FencedTransitionCapabilityReply::V1
-                    } else {
-                        FencedTransitionCapabilityReply::Unsupported
-                    };
-                    return encode_service_reply(&reply);
+                    return encode_service_reply(&managed_provider_v5_capability_probe_reply(
+                        probe,
+                        self.store.local_managed_provider_v5_capability(),
+                    ));
                 }
-                if let Ok(probe) =
-                    decode_bounded::<FencedTransitionV2CapabilityProbe>(&request.payload)
+                if let Ok(
+                    probe @ FencedMutationRosterCapabilityProbe {
+                        magic: FENCED_MUTATION_ROSTER_CAPABILITY_PROBE_MAGIC,
+                        ..
+                    },
+                ) = decode_bounded::<FencedMutationRosterCapabilityProbe>(&request.payload)
+                {
+                    return encode_service_reply(&fenced_mutation_roster_capability_probe_reply(
+                        probe,
+                        self.store.local_fenced_mutation_roster_capability(),
+                    ));
+                }
+                if let Ok(
+                    probe @ FencedTransitionV2CapabilityProbe {
+                        schema_version: FENCED_TRANSITION_SCHEMA_V2,
+                        ..
+                    },
+                ) = decode_bounded::<FencedTransitionV2CapabilityProbe>(&request.payload)
                 {
                     let reply = fenced_transition_v2_capability_probe_reply(
                         probe,
@@ -6308,23 +6329,20 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                     );
                     return encode_service_reply(&reply);
                 }
-                if let Ok(probe) =
-                    decode_bounded::<ManagedProviderV5CapabilityProbe>(&request.payload)
+                if let Ok(FencedTransitionCapabilityProbe {
+                    schema_version: FENCED_TRANSITION_SCHEMA_V1,
+                }) = decode_bounded::<FencedTransitionCapabilityProbe>(&request.payload)
                 {
-                    return encode_service_reply(&managed_provider_v5_capability_probe_reply(
-                        probe,
-                        self.store.local_managed_provider_v5_capability(),
-                    ));
-                }
-                let probe =
-                    match decode_bounded::<FencedMutationRosterCapabilityProbe>(&request.payload) {
-                        Ok(probe) => probe,
-                        Err(_) => return protocol_rejection(),
+                    let reply = if self.store.local_fenced_transition_capability()
+                        == AtomicFencedTransitionCapability::V1
+                    {
+                        FencedTransitionCapabilityReply::V1
+                    } else {
+                        FencedTransitionCapabilityReply::Unsupported
                     };
-                encode_service_reply(&fenced_mutation_roster_capability_probe_reply(
-                    probe,
-                    self.store.local_fenced_mutation_roster_capability(),
-                ))
+                    return encode_service_reply(&reply);
+                }
+                protocol_rejection()
             }
             SessionConsensusRpcFamily::TopologyAdmissionBarrier => {
                 let barrier = match decode_bounded(&request.payload) {
@@ -7999,7 +8017,7 @@ impl SessionLeaseManager for ConsensusSessionStore {
 #[cfg(test)]
 mod membership_tests {
     use std::sync::atomic::AtomicUsize;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex, RwLock};
 
     use bytes::Bytes;
     use futures_util::StreamExt;
@@ -8019,8 +8037,8 @@ mod membership_tests {
     use crate::model::{FenceToken, Generation, SessionKeyType, StateClass, StateType};
     use crate::record::EncryptedSessionPayload;
     use crate::topology::{
-        QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-        ReplicaId, ReplicaTlsIdentity,
+        QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
+        ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
     };
     use crate::{
         FencedTransitionLease, FencedTransitionMutation, FencedTransitionMutationResult,
@@ -8106,6 +8124,343 @@ mod membership_tests {
             ConsensusIdentity::new(cluster_id, configuration_id, epoch),
         )
         .expect("singleton topology")
+    }
+
+    const MANAGED_V5_CAPABILITY_TEST_VOTERS: usize = 3;
+
+    #[derive(Clone)]
+    struct ManagedV5CapabilityTestPeer {
+        target: SessionConsensusNodeId,
+        handler: Arc<RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
+    }
+
+    impl ManagedV5CapabilityTestPeer {
+        fn new(target: SessionConsensusNodeId) -> Self {
+            Self {
+                target,
+                handler: Arc::new(RwLock::new(None)),
+            }
+        }
+
+        fn install(&self, handler: Arc<dyn SessionConsensusRpcHandler>) {
+            *self.handler.write().expect("capability test handler lock") = Some(handler);
+        }
+
+        fn clear_handler(&self) {
+            self.handler
+                .write()
+                .expect("capability test handler lock")
+                .take();
+        }
+    }
+
+    impl fmt::Debug for ManagedV5CapabilityTestPeer {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("ManagedV5CapabilityTestPeer")
+                .field("target", &self.target)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionConsensusPeer for ManagedV5CapabilityTestPeer {
+        fn node_id(&self) -> SessionConsensusNodeId {
+            self.target
+        }
+
+        async fn call(
+            &self,
+            request: SessionConsensusWireRequest,
+        ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+            let handler = self
+                .handler
+                .read()
+                .expect("capability test handler lock")
+                .clone()
+                .ok_or(SessionConsensusPeerError::Unavailable)?;
+            Ok(handler.handle(request.sender, request).await)
+        }
+    }
+
+    /// Test-only copies of the private capability frame preserve the real
+    /// postcard boundary while allowing one peer to advertise the predecessor
+    /// profile. The command itself still crosses `ConsensusSessionStore`.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ManagedV5CapabilityTestProbe {
+        magic: [u8; 8],
+        schema_version: u16,
+        profile_digest: [u8; 32],
+    }
+
+    #[derive(Serialize)]
+    enum ManagedV5CapabilityTestReply {
+        V5 {
+            magic: [u8; 8],
+            profile_digest: [u8; 32],
+        },
+    }
+
+    struct PredecessorManagedV5ProfileHandler {
+        inner: Arc<dyn SessionConsensusRpcHandler>,
+        v5_probes: Arc<AtomicUsize>,
+    }
+
+    impl fmt::Debug for PredecessorManagedV5ProfileHandler {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("PredecessorManagedV5ProfileHandler(<redacted>)")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionConsensusRpcHandler for PredecessorManagedV5ProfileHandler {
+        async fn handle(
+            &self,
+            authenticated_sender: SessionConsensusNodeId,
+            request: SessionConsensusWireRequest,
+        ) -> SessionConsensusWireResponse {
+            if request.family == SessionConsensusRpcFamily::ReadBarrier
+                && matches!(
+                    decode_bounded::<ManagedV5CapabilityTestProbe>(&request.payload),
+                    Ok(ManagedV5CapabilityTestProbe {
+                        magic: MANAGED_PROVIDER_V5_CAPABILITY_PROBE_MAGIC,
+                        schema_version: MANAGED_PROVIDER_V5_CAPABILITY_SCHEMA_VERSION,
+                        profile_digest,
+                    }) if profile_digest == fenced_mutation_roster_managed_provider_v5_profile_digest()
+                )
+            {
+                self.v5_probes.fetch_add(1, Ordering::SeqCst);
+                let reply = ManagedV5CapabilityTestReply::V5 {
+                    magic: MANAGED_PROVIDER_V5_CAPABILITY_REPLY_MAGIC,
+                    profile_digest: fenced_mutation_roster_profile_digest(),
+                };
+                return SessionConsensusWireResponse {
+                    result: encode_bounded(&reply).map_err(|_| SessionConsensusPeerError::Protocol),
+                };
+            }
+            self.inner.handle(authenticated_sender, request).await
+        }
+    }
+
+    struct ManagedV5CapabilityThreeVoterFixture {
+        paths: BTreeMap<(usize, usize), Arc<ManagedV5CapabilityTestPeer>>,
+        stores: Vec<ConsensusSessionStore>,
+        _backends: Vec<SqliteSessionBackend>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl Drop for ManagedV5CapabilityThreeVoterFixture {
+        fn drop(&mut self) {
+            for path in self.paths.values() {
+                path.clear_handler();
+            }
+        }
+    }
+
+    fn managed_v5_capability_test_member(index: usize) -> QuorumReplicaDescriptor {
+        let replica_id =
+            ReplicaId::new(format!("managed-v5-capability-test-{index}")).expect("replica ID");
+        QuorumReplicaDescriptor::new(
+            replica_id,
+            ReplicaEndpoint::new(format!("managed-v5-capability-test-{index}.invalid"), 7443)
+                .expect("endpoint"),
+            ReplicaTlsIdentity::new(format!("spiffe://test/session/managed-v5/{index}"))
+                .expect("TLS identity"),
+            ReplicaFailureDomain::new(format!("managed-v5-capability-zone-{index}"))
+                .expect("failure domain"),
+            ReplicaBackingIdentity::new(format!("managed-v5-capability-disk-{index}"))
+                .expect("backing identity"),
+        )
+    }
+
+    async fn managed_v5_capability_three_voter_fixture() -> ManagedV5CapabilityThreeVoterFixture {
+        let members = (0..MANAGED_V5_CAPABILITY_TEST_VOTERS)
+            .map(managed_v5_capability_test_member)
+            .collect::<Vec<_>>();
+        let cluster_id =
+            ConsensusClusterId::new("managed-v5-capability-three-voter").expect("cluster ID");
+        let epoch = ConsensusConfigurationEpoch::new(1).expect("configuration epoch");
+        let configuration_id = derive_configuration_id(
+            cluster_id,
+            epoch,
+            &members
+                .iter()
+                .map(QuorumReplicaDescriptor::configuration_fingerprint)
+                .collect::<Vec<_>>(),
+        );
+        let identity = ConsensusIdentity::new(cluster_id, configuration_id, epoch);
+        let topologies = members
+            .iter()
+            .map(|member| {
+                ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                    member.replica_id().clone(),
+                    members.clone(),
+                    identity,
+                ))
+                .expect("three-voter topology")
+            })
+            .collect::<Vec<_>>();
+        let node_ids = topologies
+            .iter()
+            .map(|topology| topology.local_consensus_node_id().expect("node ID"))
+            .collect::<Vec<_>>();
+        let directory = tempfile::tempdir().expect("three-voter directory");
+        let backends = (0..MANAGED_V5_CAPABILITY_TEST_VOTERS)
+            .map(|index| {
+                SqliteSessionBackend::open(directory.path().join(format!("node-{index}.sqlite")))
+                    .expect("file-backed SQLite backend")
+            })
+            .collect::<Vec<_>>();
+        let mut paths = BTreeMap::new();
+        for source in 0..MANAGED_V5_CAPABILITY_TEST_VOTERS {
+            for (target, node_id) in node_ids.iter().copied().enumerate() {
+                if source != target {
+                    paths.insert(
+                        (source, target),
+                        Arc::new(ManagedV5CapabilityTestPeer::new(node_id)),
+                    );
+                }
+            }
+        }
+        let mut stores = Vec::with_capacity(MANAGED_V5_CAPABILITY_TEST_VOTERS);
+        for index in 0..MANAGED_V5_CAPABILITY_TEST_VOTERS {
+            let peers = (0..MANAGED_V5_CAPABILITY_TEST_VOTERS)
+                .filter(|target| *target != index)
+                .map(|target| {
+                    let peer: Arc<dyn SessionConsensusPeer> =
+                        paths.get(&(index, target)).expect("test path").clone();
+                    (node_ids[target], peer)
+                })
+                .collect();
+            stores.push(
+                ConsensusSessionStore::open(
+                    topologies[index].clone(),
+                    backends[index].clone(),
+                    directory.path().join(format!("snapshots-{index}")),
+                    peers,
+                )
+                .await
+                .expect("open three-voter consensus store"),
+            );
+        }
+        let fixture = ManagedV5CapabilityThreeVoterFixture {
+            paths,
+            stores,
+            _backends: backends,
+            _directory: directory,
+        };
+        for ((_, target), path) in &fixture.paths {
+            path.install(fixture.stores[*target].rpc_handler());
+        }
+        for result in futures_util::future::join_all(
+            fixture
+                .stores
+                .iter()
+                .map(ConsensusSessionStore::initialize_cluster),
+        )
+        .await
+        {
+            result.expect("initialize three-voter cluster");
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if futures_util::future::join_all(
+                    fixture
+                        .stores
+                        .iter()
+                        .map(ConsensusSessionStore::probe_durable_readiness),
+                )
+                .await
+                .iter()
+                .all(DurableReadinessReport::is_ready)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("three-voter cluster reaches readiness");
+        fixture
+    }
+
+    #[tokio::test]
+    async fn managed_v5_command_rejects_mismatched_three_voter_profile_before_proposal_or_apply() {
+        let fixture = managed_v5_capability_three_voter_fixture().await;
+        let statuses = fixture
+            .stores
+            .iter()
+            .map(ConsensusSessionStore::status)
+            .collect::<Vec<_>>();
+        let leader_id = statuses
+            .first()
+            .and_then(|status| status.leader_id)
+            .expect("ready cluster has a leader");
+        let leader = statuses
+            .iter()
+            .position(|status| status.node_id == leader_id)
+            .expect("leader is configured");
+        let predecessor = (leader + 1) % MANAGED_V5_CAPABILITY_TEST_VOTERS;
+        let predecessor_v5_probes = Arc::new(AtomicUsize::new(0));
+        for source in 0..MANAGED_V5_CAPABILITY_TEST_VOTERS {
+            if source != predecessor {
+                fixture
+                    .paths
+                    .get(&(source, predecessor))
+                    .expect("path to predecessor-profile voter")
+                    .install(Arc::new(PredecessorManagedV5ProfileHandler {
+                        inner: fixture.stores[predecessor].rpc_handler(),
+                        v5_probes: Arc::clone(&predecessor_v5_probes),
+                    }));
+            }
+        }
+
+        let before = fixture
+            .stores
+            .iter()
+            .map(ConsensusSessionStore::status)
+            .map(|status| (status.last_log_index, status.applied_index))
+            .collect::<Vec<_>>();
+        let scope = fixture.stores[leader]
+            .consumer_scope()
+            .expect("leader exposes its admitted consumer scope");
+        let consumer = SessionConsumerIdentity::new("spiffe://test/managed-v5/capability")
+            .expect("consumer identity");
+        let admission = consumer_v3_roster_admission(scope, &consumer);
+        let result = fixture.stores[leader]
+            .submit_intent(SessionMutationIntent::EnsureManagedProviderJob {
+                admission: Box::new(admission.clone()),
+                protected_checkpoint: FencedMutationRosterProtectedPlan::new(
+                    vec![0xA7].into_boxed_slice(),
+                )
+                .expect("managed checkpoint"),
+                worker_digest: [0xA8; 32],
+                verifier_digest: [0xA9; 32],
+            })
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::CapabilityNotSupported(ref reason)) if reason == "fenced_mutation_roster_v1"
+            ),
+            "a predecessor managed-V5 profile must reject the public consensus command"
+        );
+        assert_eq!(
+            predecessor_v5_probes.load(Ordering::SeqCst),
+            1,
+            "the mismatched voter must advertise its predecessor profile to the fresh V5 probe"
+        );
+        let after = fixture
+            .stores
+            .iter()
+            .map(ConsensusSessionStore::status)
+            .map(|status| (status.last_log_index, status.applied_index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after, before,
+            "a mismatched voter must stop the managed command before proposal or apply on every voter"
+        );
     }
 
     #[tokio::test]
