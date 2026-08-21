@@ -1312,11 +1312,13 @@ struct PersistentFencedMutationRosterPool {
     // workers. It has no queue: concurrent callers fail admission rather
     // than creating a caller-owned connection or unbounded retained work.
     attested_pending: Arc<Semaphore>,
+    /// Serializes the phase decision that governs V4 publication and forced
+    /// removal. Always acquire this before `attested_lane`.
+    attested_state: Mutex<()>,
     attested_lane: Mutex<Option<FencedMutationRosterV4LaneConnection>>,
     attested_warm: AtomicBool,
     attested_setup_inflight: AtomicU64,
     attested_calls_inflight: AtomicU64,
-    attested_drained_calls: AtomicU64,
     scheduler: StdMutex<Option<mpsc::Sender<FencedMutationRosterSchedulerCommand>>>,
     started: AtomicBool,
     phase: AtomicU8,
@@ -1381,11 +1383,11 @@ impl PersistentFencedMutationRosterClient {
                 response_cells: Arc::new(Semaphore::new(config.response_cells)),
                 terminal_adoption: Arc::new(Semaphore::new(config.terminal_adoption_entries)),
                 attested_pending: Arc::new(Semaphore::new(1)),
+                attested_state: Mutex::new(()),
                 attested_lane: Mutex::new(None),
                 attested_warm: AtomicBool::new(false),
                 attested_setup_inflight: AtomicU64::new(0),
                 attested_calls_inflight: AtomicU64::new(0),
-                attested_drained_calls: AtomicU64::new(0),
                 scheduler: StdMutex::new(None),
                 started: AtomicBool::new(false),
                 phase: AtomicU8::new(PersistentFencedMutationRosterPoolPhase::Running as u8),
@@ -1645,6 +1647,7 @@ impl PersistentFencedMutationRosterClient {
             .map_err(|_| {
                 SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Overloaded)
             })?;
+        let _call = FencedMutationRosterAttestedCallInFlight::new(&self.pool);
         let mut connection = {
             let mut lane = self.pool.attested_lane.try_lock().map_err(|_| {
                 SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Overloaded)
@@ -1671,7 +1674,6 @@ impl PersistentFencedMutationRosterClient {
                 _ = &mut forced => return Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::ShuttingDown)),
             });
         }
-        let _call = FencedMutationRosterAttestedCallInFlight::new(&self.pool);
         let progress = FrameWriteProgress::new();
         let result = match connection.as_mut() {
             Some(connection) => {
@@ -1714,13 +1716,6 @@ impl PersistentFencedMutationRosterClient {
             if let Some(connection) = connection {
                 let _ = publish_attested_lane(&self.pool, connection).await;
             }
-        }
-        if PersistentFencedMutationRosterPoolPhase::load(&self.pool.phase)
-            == PersistentFencedMutationRosterPoolPhase::Draining
-        {
-            self.pool
-                .attested_drained_calls
-                .fetch_add(1, Ordering::Relaxed);
         }
         result
     }
@@ -1878,12 +1873,15 @@ impl PersistentFencedMutationRosterClient {
 
     /// Stop admission, boundedly drain fixed work, then force remaining lane I/O.
     pub async fn shutdown(&self) -> PersistentFencedMutationRosterShutdownReport {
-        let previous = self.pool.phase.compare_exchange(
-            PersistentFencedMutationRosterPoolPhase::Running as u8,
-            PersistentFencedMutationRosterPoolPhase::Draining as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let previous = {
+            let _state = self.pool.attested_state.lock().await;
+            self.pool.phase.compare_exchange(
+                PersistentFencedMutationRosterPoolPhase::Running as u8,
+                PersistentFencedMutationRosterPoolPhase::Draining as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+        };
         if previous.is_err() {
             return self
                 .pool
@@ -1897,6 +1895,7 @@ impl PersistentFencedMutationRosterClient {
             Ordering::Relaxed,
         );
         counter_increment(&self.pool.counters.drain);
+        let attested_accepted_at_drain = self.pool.attested_calls_inflight.load(Ordering::Acquire);
         if let Some(sender) = self.pool.scheduler_sender() {
             let _ = sender
                 .send(FencedMutationRosterSchedulerCommand::Drain)
@@ -1929,9 +1928,8 @@ impl PersistentFencedMutationRosterClient {
             .queued
             .load(Ordering::Relaxed)
             .saturating_add(self.pool.counters.inflight.load(Ordering::Relaxed));
-        let forced_calls = forced_calls
-            .saturating_add(self.pool.attested_setup_inflight.load(Ordering::Relaxed))
-            .saturating_add(self.pool.attested_calls_inflight.load(Ordering::Relaxed));
+        let attested_forced_calls = self.pool.attested_calls_inflight.load(Ordering::Relaxed);
+        let forced_calls = forced_calls.saturating_add(attested_forced_calls);
         self.pool.phase.store(
             PersistentFencedMutationRosterPoolPhase::Forced as u8,
             Ordering::Release,
@@ -1942,8 +1940,11 @@ impl PersistentFencedMutationRosterClient {
         );
         counter_increment(&self.pool.counters.forced);
         self.pool.force_notify.notify_waiters();
-        self.pool.attested_warm.store(false, Ordering::Release);
-        self.pool.attested_lane.lock().await.take();
+        {
+            let _state = self.pool.attested_state.lock().await;
+            self.pool.attested_lane.lock().await.take();
+            self.pool.attested_warm.store(false, Ordering::Release);
+        }
         if let Some(sender) = self.pool.scheduler_sender() {
             let _ = sender
                 .send(FencedMutationRosterSchedulerCommand::Force)
@@ -1956,7 +1957,7 @@ impl PersistentFencedMutationRosterClient {
                 .drain
                 .load(Ordering::Relaxed)
                 .saturating_sub(1)
-                .saturating_add(self.pool.attested_drained_calls.load(Ordering::Relaxed)),
+                .saturating_add(attested_accepted_at_drain.saturating_sub(attested_forced_calls)),
             forced_calls,
         };
         *self
@@ -2109,6 +2110,7 @@ async fn publish_attested_lane(
     pool: &PersistentFencedMutationRosterPool,
     lane: FencedMutationRosterV4LaneConnection,
 ) -> Result<(), SessionConsumerClientError> {
+    let _state = pool.attested_state.lock().await;
     let mut stored = pool.attested_lane.lock().await;
     if PersistentFencedMutationRosterPoolPhase::load(&pool.phase)
         != PersistentFencedMutationRosterPoolPhase::Running
@@ -13201,7 +13203,9 @@ mod tests {
     use futures_util::StreamExt;
     use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
     use opc_session_store::fenced_mutation_roster::{
-        FencedMutationRosterDescriptor, FencedMutationRosterOrdinal, FencedMutationRosterPlan,
+        FencedMutationRosterDescriptor, FencedMutationRosterMemberAttestation,
+        FencedMutationRosterMemberExecutionContext, FencedMutationRosterOrdinal,
+        FencedMutationRosterPlan, FencedMutationRosterProviderOutcome,
     };
     use opc_session_store::{
         checked_session_deadline, encode_fenced_mutation_roster_admission,
@@ -13229,10 +13233,11 @@ mod tests {
         SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
         SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
         SessionConsumerV3Operation, SessionConsumerV3Request, SessionConsumerV3Response,
-        SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType,
-        StoreError, StoredSessionRecord, FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES,
-        FENCED_MUTATION_ROSTER_MAX_MEMBERS, FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES,
-        FENCED_MUTATION_ROSTER_SCHEMA_V2, MAX_SESSION_TTL,
+        SessionConsumerV4Operation, SessionConsumerV4Request, SessionKey, SessionKeyType,
+        SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
+        FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES, FENCED_MUTATION_ROSTER_MAX_MEMBERS,
+        FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES, FENCED_MUTATION_ROSTER_SCHEMA_V2,
+        MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
@@ -14638,6 +14643,136 @@ mod tests {
             let _call = super::FencedMutationRosterAttestedCallInFlight::new(&client.pool);
             assert_eq!(client.diagnostics().persistent_connections, 1);
         }
+        assert_eq!(client.diagnostics().persistent_connections, 0);
+    }
+
+    fn synthetic_attested_lane(
+        client: &PersistentFencedMutationRosterClient,
+    ) -> super::FencedMutationRosterV4LaneConnection {
+        let established_at = tokio::time::Instant::now();
+        let lifecycle = ConnectionLifecycle::new(
+            client.pool.client.lifecycle_policy,
+            established_at,
+            None,
+            None,
+            client.pool.client.reauthentication.generation(),
+            Some(client.pool.client.tls_config.material_status().epoch()),
+        )
+        .expect("test lifecycle");
+        let rotation_jitter = client
+            .pool
+            .client
+            .tls_config
+            .begin_handshake()
+            .expect("test client handshake snapshot")
+            .consumer_rotation_jitter(&client.pool.client.expected_server_identity);
+        let (reader, writer) = tokio::io::duplex(1);
+        super::FencedMutationRosterV4LaneConnection {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            lifecycle,
+            rotation_jitter,
+            next_correlation: NonZeroU32::MIN,
+            calls: 0,
+            request_frame_size: super::MAX_FENCED_MUTATION_ROSTER_V4_CALL_BYTES,
+        }
+    }
+
+    fn attested_test_request(
+        client: &PersistentFencedMutationRosterClient,
+    ) -> SessionConsumerV4Request {
+        let admission = client
+            .bind_fenced_mutation_roster_admission(roster_admission_with_caller_scope())
+            .expect("bind authenticated roster scope");
+        let context = FencedMutationRosterMemberExecutionContext::for_admission_member(
+            &admission,
+            admission.members().as_slice()[0].ordinal(),
+        )
+        .expect("attestation context");
+        let attestation = FencedMutationRosterMemberAttestation::new(
+            &context,
+            FencedMutationRosterProviderOutcome::AppliedExecuted,
+            vec![0x91].into_boxed_slice(),
+        )
+        .expect("bounded attestation");
+        SessionConsumerV4Request::new(
+            client.scope(),
+            SessionConsumerV4Operation::FencedMutationRosterTerminalizeAttested {
+                admission: Box::new(admission),
+                attestations: vec![attestation].into_boxed_slice(),
+                protected_checkpoint: Vec::new().into_boxed_slice(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn attested_shutdown_rejects_a_lane_handoff_queued_after_its_phase_transition() {
+        let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
+        let client = PersistentFencedMutationRosterClient::try_from_stateless(
+            stateless,
+            PersistentFencedMutationRosterConfig::default(),
+        )
+        .expect("bounded roster client");
+        let state = client.pool.attested_state.lock().await;
+        let (shutdown_started, shutdown_started_rx) = oneshot::channel();
+        let shutdown_client = client.clone();
+        let shutdown = tokio::spawn(async move {
+            let _ = shutdown_started.send(());
+            shutdown_client.shutdown().await
+        });
+        shutdown_started_rx.await.expect("shutdown task started");
+        // Tokio's mutex queues waiters fairly. The shutdown task has reached
+        // its shared phase boundary before this publication is queued.
+        tokio::task::yield_now().await;
+        let pool = Arc::clone(&client.pool);
+        let lane = synthetic_attested_lane(&client);
+        let publisher =
+            tokio::spawn(async move { super::publish_attested_lane(&pool, lane).await });
+        drop(state);
+
+        let report = shutdown.await.expect("shutdown task completes");
+        assert_eq!(report.drained_calls, 0);
+        assert_eq!(report.forced_calls, 0);
+        assert_eq!(
+            publisher.await.expect("publisher task completes"),
+            Err(SessionConsumerClientError::ShuttingDown)
+        );
+        assert!(!client.pool.attested_warm.load(Ordering::Acquire));
+        assert!(client.pool.attested_lane.lock().await.is_none());
+        assert_eq!(client.diagnostics().persistent_connections, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attested_shutdown_snapshots_real_call_and_excludes_setup_from_forced_calls() {
+        let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
+        let client = PersistentFencedMutationRosterClient::try_from_stateless(
+            stateless,
+            PersistentFencedMutationRosterConfig::default(),
+        )
+        .expect("bounded roster client");
+        super::publish_attested_lane(&client.pool, synthetic_attested_lane(&client))
+            .await
+            .expect("publish synthetic lane");
+        let request = attested_test_request(&client);
+        let call_client = client.clone();
+        let call = tokio::spawn(async move { call_client.execute_attested(request).await });
+        while client.pool.attested_calls_inflight.load(Ordering::Acquire) != 1 {
+            tokio::task::yield_now().await;
+        }
+        let setup = super::FencedMutationRosterAttestedSetupInFlight::new(&client.pool);
+        let shutdown_client = client.clone();
+        let shutdown = tokio::spawn(async move { shutdown_client.shutdown().await });
+        while PersistentFencedMutationRosterPoolPhase::load(&client.pool.phase)
+            == PersistentFencedMutationRosterPoolPhase::Running
+        {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN).await;
+        let report = shutdown.await.expect("shutdown task completes");
+        assert_eq!(report.drained_calls, 0);
+        assert_eq!(report.forced_calls, 1, "only the accepted call is forced");
+        assert!(call.await.expect("call task completes").is_err());
+        drop(setup);
         assert_eq!(client.diagnostics().persistent_connections, 0);
     }
 
