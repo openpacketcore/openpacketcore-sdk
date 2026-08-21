@@ -353,6 +353,7 @@ impl FencedMutationRosterMember {
             adoption,
         })
     }
+
     /// Return the fixed canonical role ordinal.
     pub fn ordinal(&self) -> FencedMutationRosterOrdinal {
         self.ordinal
@@ -578,7 +579,7 @@ pub struct FencedMutationRosterTerminal {
 
 impl FencedMutationRosterTerminal {
     /// Construct a complete terminal result with bounded protected bytes.
-    pub fn new(
+    pub(crate) fn new(
         admission_commitment: [u8; 32],
         members: Vec<FencedMutationRosterMemberOutcome>,
         protected_checkpoint: Vec<u8>,
@@ -601,6 +602,54 @@ impl FencedMutationRosterTerminal {
             protected_checkpoint,
             protected_result,
         })
+    }
+
+    /// Build a terminal receipt only from SDK-issued conclusive member proofs.
+    pub fn from_member_proofs(
+        admission: &FencedMutationRosterAdmission,
+        proofs: &[FencedMutationRosterMemberProof],
+        current_fence: FenceToken,
+        protected_checkpoint: Vec<u8>,
+        protected_result: Vec<u8>,
+    ) -> Result<Self, FencedMutationRosterError> {
+        if proofs.len() != admission.members().len() {
+            return Err(FencedMutationRosterError::LifecycleConflict);
+        }
+        let mut outcomes = Vec::with_capacity(proofs.len());
+        for proof in proofs {
+            proof.validate_for(admission, current_fence)?;
+            let (disposition, adoption) = match proof.outcome {
+                FencedMutationRosterProviderOutcome::AppliedExecuted => (
+                    FencedMutationRosterDisposition::Applied,
+                    FencedMutationRosterAdoption::Executed,
+                ),
+                FencedMutationRosterProviderOutcome::AppliedAdopted => (
+                    FencedMutationRosterDisposition::Applied,
+                    FencedMutationRosterAdoption::Adopted,
+                ),
+                FencedMutationRosterProviderOutcome::NotAppliedReconciled => (
+                    FencedMutationRosterDisposition::NotApplied,
+                    FencedMutationRosterAdoption::Reconciled,
+                ),
+                FencedMutationRosterProviderOutcome::CompensatedReconciled => (
+                    FencedMutationRosterDisposition::Compensated,
+                    FencedMutationRosterAdoption::Reconciled,
+                ),
+            };
+            outcomes.push(FencedMutationRosterMemberOutcome::new(
+                proof.ordinal,
+                proof.member_operation_id,
+                disposition,
+                adoption,
+                FencedMutationRosterStatusBytes::new(Vec::new())?,
+            )?);
+        }
+        Self::new(
+            admission.request_id().body_commitment(),
+            outcomes,
+            protected_checkpoint,
+            protected_result,
+        )
     }
     /// Return the admission commitment that this receipt terminalizes.
     pub fn admission_commitment(&self) -> [u8; 32] {
@@ -1067,7 +1116,7 @@ impl fmt::Debug for FencedMutationRosterProtectedPlan {
 }
 
 /// Bounded, caller-protected exact terminal response bytes.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FencedMutationRosterProtectedResult(Box<[u8]>);
 impl FencedMutationRosterProtectedResult {
     /// Retain bytes only when they meet the exact protected-result bound.
@@ -1135,6 +1184,8 @@ pub struct FencedMutationRosterAdmission {
     expected_generation: Generation,
     members: FencedMutationRosterMembers,
     protected_plan: FencedMutationRosterProtectedPlan,
+    #[serde(default)]
+    terminal_result: FencedMutationRosterProtectedResult,
 }
 impl FencedMutationRosterAdmission {
     /// Construct one exact immutable admission binding.
@@ -1155,6 +1206,7 @@ impl FencedMutationRosterAdmission {
             expected_generation,
             members,
             protected_plan,
+            terminal_result: FencedMutationRosterProtectedResult::new(Box::new([]))?,
         };
         value.validate()?;
         Ok(value)
@@ -1191,6 +1243,19 @@ impl FencedMutationRosterAdmission {
     pub fn protected_plan(&self) -> &FencedMutationRosterProtectedPlan {
         &self.protected_plan
     }
+    /// Bind the prebuilt exact terminal result before admission.
+    pub fn with_terminal_result(
+        mut self,
+        result: FencedMutationRosterProtectedResult,
+    ) -> Result<Self, FencedMutationRosterError> {
+        self.terminal_result = result;
+        self.validate()?;
+        Ok(self)
+    }
+    /// Borrow the prebuilt exact terminal result bound into the request ID.
+    pub fn terminal_result(&self) -> &FencedMutationRosterProtectedResult {
+        &self.terminal_result
+    }
     fn canonical_body(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.history_epoch.to_be_bytes());
@@ -1203,6 +1268,7 @@ impl FencedMutationRosterAdmission {
             out.extend_from_slice(member.caller_id());
         }
         put_bytes(&mut out, self.protected_plan.as_bytes());
+        put_bytes(&mut out, self.terminal_result.as_bytes());
         out
     }
 }
