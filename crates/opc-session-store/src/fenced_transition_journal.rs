@@ -7,7 +7,7 @@
 //! without invoking a key or remote-seal provider again.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
     sync::{
@@ -16,6 +16,9 @@ use std::{
     },
     time::Duration,
 };
+
+#[cfg(test)]
+use std::sync::Condvar;
 
 use rand::{rngs::SysRng, TryRng};
 use rusqlite::{
@@ -27,9 +30,13 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{
-    FencedTransitionRequestId, PreparedFencedTransition, PreparedFencedTransitionLookup,
+    FencedTransitionRequestId, FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
+    FencedTransitionV2RequestId, PreparedFencedTransition, PreparedFencedTransitionLookup,
     StoreError, FENCED_TRANSITION_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_MAX_PREPARED_BYTES,
     FENCED_TRANSITION_PREPARED_SCHEMA_V1, FENCED_TRANSITION_REQUEST_ID_BYTES,
+    FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS, FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
 };
 
 /// Width of the independent integrity key protecting one prepared journal.
@@ -91,6 +98,171 @@ const JOURNAL_MEMBERSHIP_ROOT_DOMAIN: &[u8] =
     b"openpacketcore/session-store/prepared-journal/schema-3/membership-root/v1\0";
 const JOURNAL_MEMBERSHIP_TAG_DOMAIN: &[u8] =
     b"openpacketcore/session-store/prepared-journal/schema-3/membership-tag/v1\0";
+
+/// Width of the separate integrity key protecting one protected V2 journal.
+pub const FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES: usize = 32;
+
+const V2_JOURNAL_APPLICATION_ID: i64 = 0x4f50_4656;
+// Schema 1 was an unscoped implementation introduced before the protected-V2
+// journal reached a stable provisioning contract.  It must never be opened as
+// though it were bound to an authority: a fresh scoped journal is required.
+const V2_JOURNAL_SCHEMA_VERSION: i64 = 3;
+const V2_JOURNAL_SCHEMA_OBJECT_COUNT: i64 = 7;
+const V2_JOURNAL_METADATA_MAX_ROWS: usize = 1;
+const V2_JOURNAL_CATALOG_MAX_OBJECTS: usize = V2_JOURNAL_SCHEMA_OBJECT_COUNT as usize;
+const V2_JOURNAL_MEMBERSHIP_SCAN_LIMIT: usize =
+    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES + 1;
+const V2_JOURNAL_CATALOG_SCAN_LIMIT: usize = V2_JOURNAL_CATALOG_MAX_OBJECTS + 1;
+const V2_JOURNAL_METADATA_SCAN_LIMIT: usize = V2_JOURNAL_METADATA_MAX_ROWS + 1;
+const V2_JOURNAL_MEMBERSHIP_INDEX: &str = "protected_fenced_transition_v2_journal_membership_idx";
+const V2_JOURNAL_EPOCH_INDEX: &str = "protected_fenced_transition_v2_journal_epoch_idx";
+const V2_JOURNAL_RECLAIM_BATCH_ENTRIES: usize = 1_024;
+// A journal owns a small, fixed set of independently configured SQLite
+// handles.  Read transactions may use all reader handles concurrently while
+// mutations retain the single-writer discipline required by SQLite/WAL.
+const V2_JOURNAL_READER_CONNECTIONS: usize = 4;
+const V2_JOURNAL_BUCKET_COUNT: usize = 4_096;
+const V2_JOURNAL_BUCKET_MAX_ENTRIES: usize = 512;
+const V2_JOURNAL_MAX_RETAINED_EPOCHS: usize =
+    FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS + FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS;
+const V2_JOURNAL_EPOCH_SCAN_LIMIT: usize = V2_JOURNAL_MAX_RETAINED_EPOCHS + 1;
+const V2_JOURNAL_INITIALIZE_MAX_PROGRESS_CALLBACKS: usize = V2_JOURNAL_BUCKET_COUNT + 1;
+const V2_JOURNAL_OPERATION_MAX_PROGRESS_CALLBACKS: usize = V2_JOURNAL_RECLAIM_BATCH_ENTRIES
+    * (V2_JOURNAL_BUCKET_MAX_ENTRIES + 2)
+    + V2_JOURNAL_BUCKET_COUNT;
+const V2_JOURNAL_FULL_AUDIT_MAX_PROGRESS_CALLBACKS: usize =
+    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES * 8 + V2_JOURNAL_BUCKET_COUNT;
+const V2_JOURNAL_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+const V2_JOURNAL_UNAVAILABLE: &str = "protected fenced-transition V2 journal unavailable";
+const V2_JOURNAL_TOKEN_MAX_BYTES: usize = FENCED_TRANSITION_MAX_PREPARED_BYTES;
+const V2_JOURNAL_ROW_OVERHEAD_BYTES: usize = 256;
+const V2_JOURNAL_PAGE_SIZE_BYTES: u64 = 4_096;
+const V2_JOURNAL_MAIN_FIXED_OVERHEAD_BYTES: u64 = 16 * 1024 * 1024;
+const V2_JOURNAL_PER_ENTRY_FILE_OVERHEAD_BYTES: u64 =
+    V2_JOURNAL_ROW_OVERHEAD_BYTES as u64 + 2 * V2_JOURNAL_PAGE_SIZE_BYTES;
+const V2_JOURNAL_MAIN_MAX_BYTES: u64 = (V2_JOURNAL_TOKEN_MAX_BYTES as u64
+    + V2_JOURNAL_PER_ENTRY_FILE_OVERHEAD_BYTES)
+    * FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES as u64
+    + V2_JOURNAL_MAIN_FIXED_OVERHEAD_BYTES;
+const V2_JOURNAL_MAX_PAGE_COUNT: i64 =
+    V2_JOURNAL_MAIN_MAX_BYTES.div_ceil(V2_JOURNAL_PAGE_SIZE_BYTES) as i64;
+const V2_JOURNAL_WAL_MAX_BYTES: u64 = V2_JOURNAL_MAIN_MAX_BYTES + 512 * 1024 * 1024;
+const V2_JOURNAL_SHM_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const V2_JOURNAL_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
+const V2_JOURNAL_KEY_CHECK_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/protected-v2-journal/schema-3/key-check/v1\0";
+const V2_JOURNAL_PATH_KEY_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/protected-v2-journal/schema-3/path-key/v1\0";
+const V2_JOURNAL_ENTRY_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/protected-v2-journal/schema-3/entry/v1\0";
+const V2_JOURNAL_MEMBERSHIP_ROOT_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/protected-v2-journal/schema-3/membership-root/v1\0";
+const V2_JOURNAL_MEMBERSHIP_TAG_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/protected-v2-journal/schema-3/membership-tag/v1\0";
+const V2_JOURNAL_EPOCH_TAG_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/protected-v2-journal/schema-3/epoch-tag/v1\0";
+const V2_JOURNAL_BUCKET_TAG_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/protected-v2-journal/schema-3/bucket-tag/v1\0";
+const V2_JOURNAL_BUCKET_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/protected-v2-journal/schema-3/bucket/v1\0";
+const V2_JOURNAL_SCOPE_TAG_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/protected-v2-journal/schema-3/scope-tag/v1\0";
+const V2_JOURNAL_UNBOUND_SCOPE: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES] = [0; 32];
+
+#[cfg(test)]
+struct V2RemoveIfExactAfterCommitHook {
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    released: (Mutex<bool>, Condvar),
+}
+
+/// Test-only gate at the old cleanup hand-off: the SQLite transaction has
+/// committed, but the blocking closure has not returned to its join handle.
+#[cfg(test)]
+pub(crate) struct V2RemoveIfExactAfterCommitGate {
+    entered: Option<tokio::sync::oneshot::Receiver<()>>,
+    hook: Arc<V2RemoveIfExactAfterCommitHook>,
+    registry: Arc<Mutex<Option<Arc<V2RemoveIfExactAfterCommitHook>>>>,
+}
+
+#[cfg(test)]
+impl V2RemoveIfExactAfterCommitGate {
+    pub(crate) async fn wait_until_committed(&mut self) {
+        self.entered
+            .take()
+            .expect("after-commit gate must be awaited once")
+            .await
+            .expect("cleanup transaction must reach the after-commit gate");
+    }
+
+    pub(crate) fn release(&self) {
+        let (released, wake) = &self.hook.released;
+        let mut released = released.lock().expect("after-commit gate lock");
+        *released = true;
+        wake.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for V2RemoveIfExactAfterCommitGate {
+    fn drop(&mut self) {
+        self.release();
+        let mut hooks = self
+            .registry
+            .lock()
+            .expect("after-commit hook registry lock");
+        if hooks
+            .as_ref()
+            .is_some_and(|installed| Arc::ptr_eq(installed, &self.hook))
+        {
+            *hooks = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn block_next_v2_remove_if_exact_after_commit(
+    journal: &FencedTransitionV2PreparedJournal,
+) -> V2RemoveIfExactAfterCommitGate {
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let hook = Arc::new(V2RemoveIfExactAfterCommitHook {
+        entered: Mutex::new(Some(entered_tx)),
+        released: (Mutex::new(false), Condvar::new()),
+    });
+    let registry = Arc::clone(&journal.remove_if_exact_after_commit_hook);
+    let mut hooks = registry.lock().expect("after-commit hook registry lock");
+    assert!(
+        hooks.is_none(),
+        "only one after-commit hook may be installed per journal"
+    );
+    *hooks = Some(Arc::clone(&hook));
+    drop(hooks);
+    V2RemoveIfExactAfterCommitGate {
+        entered: Some(entered),
+        hook,
+        registry,
+    }
+}
+
+#[cfg(test)]
+fn wait_after_v2_remove_if_exact_commit(
+    registry: &Mutex<Option<Arc<V2RemoveIfExactAfterCommitHook>>>,
+) {
+    let hook = registry
+        .lock()
+        .expect("after-commit hook registry lock")
+        .clone();
+    let Some(hook) = hook else {
+        return;
+    };
+    if let Some(entered) = hook.entered.lock().expect("after-commit gate lock").take() {
+        let _ = entered.send(());
+    }
+    let (released, wake) = &hook.released;
+    let mut released = released.lock().expect("after-commit gate lock");
+    while !*released {
+        released = wake.wait(released).expect("after-commit gate lock");
+    }
+}
 
 /// HMAC-SHA-256 with its key-derived pads and intermediate digests zeroized.
 struct ZeroizingHmacSha256 {
@@ -269,6 +441,18 @@ struct PreparedJournalPath {
     path_guard: SecureJournalPathGuard,
 }
 
+/// Upper bounds admitted for one dedicated journal and its SQLite sidecars.
+///
+/// These are carried by the held path guard rather than inferred from a file
+/// name, so a V1 journal can never be reopened under the larger V2 budget.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct SecureJournalFileBounds {
+    main: u64,
+    wal: u64,
+    shm: u64,
+}
+
 #[cfg(unix)]
 struct SecureJournalPathGuard {
     root: std::fs::File,
@@ -278,6 +462,7 @@ struct SecureJournalPathGuard {
     parent: std::fs::File,
     leaf_identity: SecureJournalFileIdentity,
     leaf_name: std::ffi::OsString,
+    bounds: SecureJournalFileBounds,
     _open_lease: SecureJournalOpenLease,
     #[cfg(test)]
     fail_next_parent_sync: std::sync::atomic::AtomicBool,
@@ -597,6 +782,3215 @@ impl PreparedFencedTransitionJournal {
         .await
         .map_err(|_| journal_unavailable())?
     }
+}
+
+/// Stable secret used only to authenticate one protected V2 request journal.
+///
+/// This key is intentionally distinct from both record-protection keys and
+/// [`PreparedFencedTransitionJournalKey`].  It must be restored unchanged
+/// with the same V2 journal path after a process restart.
+pub struct FencedTransitionV2PreparedJournalKey(
+    Zeroizing<[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]>,
+);
+
+impl FencedTransitionV2PreparedJournalKey {
+    /// Import the stable V2-journal integrity key from secret configuration.
+    pub fn from_bytes(bytes: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    fn as_bytes(&self) -> &[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES] {
+        &self.0
+    }
+
+    #[cfg(unix)]
+    fn bind_to_checked_path(self, path: &Path) -> Result<Self, StoreError> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = path.as_os_str().as_bytes();
+        let path_length = u32::try_from(path.len()).map_err(|_| v2_journal_unavailable())?;
+        let mut mac = ZeroizingHmacSha256::new(self.as_bytes());
+        mac.update(V2_JOURNAL_PATH_KEY_DOMAIN);
+        mac.update(&V2_JOURNAL_APPLICATION_ID.to_be_bytes());
+        mac.update(&V2_JOURNAL_SCHEMA_VERSION.to_be_bytes());
+        mac.update(&path_length.to_be_bytes());
+        mac.update(path);
+        Ok(Self(mac.finalize()))
+    }
+}
+
+impl Clone for FencedTransitionV2PreparedJournalKey {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl fmt::Debug for FencedTransitionV2PreparedJournalKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FencedTransitionV2PreparedJournalKey(<redacted>)")
+    }
+}
+
+/// Stable non-secret authority selected when provisioning one protected-V2
+/// prepared-request journal.
+///
+/// Supply a value that identifies the durable backend authority sharing the
+/// journal, normally a consensus-cluster identity.  It deliberately excludes
+/// remote sealing endpoints and rotatable record-protection keys: the journal
+/// retains an already sealed request across their rotation.  The protection
+/// wrapper additionally commits its protection mode and payload namespace, so
+/// this value cannot make a local-AEAD journal interchangeable with a
+/// remote-seal journal or a different namespace.
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+pub struct FencedTransitionV2JournalScope([u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]);
+
+impl FencedTransitionV2JournalScope {
+    /// Construct an explicit fixed-width backend authority commitment.
+    ///
+    /// The same journal path and journal key must always use the same value.
+    /// Operators using a consensus backend should prefer
+    /// [`Self::for_consensus_cluster`].
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    /// Derive a journal scope from the stable identity of one consensus
+    /// cluster, intentionally excluding its mutable configuration epoch.
+    #[must_use]
+    pub fn for_consensus_cluster(cluster: &crate::SessionConsensusClusterId) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"openpacketcore/session-store/protected-v2-journal/consensus-scope/v1\0");
+        digest.update(cluster.as_bytes());
+        Self(digest.finalize().into())
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for FencedTransitionV2JournalScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FencedTransitionV2JournalScope(<redacted>)")
+    }
+}
+
+struct FencedTransitionV2PreparedJournalInner {
+    writer: Mutex<V2JournalConnection>,
+    readers: Mutex<Vec<V2JournalConnection>>,
+    key: FencedTransitionV2PreparedJournalKey,
+    #[cfg(unix)]
+    path_guard: SecureJournalPathGuard,
+}
+
+struct V2JournalConnection {
+    conn: Connection,
+    progress_budget: Arc<JournalSqliteProgressBudget>,
+}
+
+/// Durable protected-V2 preparation boundary.
+///
+/// This database maps a caller's complete 56-byte V2 ID to exactly one sealed
+/// inner V2 request. It never stores the caller plaintext body, never shares
+/// V1's 4,096-entry journal, and deletes a mapping only after the wrapper has
+/// observed the consensus retired floor that closes its epoch.
+#[derive(Clone)]
+pub struct FencedTransitionV2PreparedJournal {
+    inner: Arc<FencedTransitionV2PreparedJournalInner>,
+    writer_permit: Arc<tokio::sync::Semaphore>,
+    reader_permits: Arc<tokio::sync::Semaphore>,
+    effect_boundary_locks: Arc<Vec<Arc<tokio::sync::Mutex<()>>>>,
+    #[cfg(test)]
+    remove_if_exact_after_commit_hook: Arc<Mutex<Option<Arc<V2RemoveIfExactAfterCommitHook>>>>,
+}
+
+impl fmt::Debug for FencedTransitionV2PreparedJournal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FencedTransitionV2PreparedJournal")
+            .field("path", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+/// One exact protected-V2 journal binding together with its insertion proof.
+///
+/// This stays crate-private because only the protected dispatch wrappers may
+/// act on the proof.
+pub(crate) struct FencedTransitionV2PreparedJournalBinding {
+    request: FencedTransitionV2Request,
+    created: bool,
+}
+
+impl FencedTransitionV2PreparedJournalBinding {
+    pub(crate) fn request(&self) -> &FencedTransitionV2Request {
+        &self.request
+    }
+
+    pub(crate) const fn was_created(&self) -> bool {
+        self.created
+    }
+
+    #[cfg(test)]
+    fn into_request(self) -> FencedTransitionV2Request {
+        self.request
+    }
+}
+
+/// Fixed-cardinality synchronization held from V2 mapping selection through
+/// its inner effect boundary. One lock covers each authenticated journal
+/// bucket selected by the invocation's outer IDs.
+pub(crate) struct FencedTransitionV2JournalEffectGuard {
+    _locks: Vec<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+/// Admission held across the non-yielding exact-cleanup finalization.
+///
+/// Acquiring this permit remains cancellable while every mapping is intact.
+/// Once acquired, protected wrappers run the bounded SQLite transaction
+/// synchronously and return from the same future poll.
+pub(crate) struct FencedTransitionV2JournalCleanupPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl FencedTransitionV2PreparedJournal {
+    /// Provision one missing dedicated protected-V2 journal database.
+    ///
+    /// This has the same local-filesystem, private-path, locking, fsync, and
+    /// restart requirements as the V1 prepared journal, but uses a separate
+    /// file and key namespace. A V1 journal at this path is rejected.
+    pub fn create_new(
+        path: impl AsRef<Path>,
+        key: FencedTransitionV2PreparedJournalKey,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_mode(path.as_ref(), key, JournalOpenMode::CreateNew)
+    }
+
+    /// Open an already provisioned protected-V2 journal database.
+    ///
+    /// This never creates or reinitializes a missing, legacy, truncated, or
+    /// mixed-schema file.
+    pub fn open_existing(
+        path: impl AsRef<Path>,
+        key: FencedTransitionV2PreparedJournalKey,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_mode(path.as_ref(), key, JournalOpenMode::OpenExisting)
+    }
+
+    fn open_with_mode(
+        path: &Path,
+        key: FencedTransitionV2PreparedJournalKey,
+        mode: JournalOpenMode,
+    ) -> Result<Self, StoreError> {
+        let path = prepare_secure_journal_path_with_bounds(
+            path,
+            mode,
+            #[cfg(unix)]
+            SecureJournalFileBounds {
+                main: V2_JOURNAL_MAIN_MAX_BYTES,
+                wal: V2_JOURNAL_WAL_MAX_BYTES,
+                shm: V2_JOURNAL_SHM_MAX_BYTES,
+            },
+        )
+        .map_err(|_| v2_journal_unavailable())?;
+        #[cfg(unix)]
+        let key = key
+            .bind_to_checked_path(&path.binding_path)
+            .map_err(|_| v2_journal_unavailable())?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
+        let mut conn = Connection::open_with_flags(&path.sqlite_path, flags)
+            .map_err(|_| v2_journal_unavailable())?;
+        configure_v2_journal_sqlite_limits(&conn)?;
+        let progress_budget = install_journal_progress_handler(&conn);
+        #[cfg(unix)]
+        path.path_guard
+            .verify_connection(&conn)
+            .map_err(|_| v2_journal_unavailable())?;
+        initialize_v2_journal_connection(&mut conn, &key, mode, &progress_budget)?;
+        #[cfg(unix)]
+        {
+            path.path_guard
+                .verify_connection(&conn)
+                .map_err(|_| v2_journal_unavailable())?;
+            path.path_guard
+                .sync_parent_directory()
+                .map_err(|_| v2_journal_unavailable())?;
+        }
+        let mut readers = Vec::with_capacity(V2_JOURNAL_READER_CONNECTIONS);
+        for _ in 0..V2_JOURNAL_READER_CONNECTIONS {
+            let mut reader = Connection::open_with_flags(&path.sqlite_path, flags)
+                .map_err(|_| v2_journal_unavailable())?;
+            configure_v2_journal_sqlite_limits(&reader)?;
+            let reader_budget = install_journal_progress_handler(&reader);
+            #[cfg(unix)]
+            path.path_guard
+                .verify_connection(&reader)
+                .map_err(|_| v2_journal_unavailable())?;
+            // Re-run the hardened profile/schema/integrity admission on every
+            // fixed pool member. This is provisioning work, never per-ID.
+            initialize_v2_journal_connection(
+                &mut reader,
+                &key,
+                JournalOpenMode::OpenExisting,
+                &reader_budget,
+            )?;
+            #[cfg(unix)]
+            path.path_guard
+                .verify_connection(&reader)
+                .map_err(|_| v2_journal_unavailable())?;
+            readers.push(V2JournalConnection {
+                conn: reader,
+                progress_budget: reader_budget,
+            });
+        }
+        Ok(Self {
+            inner: Arc::new(FencedTransitionV2PreparedJournalInner {
+                writer: Mutex::new(V2JournalConnection {
+                    conn,
+                    progress_budget,
+                }),
+                readers: Mutex::new(readers),
+                key,
+                #[cfg(unix)]
+                path_guard: path.path_guard,
+            }),
+            writer_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            reader_permits: Arc::new(tokio::sync::Semaphore::new(V2_JOURNAL_READER_CONNECTIONS)),
+            effect_boundary_locks: Arc::new(
+                (0..V2_JOURNAL_BUCKET_COUNT)
+                    .map(|_| Arc::new(tokio::sync::Mutex::new(())))
+                    .collect(),
+            ),
+            #[cfg(test)]
+            remove_if_exact_after_commit_hook: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Authenticate the journal and bind it to `scope` on first use.
+    ///
+    /// The compare-and-set includes the unbound sentinel and runs in the same
+    /// immediate transaction as the metadata verification, so concurrent
+    /// first users converge on one scope.  A different scope can never turn
+    /// a retained request into an absence decision.
+    pub(crate) async fn ensure_scope(
+        &self,
+        scope: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    ) -> Result<(), StoreError> {
+        if scope == V2_JOURNAL_UNBOUND_SCOPE {
+            return Err(v2_journal_unavailable());
+        }
+        self.with_connection(true, move |conn, key| {
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| v2_journal_unavailable())?;
+            let metadata = verify_v2_journal_metadata(&transaction, key, None)?;
+            if metadata.scope == V2_JOURNAL_UNBOUND_SCOPE {
+                let scope_tag = v2_journal_scope_tag(key, &scope);
+                let changed = transaction
+                    .execute(
+                        "UPDATE protected_fenced_transition_v2_journal_metadata \
+                         SET scope_commitment = ?1, scope_tag = ?2 \
+                         WHERE singleton = 1 AND scope_commitment = ?3 AND scope_tag = ?4",
+                        params![
+                            scope.as_slice(),
+                            scope_tag.as_slice(),
+                            V2_JOURNAL_UNBOUND_SCOPE.as_slice(),
+                            v2_journal_scope_tag(key, &V2_JOURNAL_UNBOUND_SCOPE).as_slice(),
+                        ],
+                    )
+                    .map_err(|_| v2_journal_unavailable())?;
+                if changed != 1 {
+                    return Err(v2_journal_unavailable());
+                }
+            }
+            verify_v2_journal_metadata(&transaction, key, Some(&scope))?;
+            verify_sqlite_main_file_binding(&transaction).map_err(|_| v2_journal_unavailable())?;
+            transaction.commit().map_err(|_| v2_journal_unavailable())
+        })
+        .await
+    }
+
+    pub(crate) async fn health_check(
+        &self,
+        scope: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    ) -> Result<(), StoreError> {
+        self.health_check_with_retained_state(scope)
+            .await
+            .map(|_| ())
+    }
+
+    async fn health_check_with_retained_state(
+        &self,
+        scope: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    ) -> Result<usize, StoreError> {
+        self.with_connection_with_budget(
+            false,
+            V2_JOURNAL_FULL_AUDIT_MAX_PROGRESS_CALLBACKS,
+            move |conn, key| {
+                let transaction = v2_journal_read_transaction(conn)?;
+                let metadata = verify_v2_journal_metadata(&transaction, key, Some(&scope))?;
+                let retained_state =
+                    verify_v2_journal_full_membership(&transaction, key, metadata.membership)?;
+                verify_sqlite_main_file_binding(&transaction)
+                    .map_err(|_| v2_journal_unavailable())?;
+                transaction.commit().map_err(|_| v2_journal_unavailable())?;
+                Ok(retained_state)
+            },
+        )
+        .await
+    }
+
+    /// Serialize protected V2 effect-boundary work for the requested IDs.
+    ///
+    /// Buckets are acquired in ascending order so overlapping batches cannot
+    /// deadlock. A caller passes at most the fixed V2 batch limit, so this
+    /// guard retains no global mutex and its lock vector is bounded by that
+    /// protocol maximum (and by the fixed bucket count). Holding it through
+    /// conditional cleanup prevents one same-ID invocation from removing
+    /// another invocation's dispatchable mapping after the latter has observed
+    /// it.
+    pub(crate) async fn lock_effect_boundary(
+        &self,
+        outer_ids: &[FencedTransitionV2RequestId],
+    ) -> Result<FencedTransitionV2JournalEffectGuard, StoreError> {
+        let mut buckets = BTreeSet::new();
+        for outer_id in outer_ids {
+            let bucket = usize::try_from(v2_journal_bucket(&self.inner.key, *outer_id)?)
+                .map_err(|_| v2_journal_unavailable())?;
+            if bucket >= V2_JOURNAL_BUCKET_COUNT {
+                return Err(v2_journal_unavailable());
+            }
+            buckets.insert(bucket);
+        }
+        let mut locks = Vec::with_capacity(buckets.len());
+        for bucket in buckets {
+            let lock = Arc::clone(
+                self.effect_boundary_locks
+                    .get(bucket)
+                    .ok_or_else(v2_journal_unavailable)?,
+            );
+            locks.push(lock.lock_owned().await);
+        }
+        Ok(FencedTransitionV2JournalEffectGuard { _locks: locks })
+    }
+
+    /// Return the exact sealed inner request selected for `outer_id`.
+    pub(crate) async fn lookup(
+        &self,
+        scope: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+        outer_id: FencedTransitionV2RequestId,
+    ) -> Result<Option<FencedTransitionV2Request>, StoreError> {
+        self.with_connection(false, move |conn, key| {
+            let transaction = v2_journal_read_transaction(conn)?;
+            let metadata = verify_v2_journal_metadata(&transaction, key, Some(&scope))?;
+            verify_v2_journal_bucket(
+                &transaction,
+                key,
+                metadata.membership,
+                v2_journal_bucket(key, outer_id)?,
+            )?;
+            let request = read_v2_journal_entry(&transaction, key, outer_id)?;
+            verify_sqlite_main_file_binding(&transaction).map_err(|_| v2_journal_unavailable())?;
+            transaction.commit().map_err(|_| v2_journal_unavailable())?;
+            Ok(request)
+        })
+        .await
+    }
+
+    /// Return the exact sealed inner request for each bounded caller identity
+    /// in one authenticated read transaction.
+    ///
+    /// Each secret-selected bucket is checked before it can contribute either
+    /// a present value or an absence decision. The primary and membership
+    /// indexes remain cross-witnesses through [`read_v2_journal_entry`].
+    pub(crate) async fn lookup_batch(
+        &self,
+        scope: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+        outer_ids: Vec<FencedTransitionV2RequestId>,
+    ) -> Result<Vec<Option<FencedTransitionV2Request>>, StoreError> {
+        if outer_ids.len() > crate::MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS {
+            return Err(v2_journal_unavailable());
+        }
+        self.with_connection(false, move |conn, key| {
+            let transaction = v2_journal_read_transaction(conn)?;
+            let metadata = verify_v2_journal_metadata(&transaction, key, Some(&scope))?;
+            let mut buckets = BTreeSet::new();
+            for outer_id in &outer_ids {
+                buckets.insert(v2_journal_bucket(key, *outer_id)?);
+            }
+            for bucket in buckets {
+                verify_v2_journal_bucket(&transaction, key, metadata.membership, bucket)?;
+            }
+            let mut prepared = Vec::with_capacity(outer_ids.len());
+            for outer_id in outer_ids {
+                prepared.push(read_v2_journal_entry(&transaction, key, outer_id)?);
+            }
+            verify_sqlite_main_file_binding(&transaction).map_err(|_| v2_journal_unavailable())?;
+            transaction.commit().map_err(|_| v2_journal_unavailable())?;
+            Ok(prepared)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn bind_or_lookup(
+        &self,
+        scope: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+        outer_id: FencedTransitionV2RequestId,
+        prepared: &FencedTransitionV2Request,
+    ) -> Result<FencedTransitionV2Request, StoreError> {
+        self.bind_or_lookup_with_created(scope, outer_id, prepared)
+            .await
+            .map(FencedTransitionV2PreparedJournalBinding::into_request)
+    }
+
+    /// Atomically retain `prepared` and report whether this invocation added
+    /// the mapping. The proof is valid only while the caller retains the
+    /// matching [`Self::lock_effect_boundary`] guard.
+    pub(crate) async fn bind_or_lookup_with_created(
+        &self,
+        scope: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+        outer_id: FencedTransitionV2RequestId,
+        prepared: &FencedTransitionV2Request,
+    ) -> Result<FencedTransitionV2PreparedJournalBinding, StoreError> {
+        let canonical = canonical_v2_journal_request(prepared)?;
+        self.with_connection(true, move |conn, key| {
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| v2_journal_unavailable())?;
+            let membership = verify_v2_journal_metadata(&transaction, key, Some(&scope))?;
+            let bucket = v2_journal_bucket(key, outer_id)?;
+            let bucket_state =
+                verify_v2_journal_bucket(&transaction, key, membership.membership, bucket)?;
+            if let Some(existing) = read_v2_journal_entry(&transaction, key, outer_id)? {
+                verify_sqlite_main_file_binding(&transaction)
+                    .map_err(|_| v2_journal_unavailable())?;
+                transaction.commit().map_err(|_| v2_journal_unavailable())?;
+                return Ok(FencedTransitionV2PreparedJournalBinding {
+                    request: existing,
+                    created: false,
+                });
+            }
+            if bucket_state.count
+                >= i64::try_from(V2_JOURNAL_BUCKET_MAX_ENTRIES)
+                    .map_err(|_| v2_journal_unavailable())?
+            {
+                return Err(StoreError::FencedTransitionHistoryFull);
+            }
+            if membership.membership.count
+                >= i64::try_from(FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES)
+                    .map_err(|_| v2_journal_unavailable())?
+            {
+                return Err(StoreError::FencedTransitionHistoryFull);
+            }
+            let history_epoch =
+                i64::try_from(outer_id.epoch().get()).map_err(|_| v2_journal_unavailable())?;
+            let epoch_count =
+                v2_journal_epoch_count(&transaction, key, membership.membership, history_epoch)?;
+            if epoch_count == 0
+                && v2_journal_retained_epoch_count(&transaction, key, membership.membership)?
+                    >= V2_JOURNAL_MAX_RETAINED_EPOCHS
+            {
+                return Err(StoreError::FencedTransitionHistoryFull);
+            }
+            if epoch_count
+                >= i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                    .map_err(|_| v2_journal_unavailable())?
+            {
+                return Err(StoreError::FencedTransitionHistoryFull);
+            }
+            let tag = v2_journal_entry_tag(key, outer_id, &canonical)?;
+            let inserted = transaction
+                .execute(
+                    "INSERT INTO protected_fenced_transition_v2_journal \
+                     (outer_request_id, history_epoch, bucket, prepared_request, integrity_tag) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        outer_id.to_bytes().as_slice(),
+                        history_epoch,
+                        bucket,
+                        canonical.as_slice(),
+                        tag.as_slice(),
+                    ],
+                )
+                .map_err(|_| v2_journal_unavailable())?;
+            if inserted != 1 {
+                return Err(v2_journal_unavailable());
+            }
+            let Some(inserted_request) = read_v2_journal_entry(&transaction, key, outer_id)? else {
+                return Err(v2_journal_unavailable());
+            };
+            if canonical_v2_journal_request(&inserted_request)?.as_slice() != canonical.as_slice() {
+                return Err(v2_journal_unavailable());
+            }
+            update_v2_journal_membership_after_insert(
+                &transaction,
+                key,
+                membership.membership,
+                V2JournalInsert {
+                    epoch: history_epoch,
+                    bucket,
+                    bucket_state,
+                    outer_id,
+                    tag: *tag,
+                },
+            )?;
+            verify_v2_journal_metadata(&transaction, key, Some(&scope))?;
+            verify_sqlite_main_file_binding(&transaction).map_err(|_| v2_journal_unavailable())?;
+            transaction.commit().map_err(|_| v2_journal_unavailable())?;
+            Ok(FencedTransitionV2PreparedJournalBinding {
+                request: inserted_request,
+                created: true,
+            })
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn bind_or_lookup_batch(
+        &self,
+        scope: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+        prepared: Vec<(FencedTransitionV2RequestId, FencedTransitionV2Request)>,
+    ) -> Result<Vec<FencedTransitionV2Request>, StoreError> {
+        self.bind_or_lookup_batch_with_created(scope, prepared)
+            .await
+            .map(|bindings| {
+                bindings
+                    .into_iter()
+                    .map(FencedTransitionV2PreparedJournalBinding::into_request)
+                    .collect()
+            })
+    }
+
+    /// Atomically retain every missing mapping and report insertion ownership
+    /// for each original position. The proofs are valid only while the caller
+    /// retains the matching [`Self::lock_effect_boundary`] guard.
+    pub(crate) async fn bind_or_lookup_batch_with_created(
+        &self,
+        scope: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+        prepared: Vec<(FencedTransitionV2RequestId, FencedTransitionV2Request)>,
+    ) -> Result<Vec<FencedTransitionV2PreparedJournalBinding>, StoreError> {
+        if prepared.len() > crate::MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS {
+            return Err(v2_journal_unavailable());
+        }
+        let mut ids = BTreeSet::new();
+        let mut canonical = Vec::with_capacity(prepared.len());
+        for (outer_id, request) in prepared {
+            if !ids.insert(outer_id.to_bytes()) {
+                return Err(v2_journal_unavailable());
+            }
+            let request_bytes = canonical_v2_journal_request(&request)?;
+            canonical.push((outer_id, request, request_bytes));
+        }
+        self.with_connection(true, move |conn, key| {
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| v2_journal_unavailable())?;
+            let membership = verify_v2_journal_metadata(&transaction, key, Some(&scope))?.membership;
+            let mut bucket_states = BTreeMap::new();
+            for (outer_id, _, _) in &canonical {
+                let bucket = v2_journal_bucket(key, *outer_id)?;
+                if let std::collections::btree_map::Entry::Vacant(slot) = bucket_states.entry(bucket) {
+                    slot.insert(verify_v2_journal_bucket(&transaction, key, membership, bucket)?);
+                }
+            }
+
+            let mut resolved = Vec::with_capacity(canonical.len());
+            let mut missing = Vec::new();
+            for (outer_id, request, request_bytes) in canonical {
+                if let Some(existing) = read_v2_journal_entry(&transaction, key, outer_id)? {
+                    resolved.push(Some(existing));
+                    continue;
+                }
+                let epoch = i64::try_from(outer_id.epoch().get())
+                    .map_err(|_| v2_journal_unavailable())?;
+                let bucket = v2_journal_bucket(key, outer_id)?;
+                let tag = *v2_journal_entry_tag(key, outer_id, &request_bytes)?;
+                resolved.push(None);
+                missing.push(V2JournalBatchInsert {
+                    outer_id,
+                    request,
+                    canonical: request_bytes,
+                    epoch,
+                    bucket,
+                    tag,
+                });
+            }
+            if missing.is_empty() {
+                let mut output = Vec::with_capacity(resolved.len());
+                for request in resolved {
+                    output.push(FencedTransitionV2PreparedJournalBinding {
+                        request: request.ok_or_else(v2_journal_unavailable)?,
+                        created: false,
+                    });
+                }
+                verify_sqlite_main_file_binding(&transaction).map_err(|_| v2_journal_unavailable())?;
+                transaction.commit().map_err(|_| v2_journal_unavailable())?;
+                return Ok(output);
+            }
+
+            let total = membership
+                .count
+                .checked_add(i64::try_from(missing.len()).map_err(|_| v2_journal_unavailable())?)
+                .ok_or_else(v2_journal_unavailable)?;
+            if total > i64::try_from(FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES)
+                .map_err(|_| v2_journal_unavailable())?
+            {
+                return Err(StoreError::FencedTransitionHistoryFull);
+            }
+            let mut bucket_additions = BTreeMap::<i64, usize>::new();
+            let mut epoch_additions = BTreeMap::<i64, usize>::new();
+            for entry in &missing {
+                *bucket_additions.entry(entry.bucket).or_default() += 1;
+                *epoch_additions.entry(entry.epoch).or_default() += 1;
+            }
+            for (bucket, additions) in &bucket_additions {
+                let state = bucket_states.get(bucket).ok_or_else(v2_journal_unavailable)?;
+                if state
+                    .count
+                    .checked_add(i64::try_from(*additions).map_err(|_| v2_journal_unavailable())?)
+                    .ok_or_else(v2_journal_unavailable)?
+                    > i64::try_from(V2_JOURNAL_BUCKET_MAX_ENTRIES)
+                        .map_err(|_| v2_journal_unavailable())?
+                {
+                    return Err(StoreError::FencedTransitionHistoryFull);
+                }
+            }
+            let retained_epochs = v2_journal_retained_epoch_count(&transaction, key, membership)?;
+            let mut new_epochs = 0_usize;
+            let mut epoch_counts = BTreeMap::new();
+            for (epoch, additions) in &epoch_additions {
+                let count = v2_journal_epoch_count(&transaction, key, membership, *epoch)?;
+                if count == 0 {
+                    new_epochs = new_epochs.checked_add(1).ok_or_else(v2_journal_unavailable)?;
+                }
+                if count
+                    .checked_add(i64::try_from(*additions).map_err(|_| v2_journal_unavailable())?)
+                    .ok_or_else(v2_journal_unavailable)?
+                    > i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                        .map_err(|_| v2_journal_unavailable())?
+                {
+                    return Err(StoreError::FencedTransitionHistoryFull);
+                }
+                epoch_counts.insert(*epoch, count);
+            }
+            if retained_epochs
+                .checked_add(new_epochs)
+                .ok_or_else(v2_journal_unavailable)?
+                > V2_JOURNAL_MAX_RETAINED_EPOCHS
+            {
+                return Err(StoreError::FencedTransitionHistoryFull);
+            }
+
+            let mut root = membership.root;
+            let mut bucket_leaves = BTreeMap::<i64, Vec<[u8; 32]>>::new();
+            for entry in &missing {
+                let inserted = transaction
+                    .execute(
+                        "INSERT INTO protected_fenced_transition_v2_journal \
+                         (outer_request_id, history_epoch, bucket, prepared_request, integrity_tag) \
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            entry.outer_id.to_bytes().as_slice(),
+                            entry.epoch,
+                            entry.bucket,
+                            entry.canonical.as_slice(),
+                            entry.tag.as_slice(),
+                        ],
+                    )
+                    .map_err(|_| v2_journal_unavailable())?;
+                if inserted != 1 {
+                    return Err(v2_journal_unavailable());
+                }
+                let leaf = v2_journal_membership_leaf(
+                    &membership.incarnation,
+                    entry.outer_id.to_bytes(),
+                    entry.epoch,
+                    entry.tag,
+                )?;
+                for (root_byte, leaf_byte) in root.iter_mut().zip(leaf) {
+                    *root_byte ^= leaf_byte;
+                }
+                bucket_leaves.entry(entry.bucket).or_default().push(leaf);
+            }
+            let membership_tag = v2_journal_membership_tag(key, &membership.incarnation, total, &root)?;
+            if transaction.execute(
+                "UPDATE protected_fenced_transition_v2_journal_metadata \
+                 SET membership_count = ?1, membership_root = ?2, membership_tag = ?3 \
+                 WHERE singleton = 1 AND membership_count = ?4 AND membership_root = ?5 AND membership_tag = ?6",
+                params![total, root.as_slice(), membership_tag.as_slice(), membership.count, membership.root.as_slice(), membership.tag.as_slice()],
+            ).map_err(|_| v2_journal_unavailable())? != 1 {
+                return Err(v2_journal_unavailable());
+            }
+            for (bucket, leaves) in bucket_leaves {
+                let state = bucket_states.get(&bucket).ok_or_else(v2_journal_unavailable)?;
+                let mut bucket_root = state.root;
+                for leaf in leaves {
+                    for (root_byte, leaf_byte) in bucket_root.iter_mut().zip(leaf) {
+                        *root_byte ^= leaf_byte;
+                    }
+                }
+                let count = state.count.checked_add(i64::try_from(bucket_additions[&bucket]).map_err(|_| v2_journal_unavailable())?).ok_or_else(v2_journal_unavailable)?;
+                let tag = v2_journal_bucket_tag(key, &membership.incarnation, bucket, count, &bucket_root)?;
+                if transaction.execute(
+                    "UPDATE protected_fenced_transition_v2_journal_buckets \
+                     SET entry_count = ?1, membership_root = ?2, integrity_tag = ?3 \
+                     WHERE bucket = ?4 AND entry_count = ?5 AND membership_root = ?6 AND integrity_tag = ?7",
+                    params![count, bucket_root.as_slice(), tag.as_slice(), bucket, state.count, state.root.as_slice(), state.tag.as_slice()],
+                ).map_err(|_| v2_journal_unavailable())? != 1 {
+                    return Err(v2_journal_unavailable());
+                }
+            }
+            for (epoch, old_count) in epoch_counts {
+                let count = old_count.checked_add(i64::try_from(epoch_additions[&epoch]).map_err(|_| v2_journal_unavailable())?).ok_or_else(v2_journal_unavailable)?;
+                let tag = v2_journal_epoch_tag(key, &membership.incarnation, epoch, count)?;
+                let changed = if old_count == 0 {
+                    transaction.execute(
+                        "INSERT INTO protected_fenced_transition_v2_journal_epochs \
+                         (history_epoch, entry_count, integrity_tag) VALUES (?1, ?2, ?3)",
+                        params![epoch, count, tag.as_slice()],
+                    )
+                } else {
+                    let old_tag = v2_journal_epoch_tag(key, &membership.incarnation, epoch, old_count)?;
+                    transaction.execute(
+                        "UPDATE protected_fenced_transition_v2_journal_epochs \
+                         SET entry_count = ?1, integrity_tag = ?2 \
+                         WHERE history_epoch = ?3 AND entry_count = ?4 AND integrity_tag = ?5",
+                        params![count, tag.as_slice(), epoch, old_count, old_tag.as_slice()],
+                    )
+                }.map_err(|_| v2_journal_unavailable())?;
+                if changed != 1 {
+                    return Err(v2_journal_unavailable());
+                }
+            }
+            verify_v2_journal_metadata(&transaction, key, Some(&scope))?;
+            verify_sqlite_main_file_binding(&transaction).map_err(|_| v2_journal_unavailable())?;
+            transaction.commit().map_err(|_| v2_journal_unavailable())?;
+            let mut missing = missing.into_iter();
+            let mut output = Vec::with_capacity(resolved.len());
+            for resolved in resolved {
+                output.push(match resolved {
+                    Some(request) => FencedTransitionV2PreparedJournalBinding {
+                        request,
+                        created: false,
+                    },
+                    None => FencedTransitionV2PreparedJournalBinding {
+                        request: missing.next().ok_or_else(v2_journal_unavailable)?.request,
+                        created: true,
+                    },
+                });
+            }
+            if missing.next().is_some() {
+                return Err(v2_journal_unavailable());
+            }
+            Ok(output)
+        })
+        .await
+    }
+
+    async fn acquire_cleanup_permit(
+        &self,
+    ) -> Result<FencedTransitionV2JournalCleanupPermit, StoreError> {
+        let permit = Arc::clone(&self.writer_permit)
+            .acquire_owned()
+            .await
+            .map_err(|_| v2_journal_unavailable())?;
+        Ok(FencedTransitionV2JournalCleanupPermit { _permit: permit })
+    }
+
+    fn with_cleanup_connection<T, F>(
+        &self,
+        _permit: FencedTransitionV2JournalCleanupPermit,
+        operation: F,
+    ) -> Result<T, StoreError>
+    where
+        F: FnOnce(&mut Connection, &FencedTransitionV2PreparedJournalKey) -> Result<T, StoreError>,
+    {
+        let mut writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| v2_journal_unavailable())?;
+        #[cfg(unix)]
+        self.inner
+            .path_guard
+            .verify_connection(&writer.conn)
+            .map_err(|_| v2_journal_unavailable())?;
+        let progress_budget = Arc::clone(&writer.progress_budget);
+        let result = with_journal_progress_budget_limit(
+            &mut writer.conn,
+            &progress_budget,
+            V2_JOURNAL_OPERATION_MAX_PROGRESS_CALLBACKS,
+            |conn| operation(conn, &self.inner.key),
+        );
+        #[cfg(unix)]
+        if result.is_ok() {
+            self.inner
+                .path_guard
+                .sync_parent_directory()
+                .map_err(|_| v2_journal_unavailable())?;
+        }
+        #[cfg(unix)]
+        self.inner
+            .path_guard
+            .verify_connection(&writer.conn)
+            .map_err(|_| v2_journal_unavailable())?;
+        result
+    }
+
+    /// Remove an exactly matching V2 mapping after a proved pre-dispatch
+    /// failure.
+    ///
+    /// The caller must hold the exact-ID effect-boundary guard and must have
+    /// received an insertion proof from this invocation. The compare-and-delete
+    /// includes canonical sealed bytes and every authenticated aggregate, so a
+    /// stale proof cannot remove a replacement mapping.
+    pub(crate) async fn remove_if_exact(
+        &self,
+        scope: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+        outer_id: FencedTransitionV2RequestId,
+        expected: &FencedTransitionV2Request,
+    ) -> Result<bool, StoreError> {
+        let canonical = canonical_v2_journal_request(expected)?;
+        let permit = self.acquire_cleanup_permit().await?;
+        #[cfg(test)]
+        let after_commit_hook = Arc::clone(&self.remove_if_exact_after_commit_hook);
+        self.with_cleanup_connection(permit, move |conn, key| {
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| v2_journal_unavailable())?;
+            let membership =
+                verify_v2_journal_metadata(&transaction, key, Some(&scope))?.membership;
+            let bucket = v2_journal_bucket(key, outer_id)?;
+            let bucket_state = verify_v2_journal_bucket(&transaction, key, membership, bucket)?;
+            let Some(stored) = read_v2_journal_entry(&transaction, key, outer_id)? else {
+                verify_sqlite_main_file_binding(&transaction)
+                    .map_err(|_| v2_journal_unavailable())?;
+                transaction.commit().map_err(|_| v2_journal_unavailable())?;
+                return Ok(false);
+            };
+            if canonical_v2_journal_request(&stored)?.as_slice() != canonical.as_slice() {
+                verify_sqlite_main_file_binding(&transaction)
+                    .map_err(|_| v2_journal_unavailable())?;
+                transaction.commit().map_err(|_| v2_journal_unavailable())?;
+                return Ok(false);
+            }
+            let entry: Option<(
+                i64,
+                i64,
+                [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+            )> = transaction
+                .query_row(
+                    "SELECT history_epoch, bucket, integrity_tag \
+                     FROM protected_fenced_transition_v2_journal NOT INDEXED \
+                     WHERE outer_request_id = ?1 LIMIT 2",
+                    [outer_id.to_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, fixed_blob(row.get_ref(2)?)?)),
+                )
+                .optional()
+                .map_err(|_| v2_journal_unavailable())?;
+            let Some((epoch, table_bucket, tag)) = entry else {
+                return Err(v2_journal_unavailable());
+            };
+            if epoch <= 0
+                || epoch
+                    != i64::try_from(outer_id.epoch().get())
+                        .map_err(|_| v2_journal_unavailable())?
+                || table_bucket != bucket
+                || membership.count <= 0
+                || bucket_state.count <= 0
+            {
+                return Err(v2_journal_unavailable());
+            }
+            let epoch_count = v2_journal_epoch_count(&transaction, key, membership, epoch)?;
+            if epoch_count <= 0 {
+                return Err(v2_journal_unavailable());
+            }
+            let leaf = v2_journal_membership_leaf(
+                &membership.incarnation,
+                outer_id.to_bytes(),
+                epoch,
+                tag,
+            )?;
+            let deleted = transaction
+                .execute(
+                    "DELETE FROM protected_fenced_transition_v2_journal \
+                     WHERE outer_request_id = ?1 AND history_epoch = ?2 AND bucket = ?3 \
+                       AND prepared_request = ?4 AND integrity_tag = ?5",
+                    params![
+                        outer_id.to_bytes().as_slice(),
+                        epoch,
+                        bucket,
+                        canonical.as_slice(),
+                        tag.as_slice(),
+                    ],
+                )
+                .map_err(|_| v2_journal_unavailable())?;
+            if deleted != 1 {
+                return Err(v2_journal_unavailable());
+            }
+
+            let mut membership_root = membership.root;
+            let mut bucket_root = bucket_state.root;
+            for ((membership_byte, bucket_byte), leaf_byte) in membership_root
+                .iter_mut()
+                .zip(bucket_root.iter_mut())
+                .zip(leaf)
+            {
+                *membership_byte ^= leaf_byte;
+                *bucket_byte ^= leaf_byte;
+            }
+            let membership_count = membership
+                .count
+                .checked_sub(1)
+                .ok_or_else(v2_journal_unavailable)?;
+            let bucket_count = bucket_state
+                .count
+                .checked_sub(1)
+                .ok_or_else(v2_journal_unavailable)?;
+            let epoch_new_count = epoch_count
+                .checked_sub(1)
+                .ok_or_else(v2_journal_unavailable)?;
+            let membership_tag = v2_journal_membership_tag(
+                key,
+                &membership.incarnation,
+                membership_count,
+                &membership_root,
+            )?;
+            let bucket_tag = v2_journal_bucket_tag(
+                key,
+                &membership.incarnation,
+                bucket,
+                bucket_count,
+                &bucket_root,
+            )?;
+            let changed = transaction
+                .execute(
+                    "UPDATE protected_fenced_transition_v2_journal_metadata \
+                     SET membership_count = ?1, membership_root = ?2, membership_tag = ?3 \
+                     WHERE singleton = 1 AND membership_count = ?4 AND membership_root = ?5 \
+                       AND membership_tag = ?6",
+                    params![
+                        membership_count,
+                        membership_root.as_slice(),
+                        membership_tag.as_slice(),
+                        membership.count,
+                        membership.root.as_slice(),
+                        membership.tag.as_slice(),
+                    ],
+                )
+                .map_err(|_| v2_journal_unavailable())?;
+            if changed != 1 {
+                return Err(v2_journal_unavailable());
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE protected_fenced_transition_v2_journal_buckets \
+                     SET entry_count = ?1, membership_root = ?2, integrity_tag = ?3 \
+                     WHERE bucket = ?4 AND entry_count = ?5 AND membership_root = ?6 \
+                       AND integrity_tag = ?7",
+                    params![
+                        bucket_count,
+                        bucket_root.as_slice(),
+                        bucket_tag.as_slice(),
+                        bucket,
+                        bucket_state.count,
+                        bucket_state.root.as_slice(),
+                        bucket_state.tag.as_slice(),
+                    ],
+                )
+                .map_err(|_| v2_journal_unavailable())?;
+            if changed != 1 {
+                return Err(v2_journal_unavailable());
+            }
+            let old_epoch_tag =
+                v2_journal_epoch_tag(key, &membership.incarnation, epoch, epoch_count)?;
+            let changed = if epoch_new_count == 0 {
+                transaction.execute(
+                    "DELETE FROM protected_fenced_transition_v2_journal_epochs \
+                     WHERE history_epoch = ?1 AND entry_count = ?2 AND integrity_tag = ?3",
+                    params![epoch, epoch_count, old_epoch_tag.as_slice()],
+                )
+            } else {
+                let new_epoch_tag =
+                    v2_journal_epoch_tag(key, &membership.incarnation, epoch, epoch_new_count)?;
+                transaction.execute(
+                    "UPDATE protected_fenced_transition_v2_journal_epochs \
+                     SET entry_count = ?1, integrity_tag = ?2 \
+                     WHERE history_epoch = ?3 AND entry_count = ?4 AND integrity_tag = ?5",
+                    params![
+                        epoch_new_count,
+                        new_epoch_tag.as_slice(),
+                        epoch,
+                        epoch_count,
+                        old_epoch_tag.as_slice(),
+                    ],
+                )
+            }
+            .map_err(|_| v2_journal_unavailable())?;
+            if changed != 1 {
+                return Err(v2_journal_unavailable());
+            }
+            verify_v2_journal_metadata(&transaction, key, Some(&scope))?;
+            verify_sqlite_main_file_binding(&transaction).map_err(|_| v2_journal_unavailable())?;
+            transaction.commit().map_err(|_| v2_journal_unavailable())?;
+            #[cfg(test)]
+            wait_after_v2_remove_if_exact_commit(&after_commit_hook);
+            Ok(true)
+        })
+    }
+
+    /// Atomically remove every exactly matching mapping from one proved
+    /// pre-dispatch V2 batch.  Permit acquisition is the only cancellation
+    /// point: after that await, the complete compare-and-delete transaction
+    /// and the caller's `NotTransmitted` return share one future poll.
+    pub(crate) async fn remove_batch_if_exact(
+        &self,
+        scope: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+        expected: Vec<(FencedTransitionV2RequestId, FencedTransitionV2Request)>,
+    ) -> Result<usize, StoreError> {
+        if expected.len() > crate::MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS {
+            return Err(v2_journal_unavailable());
+        }
+        let mut ids = BTreeSet::new();
+        let mut canonical = Vec::with_capacity(expected.len());
+        for (outer_id, request) in expected {
+            if !ids.insert(outer_id.to_bytes()) {
+                return Err(v2_journal_unavailable());
+            }
+            canonical.push((outer_id, canonical_v2_journal_request(&request)?));
+        }
+        let permit = self.acquire_cleanup_permit().await?;
+        #[cfg(test)]
+        let after_commit_hook = Arc::clone(&self.remove_if_exact_after_commit_hook);
+        self.with_cleanup_connection(permit, move |conn, key| {
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| v2_journal_unavailable())?;
+            let membership =
+                verify_v2_journal_metadata(&transaction, key, Some(&scope))?.membership;
+            let mut entries = Vec::with_capacity(canonical.len());
+            for (outer_id, expected) in canonical {
+                let Some(stored) = read_v2_journal_entry(&transaction, key, outer_id)? else {
+                    continue;
+                };
+                if canonical_v2_journal_request(&stored)?.as_slice() != expected.as_slice() {
+                    continue;
+                }
+                let entry: Option<(i64, i64, [u8; 32], i64)> = transaction
+                    .query_row(
+                        "SELECT history_epoch, bucket, integrity_tag, rowid \
+                         FROM protected_fenced_transition_v2_journal NOT INDEXED \
+                         WHERE outer_request_id = ?1 LIMIT 2",
+                        [outer_id.to_bytes().as_slice()],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                fixed_blob(row.get_ref(2)?)?,
+                                row.get(3)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|_| v2_journal_unavailable())?;
+                let Some((epoch, bucket, tag, rowid)) = entry else {
+                    return Err(v2_journal_unavailable());
+                };
+                if epoch <= 0
+                    || epoch
+                        != i64::try_from(outer_id.epoch().get())
+                            .map_err(|_| v2_journal_unavailable())?
+                    || bucket != v2_journal_bucket(key, outer_id)?
+                    || rowid <= 0
+                {
+                    return Err(v2_journal_unavailable());
+                }
+                entries.push(V2JournalReclaimEntry {
+                    id: outer_id.to_bytes(),
+                    epoch,
+                    bucket,
+                    tag,
+                    rowid,
+                });
+            }
+            remove_v2_journal_entries(&transaction, key, membership, &entries)?;
+            verify_v2_journal_metadata(&transaction, key, Some(&scope))?;
+            verify_sqlite_main_file_binding(&transaction).map_err(|_| v2_journal_unavailable())?;
+            transaction.commit().map_err(|_| v2_journal_unavailable())?;
+            #[cfg(test)]
+            wait_after_v2_remove_if_exact_commit(&after_commit_hook);
+            Ok(entries.len())
+        })
+    }
+
+    /// Reclaim only entries at or below a retired consensus epoch floor.
+    ///
+    /// Callers inside this crate invoke this only with the floor returned by a
+    /// linearized inner V2 history-state read. `None` is a no-op.
+    pub(crate) async fn reclaim_retired_through(
+        &self,
+        scope: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+        retired_through: Option<FencedTransitionV2HistoryEpoch>,
+    ) -> Result<(), StoreError> {
+        let Some(retired_through) = retired_through else {
+            return Ok(());
+        };
+        let floor = i64::try_from(retired_through.get()).map_err(|_| v2_journal_unavailable())?;
+        self.with_connection(true, move |conn, key| {
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| v2_journal_unavailable())?;
+            let membership = verify_v2_journal_metadata(&transaction, key, Some(&scope))?;
+            reclaim_v2_journal_batch(&transaction, key, membership.membership, floor)?;
+            verify_v2_journal_metadata(&transaction, key, Some(&scope))?;
+            verify_sqlite_main_file_binding(&transaction).map_err(|_| v2_journal_unavailable())?;
+            transaction.commit().map_err(|_| v2_journal_unavailable())
+        })
+        .await
+    }
+
+    async fn with_connection<T, F>(
+        &self,
+        sync_parent_on_success: bool,
+        operation: F,
+    ) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection, &FencedTransitionV2PreparedJournalKey) -> Result<T, StoreError>
+            + Send
+            + 'static,
+    {
+        self.with_connection_with_budget(
+            sync_parent_on_success,
+            V2_JOURNAL_OPERATION_MAX_PROGRESS_CALLBACKS,
+            operation,
+        )
+        .await
+    }
+
+    async fn with_connection_with_budget<T, F>(
+        &self,
+        sync_parent_on_success: bool,
+        max_progress_callbacks: usize,
+        operation: F,
+    ) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection, &FencedTransitionV2PreparedJournalKey) -> Result<T, StoreError>
+            + Send
+            + 'static,
+    {
+        let permit = if sync_parent_on_success {
+            Arc::clone(&self.writer_permit)
+                .acquire_owned()
+                .await
+                .map_err(|_| v2_journal_unavailable())?
+        } else {
+            Arc::clone(&self.reader_permits)
+                .acquire_owned()
+                .await
+                .map_err(|_| v2_journal_unavailable())?
+        };
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if sync_parent_on_success {
+                let mut writer = inner.writer.lock().map_err(|_| v2_journal_unavailable())?;
+                #[cfg(unix)]
+                inner
+                    .path_guard
+                    .verify_connection(&writer.conn)
+                    .map_err(|_| v2_journal_unavailable())?;
+                let progress_budget = Arc::clone(&writer.progress_budget);
+                let result = with_journal_progress_budget_limit(
+                    &mut writer.conn,
+                    &progress_budget,
+                    max_progress_callbacks,
+                    |conn| operation(conn, &inner.key),
+                );
+                #[cfg(unix)]
+                if result.is_ok() {
+                    inner
+                        .path_guard
+                        .sync_parent_directory()
+                        .map_err(|_| v2_journal_unavailable())?;
+                }
+                #[cfg(unix)]
+                inner
+                    .path_guard
+                    .verify_connection(&writer.conn)
+                    .map_err(|_| v2_journal_unavailable())?;
+                result
+            } else {
+                // The semaphore count and vector cardinality are established
+                // together at open. Always return this member before the
+                // permit drops, including an integrity failure.
+                let mut reader = inner
+                    .readers
+                    .lock()
+                    .map_err(|_| v2_journal_unavailable())?
+                    .pop()
+                    .ok_or_else(v2_journal_unavailable)?;
+                let result = (|| {
+                    #[cfg(unix)]
+                    inner
+                        .path_guard
+                        .verify_connection(&reader.conn)
+                        .map_err(|_| v2_journal_unavailable())?;
+                    let result = with_journal_progress_budget_limit(
+                        &mut reader.conn,
+                        &reader.progress_budget,
+                        max_progress_callbacks,
+                        |conn| operation(conn, &inner.key),
+                    );
+                    #[cfg(unix)]
+                    inner
+                        .path_guard
+                        .verify_connection(&reader.conn)
+                        .map_err(|_| v2_journal_unavailable())?;
+                    result
+                })();
+                inner
+                    .readers
+                    .lock()
+                    .map_err(|_| v2_journal_unavailable())?
+                    .push(reader);
+                result
+            }
+        })
+        .await
+        .map_err(|_| v2_journal_unavailable())?
+    }
+}
+
+#[derive(Clone, Copy)]
+struct V2JournalMembership {
+    incarnation: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    count: i64,
+    root: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    tag: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+}
+
+type V2JournalMetadataRow = (
+    i64,
+    i64,
+    [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    i64,
+    [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+);
+
+struct V2JournalMetadata {
+    membership: V2JournalMembership,
+    scope: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+}
+
+#[derive(Clone, Copy)]
+struct V2JournalBucket {
+    count: i64,
+    root: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    tag: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+}
+
+type V2JournalStoredEntry = (
+    i64,
+    i64,
+    Zeroizing<Vec<u8>>,
+    [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+);
+
+#[derive(Clone, Copy)]
+struct V2JournalInsert {
+    epoch: i64,
+    bucket: i64,
+    bucket_state: V2JournalBucket,
+    outer_id: FencedTransitionV2RequestId,
+    tag: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+}
+
+struct V2JournalBatchInsert {
+    outer_id: FencedTransitionV2RequestId,
+    request: FencedTransitionV2Request,
+    canonical: Zeroizing<Vec<u8>>,
+    epoch: i64,
+    bucket: i64,
+    tag: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+}
+
+fn v2_journal_unavailable() -> StoreError {
+    StoreError::BackendUnavailable(V2_JOURNAL_UNAVAILABLE.into())
+}
+
+fn canonical_v2_journal_request(
+    request: &FencedTransitionV2Request,
+) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+    request.validate()?;
+    let encoded = serde_json::to_vec(request).map_err(|_| v2_journal_unavailable())?;
+    if encoded.len() > V2_JOURNAL_TOKEN_MAX_BYTES {
+        return Err(v2_journal_unavailable());
+    }
+    Ok(Zeroizing::new(encoded))
+}
+
+fn v2_journal_key_check(
+    key: &FencedTransitionV2PreparedJournalKey,
+) -> Zeroizing<[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]> {
+    let mut mac = ZeroizingHmacSha256::new(key.as_bytes());
+    mac.update(V2_JOURNAL_KEY_CHECK_DOMAIN);
+    mac.update(&V2_JOURNAL_APPLICATION_ID.to_be_bytes());
+    mac.update(&V2_JOURNAL_SCHEMA_VERSION.to_be_bytes());
+    mac.finalize()
+}
+
+fn v2_journal_scope_tag(
+    key: &FencedTransitionV2PreparedJournalKey,
+    scope: &[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+) -> Zeroizing<[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]> {
+    let mut mac = ZeroizingHmacSha256::new(key.as_bytes());
+    mac.update(V2_JOURNAL_SCOPE_TAG_DOMAIN);
+    mac.update(&V2_JOURNAL_APPLICATION_ID.to_be_bytes());
+    mac.update(&V2_JOURNAL_SCHEMA_VERSION.to_be_bytes());
+    mac.update(scope);
+    mac.finalize()
+}
+
+fn v2_journal_entry_tag(
+    key: &FencedTransitionV2PreparedJournalKey,
+    outer_id: FencedTransitionV2RequestId,
+    canonical: &[u8],
+) -> Result<Zeroizing<[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]>, StoreError> {
+    let length = u64::try_from(canonical.len()).map_err(|_| v2_journal_unavailable())?;
+    let mut mac = ZeroizingHmacSha256::new(key.as_bytes());
+    mac.update(V2_JOURNAL_ENTRY_DOMAIN);
+    mac.update(&V2_JOURNAL_SCHEMA_VERSION.to_be_bytes());
+    mac.update(&outer_id.to_bytes());
+    mac.update(&length.to_be_bytes());
+    mac.update(canonical);
+    Ok(mac.finalize())
+}
+
+fn v2_journal_membership_tag(
+    key: &FencedTransitionV2PreparedJournalKey,
+    incarnation: &[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    count: i64,
+    root: &[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+) -> Result<Zeroizing<[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]>, StoreError> {
+    let encoded_count = u64::try_from(count)
+        .map_err(|_| v2_journal_unavailable())?
+        .to_be_bytes();
+    let mut mac = ZeroizingHmacSha256::new(key.as_bytes());
+    mac.update(V2_JOURNAL_MEMBERSHIP_TAG_DOMAIN);
+    mac.update(&V2_JOURNAL_SCHEMA_VERSION.to_be_bytes());
+    mac.update(incarnation);
+    mac.update(&encoded_count);
+    mac.update(root);
+    Ok(mac.finalize())
+}
+
+fn v2_journal_epoch_tag(
+    key: &FencedTransitionV2PreparedJournalKey,
+    incarnation: &[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    epoch: i64,
+    count: i64,
+) -> Result<Zeroizing<[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]>, StoreError> {
+    let mut mac = ZeroizingHmacSha256::new(key.as_bytes());
+    mac.update(V2_JOURNAL_EPOCH_TAG_DOMAIN);
+    mac.update(&V2_JOURNAL_SCHEMA_VERSION.to_be_bytes());
+    mac.update(incarnation);
+    mac.update(
+        &u64::try_from(epoch)
+            .map_err(|_| v2_journal_unavailable())?
+            .to_be_bytes(),
+    );
+    mac.update(
+        &u64::try_from(count)
+            .map_err(|_| v2_journal_unavailable())?
+            .to_be_bytes(),
+    );
+    Ok(mac.finalize())
+}
+
+fn v2_journal_bucket(
+    key: &FencedTransitionV2PreparedJournalKey,
+    id: FencedTransitionV2RequestId,
+) -> Result<i64, StoreError> {
+    v2_journal_bucket_from_bytes(key, &id.to_bytes())
+}
+
+fn v2_journal_bucket_from_bytes(
+    key: &FencedTransitionV2PreparedJournalKey,
+    id: &[u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES],
+) -> Result<i64, StoreError> {
+    let mut mac = ZeroizingHmacSha256::new(key.as_bytes());
+    mac.update(V2_JOURNAL_BUCKET_DOMAIN);
+    mac.update(&V2_JOURNAL_SCHEMA_VERSION.to_be_bytes());
+    mac.update(id);
+    let digest = mac.finalize();
+    let value = u16::from_be_bytes([digest[0], digest[1]]) as usize % V2_JOURNAL_BUCKET_COUNT;
+    i64::try_from(value).map_err(|_| v2_journal_unavailable())
+}
+
+fn v2_journal_bucket_tag(
+    key: &FencedTransitionV2PreparedJournalKey,
+    incarnation: &[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    bucket: i64,
+    count: i64,
+    root: &[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+) -> Result<Zeroizing<[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]>, StoreError> {
+    let mut mac = ZeroizingHmacSha256::new(key.as_bytes());
+    mac.update(V2_JOURNAL_BUCKET_TAG_DOMAIN);
+    mac.update(&V2_JOURNAL_SCHEMA_VERSION.to_be_bytes());
+    mac.update(incarnation);
+    mac.update(
+        &u64::try_from(bucket)
+            .map_err(|_| v2_journal_unavailable())?
+            .to_be_bytes(),
+    );
+    mac.update(
+        &u64::try_from(count)
+            .map_err(|_| v2_journal_unavailable())?
+            .to_be_bytes(),
+    );
+    mac.update(root);
+    Ok(mac.finalize())
+}
+
+fn v2_journal_membership_root(
+    incarnation: &[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    count: i64,
+    entries: impl IntoIterator<Item = ([u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES], i64, [u8; 32])>,
+) -> Result<[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES], StoreError> {
+    if count < 0
+        || usize::try_from(count)
+            .ok()
+            .is_none_or(|count| count > FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES)
+    {
+        return Err(v2_journal_unavailable());
+    }
+    let mut root = [0_u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES];
+    let mut observed = 0_i64;
+    for (id, epoch, tag) in entries {
+        if epoch <= 0 {
+            return Err(v2_journal_unavailable());
+        }
+        let leaf = v2_journal_membership_leaf(incarnation, id, epoch, tag)?;
+        for (root_byte, leaf_byte) in root.iter_mut().zip(leaf) {
+            *root_byte ^= leaf_byte;
+        }
+        observed = observed.checked_add(1).ok_or_else(v2_journal_unavailable)?;
+    }
+    if observed != count {
+        return Err(v2_journal_unavailable());
+    }
+    Ok(root)
+}
+
+fn v2_journal_membership_leaf(
+    incarnation: &[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    id: [u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES],
+    epoch: i64,
+    tag: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+) -> Result<[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES], StoreError> {
+    let mut hasher = Sha256::new();
+    hasher.update(V2_JOURNAL_MEMBERSHIP_ROOT_DOMAIN);
+    hasher.update(V2_JOURNAL_SCHEMA_VERSION.to_be_bytes());
+    hasher.update(incarnation);
+    hasher.update(id);
+    hasher.update(
+        u64::try_from(epoch)
+            .map_err(|_| v2_journal_unavailable())?
+            .to_be_bytes(),
+    );
+    hasher.update(tag);
+    Ok(hasher.finalize().into())
+}
+
+fn v2_journal_epoch_count(
+    conn: &Connection,
+    key: &FencedTransitionV2PreparedJournalKey,
+    membership: V2JournalMembership,
+    epoch: i64,
+) -> Result<i64, StoreError> {
+    if epoch <= 0 {
+        return Err(v2_journal_unavailable());
+    }
+    let row: Option<(i64, [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES])> = conn
+        .query_row(
+            "SELECT entry_count, integrity_tag FROM protected_fenced_transition_v2_journal_epochs WHERE history_epoch = ?1",
+            [epoch],
+            |row| Ok((row.get(0)?, fixed_blob(row.get_ref(1)?)?)),
+        )
+        .optional()
+        .map_err(|_| v2_journal_unavailable())?;
+    let Some((count, tag)) = row else {
+        return Ok(0);
+    };
+    if count < 0
+        || count
+            > i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                .map_err(|_| v2_journal_unavailable())?
+        || !bool::from(
+            tag.ct_eq(v2_journal_epoch_tag(key, &membership.incarnation, epoch, count)?.as_slice()),
+        )
+    {
+        return Err(v2_journal_unavailable());
+    }
+    Ok(count)
+}
+
+/// Count and authenticate the nonempty epochs retained by this journal.
+///
+/// The protocol admits at most eight retained epochs, so this deliberately
+/// reads at most nine metadata rows.  It is used only when a new epoch first
+/// receives an entry; ordinary requests for an existing epoch need one keyed
+/// row lookup instead.
+fn v2_journal_retained_epoch_count(
+    conn: &Connection,
+    key: &FencedTransitionV2PreparedJournalKey,
+    membership: V2JournalMembership,
+) -> Result<usize, StoreError> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT history_epoch, entry_count, integrity_tag \
+             FROM protected_fenced_transition_v2_journal_epochs \
+             ORDER BY history_epoch ASC LIMIT {V2_JOURNAL_EPOCH_SCAN_LIMIT}"
+        ))
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut rows = statement.query([]).map_err(|_| v2_journal_unavailable())?;
+    let mut count = 0_usize;
+    while let Some(row) = rows.next().map_err(|_| v2_journal_unavailable())? {
+        if count >= V2_JOURNAL_MAX_RETAINED_EPOCHS {
+            return Err(v2_journal_unavailable());
+        }
+        let ValueRef::Integer(epoch) = row.get_ref(0).map_err(|_| v2_journal_unavailable())? else {
+            return Err(v2_journal_unavailable());
+        };
+        let ValueRef::Integer(entry_count) =
+            row.get_ref(1).map_err(|_| v2_journal_unavailable())?
+        else {
+            return Err(v2_journal_unavailable());
+        };
+        let tag: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES] =
+            fixed_blob(row.get_ref(2).map_err(|_| v2_journal_unavailable())?)
+                .map_err(|_| v2_journal_unavailable())?;
+        if epoch <= 0
+            || entry_count <= 0
+            || entry_count
+                > i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                    .map_err(|_| v2_journal_unavailable())?
+            || !bool::from(tag.ct_eq(
+                v2_journal_epoch_tag(key, &membership.incarnation, epoch, entry_count)?.as_slice(),
+            ))
+        {
+            return Err(v2_journal_unavailable());
+        }
+        count = count.checked_add(1).ok_or_else(v2_journal_unavailable)?;
+    }
+    Ok(count)
+}
+
+fn verify_v2_journal_bucket(
+    conn: &Connection,
+    key: &FencedTransitionV2PreparedJournalKey,
+    membership: V2JournalMembership,
+    bucket: i64,
+) -> Result<V2JournalBucket, StoreError> {
+    let (count, root, tag): (i64, [u8; 32], [u8; 32]) = conn
+        .query_row(
+            "SELECT entry_count, membership_root, integrity_tag FROM protected_fenced_transition_v2_journal_buckets WHERE bucket = ?1",
+            [bucket],
+            |row| Ok((row.get(0)?, fixed_blob(row.get_ref(1)?)?, fixed_blob(row.get_ref(2)?)?)),
+        )
+        .map_err(|_| v2_journal_unavailable())?;
+    if count < 0
+        || count
+            > i64::try_from(V2_JOURNAL_BUCKET_MAX_ENTRIES).map_err(|_| v2_journal_unavailable())?
+        || !bool::from(tag.ct_eq(
+            v2_journal_bucket_tag(key, &membership.incarnation, bucket, count, &root)?.as_slice(),
+        ))
+    {
+        return Err(v2_journal_unavailable());
+    }
+    let mut table_statement = conn
+        .prepare(
+            "SELECT outer_request_id, history_epoch, bucket, integrity_tag \
+             FROM protected_fenced_transition_v2_journal NOT INDEXED WHERE rowid = ?1",
+        )
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT outer_request_id, history_epoch, integrity_tag, rowid FROM protected_fenced_transition_v2_journal \
+             INDEXED BY {V2_JOURNAL_MEMBERSHIP_INDEX} WHERE bucket = ?1 ORDER BY outer_request_id LIMIT {}",
+            V2_JOURNAL_BUCKET_MAX_ENTRIES + 1
+        ))
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut rows = statement
+        .query([bucket])
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().map_err(|_| v2_journal_unavailable())? {
+        if entries.len() >= V2_JOURNAL_BUCKET_MAX_ENTRIES {
+            return Err(v2_journal_unavailable());
+        }
+        let id = fixed_blob(row.get_ref(0).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?;
+        let epoch: i64 = row.get(1).map_err(|_| v2_journal_unavailable())?;
+        let tag = fixed_blob(row.get_ref(2).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?;
+        let ValueRef::Integer(rowid) = row.get_ref(3).map_err(|_| v2_journal_unavailable())? else {
+            return Err(v2_journal_unavailable());
+        };
+        let table_entry: Option<(
+            [u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES],
+            i64,
+            i64,
+            [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+        )> = table_statement
+            .query_row([rowid], |table_row| {
+                Ok((
+                    fixed_blob(table_row.get_ref(0)?)?,
+                    table_row.get(1)?,
+                    table_row.get(2)?,
+                    fixed_blob(table_row.get_ref(3)?)?,
+                ))
+            })
+            .optional()
+            .map_err(|_| v2_journal_unavailable())?;
+        if rowid <= 0
+            || epoch <= 0
+            || id[..8]
+                != u64::try_from(epoch)
+                    .map_err(|_| v2_journal_unavailable())?
+                    .to_be_bytes()
+            || bucket != v2_journal_bucket_from_bytes(key, &id)?
+            || table_entry != Some((id, epoch, bucket, tag))
+        {
+            return Err(v2_journal_unavailable());
+        }
+        entries.push((id, epoch, tag));
+    }
+    if i64::try_from(entries.len()).map_err(|_| v2_journal_unavailable())? != count
+        || v2_journal_membership_root(&membership.incarnation, count, entries)? != root
+    {
+        return Err(v2_journal_unavailable());
+    }
+    Ok(V2JournalBucket { count, root, tag })
+}
+
+fn v2_journal_read_transaction(
+    conn: &mut Connection,
+) -> Result<rusqlite::Transaction<'_>, StoreError> {
+    conn.transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(|_| v2_journal_unavailable())
+}
+
+fn v2_journal_limits() -> Result<[(Limit, i32); 9], StoreError> {
+    let length = V2_JOURNAL_TOKEN_MAX_BYTES
+        .checked_add(V2_JOURNAL_ROW_OVERHEAD_BYTES)
+        .and_then(|length| i32::try_from(length).ok())
+        .ok_or_else(v2_journal_unavailable)?;
+    Ok([
+        (Limit::SQLITE_LIMIT_LENGTH, length),
+        (Limit::SQLITE_LIMIT_SQL_LENGTH, 16_384),
+        (Limit::SQLITE_LIMIT_COLUMN, 16),
+        (Limit::SQLITE_LIMIT_EXPR_DEPTH, 32),
+        (Limit::SQLITE_LIMIT_VDBE_OP, 10_000),
+        (Limit::SQLITE_LIMIT_COMPOUND_SELECT, 4),
+        (Limit::SQLITE_LIMIT_FUNCTION_ARG, 16),
+        (Limit::SQLITE_LIMIT_ATTACHED, 0),
+        (Limit::SQLITE_LIMIT_WORKER_THREADS, 0),
+    ])
+}
+
+fn verify_v2_journal_limits(conn: &Connection) -> Result<(), StoreError> {
+    for (limit, expected) in v2_journal_limits()? {
+        if conn.limit(limit) != expected {
+            return Err(v2_journal_unavailable());
+        }
+    }
+    Ok(())
+}
+
+fn configure_v2_journal_sqlite_limits(conn: &Connection) -> Result<(), StoreError> {
+    for (limit, requested) in v2_journal_limits()? {
+        conn.set_limit(limit, requested);
+    }
+    verify_v2_journal_limits(conn)
+}
+
+fn verify_v2_journal_profile(conn: &Connection) -> Result<(), StoreError> {
+    verify_v2_journal_limits(conn)?;
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let max_page_count: i64 = conn
+        .query_row("PRAGMA max_page_count", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let cache_size: i64 = conn
+        .query_row("PRAGMA cache_size", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let cache_spill: i64 = conn
+        .query_row("PRAGMA cache_spill", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let mmap_size: i64 = conn
+        .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let wal_autocheckpoint: i64 = conn
+        .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let journal_size_limit: i64 = conn
+        .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let journal_mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let synchronous: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let fullfsync: i64 = conn
+        .query_row("PRAGMA fullfsync", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let checkpoint_fullfsync: i64 = conn
+        .query_row("PRAGMA checkpoint_fullfsync", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let foreign_keys: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let locking_mode: String = conn
+        .query_row("PRAGMA locking_mode", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let temp_store: i64 = conn
+        .query_row("PRAGMA temp_store", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    let secure_delete: i64 = conn
+        .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+        .map_err(|_| v2_journal_unavailable())?;
+    if page_size
+        != i64::try_from(V2_JOURNAL_PAGE_SIZE_BYTES).map_err(|_| v2_journal_unavailable())?
+        || max_page_count != V2_JOURNAL_MAX_PAGE_COUNT
+        || cache_size != -JOURNAL_SQLITE_CACHE_KIB
+        || cache_spill != 0
+        || mmap_size != 0
+        || wal_autocheckpoint != V2_JOURNAL_WAL_AUTOCHECKPOINT_PAGES
+        || journal_size_limit
+            != i64::try_from(V2_JOURNAL_WAL_MAX_BYTES).map_err(|_| v2_journal_unavailable())?
+        || !journal_mode.eq_ignore_ascii_case("wal")
+        || synchronous != 3
+        || fullfsync != 1
+        || checkpoint_fullfsync != 1
+        || foreign_keys != 1
+        || !locking_mode.eq_ignore_ascii_case("normal")
+        || temp_store != 2
+        || secure_delete != 1
+    {
+        return Err(v2_journal_unavailable());
+    }
+    Ok(())
+}
+
+fn initialize_v2_journal_connection(
+    conn: &mut Connection,
+    key: &FencedTransitionV2PreparedJournalKey,
+    mode: JournalOpenMode,
+    budget: &JournalSqliteProgressBudget,
+) -> Result<(), StoreError> {
+    with_journal_progress_budget_limit(
+        conn,
+        budget,
+        V2_JOURNAL_INITIALIZE_MAX_PROGRESS_CALLBACKS,
+        |conn| {
+            conn.busy_timeout(V2_JOURNAL_BUSY_TIMEOUT)
+                .map_err(|_| v2_journal_unavailable())?;
+            let application_id =
+                journal_application_id(conn).map_err(|_| v2_journal_unavailable())?;
+            let user_version = journal_user_version(conn).map_err(|_| v2_journal_unavailable())?;
+            let object_count = v2_journal_schema_catalog_count(conn)?;
+            let empty = application_id == 0 && user_version == 0 && object_count == 0;
+            if mode == JournalOpenMode::OpenExisting && empty {
+                return Err(v2_journal_unavailable());
+            }
+            if !((application_id == 0 && user_version == 0 && object_count == 0)
+                || (application_id == V2_JOURNAL_APPLICATION_ID
+                    && user_version == V2_JOURNAL_SCHEMA_VERSION
+                    && object_count == V2_JOURNAL_SCHEMA_OBJECT_COUNT))
+            {
+                return Err(v2_journal_unavailable());
+            }
+            if application_id == V2_JOURNAL_APPLICATION_ID {
+                verify_v2_journal_schema(conn)?;
+            }
+            conn.execute_batch(&format!(
+                "PRAGMA page_size = {V2_JOURNAL_PAGE_SIZE_BYTES}; \
+                 PRAGMA max_page_count = {V2_JOURNAL_MAX_PAGE_COUNT}; \
+                 PRAGMA cache_size = -{JOURNAL_SQLITE_CACHE_KIB}; \
+                 PRAGMA cache_spill = OFF; PRAGMA mmap_size = 0; \
+                 PRAGMA journal_mode = WAL; \
+                 PRAGMA wal_autocheckpoint = {V2_JOURNAL_WAL_AUTOCHECKPOINT_PAGES}; \
+                 PRAGMA journal_size_limit = {V2_JOURNAL_WAL_MAX_BYTES}; \
+                 PRAGMA synchronous = EXTRA; PRAGMA fullfsync = ON; \
+                 PRAGMA checkpoint_fullfsync = ON; PRAGMA foreign_keys = ON; \
+                 PRAGMA locking_mode = NORMAL; PRAGMA temp_store = MEMORY; \
+                 PRAGMA secure_delete = ON;"
+            ))
+            .map_err(|_| v2_journal_unavailable())?;
+            verify_v2_journal_profile(conn)?;
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| v2_journal_unavailable())?;
+            if empty {
+                transaction.execute_batch(&format!(
+                    r#"
+                    CREATE TABLE protected_fenced_transition_v2_journal_metadata (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        schema_version INTEGER NOT NULL CHECK (schema_version = {V2_JOURNAL_SCHEMA_VERSION}),
+                        journal_incarnation BLOB NOT NULL CHECK (
+                            typeof(journal_incarnation) = 'blob' AND length(journal_incarnation) = 32
+                        ),
+                        membership_count INTEGER NOT NULL CHECK (
+                            membership_count >= 0
+                            AND membership_count <= {FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES}
+                        ),
+                        membership_root BLOB NOT NULL CHECK (
+                            typeof(membership_root) = 'blob' AND length(membership_root) = 32
+                        ),
+                        membership_tag BLOB NOT NULL CHECK (
+                            typeof(membership_tag) = 'blob' AND length(membership_tag) = 32
+                        ),
+                        scope_commitment BLOB NOT NULL CHECK (
+                            typeof(scope_commitment) = 'blob' AND length(scope_commitment) = 32
+                        ),
+                        scope_tag BLOB NOT NULL CHECK (
+                            typeof(scope_tag) = 'blob' AND length(scope_tag) = 32
+                        ),
+                        key_check BLOB NOT NULL CHECK (
+                            typeof(key_check) = 'blob' AND length(key_check) = 32
+                        )
+                    ) STRICT;
+                    CREATE TABLE protected_fenced_transition_v2_journal (
+                        history_epoch INTEGER NOT NULL CHECK (history_epoch > 0),
+                        bucket INTEGER NOT NULL CHECK (bucket >= 0 AND bucket < {V2_JOURNAL_BUCKET_COUNT}),
+                        outer_request_id BLOB NOT NULL CHECK (
+                            typeof(outer_request_id) = 'blob'
+                            AND length(outer_request_id) = {FENCED_TRANSITION_V2_REQUEST_ID_BYTES}
+                        ),
+                        prepared_request BLOB NOT NULL CHECK (
+                            typeof(prepared_request) = 'blob'
+                            AND length(prepared_request) <= {V2_JOURNAL_TOKEN_MAX_BYTES}
+                        ),
+                        integrity_tag BLOB NOT NULL CHECK (
+                            typeof(integrity_tag) = 'blob' AND length(integrity_tag) = 32
+                        ),
+                        PRIMARY KEY (history_epoch, outer_request_id)
+                    ) STRICT;
+                    CREATE TABLE protected_fenced_transition_v2_journal_epochs (
+                        history_epoch INTEGER PRIMARY KEY CHECK (history_epoch > 0),
+                        entry_count INTEGER NOT NULL CHECK (
+                            entry_count >= 0 AND entry_count <= {FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES}
+                        ),
+                        integrity_tag BLOB NOT NULL CHECK (
+                            typeof(integrity_tag) = 'blob' AND length(integrity_tag) = 32
+                        )
+                    ) STRICT;
+                    CREATE TABLE protected_fenced_transition_v2_journal_buckets (
+                        bucket INTEGER PRIMARY KEY CHECK (bucket >= 0 AND bucket < {V2_JOURNAL_BUCKET_COUNT}),
+                        entry_count INTEGER NOT NULL CHECK (
+                            entry_count >= 0 AND entry_count <= {V2_JOURNAL_BUCKET_MAX_ENTRIES}
+                        ),
+                        membership_root BLOB NOT NULL CHECK (
+                            typeof(membership_root) = 'blob' AND length(membership_root) = 32
+                        ),
+                        integrity_tag BLOB NOT NULL CHECK (
+                            typeof(integrity_tag) = 'blob' AND length(integrity_tag) = 32
+                        )
+                    ) STRICT;
+                    CREATE INDEX {V2_JOURNAL_MEMBERSHIP_INDEX} ON protected_fenced_transition_v2_journal (bucket, outer_request_id, history_epoch, integrity_tag);
+                    CREATE INDEX {V2_JOURNAL_EPOCH_INDEX}
+                        ON protected_fenced_transition_v2_journal (history_epoch, outer_request_id);
+                    PRAGMA application_id = {V2_JOURNAL_APPLICATION_ID};
+                    PRAGMA user_version = {V2_JOURNAL_SCHEMA_VERSION};
+                    "#
+                ))
+                .map_err(|_| v2_journal_unavailable())?;
+                let mut incarnation = [0_u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES];
+                SysRng
+                    .try_fill_bytes(&mut incarnation)
+                    .map_err(|_| v2_journal_unavailable())?;
+                let root = v2_journal_membership_root(&incarnation, 0, std::iter::empty())?;
+                let tag = v2_journal_membership_tag(key, &incarnation, 0, &root)?;
+                let scope_tag = v2_journal_scope_tag(key, &V2_JOURNAL_UNBOUND_SCOPE);
+                let key_check = v2_journal_key_check(key);
+                transaction
+                    .execute(
+                        "INSERT INTO protected_fenced_transition_v2_journal_metadata \
+                         (singleton, schema_version, journal_incarnation, membership_count, membership_root, membership_tag, scope_commitment, scope_tag, key_check) \
+                         VALUES (1, ?1, ?2, 0, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            V2_JOURNAL_SCHEMA_VERSION,
+                            incarnation.as_slice(),
+                            root.as_slice(),
+                            tag.as_slice(),
+                            V2_JOURNAL_UNBOUND_SCOPE.as_slice(),
+                            scope_tag.as_slice(),
+                            key_check.as_slice(),
+                        ],
+                    )
+                    .map_err(|_| v2_journal_unavailable())?;
+                for bucket in 0..V2_JOURNAL_BUCKET_COUNT {
+                    let bucket = i64::try_from(bucket).map_err(|_| v2_journal_unavailable())?;
+                    let root = [0_u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES];
+                    let tag = v2_journal_bucket_tag(key, &incarnation, bucket, 0, &root)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO protected_fenced_transition_v2_journal_buckets \
+                             (bucket, entry_count, membership_root, integrity_tag) VALUES (?1, 0, ?2, ?3)",
+                            params![bucket, root.as_slice(), tag.as_slice()],
+                        )
+                        .map_err(|_| v2_journal_unavailable())?;
+                }
+            }
+            let metadata = verify_v2_journal_metadata(&transaction, key, None)?;
+            verify_v2_journal_full_membership(&transaction, key, metadata.membership)?;
+            verify_sqlite_main_file_binding(&transaction).map_err(|_| v2_journal_unavailable())?;
+            transaction.commit().map_err(|_| v2_journal_unavailable())
+        },
+    )
+}
+
+fn v2_journal_schema_catalog_count(conn: &Connection) -> Result<i64, StoreError> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT 1 FROM sqlite_schema LIMIT {V2_JOURNAL_CATALOG_SCAN_LIMIT}"
+        ))
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut rows = statement.query([]).map_err(|_| v2_journal_unavailable())?;
+    let mut count = 0_i64;
+    while rows.next().map_err(|_| v2_journal_unavailable())?.is_some() {
+        count = count.checked_add(1).ok_or_else(v2_journal_unavailable)?;
+    }
+    Ok(count)
+}
+
+fn verify_v2_journal_schema(conn: &Connection) -> Result<(), StoreError> {
+    if v2_journal_schema_catalog_count(conn)? != V2_JOURNAL_SCHEMA_OBJECT_COUNT {
+        return Err(v2_journal_unavailable());
+    }
+    let expected = [
+        (
+            "table",
+            "protected_fenced_transition_v2_journal_metadata",
+            "protected_fenced_transition_v2_journal_metadata",
+            format!(
+                r#"CREATE TABLE protected_fenced_transition_v2_journal_metadata (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    schema_version INTEGER NOT NULL CHECK (schema_version = {V2_JOURNAL_SCHEMA_VERSION}),
+                    journal_incarnation BLOB NOT NULL CHECK (
+                        typeof(journal_incarnation) = 'blob' AND length(journal_incarnation) = 32
+                    ),
+                    membership_count INTEGER NOT NULL CHECK (
+                        membership_count >= 0
+                        AND membership_count <= {FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES}
+                    ),
+                    membership_root BLOB NOT NULL CHECK (
+                        typeof(membership_root) = 'blob' AND length(membership_root) = 32
+                    ),
+                    membership_tag BLOB NOT NULL CHECK (
+                        typeof(membership_tag) = 'blob' AND length(membership_tag) = 32
+                    ),
+                    scope_commitment BLOB NOT NULL CHECK (
+                        typeof(scope_commitment) = 'blob' AND length(scope_commitment) = 32
+                    ),
+                    scope_tag BLOB NOT NULL CHECK (
+                        typeof(scope_tag) = 'blob' AND length(scope_tag) = 32
+                    ),
+                    key_check BLOB NOT NULL CHECK (
+                        typeof(key_check) = 'blob' AND length(key_check) = 32
+                    )
+                ) STRICT"#
+            ),
+        ),
+        (
+            "table",
+            "protected_fenced_transition_v2_journal",
+            "protected_fenced_transition_v2_journal",
+            format!(
+                r#"CREATE TABLE protected_fenced_transition_v2_journal (
+                    history_epoch INTEGER NOT NULL CHECK (history_epoch > 0),
+                    bucket INTEGER NOT NULL CHECK (bucket >= 0 AND bucket < {V2_JOURNAL_BUCKET_COUNT}),
+                    outer_request_id BLOB NOT NULL CHECK (
+                        typeof(outer_request_id) = 'blob'
+                        AND length(outer_request_id) = {FENCED_TRANSITION_V2_REQUEST_ID_BYTES}
+                    ),
+                    prepared_request BLOB NOT NULL CHECK (
+                        typeof(prepared_request) = 'blob'
+                        AND length(prepared_request) <= {V2_JOURNAL_TOKEN_MAX_BYTES}
+                    ),
+                    integrity_tag BLOB NOT NULL CHECK (
+                        typeof(integrity_tag) = 'blob' AND length(integrity_tag) = 32
+                    ),
+                    PRIMARY KEY (history_epoch, outer_request_id)
+                ) STRICT"#
+            ),
+        ),
+        (
+            "table",
+            "protected_fenced_transition_v2_journal_epochs",
+            "protected_fenced_transition_v2_journal_epochs",
+            format!(
+                r#"CREATE TABLE protected_fenced_transition_v2_journal_epochs (
+                    history_epoch INTEGER PRIMARY KEY CHECK (history_epoch > 0),
+                    entry_count INTEGER NOT NULL CHECK (
+                        entry_count >= 0 AND entry_count <= {FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES}
+                    ),
+                    integrity_tag BLOB NOT NULL CHECK (
+                        typeof(integrity_tag) = 'blob' AND length(integrity_tag) = 32
+                    )
+                ) STRICT"#
+            ),
+        ),
+        (
+            "table",
+            "protected_fenced_transition_v2_journal_buckets",
+            "protected_fenced_transition_v2_journal_buckets",
+            format!(
+                r#"CREATE TABLE protected_fenced_transition_v2_journal_buckets (
+                    bucket INTEGER PRIMARY KEY CHECK (bucket >= 0 AND bucket < {V2_JOURNAL_BUCKET_COUNT}),
+                    entry_count INTEGER NOT NULL CHECK (
+                        entry_count >= 0 AND entry_count <= {V2_JOURNAL_BUCKET_MAX_ENTRIES}
+                    ),
+                    membership_root BLOB NOT NULL CHECK (
+                        typeof(membership_root) = 'blob' AND length(membership_root) = 32
+                    ),
+                    integrity_tag BLOB NOT NULL CHECK (
+                        typeof(integrity_tag) = 'blob' AND length(integrity_tag) = 32
+                    )
+                ) STRICT"#
+            ),
+        ),
+        (
+            "index",
+            "sqlite_autoindex_protected_fenced_transition_v2_journal_1",
+            "protected_fenced_transition_v2_journal",
+            String::new(),
+        ),
+        (
+            "index",
+            V2_JOURNAL_MEMBERSHIP_INDEX,
+            "protected_fenced_transition_v2_journal",
+            format!(
+                "CREATE INDEX {V2_JOURNAL_MEMBERSHIP_INDEX} \
+                 ON protected_fenced_transition_v2_journal \
+                 (bucket, outer_request_id, history_epoch, integrity_tag)"
+            ),
+        ),
+        (
+            "index",
+            V2_JOURNAL_EPOCH_INDEX,
+            "protected_fenced_transition_v2_journal",
+            format!(
+                "CREATE INDEX {V2_JOURNAL_EPOCH_INDEX} \
+                 ON protected_fenced_transition_v2_journal (history_epoch, outer_request_id)"
+            ),
+        ),
+    ];
+    for (expected_type, name, expected_table_name, expected_sql) in expected {
+        let actual: Option<(String, String, Option<String>)> = conn
+            .query_row(
+                "SELECT type, tbl_name, sql FROM sqlite_schema WHERE name = ?1",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| v2_journal_unavailable())?;
+        let Some((object_type, table_name, actual_sql)) = actual else {
+            return Err(v2_journal_unavailable());
+        };
+        let sql_matches = if expected_sql.is_empty() {
+            actual_sql.is_none()
+        } else {
+            actual_sql.as_ref().is_some_and(|actual_sql| {
+                canonical_schema_sql(actual_sql) == canonical_schema_sql(&expected_sql)
+            })
+        };
+        if object_type != expected_type || table_name != expected_table_name || !sql_matches {
+            return Err(v2_journal_unavailable());
+        }
+    }
+    Ok(())
+}
+
+fn verify_v2_journal_metadata(
+    conn: &Connection,
+    key: &FencedTransitionV2PreparedJournalKey,
+    expected_scope: Option<&[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]>,
+) -> Result<V2JournalMetadata, StoreError> {
+    verify_v2_journal_profile(conn)?;
+    if journal_application_id(conn).map_err(|_| v2_journal_unavailable())?
+        != V2_JOURNAL_APPLICATION_ID
+        || journal_user_version(conn).map_err(|_| v2_journal_unavailable())?
+            != V2_JOURNAL_SCHEMA_VERSION
+    {
+        return Err(v2_journal_unavailable());
+    }
+    verify_v2_journal_schema(conn)?;
+    let metadata_query = format!(
+        "SELECT singleton, schema_version, key_check, journal_incarnation, membership_count, \
+                membership_root, membership_tag, scope_commitment, scope_tag \
+         FROM protected_fenced_transition_v2_journal_metadata \
+         LIMIT {V2_JOURNAL_METADATA_SCAN_LIMIT}"
+    );
+    let mut statement = conn
+        .prepare(&metadata_query)
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut rows = statement.query([]).map_err(|_| v2_journal_unavailable())?;
+    let row = rows
+        .next()
+        .map_err(|_| v2_journal_unavailable())?
+        .ok_or_else(v2_journal_unavailable)?;
+    let ValueRef::Integer(schema_version) = row.get_ref(1).map_err(|_| v2_journal_unavailable())?
+    else {
+        return Err(v2_journal_unavailable());
+    };
+    let ValueRef::Integer(membership_count) =
+        row.get_ref(4).map_err(|_| v2_journal_unavailable())?
+    else {
+        return Err(v2_journal_unavailable());
+    };
+    let row: V2JournalMetadataRow = (
+        row.get(0).map_err(|_| v2_journal_unavailable())?,
+        schema_version,
+        fixed_blob(row.get_ref(2).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?,
+        fixed_blob(row.get_ref(3).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?,
+        membership_count,
+        fixed_blob(row.get_ref(5).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?,
+        fixed_blob(row.get_ref(6).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?,
+        fixed_blob(row.get_ref(7).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?,
+        fixed_blob(row.get_ref(8).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?,
+    );
+    if rows.next().map_err(|_| v2_journal_unavailable())?.is_some()
+        || row.0 != 1
+        || row.1 != V2_JOURNAL_SCHEMA_VERSION
+        || !bool::from(row.2.ct_eq(v2_journal_key_check(key).as_slice()))
+        || !bool::from(row.8.ct_eq(v2_journal_scope_tag(key, &row.7).as_slice()))
+    {
+        return Err(v2_journal_unavailable());
+    }
+    let membership = V2JournalMembership {
+        incarnation: row.3,
+        count: row.4,
+        root: row.5,
+        tag: row.6,
+    };
+    if membership.count < 0
+        || membership.count
+            > i64::try_from(FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES)
+                .map_err(|_| v2_journal_unavailable())?
+        || *v2_journal_membership_tag(
+            key,
+            &membership.incarnation,
+            membership.count,
+            &membership.root,
+        )? != membership.tag
+    {
+        return Err(v2_journal_unavailable());
+    }
+    if expected_scope.is_some_and(|scope| scope != &row.7) {
+        return Err(v2_journal_unavailable());
+    }
+    Ok(V2JournalMetadata {
+        membership,
+        scope: row.7,
+    })
+}
+
+fn verify_v2_journal_full_membership(
+    conn: &Connection,
+    key: &FencedTransitionV2PreparedJournalKey,
+    membership: V2JournalMembership,
+) -> Result<usize, StoreError> {
+    let (root, retained_state) =
+        scan_v2_journal_membership(conn, key, &membership.incarnation, membership.count)?;
+    if root != membership.root
+        || *v2_journal_membership_tag(
+            key,
+            &membership.incarnation,
+            membership.count,
+            &membership.root,
+        )? != membership.tag
+    {
+        return Err(v2_journal_unavailable());
+    }
+    Ok(retained_state)
+}
+
+fn scan_v2_journal_membership(
+    conn: &Connection,
+    key: &FencedTransitionV2PreparedJournalKey,
+    incarnation: &[u8; 32],
+    expected_count: i64,
+) -> Result<([u8; 32], usize), StoreError> {
+    if expected_count < 0
+        || usize::try_from(expected_count)
+            .ok()
+            .is_none_or(|count| count > FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES)
+    {
+        return Err(v2_journal_unavailable());
+    }
+    // Keep only the fixed bucket and epoch aggregates while walking ordered
+    // index/table cursors. In particular, do not retain one Rust collection
+    // per history row during a full-capacity health audit.
+    let mut bucket_aggregates = vec![(0_i64, [0_u8; 32]); V2_JOURNAL_BUCKET_COUNT];
+    let mut epoch_aggregates: Vec<(i64, i64)> = Vec::with_capacity(V2_JOURNAL_MAX_RETAINED_EPOCHS);
+    let mut root = [0_u8; 32];
+    let mut membership_statement = conn
+        .prepare(&format!(
+            "SELECT outer_request_id, history_epoch, bucket, integrity_tag, rowid \
+             FROM protected_fenced_transition_v2_journal \
+             INDEXED BY {V2_JOURNAL_MEMBERSHIP_INDEX} \
+             ORDER BY bucket ASC, outer_request_id ASC, history_epoch ASC, integrity_tag ASC \
+             LIMIT {V2_JOURNAL_MEMBERSHIP_SCAN_LIMIT}"
+        ))
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut membership_rows = membership_statement
+        .query([])
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut table_statement = conn
+        .prepare(&format!(
+            "SELECT outer_request_id, history_epoch, bucket, integrity_tag, rowid \
+             FROM protected_fenced_transition_v2_journal NOT INDEXED \
+             ORDER BY bucket ASC, outer_request_id ASC, history_epoch ASC, integrity_tag ASC \
+             LIMIT {V2_JOURNAL_MEMBERSHIP_SCAN_LIMIT}"
+        ))
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut table_rows = table_statement
+        .query([])
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut observed = 0_usize;
+    loop {
+        let membership = membership_rows
+            .next()
+            .map_err(|_| v2_journal_unavailable())?;
+        let table = table_rows.next().map_err(|_| v2_journal_unavailable())?;
+        let (Some(membership), Some(table)) = (membership, table) else {
+            if membership.is_some() || table.is_some() {
+                return Err(v2_journal_unavailable());
+            }
+            break;
+        };
+        if observed >= FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES {
+            return Err(v2_journal_unavailable());
+        }
+        let membership = v2_journal_audit_row(membership)?;
+        let table = v2_journal_audit_row(table)?;
+        if membership != table
+            || membership.epoch <= 0
+            || membership.id[..8]
+                != u64::try_from(membership.epoch)
+                    .map_err(|_| v2_journal_unavailable())?
+                    .to_be_bytes()
+            || membership.bucket != v2_journal_bucket_from_bytes(key, &membership.id)?
+        {
+            return Err(v2_journal_unavailable());
+        }
+        let bucket = usize::try_from(membership.bucket).map_err(|_| v2_journal_unavailable())?;
+        let aggregate = bucket_aggregates
+            .get_mut(bucket)
+            .ok_or_else(v2_journal_unavailable)?;
+        aggregate.0 = aggregate
+            .0
+            .checked_add(1)
+            .ok_or_else(v2_journal_unavailable)?;
+        let leaf = v2_journal_membership_leaf(
+            incarnation,
+            membership.id,
+            membership.epoch,
+            membership.tag,
+        )?;
+        for (root_byte, leaf_byte) in root.iter_mut().zip(leaf) {
+            *root_byte ^= leaf_byte;
+        }
+        for (root_byte, leaf_byte) in aggregate.1.iter_mut().zip(leaf) {
+            *root_byte ^= leaf_byte;
+        }
+        let epochs_at_capacity = epoch_aggregates.len() >= V2_JOURNAL_MAX_RETAINED_EPOCHS;
+        match epoch_aggregates
+            .iter_mut()
+            .find(|(epoch, _)| *epoch == membership.epoch)
+        {
+            Some((_, count)) => *count = count.checked_add(1).ok_or_else(v2_journal_unavailable)?,
+            None if !epochs_at_capacity => epoch_aggregates.push((membership.epoch, 1)),
+            None => return Err(v2_journal_unavailable()),
+        }
+        observed = observed.checked_add(1).ok_or_else(v2_journal_unavailable)?;
+    }
+    drop(table_rows);
+    drop(table_statement);
+    drop(membership_rows);
+    drop(membership_statement);
+    let retained_state = V2_JOURNAL_BUCKET_COUNT
+        .checked_add(epoch_aggregates.len())
+        .ok_or_else(v2_journal_unavailable)?;
+    if i64::try_from(observed).map_err(|_| v2_journal_unavailable())? != expected_count
+        || scan_v2_journal_table_count(conn)? != expected_count
+        || !v2_journal_primary_and_epoch_indexes_match(conn, expected_count)?
+        || !v2_journal_bucket_aggregates_match_bounded(conn, key, incarnation, &bucket_aggregates)?
+        || !v2_journal_epoch_aggregates_match_bounded(conn, key, incarnation, &epoch_aggregates)?
+    {
+        return Err(v2_journal_unavailable());
+    }
+    Ok((root, retained_state))
+}
+
+#[derive(PartialEq)]
+struct V2JournalAuditRow {
+    id: [u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES],
+    epoch: i64,
+    bucket: i64,
+    tag: [u8; 32],
+    rowid: i64,
+}
+
+fn v2_journal_audit_row(row: &rusqlite::Row<'_>) -> Result<V2JournalAuditRow, StoreError> {
+    let ValueRef::Integer(epoch) = row.get_ref(1).map_err(|_| v2_journal_unavailable())? else {
+        return Err(v2_journal_unavailable());
+    };
+    let ValueRef::Integer(bucket) = row.get_ref(2).map_err(|_| v2_journal_unavailable())? else {
+        return Err(v2_journal_unavailable());
+    };
+    let ValueRef::Integer(rowid) = row.get_ref(4).map_err(|_| v2_journal_unavailable())? else {
+        return Err(v2_journal_unavailable());
+    };
+    if rowid <= 0 {
+        return Err(v2_journal_unavailable());
+    }
+    Ok(V2JournalAuditRow {
+        id: fixed_blob(row.get_ref(0).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?,
+        epoch,
+        bucket,
+        tag: fixed_blob(row.get_ref(3).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?,
+        rowid,
+    })
+}
+
+fn v2_journal_bucket_aggregates_match_bounded(
+    conn: &Connection,
+    key: &FencedTransitionV2PreparedJournalKey,
+    incarnation: &[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    expected: &[(i64, [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES])],
+) -> Result<bool, StoreError> {
+    if expected.len() != V2_JOURNAL_BUCKET_COUNT {
+        return Ok(false);
+    }
+    let mut statement = conn.prepare(&format!(
+        "SELECT bucket, entry_count, membership_root, integrity_tag FROM protected_fenced_transition_v2_journal_buckets ORDER BY bucket ASC LIMIT {}", V2_JOURNAL_BUCKET_COUNT + 1
+    )).map_err(|_| v2_journal_unavailable())?;
+    let mut rows = statement.query([]).map_err(|_| v2_journal_unavailable())?;
+    for (expected_bucket, (expected_count, expected_root)) in expected.iter().enumerate() {
+        let Some(row) = rows.next().map_err(|_| v2_journal_unavailable())? else {
+            return Ok(false);
+        };
+        let ValueRef::Integer(bucket) = row.get_ref(0).map_err(|_| v2_journal_unavailable())?
+        else {
+            return Err(v2_journal_unavailable());
+        };
+        let ValueRef::Integer(count) = row.get_ref(1).map_err(|_| v2_journal_unavailable())? else {
+            return Err(v2_journal_unavailable());
+        };
+        let root: [u8; 32] = fixed_blob(row.get_ref(2).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?;
+        let tag: [u8; 32] = fixed_blob(row.get_ref(3).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?;
+        if bucket != i64::try_from(expected_bucket).map_err(|_| v2_journal_unavailable())?
+            || count != *expected_count
+            || root != *expected_root
+            || !bool::from(
+                tag.ct_eq(
+                    v2_journal_bucket_tag(key, incarnation, bucket, count, &root)?.as_slice(),
+                ),
+            )
+        {
+            return Ok(false);
+        }
+    }
+    Ok(rows.next().map_err(|_| v2_journal_unavailable())?.is_none())
+}
+
+fn v2_journal_epoch_aggregates_match_bounded(
+    conn: &Connection,
+    key: &FencedTransitionV2PreparedJournalKey,
+    incarnation: &[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    expected: &[(i64, i64)],
+) -> Result<bool, StoreError> {
+    let mut expected = expected.to_vec();
+    expected.sort_unstable_by_key(|(epoch, _)| *epoch);
+    let mut statement = conn.prepare(&format!(
+        "SELECT history_epoch, entry_count, integrity_tag FROM protected_fenced_transition_v2_journal_epochs ORDER BY history_epoch ASC LIMIT {V2_JOURNAL_EPOCH_SCAN_LIMIT}"
+    )).map_err(|_| v2_journal_unavailable())?;
+    let mut rows = statement.query([]).map_err(|_| v2_journal_unavailable())?;
+    for (epoch, expected_count) in expected {
+        let Some(row) = rows.next().map_err(|_| v2_journal_unavailable())? else {
+            return Ok(false);
+        };
+        let ValueRef::Integer(actual_epoch) =
+            row.get_ref(0).map_err(|_| v2_journal_unavailable())?
+        else {
+            return Err(v2_journal_unavailable());
+        };
+        let ValueRef::Integer(count) = row.get_ref(1).map_err(|_| v2_journal_unavailable())? else {
+            return Err(v2_journal_unavailable());
+        };
+        let tag: [u8; 32] = fixed_blob(row.get_ref(2).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?;
+        if actual_epoch != epoch
+            || count != expected_count
+            || count <= 0
+            || count
+                > i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                    .map_err(|_| v2_journal_unavailable())?
+            || !bool::from(
+                tag.ct_eq(v2_journal_epoch_tag(key, incarnation, actual_epoch, count)?.as_slice()),
+            )
+        {
+            return Ok(false);
+        }
+    }
+    Ok(rows.next().map_err(|_| v2_journal_unavailable())?.is_none())
+}
+
+fn v2_journal_primary_and_epoch_indexes_match(
+    conn: &Connection,
+    expected_count: i64,
+) -> Result<bool, StoreError> {
+    let query = |index: &str| {
+        format!(
+        "SELECT outer_request_id, history_epoch, bucket, integrity_tag, rowid FROM protected_fenced_transition_v2_journal INDEXED BY {index} ORDER BY history_epoch ASC, outer_request_id ASC LIMIT {V2_JOURNAL_MEMBERSHIP_SCAN_LIMIT}"
+    )
+    };
+    let mut primary_statement = conn
+        .prepare(&query(
+            "sqlite_autoindex_protected_fenced_transition_v2_journal_1",
+        ))
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut epoch_statement = conn
+        .prepare(&query(V2_JOURNAL_EPOCH_INDEX))
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut table_statement = conn.prepare(&format!(
+        "SELECT outer_request_id, history_epoch, bucket, integrity_tag, rowid FROM protected_fenced_transition_v2_journal NOT INDEXED ORDER BY history_epoch ASC, outer_request_id ASC LIMIT {V2_JOURNAL_MEMBERSHIP_SCAN_LIMIT}"
+    )).map_err(|_| v2_journal_unavailable())?;
+    let mut primary = primary_statement
+        .query([])
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut epoch = epoch_statement
+        .query([])
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut table = table_statement
+        .query([])
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut observed = 0_usize;
+    loop {
+        let primary_row = primary.next().map_err(|_| v2_journal_unavailable())?;
+        let epoch_row = epoch.next().map_err(|_| v2_journal_unavailable())?;
+        let table_row = table.next().map_err(|_| v2_journal_unavailable())?;
+        let (Some(primary_row), Some(epoch_row), Some(table_row)) =
+            (primary_row, epoch_row, table_row)
+        else {
+            return Ok(primary_row.is_none()
+                && epoch_row.is_none()
+                && table_row.is_none()
+                && i64::try_from(observed).map_err(|_| v2_journal_unavailable())?
+                    == expected_count);
+        };
+        if observed >= FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES
+            || v2_journal_audit_row(primary_row)? != v2_journal_audit_row(epoch_row)?
+            || v2_journal_audit_row(primary_row)? != v2_journal_audit_row(table_row)?
+        {
+            return Ok(false);
+        }
+        observed = observed.checked_add(1).ok_or_else(v2_journal_unavailable)?;
+    }
+}
+
+fn scan_v2_journal_table_count(conn: &Connection) -> Result<i64, StoreError> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT rowid FROM protected_fenced_transition_v2_journal NOT INDEXED \
+             LIMIT {V2_JOURNAL_MEMBERSHIP_SCAN_LIMIT}"
+        ))
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut rows = statement.query([]).map_err(|_| v2_journal_unavailable())?;
+    let mut count = 0_i64;
+    while let Some(row) = rows.next().map_err(|_| v2_journal_unavailable())? {
+        let ValueRef::Integer(rowid) = row.get_ref(0).map_err(|_| v2_journal_unavailable())? else {
+            return Err(v2_journal_unavailable());
+        };
+        if rowid <= 0
+            || count
+                >= i64::try_from(FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES)
+                    .map_err(|_| v2_journal_unavailable())?
+        {
+            return Err(v2_journal_unavailable());
+        }
+        count = count.checked_add(1).ok_or_else(v2_journal_unavailable)?;
+    }
+    Ok(count)
+}
+
+fn read_v2_journal_entry(
+    conn: &Connection,
+    key: &FencedTransitionV2PreparedJournalKey,
+    outer_id: FencedTransitionV2RequestId,
+) -> Result<Option<FencedTransitionV2Request>, StoreError> {
+    // `verify_v2_journal_bucket` has authenticated and cross-checked every
+    // member of this secret-selected bucket before this point.  Do not let an
+    // independently corruptible primary-key index make an absence decision:
+    // use it only as a second bounded witness that the membership index did
+    // not hide this exact identity.
+    let bucket = v2_journal_bucket(key, outer_id)?;
+    let (rowid, indexed_epoch, indexed_tag) = {
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT rowid, history_epoch, integrity_tag \
+                 FROM protected_fenced_transition_v2_journal \
+                 INDEXED BY {V2_JOURNAL_MEMBERSHIP_INDEX} \
+                 WHERE bucket = ?1 AND outer_request_id = ?2 LIMIT 2"
+            ))
+            .map_err(|_| v2_journal_unavailable())?;
+        let mut rows = statement
+            .query(params![bucket, outer_id.to_bytes().as_slice()])
+            .map_err(|_| v2_journal_unavailable())?;
+        let Some(row) = rows.next().map_err(|_| v2_journal_unavailable())? else {
+            drop(rows);
+            drop(statement);
+            let primary_row: Option<i64> = conn
+                .query_row(
+                    "SELECT rowid FROM protected_fenced_transition_v2_journal \
+                     INDEXED BY sqlite_autoindex_protected_fenced_transition_v2_journal_1 \
+                     WHERE history_epoch = ?1 AND outer_request_id = ?2",
+                    params![
+                        i64::try_from(outer_id.epoch().get())
+                            .map_err(|_| v2_journal_unavailable())?,
+                        outer_id.to_bytes().as_slice(),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| v2_journal_unavailable())?;
+            return if primary_row.is_none() {
+                Ok(None)
+            } else {
+                Err(v2_journal_unavailable())
+            };
+        };
+        let ValueRef::Integer(rowid) = row.get_ref(0).map_err(|_| v2_journal_unavailable())? else {
+            return Err(v2_journal_unavailable());
+        };
+        let ValueRef::Integer(epoch) = row.get_ref(1).map_err(|_| v2_journal_unavailable())? else {
+            return Err(v2_journal_unavailable());
+        };
+        let tag: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES] =
+            fixed_blob(row.get_ref(2).map_err(|_| v2_journal_unavailable())?)
+                .map_err(|_| v2_journal_unavailable())?;
+        if rowid <= 0 || rows.next().map_err(|_| v2_journal_unavailable())?.is_some() {
+            return Err(v2_journal_unavailable());
+        }
+        (rowid, epoch, tag)
+    };
+    let row: Option<V2JournalStoredEntry> = conn
+        .query_row(
+            "SELECT history_epoch, bucket, prepared_request, integrity_tag \
+             FROM protected_fenced_transition_v2_journal NOT INDEXED \
+             WHERE rowid = ?1 AND outer_request_id = ?2",
+            params![rowid, outer_id.to_bytes().as_slice()],
+            |row| {
+                let ValueRef::Integer(epoch) = row.get_ref(0)? else {
+                    return Err(rusqlite::Error::InvalidQuery);
+                };
+                Ok((
+                    epoch,
+                    row.get(1)?,
+                    bounded_token(row.get_ref(2)?)?,
+                    fixed_blob(row.get_ref(3)?)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| v2_journal_unavailable())?;
+    let Some((epoch, table_bucket, canonical, tag)) = row else {
+        return Err(v2_journal_unavailable());
+    };
+    if epoch != indexed_epoch
+        || table_bucket != bucket
+        || !bool::from(tag.ct_eq(&indexed_tag))
+        || epoch <= 0
+        || u64::try_from(epoch).map_err(|_| v2_journal_unavailable())? != outer_id.epoch().get()
+        || !bool::from(
+            v2_journal_entry_tag(key, outer_id, &canonical)?
+                .as_slice()
+                .ct_eq(&tag),
+        )
+    {
+        return Err(v2_journal_unavailable());
+    }
+    let request: FencedTransitionV2Request =
+        serde_json::from_slice(&canonical).map_err(|_| v2_journal_unavailable())?;
+    if canonical_v2_journal_request(&request)?.as_slice() != canonical.as_slice() {
+        return Err(v2_journal_unavailable());
+    }
+    Ok(Some(request))
+}
+
+#[derive(Clone, Copy)]
+struct V2JournalReclaimEntry {
+    id: [u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES],
+    epoch: i64,
+    bucket: i64,
+    tag: [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+    rowid: i64,
+}
+
+/// Apply one bounded, pre-verified set of exact deletes in a single
+/// transaction while updating every authenticated aggregate together.
+fn remove_v2_journal_entries(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &FencedTransitionV2PreparedJournalKey,
+    membership: V2JournalMembership,
+    entries: &[V2JournalReclaimEntry],
+) -> Result<(), StoreError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut buckets: BTreeMap<
+        i64,
+        (
+            V2JournalBucket,
+            Vec<[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]>,
+        ),
+    > = BTreeMap::new();
+    let mut epochs: BTreeMap<i64, (i64, usize)> = BTreeMap::new();
+    let mut root = membership.root;
+    for entry in entries {
+        let leaf =
+            v2_journal_membership_leaf(&membership.incarnation, entry.id, entry.epoch, entry.tag)?;
+        for (root_byte, leaf_byte) in root.iter_mut().zip(leaf) {
+            *root_byte ^= leaf_byte;
+        }
+        if let std::collections::btree_map::Entry::Vacant(slot) = buckets.entry(entry.bucket) {
+            let state = verify_v2_journal_bucket(transaction, key, membership, entry.bucket)?;
+            slot.insert((state, Vec::new()));
+        }
+        let (_, leaves) = buckets
+            .get_mut(&entry.bucket)
+            .ok_or_else(v2_journal_unavailable)?;
+        leaves.push(leaf);
+        let epoch = epochs.entry(entry.epoch).or_insert((
+            v2_journal_epoch_count(transaction, key, membership, entry.epoch)?,
+            0,
+        ));
+        epoch.1 = epoch.1.checked_add(1).ok_or_else(v2_journal_unavailable)?;
+    }
+
+    let deleted_count = i64::try_from(entries.len()).map_err(|_| v2_journal_unavailable())?;
+    let count = membership
+        .count
+        .checked_sub(deleted_count)
+        .ok_or_else(v2_journal_unavailable)?;
+    for (state, leaves) in buckets.values() {
+        if usize::try_from(state.count).map_err(|_| v2_journal_unavailable())? < leaves.len() {
+            return Err(v2_journal_unavailable());
+        }
+    }
+    for (old_count, removed) in epochs.values() {
+        if usize::try_from(*old_count).map_err(|_| v2_journal_unavailable())? < *removed {
+            return Err(v2_journal_unavailable());
+        }
+    }
+
+    for entry in entries {
+        let deleted = transaction
+            .execute(
+                "DELETE FROM protected_fenced_transition_v2_journal \
+                 WHERE rowid = ?1 AND outer_request_id = ?2 AND history_epoch = ?3 \
+                   AND bucket = ?4 AND integrity_tag = ?5",
+                params![
+                    entry.rowid,
+                    entry.id.as_slice(),
+                    entry.epoch,
+                    entry.bucket,
+                    entry.tag.as_slice(),
+                ],
+            )
+            .map_err(|_| v2_journal_unavailable())?;
+        if deleted != 1 {
+            return Err(v2_journal_unavailable());
+        }
+    }
+    for (bucket, (state, leaves)) in &buckets {
+        let mut bucket_root = state.root;
+        for leaf in leaves {
+            for (root_byte, leaf_byte) in bucket_root.iter_mut().zip(leaf) {
+                *root_byte ^= leaf_byte;
+            }
+        }
+        let removed = i64::try_from(leaves.len()).map_err(|_| v2_journal_unavailable())?;
+        let bucket_count = state
+            .count
+            .checked_sub(removed)
+            .ok_or_else(v2_journal_unavailable)?;
+        let tag = v2_journal_bucket_tag(
+            key,
+            &membership.incarnation,
+            *bucket,
+            bucket_count,
+            &bucket_root,
+        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE protected_fenced_transition_v2_journal_buckets \
+                 SET entry_count = ?1, membership_root = ?2, integrity_tag = ?3 \
+                 WHERE bucket = ?4 AND entry_count = ?5 AND membership_root = ?6 AND integrity_tag = ?7",
+                params![
+                    bucket_count,
+                    bucket_root.as_slice(),
+                    tag.as_slice(),
+                    bucket,
+                    state.count,
+                    state.root.as_slice(),
+                    state.tag.as_slice(),
+                ],
+            )
+            .map_err(|_| v2_journal_unavailable())?;
+        if changed != 1 {
+            return Err(v2_journal_unavailable());
+        }
+    }
+    for (epoch, (old_count, removed)) in &epochs {
+        let removed = i64::try_from(*removed).map_err(|_| v2_journal_unavailable())?;
+        let new_count = old_count
+            .checked_sub(removed)
+            .ok_or_else(v2_journal_unavailable)?;
+        let old_tag = v2_journal_epoch_tag(key, &membership.incarnation, *epoch, *old_count)?;
+        let changed = if new_count == 0 {
+            transaction
+                .execute(
+                    "DELETE FROM protected_fenced_transition_v2_journal_epochs \
+                     WHERE history_epoch = ?1 AND entry_count = ?2 AND integrity_tag = ?3",
+                    params![epoch, old_count, old_tag.as_slice()],
+                )
+                .map_err(|_| v2_journal_unavailable())?
+        } else {
+            let new_tag = v2_journal_epoch_tag(key, &membership.incarnation, *epoch, new_count)?;
+            transaction
+                .execute(
+                    "UPDATE protected_fenced_transition_v2_journal_epochs \
+                     SET entry_count = ?1, integrity_tag = ?2 \
+                     WHERE history_epoch = ?3 AND entry_count = ?4 AND integrity_tag = ?5",
+                    params![
+                        new_count,
+                        new_tag.as_slice(),
+                        epoch,
+                        old_count,
+                        old_tag.as_slice(),
+                    ],
+                )
+                .map_err(|_| v2_journal_unavailable())?
+        };
+        if changed != 1 {
+            return Err(v2_journal_unavailable());
+        }
+    }
+    let tag = v2_journal_membership_tag(key, &membership.incarnation, count, &root)?;
+    let changed = transaction
+        .execute(
+            "UPDATE protected_fenced_transition_v2_journal_metadata \
+             SET membership_count = ?1, membership_root = ?2, membership_tag = ?3 \
+             WHERE singleton = 1 AND membership_count = ?4 AND membership_root = ?5 AND membership_tag = ?6",
+            params![
+                count,
+                root.as_slice(),
+                tag.as_slice(),
+                membership.count,
+                membership.root.as_slice(),
+                membership.tag.as_slice(),
+            ],
+        )
+        .map_err(|_| v2_journal_unavailable())?;
+    if changed != 1 {
+        return Err(v2_journal_unavailable());
+    }
+    Ok(())
+}
+
+/// Delete one fixed-size retired prefix while preserving every authenticated
+/// aggregate.  A caller invokes this after a linearized consensus-floor read;
+/// the next ordinary operation retries the next bounded batch if needed.
+fn reclaim_v2_journal_batch(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &FencedTransitionV2PreparedJournalKey,
+    membership: V2JournalMembership,
+    retired_through: i64,
+) -> Result<(), StoreError> {
+    let mut table_statement = transaction
+        .prepare(
+            "SELECT outer_request_id, history_epoch, bucket, integrity_tag \
+             FROM protected_fenced_transition_v2_journal NOT INDEXED WHERE rowid = ?1",
+        )
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut statement = transaction
+        .prepare(&format!(
+            "SELECT outer_request_id, history_epoch, bucket, integrity_tag, rowid \
+             FROM protected_fenced_transition_v2_journal \
+             INDEXED BY {V2_JOURNAL_EPOCH_INDEX} \
+             WHERE history_epoch <= ?1 \
+             ORDER BY history_epoch ASC, outer_request_id ASC \
+             LIMIT {V2_JOURNAL_RECLAIM_BATCH_ENTRIES}"
+        ))
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut rows = statement
+        .query([retired_through])
+        .map_err(|_| v2_journal_unavailable())?;
+    let mut entries = Vec::with_capacity(V2_JOURNAL_RECLAIM_BATCH_ENTRIES);
+    while let Some(row) = rows.next().map_err(|_| v2_journal_unavailable())? {
+        let id = fixed_blob(row.get_ref(0).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?;
+        let ValueRef::Integer(epoch) = row.get_ref(1).map_err(|_| v2_journal_unavailable())? else {
+            return Err(v2_journal_unavailable());
+        };
+        let ValueRef::Integer(bucket) = row.get_ref(2).map_err(|_| v2_journal_unavailable())?
+        else {
+            return Err(v2_journal_unavailable());
+        };
+        let tag = fixed_blob(row.get_ref(3).map_err(|_| v2_journal_unavailable())?)
+            .map_err(|_| v2_journal_unavailable())?;
+        let ValueRef::Integer(rowid) = row.get_ref(4).map_err(|_| v2_journal_unavailable())? else {
+            return Err(v2_journal_unavailable());
+        };
+        let table_entry: Option<(
+            [u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES],
+            i64,
+            i64,
+            [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES],
+        )> = table_statement
+            .query_row([rowid], |table_row| {
+                Ok((
+                    fixed_blob(table_row.get_ref(0)?)?,
+                    table_row.get(1)?,
+                    table_row.get(2)?,
+                    fixed_blob(table_row.get_ref(3)?)?,
+                ))
+            })
+            .optional()
+            .map_err(|_| v2_journal_unavailable())?;
+        if epoch <= 0
+            || epoch > retired_through
+            || rowid <= 0
+            || id[..8]
+                != u64::try_from(epoch)
+                    .map_err(|_| v2_journal_unavailable())?
+                    .to_be_bytes()
+            || bucket != v2_journal_bucket_from_bytes(key, &id)?
+            || table_entry != Some((id, epoch, bucket, tag))
+            || entries.len() >= V2_JOURNAL_RECLAIM_BATCH_ENTRIES
+        {
+            return Err(v2_journal_unavailable());
+        }
+        entries.push(V2JournalReclaimEntry {
+            id,
+            epoch,
+            bucket,
+            tag,
+            rowid,
+        });
+    }
+    drop(rows);
+    drop(statement);
+    drop(table_statement);
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let mut buckets: BTreeMap<
+        i64,
+        (
+            V2JournalBucket,
+            Vec<[u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]>,
+        ),
+    > = BTreeMap::new();
+    let mut epochs: BTreeMap<i64, (i64, usize)> = BTreeMap::new();
+    let mut root = membership.root;
+    for entry in &entries {
+        let leaf =
+            v2_journal_membership_leaf(&membership.incarnation, entry.id, entry.epoch, entry.tag)?;
+        for (root_byte, leaf_byte) in root.iter_mut().zip(leaf) {
+            *root_byte ^= leaf_byte;
+        }
+        if let std::collections::btree_map::Entry::Vacant(slot) = buckets.entry(entry.bucket) {
+            let state = verify_v2_journal_bucket(transaction, key, membership, entry.bucket)?;
+            slot.insert((state, Vec::new()));
+        }
+        let (_, leaves) = buckets
+            .get_mut(&entry.bucket)
+            .ok_or_else(v2_journal_unavailable)?;
+        leaves.push(leaf);
+        let epoch = epochs.entry(entry.epoch).or_insert((
+            v2_journal_epoch_count(transaction, key, membership, entry.epoch)?,
+            0,
+        ));
+        epoch.1 = epoch.1.checked_add(1).ok_or_else(v2_journal_unavailable)?;
+    }
+
+    let deleted_count = i64::try_from(entries.len()).map_err(|_| v2_journal_unavailable())?;
+    let count = membership
+        .count
+        .checked_sub(deleted_count)
+        .ok_or_else(v2_journal_unavailable)?;
+    for (state, leaves) in buckets.values() {
+        if usize::try_from(state.count).map_err(|_| v2_journal_unavailable())? < leaves.len() {
+            return Err(v2_journal_unavailable());
+        }
+    }
+    for (old_count, removed) in epochs.values() {
+        if usize::try_from(*old_count).map_err(|_| v2_journal_unavailable())? < *removed {
+            return Err(v2_journal_unavailable());
+        }
+    }
+
+    for entry in &entries {
+        let deleted = transaction
+            .execute(
+                "DELETE FROM protected_fenced_transition_v2_journal \
+                 WHERE rowid = ?1 AND outer_request_id = ?2 AND history_epoch = ?3 \
+                   AND bucket = ?4 AND integrity_tag = ?5",
+                params![
+                    entry.rowid,
+                    entry.id.as_slice(),
+                    entry.epoch,
+                    entry.bucket,
+                    entry.tag.as_slice(),
+                ],
+            )
+            .map_err(|_| v2_journal_unavailable())?;
+        if deleted != 1 {
+            return Err(v2_journal_unavailable());
+        }
+    }
+    for (bucket, (state, leaves)) in &buckets {
+        let mut bucket_root = state.root;
+        for leaf in leaves {
+            for (root_byte, leaf_byte) in bucket_root.iter_mut().zip(leaf) {
+                *root_byte ^= leaf_byte;
+            }
+        }
+        let removed = i64::try_from(leaves.len()).map_err(|_| v2_journal_unavailable())?;
+        let bucket_count = state
+            .count
+            .checked_sub(removed)
+            .ok_or_else(v2_journal_unavailable)?;
+        let tag = v2_journal_bucket_tag(
+            key,
+            &membership.incarnation,
+            *bucket,
+            bucket_count,
+            &bucket_root,
+        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE protected_fenced_transition_v2_journal_buckets \
+                 SET entry_count = ?1, membership_root = ?2, integrity_tag = ?3 \
+                 WHERE bucket = ?4 AND entry_count = ?5 AND membership_root = ?6 AND integrity_tag = ?7",
+                params![
+                    bucket_count,
+                    bucket_root.as_slice(),
+                    tag.as_slice(),
+                    bucket,
+                    state.count,
+                    state.root.as_slice(),
+                    state.tag.as_slice(),
+                ],
+            )
+            .map_err(|_| v2_journal_unavailable())?;
+        if changed != 1 {
+            return Err(v2_journal_unavailable());
+        }
+    }
+    for (epoch, (old_count, removed)) in &epochs {
+        let removed = i64::try_from(*removed).map_err(|_| v2_journal_unavailable())?;
+        let new_count = old_count
+            .checked_sub(removed)
+            .ok_or_else(v2_journal_unavailable)?;
+        let old_tag = v2_journal_epoch_tag(key, &membership.incarnation, *epoch, *old_count)?;
+        let changed = if new_count == 0 {
+            transaction
+                .execute(
+                    "DELETE FROM protected_fenced_transition_v2_journal_epochs \
+                     WHERE history_epoch = ?1 AND entry_count = ?2 AND integrity_tag = ?3",
+                    params![epoch, old_count, old_tag.as_slice()],
+                )
+                .map_err(|_| v2_journal_unavailable())?
+        } else {
+            let new_tag = v2_journal_epoch_tag(key, &membership.incarnation, *epoch, new_count)?;
+            transaction
+                .execute(
+                    "UPDATE protected_fenced_transition_v2_journal_epochs \
+                     SET entry_count = ?1, integrity_tag = ?2 \
+                     WHERE history_epoch = ?3 AND entry_count = ?4 AND integrity_tag = ?5",
+                    params![
+                        new_count,
+                        new_tag.as_slice(),
+                        epoch,
+                        old_count,
+                        old_tag.as_slice(),
+                    ],
+                )
+                .map_err(|_| v2_journal_unavailable())?
+        };
+        if changed != 1 {
+            return Err(v2_journal_unavailable());
+        }
+    }
+    let tag = v2_journal_membership_tag(key, &membership.incarnation, count, &root)?;
+    let changed = transaction
+        .execute(
+            "UPDATE protected_fenced_transition_v2_journal_metadata \
+             SET membership_count = ?1, membership_root = ?2, membership_tag = ?3 \
+             WHERE singleton = 1 AND membership_count = ?4 AND membership_root = ?5 AND membership_tag = ?6",
+            params![
+                count,
+                root.as_slice(),
+                tag.as_slice(),
+                membership.count,
+                membership.root.as_slice(),
+                membership.tag.as_slice(),
+            ],
+        )
+        .map_err(|_| v2_journal_unavailable())?;
+    if changed != 1 {
+        return Err(v2_journal_unavailable());
+    }
+    Ok(())
+}
+
+fn update_v2_journal_membership_after_insert(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &FencedTransitionV2PreparedJournalKey,
+    membership: V2JournalMembership,
+    inserted: V2JournalInsert,
+) -> Result<(), StoreError> {
+    let leaf = v2_journal_membership_leaf(
+        &membership.incarnation,
+        inserted.outer_id.to_bytes(),
+        inserted.epoch,
+        inserted.tag,
+    )?;
+    let mut root = membership.root;
+    for (root_byte, leaf_byte) in root.iter_mut().zip(leaf) {
+        *root_byte ^= leaf_byte;
+    }
+    let count = membership
+        .count
+        .checked_add(1)
+        .ok_or_else(v2_journal_unavailable)?;
+    let membership_tag = v2_journal_membership_tag(key, &membership.incarnation, count, &root)?;
+    let changed = transaction.execute(
+        "UPDATE protected_fenced_transition_v2_journal_metadata SET membership_count = ?1, membership_root = ?2, membership_tag = ?3 \
+         WHERE singleton = 1 AND membership_count = ?4 AND membership_root = ?5 AND membership_tag = ?6",
+        params![count, root.as_slice(), membership_tag.as_slice(), membership.count, membership.root.as_slice(), membership.tag.as_slice()],
+    ).map_err(|_| v2_journal_unavailable())?;
+    if changed != 1 {
+        return Err(v2_journal_unavailable());
+    }
+    let mut bucket_root = inserted.bucket_state.root;
+    for (root_byte, leaf_byte) in bucket_root.iter_mut().zip(leaf) {
+        *root_byte ^= leaf_byte;
+    }
+    let bucket_count = inserted
+        .bucket_state
+        .count
+        .checked_add(1)
+        .ok_or_else(v2_journal_unavailable)?;
+    if bucket_count
+        > i64::try_from(V2_JOURNAL_BUCKET_MAX_ENTRIES).map_err(|_| v2_journal_unavailable())?
+    {
+        return Err(v2_journal_unavailable());
+    }
+    let bucket_tag = v2_journal_bucket_tag(
+        key,
+        &membership.incarnation,
+        inserted.bucket,
+        bucket_count,
+        &bucket_root,
+    )?;
+    let changed = transaction.execute(
+        "UPDATE protected_fenced_transition_v2_journal_buckets SET entry_count = ?1, membership_root = ?2, integrity_tag = ?3 \
+         WHERE bucket = ?4 AND entry_count = ?5 AND membership_root = ?6 AND integrity_tag = ?7",
+        params![bucket_count, bucket_root.as_slice(), bucket_tag.as_slice(), inserted.bucket, inserted.bucket_state.count, inserted.bucket_state.root.as_slice(), inserted.bucket_state.tag.as_slice()],
+    ).map_err(|_| v2_journal_unavailable())?;
+    if changed != 1 {
+        return Err(v2_journal_unavailable());
+    }
+    let old_epoch_count = v2_journal_epoch_count(transaction, key, membership, inserted.epoch)?;
+    let new_epoch_count = old_epoch_count
+        .checked_add(1)
+        .ok_or_else(v2_journal_unavailable)?;
+    if new_epoch_count
+        > i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+            .map_err(|_| v2_journal_unavailable())?
+    {
+        return Err(v2_journal_unavailable());
+    }
+    let epoch_tag = v2_journal_epoch_tag(
+        key,
+        &membership.incarnation,
+        inserted.epoch,
+        new_epoch_count,
+    )?;
+    let changed = if old_epoch_count == 0 {
+        transaction
+            .execute(
+                "INSERT INTO protected_fenced_transition_v2_journal_epochs \
+                 (history_epoch, entry_count, integrity_tag) VALUES (?1, ?2, ?3)",
+                params![inserted.epoch, new_epoch_count, epoch_tag.as_slice()],
+            )
+            .map_err(|_| v2_journal_unavailable())?
+    } else {
+        let old_epoch_tag = v2_journal_epoch_tag(
+            key,
+            &membership.incarnation,
+            inserted.epoch,
+            old_epoch_count,
+        )?;
+        transaction
+            .execute(
+                "UPDATE protected_fenced_transition_v2_journal_epochs \
+                 SET entry_count = ?1, integrity_tag = ?2 \
+                 WHERE history_epoch = ?3 AND entry_count = ?4 AND integrity_tag = ?5",
+                params![
+                    new_epoch_count,
+                    epoch_tag.as_slice(),
+                    inserted.epoch,
+                    old_epoch_count,
+                    old_epoch_tag.as_slice(),
+                ],
+            )
+            .map_err(|_| v2_journal_unavailable())?
+    };
+    if changed != 1 {
+        return Err(v2_journal_unavailable());
+    }
+    Ok(())
 }
 
 fn install_journal_progress_handler(conn: &Connection) -> Arc<JournalSqliteProgressBudget> {
@@ -1562,13 +4956,30 @@ fn prepare_secure_journal_path(
     path: &Path,
     mode: JournalOpenMode,
 ) -> Result<PreparedJournalPath, StoreError> {
+    prepare_secure_journal_path_with_bounds(
+        path,
+        mode,
+        #[cfg(unix)]
+        SecureJournalFileBounds {
+            main: JOURNAL_SQLITE_MAIN_MAX_BYTES,
+            wal: JOURNAL_SQLITE_WAL_MAX_BYTES,
+            shm: JOURNAL_SQLITE_SHM_MAX_BYTES,
+        },
+    )
+}
+
+fn prepare_secure_journal_path_with_bounds(
+    path: &Path,
+    mode: JournalOpenMode,
+    #[cfg(unix)] bounds: SecureJournalFileBounds,
+) -> Result<PreparedJournalPath, StoreError> {
     if path.file_name().is_none() {
         return Err(journal_unavailable());
     }
 
     #[cfg(unix)]
     {
-        prepare_secure_journal_path_unix(path, mode)
+        prepare_secure_journal_path_unix(path, mode, bounds)
     }
 
     #[cfg(not(unix))]
@@ -1624,12 +5035,18 @@ impl SecureJournalPathGuard {
         )
         .map_err(|_| journal_unavailable())?;
         if !is_private_parent(&parent, effective_uid)
-            || !is_private_leaf(&visible, effective_uid)
+            || !is_private_bounded_file(&visible, effective_uid, self.bounds.main)
             || !self.leaf_identity.matches(&visible)
         {
             return Err(journal_unavailable());
         }
-        verify_journal_sidecars(&self.parent, &self.leaf_name, effective_uid, true)?;
+        verify_journal_sidecars(
+            &self.parent,
+            &self.leaf_name,
+            effective_uid,
+            true,
+            self.bounds,
+        )?;
         Ok(())
     }
 
@@ -1675,6 +5092,7 @@ fn active_secure_journal_identities() -> &'static Mutex<BTreeSet<SecureJournalFi
 fn prepare_secure_journal_path_unix(
     path: &Path,
     mode: JournalOpenMode,
+    bounds: SecureJournalFileBounds,
 ) -> Result<PreparedJournalPath, StoreError> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -1760,7 +5178,7 @@ fn prepare_secure_journal_path_unix(
             if mode == JournalOpenMode::CreateNew {
                 return Err(journal_unavailable());
             }
-            if !is_private_leaf(&metadata, effective_uid) {
+            if !is_private_bounded_file(&metadata, effective_uid, bounds.main) {
                 return Err(journal_unavailable());
             }
             metadata
@@ -1786,7 +5204,9 @@ fn prepare_secure_journal_path_unix(
     };
     let visible = fstatat(&parent, leaf_name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
         .map_err(|_| journal_unavailable())?;
-    if !is_private_leaf(&leaf_metadata, effective_uid) || !same_file(&leaf_metadata, &visible) {
+    if !is_private_bounded_file(&leaf_metadata, effective_uid, bounds.main)
+        || !same_file(&leaf_metadata, &visible)
+    {
         return Err(journal_unavailable());
     }
     let leaf_identity = SecureJournalFileIdentity::from_stat(&leaf_metadata);
@@ -1796,7 +5216,7 @@ fn prepare_secure_journal_path_unix(
             return Err(journal_unavailable());
         }
         JournalOpenMode::OpenExisting => {
-            validate_existing_sqlite_header(&parent, leaf_name, leaf_identity)?;
+            validate_existing_sqlite_header(&parent, leaf_name, leaf_identity, bounds.main)?;
         }
         JournalOpenMode::CreateNew => {}
     }
@@ -1805,6 +5225,7 @@ fn prepare_secure_journal_path_unix(
         leaf_name,
         effective_uid,
         mode == JournalOpenMode::OpenExisting,
+        bounds,
     )?;
 
     let sqlite_path = sqlite_descriptor_path(&parent, leaf_name)?;
@@ -1817,6 +5238,7 @@ fn prepare_secure_journal_path_unix(
             parent: std::fs::File::from(parent),
             leaf_identity,
             leaf_name: leaf_name.clone(),
+            bounds,
             _open_lease: open_lease,
             #[cfg(test)]
             fail_next_parent_sync: std::sync::atomic::AtomicBool::new(false),
@@ -1829,6 +5251,7 @@ fn validate_existing_sqlite_header(
     parent: &impl std::os::fd::AsFd,
     leaf_name: &std::ffi::OsStr,
     expected_identity: SecureJournalFileIdentity,
+    max_main_bytes: u64,
 ) -> Result<(), StoreError> {
     use std::os::unix::fs::FileExt;
 
@@ -1850,6 +5273,7 @@ fn validate_existing_sqlite_header(
     let metadata = fstat(&descriptor).map_err(|_| journal_unavailable())?;
     let file_size = u64::try_from(metadata.st_size).map_err(|_| journal_unavailable())?;
     if !expected_identity.matches(&metadata)
+        || file_size > max_main_bytes
         || file_size < JOURNAL_SQLITE_HEADER_BYTES as u64
         || file_size % JOURNAL_SQLITE_PAGE_SIZE_BYTES != 0
     {
@@ -1917,11 +5341,6 @@ fn is_private_parent(metadata: &nix::sys::stat::FileStat, effective_uid: u32) ->
 }
 
 #[cfg(unix)]
-fn is_private_leaf(metadata: &nix::sys::stat::FileStat, effective_uid: u32) -> bool {
-    is_private_bounded_file(metadata, effective_uid, JOURNAL_SQLITE_MAIN_MAX_BYTES)
-}
-
-#[cfg(unix)]
 fn is_private_bounded_file(
     metadata: &nix::sys::stat::FileStat,
     effective_uid: u32,
@@ -1941,11 +5360,9 @@ fn verify_journal_sidecars(
     leaf_name: &std::ffi::OsStr,
     effective_uid: u32,
     allow_existing: bool,
+    bounds: SecureJournalFileBounds,
 ) -> Result<(), StoreError> {
-    for (suffix, max_bytes) in [
-        ("-wal", JOURNAL_SQLITE_WAL_MAX_BYTES),
-        ("-shm", JOURNAL_SQLITE_SHM_MAX_BYTES),
-    ] {
+    for (suffix, max_bytes) in [("-wal", bounds.wal), ("-shm", bounds.shm)] {
         verify_optional_journal_sidecar(
             parent,
             leaf_name,
@@ -2027,7 +5444,8 @@ mod tests {
     use super::*;
     use crate::{
         FenceToken, FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
-        Generation, LeaseGuard, OwnerId, SessionKey, SessionKeyType, StableId,
+        FencedTransitionV2CallerNonce, Generation, LeaseGuard, OwnerId, SessionKey, SessionKeyType,
+        StableId,
     };
 
     struct JournalFixture {
@@ -2103,6 +5521,50 @@ mod tests {
         )
         .expect("record-free request");
         PreparedFencedTransition::from_unprotected_request(request).expect("prepared request")
+    }
+
+    fn v2_path(fixture: &JournalFixture) -> PathBuf {
+        fixture.path.with_file_name("protected-v2.sqlite3")
+    }
+
+    fn open_v2(fixture: &JournalFixture) -> FencedTransitionV2PreparedJournal {
+        let path = v2_path(fixture);
+        let key = FencedTransitionV2PreparedJournalKey::from_bytes(fixture.key);
+        if path.exists() {
+            FencedTransitionV2PreparedJournal::open_existing(path, key)
+        } else {
+            FencedTransitionV2PreparedJournal::create_new(path, key)
+        }
+        .expect("open protected V2 journal fixture")
+    }
+
+    fn v2_scope(fixture: &JournalFixture) -> [u8; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES] {
+        [fixture.key[0] ^ 0x5a; FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES]
+    }
+
+    fn v2_request(epoch: u64, id: u8) -> FencedTransitionV2Request {
+        let key = SessionKey {
+            tenant: TenantId::from_static("v2-journal-test"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: StableId::new(Bytes::from_static(b"v2-journal-test-id"))
+                .expect("stable V2 ID"),
+        };
+        let owner = OwnerId::new("v2-journal-test-owner").expect("V2 owner");
+        let acquired_at = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10),
+        );
+        let expires_at = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(70),
+        );
+        let guard = LeaseGuard::new(key, owner, FenceToken::new(9), acquired_at, expires_at, 1);
+        FencedTransitionV2Request::new(
+            FencedTransitionV2HistoryEpoch::new(epoch).expect("V2 history epoch"),
+            FencedTransitionV2CallerNonce::from_bytes([id; 16]),
+            FencedTransitionLease::renew(guard, Duration::from_secs(30)).expect("V2 renewal"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("V2 request")
     }
 
     #[test]
@@ -2393,6 +5855,15 @@ mod tests {
                 assert_eq!(message, JOURNAL_UNAVAILABLE);
             }
             Ok(_) | Err(_) => panic!("journal failure was not coarsely classified"),
+        }
+    }
+
+    fn assert_v2_unavailable<T>(result: Result<T, StoreError>) {
+        match result {
+            Err(StoreError::BackendUnavailable(message)) => {
+                assert_eq!(message, V2_JOURNAL_UNAVAILABLE);
+            }
+            Ok(_) | Err(_) => panic!("V2 journal failure was not coarsely classified"),
         }
     }
 
@@ -3299,5 +6770,433 @@ mod tests {
         let debug = format!("{journal:?}");
         assert!(!debug.contains("prepared.sqlite3"));
         assert!(!debug.contains(&fixture.path.to_string_lossy().into_owned()));
+    }
+
+    #[tokio::test]
+    async fn protected_v2_journal_retains_exact_requests_across_epochs_and_caps_epochs() {
+        let fixture = JournalFixture::new(0x90);
+        let journal = open_v2(&fixture);
+        let scope = v2_scope(&fixture);
+        journal.ensure_scope(scope).await.expect("bind V2 scope");
+
+        let first = v2_request(1, 1);
+        let second = v2_request(1, 2);
+        assert_eq!(
+            journal
+                .bind_or_lookup_batch(
+                    scope,
+                    vec![
+                        (first.request_id(), first.clone()),
+                        (second.request_id(), second.clone()),
+                    ],
+                )
+                .await
+                .expect("atomically bind first V2 batch"),
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(
+            journal
+                .lookup_batch(
+                    scope,
+                    vec![first.request_id(), v2_request(1, 3).request_id()],
+                )
+                .await
+                .expect("authenticated exact batch lookup"),
+            vec![Some(first.clone()), None]
+        );
+
+        for epoch in 2_u64..=8 {
+            let request = v2_request(epoch, epoch as u8);
+            journal
+                .bind_or_lookup(scope, request.request_id(), &request)
+                .await
+                .expect("retain one request in every admitted epoch");
+        }
+        let ninth = v2_request(9, 9);
+        let ninth_peer = v2_request(9, 10);
+        assert!(matches!(
+            journal
+                .bind_or_lookup_batch(
+                    scope,
+                    vec![
+                        (ninth.request_id(), ninth.clone()),
+                        (ninth_peer.request_id(), ninth_peer.clone()),
+                    ],
+                )
+                .await,
+            Err(StoreError::FencedTransitionHistoryFull)
+        ));
+        assert_eq!(
+            journal
+                .lookup_batch(scope, vec![ninth.request_id(), ninth_peer.request_id()])
+                .await
+                .expect("failed batch leaves no durable prefix"),
+            vec![None, None]
+        );
+        journal.health_check(scope).await.expect("full V2 audit");
+    }
+
+    #[tokio::test]
+    async fn protected_v2_reader_pool_keeps_unrelated_reads_and_writer_live() {
+        let fixture = JournalFixture::new(0x9a);
+        let journal = open_v2(&fixture);
+        let scope = v2_scope(&fixture);
+        journal.ensure_scope(scope).await.expect("bind V2 scope");
+        let first = v2_request(1, 1);
+        journal
+            .bind_or_lookup(scope, first.request_id(), &first)
+            .await
+            .expect("seed V2 mapping");
+
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let held_release = Arc::clone(&release);
+        let held_journal = journal.clone();
+        let held = tokio::spawn(async move {
+            held_journal
+                .with_connection(false, move |conn, _| {
+                    // This transaction begins only after a real pool member
+                    // has been checked out and holds a WAL read snapshot.
+                    let transaction = v2_journal_read_transaction(conn)?;
+                    transaction
+                        .query_row(
+                            "SELECT membership_count FROM protected_fenced_transition_v2_journal_metadata WHERE singleton = 1",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(|_| v2_journal_unavailable())?;
+                    entered_tx
+                        .send(())
+                        .map_err(|_| v2_journal_unavailable())?;
+                    let (released, wake) = &*held_release;
+                    let mut released = released.lock().map_err(|_| v2_journal_unavailable())?;
+                    while !*released {
+                        released = wake.wait(released).map_err(|_| v2_journal_unavailable())?;
+                    }
+                    transaction.commit().map_err(|_| v2_journal_unavailable())
+                })
+                .await
+        });
+        entered.await.expect("held reader started its WAL snapshot");
+        assert_eq!(
+            journal
+                .inner
+                .readers
+                .lock()
+                .expect("reader pool lock")
+                .len(),
+            V2_JOURNAL_READER_CONNECTIONS - 1
+        );
+
+        // Completion before releasing `held` is the positive proof that this
+        // exact read received another fixed pool member.
+        assert_eq!(
+            journal
+                .lookup(scope, first.request_id())
+                .await
+                .expect("unrelated read reaches second pool member"),
+            Some(first.clone())
+        );
+        let second = v2_request(2, 2);
+        journal
+            .bind_or_lookup(scope, second.request_id(), &second)
+            .await
+            .expect("writer commits beside held WAL snapshot");
+        assert_eq!(
+            journal
+                .inner
+                .readers
+                .lock()
+                .expect("reader pool lock")
+                .len(),
+            V2_JOURNAL_READER_CONNECTIONS - 1
+        );
+
+        let (released, wake) = &*release;
+        *released.lock().expect("reader release lock") = true;
+        wake.notify_all();
+        held.await
+            .expect("held reader task joins")
+            .expect("held reader transaction commits");
+        assert_eq!(
+            journal
+                .inner
+                .readers
+                .lock()
+                .expect("reader pool lock")
+                .len(),
+            V2_JOURNAL_READER_CONNECTIONS
+        );
+
+        let retained_state = journal
+            .health_check_with_retained_state(scope)
+            .await
+            .expect("streaming full audit");
+        assert_eq!(
+            retained_state,
+            V2_JOURNAL_BUCKET_COUNT + 2,
+            "audit retains the fixed bucket state plus one aggregate per retained epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_v2_streaming_audit_rejects_early_middle_and_late_row_corruption() {
+        for (fixture_byte, corrupt_index) in [(0x9b, 0_usize), (0x9c, 1), (0x9d, 2)] {
+            let fixture = JournalFixture::new(fixture_byte);
+            let journal = open_v2(&fixture);
+            let scope = v2_scope(&fixture);
+            journal.ensure_scope(scope).await.expect("bind V2 scope");
+            let requests = [v2_request(1, 1), v2_request(1, 2), v2_request(1, 3)];
+            for request in &requests {
+                journal
+                    .bind_or_lookup(scope, request.request_id(), request)
+                    .await
+                    .expect("seed audit row");
+            }
+            let connection = Connection::open(v2_path(&fixture)).expect("open corruption fixture");
+            connection
+                .execute(
+                    "UPDATE protected_fenced_transition_v2_journal SET integrity_tag = zeroblob(32) WHERE outer_request_id = ?1",
+                    [requests[corrupt_index].request_id().to_bytes().as_slice()],
+                )
+                .expect("corrupt selected row");
+            drop(connection);
+            assert_v2_unavailable(journal.health_check(scope).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_v2_journal_reclaim_updates_all_authenticated_aggregates_and_retries() {
+        let fixture = JournalFixture::new(0x91);
+        let journal = open_v2(&fixture);
+        let scope = v2_scope(&fixture);
+        journal.ensure_scope(scope).await.expect("bind V2 scope");
+        let first = v2_request(1, 1);
+        let second = v2_request(2, 2);
+        for request in [&first, &second] {
+            journal
+                .bind_or_lookup(scope, request.request_id(), request)
+                .await
+                .expect("bind V2 request");
+        }
+
+        journal
+            .reclaim_retired_through(
+                scope,
+                Some(FencedTransitionV2HistoryEpoch::new(1).expect("retire epoch one")),
+            )
+            .await
+            .expect("reclaim first retired epoch");
+        assert_eq!(
+            journal
+                .lookup(scope, first.request_id())
+                .await
+                .expect("first epoch absence after reclaim"),
+            None
+        );
+        assert_eq!(
+            journal
+                .lookup(scope, second.request_id())
+                .await
+                .expect("second epoch remains retained"),
+            Some(second.clone())
+        );
+        journal
+            .health_check(scope)
+            .await
+            .expect("audit after first reclaim");
+
+        // Consensus may report the same floor on a delayed retry.  It is a
+        // bounded no-op until a later linearized floor retires the successor.
+        journal
+            .reclaim_retired_through(
+                scope,
+                Some(FencedTransitionV2HistoryEpoch::new(1).expect("repeat retire floor")),
+            )
+            .await
+            .expect("idempotent delayed retry");
+        journal
+            .reclaim_retired_through(
+                scope,
+                Some(FencedTransitionV2HistoryEpoch::new(2).expect("retire epoch two")),
+            )
+            .await
+            .expect("reclaim later retired epoch");
+        assert_eq!(
+            journal
+                .lookup(scope, second.request_id())
+                .await
+                .expect("second epoch absence after later floor"),
+            None
+        );
+        journal
+            .health_check(scope)
+            .await
+            .expect("audit after retry reclaim");
+    }
+
+    #[tokio::test]
+    async fn protected_v2_journal_bucket_scan_rejects_more_than_512_indexed_entries() {
+        let fixture = JournalFixture::new(0x92);
+        let journal = open_v2(&fixture);
+        let scope = v2_scope(&fixture);
+        journal.ensure_scope(scope).await.expect("bind V2 scope");
+        let target = v2_request(1, 0x44);
+        let bucket = v2_journal_bucket(&journal.inner.key, target.request_id())
+            .expect("derive target bucket");
+        let path = v2_path(&fixture);
+        let connection = Connection::open(path).expect("open V2 bucket-bound fixture");
+        let transaction = connection
+            .unchecked_transaction()
+            .expect("begin V2 bucket-bound fixture");
+        for ordinal in 0..=V2_JOURNAL_BUCKET_MAX_ENTRIES {
+            let mut id = [0_u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES];
+            id[..8].copy_from_slice(&1_u64.to_be_bytes());
+            id[8..16].copy_from_slice(&(ordinal as u64).to_be_bytes());
+            transaction
+                .execute(
+                    "INSERT INTO protected_fenced_transition_v2_journal \
+                     (outer_request_id, history_epoch, bucket, prepared_request, integrity_tag) \
+                     VALUES (?1, 1, ?2, x'5b5d', zeroblob(32))",
+                    params![id.as_slice(), bucket],
+                )
+                .expect("insert adversarial indexed bucket entry");
+        }
+        transaction
+            .commit()
+            .expect("commit V2 bucket-bound fixture");
+        assert_v2_unavailable(journal.lookup(scope, target.request_id()).await);
+    }
+
+    #[tokio::test]
+    async fn protected_v2_journal_fails_closed_for_catalog_table_bucket_epoch_and_metadata_corruption(
+    ) {
+        let cases: [(&str, &str); 6] = [
+            (
+                "catalog",
+                "DROP INDEX protected_fenced_transition_v2_journal_membership_idx;",
+            ),
+            (
+                "canonical schema",
+                "PRAGMA writable_schema = ON; \
+                 UPDATE sqlite_schema SET sql = \
+                   'CREATE INDEX protected_fenced_transition_v2_journal_membership_idx \
+                    ON protected_fenced_transition_v2_journal \
+                    (bucket, history_epoch, outer_request_id, integrity_tag)' \
+                 WHERE name = 'protected_fenced_transition_v2_journal_membership_idx'; \
+                 PRAGMA writable_schema = OFF;",
+            ),
+            (
+                "table",
+                "DELETE FROM protected_fenced_transition_v2_journal;",
+            ),
+            (
+                "bucket",
+                "DELETE FROM protected_fenced_transition_v2_journal_buckets WHERE bucket = 0;",
+            ),
+            (
+                "epoch",
+                "PRAGMA ignore_check_constraints = ON; \
+                 UPDATE protected_fenced_transition_v2_journal_epochs SET entry_count = 2;",
+            ),
+            (
+                "metadata",
+                "UPDATE protected_fenced_transition_v2_journal_metadata SET membership_tag = zeroblob(32);",
+            ),
+        ];
+        for (ordinal, (_name, mutation)) in cases.into_iter().enumerate() {
+            let fixture = JournalFixture::new(0xa0_u8.wrapping_add(ordinal as u8));
+            let journal = open_v2(&fixture);
+            let scope = v2_scope(&fixture);
+            journal.ensure_scope(scope).await.expect("bind V2 scope");
+            let request = v2_request(1, ordinal as u8 + 1);
+            journal
+                .bind_or_lookup(scope, request.request_id(), &request)
+                .await
+                .expect("bind corruption fixture request");
+            drop(journal);
+            let connection =
+                Connection::open(v2_path(&fixture)).expect("open V2 corruption fixture");
+            connection
+                .execute_batch(mutation)
+                .expect("apply V2 corruption fixture");
+            drop(connection);
+            assert_v2_unavailable(FencedTransitionV2PreparedJournal::open_existing(
+                v2_path(&fixture),
+                FencedTransitionV2PreparedJournalKey::from_bytes(fixture.key),
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_v2_journal_restarts_only_with_its_original_key_and_scope() {
+        let fixture = JournalFixture::new(0x93);
+        let scope = v2_scope(&fixture);
+        let request = v2_request(1, 7);
+        let journal = open_v2(&fixture);
+        journal.ensure_scope(scope).await.expect("bind V2 scope");
+        journal
+            .bind_or_lookup(scope, request.request_id(), &request)
+            .await
+            .expect("bind restart fixture request");
+        drop(journal);
+
+        let reopened = FencedTransitionV2PreparedJournal::open_existing(
+            v2_path(&fixture),
+            FencedTransitionV2PreparedJournalKey::from_bytes(fixture.key),
+        )
+        .expect("reopen V2 journal with original key");
+        assert_eq!(
+            reopened
+                .lookup(scope, request.request_id())
+                .await
+                .expect("recover exact retained request"),
+            Some(request)
+        );
+        drop(reopened);
+        assert_v2_unavailable(FencedTransitionV2PreparedJournal::open_existing(
+            v2_path(&fixture),
+            FencedTransitionV2PreparedJournalKey::from_bytes([0x94; 32]),
+        ));
+    }
+
+    #[tokio::test]
+    async fn protected_v2_journal_rejects_live_durability_profile_drift() {
+        for (ordinal, drift) in [
+            (0x90_u8, "PRAGMA foreign_keys = OFF;"),
+            (0x91_u8, "PRAGMA fullfsync = OFF;"),
+            (0x92_u8, "PRAGMA temp_store = FILE;"),
+        ] {
+            let fixture = JournalFixture::new(ordinal);
+            let path = fixture
+                .path
+                .with_file_name(format!("protected-v2-{ordinal}.sqlite3"));
+            let journal = FencedTransitionV2PreparedJournal::create_new(
+                &path,
+                FencedTransitionV2PreparedJournalKey::from_bytes(fixture.key),
+            )
+            .expect("provision V2 journal");
+            let scope = [ordinal.wrapping_add(1); FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES];
+            journal
+                .ensure_scope(scope)
+                .await
+                .expect("bind V2 journal scope");
+            journal
+                .inner
+                .readers
+                .lock()
+                .expect("lock V2 journal readers")
+                .last_mut()
+                .expect("fixed V2 reader pool")
+                .conn
+                .execute_batch(drift)
+                .expect("drift V2 journal profile");
+            match journal.health_check(scope).await {
+                Err(StoreError::BackendUnavailable(message)) => {
+                    assert_eq!(message, V2_JOURNAL_UNAVAILABLE);
+                }
+                Ok(()) | Err(_) => panic!("V2 profile drift was not fail closed"),
+            }
+        }
     }
 }

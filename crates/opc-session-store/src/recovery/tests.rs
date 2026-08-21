@@ -45,7 +45,8 @@ use crate::{
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
     SessionLeaseManager, SqliteSessionBackend, StateClass, StateType, StoredSessionRecord,
     SystemClock, FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_SCHEMA_V1,
-    REPLICATION_TX_ID_MAX_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
+    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, REPLICATION_TX_ID_MAX_BYTES,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 
 const RECOVERY_CAMPAIGN_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
@@ -1641,7 +1642,7 @@ CREATE TABLE consensus_fenced_transition_v2_history (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     storage_configuration_epoch INTEGER NOT NULL CHECK (storage_configuration_epoch > 0),
     profile_digest BLOB NOT NULL CHECK (length(profile_digest) = 32),
-    active_epoch INTEGER CHECK (active_epoch IS NULL OR active_epoch > 0),
+    active_epoch INTEGER NOT NULL CHECK (active_epoch > 0),
     retired_through_epoch INTEGER NOT NULL CHECK (retired_through_epoch >= 0),
     generation INTEGER NOT NULL CHECK (generation >= 0),
     current_bound_count INTEGER NOT NULL CHECK (current_bound_count BETWEEN 0 AND 131072),
@@ -1649,7 +1650,7 @@ CREATE TABLE consensus_fenced_transition_v2_history (
     reclaim_cursor_ordinal INTEGER CHECK (reclaim_cursor_ordinal IS NULL OR reclaim_cursor_ordinal >= 0),
     reclaim_remaining INTEGER CHECK (reclaim_remaining IS NULL OR reclaim_remaining >= 0),
     reclaimed_entries INTEGER NOT NULL DEFAULT 0 CHECK (reclaimed_entries >= 0),
-    CHECK ((active_epoch IS NOT NULL AND active_epoch > retired_through_epoch AND reclaim_epoch IS NULL AND reclaim_cursor_ordinal IS NULL AND reclaim_remaining IS NULL) OR (active_epoch IS NULL AND reclaim_epoch IS NOT NULL AND reclaim_epoch = retired_through_epoch AND reclaim_cursor_ordinal IS NOT NULL AND reclaim_remaining IS NOT NULL AND current_bound_count = 0)),
+    CHECK ((reclaim_epoch IS NULL AND reclaim_cursor_ordinal IS NULL AND reclaim_remaining IS NULL AND active_epoch - retired_through_epoch BETWEEN 1 AND 8) OR (reclaim_epoch IS NOT NULL AND reclaim_epoch = retired_through_epoch AND reclaim_cursor_ordinal IS NOT NULL AND reclaim_remaining IS NOT NULL AND active_epoch - retired_through_epoch BETWEEN 1 AND 7)),
     FOREIGN KEY(storage_configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
 );
 "#,
@@ -1680,12 +1681,21 @@ fn insert_valid_v3_receipt_fixture(
     history_epoch: u64,
     ordinal: u64,
 ) -> V3ReceiptFixture {
+    insert_valid_v3_receipt_fixture_with_marker(replica, history_epoch, ordinal, 0xA1)
+}
+
+fn insert_valid_v3_receipt_fixture_with_marker(
+    replica: &RecoveryReplica,
+    history_epoch: u64,
+    ordinal: u64,
+    marker: u8,
+) -> V3ReceiptFixture {
     let logical_time = receipt_inspection_timestamp();
     let retained_until =
         crate::checked_session_deadline(logical_time, FENCED_TRANSITION_OUTCOME_RETENTION)
             .expect("V3 receipt deadline");
     let retained_until = crate::sqlite::ops::format_rfc3339_normalized(retained_until);
-    let mut request_id = [0xA1; 56];
+    let mut request_id = [marker; 56];
     request_id[..8].copy_from_slice(&history_epoch.to_be_bytes());
     let payload_digest =
         consensus::fenced_transition_v2_payload_digest_for_request_id(identity(), request_id)
@@ -1743,6 +1753,87 @@ fn insert_valid_v3_receipt_fixture(
     )
 }
 
+fn insert_v3_tombstone_rows_in_epoch(
+    replica: &RecoveryReplica,
+    history_epoch: u64,
+    first_ordinal: u64,
+    count: usize,
+) {
+    let logical_time = receipt_inspection_timestamp();
+    let retained_until =
+        crate::checked_session_deadline(logical_time, FENCED_TRANSITION_OUTCOME_RETENTION)
+            .expect("V3 tombstone deadline");
+    let retained_until = crate::sqlite::ops::format_rfc3339_normalized(retained_until);
+    let mut conn = Connection::open(&replica.database_path).expect("open V3 tombstone fixture");
+    let transaction = conn.transaction().expect("begin V3 tombstone fixture");
+    let mut insert = transaction
+        .prepare(
+            "INSERT INTO consensus_fenced_transition_v2_receipts (request_id, history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
+        )
+        .expect("prepare V3 tombstone insert");
+    for offset in 0..count {
+        let ordinal = first_ordinal
+            .checked_add(u64::try_from(offset).expect("V3 tombstone offset"))
+            .expect("V3 tombstone ordinal");
+        let mut request_id = [0x54_u8; 56];
+        request_id[..8].copy_from_slice(&history_epoch.to_be_bytes());
+        request_id[48..].copy_from_slice(&ordinal.to_be_bytes());
+        let payload_digest =
+            consensus::fenced_transition_v2_payload_digest_for_request_id(identity(), request_id)
+                .expect("V3 tombstone payload");
+        let binding_digest = consensus::fenced_transition_v2_receipt_binding_digest(
+            identity(),
+            request_id,
+            history_epoch,
+            ordinal,
+            payload_digest,
+            &retained_until,
+        )
+        .expect("V3 tombstone binding");
+        insert
+            .execute(params![
+                request_id.as_slice(),
+                i64::try_from(history_epoch).expect("V3 tombstone history epoch"),
+                i64::try_from(ordinal).expect("V3 tombstone ordinal"),
+                i64::try_from(identity().configuration_epoch().get())
+                    .expect("V3 tombstone configuration epoch"),
+                payload_digest.as_slice(),
+                retained_until.as_str(),
+                binding_digest.as_slice(),
+            ])
+            .expect("insert V3 tombstone");
+    }
+    drop(insert);
+    transaction.commit().expect("commit V3 tombstone fixture");
+    conn.execute(
+        "UPDATE consensus_machine SET logical_time = ?1 WHERE singleton = 1",
+        [retained_until.as_str()],
+    )
+    .expect("advance V3 tombstone fixture clock");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint V3 tombstones");
+}
+
+fn begin_v3_reclaim_fixture(
+    replica: &RecoveryReplica,
+    reclaim_epoch: u64,
+    cursor: u64,
+    remaining: u64,
+) {
+    let conn = Connection::open(&replica.database_path).expect("open V3 reclaim fixture");
+    conn.execute(
+        "UPDATE consensus_fenced_transition_v2_history SET reclaim_epoch = ?1, reclaim_cursor_ordinal = ?2, reclaim_remaining = ?3 WHERE singleton = 1",
+        params![
+            i64::try_from(reclaim_epoch).expect("reclaim epoch"),
+            i64::try_from(cursor).expect("reclaim cursor"),
+            i64::try_from(remaining).expect("reclaim remaining"),
+        ],
+    )
+    .expect("begin V3 reclaim");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint V3 reclaim");
+}
+
 fn inspect_current_fixture(
     replica: &RecoveryReplica,
     members: &BTreeSet<SessionConsensusNodeId>,
@@ -1770,8 +1861,24 @@ fn v3_history_lifecycle(replica: &RecoveryReplica) -> V3HistoryLifecycle {
 fn current_recovery_inspection_accepts_populated_v3_history_and_reopen_preserves_branch() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let (replica, members) = current_receipt_inspection_fixture(temp.path());
-    activate_v3_history_fixture(&replica, 5, 4, 1);
-    insert_valid_v3_receipt_fixture(&replica, 5, 1);
+    activate_v3_history_fixture(&replica, 3, 2, 1);
+    let final_ordinal =
+        u64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES).expect("V3 maximum ordinal");
+    let reclaim_remaining = 1_024_u64;
+    let reclaim_cursor = final_ordinal
+        .checked_sub(reclaim_remaining)
+        .expect("V3 reclaim cursor");
+    insert_valid_v3_receipt_fixture_with_marker(&replica, 2, final_ordinal, 0xA2);
+    insert_valid_v3_receipt_fixture_with_marker(&replica, 3, 1, 0xA3);
+    insert_v3_tombstone_rows_in_epoch(
+        &replica,
+        2,
+        reclaim_cursor
+            .checked_add(1)
+            .expect("V3 first retained ordinal"),
+        usize::try_from(reclaim_remaining - 1).expect("V3 retained tombstone count"),
+    );
+    begin_v3_reclaim_fixture(&replica, 2, reclaim_cursor, reclaim_remaining);
 
     let conn = Connection::open(&replica.database_path).expect("open V3 validation fixture");
     consensus::validate_fenced_transition_v2_receipts_sync(&conn, identity())
@@ -1818,16 +1925,16 @@ fn current_recovery_v3_rejects_lifecycle_corruption_and_distinguishes_floor() {
         ),
         (
             "reclaim cursor shape",
-            "UPDATE consensus_fenced_transition_v2_history SET active_epoch = NULL, reclaim_epoch = 4, reclaim_cursor_ordinal = 2, reclaim_remaining = 1, current_bound_count = 0",
+            "UPDATE consensus_fenced_transition_v2_history SET reclaim_epoch = 4, reclaim_cursor_ordinal = 2, reclaim_remaining = 1, current_bound_count = 0",
         ),
     ] {
-        let (replica, case_members) =
-            current_receipt_inspection_fixture(&temp.path().join(label));
+        let (replica, case_members) = current_receipt_inspection_fixture(&temp.path().join(label));
         activate_v3_history_fixture(&replica, 5, 4, 0);
         let conn = Connection::open(&replica.database_path).expect("open corrupt V3 fixture");
         conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
             .expect("allow lifecycle corruption");
-        conn.execute_batch(sql).expect("inject lifecycle corruption");
+        conn.execute_batch(sql)
+            .expect("inject lifecycle corruption");
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .expect("checkpoint lifecycle corruption");
         drop(conn);

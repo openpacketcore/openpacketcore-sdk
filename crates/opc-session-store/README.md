@@ -832,6 +832,13 @@ caller cancellation or timeout cannot
 cancel it or start an overlapping check. Openraft still supplies every quorum
 proof; the supervisor is only a local resource bound.
 
+File-backed fixed-quorum V2 acceptance snapshots use three process-scoped WAL
+reader lanes shared by every clone. Each checkout owns one reader and one
+matching permit through its fresh transaction; a lost or unusable reader is
+replenished or permanently retires that permit. This prevents a write-held
+SQLite connection from globally serializing unrelated acceptance reads without
+creating a connection, task, or pool entry per caller or subscriber.
+
 Each production mutation creates one hidden `SessionConsensusRequestId` and
 keeps it across leader-forwarding retries. Failure before local proposal
 submission remains `BackendUnavailable`. Once `client_write_ff` accepts the
@@ -1227,16 +1234,20 @@ and SQLite-VFS checks fail closed for V2.
 
 The schema-3 journal authenticates more than each row: a per-journal random
 incarnation, bounded row count, and root over the complete request-ID/tag set
-are committed by a separate HMAC. Health, lookup/recovery, and insertion scan
-and authenticate that small bounded set. The authenticated covering index is
-the presence authority. Its scan cross-validates each indexed row and fixed tag
-against the table, plus independently bounded table and primary-index scans;
-divergent table, primary, or secondary-index state therefore cannot become
-false absence. Schema 3 places the fixed tag before the potentially overflowing
-prepared body, so the global proof remains independent of body size. Lookup
-authenticates the selected token, while insertion re-reads its new row and
-updates the membership commitment atomically before returning success. The
-SQLite catalog is an exact whitelist of the two SDK tables, generated
+are committed by a separate HMAC. One fixed writer and four fixed WAL readers
+serve the process-scoped journal handle; callers clone that handle rather than
+creating per-request connections. Health streams the complete bounded history
+through ordered cursors while retaining only 4,096 bucket aggregates and the
+at-most-eight epoch states. Lookup/recovery and insertion use the same fixed
+pool and authenticate their selected bounded state. The authenticated covering
+index is the presence authority. Its scan cross-validates each indexed row and
+fixed tag against the table, plus independently ordered table and primary-index
+cursors; divergent table, primary, or secondary-index state therefore cannot
+become false absence. Schema 3 places the fixed tag before the potentially
+overflowing prepared body, so the global proof remains independent of body
+size. Lookup authenticates the selected token, while insertion re-reads its new
+row and updates the membership commitment atomically before returning success.
+The SQLite catalog is an exact whitelist of the two SDK tables, generated
 primary-key autoindex, and membership index, so any other object, including a
 reserved-prefix object, fails closed before journal setup. These checks detect
 offline row deletion, addition, primary-key replacement, index divergence, and
@@ -1279,6 +1290,52 @@ journal schema everywhere recovery may run before enabling V2. Rollback
 requires draining every unresolved/delayed request or retaining a compatible
 reader and the same journal; never re-encode, reseal, reconstruct, copy into a
 fresh journal identity, or migrate an in-flight token.
+
+The separate epoch-fenced receipt-history protocol uses
+`FencedTransitionV2Request`, not a prepared V1 token. A protected wrapper
+advertises `FencedTransitionV2Capability::V2` only after it is configured with
+its own `FencedTransitionV2PreparedJournal` through
+`with_fenced_transition_v2_journal` and a stable
+`FencedTransitionV2JournalScope` through
+`with_fenced_transition_v2_journal_scope`. For a consensus backend, derive
+that scope with `FencedTransitionV2JournalScope::for_consensus_cluster`; do
+not use a rotatable sealing key or provider endpoint. The journal binds that
+scope together with the wrapper mode and payload namespace before it invokes a
+provider or the inner backend. A missing scope on a standalone backend, a
+different namespace, a local/remote mode change, or a different cluster fails
+closed. The V2 journal has a distinct path, key, schema, and 56-byte
+complete-ID namespace; it maps the validated outer ID to one sealed inner V2
+request, never stores the caller plaintext body, and is never the permanent
+capped V1 journal. Exact retries after an ambiguous send, restart, or
+record-protection-key rotation reuse that same sealed inner request. A mapping
+remains until the inner consensus history reports an epoch at or below
+`retired_through`; only then may the wrapper reclaim it, after which an exact
+delayed retry remains terminally `Retired`. Schema-1 unscoped V2 journals are
+not migrated in place: provision a fresh scoped V2 journal after draining any
+unresolved requests. Missing, mixed, legacy, wrong-key, wrong-scope, or
+corrupt V2 journal state fails closed rather than falling back to V1 or
+resealing a caller request.
+
+`SessionBackend::fenced_transition_v2_batch` coalesces 1 through 256 ordered
+requests from one epoch into one physical backend batch while preserving one
+full-ID result per submitted item. It is not a cross-item conditional or
+all-or-nothing transaction. Protected wrappers first recover every retained
+mapping and seal and journal every fresh item before dispatching the one inner
+batch; a local preparation failure therefore has no consensus effect, while a
+later retry or key rotation reuses each exact stored sealed request.
+
+V2 keeps exactly one writable epoch and at most seven contiguous closed replay
+epochs. Each epoch holds at most 131,072 request bindings, so receipts and the
+protected journal have a fixed maximum of 1,048,576 bindings; receipt semantic
+content is additionally capped at 18,469,617,664 bytes (storage-engine page
+overhead has its own journal/store file limit). A consensus maintenance entry
+opens the immediate successor while a replay slot is available. When all eight
+slots are retained, a new identity is deterministically rejected before record
+or lease effects; a later maintenance entry can retire the oldest epoch only
+after its exact-result window and reclaim it in ordered 1,024-entry batches.
+During that reclamation the active epoch remains writable, but no ninth epoch
+is allocated. This is generic bounded SDK lifecycle state, not subscriber or
+network-function policy.
 
 ## Fenced ownership
 

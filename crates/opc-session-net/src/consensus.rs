@@ -203,6 +203,13 @@ fn consensus_server_tls_config(config: Arc<opc_tls::ServerConfig>) -> Arc<opc_tl
     Arc::new(config)
 }
 
+// Consensus reuses connections for small request/response frames. Disable
+// Nagle before TLS or the plaintext Hello so either transport cannot inherit a
+// delayed-ACK cadence that consumes the bounded consensus call budget.
+fn configure_consensus_tcp_socket(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nodelay(true)
+}
+
 #[derive(Debug)]
 struct DisabledSessionTickets;
 
@@ -751,6 +758,8 @@ impl ConsensusColdConnector {
                         let tcp = TcpStream::connect(addr)
                             .await
                             .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+                        configure_consensus_tcp_socket(&tcp)
+                            .map_err(|_| SessionConsensusPeerError::Unavailable)?;
                         let tls_connector = tokio_rustls::TlsConnector::from(
                             consensus_client_tls_config(attempt.rustls_config()),
                         );
@@ -843,6 +852,7 @@ impl ConsensusColdConnector {
         let tcp = TcpStream::connect(addr)
             .await
             .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+        configure_consensus_tcp_socket(&tcp).map_err(|_| SessionConsensusPeerError::Unavailable)?;
         let (mut reader, mut writer) = tokio::io::split(tcp);
         let established_at = tokio::time::Instant::now();
         let (response_frame_size, request_frame_size) =
@@ -2429,6 +2439,7 @@ async fn handle_consensus_connection(
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
 ) -> Result<(), ProtocolError> {
+    configure_consensus_tcp_socket(&stream).map_err(ProtocolError::Io)?;
     if let Some(tls_config) = tls_config {
         let generation = reauthentication.generation();
         let handshake = tls_config
@@ -3226,6 +3237,41 @@ mod tests {
             .bind_local(ReplicaId::new("replica-2").expect("server ID"))
             .expect("server binding");
         (server, client)
+    }
+
+    #[tokio::test]
+    async fn consensus_tcp_setup_enables_nodelay_for_outbound_and_accepted_sockets() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind consensus TCP setup listener");
+        let address = listener
+            .local_addr()
+            .expect("read consensus TCP setup listener address");
+        let (outbound, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let outbound = outbound.expect("connect consensus TCP setup client");
+        let (accepted, _) = accepted.expect("accept consensus TCP setup client");
+
+        outbound
+            .set_nodelay(false)
+            .expect("enable fixture Nagle delay on outbound socket");
+        accepted
+            .set_nodelay(false)
+            .expect("enable fixture Nagle delay on accepted socket");
+        configure_consensus_tcp_socket(&outbound).expect("configure outbound consensus TCP socket");
+        configure_consensus_tcp_socket(&accepted).expect("configure accepted consensus TCP socket");
+
+        assert!(
+            outbound
+                .nodelay()
+                .expect("inspect outbound consensus TCP socket"),
+            "outbound consensus setup must disable Nagle before TLS or Hello"
+        );
+        assert!(
+            accepted
+                .nodelay()
+                .expect("inspect accepted consensus TCP socket"),
+            "accepted consensus setup must disable Nagle before TLS or Hello"
+        );
     }
 
     #[cfg(feature = "insecure-test")]

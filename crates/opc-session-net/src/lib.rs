@@ -64,7 +64,8 @@ pub use consumer::{
     PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
     PersistentSessionConsumerConfigError, PersistentSessionConsumerDiagnostics,
     PersistentSessionConsumerExecuteError, PersistentSessionConsumerReadiness,
-    PersistentSessionConsumerShutdownReport, SessionConsumerAuthorizationError,
+    PersistentSessionConsumerShutdownReport, PersistentSessionConsumerV2Diagnostics,
+    PersistentSessionConsumerV2ExecuteError, SessionConsumerAuthorizationError,
     SessionConsumerAuthorizer, SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
     SessionConsumerFencedTransitionBackendError, SessionConsumerFencedTransitionMutationError,
     SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionQuorumConsumerServer,
@@ -111,18 +112,18 @@ pub use opc_consensus::{
     ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusConfigurationId, ConsensusIdentity,
     ConsensusNodeId,
 };
+pub use protocol::{
+    conservative_payload_budget, SessionConsensusContractProfile,
+    CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE, MAX_NEGOTIATED_FRAME_SIZE,
+    MIN_SESSION_CONSENSUS_FRAME_SIZE, RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES,
+    SESSION_CONSENSUS_ALPN, SESSION_CONSENSUS_TRANSPORT_REVISION,
+};
 #[cfg(feature = "legacy-session-net-compat")]
 pub use protocol::{
-    conservative_payload_budget, ContractProfile, HelloRejectReason, Request, Response,
-    CURRENT_CONTRACT_PROFILE, MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES,
+    ContractProfile, HelloRejectReason, Request, Response, CURRENT_CONTRACT_PROFILE,
+    MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES,
     MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES, MAX_SESSION_NET_REPLICATION_TX_ID_BYTES,
     MAX_SESSION_NET_STABLE_ID_BYTES, MIN_NEGOTIATED_FRAME_SIZE, SESSION_NET_CAS_REQUEST_ID_BYTES,
-};
-pub use protocol::{
-    SessionConsensusContractProfile, CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
-    MAX_NEGOTIATED_FRAME_SIZE, MIN_SESSION_CONSENSUS_FRAME_SIZE,
-    RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES, SESSION_CONSENSUS_ALPN,
-    SESSION_CONSENSUS_TRANSPORT_REVISION,
 };
 #[cfg(feature = "legacy-session-net-compat")]
 pub use server::SessionReplicationServer;

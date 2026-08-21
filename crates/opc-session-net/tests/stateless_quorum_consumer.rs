@@ -17,10 +17,10 @@ use opc_key::{
 };
 use opc_session_net::{
     conservative_payload_budget, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-    RemoteAddrResolver, SessionConsumerAuthorizer, SessionConsumerClientError,
-    SessionConsumerFencedTransitionBackend, SessionConsumerLeaseMutationError,
-    SessionConsumerMutationError, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
-    MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
+    PersistentSessionConsumerV2ExecuteError, RemoteAddrResolver, SessionConsumerAuthorizer,
+    SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
+    SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionQuorumConsumerServer,
+    StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
     SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
@@ -688,6 +688,7 @@ async fn revision_four_v2_status_transports_a_retained_stale_fence_receipt() {
     )
     .expect("self-authenticating V2 transition");
 
+    let request_id = transition.request_id();
     let execute = client
         .execute_v2(SessionConsumerV2Request::new(
             scope,
@@ -696,13 +697,10 @@ async fn revision_four_v2_status_transports_a_retained_stale_fence_receipt() {
             },
         ))
         .await;
-    let execute_error = match execute {
-        Ok(SessionConsumerV2Response::FencedTransitionV2(Err(error))) => error,
-        response => panic!("expected a retained V2 execution error, got {response:?}"),
-    };
     assert_eq!(
-        execute_error,
-        SessionConsumerV2FencedTransitionError::Store(SessionConsumerStoreError::StaleFence),
+        execute,
+        Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknown { request_id }),
+        "the unbound execution error is recovered only through exact V2 status"
     );
 
     let status = SessionConsumerV2Request::new(
@@ -731,7 +729,9 @@ async fn revision_four_v2_status_transports_a_retained_stale_fence_receipt() {
         serde_json::from_value(malformed).expect("outer-ID mismatch decodes");
     assert_eq!(
         client.execute_v2(malformed).await,
-        Err(SessionConsumerClientError::Protocol),
+        Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Protocol,
+        }),
         "an outer full-ID mismatch remains rejected before dispatch"
     );
     handle.abort_and_wait().await;

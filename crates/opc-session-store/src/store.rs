@@ -206,6 +206,29 @@ impl<B: SessionBackend> SessionBackend for SessionStore<B> {
         self.backend.fenced_transition_v2(request).await
     }
 
+    async fn fenced_transition_v2_effect(
+        &self,
+        request: crate::fenced_transition::FencedTransitionV2Request,
+    ) -> crate::fenced_transition::FencedTransitionV2Effect<
+        Result<crate::fenced_transition::FencedTransitionOutcome, StoreError>,
+    > {
+        self.backend.fenced_transition_v2_effect(request).await
+    }
+
+    async fn fenced_transition_v2_batch_effect(
+        &self,
+        requests: Vec<crate::fenced_transition::FencedTransitionV2Request>,
+    ) -> crate::fenced_transition::FencedTransitionV2Effect<
+        Result<
+            Vec<Result<crate::fenced_transition::FencedTransitionOutcome, StoreError>>,
+            StoreError,
+        >,
+    > {
+        self.backend
+            .fenced_transition_v2_batch_effect(requests)
+            .await
+    }
+
     async fn fenced_transition_v2_status(
         &self,
         request: &crate::fenced_transition::FencedTransitionV2Request,

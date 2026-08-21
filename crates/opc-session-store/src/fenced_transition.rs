@@ -47,6 +47,26 @@ pub const FENCED_TRANSITION_SCHEMA_V2: u16 = 2;
 /// Maximum physical V2 receipt rows retained for one active history epoch.
 pub const FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES: usize = 131_072;
 
+/// Number of epochs that may accept new V2 identities at once.
+///
+/// A successor is opened by one replicated maintenance command, so there is
+/// exactly one writable epoch.  The preceding epoch remains replayable, but
+/// is closed to new identities.
+pub const FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS: usize = 1;
+
+/// Number of closed V2 epochs that may remain exactly replayable.
+///
+/// Seven closed epochs plus one writable successor cover the release traffic
+/// envelope (50,000 preload plus 960,000 operations) without making V2's
+/// 24-hour exact-replay window absorbing. The number remains a fixed protocol
+/// limit, not a per-subscriber allocation.
+pub const FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS: usize = 7;
+
+/// Maximum total retained V2 receipt bindings across active and replay epochs.
+pub const FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES: usize =
+    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+        * (FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS + FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS);
+
 /// Number of V2 bindings an implementation must support operationally before
 /// it may need to reclaim a retired epoch.
 pub const FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET: usize = 100_000;
@@ -90,6 +110,25 @@ pub const FENCED_TRANSITION_V2_MAX_DURABLE_GENERATION: u64 = i64::MAX as u64;
 /// envelope before storing or hashing it.
 pub const FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES: usize =
     FENCED_TRANSITION_MAX_OUTCOME_BYTES + 1_024;
+
+/// Maximum semantic bytes in one retained V2 receipt row.
+///
+/// This counts every fixed persisted field and the bounded response envelope;
+/// SQLite page/index overhead is additionally bounded by the journal/store
+/// file profiles. The 30-byte timestamp is V2's canonical RFC3339 width.
+pub const FENCED_TRANSITION_V2_RECEIPT_MAX_DURABLE_BYTES: usize =
+    FENCED_TRANSITION_V2_REQUEST_ID_BYTES
+        + (3 * std::mem::size_of::<u64>())
+        + FENCED_TRANSITION_V2_BODY_COMMITMENT_BYTES
+        + 30
+        + FENCED_TRANSITION_V2_BODY_COMMITMENT_BYTES
+        + FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES
+        + FENCED_TRANSITION_V2_BODY_COMMITMENT_BYTES;
+
+/// Maximum semantic bytes retained by all active/replay V2 receipt epochs.
+pub const FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES: u64 =
+    (FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES as u64)
+        * (FENCED_TRANSITION_V2_RECEIPT_MAX_DURABLE_BYTES as u64);
 
 /// Exact encrypted-record payload capacity admitted by every V2 voter.
 ///
@@ -275,7 +314,7 @@ pub const FENCED_TRANSITION_V2_RETENTION_PROFILE_INPUTS: [u64; 2] = [
 ];
 
 /// Revision of V2's backend-neutral persisted receipt-history schema.
-pub const FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_REVISION: u16 = 1;
+pub const FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_REVISION: u16 = 2;
 
 /// Frozen backend-neutral schema for V2's durable receipt history.
 ///
@@ -283,7 +322,7 @@ pub const FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_REVISION: u16 = 1;
 /// durable implementation may choose its storage engine, but it must preserve
 /// these identities, fields, bounds, and lifecycle ordering to advertise V2.
 pub const FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_DESCRIPTOR: &str = concat!(
-    "history-format=3;revision=1;scope=one-history-singleton-per-storage-identity;",
+    "history-format=4;revision=2;scope=one-history-singleton-per-storage-identity;",
     "singleton=immutable-profile-digest:bytes32,storage-configuration-epoch:u64be,",
     "active-epoch:optional-u64,retired-through-epoch:optional-u64,generation:u64be<=durable-counter-max,",
     "bound-entry-count:u64be,reclaim-epoch:optional-u64,reclaim-cursor-ordinal:optional-u64,",
@@ -293,10 +332,13 @@ pub const FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_DESCRIPTOR: &str = conca
     "binding-digest:bytes32,response:optional-exact-codec-bytes,response-digest:bytes32;",
     "activation-certificate=storage-identity,scope-identity,voter-set-digest:bytes32,",
     "immutable-profile-digest:bytes32;",
-    "capacity=active-epoch-receipts<=131072;index=history-epoch-ascending,ordinal-ascending,",
-    "unique(history-epoch,ordinal);reclaim=retire-floor-before-delete,",
-    "ordered(history-epoch,ordinal)-ascending,batch<=1024,no-active-during-reclaim,",
-    "open-immediate-successor-only-after-final-batch"
+    "capacity=active-epochs<=1,replay-epochs<=7,retained-epochs<=8,",
+    "per-epoch-receipts<=131072,total-receipts<=1048576,total-semantic-bytes<=18469617664;",
+    "index=history-epoch-ascending,ordinal-ascending,unique(history-epoch,ordinal);",
+    "successor=open-immediate-successor-at-one-maintenance-linearization,",
+    "prior=closed-replayable-until-retired-through-linearization;",
+    "reclaim=retire-floor-before-delete,ordered(history-epoch,ordinal)-ascending,batch<=1024,",
+    "active-remains-writable-during-reclaim"
 );
 
 /// Revision of V2's fixed error and status meanings covered by its profile.
@@ -318,7 +360,8 @@ pub const FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR: &str = concat!(
     ",schema:u16be,epoch:u64be,nonce:bytes16,body-len:u64be,body);",
     "history-epoch=nonzero-u64,range:1..=i64-max;body=version:u8=1|lease|mutation;",
     "history-state-wire=active-epoch:optional-u64,retired-through:optional-u64,",
-    "reclaim-epoch:optional-u64,reclaim-remaining:u64,generation:u64<=i64-max,bound-entries:u64,",
+    "reclaim-epoch:optional-u64(replay-before-floor,physical-reclaim-at-floor),",
+    "reclaim-remaining:u64,generation:u64<=i64-max,bound-entries:u64,",
     "reclaimed-entries:u64;",
     "framing=tags:u8,integers:big-endian,bytes:length-u64be,",
     "duration:secs-u64be+nanos-u32be,timestamp:unix-secs-i64be+nanos-u32be,",
@@ -1244,6 +1287,53 @@ pub enum FencedTransitionExecuteError {
     Rejected(StoreError),
 }
 
+/// Result of one V2 operation at its effect boundary.
+///
+/// V2 protected wrappers use this result to distinguish a request that was
+/// proved not to have crossed a proposal boundary from one whose outcome is
+/// ambiguous. `Resolved` is generic so the same boundary preserves both the
+/// singleton and batch APIs' existing committed-or-rejected result shapes.
+/// V1 deliberately continues to use [`FencedTransitionExecuteError`].
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FencedTransitionV2Effect<T> {
+    /// This invocation did not transmit any of the associated requests.
+    ///
+    /// The preserved rejection is the existing caller-visible result for the
+    /// pre-dispatch failure. A protected wrapper may discard only mappings it
+    /// created for this invocation after observing this variant.
+    NotTransmitted(StoreError),
+    /// The listed complete V2 request identities may have crossed an effect
+    /// boundary and must remain available for exact status recovery.
+    OutcomeUnknown {
+        /// Exact identities that may have been transmitted.
+        request_ids: Vec<FencedTransitionV2RequestId>,
+    },
+    /// The operation completed with its existing committed-or-rejected shape.
+    Resolved(T),
+}
+
+impl<T> FencedTransitionV2Effect<T> {
+    /// Return whether this invocation was proved not to have transmitted.
+    pub const fn is_not_transmitted(&self) -> bool {
+        matches!(self, Self::NotTransmitted(_))
+    }
+}
+
+impl<T> fmt::Debug for FencedTransitionV2Effect<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::NotTransmitted(_) => "not_transmitted",
+            Self::OutcomeUnknown { .. } => "outcome_unknown",
+            Self::Resolved(_) => "resolved",
+        };
+        formatter
+            .debug_struct("FencedTransitionV2Effect")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
 impl fmt::Debug for FencedTransitionExecuteError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self {
@@ -1614,6 +1704,10 @@ fn fenced_transition_v2_profile_digest_with_retention_inputs(
     hasher.update(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH.to_be_bytes());
     hasher.update(FENCED_TRANSITION_V2_MAX_HISTORY_EPOCH.to_be_bytes());
     hasher.update((FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64).to_be_bytes());
+    hasher.update((FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS as u64).to_be_bytes());
+    hasher.update((FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS as u64).to_be_bytes());
+    hasher.update((FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES as u64).to_be_bytes());
+    hasher.update(FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES.to_be_bytes());
     hasher.update((FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET as u64).to_be_bytes());
     hasher.update((FENCED_TRANSITION_V2_RECLAIM_BATCH as u64).to_be_bytes());
     for input in retention_inputs {
@@ -1621,7 +1715,7 @@ fn fenced_transition_v2_profile_digest_with_retention_inputs(
     }
     hasher.update((FENCED_TRANSITION_MAX_OUTCOME_BYTES as u64).to_be_bytes());
     hasher.update(
-        b"lifecycle=validate-self-auth-before-floor;active-only;retire-floor-before-delete;no-active-during-reclaim;final-open-next\0",
+        b"lifecycle=validate-self-auth-before-floor;active-only;open-successor-with-closed-replay;retire-floor-before-delete;active-during-reclaim\0",
     );
     hasher.update(b"reclaim=ordered(epoch,ordinal);status-error-revision=");
     hasher.update(FENCED_TRANSITION_V2_ERROR_STATUS_REVISION.to_be_bytes());
@@ -2297,14 +2391,18 @@ impl fmt::Debug for FencedTransitionStatus {
 
 /// Durable, non-secret summary of V2 receipt-history lifecycle.
 ///
-/// `active_epoch` is the only epoch that admits new V2 requests. Epochs at or
-/// below `retired_through` are permanently closed. `reclaim_epoch` and
-/// `reclaim_remaining` expose durable, CAS-safe progress through the ordered
-/// `(epoch, ordinal)` reclamation of closed receipt rows. After activation
-/// exactly one of `active_epoch` or `reclaim_epoch` is present. An
-/// implementation clears `active_epoch` before beginning reclamation and
-/// opens the immediate successor epoch only after the final reclaim batch
-/// commits.
+/// `active_epoch` is the only epoch that admits new V2 requests. Epochs in
+/// the contiguous interval `(retired_through, active_epoch)` are closed to
+/// new identities but remain exactly replayable. That interval has at most
+/// seven replay epochs plus the one active epoch. A successor is opened by
+/// one maintenance linearization whenever that bounded interval has room.
+///
+/// Epochs at or below `retired_through` are permanently closed. When the
+/// oldest replay epoch's exact window elapses, the same maintenance path
+/// advances that floor and records it in `reclaim_epoch`; its physical rows
+/// are then deleted in ordered bounded batches while the current active epoch
+/// remains writable. The reclaimer occupies the freed eighth physical slot,
+/// so total retained rows never exceed the fixed eight-epoch bound.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FencedTransitionV2HistoryState {
     active_epoch: Option<FencedTransitionV2HistoryEpoch>,
@@ -2387,24 +2485,39 @@ impl FencedTransitionV2HistoryState {
     ) -> Result<Self, StoreError> {
         let active_state_is_valid = match (active_epoch, retired_through, reclaim_epoch) {
             (Some(active), None, None) => {
-                active.get() == FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH && reclaim_remaining == 0
+                (FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH
+                    ..=FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS as u64
+                        + FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS as u64)
+                    .contains(&active.get())
+                    && reclaim_remaining == 0
             }
             (Some(active), Some(retired), None) => {
-                retired
+                active
                     .get()
-                    .checked_add(1)
-                    .is_some_and(|expected| active.get() == expected)
+                    .checked_sub(retired.get())
+                    .is_some_and(|retained| {
+                        (1..=(FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS
+                            + FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS)
+                            as u64)
+                            .contains(&retained)
+                    })
                     && reclaim_remaining == 0
+            }
+            // Closed replay epochs form one contiguous interval above the
+            // durable floor and below the sole active successor.
+            (Some(active), Some(retired), Some(reclaim)) => {
+                reclaim == retired
+                    && active
+                        .get()
+                        .checked_sub(retired.get())
+                        .is_some_and(|retained| {
+                            (1..=FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS as u64).contains(&retained)
+                        })
+                    && (1..=FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES).contains(&reclaim_remaining)
             }
             _ => false,
         };
-        let reclaim_state_is_valid = matches!(
-            (active_epoch, retired_through, reclaim_epoch),
-            (None, Some(retired), Some(reclaim)) if reclaim == retired
-        ) && bound_entries == 0
-            && (1..=FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES).contains(&reclaim_remaining);
-
-        if !(active_state_is_valid || reclaim_state_is_valid)
+        if !active_state_is_valid
             || bound_entries > FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
             || generation > FENCED_TRANSITION_V2_MAX_DURABLE_GENERATION
         {
@@ -2433,12 +2546,15 @@ impl FencedTransitionV2HistoryState {
         self.retired_through
     }
 
-    /// Retired epoch currently being reclaimed in ordered bounded batches.
+    /// Oldest epoch already retired through and being reclaimed in ordered
+    /// bounded batches. Replay epochs are the contiguous interval above the
+    /// floor and below `active_epoch`.
     pub const fn reclaim_epoch(&self) -> Option<FencedTransitionV2HistoryEpoch> {
         self.reclaim_epoch
     }
 
-    /// Receipt rows remaining in `reclaim_epoch` before the next epoch opens.
+    /// Receipt rows remaining in the retired `reclaim_epoch` before its
+    /// durable space is reclaimed. The current active epoch remains writable.
     pub const fn reclaim_remaining(&self) -> usize {
         self.reclaim_remaining
     }
@@ -4329,6 +4445,13 @@ mod tests {
     fn v2_constants_leave_required_headroom_and_profile_is_fixed() {
         assert_eq!(FENCED_TRANSITION_SCHEMA_V2, 2);
         assert_eq!(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, 131_072);
+        assert_eq!(FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS, 1);
+        assert_eq!(FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS, 7);
+        assert_eq!(FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES, 1_048_576);
+        assert_eq!(
+            FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES,
+            18_469_617_664
+        );
         assert_eq!(FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET, 100_000);
         assert_eq!(FENCED_TRANSITION_V2_RECLAIM_BATCH, 1_024);
         assert_eq!(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH, 1);
@@ -4388,7 +4511,7 @@ mod tests {
                 u32::MAX as u64,
             ]
         );
-        assert_eq!(FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_REVISION, 1);
+        assert_eq!(FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_REVISION, 2);
         assert_eq!(FENCED_TRANSITION_V2_ERROR_STATUS_REVISION, 2);
         assert!(FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR.contains("body=version:u8=1"));
         assert!(FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR
@@ -4424,10 +4547,11 @@ mod tests {
                 .contains("25:storage-exhausted")
         );
         assert!(
-            FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_DESCRIPTOR.contains("history-format=3")
+            FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_DESCRIPTOR.contains("history-format=4")
         );
-        assert!(FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_DESCRIPTOR
-            .contains("capacity=active-epoch-receipts<=131072"));
+        assert!(
+            FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_DESCRIPTOR.contains("replay-epochs<=7")
+        );
         assert!(FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_DESCRIPTOR
             .contains("generation:u64be<=durable-counter-max"));
         assert!(FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR.contains("replicated-command-wire="));
@@ -4457,9 +4581,9 @@ mod tests {
         assert_eq!(
             fenced_transition_v2_profile_digest(),
             [
-                0xbf, 0x22, 0x10, 0xe0, 0x9a, 0x84, 0xb4, 0x17, 0xb7, 0x27, 0x06, 0x46, 0x82, 0x1b,
-                0x87, 0xa7, 0x3d, 0x1a, 0x87, 0x50, 0x38, 0x21, 0xfc, 0x44, 0x92, 0x2d, 0xb2, 0x2e,
-                0x04, 0x87, 0x9d, 0x15,
+                0x8a, 0x0b, 0x70, 0xb5, 0x46, 0x54, 0xc7, 0x25, 0x0c, 0xf5, 0x46, 0x9d, 0xb6, 0xe1,
+                0xe5, 0x45, 0xf3, 0x5e, 0x38, 0xe9, 0x77, 0x8d, 0x5f, 0x50, 0x0f, 0xea, 0x67, 0x06,
+                0x96, 0xc4, 0xbd, 0xc3,
             ],
             "changing V2's pinned semantics requires a new advertised profile digest"
         );
@@ -4467,8 +4591,8 @@ mod tests {
 
     #[test]
     fn v2_history_state_exposes_safe_rotation_and_reclaim_progress() {
-        let active = FencedTransitionV2HistoryEpoch::new(3).expect("epoch");
-        let retired = FencedTransitionV2HistoryEpoch::new(2).expect("epoch");
+        let active = FencedTransitionV2HistoryEpoch::new(9).expect("epoch");
+        let retired = FencedTransitionV2HistoryEpoch::new(1).expect("epoch");
         let active_state = FencedTransitionV2HistoryState::new(
             Some(active),
             Some(retired),
@@ -4488,7 +4612,7 @@ mod tests {
         assert_eq!(active_state.reclaimed_entries(), 12);
 
         let reclaiming = FencedTransitionV2HistoryState::new(
-            None,
+            Some(FencedTransitionV2HistoryEpoch::new(8).expect("epoch")),
             Some(retired),
             Some(retired),
             FENCED_TRANSITION_V2_RECLAIM_BATCH,
@@ -4502,16 +4626,19 @@ mod tests {
             reclaiming.reclaim_remaining(),
             FENCED_TRANSITION_V2_RECLAIM_BATCH
         );
-        assert!(FencedTransitionV2HistoryState::new(
-            Some(active),
-            Some(retired),
-            Some(retired),
-            1,
-            12,
-            0,
-            100_000,
-        )
-        .is_err());
+        assert!(
+            FencedTransitionV2HistoryState::new(
+                Some(FencedTransitionV2HistoryEpoch::new(9).expect("epoch")),
+                Some(retired),
+                Some(retired),
+                1,
+                12,
+                0,
+                100_000,
+            )
+            .is_err(),
+            "the physical reclaimer occupies the eighth epoch slot"
+        );
     }
 
     #[test]
@@ -4540,6 +4667,23 @@ mod tests {
             )
             .expect("decode valid state"),
             initial
+        );
+        let full_pre_floor_interval = FencedTransitionV2HistoryState::new(
+            Some(FencedTransitionV2HistoryEpoch::new(8).expect("eighth active epoch")),
+            None,
+            None,
+            0,
+            2,
+            FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+            0,
+        )
+        .expect("floor zero retains epochs one through eight");
+        assert_eq!(
+            serde_json::from_value::<FencedTransitionV2HistoryState>(
+                serde_json::to_value(full_pre_floor_interval).expect("encode floor-zero interval"),
+            )
+            .expect("decode floor-zero interval"),
+            full_pre_floor_interval
         );
         for malformed in [
             r#"{"active_epoch":1,"retired_through":null,"reclaim_epoch":1,"reclaim_remaining":1,"generation":1,"bound_entries":0,"reclaimed_entries":0}"#,
@@ -4603,7 +4747,8 @@ mod tests {
             FencedTransitionV2HistoryEpoch::new(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
                 .expect("epoch");
         let epoch_two = FencedTransitionV2HistoryEpoch::new(2).expect("epoch");
-        let epoch_three = FencedTransitionV2HistoryEpoch::new(3).expect("epoch");
+        let epoch_nine = FencedTransitionV2HistoryEpoch::new(9).expect("epoch");
+        let epoch_ten = FencedTransitionV2HistoryEpoch::new(10).expect("epoch");
         let maximum_epoch =
             FencedTransitionV2HistoryEpoch::new(FENCED_TRANSITION_V2_MAX_HISTORY_EPOCH)
                 .expect("epoch");
@@ -4611,20 +4756,14 @@ mod tests {
         for state in [
             // An initialized history cannot have neither an active nor a reclaim epoch.
             FencedTransitionV2HistoryState::new(None, None, None, 0, 1, 0, 0),
-            // The first active epoch is exactly one.
-            FencedTransitionV2HistoryState::new(Some(epoch_two), None, None, 0, 1, 0, 0),
+            // With no retired floor, at most eight retained epochs begin at
+            // the fixed initial epoch.
+            FencedTransitionV2HistoryState::new(Some(epoch_nine), None, None, 0, 1, 0, 0),
             // Active epochs do not carry in-progress reclaim work.
             FencedTransitionV2HistoryState::new(Some(epoch_one), None, None, 1, 1, 0, 0),
-            // Rotation must open the immediate successor, never leave a gap.
-            FencedTransitionV2HistoryState::new(
-                Some(epoch_three),
-                Some(epoch_one),
-                None,
-                0,
-                1,
-                0,
-                0,
-            ),
+            // At most seven closed replay epochs plus one active epoch may be
+            // retained without a physical reclaimer.
+            FencedTransitionV2HistoryState::new(Some(epoch_ten), Some(epoch_one), None, 0, 1, 0, 0),
             // A saturated retired epoch has no representable next active epoch.
             FencedTransitionV2HistoryState::new(
                 Some(maximum_epoch),
@@ -4635,9 +4774,18 @@ mod tests {
                 0,
                 0,
             ),
-            // Reclaim targets exactly the retired floor and has no active bindings.
+            // Reclaim targets exactly the retired floor and leaves one
+            // physical slot free for its bounded rows.
             FencedTransitionV2HistoryState::new(None, Some(epoch_two), Some(epoch_one), 1, 1, 0, 0),
-            FencedTransitionV2HistoryState::new(None, Some(epoch_two), Some(epoch_two), 1, 1, 1, 0),
+            FencedTransitionV2HistoryState::new(
+                Some(epoch_nine),
+                Some(epoch_one),
+                Some(epoch_one),
+                1,
+                1,
+                1,
+                0,
+            ),
             // A reclaim operation is never empty or beyond the physical cap.
             FencedTransitionV2HistoryState::new(None, Some(epoch_two), Some(epoch_two), 0, 1, 0, 0),
             FencedTransitionV2HistoryState::new(

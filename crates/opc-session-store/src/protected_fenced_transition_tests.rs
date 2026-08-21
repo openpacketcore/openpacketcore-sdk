@@ -16,14 +16,19 @@ use opc_key::{
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
+use crate::fenced_transition::FencedTransitionV2Effect;
 use crate::{
     checked_session_deadline, validate_consensus_physical_fenced_transition_request,
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
     EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
     FencedTransitionLease, FencedTransitionMutation, FencedTransitionMutationResult,
     FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
-    FencedTransitionRequestId, FencedTransitionStatus, Generation, LeaseError, LeaseGuard, OwnerId,
-    PreparedFencedTransition, PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
+    FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
+    FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, FencedTransitionV2HistoryState,
+    FencedTransitionV2JournalScope, FencedTransitionV2PreparedJournal,
+    FencedTransitionV2PreparedJournalKey, FencedTransitionV2Request, FencedTransitionV2Status,
+    Generation, LeaseError, LeaseGuard, OwnerId, PreparedFencedTransition,
+    PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
     PreparedFencedTransitionLookup, RemoteSealingSessionBackend, SessionBackend, SessionKey,
     SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult, SessionPayloadEncoding,
     SessionStore, StateClass, StateType, StoreError, StoredSessionRecord,
@@ -36,6 +41,7 @@ const SYNTHETIC_PAYLOAD: &[u8] = b"synthetic-opaque-payload";
 struct JournalFixture {
     _directory: tempfile::TempDir,
     path: PathBuf,
+    v2_path: PathBuf,
     key: [u8; 32],
 }
 
@@ -50,9 +56,11 @@ impl JournalFixture {
                 .expect("private journal directory");
         }
         let path = directory.path().join("prepared.sqlite3");
+        let v2_path = directory.path().join("prepared-v2.sqlite3");
         Self {
             _directory: directory,
             path,
+            v2_path,
             key: [fill; 32],
         }
     }
@@ -67,6 +75,22 @@ impl JournalFixture {
             }
             .expect("open prepared journal"),
         )
+    }
+
+    fn open_v2(&self) -> Arc<FencedTransitionV2PreparedJournal> {
+        let key = FencedTransitionV2PreparedJournalKey::from_bytes(self.key);
+        Arc::new(
+            if self.v2_path.exists() {
+                FencedTransitionV2PreparedJournal::open_existing(&self.v2_path, key)
+            } else {
+                FencedTransitionV2PreparedJournal::create_new(&self.v2_path, key)
+            }
+            .expect("open V2 prepared journal"),
+        )
+    }
+
+    fn v2_scope(&self) -> FencedTransitionV2JournalScope {
+        FencedTransitionV2JournalScope::from_bytes([self.key[0] ^ 0x5a; 32])
     }
 
     fn replace_token_with_oversized_blob(&self) {
@@ -90,6 +114,21 @@ impl JournalFixture {
             1
         );
     }
+}
+
+fn protected_v2_journal_scope_for<B: SessionBackend + ?Sized>(
+    backend: &B,
+    scope: FencedTransitionV2JournalScope,
+    namespace: &str,
+    mode: crate::backend::ProtectedFencedTransitionV2JournalMode,
+) -> [u8; 32] {
+    crate::backend::protected_fenced_transition_v2_journal_scope(
+        backend,
+        Some(scope),
+        namespace,
+        mode,
+    )
+    .expect("valid protected V2 test scope")
 }
 
 fn tenant() -> TenantId {
@@ -230,10 +269,40 @@ fn refresh_request(id: u8) -> FencedTransitionRequest {
     .expect("valid refresh request")
 }
 
+fn initial_v2_epoch() -> FencedTransitionV2HistoryEpoch {
+    FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch")
+}
+
+fn active_v2_history(epoch: FencedTransitionV2HistoryEpoch) -> FencedTransitionV2HistoryState {
+    FencedTransitionV2HistoryState::new(Some(epoch), None, None, 0, 1, 0, 0)
+        .expect("active V2 history")
+}
+
+fn create_v2_request(id: u8, epoch: FencedTransitionV2HistoryEpoch) -> FencedTransitionV2Request {
+    let request = create_request(id);
+    FencedTransitionV2Request::new(
+        epoch,
+        FencedTransitionV2CallerNonce::from_bytes([id; 16]),
+        request.lease().clone(),
+        request.mutation().clone(),
+    )
+    .expect("valid V2 create request")
+}
+
 #[derive(Default)]
 struct SpyState {
     capability: Option<AtomicFencedTransitionCapability>,
     capability_calls: usize,
+    v2_capability: Option<FencedTransitionV2Capability>,
+    v2_history: Option<FencedTransitionV2HistoryState>,
+    v2_executed: Vec<FencedTransitionV2Request>,
+    v2_statuses: Vec<FencedTransitionV2Request>,
+    v2_delay_ambiguous_commit: bool,
+    v2_not_transmitted: usize,
+    v2_not_transmitted_gate: Option<V2NotTransmittedGate>,
+    v2_not_transmitted_error: Option<StoreError>,
+    v2_pending: Option<FencedTransitionV2Request>,
+    v2_receipt: Option<(FencedTransitionV2Request, FencedTransitionOutcome)>,
     reject_expiry_preflight: bool,
     observed: Option<StoredSessionRecord>,
     observation_calls: usize,
@@ -248,6 +317,12 @@ struct SpyState {
     enforce_physical_admission: bool,
     pending: Option<FencedTransitionRequest>,
     receipt: Option<(FencedTransitionRequest, FencedTransitionOutcome)>,
+}
+
+#[derive(Clone)]
+struct V2NotTransmittedGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 
 /// A deliberately adversarial atomic boundary: first dispatch is definitely
@@ -338,9 +413,119 @@ impl AtomicSpy {
     fn reject_physical_tokens(&self) {
         self.reject_physical_tokens.store(true, Ordering::SeqCst);
     }
+
+    fn enable_v2(&self) {
+        let mut state = self.state.lock().expect("spy lock");
+        state.v2_capability = Some(FencedTransitionV2Capability::V2);
+        state.v2_history = Some(active_v2_history(initial_v2_epoch()));
+    }
+
+    fn set_v2_history(&self, history: FencedTransitionV2HistoryState) {
+        self.state.lock().expect("spy lock").v2_history = Some(history);
+    }
+
+    fn delay_v2_ambiguous_commit(&self) {
+        self.state
+            .lock()
+            .expect("spy lock")
+            .v2_delay_ambiguous_commit = true;
+    }
+
+    fn not_transmit_v2_once(&self) {
+        self.state.lock().expect("spy lock").v2_not_transmitted += 1;
+    }
+
+    fn reject_v2_preproposal_once(&self) {
+        let mut state = self.state.lock().expect("spy lock");
+        state.v2_not_transmitted += 1;
+        state.v2_not_transmitted_error = Some(StoreError::PayloadTooLarge { actual: 2, max: 1 });
+    }
+
+    fn block_next_v2_not_transmitted(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut state = self.state.lock().expect("spy lock");
+        state.v2_not_transmitted += 1;
+        state.v2_not_transmitted_gate = Some(V2NotTransmittedGate {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        (entered, release)
+    }
+
+    fn take_v2_not_transmitted_gate(&self) -> Option<(Option<V2NotTransmittedGate>, StoreError)> {
+        let mut state = self.state.lock().expect("spy lock");
+        if state.v2_not_transmitted == 0 {
+            return None;
+        }
+        state.v2_not_transmitted -= 1;
+        Some((
+            state.v2_not_transmitted_gate.take(),
+            state.v2_not_transmitted_error.take().unwrap_or_else(|| {
+                StoreError::BackendUnavailable("synthetic V2 pre-dispatch failure".into())
+            }),
+        ))
+    }
+
+    fn commit_v2_delayed(&self) {
+        let mut state = self.state.lock().expect("spy lock");
+        let request = state.v2_pending.take().expect("pending V2 transition");
+        let outcome = v2_outcome_for(&request);
+        state.v2_receipt = Some((request, outcome));
+    }
+
+    fn v2_executed(&self) -> Vec<FencedTransitionV2Request> {
+        self.state.lock().expect("spy lock").v2_executed.clone()
+    }
 }
 
 fn outcome_for(request: &FencedTransitionRequest) -> FencedTransitionOutcome {
+    let recorded_at = Timestamp::now_utc();
+    let lease = match request.lease() {
+        FencedTransitionLease::Acquire {
+            key, owner, ttl, ..
+        } => LeaseGuard::new(
+            key.clone(),
+            owner.clone(),
+            request.lease().committed_fence().expect("committed fence"),
+            recorded_at,
+            checked_session_deadline(recorded_at, *ttl).expect("lease expiry"),
+            7,
+        ),
+        FencedTransitionLease::Renew { lease, ttl } => LeaseGuard::new(
+            lease.key().clone(),
+            lease.owner().clone(),
+            lease.fence(),
+            recorded_at,
+            checked_session_deadline(recorded_at, *ttl).expect("lease expiry"),
+            lease.credential_id(),
+        ),
+    };
+    let mutation = match request.mutation() {
+        FencedTransitionMutation::Create { .. } => FencedTransitionMutationResult::Created,
+        FencedTransitionMutation::Update { .. } => FencedTransitionMutationResult::Updated,
+        FencedTransitionMutation::Delete { .. } => FencedTransitionMutationResult::Deleted,
+        FencedTransitionMutation::RefreshTtl { ttl, .. } => {
+            FencedTransitionMutationResult::TtlRefreshed {
+                expires_at: checked_session_deadline(recorded_at, *ttl).expect("refresh expiry"),
+            }
+        }
+    };
+    let generation = request.mutation().record().map_or_else(
+        || {
+            request
+                .mutation()
+                .expected_generation()
+                .expect("existing generation")
+        },
+        |record| record.generation,
+    );
+    FencedTransitionOutcome::new(lease, generation, mutation, recorded_at).expect("valid outcome")
+}
+
+fn v2_outcome_for(request: &FencedTransitionV2Request) -> FencedTransitionOutcome {
     let recorded_at = Timestamp::now_utc();
     let lease = match request.lease() {
         FencedTransitionLease::Acquire {
@@ -438,6 +623,166 @@ impl SessionBackend for AtomicSpy {
         let mut state = self.state.lock().expect("spy lock");
         state.capability_calls += 1;
         Ok(state.capability)
+    }
+
+    async fn fenced_transition_v2_capability(
+        &self,
+    ) -> Result<Option<FencedTransitionV2Capability>, StoreError> {
+        Ok(self.state.lock().expect("spy lock").v2_capability)
+    }
+
+    async fn fenced_transition_v2_history_state(
+        &self,
+    ) -> Result<FencedTransitionV2HistoryState, StoreError> {
+        self.state
+            .lock()
+            .expect("spy lock")
+            .v2_history
+            .ok_or_else(|| {
+                StoreError::CapabilityNotSupported(
+                    "atomic_fenced_transition_epoch_history_v2".into(),
+                )
+            })
+    }
+
+    async fn fenced_transition_v2(
+        &self,
+        request: FencedTransitionV2Request,
+    ) -> Result<FencedTransitionOutcome, StoreError> {
+        request.validate()?;
+        let mut state = self.state.lock().expect("spy lock");
+        let history = state.v2_history.ok_or_else(|| {
+            StoreError::CapabilityNotSupported("atomic_fenced_transition_epoch_history_v2".into())
+        })?;
+        let epoch = request.request_id().epoch();
+        if history
+            .retired_through()
+            .is_some_and(|floor| epoch <= floor)
+        {
+            return Err(StoreError::FencedTransitionHistoryEpochRetired);
+        }
+        if let Some((bound, outcome)) = state.v2_receipt.clone() {
+            state.v2_executed.push(request.clone());
+            return if bound.matches(&request) {
+                Ok(outcome)
+            } else if bound.request_id() == request.request_id() {
+                Err(StoreError::FencedTransitionRequestConflict)
+            } else {
+                Err(StoreError::FencedTransitionOutcomeUnknown)
+            };
+        }
+        if history.active_epoch() != Some(epoch) {
+            return Err(StoreError::FencedTransitionHistoryEpochNotActive);
+        }
+        state.v2_executed.push(request.clone());
+        if state.v2_delay_ambiguous_commit {
+            state.v2_pending = Some(request);
+            return Err(StoreError::FencedTransitionOutcomeUnknown);
+        }
+        let outcome = v2_outcome_for(&request);
+        state.v2_receipt = Some((request, outcome.clone()));
+        Ok(outcome)
+    }
+
+    async fn fenced_transition_v2_effect(
+        &self,
+        request: FencedTransitionV2Request,
+    ) -> FencedTransitionV2Effect<Result<FencedTransitionOutcome, StoreError>> {
+        let request_id = request.request_id();
+        if let Some((gate, error)) = self.take_v2_not_transmitted_gate() {
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            return FencedTransitionV2Effect::NotTransmitted(error);
+        }
+        match self.fenced_transition_v2(request).await {
+            Ok(outcome) => FencedTransitionV2Effect::Resolved(Ok(outcome)),
+            Err(StoreError::FencedTransitionOutcomeUnknown) => {
+                FencedTransitionV2Effect::OutcomeUnknown {
+                    request_ids: vec![request_id],
+                }
+            }
+            Err(error) => FencedTransitionV2Effect::Resolved(Err(error)),
+        }
+    }
+
+    async fn fenced_transition_v2_batch(
+        &self,
+        requests: Vec<FencedTransitionV2Request>,
+    ) -> Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError> {
+        crate::consensus::types::validate_fenced_transition_v2_batch(&requests)?;
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            outcomes.push(self.fenced_transition_v2(request).await);
+        }
+        Ok(outcomes)
+    }
+
+    async fn fenced_transition_v2_batch_effect(
+        &self,
+        requests: Vec<FencedTransitionV2Request>,
+    ) -> FencedTransitionV2Effect<
+        Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError>,
+    > {
+        if let Err(error) = crate::consensus::types::validate_fenced_transition_v2_batch(&requests)
+        {
+            return FencedTransitionV2Effect::Resolved(Err(error));
+        }
+        if let Some((gate, error)) = self.take_v2_not_transmitted_gate() {
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            return FencedTransitionV2Effect::NotTransmitted(error);
+        }
+        let request_ids = requests
+            .iter()
+            .map(FencedTransitionV2Request::request_id)
+            .collect();
+        match self.fenced_transition_v2_batch(requests).await {
+            Ok(outcomes) => FencedTransitionV2Effect::Resolved(Ok(outcomes)),
+            Err(StoreError::FencedTransitionOutcomeUnknown) => {
+                FencedTransitionV2Effect::OutcomeUnknown { request_ids }
+            }
+            Err(error) => FencedTransitionV2Effect::Resolved(Err(error)),
+        }
+    }
+
+    async fn fenced_transition_v2_status(
+        &self,
+        request: &FencedTransitionV2Request,
+    ) -> Result<FencedTransitionV2Status, StoreError> {
+        if let Err(error) = request.validate() {
+            return if matches!(error, StoreError::FencedTransitionRequestConflict) {
+                Ok(FencedTransitionV2Status::RequestConflict)
+            } else {
+                Err(error)
+            };
+        }
+        let mut state = self.state.lock().expect("spy lock");
+        let history = state.v2_history.ok_or_else(|| {
+            StoreError::CapabilityNotSupported("atomic_fenced_transition_epoch_history_v2".into())
+        })?;
+        let epoch = request.request_id().epoch();
+        if history
+            .retired_through()
+            .is_some_and(|floor| epoch <= floor)
+        {
+            return Ok(FencedTransitionV2Status::Retired);
+        }
+        let status = match &state.v2_receipt {
+            Some((bound, outcome)) if bound.matches(request) => {
+                FencedTransitionV2Status::Recorded(Box::new(Ok(outcome.clone())))
+            }
+            Some((bound, _)) if bound.request_id() == request.request_id() => {
+                FencedTransitionV2Status::RequestConflict
+            }
+            _ if history.active_epoch() == Some(epoch) => FencedTransitionV2Status::NotFound,
+            _ => FencedTransitionV2Status::EpochNotActive,
+        };
+        state.v2_statuses.push(request.clone());
+        Ok(status)
     }
 
     async fn prepare_fenced_transition(
@@ -659,6 +1004,1195 @@ impl RemoteSealProvider for CountingRemoteProvider {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.unseal(key_id, aad, ciphertext_and_tag).await
     }
+}
+
+fn conflicting_v2_request(request: &FencedTransitionV2Request) -> FencedTransitionV2Request {
+    let mut wire = serde_json::to_value(request).expect("serialize V2 request");
+    let body_commitment = wire
+        .get_mut("request_id")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|request_id| request_id.get_mut("body_commitment"))
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("fixed-width V2 body commitment");
+    let last = body_commitment
+        .last()
+        .and_then(serde_json::Value::as_u64)
+        .expect("V2 body commitment byte");
+    *body_commitment
+        .last_mut()
+        .expect("last V2 body commitment byte") = serde_json::json!(last ^ 1);
+    serde_json::from_value(wire).expect("wire retains conflicting V2 request")
+}
+
+#[tokio::test]
+async fn protected_v2_batches_reuse_existing_mappings_and_seal_only_missing_items() {
+    let epoch = initial_v2_epoch();
+
+    let local_spy = Arc::new(AtomicSpy::new());
+    local_spy.enable_v2();
+    let local_fixture = JournalFixture::new(0xc1);
+    let local_provider = CountingKeyProvider::with_key("local-v2-batch", 0x91);
+    let local = EncryptingSessionBackend::new(
+        Arc::clone(&local_spy),
+        Arc::clone(&local_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(local_fixture.open_v2())
+    .with_fenced_transition_v2_journal_scope(local_fixture.v2_scope());
+    let local_batch = vec![
+        create_v2_request(0x41, epoch),
+        create_v2_request(0x42, epoch),
+        create_v2_request(0x43, epoch),
+    ];
+    assert!(local
+        .fenced_transition_v2(local_batch[0].clone())
+        .await
+        .is_ok());
+    assert_eq!(local_provider.calls(), 1);
+    assert!(local
+        .fenced_transition_v2_batch(local_batch.clone())
+        .await
+        .is_ok());
+    assert_eq!(local_provider.calls(), 3, "only the two missing items seal");
+    assert!(local.fenced_transition_v2_batch(local_batch).await.is_ok());
+    assert_eq!(local_provider.calls(), 3, "exact replay does not reseal");
+    let local_physical = local_spy.v2_executed();
+    assert_eq!(local_physical.len(), 7);
+    assert!(local_physical[0].matches(&local_physical[1]));
+    assert!(local_physical[1].matches(&local_physical[4]));
+    assert!(local_physical[2].matches(&local_physical[5]));
+    assert!(local_physical[3].matches(&local_physical[6]));
+
+    let remote_spy = Arc::new(AtomicSpy::new());
+    remote_spy.enable_v2();
+    let remote_fixture = JournalFixture::new(0xc2);
+    let remote_provider = CountingRemoteProvider::with_key("remote-v2-batch", 0x92);
+    let remote = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_spy),
+        Arc::clone(&remote_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(remote_fixture.open_v2())
+    .with_fenced_transition_v2_journal_scope(remote_fixture.v2_scope());
+    let remote_batch = vec![
+        create_v2_request(0x44, epoch),
+        create_v2_request(0x45, epoch),
+        create_v2_request(0x46, epoch),
+    ];
+    assert!(remote
+        .fenced_transition_v2(remote_batch[0].clone())
+        .await
+        .is_ok());
+    assert_eq!(remote_provider.calls(), 1);
+    assert!(remote
+        .fenced_transition_v2_batch(remote_batch.clone())
+        .await
+        .is_ok());
+    assert_eq!(
+        remote_provider.calls(),
+        3,
+        "only the two missing items seal"
+    );
+    assert!(remote
+        .fenced_transition_v2_batch(remote_batch)
+        .await
+        .is_ok());
+    assert_eq!(remote_provider.calls(), 3, "exact replay does not reseal");
+    let remote_physical = remote_spy.v2_executed();
+    assert_eq!(remote_physical.len(), 7);
+    assert!(remote_physical[0].matches(&remote_physical[1]));
+    assert!(remote_physical[1].matches(&remote_physical[4]));
+    assert!(remote_physical[2].matches(&remote_physical[5]));
+    assert!(remote_physical[3].matches(&remote_physical[6]));
+}
+
+#[tokio::test]
+async fn protected_v2_proven_not_transmitted_and_preproposal_rejection_recover_capacity() {
+    let epoch = initial_v2_epoch();
+
+    let local_spy = Arc::new(AtomicSpy::new());
+    local_spy.enable_v2();
+    local_spy.reject_v2_preproposal_once();
+    let local_fixture = JournalFixture::new(0xa1);
+    let local_journal = local_fixture.open_v2();
+    let local_provider = CountingKeyProvider::with_key("local-v2-not-transmitted", 0xa1);
+    let local = EncryptingSessionBackend::new(
+        Arc::clone(&local_spy),
+        Arc::clone(&local_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&local_journal))
+    .with_fenced_transition_v2_journal_scope(local_fixture.v2_scope());
+    let local_request = create_v2_request(0x71, epoch);
+    assert!(matches!(
+        local.fenced_transition_v2(local_request.clone()).await,
+        Err(StoreError::PayloadTooLarge { actual: 2, max: 1 })
+    ));
+    let local_scope = protected_v2_journal_scope_for(
+        local_spy.as_ref(),
+        local_fixture.v2_scope(),
+        NAMESPACE,
+        crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
+    );
+    assert!(local_journal
+        .lookup(local_scope, local_request.request_id())
+        .await
+        .expect("local not-transmitted journal lookup")
+        .is_none());
+    assert!(local
+        .fenced_transition_v2(local_request.clone())
+        .await
+        .is_ok());
+    assert_eq!(
+        local_provider.calls(),
+        2,
+        "retry reseals only after cleanup"
+    );
+
+    let remote_spy = Arc::new(AtomicSpy::new());
+    remote_spy.enable_v2();
+    remote_spy.not_transmit_v2_once();
+    let remote_fixture = JournalFixture::new(0xa2);
+    let remote_journal = remote_fixture.open_v2();
+    let remote_provider = CountingRemoteProvider::with_key("remote-v2-not-transmitted", 0xa2);
+    let remote = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_spy),
+        Arc::clone(&remote_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&remote_journal))
+    .with_fenced_transition_v2_journal_scope(remote_fixture.v2_scope());
+    let remote_request = create_v2_request(0x72, epoch);
+    assert!(matches!(
+        remote.fenced_transition_v2(remote_request.clone()).await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    let remote_scope = protected_v2_journal_scope_for(
+        remote_spy.as_ref(),
+        remote_fixture.v2_scope(),
+        NAMESPACE,
+        crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+    );
+    assert!(remote_journal
+        .lookup(remote_scope, remote_request.request_id())
+        .await
+        .expect("remote not-transmitted journal lookup")
+        .is_none());
+    assert!(remote
+        .fenced_transition_v2(remote_request.clone())
+        .await
+        .is_ok());
+    assert_eq!(
+        remote_provider.calls(),
+        2,
+        "retry reseals only after cleanup"
+    );
+
+    let local_batch_spy = Arc::new(AtomicSpy::new());
+    local_batch_spy.enable_v2();
+    local_batch_spy.not_transmit_v2_once();
+    let local_batch_fixture = JournalFixture::new(0xa3);
+    let local_batch_journal = local_batch_fixture.open_v2();
+    let local_batch_provider =
+        CountingKeyProvider::with_key("local-v2-batch-not-transmitted", 0xa3);
+    let local_batch_backend = EncryptingSessionBackend::new(
+        Arc::clone(&local_batch_spy),
+        Arc::clone(&local_batch_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&local_batch_journal))
+    .with_fenced_transition_v2_journal_scope(local_batch_fixture.v2_scope());
+    let local_batch = vec![
+        create_v2_request(0x73, epoch),
+        create_v2_request(0x74, epoch),
+    ];
+    assert!(matches!(
+        local_batch_backend
+            .fenced_transition_v2_batch(local_batch.clone())
+            .await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    let local_batch_scope = protected_v2_journal_scope_for(
+        local_batch_spy.as_ref(),
+        local_batch_fixture.v2_scope(),
+        NAMESPACE,
+        crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
+    );
+    for request in &local_batch {
+        assert!(local_batch_journal
+            .lookup(local_batch_scope, request.request_id())
+            .await
+            .expect("local batch not-transmitted journal lookup")
+            .is_none());
+    }
+    assert!(local_batch_backend
+        .fenced_transition_v2_batch(local_batch)
+        .await
+        .is_ok());
+    assert_eq!(
+        local_batch_provider.calls(),
+        4,
+        "batch retry reseals every conditionally removed mapping"
+    );
+
+    let remote_batch_spy = Arc::new(AtomicSpy::new());
+    remote_batch_spy.enable_v2();
+    remote_batch_spy.reject_v2_preproposal_once();
+    let remote_batch_fixture = JournalFixture::new(0xa4);
+    let remote_batch_journal = remote_batch_fixture.open_v2();
+    let remote_batch_provider =
+        CountingRemoteProvider::with_key("remote-v2-batch-not-transmitted", 0xa4);
+    let remote_batch_backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_batch_spy),
+        Arc::clone(&remote_batch_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&remote_batch_journal))
+    .with_fenced_transition_v2_journal_scope(remote_batch_fixture.v2_scope());
+    let remote_batch = vec![
+        create_v2_request(0x75, epoch),
+        create_v2_request(0x76, epoch),
+    ];
+    assert!(matches!(
+        remote_batch_backend
+            .fenced_transition_v2_batch(remote_batch.clone())
+            .await,
+        Err(StoreError::PayloadTooLarge { actual: 2, max: 1 })
+    ));
+    let remote_batch_scope = protected_v2_journal_scope_for(
+        remote_batch_spy.as_ref(),
+        remote_batch_fixture.v2_scope(),
+        NAMESPACE,
+        crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+    );
+    for request in &remote_batch {
+        assert!(remote_batch_journal
+            .lookup(remote_batch_scope, request.request_id())
+            .await
+            .expect("remote batch not-transmitted journal lookup")
+            .is_none());
+    }
+    assert!(remote_batch_backend
+        .fenced_transition_v2_batch(remote_batch)
+        .await
+        .is_ok());
+    assert_eq!(
+        remote_batch_provider.calls(),
+        4,
+        "batch retry reseals every conditionally removed mapping"
+    );
+}
+
+#[tokio::test]
+async fn protected_v2_not_transmitted_cleanup_cannot_remove_a_same_id_retry_mapping() {
+    let epoch = initial_v2_epoch();
+    let spy = Arc::new(AtomicSpy::new());
+    spy.enable_v2();
+    let (entered, release) = spy.block_next_v2_not_transmitted();
+    let fixture = JournalFixture::new(0xa5);
+    let journal = fixture.open_v2();
+    let provider = CountingKeyProvider::with_key("local-v2-same-id-cleanup", 0xa5);
+    let backend = EncryptingSessionBackend::new(Arc::clone(&spy), Arc::clone(&provider), NAMESPACE)
+        .with_fenced_transition_v2_journal(Arc::clone(&journal))
+        .with_fenced_transition_v2_journal_scope(fixture.v2_scope());
+    let request = create_v2_request(0x77, epoch);
+
+    let entered_wait = entered.notified();
+    let first_backend = backend.clone();
+    let first_request = request.clone();
+    let first =
+        tokio::spawn(async move { first_backend.fenced_transition_v2(first_request).await });
+    entered_wait.await;
+
+    let mut second = Box::pin(backend.fenced_transition_v2(request.clone()));
+    assert!(matches!(
+        futures_util::poll!(&mut second),
+        std::task::Poll::Pending
+    ));
+    release.notify_one();
+
+    assert!(matches!(
+        first.await.expect("first same-ID task joins"),
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert!(second.await.is_ok());
+    assert_eq!(provider.calls(), 2, "the retry binds after exact cleanup");
+    let scope = protected_v2_journal_scope_for(
+        spy.as_ref(),
+        fixture.v2_scope(),
+        NAMESPACE,
+        crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
+    );
+    assert!(journal
+        .lookup(scope, request.request_id())
+        .await
+        .expect("same-ID journal lookup")
+        .is_some());
+    assert_eq!(spy.v2_executed().len(), 1);
+}
+
+#[tokio::test]
+async fn protected_v2_cancellation_retains_a_recoverable_mapping_without_background_work() {
+    let epoch = initial_v2_epoch();
+    let spy = Arc::new(AtomicSpy::new());
+    spy.enable_v2();
+    let (entered, _release) = spy.block_next_v2_not_transmitted();
+    let fixture = JournalFixture::new(0xa6);
+    let journal = fixture.open_v2();
+    let provider = CountingKeyProvider::with_key("local-v2-cancellation", 0xa6);
+    let backend = EncryptingSessionBackend::new(Arc::clone(&spy), Arc::clone(&provider), NAMESPACE)
+        .with_fenced_transition_v2_journal(Arc::clone(&journal))
+        .with_fenced_transition_v2_journal_scope(fixture.v2_scope());
+    let request = create_v2_request(0x78, epoch);
+
+    let entered_wait = entered.notified();
+    let cancelled_backend = backend.clone();
+    let cancelled_request = request.clone();
+    let cancelled = tokio::spawn(async move {
+        cancelled_backend
+            .fenced_transition_v2(cancelled_request)
+            .await
+    });
+    entered_wait.await;
+    cancelled.abort();
+    assert!(cancelled
+        .await
+        .expect_err("cancelled task must not join")
+        .is_cancelled());
+
+    let scope = protected_v2_journal_scope_for(
+        spy.as_ref(),
+        fixture.v2_scope(),
+        NAMESPACE,
+        crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
+    );
+    assert!(journal
+        .lookup(scope, request.request_id())
+        .await
+        .expect("cancelled journal lookup")
+        .is_some());
+    assert!(backend.fenced_transition_v2(request).await.is_ok());
+    assert_eq!(
+        provider.calls(),
+        1,
+        "retry reuses the retained sealed mapping"
+    );
+}
+
+async fn abort_v2_cleanup_while_final_poll_is_committed<T>(
+    mut gate: crate::fenced_transition_journal::V2RemoveIfExactAfterCommitGate,
+    task: tokio::task::JoinHandle<T>,
+) -> T
+where
+    T: Send + 'static,
+{
+    gate.wait_until_committed().await;
+    task.abort();
+    gate.release();
+    task.await
+        .expect("no-yield cleanup finalization must complete before cancellation")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_v2_local_not_transmitted_cleanup_finalizes_without_a_cancellation_gap() {
+    let epoch = initial_v2_epoch();
+    let singleton_spy = Arc::new(AtomicSpy::new());
+    singleton_spy.enable_v2();
+    singleton_spy.not_transmit_v2_once();
+    let singleton_fixture = JournalFixture::new(0xab);
+    let singleton_journal = singleton_fixture.open_v2();
+    let singleton_provider = CountingKeyProvider::with_key("local-v2-final-singleton", 0xab);
+    let singleton_backend = EncryptingSessionBackend::new(
+        Arc::clone(&singleton_spy),
+        Arc::clone(&singleton_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&singleton_journal))
+    .with_fenced_transition_v2_journal_scope(singleton_fixture.v2_scope());
+    let singleton_request = create_v2_request(0x79, epoch);
+    let gate = crate::fenced_transition_journal::block_next_v2_remove_if_exact_after_commit(
+        singleton_journal.as_ref(),
+    );
+    let task_backend = singleton_backend.clone();
+    let task_request = singleton_request.clone();
+    let singleton_result = abort_v2_cleanup_while_final_poll_is_committed(
+        gate,
+        tokio::spawn(async move { task_backend.fenced_transition_v2(task_request).await }),
+    )
+    .await;
+    assert!(matches!(
+        singleton_result,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    let singleton_scope = protected_v2_journal_scope_for(
+        singleton_spy.as_ref(),
+        singleton_fixture.v2_scope(),
+        NAMESPACE,
+        crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
+    );
+    assert!(singleton_journal
+        .lookup(singleton_scope, singleton_request.request_id())
+        .await
+        .expect("completed singleton cleanup lookup")
+        .is_none());
+    assert!(singleton_backend
+        .fenced_transition_v2(singleton_request)
+        .await
+        .is_ok());
+    assert_eq!(singleton_provider.calls(), 2);
+
+    let batch_spy = Arc::new(AtomicSpy::new());
+    batch_spy.enable_v2();
+    batch_spy.not_transmit_v2_once();
+    let batch_fixture = JournalFixture::new(0xac);
+    let batch_journal = batch_fixture.open_v2();
+    let batch_provider = CountingKeyProvider::with_key("local-v2-final-batch", 0xac);
+    let batch_backend = EncryptingSessionBackend::new(
+        Arc::clone(&batch_spy),
+        Arc::clone(&batch_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&batch_journal))
+    .with_fenced_transition_v2_journal_scope(batch_fixture.v2_scope());
+    let batch_requests = vec![
+        create_v2_request(0x7a, epoch),
+        create_v2_request(0x7b, epoch),
+    ];
+    let gate = crate::fenced_transition_journal::block_next_v2_remove_if_exact_after_commit(
+        batch_journal.as_ref(),
+    );
+    let task_backend = batch_backend.clone();
+    let task_requests = batch_requests.clone();
+    let batch_result = abort_v2_cleanup_while_final_poll_is_committed(
+        gate,
+        tokio::spawn(async move { task_backend.fenced_transition_v2_batch(task_requests).await }),
+    )
+    .await;
+    assert!(matches!(
+        batch_result,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    let batch_scope = protected_v2_journal_scope_for(
+        batch_spy.as_ref(),
+        batch_fixture.v2_scope(),
+        NAMESPACE,
+        crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
+    );
+    for request in &batch_requests {
+        assert!(batch_journal
+            .lookup(batch_scope, request.request_id())
+            .await
+            .expect("completed batch cleanup lookup")
+            .is_none());
+    }
+    assert!(batch_backend
+        .fenced_transition_v2_batch(batch_requests)
+        .await
+        .is_ok());
+    assert_eq!(batch_provider.calls(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_v2_remote_not_transmitted_cleanup_finalizes_without_a_cancellation_gap() {
+    let epoch = initial_v2_epoch();
+    let singleton_spy = Arc::new(AtomicSpy::new());
+    singleton_spy.enable_v2();
+    singleton_spy.not_transmit_v2_once();
+    let singleton_fixture = JournalFixture::new(0xad);
+    let singleton_journal = singleton_fixture.open_v2();
+    let singleton_provider = CountingRemoteProvider::with_key("remote-v2-final-singleton", 0xad);
+    let singleton_backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&singleton_spy),
+        Arc::clone(&singleton_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&singleton_journal))
+    .with_fenced_transition_v2_journal_scope(singleton_fixture.v2_scope());
+    let singleton_request = create_v2_request(0x7c, epoch);
+    let gate = crate::fenced_transition_journal::block_next_v2_remove_if_exact_after_commit(
+        singleton_journal.as_ref(),
+    );
+    let task_backend = singleton_backend.clone();
+    let task_request = singleton_request.clone();
+    let singleton_result = abort_v2_cleanup_while_final_poll_is_committed(
+        gate,
+        tokio::spawn(async move { task_backend.fenced_transition_v2(task_request).await }),
+    )
+    .await;
+    assert!(matches!(
+        singleton_result,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    let singleton_scope = protected_v2_journal_scope_for(
+        singleton_spy.as_ref(),
+        singleton_fixture.v2_scope(),
+        NAMESPACE,
+        crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+    );
+    assert!(singleton_journal
+        .lookup(singleton_scope, singleton_request.request_id())
+        .await
+        .expect("completed singleton cleanup lookup")
+        .is_none());
+    assert!(singleton_backend
+        .fenced_transition_v2(singleton_request)
+        .await
+        .is_ok());
+    assert_eq!(singleton_provider.calls(), 2);
+
+    let batch_spy = Arc::new(AtomicSpy::new());
+    batch_spy.enable_v2();
+    batch_spy.not_transmit_v2_once();
+    let batch_fixture = JournalFixture::new(0xae);
+    let batch_journal = batch_fixture.open_v2();
+    let batch_provider = CountingRemoteProvider::with_key("remote-v2-final-batch", 0xae);
+    let batch_backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&batch_spy),
+        Arc::clone(&batch_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&batch_journal))
+    .with_fenced_transition_v2_journal_scope(batch_fixture.v2_scope());
+    let batch_requests = vec![
+        create_v2_request(0x7d, epoch),
+        create_v2_request(0x7e, epoch),
+    ];
+    let gate = crate::fenced_transition_journal::block_next_v2_remove_if_exact_after_commit(
+        batch_journal.as_ref(),
+    );
+    let task_backend = batch_backend.clone();
+    let task_requests = batch_requests.clone();
+    let batch_result = abort_v2_cleanup_while_final_poll_is_committed(
+        gate,
+        tokio::spawn(async move { task_backend.fenced_transition_v2_batch(task_requests).await }),
+    )
+    .await;
+    assert!(matches!(
+        batch_result,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    let batch_scope = protected_v2_journal_scope_for(
+        batch_spy.as_ref(),
+        batch_fixture.v2_scope(),
+        NAMESPACE,
+        crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+    );
+    for request in &batch_requests {
+        assert!(batch_journal
+            .lookup(batch_scope, request.request_id())
+            .await
+            .expect("completed batch cleanup lookup")
+            .is_none());
+    }
+    assert!(batch_backend
+        .fenced_transition_v2_batch(batch_requests)
+        .await
+        .is_ok());
+    assert_eq!(batch_provider.calls(), 4);
+}
+
+#[tokio::test]
+async fn protected_wrappers_preserve_v2_exact_replay_across_successor_restart_and_key_rotation() {
+    let epoch = initial_v2_epoch();
+
+    let local_spy = Arc::new(AtomicSpy::new());
+    local_spy.enable_v2();
+    local_spy.delay_v2_ambiguous_commit();
+    let local_fixture = JournalFixture::new(0xb1);
+    let local_request = create_v2_request(0x31, epoch);
+    let local_first_provider = CountingKeyProvider::with_key("local-v2-before-rotation", 0x31);
+    let local_first = EncryptingSessionBackend::new(
+        Arc::clone(&local_spy),
+        Arc::clone(&local_first_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(local_fixture.open_v2())
+    .with_fenced_transition_v2_journal_scope(local_fixture.v2_scope());
+    assert_eq!(
+        local_first
+            .fenced_transition_v2_capability()
+            .await
+            .expect("local V2 capability"),
+        Some(FencedTransitionV2Capability::V2)
+    );
+    assert!(matches!(
+        local_first
+            .fenced_transition_v2(local_request.clone())
+            .await,
+        Err(StoreError::FencedTransitionOutcomeUnknown)
+    ));
+    assert_eq!(local_first_provider.calls(), 1);
+    drop(local_first);
+
+    local_spy.commit_v2_delayed();
+    local_spy.set_v2_history(
+        FencedTransitionV2HistoryState::new(
+            Some(FencedTransitionV2HistoryEpoch::new(2).expect("successor epoch")),
+            None,
+            None,
+            0,
+            2,
+            0,
+            0,
+        )
+        .expect("successor keeps epoch one replayable"),
+    );
+    let local_rotated_provider = CountingKeyProvider::with_key("local-v2-after-rotation", 0x32);
+    let local_reopened = EncryptingSessionBackend::new(
+        Arc::clone(&local_spy),
+        Arc::clone(&local_rotated_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(local_fixture.open_v2())
+    .with_fenced_transition_v2_journal_scope(local_fixture.v2_scope());
+    assert!(local_reopened
+        .fenced_transition_v2(local_request.clone())
+        .await
+        .is_ok());
+    assert_eq!(
+        local_rotated_provider.calls(),
+        0,
+        "restart recovery reuses the sealed physical V2 request"
+    );
+    let local_physical = local_spy.v2_executed();
+    assert_eq!(local_physical.len(), 2);
+    assert!(local_physical[0].matches(&local_physical[1]));
+    assert_eq!(
+        serde_json::to_vec(&local_physical[0]).expect("serialize first local sealed V2 request"),
+        serde_json::to_vec(&local_physical[1]).expect("serialize replayed local sealed V2 request"),
+        "rotation retry preserves the exact sealed bytes"
+    );
+    assert_ne!(local_physical[0].request_id(), local_request.request_id());
+    assert_eq!(
+        local_reopened
+            .fenced_transition_v2_status(&conflicting_v2_request(&local_request))
+            .await
+            .expect("local conflicting V2 status"),
+        FencedTransitionV2Status::RequestConflict
+    );
+    assert_eq!(local_rotated_provider.calls(), 0);
+
+    let remote_spy = Arc::new(AtomicSpy::new());
+    remote_spy.enable_v2();
+    remote_spy.delay_v2_ambiguous_commit();
+    let remote_fixture = JournalFixture::new(0xb2);
+    let remote_request = create_v2_request(0x32, epoch);
+    let remote_first_provider = CountingRemoteProvider::with_key("remote-v2-before-rotation", 0x41);
+    let remote_first = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_spy),
+        Arc::clone(&remote_first_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(remote_fixture.open_v2())
+    .with_fenced_transition_v2_journal_scope(remote_fixture.v2_scope());
+    assert_eq!(
+        remote_first
+            .fenced_transition_v2_capability()
+            .await
+            .expect("remote V2 capability"),
+        Some(FencedTransitionV2Capability::V2)
+    );
+    assert!(matches!(
+        remote_first
+            .fenced_transition_v2(remote_request.clone())
+            .await,
+        Err(StoreError::FencedTransitionOutcomeUnknown)
+    ));
+    assert_eq!(remote_first_provider.calls(), 1);
+    drop(remote_first);
+
+    remote_spy.commit_v2_delayed();
+    remote_spy.set_v2_history(
+        FencedTransitionV2HistoryState::new(
+            Some(FencedTransitionV2HistoryEpoch::new(2).expect("successor epoch")),
+            None,
+            None,
+            0,
+            2,
+            0,
+            0,
+        )
+        .expect("successor keeps epoch one replayable"),
+    );
+    let remote_rotated_provider =
+        CountingRemoteProvider::with_key("remote-v2-after-rotation", 0x42);
+    let remote_reopened = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_spy),
+        Arc::clone(&remote_rotated_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(remote_fixture.open_v2())
+    .with_fenced_transition_v2_journal_scope(remote_fixture.v2_scope());
+    assert!(remote_reopened
+        .fenced_transition_v2(remote_request.clone())
+        .await
+        .is_ok());
+    assert_eq!(
+        remote_rotated_provider.calls(),
+        0,
+        "restart recovery reuses the remotely sealed physical V2 request"
+    );
+    let remote_physical = remote_spy.v2_executed();
+    assert_eq!(remote_physical.len(), 2);
+    assert!(remote_physical[0].matches(&remote_physical[1]));
+    assert_eq!(
+        serde_json::to_vec(&remote_physical[0]).expect("serialize first remote sealed V2 request"),
+        serde_json::to_vec(&remote_physical[1])
+            .expect("serialize replayed remote sealed V2 request"),
+        "rotation retry preserves the exact sealed bytes"
+    );
+    assert_ne!(remote_physical[0].request_id(), remote_request.request_id());
+    assert_eq!(
+        remote_reopened
+            .fenced_transition_v2_status(&conflicting_v2_request(&remote_request))
+            .await
+            .expect("remote conflicting V2 status"),
+        FencedTransitionV2Status::RequestConflict
+    );
+    assert_eq!(remote_rotated_provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn protected_wrappers_reclaim_v2_mappings_only_after_consensus_retires_the_epoch() {
+    let epoch = initial_v2_epoch();
+    let retired = FencedTransitionV2HistoryState::new(
+        Some(FencedTransitionV2HistoryEpoch::new(2).expect("successor epoch")),
+        Some(epoch),
+        Some(epoch),
+        1,
+        2,
+        0,
+        0,
+    )
+    .expect("retired V2 history");
+
+    let local_spy = Arc::new(AtomicSpy::new());
+    local_spy.enable_v2();
+    local_spy.delay_v2_ambiguous_commit();
+    let local_fixture = JournalFixture::new(0xb3);
+    let local_journal = local_fixture.open_v2();
+    let local_provider = CountingKeyProvider::with_key("local-v2-retire", 0x51);
+    let local = EncryptingSessionBackend::new(
+        Arc::clone(&local_spy),
+        Arc::clone(&local_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&local_journal))
+    .with_fenced_transition_v2_journal_scope(local_fixture.v2_scope());
+    let local_request = create_v2_request(0x33, epoch);
+    assert!(matches!(
+        local.fenced_transition_v2(local_request.clone()).await,
+        Err(StoreError::FencedTransitionOutcomeUnknown)
+    ));
+    assert!(local_journal
+        .lookup(
+            protected_v2_journal_scope_for(
+                local_spy.as_ref(),
+                local_fixture.v2_scope(),
+                NAMESPACE,
+                crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
+            ),
+            local_request.request_id(),
+        )
+        .await
+        .expect("local V2 journal lookup before retirement")
+        .is_some());
+    local_spy.set_v2_history(retired);
+    assert_eq!(
+        local
+            .fenced_transition_v2_status(&local_request)
+            .await
+            .expect("local retired V2 status"),
+        FencedTransitionV2Status::Retired
+    );
+    assert!(local_journal
+        .lookup(
+            protected_v2_journal_scope_for(
+                local_spy.as_ref(),
+                local_fixture.v2_scope(),
+                NAMESPACE,
+                crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
+            ),
+            local_request.request_id(),
+        )
+        .await
+        .expect("local V2 journal lookup after retirement")
+        .is_none());
+    assert!(matches!(
+        local.fenced_transition_v2(local_request).await,
+        Err(StoreError::FencedTransitionHistoryEpochRetired)
+    ));
+    assert_eq!(local_provider.calls(), 1);
+    assert_eq!(local_spy.v2_executed().len(), 1);
+
+    let remote_spy = Arc::new(AtomicSpy::new());
+    remote_spy.enable_v2();
+    remote_spy.delay_v2_ambiguous_commit();
+    let remote_fixture = JournalFixture::new(0xb4);
+    let remote_journal = remote_fixture.open_v2();
+    let remote_provider = CountingRemoteProvider::with_key("remote-v2-retire", 0x61);
+    let remote = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_spy),
+        Arc::clone(&remote_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&remote_journal))
+    .with_fenced_transition_v2_journal_scope(remote_fixture.v2_scope());
+    let remote_request = create_v2_request(0x34, epoch);
+    assert!(matches!(
+        remote.fenced_transition_v2(remote_request.clone()).await,
+        Err(StoreError::FencedTransitionOutcomeUnknown)
+    ));
+    assert!(remote_journal
+        .lookup(
+            protected_v2_journal_scope_for(
+                remote_spy.as_ref(),
+                remote_fixture.v2_scope(),
+                NAMESPACE,
+                crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+            ),
+            remote_request.request_id(),
+        )
+        .await
+        .expect("remote V2 journal lookup before retirement")
+        .is_some());
+    remote_spy.set_v2_history(retired);
+    assert_eq!(
+        remote
+            .fenced_transition_v2_status(&remote_request)
+            .await
+            .expect("remote retired V2 status"),
+        FencedTransitionV2Status::Retired
+    );
+    assert!(remote_journal
+        .lookup(
+            protected_v2_journal_scope_for(
+                remote_spy.as_ref(),
+                remote_fixture.v2_scope(),
+                NAMESPACE,
+                crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+            ),
+            remote_request.request_id(),
+        )
+        .await
+        .expect("remote V2 journal lookup after retirement")
+        .is_none());
+    assert!(matches!(
+        remote.fenced_transition_v2(remote_request).await,
+        Err(StoreError::FencedTransitionHistoryEpochRetired)
+    ));
+    assert_eq!(remote_provider.calls(), 1);
+    assert_eq!(remote_spy.v2_executed().len(), 1);
+}
+
+#[tokio::test]
+async fn protected_v2_journal_rejects_mixed_formats_and_corrupted_bindings() {
+    let legacy_fixture = JournalFixture::new(0xb5);
+    drop(legacy_fixture.open());
+    assert!(FencedTransitionV2PreparedJournal::open_existing(
+        &legacy_fixture.path,
+        FencedTransitionV2PreparedJournalKey::from_bytes(legacy_fixture.key),
+    )
+    .is_err());
+
+    let v2_fixture = JournalFixture::new(0xb6);
+    drop(v2_fixture.open_v2());
+    assert!(PreparedFencedTransitionJournal::open_existing(
+        &v2_fixture.v2_path,
+        PreparedFencedTransitionJournalKey::from_bytes(v2_fixture.key),
+    )
+    .is_err());
+
+    let wrong_key_fixture = JournalFixture::new(0xbe);
+    drop(wrong_key_fixture.open_v2());
+    assert!(FencedTransitionV2PreparedJournal::open_existing(
+        &wrong_key_fixture.v2_path,
+        FencedTransitionV2PreparedJournalKey::from_bytes([0xbf; 32]),
+    )
+    .is_err());
+
+    let spy = Arc::new(AtomicSpy::new());
+    spy.enable_v2();
+    let fixture = JournalFixture::new(0xb7);
+    let request = create_v2_request(0x35, initial_v2_epoch());
+    let initial_provider = CountingKeyProvider::with_key("local-v2-corruption", 0x71);
+    let wrapper =
+        EncryptingSessionBackend::new(Arc::clone(&spy), Arc::clone(&initial_provider), NAMESPACE)
+            .with_fenced_transition_v2_journal(fixture.open_v2())
+            .with_fenced_transition_v2_journal_scope(fixture.v2_scope());
+    assert!(wrapper.fenced_transition_v2(request.clone()).await.is_ok());
+    drop(wrapper);
+
+    let connection = rusqlite::Connection::open(&fixture.v2_path)
+        .expect("open V2 journal fixture for corruption");
+    connection
+        .execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .expect("enable V2 corruption fixture");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE protected_fenced_transition_v2_journal \
+                 SET prepared_request = zeroblob(1)",
+                [],
+            )
+            .expect("corrupt V2 prepared request"),
+        1
+    );
+    drop(connection);
+
+    let reopened_provider = CountingKeyProvider::with_key("local-v2-after-corruption", 0x72);
+    let reopened =
+        EncryptingSessionBackend::new(Arc::clone(&spy), Arc::clone(&reopened_provider), NAMESPACE)
+            .with_fenced_transition_v2_journal(fixture.open_v2())
+            .with_fenced_transition_v2_journal_scope(fixture.v2_scope());
+    assert!(matches!(
+        reopened.fenced_transition_v2_status(&request).await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(reopened_provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn protected_v2_scope_mismatch_stops_before_provider_or_inner() {
+    let epoch = initial_v2_epoch();
+    let request = create_v2_request(0x36, epoch);
+    let fixture = JournalFixture::new(0xb8);
+    let journal = fixture.open_v2();
+    let scope = fixture.v2_scope();
+    let spy = Arc::new(AtomicSpy::new());
+    spy.enable_v2();
+
+    let initial_provider = CountingKeyProvider::with_key("v2-scope-initial", 0x81);
+    let initial =
+        EncryptingSessionBackend::new(Arc::clone(&spy), Arc::clone(&initial_provider), NAMESPACE)
+            .with_fenced_transition_v2_journal(Arc::clone(&journal))
+            .with_fenced_transition_v2_journal_scope(scope);
+    assert!(initial.fenced_transition_v2(request.clone()).await.is_ok());
+    assert_eq!(initial_provider.calls(), 1);
+    let dispatched = spy.v2_executed().len();
+    drop(initial);
+
+    let wrong_namespace_provider = CountingKeyProvider::with_key("v2-scope-namespace", 0x82);
+    let wrong_namespace = EncryptingSessionBackend::new(
+        Arc::clone(&spy),
+        Arc::clone(&wrong_namespace_provider),
+        "protected-fenced-transition-other",
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&journal))
+    .with_fenced_transition_v2_journal_scope(scope);
+    assert!(matches!(
+        wrong_namespace.fenced_transition_v2(request.clone()).await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(wrong_namespace_provider.calls(), 0);
+    assert_eq!(spy.v2_executed().len(), dispatched);
+
+    let remote_provider = CountingRemoteProvider::with_key("v2-scope-remote", 0x83);
+    let wrong_mode =
+        RemoteSealingSessionBackend::new(Arc::clone(&spy), Arc::clone(&remote_provider), NAMESPACE)
+            .with_fenced_transition_v2_journal(Arc::clone(&journal))
+            .with_fenced_transition_v2_journal_scope(scope);
+    assert!(matches!(
+        wrong_mode.fenced_transition_v2(request.clone()).await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(remote_provider.calls(), 0);
+    assert_eq!(spy.v2_executed().len(), dispatched);
+
+    let wrong_cluster_provider = CountingKeyProvider::with_key("v2-scope-cluster", 0x84);
+    let wrong_cluster = EncryptingSessionBackend::new(
+        Arc::clone(&spy),
+        Arc::clone(&wrong_cluster_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&journal))
+    .with_fenced_transition_v2_journal_scope(FencedTransitionV2JournalScope::from_bytes(
+        [0xc8; 32],
+    ));
+    assert!(matches!(
+        wrong_cluster.fenced_transition_v2(request.clone()).await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(wrong_cluster_provider.calls(), 0);
+    assert_eq!(spy.v2_executed().len(), dispatched);
+
+    assert!(matches!(
+        journal
+            .lookup(
+                protected_v2_journal_scope_for(
+                    spy.as_ref(),
+                    FencedTransitionV2JournalScope::from_bytes([0xc8; 32]),
+                    NAMESPACE,
+                    crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
+                ),
+                request.request_id(),
+            )
+            .await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+}
+
+fn corrupt_v2_index_root(path: &std::path::Path, index_name: &str) {
+    let connection = rusqlite::Connection::open(path).expect("open V2 index-corruption fixture");
+    connection
+        .execute_batch("PRAGMA writable_schema = ON;")
+        .expect("enable V2 index corruption fixture");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE sqlite_schema SET rootpage = 0 WHERE name = ?1",
+                [index_name],
+            )
+            .expect("corrupt V2 index root"),
+        1
+    );
+    connection
+        .execute_batch("PRAGMA writable_schema = OFF;")
+        .expect("finish V2 index corruption fixture");
+}
+
+fn remove_v2_index(path: &std::path::Path, index_name: &str) {
+    let connection = rusqlite::Connection::open(path).expect("open V2 index-removal fixture");
+    connection
+        .execute(&format!("DROP INDEX {index_name}"), [])
+        .expect("remove V2 index");
+}
+
+#[tokio::test]
+async fn protected_v2_primary_index_corruption_fails_closed_on_direct_journal_reopen() {
+    let fixture = JournalFixture::new(0xb9);
+    let scope = fixture.v2_scope();
+    let journal = fixture.open_v2();
+    let spy = Arc::new(AtomicSpy::new());
+    spy.enable_v2();
+    let request = create_v2_request(0x37, initial_v2_epoch());
+    let provider = CountingKeyProvider::with_key("v2-primary-index", 0x85);
+    let wrapper = EncryptingSessionBackend::new(Arc::clone(&spy), Arc::clone(&provider), NAMESPACE)
+        .with_fenced_transition_v2_journal(Arc::clone(&journal))
+        .with_fenced_transition_v2_journal_scope(scope);
+    assert!(wrapper.fenced_transition_v2(request.clone()).await.is_ok());
+    drop(wrapper);
+    drop(journal);
+    corrupt_v2_index_root(
+        &fixture.v2_path,
+        "sqlite_autoindex_protected_fenced_transition_v2_journal_1",
+    );
+    assert!(FencedTransitionV2PreparedJournal::open_existing(
+        &fixture.v2_path,
+        FencedTransitionV2PreparedJournalKey::from_bytes(fixture.key),
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn protected_v2_index_divergence_fails_closed_before_reseal_or_dispatch() {
+    let epoch = initial_v2_epoch();
+
+    let local_fixture = JournalFixture::new(0xb9);
+    let local_scope = local_fixture.v2_scope();
+    let local_journal = local_fixture.open_v2();
+    let local_spy = Arc::new(AtomicSpy::new());
+    local_spy.enable_v2();
+    let local_request = create_v2_request(0x37, epoch);
+    let local_initial_provider = CountingKeyProvider::with_key("v2-index-local", 0x85);
+    let local_initial = EncryptingSessionBackend::new(
+        Arc::clone(&local_spy),
+        Arc::clone(&local_initial_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&local_journal))
+    .with_fenced_transition_v2_journal_scope(local_scope);
+    assert!(local_initial
+        .fenced_transition_v2(local_request.clone())
+        .await
+        .is_ok());
+    drop(local_initial);
+    let local_dispatched = local_spy.v2_executed().len();
+    remove_v2_index(
+        &local_fixture.v2_path,
+        "protected_fenced_transition_v2_journal_membership_idx",
+    );
+    assert!(matches!(
+        local_journal
+            .lookup(
+                protected_v2_journal_scope_for(
+                    local_spy.as_ref(),
+                    local_scope,
+                    NAMESPACE,
+                    crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
+                ),
+                local_request.request_id(),
+            )
+            .await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    let local_retry_provider = CountingKeyProvider::with_key("v2-index-local-retry", 0x86);
+    let local_retry = EncryptingSessionBackend::new(
+        Arc::clone(&local_spy),
+        Arc::clone(&local_retry_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&local_journal))
+    .with_fenced_transition_v2_journal_scope(local_scope);
+    assert!(matches!(
+        local_retry.fenced_transition_v2(local_request).await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(local_retry_provider.calls(), 0);
+    assert_eq!(local_spy.v2_executed().len(), local_dispatched);
+
+    let remote_fixture = JournalFixture::new(0xba);
+    let remote_scope = remote_fixture.v2_scope();
+    let remote_journal = remote_fixture.open_v2();
+    let remote_spy = Arc::new(AtomicSpy::new());
+    remote_spy.enable_v2();
+    let remote_request = create_v2_request(0x38, epoch);
+    let remote_initial_provider = CountingRemoteProvider::with_key("v2-index-remote", 0x87);
+    let remote_initial = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_spy),
+        Arc::clone(&remote_initial_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&remote_journal))
+    .with_fenced_transition_v2_journal_scope(remote_scope);
+    assert!(remote_initial
+        .fenced_transition_v2(remote_request.clone())
+        .await
+        .is_ok());
+    drop(remote_initial);
+    let remote_dispatched = remote_spy.v2_executed().len();
+    remove_v2_index(
+        &remote_fixture.v2_path,
+        "protected_fenced_transition_v2_journal_epoch_idx",
+    );
+    assert!(matches!(
+        remote_journal
+            .lookup(
+                protected_v2_journal_scope_for(
+                    remote_spy.as_ref(),
+                    remote_scope,
+                    NAMESPACE,
+                    crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+                ),
+                remote_request.request_id(),
+            )
+            .await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    let remote_retry_provider = CountingRemoteProvider::with_key("v2-index-remote-retry", 0x88);
+    let remote_retry = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_spy),
+        Arc::clone(&remote_retry_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&remote_journal))
+    .with_fenced_transition_v2_journal_scope(remote_scope);
+    assert!(matches!(
+        remote_retry.fenced_transition_v2(remote_request).await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(remote_retry_provider.calls(), 0);
+    assert_eq!(remote_spy.v2_executed().len(), remote_dispatched);
 }
 
 #[tokio::test]
@@ -968,11 +2502,14 @@ async fn protected_fenced_transition_local_prepares_once_and_recovers_exact_phys
         Some(AtomicFencedTransitionCapability::V2),
         "dynamic local composition must expose durable protected recovery"
     );
-    assert!(matches!(
-        backend.fenced_transition_v2_capability().await,
-        Err(StoreError::CapabilityNotSupported(reason))
-            if reason == "atomic_fenced_transition_epoch_history_v2"
-    ));
+    assert_eq!(
+        backend
+            .fenced_transition_v2_capability()
+            .await
+            .expect("V2 capability without a V2 journal"),
+        None,
+        "the V1 prepared journal must never be reinterpreted as V2 state"
+    );
 
     let prepared = backend
         .prepare_fenced_transition(create_request(1))

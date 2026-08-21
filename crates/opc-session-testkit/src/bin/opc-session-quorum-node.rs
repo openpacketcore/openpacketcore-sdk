@@ -47,9 +47,11 @@ use opc_session_store::{
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerChange,
     SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
     SessionConsumerRejection, SessionConsumerRequest, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
-    SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer, SqliteSessionBackend,
-    StateClass, StateType, StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
+    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response, SessionKey,
+    SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer,
+    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
+    ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
     qualification_key_bytes_sha256, qualification_owner_sha256, qualification_state_type_sha256,
@@ -393,6 +395,42 @@ impl SessionQuorumConsumer for QualificationConsumerOutcomeUnknownService {
         response
     }
 
+    async fn execute_v2(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: SessionConsumerV2Request,
+    ) -> SessionConsumerV2Response {
+        let outcome_unknown = match request.operation() {
+            SessionConsumerV2Operation::FencedTransitionV2 { .. } => {
+                Some(OutcomeUnknownV2Response::Singleton)
+            }
+            SessionConsumerV2Operation::FencedTransitionV2Batch { requests } => {
+                Some(OutcomeUnknownV2Response::Batch(
+                    requests
+                        .iter()
+                        .map(|request| request.request_id())
+                        .collect(),
+                ))
+            }
+            _ => None,
+        };
+        let response = self.inner.execute_v2(identity, request).await;
+        if let Some(outcome_unknown) = outcome_unknown {
+            if outcome_unknown.matches(&response)
+                && self
+                    .armed
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                // This qualification-only seam withholds an already produced
+                // response; it does not bypass or alter the real consumer,
+                // consensus, or SQLite execution path.
+                return outcome_unknown.response();
+            }
+        }
+        response
+    }
+
     async fn watch(
         &self,
         identity: &SessionConsumerIdentity,
@@ -403,6 +441,39 @@ impl SessionQuorumConsumer for QualificationConsumerOutcomeUnknownService {
         SessionConsumerRejection,
     > {
         self.inner.watch(identity, scope, start_sequence).await
+    }
+}
+
+enum OutcomeUnknownV2Response {
+    Singleton,
+    Batch(Vec<opc_session_store::FencedTransitionV2RequestId>),
+}
+
+impl OutcomeUnknownV2Response {
+    fn matches(&self, response: &SessionConsumerV2Response) -> bool {
+        matches!(
+            (self, response),
+            (
+                Self::Singleton,
+                SessionConsumerV2Response::FencedTransitionV2(Ok(_))
+            ) | (
+                Self::Batch(_),
+                SessionConsumerV2Response::FencedTransitionV2Batch(Ok(_))
+            )
+        )
+    }
+
+    fn response(self) -> SessionConsumerV2Response {
+        match self {
+            Self::Singleton => SessionConsumerV2Response::FencedTransitionV2(Err(
+                SessionConsumerV2FencedTransitionError::OutcomeUnknown,
+            )),
+            Self::Batch(request_ids) => SessionConsumerV2Response::FencedTransitionV2Batch(Err(
+                opc_session_store::consumer::SessionConsumerV2FencedTransitionBatchError::OutcomeUnknown {
+                    request_ids,
+                },
+            )),
+        }
     }
 }
 
@@ -943,6 +1014,11 @@ impl QualificationNode {
             QualificationNodeCommand::LifecycleMetrics => {
                 QualificationNodeReply::LifecycleMetrics {
                     metrics: lifecycle_metrics(self.empty_vote_dispatches.load(Ordering::SeqCst)),
+                }
+            }
+            QualificationNodeCommand::ConsensusDiagnostics => {
+                QualificationNodeReply::ConsensusDiagnostics {
+                    metrics: self.store.diagnostic_snapshot(),
                 }
             }
             QualificationNodeCommand::SetConsensusRpcAvailability { availability } => {

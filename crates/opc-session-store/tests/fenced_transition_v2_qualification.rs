@@ -8,13 +8,13 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use opc_consensus::{
     ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
@@ -32,13 +32,25 @@ use opc_session_store::{
     SessionConsensusRpcHandler, SessionConsensusStatus, SessionConsensusWireRequest,
     SessionConsensusWireResponse, SessionKey, SessionKeyType, SqliteSessionBackend, StateClass,
     StateType, StoreError, StoredSessionRecord, Timestamp, ValidatedQuorumTopology,
-    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_RECLAIM_BATCH,
+    FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS, FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES,
+    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES, FENCED_TRANSITION_V2_RECLAIM_BATCH,
     FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 
 const VOTERS: usize = 3;
 const QUALIFICATION_SESSIONS: usize = 50_000;
+const QUALIFICATION_SUSTAINED_RATE: usize = 500;
+const QUALIFICATION_SUSTAINED_SECONDS: usize = 30 * 60;
+const QUALIFICATION_BURST_RATE: usize = 1_000;
+const QUALIFICATION_BURST_SECONDS: usize = 60;
+const QUALIFICATION_SUSTAINED_TRANSITIONS: usize =
+    QUALIFICATION_SUSTAINED_RATE * QUALIFICATION_SUSTAINED_SECONDS;
+const QUALIFICATION_BURST_TRANSITIONS: usize =
+    QUALIFICATION_BURST_RATE * QUALIFICATION_BURST_SECONDS;
+const QUALIFICATION_RELEASE_TRANSITIONS: usize =
+    QUALIFICATION_SESSIONS + QUALIFICATION_SUSTAINED_TRANSITIONS + QUALIFICATION_BURST_TRANSITIONS;
 const QUALIFICATION_TRANSITIONS: usize = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES + 1;
 const QUALIFICATION_HEADROOM_TRANSITIONS: usize =
     FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET;
@@ -49,10 +61,64 @@ const RECLAIM_BATCHES: usize =
 // serialize and durably apply every proposal on the three voters.
 const QUALIFICATION_IN_FLIGHT_CLIENTS: usize = DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS;
 const QUALIFICATION_TRANSIENT_RETRY_LIMIT: usize = 16;
+const QUALIFICATION_PRELOAD_BATCH_OPERATIONS: usize = 256;
+// At 500 operations/second, an eight-item batch has a 16 ms formation window.
+// That leaves real budget for quorum apply while measuring each item's full
+// scheduled-arrival-to-completion latency against the 25 ms p99 contract.
+const QUALIFICATION_PACED_BATCH_OPERATIONS: usize = 8;
+// The isolated qualification voters contain only this feature's state. These
+// fixed physical regression envelopes deliberately exceed the immutable
+// semantic receipt maximum to allow SQLite pages/indexes and one bounded WAL,
+// while still making accidental unbounded retention fail the release gate.
+const QUALIFICATION_PER_VOTER_DATABASE_CEILING_BYTES: u64 =
+    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES * 3;
+const QUALIFICATION_PER_VOTER_SNAPSHOT_CEILING_BYTES: u64 =
+    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES * 2;
+const QUALIFICATION_PROCESS_PEAK_RSS_CEILING_KIB: u64 = 2 * 1024 * 1024;
+const _: () = {
+    assert!(QUALIFICATION_IN_FLIGHT_CLIENTS >= 1);
+    assert!(FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES > 0);
+};
 const FIXED_V2_PROFILE_DIGEST: [u8; 32] = [
-    0xbf, 0x22, 0x10, 0xe0, 0x9a, 0x84, 0xb4, 0x17, 0xb7, 0x27, 0x06, 0x46, 0x82, 0x1b, 0x87, 0xa7,
-    0x3d, 0x1a, 0x87, 0x50, 0x38, 0x21, 0xfc, 0x44, 0x92, 0x2d, 0xb2, 0x2e, 0x04, 0x87, 0x9d, 0x15,
+    0x8a, 0x0b, 0x70, 0xb5, 0x46, 0x54, 0xc7, 0x25, 0x0c, 0xf5, 0x46, 0x9d, 0xb6, 0xe1, 0xe5, 0x45,
+    0xf3, 0x5e, 0x38, 0xe9, 0x77, 0x8d, 0x5f, 0x50, 0x0f, 0xea, 0x67, 0x06, 0x96, 0xc4, 0xbd, 0xc3,
 ];
+
+#[derive(Default)]
+struct ReleaseLatencySamples {
+    batch: Vec<Duration>,
+    item_scheduled_to_completion: Vec<Duration>,
+}
+
+impl ReleaseLatencySamples {
+    fn record_batch(&mut self, elapsed: Duration, item_scheduled_at: &[Instant]) {
+        self.batch.push(elapsed);
+        let completed = Instant::now();
+        self.item_scheduled_to_completion.extend(
+            item_scheduled_at
+                .iter()
+                .map(|scheduled_at| completed.duration_since(*scheduled_at)),
+        );
+    }
+
+    fn percentile(samples: &mut [Duration], numerator: usize, denominator: usize) -> Duration {
+        assert!(!samples.is_empty(), "release latency samples must be real");
+        samples.sort_unstable();
+        let index = (samples.len() * numerator)
+            .div_ceil(denominator)
+            .saturating_sub(1);
+        samples[index]
+    }
+
+    fn p99_and_p999(&mut self) -> (Duration, Duration, Duration, Duration) {
+        (
+            Self::percentile(&mut self.batch, 99, 100),
+            Self::percentile(&mut self.batch, 999, 1_000),
+            Self::percentile(&mut self.item_scheduled_to_completion, 99, 100),
+            Self::percentile(&mut self.item_scheduled_to_completion, 999, 1_000),
+        )
+    }
+}
 
 #[derive(Debug, Clone)]
 struct MutableClock(Arc<Mutex<Timestamp>>);
@@ -108,6 +174,7 @@ async fn maintain_exact_history_batch(
     stores: &[ConsensusSessionStore],
     expected: FencedTransitionV2HistoryState,
     transient_retries: &AtomicU64,
+    post_commit_reply_loss: Option<&AtomicUsize>,
 ) -> Result<FencedTransitionV2HistoryState, StoreError> {
     for attempt in 0..=QUALIFICATION_TRANSIENT_RETRY_LIMIT {
         // Unlike ordinary application operations, operator maintenance is a
@@ -115,7 +182,29 @@ async fn maintain_exact_history_batch(
         // A release workload can span several election terms, so never cache
         // the leader selected before the 131k-transition phase.
         let store = &stores[current_local_maintenance_leader(stores).await];
-        match store.maintain_fenced_transition_v2_history(expected).await {
+        let result = store.maintain_fenced_transition_v2_history(expected).await;
+        // This fault is deliberately after the public local-leader method
+        // completed successfully: it models only the caller losing that
+        // successful reply, never a pre-proposal or pre-commit failure. The
+        // bounded one-shot counter keeps unrelated qualification calls on
+        // their ordinary production path.
+        let result = match result {
+            Ok(_)
+                if post_commit_reply_loss.is_some_and(|remaining| {
+                    remaining
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                            count.checked_sub(1)
+                        })
+                        .is_ok()
+                }) =>
+            {
+                Err(StoreError::BackendUnavailable(
+                    "test-only post-commit V2 maintenance reply loss".into(),
+                ))
+            }
+            result => result,
+        };
+        match result {
             Ok(state) => return Ok(state),
             // `EpochNotActive` can be the post-commit observation of this
             // exact expected state after its reply was lost.  This helper is
@@ -550,14 +639,20 @@ async fn renew_update_request(
 
 fn request_with_changed_body(request: &FencedTransitionV2Request) -> FencedTransitionV2Request {
     let mut encoded = serde_json::to_value(request).expect("serialize retained V2 request");
-    let record = encoded
+    let mutation = encoded
         .get_mut("mutation")
         .and_then(serde_json::Value::as_object_mut)
-        .and_then(|mutation| mutation.get_mut("create"))
+        .expect("V2 request mutation");
+    let mutation_body = if mutation.contains_key("create") {
+        mutation.get_mut("create")
+    } else {
+        mutation.get_mut("update")
+    };
+    let record = mutation_body
         .and_then(serde_json::Value::as_object_mut)
-        .and_then(|create| create.get_mut("record"))
+        .and_then(|mutation| mutation.get_mut("record"))
         .and_then(serde_json::Value::as_object_mut)
-        .expect("V2 create request record");
+        .expect("V2 create or update request record");
     record.insert(
         "state_type".to_owned(),
         serde_json::Value::String("sdk-702-v2-qualification-altered".to_owned()),
@@ -594,6 +689,35 @@ fn sqlite_database_family_bytes(path: &Path) -> u64 {
                 .map(|metadata| metadata.len())
         })
         .sum()
+}
+
+fn assert_voter_resource_ceiling(label: &str, values: &[u64], ceiling: u64) {
+    assert_eq!(values.len(), VOTERS, "{label} must cover every voter");
+    assert!(
+        values.iter().all(|value| *value > 0 && *value <= ceiling),
+        "{label} must be nonzero and no greater than {ceiling} bytes per voter: {values:?}",
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn process_peak_rss_kib() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .expect("read Linux process status for release resource qualification");
+    status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmHWM:")?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .expect("Linux process status contains VmHWM")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_peak_rss_kib() -> u64 {
+    0
 }
 
 #[tokio::test]
@@ -645,6 +769,94 @@ async fn fixed_quorum_first_v2_transition_activates_and_applies_on_every_voter()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn fixed_quorum_v2_batch_preserves_input_order_and_independent_statuses() {
+    let directory = tempfile::tempdir().expect("fixed-quorum V2 batch directory");
+    let start = Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_900_000_000)
+            .expect("fixed-quorum V2 batch start"),
+    );
+    let clock = Arc::new(MutableClock::new(start));
+    let (stores, _, _) = fixed_cluster(directory.path(), clock).await;
+    let leader = ready_leader(&stores).await;
+    let store = &stores[leader];
+    let provider = sealing_provider();
+    let epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
+
+    // Activation remains the existing singleton transition. The following
+    // independent create and renewal exercise the public bounded coalescing
+    // API and prove that each item retains its own exact status identity.
+    let first_key = key(0);
+    let first_observation = store
+        .observe_fenced_transition(&first_key)
+        .await
+        .expect("singleton activation observation");
+    let first_request = create_request(
+        0,
+        epoch,
+        first_key,
+        first_observation.current_fence(),
+        &provider,
+    )
+    .await;
+    let first_outcome = store
+        .fenced_transition_v2(first_request.clone())
+        .await
+        .expect("singleton V2 activation");
+
+    let second_key = key(1);
+    let second_observation = store
+        .observe_fenced_transition(&second_key)
+        .await
+        .expect("batch create observation");
+    let second_request = create_request(
+        1,
+        epoch,
+        second_key,
+        second_observation.current_fence(),
+        &provider,
+    )
+    .await;
+    let renewal_request = renew_update_request(2, epoch, &first_outcome, &provider).await;
+    let requests = vec![second_request.clone(), renewal_request.clone()];
+    let outcomes = store
+        .fenced_transition_v2_batch(requests.clone())
+        .await
+        .expect("public bounded V2 batch");
+    assert_eq!(outcomes.len(), requests.len());
+    let second_outcome = outcomes[0].clone().expect("first batch item result");
+    let renewal_outcome = outcomes[1].clone().expect("second batch item result");
+    assert!(matches!(
+        second_outcome.mutation(),
+        FencedTransitionMutationResult::Created
+    ));
+    assert!(matches!(
+        renewal_outcome.mutation(),
+        FencedTransitionMutationResult::Updated
+    ));
+
+    for voter in &stores {
+        let history = voter
+            .fenced_transition_v2_history_state()
+            .await
+            .expect("V2 batch history on every voter");
+        assert_eq!(history.bound_entries(), 3);
+        for (request, outcome) in [
+            (&first_request, &first_outcome),
+            (&second_request, &second_outcome),
+            (&renewal_request, &renewal_outcome),
+        ] {
+            assert!(matches!(
+                voter
+                    .fenced_transition_v2_status(request)
+                    .await
+                    .expect("V2 batch item status on every voter"),
+                FencedTransitionV2Status::Recorded(result) if result.as_ref() == &Ok(outcome.clone())
+            ));
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn fixed_quorum_history_maintenance_reselects_the_local_leader() {
     let directory = tempfile::tempdir().expect("fixed-quorum V2 maintenance directory");
     let start = Timestamp::from_offset_datetime(
@@ -692,24 +904,29 @@ async fn fixed_quorum_history_maintenance_reselects_the_local_leader() {
     ));
 
     let transient_retries = AtomicU64::new(0);
-    let maintained = maintain_exact_history_batch(&stores, expected, &transient_retries)
+    let maintained = maintain_exact_history_batch(&stores, expected, &transient_retries, None)
         .await
         .expect("maintenance reselects the current local leader");
-    let first_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("retired V2 epoch");
-    let next_epoch = FencedTransitionV2HistoryEpoch::new(2).expect("successor V2 epoch");
-    assert_eq!(maintained.retired_through(), Some(first_epoch));
-    assert_eq!(maintained.active_epoch(), Some(next_epoch));
+    // Maintenance is a no-op until the active epoch is full. A one-entry
+    // epoch cannot be retired merely because the result window elapsed: the
+    // first full epoch opens its successor while retaining the old replay
+    // epoch above the still-empty retirement floor.
+    assert_eq!(maintained.retired_through(), None);
+    assert_eq!(
+        maintained.active_epoch(),
+        Some(FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch"))
+    );
     assert_eq!(maintained.reclaim_epoch(), None);
     assert_eq!(maintained.reclaim_remaining(), 0);
-    assert_eq!(maintained.bound_entries(), 0);
-    assert_eq!(maintained.reclaimed_entries(), 1);
+    assert_eq!(maintained.bound_entries(), 1);
+    assert_eq!(maintained.reclaimed_entries(), 0);
 }
 
 /// Release qualification for V2 capacity and retired-history reclamation.
 /// Its shared injected clock advances through a consensus read barrier, never
 /// by SQLite mutation or a wall-clock sleep.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "131,073 real fixed-quorum consensus transitions are release qualification"]
+#[ignore = "131,074 attempted / 131,073 committed real fixed-quorum consensus transitions are release qualification"]
 async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
     let started = Instant::now();
     let directory = tempfile::tempdir().expect("qualification directory");
@@ -904,17 +1121,16 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
     // effect.
     let one_over_state = &headroom_states[0];
     let one_over_key = one_over_state.lease().key().clone();
-    let record_before_rejection =
-        retry_exact_consensus_operation(&transient_retries, || store.get(&one_over_key))
-            .await
-            .expect("read one-over record before rejection")
-            .expect("one-over session remains live");
-    let fence_before_rejection = retry_exact_consensus_operation(&transient_retries, || {
+    let observation_before_rejection = retry_exact_consensus_operation(&transient_retries, || {
         store.observe_fenced_transition(&one_over_key)
     })
     .await
-    .expect("read one-over fence before rejection")
-    .current_fence();
+    .expect("read one-over record and fence before rejection");
+    let record_before_rejection = observation_before_rejection
+        .record()
+        .cloned()
+        .expect("one-over session remains live");
+    let fence_before_rejection = observation_before_rejection.current_fence();
     let one_over_request = renew_update_request(
         FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
         first_epoch,
@@ -922,6 +1138,15 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         &provider,
     )
     .await;
+    let replication_before_rejection =
+        retry_exact_consensus_operation(&transient_retries, || store.max_replication_sequence())
+            .await
+            .expect("read application sequence before one-over rejection");
+    let mut one_over_watch = retry_exact_consensus_operation(&transient_retries, || {
+        store.watch(replication_before_rejection + 1)
+    })
+    .await
+    .expect("open live watch before one-over rejection");
     assert_eq!(
         retry_exact_consensus_operation(&transient_retries, || {
             store.fenced_transition_v2(one_over_request.clone())
@@ -931,21 +1156,53 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         "one-over request must not execute"
     );
     assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || store.get(&one_over_key))
-            .await
-            .expect("read one-over record after rejection"),
-        Some(record_before_rejection),
+        retry_exact_consensus_operation(&transient_retries, || {
+            store.fenced_transition_v2(one_over_request.clone())
+        })
+        .await,
+        Err(StoreError::FencedTransitionHistoryFull),
+        "exact one-over retry must remain a deterministic no-effect rejection"
+    );
+    let changed_one_over_request = request_with_changed_body(&one_over_request);
+    assert_eq!(
+        retry_exact_consensus_operation(&transient_retries, || {
+            store.fenced_transition_v2(changed_one_over_request.clone())
+        })
+        .await,
+        Err(StoreError::FencedTransitionRequestConflict),
+        "same full ID with a changed update body must not acquire capacity or a lease"
+    );
+    let observation_after_rejection = retry_exact_consensus_operation(&transient_retries, || {
+        store.observe_fenced_transition(&one_over_key)
+    })
+    .await
+    .expect("read one-over record and fence after all rejected retries");
+    assert_eq!(
+        observation_after_rejection, observation_before_rejection,
+        "one-over rejection must preserve the complete public record and durable fence observation"
+    );
+    assert_eq!(
+        observation_after_rejection.record(),
+        Some(&record_before_rejection),
         "one-over history rejection must not mutate the business record"
     );
     assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.observe_fenced_transition(&one_over_key)
-        })
-        .await
-        .expect("read one-over fence after rejection")
-        .current_fence(),
+        observation_after_rejection.current_fence(),
         fence_before_rejection,
         "one-over history rejection must not renew a lease or advance the fence"
+    );
+    assert_eq!(
+        retry_exact_consensus_operation(&transient_retries, || {
+            store.max_replication_sequence()
+        })
+        .await
+        .expect("read application sequence after one-over rejections"),
+        replication_before_rejection,
+        "one-over rejection and both retries must not apply an application entry"
+    );
+    assert!(
+        one_over_watch.next().now_or_never().is_none(),
+        "one-over rejection and both retries must not emit a watch event"
     );
     assert_eq!(
         retry_exact_consensus_operation(&transient_retries, || {
@@ -1020,7 +1277,7 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
     })
     .await
     .expect("commit advanced logical time through a public read barrier");
-    history = maintain_exact_history_batch(&stores, history, &transient_retries)
+    history = maintain_exact_history_batch(&stores, history, &transient_retries, None)
         .await
         .expect("first fixed-quorum retirement batch");
     assert_eq!(history.active_epoch(), None);
@@ -1108,7 +1365,7 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         "qualification assumes ordered full reclamation batches"
     );
     for batch in 1..RECLAIM_BATCHES {
-        history = maintain_exact_history_batch(&stores, history, &transient_retries)
+        history = maintain_exact_history_batch(&stores, history, &transient_retries, None)
             .await
             .expect("ordered fixed-quorum retirement batch");
         if batch + 1 < RECLAIM_BATCHES {
@@ -1189,16 +1446,19 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         FencedTransitionMutationResult::Created
     ));
 
-    let database_bytes = database_paths
+    let database_bytes_by_voter = database_paths
         .iter()
         .map(|path| sqlite_database_family_bytes(path))
-        .sum::<u64>();
-    let snapshot_bytes = snapshot_paths
+        .collect::<Vec<_>>();
+    let snapshot_bytes_by_voter = snapshot_paths
         .iter()
         .map(|path| directory_bytes(path))
-        .sum::<u64>();
+        .collect::<Vec<_>>();
+    let database_bytes = database_bytes_by_voter.iter().sum::<u64>();
+    let snapshot_bytes = snapshot_bytes_by_voter.iter().sum::<u64>();
+    let peak_rss_kib = process_peak_rss_kib();
     eprintln!(
-        "sdk-702 v2 qualification: elapsed={:?} committed={} reclaimed={} transient_exact_retries={} db_bytes={} snapshot_bytes={}",
+        "sdk-702 v2 qualification: elapsed={:?} committed={} reclaimed={} transient_exact_retries={} db_bytes_by_voter={database_bytes_by_voter:?} db_bytes={} snapshot_bytes_by_voter={snapshot_bytes_by_voter:?} snapshot_bytes={} peak_rss_kib={peak_rss_kib}",
         started.elapsed(),
         FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES + 1,
         history.reclaimed_entries(),
@@ -1206,12 +1466,530 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         database_bytes,
         snapshot_bytes,
     );
-    assert!(
-        database_bytes > 0,
-        "qualification must persist all voter state"
+    assert_voter_resource_ceiling(
+        "post-reclaim SQLite database family",
+        &database_bytes_by_voter,
+        QUALIFICATION_PER_VOTER_DATABASE_CEILING_BYTES,
     );
+    assert_voter_resource_ceiling(
+        "post-reclaim snapshot directory",
+        &snapshot_bytes_by_voter,
+        QUALIFICATION_PER_VOTER_SNAPSHOT_CEILING_BYTES,
+    );
+    #[cfg(target_os = "linux")]
     assert!(
-        snapshot_bytes > 0,
-        "qualification must produce measurable bounded snapshot state"
+        peak_rss_kib <= QUALIFICATION_PROCESS_PEAK_RSS_CEILING_KIB,
+        "three-voter peak RSS {peak_rss_kib} KiB exceeds the fixed {} KiB ceiling",
+        QUALIFICATION_PROCESS_PEAK_RSS_CEILING_KIB,
+    );
+}
+
+/// Pace a real request stream without hiding a quorum that cannot keep up.
+///
+/// The sleep only applies while the fixed quorum is ahead of the requested
+/// rate. A slower quorum therefore makes the measured rate truthful rather
+/// than dropping requests, seeding state, or hiding client backlog.
+async fn pace_release_phase(phase_started: Instant, submitted: usize, per_second: usize) {
+    let due = phase_started + Duration::from_secs_f64(submitted as f64 / per_second as f64);
+    let now = Instant::now();
+    if due > now {
+        tokio::time::sleep(due - now).await;
+    }
+}
+
+/// Full SDK-702 release workload through a real three-voter OpenRaft quorum.
+///
+/// This is intentionally ignored: it submits the real 1,010,000 operations
+/// (50,000 preload, 500/s for 30 minutes, then 1,000/s for 60 seconds) using
+/// the public V2 API.  It does not substitute generic batches, seed receipts,
+/// or call SQLite/state-machine internals. The pacing assertions cover both
+/// requested finite-window rates and emit only fixed-dimension, redaction-safe
+/// release evidence.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "SDK-702 real 1,010,000-operation three-voter release qualification"]
+async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() {
+    let started = Instant::now();
+    let directory = tempfile::tempdir().expect("SDK-702 release qualification directory");
+    let start = Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_900_000_000)
+            .expect("SDK-702 release qualification start"),
+    );
+    let clock = Arc::new(MutableClock::new(start));
+    let (mut stores, database_paths, snapshot_paths) =
+        fixed_cluster(directory.path(), clock.clone()).await;
+    let provider = sealing_provider();
+    let transient_retries = AtomicU64::new(0);
+    let first_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
+
+    assert_eq!(
+        QUALIFICATION_RELEASE_TRANSITIONS, 1_010_000,
+        "the release envelope is 50k + (500/s * 30m) + (1k/s * 60s)"
+    );
+    assert_eq!(FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS, 1);
+    assert_eq!(FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS, 7);
+    assert_eq!(
+        FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES,
+        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+            * (FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS + FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS),
+        "the public fixed resource contract must remain exactly eight epochs"
+    );
+
+    // The first V2 effect is deliberately singleton activation.  Every later
+    // preload create is submitted through the public bounded coalescing API;
+    // no receipt, database, or private-apply shortcut exists in this path.
+    // Keep the original request/outcome as an attestation exemplar for each
+    // epoch; later updates exercise independent lease renewal paths.
+    let leader = ready_leader(&stores).await;
+    let store = &stores[leader];
+    let first_key = key(0);
+    let first_observation = retry_exact_consensus_operation(&transient_retries, || {
+        store.observe_fenced_transition(&first_key)
+    })
+    .await
+    .expect("singleton activation fence observation");
+    let first_request = create_request(
+        0,
+        first_epoch,
+        first_key,
+        first_observation.current_fence(),
+        &provider,
+    )
+    .await;
+    let first_outcome = retry_exact_consensus_operation(&transient_retries, || {
+        store.fenced_transition_v2(first_request.clone())
+    })
+    .await
+    .expect("singleton V2 activation");
+    let mut sessions = vec![(first_request, first_outcome)];
+    for chunk_start in (1..QUALIFICATION_SESSIONS).step_by(QUALIFICATION_PRELOAD_BATCH_OPERATIONS) {
+        let chunk_end =
+            (chunk_start + QUALIFICATION_PRELOAD_BATCH_OPERATIONS).min(QUALIFICATION_SESSIONS);
+        let mut requests = Vec::with_capacity(chunk_end - chunk_start);
+        for session_index in chunk_start..chunk_end {
+            let session_key = key(session_index);
+            let observation = retry_exact_consensus_operation(&transient_retries, || {
+                store.observe_fenced_transition(&session_key)
+            })
+            .await
+            .expect("preload batch fence observation");
+            requests.push(
+                create_request(
+                    session_index,
+                    first_epoch,
+                    session_key,
+                    observation.current_fence(),
+                    &provider,
+                )
+                .await,
+            );
+        }
+        let outcomes = retry_exact_consensus_operation(&transient_retries, || {
+            store.fenced_transition_v2_batch(requests.clone())
+        })
+        .await
+        .expect("preload bounded V2 batch");
+        assert_eq!(outcomes.len(), requests.len());
+        for (request, outcome) in requests.into_iter().zip(outcomes) {
+            let outcome = outcome.expect("preload item result");
+            assert!(matches!(
+                outcome.mutation(),
+                FencedTransitionMutationResult::Created
+            ));
+            sessions.push((request, outcome));
+        }
+    }
+    assert_eq!(sessions.len(), QUALIFICATION_SESSIONS);
+    let mut representatives = vec![sessions[0].clone()];
+    let mut active_epoch = first_epoch;
+    let mut active_entries = QUALIFICATION_SESSIONS;
+    let mut nonce = QUALIFICATION_SESSIONS;
+    let mut rotations = 0usize;
+
+    // Keep exactly 50,000 representative sessions in memory. The retained
+    // receipt resource itself is bounded by the public eight-epoch contract
+    // asserted above, not by this test-side cache.
+    for (phase_name, target_rate, operations) in [
+        (
+            "sustained-500-per-second",
+            QUALIFICATION_SUSTAINED_RATE,
+            QUALIFICATION_SUSTAINED_TRANSITIONS,
+        ),
+        (
+            "burst-1000-per-second",
+            QUALIFICATION_BURST_RATE,
+            QUALIFICATION_BURST_TRANSITIONS,
+        ),
+    ] {
+        let phase_started = Instant::now();
+        let mut latency = ReleaseLatencySamples::default();
+        let mut submitted = 0usize;
+        while submitted < operations {
+            if active_entries == FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
+                let leader = current_local_maintenance_leader(&stores).await;
+                let before = retry_exact_consensus_operation(&transient_retries, || {
+                    stores[leader].fenced_transition_v2_history_state()
+                })
+                .await
+                .expect("linearized full active epoch before successor rotation");
+                assert_eq!(before.active_epoch(), Some(active_epoch));
+                assert_eq!(
+                    before.bound_entries(),
+                    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+                );
+                assert!(
+                    rotations < FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS,
+                    "the 1.01m envelope must require exactly seven successors, never a ninth epoch"
+                );
+                let after = maintain_exact_history_batch(&stores, before, &transient_retries, None)
+                    .await
+                    .expect("open bounded successor through local-leader maintenance");
+                rotations += 1;
+                active_epoch = FencedTransitionV2HistoryEpoch::new(active_epoch.get() + 1)
+                    .expect("representable successor epoch");
+                assert_eq!(after.active_epoch(), Some(active_epoch));
+                assert_eq!(after.retired_through(), None);
+                assert_eq!(after.reclaim_epoch(), None);
+                assert_eq!(after.bound_entries(), 0);
+                active_entries = 0;
+
+                // Every earlier epoch remains publicly attestable and exactly
+                // replayable before the 24-hour floor/reclaim boundary.
+                for (request, outcome) in &representatives {
+                    assert!(matches!(
+                        retry_exact_consensus_operation(&transient_retries, || {
+                            stores[leader].fenced_transition_v2_status(request)
+                        })
+                        .await
+                        .expect("pre-floor representative status"),
+                        FencedTransitionV2Status::Recorded(result) if result.as_ref() == &Ok(outcome.clone())
+                    ));
+                    assert_eq!(
+                        retry_exact_consensus_operation(&transient_retries, || {
+                            stores[leader].fenced_transition_v2(request.clone())
+                        })
+                        .await
+                        .expect("pre-floor exact replay"),
+                        *outcome
+                    );
+                    let changed = request_with_changed_body(request);
+                    assert_eq!(
+                        retry_exact_consensus_operation(&transient_retries, || {
+                            stores[leader].fenced_transition_v2_status(&changed)
+                        })
+                        .await
+                        .expect("pre-floor changed-body status"),
+                        FencedTransitionV2Status::RequestConflict
+                    );
+                }
+            }
+
+            let leader = ready_leader(&stores).await;
+            let batch_len = QUALIFICATION_PACED_BATCH_OPERATIONS
+                .min(operations - submitted)
+                .min(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - active_entries);
+            let mut requests = Vec::with_capacity(batch_len);
+            let mut session_slots = Vec::with_capacity(batch_len);
+            let mut scheduled_at = Vec::with_capacity(batch_len);
+            let successor_first_item = active_entries == 0;
+            for batch_offset in 0..batch_len {
+                pace_release_phase(phase_started, submitted + batch_offset, target_rate).await;
+                scheduled_at.push(
+                    phase_started
+                        + Duration::from_secs_f64(
+                            (submitted + batch_offset) as f64 / target_rate as f64,
+                        ),
+                );
+                // Each batch updates distinct independently fenced sessions.
+                // Its first item after a rotation is retained as that epoch's
+                // exact replay representative. A physical batch is
+                // coalescing only; it has no inter-item conditional or
+                // all-or-nothing meaning.
+                let slot = nonce % sessions.len();
+                let update =
+                    renew_update_request(nonce, active_epoch, &sessions[slot].1, &provider).await;
+                requests.push(update);
+                session_slots.push(slot);
+                nonce += 1;
+            }
+            let batch_started = Instant::now();
+            let outcomes = retry_exact_consensus_operation(&transient_retries, || {
+                stores[leader].fenced_transition_v2_batch(requests.clone())
+            })
+            .await
+            .expect("paced bounded V2 batch");
+            latency.record_batch(batch_started.elapsed(), &scheduled_at);
+            assert_eq!(outcomes.len(), requests.len());
+            for (batch_offset, ((request, outcome), slot)) in requests
+                .into_iter()
+                .zip(outcomes)
+                .zip(session_slots)
+                .enumerate()
+            {
+                let outcome = outcome.expect("paced V2 item result");
+                if successor_first_item && batch_offset == 0 {
+                    representatives.push((request.clone(), outcome.clone()));
+                }
+                sessions[slot].1 = outcome;
+            }
+            active_entries += batch_len;
+            submitted += batch_len;
+        }
+        let elapsed = phase_started.elapsed();
+        let batch_samples = latency.batch.len();
+        let item_samples = latency.item_scheduled_to_completion.len();
+        let (batch_p99, batch_p999, item_p99, item_p999) = latency.p99_and_p999();
+        let achieved_ops_per_second = operations as f64 / elapsed.as_secs_f64();
+        eprintln!(
+            "sdk-702 successor phase: name={phase_name} offered_ops_per_second={target_rate} achieved_ops_per_second={achieved_ops_per_second:.6} operations={operations} batch_samples={batch_samples} item_samples={item_samples} batch_p99_us={} batch_p999_us={} item_p99_us={} item_p999_us={} elapsed_ms={}",
+            batch_p99.as_micros(),
+            batch_p999.as_micros(),
+            item_p99.as_micros(),
+            item_p999.as_micros(),
+            elapsed.as_millis(),
+        );
+        assert!(
+            achieved_ops_per_second >= target_rate as f64 * 0.999,
+            "the truthful finite-window completion rate must remain within 0.1% of the offered release target"
+        );
+        assert!(item_p99 <= Duration::from_millis(25));
+        assert!(item_p999 <= Duration::from_millis(100));
+    }
+
+    assert_eq!(
+        nonce, QUALIFICATION_RELEASE_TRANSITIONS,
+        "the paced workload must use exactly its declared 1,010,000 unique V2 IDs"
+    );
+    assert_eq!(sessions.len(), QUALIFICATION_SESSIONS);
+    assert_eq!(rotations, 7, "the 1.01m envelope crosses seven successors");
+    let leader = ready_leader(&stores).await;
+    let history = retry_exact_consensus_operation(&transient_retries, || {
+        stores[leader].fenced_transition_v2_history_state()
+    })
+    .await
+    .expect("history after 1.01m real operations");
+    assert_eq!(
+        history.active_epoch(),
+        Some(FencedTransitionV2HistoryEpoch::new(8).expect("epoch 8"))
+    );
+    assert_eq!(history.retired_through(), None);
+    assert_eq!(history.reclaim_epoch(), None);
+    assert_eq!(
+        history.bound_entries(),
+        QUALIFICATION_RELEASE_TRANSITIONS % FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+    );
+    assert_eq!(representatives.len(), 8);
+
+    // A restart after seven rotations uses only the public constructor and
+    // durable voter files. It proves the replay interval was recovered, not
+    // reconstructed through a direct receipt-table inspection.
+    drop(stores);
+    let (stores_after_restart, _, _) = fixed_cluster(directory.path(), clock.clone()).await;
+    stores = stores_after_restart;
+    let leader = ready_leader(&stores).await;
+    for (request, outcome) in &representatives {
+        assert!(matches!(
+            retry_exact_consensus_operation(&transient_retries, || {
+                stores[leader].fenced_transition_v2_status(request)
+            })
+            .await
+            .expect("restart exact status"),
+            FencedTransitionV2Status::Recorded(result) if result.as_ref() == &Ok(outcome.clone())
+        ));
+        assert_eq!(
+            retry_exact_consensus_operation(&transient_retries, || {
+                stores[leader].fenced_transition_v2(request.clone())
+            })
+            .await
+            .expect("restart exact replay"),
+            *outcome
+        );
+        let changed = request_with_changed_body(request);
+        assert_eq!(
+            retry_exact_consensus_operation(&transient_retries, || {
+                stores[leader].fenced_transition_v2_status(&changed)
+            })
+            .await
+            .expect("restart changed-body status"),
+            FencedTransitionV2Status::RequestConflict
+        );
+    }
+
+    let database_bytes_before_reclaim_by_voter = database_paths
+        .iter()
+        .map(|path| sqlite_database_family_bytes(path))
+        .collect::<Vec<_>>();
+    let snapshot_bytes_before_reclaim_by_voter = snapshot_paths
+        .iter()
+        .map(|path| directory_bytes(path))
+        .collect::<Vec<_>>();
+    assert_voter_resource_ceiling(
+        "pre-reclaim SQLite database family",
+        &database_bytes_before_reclaim_by_voter,
+        QUALIFICATION_PER_VOTER_DATABASE_CEILING_BYTES,
+    );
+    assert_voter_resource_ceiling(
+        "pre-reclaim snapshot directory",
+        &snapshot_bytes_before_reclaim_by_voter,
+        QUALIFICATION_PER_VOTER_SNAPSHOT_CEILING_BYTES,
+    );
+
+    // Logical-time acceleration crosses the 24-hour boundary without a
+    // wall-clock day. The first reclaim must advance only the oldest floor,
+    // delete at most one ordered batch, and leave epoch 8 writable.
+    clock.set(
+        start
+            .add_seconds(24 * 60 * 60 + 1)
+            .expect("retention boundary"),
+    );
+    let before_floor = retry_exact_consensus_operation(&transient_retries, || {
+        stores[leader].fenced_transition_v2_history_state()
+    })
+    .await
+    .expect("linearized history before floor advancement");
+    // Discard exactly one already-successful public maintenance reply. This
+    // is post-commit reply loss only: the helper must reconcile by a fresh
+    // linearized state read, never retry the stale expected-state CAS.
+    let post_commit_reply_loss = AtomicUsize::new(1);
+    let after_floor = maintain_exact_history_batch(
+        &stores,
+        before_floor,
+        &transient_retries,
+        Some(&post_commit_reply_loss),
+    )
+    .await
+    .expect("reconcile an accepted oldest-floor advancement after reply loss");
+    assert_eq!(
+        post_commit_reply_loss.load(Ordering::SeqCst),
+        0,
+        "the test must discard exactly one successful maintenance reply"
+    );
+    let epoch_one = FencedTransitionV2HistoryEpoch::new(1).expect("epoch one");
+    let epoch_eight = FencedTransitionV2HistoryEpoch::new(8).expect("epoch eight");
+    assert_eq!(after_floor.generation(), before_floor.generation() + 1);
+    assert_eq!(after_floor.active_epoch(), Some(epoch_eight));
+    assert_eq!(after_floor.active_epoch(), before_floor.active_epoch());
+    assert_eq!(before_floor.retired_through(), None);
+    assert_eq!(after_floor.retired_through(), Some(epoch_one));
+    assert_eq!(after_floor.reclaim_epoch(), Some(epoch_one));
+    assert_eq!(
+        after_floor.reclaim_remaining(),
+        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - FENCED_TRANSITION_V2_RECLAIM_BATCH
+    );
+    assert_eq!(
+        after_floor.reclaimed_entries(),
+        before_floor.reclaimed_entries() + FENCED_TRANSITION_V2_RECLAIM_BATCH as u64,
+        "the ordered reclaim cursor advances by exactly one bounded batch"
+    );
+    let observed_after_reply_loss = retry_exact_consensus_operation(&transient_retries, || {
+        stores[leader].fenced_transition_v2_history_state()
+    })
+    .await
+    .expect("linearized history reconstructed after maintenance reply loss");
+    assert_eq!(observed_after_reply_loss, after_floor);
+    assert_eq!(
+        stores[current_local_maintenance_leader(&stores).await]
+            .maintain_fenced_transition_v2_history(before_floor)
+            .await,
+        Err(StoreError::FencedTransitionHistoryEpochNotActive),
+        "the exact stale expected state is deterministic and cannot reclaim a second batch"
+    );
+    let observed_after_stale_retry = retry_exact_consensus_operation(&transient_retries, || {
+        stores[leader].fenced_transition_v2_history_state()
+    })
+    .await
+    .expect("linearized history after stale maintenance retry");
+    assert_eq!(
+        observed_after_stale_retry, after_floor,
+        "the stale expected-state retry has no second lifecycle, floor, or cursor effect"
+    );
+    // The public restart above proves durable replay recovery; the exact
+    // SQLite snapshot companion is
+    // `fenced_transition_v2_snapshot_during_reclaim_preserves_cursor_and_rejects_regression`.
+    let (oldest, _) = &representatives[0];
+    assert_eq!(
+        retry_exact_consensus_operation(&transient_retries, || {
+            stores[leader].fenced_transition_v2_status(oldest)
+        })
+        .await
+        .expect("oldest status at floor"),
+        FencedTransitionV2Status::Retired
+    );
+    let changed_oldest = request_with_changed_body(oldest);
+    assert_eq!(
+        retry_exact_consensus_operation(&transient_retries, || {
+            stores[leader].fenced_transition_v2_status(&changed_oldest)
+        })
+        .await
+        .expect("oldest changed-body status at floor"),
+        FencedTransitionV2Status::RequestConflict
+    );
+
+    let active_slot = nonce % sessions.len();
+    let active_update =
+        renew_update_request(nonce, epoch_eight, &sessions[active_slot].1, &provider).await;
+    let active_outcome = retry_exact_consensus_operation(&transient_retries, || {
+        stores[leader].fenced_transition_v2_batch(vec![active_update.clone()])
+    })
+    .await
+    .expect("active successor remains writable during reclaim")
+    .into_iter()
+    .next()
+    .expect("one active batch outcome")
+    .expect("active batch item result");
+    sessions[active_slot].1 = active_outcome;
+    let during_reclaim = retry_exact_consensus_operation(&transient_retries, || {
+        stores[leader].fenced_transition_v2_history_state()
+    })
+    .await
+    .expect("linearized state after active mutation during reclaim");
+    let after_second_reclaim =
+        maintain_exact_history_batch(&stores, during_reclaim, &transient_retries, None)
+            .await
+            .expect("continue bounded reclaim without allocating epoch nine");
+    assert_eq!(after_second_reclaim.active_epoch(), Some(epoch_eight));
+    assert_eq!(after_second_reclaim.retired_through(), Some(epoch_one));
+    assert_eq!(after_second_reclaim.reclaim_epoch(), Some(epoch_one));
+    assert_eq!(
+        after_second_reclaim.reclaim_remaining(),
+        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - 2 * FENCED_TRANSITION_V2_RECLAIM_BATCH,
+        "the physical residual occupies the eighth slot; maintenance cannot allocate epoch nine"
+    );
+
+    let database_bytes_by_voter = database_paths
+        .iter()
+        .map(|path| sqlite_database_family_bytes(path))
+        .collect::<Vec<_>>();
+    let snapshot_bytes_by_voter = snapshot_paths
+        .iter()
+        .map(|path| directory_bytes(path))
+        .collect::<Vec<_>>();
+    let peak_rss_kib = process_peak_rss_kib();
+    eprintln!(
+        "sdk-702 successor qualification: elapsed_ms={} topology_voters={} release_operations_committed={} active_reclaim_operations_committed=1 total_operations_committed={} rotations={} semantic_history_ceiling_bytes={} transient_exact_retries={} pre_reclaim_db_bytes_by_voter={database_bytes_before_reclaim_by_voter:?} pre_reclaim_snapshot_bytes_by_voter={snapshot_bytes_before_reclaim_by_voter:?} post_reclaim_db_bytes_by_voter={database_bytes_by_voter:?} post_reclaim_snapshot_bytes_by_voter={snapshot_bytes_by_voter:?} reclaimed_entries={} reclaim_remaining={} peak_rss_kib={peak_rss_kib}",
+        started.elapsed().as_millis(),
+        stores.len(),
+        QUALIFICATION_RELEASE_TRANSITIONS,
+        QUALIFICATION_RELEASE_TRANSITIONS + 1,
+        rotations,
+        FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES,
+        transient_retries.load(Ordering::Relaxed),
+        after_second_reclaim.reclaimed_entries(),
+        after_second_reclaim.reclaim_remaining(),
+    );
+    assert_voter_resource_ceiling(
+        "post-reclaim SQLite database family",
+        &database_bytes_by_voter,
+        QUALIFICATION_PER_VOTER_DATABASE_CEILING_BYTES,
+    );
+    assert_voter_resource_ceiling(
+        "post-reclaim snapshot directory",
+        &snapshot_bytes_by_voter,
+        QUALIFICATION_PER_VOTER_SNAPSHOT_CEILING_BYTES,
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        peak_rss_kib <= QUALIFICATION_PROCESS_PEAK_RSS_CEILING_KIB,
+        "three-voter peak RSS {peak_rss_kib} KiB exceeds the fixed {} KiB ceiling",
+        QUALIFICATION_PROCESS_PEAK_RSS_CEILING_KIB,
     );
 }
