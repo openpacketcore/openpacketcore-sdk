@@ -289,6 +289,21 @@ fn create_v2_request(id: u8, epoch: FencedTransitionV2HistoryEpoch) -> FencedTra
     .expect("valid V2 create request")
 }
 
+fn create_v2_request_with_payload(
+    id: u8,
+    epoch: FencedTransitionV2HistoryEpoch,
+    payload: &[u8],
+) -> FencedTransitionV2Request {
+    let request = create_request_with_payload(id, payload);
+    FencedTransitionV2Request::new(
+        epoch,
+        FencedTransitionV2CallerNonce::from_bytes([id; 16]),
+        request.lease().clone(),
+        request.mutation().clone(),
+    )
+    .expect("valid V2 create request with payload")
+}
+
 #[derive(Default)]
 struct SpyState {
     capability: Option<AtomicFencedTransitionCapability>,
@@ -474,6 +489,10 @@ impl AtomicSpy {
         let request = state.v2_pending.take().expect("pending V2 transition");
         let outcome = v2_outcome_for(&request);
         state.v2_receipt = Some((request, outcome));
+    }
+
+    fn clear_v2_receipt(&self) {
+        self.state.lock().expect("spy lock").v2_receipt = None;
     }
 
     fn v2_executed(&self) -> Vec<FencedTransitionV2Request> {
@@ -1024,6 +1043,18 @@ fn conflicting_v2_request(request: &FencedTransitionV2Request) -> FencedTransiti
     serde_json::from_value(wire).expect("wire retains conflicting V2 request")
 }
 
+fn conflicting_v2_body_request(
+    identity: &FencedTransitionV2Request,
+    substituted_body: &FencedTransitionV2Request,
+) -> FencedTransitionV2Request {
+    let mut wire = serde_json::to_value(substituted_body).expect("serialize substituted V2 body");
+    wire.as_object_mut().expect("V2 request object").insert(
+        "request_id".into(),
+        serde_json::to_value(identity.request_id()).expect("serialize V2 request ID"),
+    );
+    serde_json::from_value(wire).expect("wire retains same-ID conflicting V2 body")
+}
+
 #[tokio::test]
 async fn protected_v2_batches_reuse_existing_mappings_and_seal_only_missing_items() {
     let epoch = initial_v2_epoch();
@@ -1104,6 +1135,187 @@ async fn protected_v2_batches_reuse_existing_mappings_and_seal_only_missing_item
     assert!(remote_physical[1].matches(&remote_physical[4]));
     assert!(remote_physical[2].matches(&remote_physical[5]));
     assert!(remote_physical[3].matches(&remote_physical[6]));
+}
+
+#[tokio::test]
+async fn protected_v2_batch_conflicts_are_synthetic_and_never_dispatched() {
+    let epoch = initial_v2_epoch();
+
+    let inert_local_spy = Arc::new(AtomicSpy::new());
+    let inert_local_provider = CountingKeyProvider::with_key("local-v2-conflict-inert", 0xd1);
+    let inert_local = EncryptingSessionBackend::new(
+        Arc::clone(&inert_local_spy),
+        Arc::clone(&inert_local_provider),
+        NAMESPACE,
+    );
+    let inert_local_outcomes = inert_local
+        .fenced_transition_v2_batch(vec![conflicting_v2_request(&create_v2_request(
+            0xd1, epoch,
+        ))])
+        .await
+        .expect("an all-conflict local batch is resolved without infrastructure");
+    assert!(matches!(
+        inert_local_outcomes.as_slice(),
+        [Err(StoreError::FencedTransitionRequestConflict)]
+    ));
+    assert_eq!(inert_local_provider.calls(), 0);
+    assert!(inert_local_spy.v2_executed().is_empty());
+
+    let inert_remote_spy = Arc::new(AtomicSpy::new());
+    let inert_remote_provider = CountingRemoteProvider::with_key("remote-v2-conflict-inert", 0xd2);
+    let inert_remote = RemoteSealingSessionBackend::new(
+        Arc::clone(&inert_remote_spy),
+        Arc::clone(&inert_remote_provider),
+        NAMESPACE,
+    );
+    let inert_remote_outcomes = inert_remote
+        .fenced_transition_v2_batch(vec![conflicting_v2_request(&create_v2_request(
+            0xd2, epoch,
+        ))])
+        .await
+        .expect("an all-conflict remote batch is resolved without infrastructure");
+    assert!(matches!(
+        inert_remote_outcomes.as_slice(),
+        [Err(StoreError::FencedTransitionRequestConflict)]
+    ));
+    assert_eq!(inert_remote_provider.calls(), 0);
+    assert!(inert_remote_spy.v2_executed().is_empty());
+
+    let local_spy = Arc::new(AtomicSpy::new());
+    local_spy.enable_v2();
+    let local_fixture = JournalFixture::new(0xd3);
+    let local_journal = local_fixture.open_v2();
+    let local_provider = CountingKeyProvider::with_key("local-v2-batch-conflict", 0xd3);
+    let local = EncryptingSessionBackend::new(
+        Arc::clone(&local_spy),
+        Arc::clone(&local_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&local_journal))
+    .with_fenced_transition_v2_journal_scope(local_fixture.v2_scope());
+    let local_seed = create_v2_request(0xd3, epoch);
+    local
+        .fenced_transition_v2(local_seed.clone())
+        .await
+        .expect("seed local journal mapping");
+    local_spy.clear_v2_receipt();
+    let local_missing_conflict = conflicting_v2_request(&create_v2_request(0xd4, epoch));
+    let local_valid = create_v2_request(0xd5, epoch);
+    let local_existing_conflict = conflicting_v2_body_request(
+        &local_seed,
+        &create_v2_request_with_payload(0xd6, epoch, b"substituted-local-body"),
+    );
+    let local_outcomes = local
+        .fenced_transition_v2_batch(vec![
+            local_missing_conflict.clone(),
+            local_valid.clone(),
+            local_existing_conflict,
+        ])
+        .await
+        .expect("mixed local batch");
+    assert!(matches!(
+        local_outcomes.as_slice(),
+        [
+            Err(StoreError::FencedTransitionRequestConflict),
+            Ok(_),
+            Err(StoreError::FencedTransitionRequestConflict)
+        ]
+    ));
+    assert_eq!(
+        local_provider.calls(),
+        2,
+        "only the seed and valid slot seal"
+    );
+    assert_eq!(local_spy.v2_executed().len(), 2);
+    let local_scope = protected_v2_journal_scope_for(
+        local_spy.as_ref(),
+        local_fixture.v2_scope(),
+        NAMESPACE,
+        crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
+    );
+    assert!(local_journal
+        .lookup(local_scope, local_missing_conflict.request_id())
+        .await
+        .expect("local conflict lookup")
+        .is_none());
+    assert!(local_journal
+        .lookup(local_scope, local_seed.request_id())
+        .await
+        .expect("local seed lookup")
+        .is_some());
+    assert!(local_journal
+        .lookup(local_scope, local_valid.request_id())
+        .await
+        .expect("local valid lookup")
+        .is_some());
+
+    let remote_spy = Arc::new(AtomicSpy::new());
+    remote_spy.enable_v2();
+    let remote_fixture = JournalFixture::new(0xd7);
+    let remote_journal = remote_fixture.open_v2();
+    let remote_provider = CountingRemoteProvider::with_key("remote-v2-batch-conflict", 0xd7);
+    let remote = RemoteSealingSessionBackend::new(
+        Arc::clone(&remote_spy),
+        Arc::clone(&remote_provider),
+        NAMESPACE,
+    )
+    .with_fenced_transition_v2_journal(Arc::clone(&remote_journal))
+    .with_fenced_transition_v2_journal_scope(remote_fixture.v2_scope());
+    let remote_seed = create_v2_request(0xd7, epoch);
+    remote
+        .fenced_transition_v2(remote_seed.clone())
+        .await
+        .expect("seed remote journal mapping");
+    remote_spy.clear_v2_receipt();
+    let remote_missing_conflict = conflicting_v2_request(&create_v2_request(0xd8, epoch));
+    let remote_valid = create_v2_request(0xd9, epoch);
+    let remote_existing_conflict = conflicting_v2_body_request(
+        &remote_seed,
+        &create_v2_request_with_payload(0xda, epoch, b"substituted-remote-body"),
+    );
+    let remote_outcomes = remote
+        .fenced_transition_v2_batch(vec![
+            remote_missing_conflict.clone(),
+            remote_valid.clone(),
+            remote_existing_conflict,
+        ])
+        .await
+        .expect("mixed remote batch");
+    assert!(matches!(
+        remote_outcomes.as_slice(),
+        [
+            Err(StoreError::FencedTransitionRequestConflict),
+            Ok(_),
+            Err(StoreError::FencedTransitionRequestConflict)
+        ]
+    ));
+    assert_eq!(
+        remote_provider.calls(),
+        2,
+        "only the seed and valid slot seal"
+    );
+    assert_eq!(remote_spy.v2_executed().len(), 2);
+    let remote_scope = protected_v2_journal_scope_for(
+        remote_spy.as_ref(),
+        remote_fixture.v2_scope(),
+        NAMESPACE,
+        crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+    );
+    assert!(remote_journal
+        .lookup(remote_scope, remote_missing_conflict.request_id())
+        .await
+        .expect("remote conflict lookup")
+        .is_none());
+    assert!(remote_journal
+        .lookup(remote_scope, remote_seed.request_id())
+        .await
+        .expect("remote seed lookup")
+        .is_some());
+    assert!(remote_journal
+        .lookup(remote_scope, remote_valid.request_id())
+        .await
+        .expect("remote valid lookup")
+        .is_some());
 }
 
 #[tokio::test]
