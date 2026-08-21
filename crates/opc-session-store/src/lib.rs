@@ -107,7 +107,8 @@ pub use consensus::types::{
 };
 pub use consensus::{
     validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
-    ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusClusterId,
+    ConsensusSessionStore, ConsensusSessionStoreOpenError,
+    FencedMutationRosterMemberExecutionAuthority, SessionConsensusClusterId,
     SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
     SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusIdentityError,
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
@@ -151,10 +152,9 @@ pub use fenced_mutation_roster::{
     FencedMutationRosterExecuteError, FencedMutationRosterFenceIntent,
     FencedMutationRosterHistoryState, FencedMutationRosterMember,
     FencedMutationRosterMemberExecutionContext, FencedMutationRosterMemberExecutionError,
-    FencedMutationRosterMemberExecutor, FencedMutationRosterMemberProof,
-    FencedMutationRosterMemberProvider, FencedMutationRosterMembers,
-    FencedMutationRosterOperationId, FencedMutationRosterOutcome, FencedMutationRosterPhase,
-    FencedMutationRosterProfile, FencedMutationRosterProtectedPlan,
+    FencedMutationRosterMemberProof, FencedMutationRosterMemberProvider,
+    FencedMutationRosterMembers, FencedMutationRosterOperationId, FencedMutationRosterOutcome,
+    FencedMutationRosterPhase, FencedMutationRosterProfile, FencedMutationRosterProtectedPlan,
     FencedMutationRosterProtectedResult, FencedMutationRosterProviderOutcome,
     FencedMutationRosterRequestId, FencedMutationRosterScope, FencedMutationRosterStatus,
     FencedMutationRosterTerminal, FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,

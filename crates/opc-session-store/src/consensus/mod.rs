@@ -19,7 +19,8 @@ pub use network::{
 pub(crate) use store::OperatorRecoveryCommitError;
 pub use store::{
     validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
-    ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusStatus,
+    ConsensusSessionStore, ConsensusSessionStoreOpenError,
+    FencedMutationRosterMemberExecutionAuthority, SessionConsensusStatus,
     SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
     SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
     SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,

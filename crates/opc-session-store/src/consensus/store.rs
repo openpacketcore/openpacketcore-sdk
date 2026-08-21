@@ -72,9 +72,12 @@ use crate::error::{LeaseError, StoreError};
 use crate::fenced_mutation_roster::{
     fenced_mutation_roster_profile_digest, FencedMutationRosterAdmission,
     FencedMutationRosterCapability, FencedMutationRosterError, FencedMutationRosterHistoryState,
-    FencedMutationRosterOutcome, FencedMutationRosterPhase, FencedMutationRosterStatus,
-    FencedMutationRosterTerminal, FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,
-    FENCED_MUTATION_ROSTER_SCHEMA_V2, FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
+    FencedMutationRosterMemberExecutionContext, FencedMutationRosterMemberExecutionError,
+    FencedMutationRosterMemberProof, FencedMutationRosterMemberProvider,
+    FencedMutationRosterOrdinal, FencedMutationRosterOutcome, FencedMutationRosterPhase,
+    FencedMutationRosterStatus, FencedMutationRosterTerminal,
+    FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES, FENCED_MUTATION_ROSTER_SCHEMA_V2,
+    FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
 };
 use crate::fenced_transition::{
     AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionObservation,
@@ -626,6 +629,139 @@ struct ConsensusSessionStoreInner {
 #[derive(Clone)]
 pub struct ConsensusSessionStore {
     inner: Arc<ConsensusSessionStoreInner>,
+}
+
+/// One-use, store-owned authority to obtain an opaque member proof.
+///
+/// This capability is created only by [`ConsensusSessionStore`] after it
+/// verifies the authenticated consumer scope, exact durable `PollAdmitted`
+/// receipt, canonical member ordinal, and admitted fence. It is deliberately
+/// neither constructible nor clonable by consumers. Each execution consumes
+/// the authority and revalidates the same durable receipt after provider I/O
+/// before issuing an opaque proof.
+pub struct FencedMutationRosterMemberExecutionAuthority {
+    store: ConsensusSessionStore,
+    scope: SessionConsumerScope,
+    admission: FencedMutationRosterAdmission,
+    ordinal: FencedMutationRosterOrdinal,
+}
+
+impl fmt::Debug for FencedMutationRosterMemberExecutionAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FencedMutationRosterMemberExecutionAuthority(<redacted>)")
+    }
+}
+
+impl FencedMutationRosterMemberExecutionAuthority {
+    fn context(
+        &self,
+    ) -> Result<FencedMutationRosterMemberExecutionContext<'_>, FencedMutationRosterError> {
+        self.admission.validate()?;
+        let member = self
+            .admission
+            .members()
+            .as_slice()
+            .iter()
+            .find(|member| member.ordinal() == self.ordinal)
+            .ok_or(FencedMutationRosterError::LifecycleConflict)?;
+        Ok(FencedMutationRosterMemberExecutionContext::new(
+            &self.admission,
+            member,
+        ))
+    }
+
+    async fn revalidate_current_receipt(&self) -> Result<(), StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.store.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        let status = self
+            .store
+            .consumer_fenced_mutation_roster_status(self.scope, &self.admission, deadline)
+            .await?;
+        if status.phase() != FencedMutationRosterPhase::PollAdmitted
+            || status.request_id() != self.admission.request_id()
+        {
+            return Err(StoreError::InvalidKey(
+                "fenced_mutation_roster_member_not_poll_admitted".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Execute one member and issue a proof only after both durable receipt
+    /// validations succeed.
+    pub async fn execute_member<P>(
+        self,
+        provider: &P,
+    ) -> Result<FencedMutationRosterMemberProof, FencedMutationRosterMemberExecutionError<P::Error>>
+    where
+        P: FencedMutationRosterMemberProvider + ?Sized,
+    {
+        let context = self
+            .context()
+            .map_err(FencedMutationRosterMemberExecutionError::Context)?;
+        self.revalidate_current_receipt()
+            .await
+            .map_err(FencedMutationRosterMemberExecutionError::Authority)?;
+        let outcome = provider
+            .execute_member(&context)
+            .await
+            .map_err(FencedMutationRosterMemberExecutionError::Provider)?;
+        self.revalidate_current_receipt()
+            .await
+            .map_err(FencedMutationRosterMemberExecutionError::Authority)?;
+        Ok(FencedMutationRosterMemberProof::issue(&context, outcome))
+    }
+
+    /// Read one member's durable evidence and issue a proof only after both
+    /// durable receipt validations succeed.
+    pub async fn member_status<P>(
+        self,
+        provider: &P,
+    ) -> Result<FencedMutationRosterMemberProof, FencedMutationRosterMemberExecutionError<P::Error>>
+    where
+        P: FencedMutationRosterMemberProvider + ?Sized,
+    {
+        let context = self
+            .context()
+            .map_err(FencedMutationRosterMemberExecutionError::Context)?;
+        self.revalidate_current_receipt()
+            .await
+            .map_err(FencedMutationRosterMemberExecutionError::Authority)?;
+        let outcome = provider
+            .member_status(&context)
+            .await
+            .map_err(FencedMutationRosterMemberExecutionError::Provider)?;
+        self.revalidate_current_receipt()
+            .await
+            .map_err(FencedMutationRosterMemberExecutionError::Authority)?;
+        Ok(FencedMutationRosterMemberProof::issue(&context, outcome))
+    }
+
+    /// Reconcile one member and issue a proof only after both durable receipt
+    /// validations succeed.
+    pub async fn adopt_member<P>(
+        self,
+        provider: &P,
+    ) -> Result<FencedMutationRosterMemberProof, FencedMutationRosterMemberExecutionError<P::Error>>
+    where
+        P: FencedMutationRosterMemberProvider + ?Sized,
+    {
+        let context = self
+            .context()
+            .map_err(FencedMutationRosterMemberExecutionError::Context)?;
+        self.revalidate_current_receipt()
+            .await
+            .map_err(FencedMutationRosterMemberExecutionError::Authority)?;
+        let outcome = provider
+            .adopt_member(&context)
+            .await
+            .map_err(FencedMutationRosterMemberExecutionError::Provider)?;
+        self.revalidate_current_receipt()
+            .await
+            .map_err(FencedMutationRosterMemberExecutionError::Authority)?;
+        Ok(FencedMutationRosterMemberProof::issue(&context, outcome))
+    }
 }
 
 /// Quorum-side adapter exposing only typed stateless consumer operations.
@@ -1793,6 +1929,63 @@ impl ConsensusSessionStore {
             return Err(consensus_unavailable());
         }
         Ok(SessionConsumerAuthorizationManifest::new(scope, members))
+    }
+
+    /// Obtain the one-use SDK authority required to issue one roster member
+    /// proof from a provider's durable evidence.
+    ///
+    /// The authenticated `identity` must be supplied by the consumer mTLS
+    /// boundary, not a request body. This method verifies that its derived
+    /// roster scope, the current consensus scope, the exact canonical member,
+    /// and the durable receipt all match before it returns the opaque
+    /// authority. The authority repeats the durable receipt verification after
+    /// provider I/O, so a terminalized, absent, or superseded receipt cannot
+    /// yield a proof.
+    pub async fn fenced_mutation_roster_member_execution_authority(
+        &self,
+        identity: &SessionConsumerIdentity,
+        scope: SessionConsumerScope,
+        admission: FencedMutationRosterAdmission,
+        ordinal: FencedMutationRosterOrdinal,
+    ) -> Result<FencedMutationRosterMemberExecutionAuthority, StoreError> {
+        admission
+            .validate()
+            .map_err(|_| StoreError::InvalidKey("fenced_mutation_roster_invalid".into()))?;
+        if !admission
+            .members()
+            .as_slice()
+            .iter()
+            .any(|member| member.ordinal() == ordinal)
+        {
+            return Err(StoreError::InvalidKey(
+                "fenced_mutation_roster_member_ordinal_invalid".into(),
+            ));
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        let scope_admission = self.admit_consumer_scope(scope, deadline).await.map_err(
+            |rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            },
+        )?;
+        let authority_scope = derive_fenced_mutation_roster_scope_for_consumer(
+            identity,
+            SessionConsumerScope::new(scope_admission.required_scope),
+        );
+        drop(scope_admission);
+        if admission.scope() != authority_scope {
+            return Err(StoreError::TopologyAuthorityRevoked);
+        }
+        let authority = FencedMutationRosterMemberExecutionAuthority {
+            store: self.clone(),
+            scope,
+            admission,
+            ordinal,
+        };
+        authority.revalidate_current_receipt().await?;
+        Ok(authority)
     }
 
     async fn consumer_scope_is_current(
@@ -7664,6 +7857,14 @@ mod membership_tests {
         scope: SessionConsumerScope,
         identity: &SessionConsumerIdentity,
     ) -> FencedMutationRosterAdmission {
+        consumer_v3_roster_admission_with_fence(scope, identity, FenceToken::new(1))
+    }
+
+    fn consumer_v3_roster_admission_with_fence(
+        scope: SessionConsumerScope,
+        identity: &SessionConsumerIdentity,
+        fence: FenceToken,
+    ) -> FencedMutationRosterAdmission {
         let member = crate::fenced_mutation_roster::FencedMutationRosterMember::new(
             crate::fenced_mutation_roster::FencedMutationRosterOrdinal::new(0)
                 .expect("roster ordinal"),
@@ -7682,7 +7883,7 @@ mod membership_tests {
             derive_fenced_mutation_roster_scope_for_consumer(identity, scope),
             crate::FencedMutationRosterFenceIntent::new(
                 OwnerId::new("consumer-v3-roster-owner").expect("roster owner"),
-                FenceToken::new(1),
+                fence,
             ),
             Generation::new(1),
             crate::FencedMutationRosterMembers::new([member]).expect("roster members"),
@@ -7699,24 +7900,25 @@ mod membership_tests {
 
     struct ConsumerV3AppliedRosterProvider;
 
+    #[async_trait::async_trait]
     impl crate::FencedMutationRosterMemberProvider for ConsumerV3AppliedRosterProvider {
         type Error = std::convert::Infallible;
 
-        fn execute_member(
+        async fn execute_member(
             &self,
             _context: &crate::FencedMutationRosterMemberExecutionContext<'_>,
         ) -> Result<crate::FencedMutationRosterProviderOutcome, Self::Error> {
             Ok(crate::FencedMutationRosterProviderOutcome::AppliedExecuted)
         }
 
-        fn member_status(
+        async fn member_status(
             &self,
             _context: &crate::FencedMutationRosterMemberExecutionContext<'_>,
         ) -> Result<crate::FencedMutationRosterProviderOutcome, Self::Error> {
             Ok(crate::FencedMutationRosterProviderOutcome::AppliedExecuted)
         }
 
-        fn adopt_member(
+        async fn adopt_member(
             &self,
             _context: &crate::FencedMutationRosterMemberExecutionContext<'_>,
         ) -> Result<crate::FencedMutationRosterProviderOutcome, Self::Error> {
@@ -7724,28 +7926,129 @@ mod membership_tests {
         }
     }
 
-    fn consumer_v3_roster_proof(
+    struct ConsumerV3FailingRosterProvider;
+
+    #[async_trait::async_trait]
+    impl crate::FencedMutationRosterMemberProvider for ConsumerV3FailingRosterProvider {
+        type Error = FencedMutationRosterError;
+
+        async fn execute_member(
+            &self,
+            _context: &crate::FencedMutationRosterMemberExecutionContext<'_>,
+        ) -> Result<crate::FencedMutationRosterProviderOutcome, Self::Error> {
+            Err(FencedMutationRosterError::Indeterminate)
+        }
+
+        async fn member_status(
+            &self,
+            _context: &crate::FencedMutationRosterMemberExecutionContext<'_>,
+        ) -> Result<crate::FencedMutationRosterProviderOutcome, Self::Error> {
+            Err(FencedMutationRosterError::Indeterminate)
+        }
+
+        async fn adopt_member(
+            &self,
+            _context: &crate::FencedMutationRosterMemberExecutionContext<'_>,
+        ) -> Result<crate::FencedMutationRosterProviderOutcome, Self::Error> {
+            Err(FencedMutationRosterError::Indeterminate)
+        }
+    }
+
+    struct ConsumerV3TerminalizingRosterProvider {
+        store: ConsensusSessionStore,
+        scope: SessionConsumerScope,
+        identity: SessionConsumerIdentity,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::FencedMutationRosterMemberProvider for ConsumerV3TerminalizingRosterProvider {
+        type Error = std::convert::Infallible;
+
+        async fn execute_member(
+            &self,
+            context: &crate::FencedMutationRosterMemberExecutionContext<'_>,
+        ) -> Result<crate::FencedMutationRosterProviderOutcome, Self::Error> {
+            let proof = crate::FencedMutationRosterMemberProof::issue(
+                context,
+                crate::FencedMutationRosterProviderOutcome::AppliedExecuted,
+            );
+            let terminal = FencedMutationRosterTerminal::from_member_proofs(
+                context.admission(),
+                &[proof],
+                vec![0x75],
+                context.admission().terminal_result().as_bytes().to_vec(),
+            )
+            .expect("test-only terminal construction");
+            assert!(matches!(
+                self.store
+                    .consumer_service()
+                    .execute_v3(
+                        &self.identity,
+                        SessionConsumerV3Request::new(
+                            self.scope,
+                            SessionConsumerV3Operation::FencedMutationRosterTerminalize {
+                                admission: Box::new(context.admission().clone()),
+                                terminal: Box::new(terminal),
+                            },
+                        ),
+                    )
+                    .await,
+                SessionConsumerV3Response::FencedMutationRosterTerminalize(Ok(_))
+            ));
+            Ok(crate::FencedMutationRosterProviderOutcome::AppliedExecuted)
+        }
+
+        async fn member_status(
+            &self,
+            context: &crate::FencedMutationRosterMemberExecutionContext<'_>,
+        ) -> Result<crate::FencedMutationRosterProviderOutcome, Self::Error> {
+            self.execute_member(context).await
+        }
+
+        async fn adopt_member(
+            &self,
+            context: &crate::FencedMutationRosterMemberExecutionContext<'_>,
+        ) -> Result<crate::FencedMutationRosterProviderOutcome, Self::Error> {
+            self.execute_member(context).await
+        }
+    }
+
+    async fn consumer_v3_roster_proof(
+        store: &ConsensusSessionStore,
+        scope: SessionConsumerScope,
+        identity: &SessionConsumerIdentity,
         admission: &FencedMutationRosterAdmission,
     ) -> crate::FencedMutationRosterMemberProof {
         let member = &admission.members().as_slice()[0];
-        crate::FencedMutationRosterMemberExecutor::new()
-            .execute_member(
-                &ConsumerV3AppliedRosterProvider,
-                admission,
+        store
+            .fenced_mutation_roster_member_execution_authority(
+                identity,
+                scope,
+                admission.clone(),
                 member.ordinal(),
-                admission.fence_intent().fence(),
             )
+            .await
+            .expect("store owns admitted roster proof authority")
+            .execute_member(
+                &ConsumerV3AppliedRosterProvider
+                    as &dyn crate::FencedMutationRosterMemberProvider<
+                        Error = std::convert::Infallible,
+                    >,
+            )
+            .await
             .expect("SDK issues roster proof")
     }
 
-    fn consumer_v3_roster_terminal(
+    async fn consumer_v3_roster_terminal(
+        store: &ConsensusSessionStore,
+        scope: SessionConsumerScope,
+        identity: &SessionConsumerIdentity,
         admission: &FencedMutationRosterAdmission,
     ) -> FencedMutationRosterTerminal {
-        let proof = consumer_v3_roster_proof(admission);
+        let proof = consumer_v3_roster_proof(store, scope, identity, admission).await;
         FencedMutationRosterTerminal::from_member_proofs(
             admission,
             &[proof],
-            admission.fence_intent().fence(),
             vec![0x75],
             admission.terminal_result().as_bytes().to_vec(),
         )
@@ -7969,7 +8272,10 @@ mod membership_tests {
         let other_identity = SessionConsumerIdentity::new("spiffe://test.example/consumer/other")
             .expect("other consumer identity");
         let admission = consumer_v3_roster_admission(scope, &identity);
-        let terminal = consumer_v3_roster_terminal(&admission);
+        let terminal = consumer_v3_self_attested_roster_terminal(
+            &admission,
+            admission.terminal_result().as_bytes().to_vec(),
+        );
 
         assert_eq!(
             store
@@ -8055,12 +8361,11 @@ mod membership_tests {
             SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_))
         ));
 
-        let proof = consumer_v3_roster_proof(&admission);
+        let proof = consumer_v3_roster_proof(&store, scope, &identity, &admission).await;
         assert_eq!(
             FencedMutationRosterTerminal::from_member_proofs(
                 &admission,
                 &[proof],
-                admission.fence_intent().fence(),
                 vec![0x75],
                 vec![0x7a],
             ),
@@ -8143,7 +8448,8 @@ mod membership_tests {
             ))
         );
         assert!(
-            consumer_v3_roster_terminal(&admission)
+            consumer_v3_roster_terminal(&store, scope, &identity, &admission)
+                .await
                 .validate_for_admission(&admission)
                 .is_ok(),
             "the frozen admission result remains terminalizable"
@@ -8155,7 +8461,59 @@ mod membership_tests {
         let (_directory, store, scope, identity, _key, _lease) = consumer_boundary_store().await;
         activate_roster_predecessor(&store, scope, &identity).await;
         let admission = consumer_v3_roster_admission(scope, &identity);
-        let terminal = consumer_v3_roster_terminal(&admission);
+        assert!(matches!(
+            store
+                .consumer_service()
+                .execute_v3(
+                    &identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterAdmit {
+                            admission: Box::new(admission.clone()),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_))
+        ));
+        let terminal = consumer_v3_roster_terminal(&store, scope, &identity, &admission).await;
+        assert!(matches!(
+            store
+                .consumer_service()
+                .execute_v3(
+                    &identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterTerminalize {
+                            admission: Box::new(admission),
+                            terminal: Box::new(terminal),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::FencedMutationRosterTerminalize(Ok(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn roster_member_proof_authority_requires_a_current_durable_admission() {
+        let (_directory, store, scope, identity, _key, _lease) = consumer_boundary_store().await;
+        activate_roster_predecessor(&store, scope, &identity).await;
+        let admission = consumer_v3_roster_admission(scope, &identity);
+        let ordinal = admission.members().as_slice()[0].ordinal();
+
+        assert!(
+            store
+                .fenced_mutation_roster_member_execution_authority(
+                    &identity,
+                    scope,
+                    admission.clone(),
+                    ordinal,
+                )
+                .await
+                .is_err(),
+            "an absent receipt cannot authorize provider I/O or proof issuance"
+        );
 
         assert!(matches!(
             store
@@ -8172,6 +8530,120 @@ mod membership_tests {
                 .await,
             SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_))
         ));
+
+        let other_identity = SessionConsumerIdentity::new("spiffe://test.example/consumer/other")
+            .expect("other consumer identity");
+        assert!(
+            matches!(
+                store
+                    .fenced_mutation_roster_member_execution_authority(
+                        &other_identity,
+                        scope,
+                        admission.clone(),
+                        ordinal,
+                    )
+                    .await,
+                Err(StoreError::TopologyAuthorityRevoked)
+            ),
+            "the authority scope is derived from authenticated mTLS identity"
+        );
+        assert!(
+            matches!(
+                store
+                    .fenced_mutation_roster_member_execution_authority(
+                        &identity,
+                        scope,
+                        admission.clone(),
+                        FencedMutationRosterOrdinal::new(1).expect("invalid ordinal fixture"),
+                    )
+                    .await,
+                Err(StoreError::InvalidKey(reason)) if reason == "fenced_mutation_roster_member_ordinal_invalid"
+            ),
+            "a member mismatch is rejected before provider I/O"
+        );
+        let mut nested_wire_body =
+            serde_json::to_value(&admission).expect("admission wire body encodes");
+        nested_wire_body["members"][0]["ordinal"] = serde_json::json!(1);
+        let malformed_from_wire: FencedMutationRosterAdmission =
+            serde_json::from_value(nested_wire_body).expect("malformed body deserializes");
+        assert!(
+            store
+                .fenced_mutation_roster_member_execution_authority(
+                    &identity,
+                    scope,
+                    malformed_from_wire,
+                    ordinal,
+                )
+                .await
+                .is_err(),
+            "nested serde cannot bypass canonical admission validation"
+        );
+        let fabricated_high_fence =
+            consumer_v3_roster_admission_with_fence(scope, &identity, FenceToken::new(9));
+        assert!(
+            store
+                .fenced_mutation_roster_member_execution_authority(
+                    &identity,
+                    scope,
+                    fabricated_high_fence,
+                    ordinal,
+                )
+                .await
+                .is_err(),
+            "a caller cannot replace the durable admission fence with a higher token"
+        );
+
+        let dynamic_provider: &dyn crate::FencedMutationRosterMemberProvider<
+            Error = std::convert::Infallible,
+        > = &ConsumerV3AppliedRosterProvider;
+        let proof = store
+            .fenced_mutation_roster_member_execution_authority(
+                &identity,
+                scope,
+                admission.clone(),
+                ordinal,
+            )
+            .await
+            .expect("durably admitted authority")
+            .execute_member(dynamic_provider)
+            .await
+            .expect("dynamic provider receives an SDK-issued proof");
+        let terminal = FencedMutationRosterTerminal::from_member_proofs(
+            &admission,
+            &[proof],
+            vec![0x75],
+            admission.terminal_result().as_bytes().to_vec(),
+        )
+        .expect("SDK proof derives a terminal bound to the admitted result");
+        terminal
+            .validate_for_admission(&admission)
+            .expect("terminal retains the exact admission commitment");
+
+        assert_eq!(
+            store
+                .fenced_mutation_roster_member_execution_authority(
+                    &identity,
+                    scope,
+                    admission.clone(),
+                    ordinal,
+                )
+                .await
+                .expect("fresh authority for provider-error coverage")
+                .execute_member(&ConsumerV3FailingRosterProvider)
+                .await,
+            Err(crate::FencedMutationRosterMemberExecutionError::Provider(
+                FencedMutationRosterError::Indeterminate,
+            )),
+            "provider failure cannot issue a proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn roster_member_proof_authority_revalidates_after_provider_io() {
+        let (_directory, store, scope, identity, _key, _lease) = consumer_boundary_store().await;
+        activate_roster_predecessor(&store, scope, &identity).await;
+        let admission = consumer_v3_roster_admission(scope, &identity);
+        let ordinal = admission.members().as_slice()[0].ordinal();
         assert!(matches!(
             store
                 .consumer_service()
@@ -8179,14 +8651,32 @@ mod membership_tests {
                     &identity,
                     SessionConsumerV3Request::new(
                         scope,
-                        SessionConsumerV3Operation::FencedMutationRosterTerminalize {
-                            admission: Box::new(admission),
-                            terminal: Box::new(terminal),
+                        SessionConsumerV3Operation::FencedMutationRosterAdmit {
+                            admission: Box::new(admission.clone()),
                         },
                     ),
                 )
                 .await,
-            SessionConsumerV3Response::FencedMutationRosterTerminalize(Ok(_))
+            SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_))
+        ));
+
+        let provider = ConsumerV3TerminalizingRosterProvider {
+            store: store.clone(),
+            scope,
+            identity: identity.clone(),
+        };
+        assert!(matches!(
+            store
+                .fenced_mutation_roster_member_execution_authority(
+                    &identity, scope, admission, ordinal,
+                )
+                .await
+                .expect("durably admitted authority")
+                .execute_member(&provider)
+                .await,
+            Err(crate::FencedMutationRosterMemberExecutionError::Authority(
+                _
+            ))
         ));
     }
 
