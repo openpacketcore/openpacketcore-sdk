@@ -160,6 +160,21 @@ fn consumer_wire_frame_size(size: usize) -> Result<u32, ProtocolError> {
     u32::try_from(size).map_err(|_| ProtocolError::InvalidWireValue)
 }
 
+fn checked_consumer_v3_response_frame_size(size: u32) -> Result<usize, ProtocolError> {
+    let size = usize::try_from(size).map_err(|_| ProtocolError::InvalidWireValue)?;
+    if !(MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES..=MAX_NEGOTIATED_FRAME_SIZE).contains(&size) {
+        return Err(ProtocolError::InvalidWireValue);
+    }
+    Ok(size)
+}
+
+fn consumer_v3_response_wire_frame_size(size: usize) -> Result<u32, ProtocolError> {
+    if !(MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES..=MAX_NEGOTIATED_FRAME_SIZE).contains(&size) {
+        return Err(ProtocolError::InvalidWireValue);
+    }
+    u32::try_from(size).map_err(|_| ProtocolError::InvalidWireValue)
+}
+
 // Return true only when the JSON arrays for encrypted payload bytes alone
 // exceed the complete negotiated request-frame budget. The exact bounded
 // encoder remains authoritative for every other request. This lower bound is
@@ -812,10 +827,23 @@ pub const MAX_PERSISTENT_FENCED_MUTATION_ROSTER_TENANT_QUEUE: usize = 64;
 pub const DEFAULT_PERSISTENT_FENCED_MUTATION_ROSTER_PENDING: usize = 64;
 /// Maximum total queued or in-flight protected roster calls.
 pub const MAX_PERSISTENT_FENCED_MUTATION_ROSTER_PENDING: usize = 256;
+/// Mechanically derived revision-5 `Call` JSON frame bound for the frozen roster profile.
+///
+/// This includes the private consumer envelope, maximum correlation, every
+/// maximum-width protected byte array, and the maximum JSON escaping permitted
+/// for opaque owner bytes.
+pub const MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES: usize = 8_787_181;
+/// Mechanically derived revision-5 `Response` JSON frame bound for the frozen roster profile.
+///
+/// This includes the longest result discriminator and wrapper around an
+/// established status with the complete maximum legal terminal receipt.
+pub const MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES: usize = 4_392_758;
 /// Default aggregate retained request-byte allowance.
-pub const DEFAULT_PERSISTENT_FENCED_MUTATION_ROSTER_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+pub const DEFAULT_PERSISTENT_FENCED_MUTATION_ROSTER_REQUEST_BYTES: usize =
+    MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES;
 /// Default maximum exact response bytes retained for one roster call.
-pub const DEFAULT_PERSISTENT_FENCED_MUTATION_ROSTER_RESPONSE_BYTES: usize = 128 * 1024;
+pub const DEFAULT_PERSISTENT_FENCED_MUTATION_ROSTER_RESPONSE_BYTES: usize =
+    MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES;
 /// Default number of response cells retained for callers.
 pub const DEFAULT_PERSISTENT_FENCED_MUTATION_ROSTER_RESPONSE_CELLS: usize = 64;
 /// Default bounded terminal/adoption entries retained by the scheduler.
@@ -968,10 +996,10 @@ impl PersistentFencedMutationRosterConfig {
             || !(1..=MAX_PERSISTENT_FENCED_MUTATION_ROSTER_TENANT_QUEUE)
                 .contains(&self.per_tenant_queue)
             || !(1..=MAX_PERSISTENT_FENCED_MUTATION_ROSTER_PENDING).contains(&self.pending_calls)
-            || self.request_bytes == 0
-            || self.request_bytes > 8 * 1024 * 1024
-            || self.response_bytes == 0
-            || self.response_bytes > MAX_NEGOTIATED_FRAME_SIZE
+            || !(MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES..=MAX_NEGOTIATED_FRAME_SIZE)
+                .contains(&self.request_bytes)
+            || !(MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES..=MAX_NEGOTIATED_FRAME_SIZE)
+                .contains(&self.response_bytes)
             || !(1..=MAX_PERSISTENT_FENCED_MUTATION_ROSTER_PENDING).contains(&self.response_cells)
             || !(1..=MAX_PERSISTENT_FENCED_MUTATION_ROSTER_PENDING)
                 .contains(&self.terminal_adoption_entries)
@@ -2002,6 +2030,7 @@ async fn fenced_mutation_roster_lane_worker(
             // Retain the job-owned request unchanged for the completion
             // boundary; the in-flight future owns this snapshot only.
             let request = job.request.clone();
+            let correlation = connection.next_correlation;
             let result = {
                 let operation = execute_fenced_mutation_roster_on_lane(
                     &pool,
@@ -2024,7 +2053,7 @@ async fn fenced_mutation_roster_lane_worker(
             let response_bytes = result
                 .as_ref()
                 .ok()
-                .and_then(roster_response_wire_bytes)
+                .and_then(|response| roster_response_wire_bytes(correlation, response))
                 .unwrap_or(0);
             let result = result.map_err(|error| roster_execute_error(&job.request, error));
             match &result {
@@ -2129,11 +2158,41 @@ fn roster_request_has_authority_scope(
 }
 
 fn roster_request_wire_bytes(request: &SessionConsumerV3Request) -> Option<usize> {
-    serde_json::to_vec(request).ok().map(|bytes| bytes.len())
+    // Aggregate admission happens before a lane has assigned its correlation.
+    // Reserve the largest correlation permitted by the connection profile so
+    // the semaphore is conservative for every actual Call frame.
+    roster_call_wire_bytes(
+        NonZeroU32::new(MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION as u32)?,
+        request,
+    )
 }
 
-fn roster_response_wire_bytes(response: &SessionConsumerV3Response) -> Option<usize> {
-    serde_json::to_vec(response).ok().map(|bytes| bytes.len())
+fn roster_call_wire_bytes(
+    correlation: NonZeroU32,
+    request: &SessionConsumerV3Request,
+) -> Option<usize> {
+    serde_json::to_vec(&BorrowedConsumerV3WireRequest::Call(
+        BorrowedConsumerV3Call {
+            correlation,
+            request,
+        },
+    ))
+    .ok()
+    .map(|bytes| bytes.len())
+}
+
+fn roster_response_wire_bytes(
+    correlation: NonZeroU32,
+    response: &SessionConsumerV3Response,
+) -> Option<usize> {
+    serde_json::to_vec(&BorrowedConsumerV3WireResponse::Response(
+        BorrowedConsumerV3CallResponse {
+            correlation,
+            response,
+        },
+    ))
+    .ok()
+    .map(|bytes| bytes.len())
 }
 
 fn roster_request_needs_terminal_adoption_slot(request: &SessionConsumerV3Request) -> bool {
@@ -2300,7 +2359,7 @@ async fn connect_fenced_mutation_roster_lane(
     let hello = ConsumerV3WireRequest::Hello(ConsumerV3Hello {
         transport_revision: SESSION_QUORUM_CONSUMER_V3_TRANSPORT_REVISION,
         scope: client.scope,
-        response_frame_size: consumer_wire_frame_size(MAX_NEGOTIATED_FRAME_SIZE)
+        response_frame_size: consumer_v3_response_wire_frame_size(pool.config.response_bytes)
             .map_err(SessionConsumerClientError::from)?,
         profile: SessionConsumerFencedMutationRosterProfile::v1(),
     });
@@ -2327,8 +2386,12 @@ async fn connect_fenced_mutation_roster_lane(
                 && ack.scope == client.scope
                 && ack.profile.is_exact() =>
         {
-            checked_consumer_frame_size(ack.request_frame_size)
-                .map_err(SessionConsumerClientError::from)?
+            let size = checked_consumer_frame_size(ack.request_frame_size)
+                .map_err(SessionConsumerClientError::from)?;
+            if size < MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES {
+                return Err(SessionConsumerClientError::Protocol);
+            }
+            size
         }
         ConsumerV3WireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch) => {
             return Err(SessionConsumerClientError::Scope);
@@ -2406,7 +2469,8 @@ async fn execute_fenced_mutation_roster_on_lane(
             SessionConsumerClientError::Unavailable,
         ));
     }
-    let request_bytes = roster_request_wire_bytes(request).ok_or(
+    let correlation = connection.next_correlation;
+    let request_bytes = roster_call_wire_bytes(correlation, request).ok_or(
         SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol),
     )?;
     if request_bytes > pool.config.request_bytes || request_bytes > connection.request_frame_size {
@@ -2414,7 +2478,6 @@ async fn execute_fenced_mutation_roster_on_lane(
             SessionConsumerClientError::Protocol,
         ));
     }
-    let correlation = connection.next_correlation;
     connection.next_correlation = NonZeroU32::new(
         connection
             .next_correlation
@@ -2477,7 +2540,7 @@ async fn execute_fenced_mutation_roster_on_lane(
     };
     if exact_correlation(correlation, received).is_err()
         || !v3_response_matches_request(request, &response)
-        || roster_response_wire_bytes(&response)
+        || roster_response_wire_bytes(correlation, &response)
             .is_none_or(|bytes| bytes > pool.config.response_bytes)
     {
         return Err(SessionConsumerCallError::MayHaveSent(
@@ -3315,6 +3378,18 @@ struct ConsumerV3CallResponse {
     response: Box<SessionConsumerV3Response>,
 }
 
+#[derive(Serialize)]
+struct BorrowedConsumerV3Call<'a> {
+    correlation: NonZeroU32,
+    request: &'a SessionConsumerV3Request,
+}
+
+#[derive(Serialize)]
+struct BorrowedConsumerV3CallResponse<'a> {
+    correlation: NonZeroU32,
+    response: &'a SessionConsumerV3Response,
+}
+
 /// Private revision-5 envelope, closed to the protected roster vocabulary.
 #[derive(Serialize, Deserialize)]
 #[serde(
@@ -3339,6 +3414,18 @@ enum ConsumerV3WireResponse {
     HelloAck(ConsumerV3HelloAck),
     HelloRejected(SessionConsumerRejection),
     Response(ConsumerV3CallResponse),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "body", rename_all = "snake_case")]
+enum BorrowedConsumerV3WireRequest<'a> {
+    Call(BorrowedConsumerV3Call<'a>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "body", rename_all = "snake_case")]
+enum BorrowedConsumerV3WireResponse<'a> {
+    Response(BorrowedConsumerV3CallResponse<'a>),
 }
 
 fn v3_request_id_matches_admission(
@@ -10231,6 +10318,8 @@ impl SessionQuorumConsumerServer {
             || self.max_connections > Semaphore::MAX_PERMITS
             || self.max_frame_size < MIN_SESSION_CONSUMER_RESPONSE_FRAME_SIZE
             || self.max_frame_size > MAX_NEGOTIATED_FRAME_SIZE
+            || (self.roster_service.is_some()
+                && self.max_frame_size < MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES)
             || self.idle_timeout.is_zero()
             || self.operation_timeout.is_zero()
             || self
@@ -10645,7 +10734,10 @@ where
         return Err(ProtocolError::UnexpectedResponse);
     }
     let response_frame_size =
-        checked_consumer_frame_size(hello.response_frame_size)?.min(max_frame_size);
+        checked_consumer_v3_response_frame_size(hello.response_frame_size)?.min(max_frame_size);
+    if response_frame_size < MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES {
+        return Err(ProtocolError::InvalidWireValue);
+    }
     if hello.scope != scope {
         write_frame_bounded_until(
             writer,
@@ -11865,13 +11957,14 @@ mod tests {
         consumer_connection_current, consumer_execute_into_fenced_transition,
         consumer_fresh_admission_is_current, consumer_payload_fragments_exceed_frame,
         consumer_request_has_exact_fenced_transition_id, consumer_response_fits,
-        consumer_watch_error_is_legal, consumer_wire_response_from_public,
-        decode_consumer_frame_payload, ensure_pre_request_budget_remaining, exact_correlation,
-        fenced_transition_response, lease_error_matches_operation, lease_response,
-        mutation_response, persistent_execute_error, poll_persistent_consumer_setup_io,
-        publish_monotonic_shutdown_phase, queued_consumer_watch_stream,
-        read_authenticated_consumer_frame_until, read_authenticated_consumer_frame_within,
-        response_is_outcome_unknown, response_matches_operation, response_matches_request,
+        consumer_v3_response_wire_frame_size, consumer_watch_error_is_legal,
+        consumer_wire_response_from_public, decode_consumer_frame_payload,
+        ensure_pre_request_budget_remaining, exact_correlation, fenced_transition_response,
+        lease_error_matches_operation, lease_response, mutation_response, persistent_execute_error,
+        poll_persistent_consumer_setup_io, publish_monotonic_shutdown_phase,
+        queued_consumer_watch_stream, read_authenticated_consumer_frame_until,
+        read_authenticated_consumer_frame_within, response_is_outcome_unknown,
+        response_matches_operation, response_matches_request,
         response_retires_connection_authority, server_connection_current,
         store_error_matches_operation, valid_consumer_operation_timeout, wait_for_forced_shutdown,
         write_consumer_call_rejection_supervised, BorrowedConsumerCall,
@@ -11879,24 +11972,25 @@ mod tests {
         BoxStream, ConsumerCall, ConsumerCallResponse, ConsumerConnection, ConsumerHello,
         ConsumerLeaseWireContext, ConsumerOperationKind, ConsumerServerCancellation,
         ConsumerServerSetupTestHooks, ConsumerSessionResponseWire, ConsumerSetupPhase,
-        ConsumerSetupPhaseAttempt, ConsumerV2Call, ConsumerV2WireRequest, ConsumerWatchTerminal,
-        ConsumerWatchTerminalSlot, ConsumerWireRequest, ConsumerWireResponse,
-        FencedMutationRosterServicePort, FencedMutationRosterTenant,
+        ConsumerSetupPhaseAttempt, ConsumerV2Call, ConsumerV2WireRequest, ConsumerV3Call,
+        ConsumerV3CallResponse, ConsumerV3WireRequest, ConsumerV3WireResponse,
+        ConsumerWatchTerminal, ConsumerWatchTerminalSlot, ConsumerWireRequest,
+        ConsumerWireResponse, FencedMutationRosterServicePort, FencedMutationRosterTenant,
         PersistentCheckedOutConnection, PersistentConsumerCounters, PersistentConsumerIoBarrier,
         PersistentConsumerShutdownReader, PersistentConsumerShutdownWriter,
         PersistentFencedMutationRosterClient, PersistentFencedMutationRosterConfig,
-        PersistentFencedMutationRosterExecuteError, PersistentFencedMutationRosterPoolPhase,
-        PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-        PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
-        PersistentSetupAttempt, PersistentShutdownPhase, PersistentWatchRecovery,
-        QueuedConsumerWatchItem, SessionConsumerAuthorizationError, SessionConsumerAuthorizer,
-        SessionConsumerCallError, SessionConsumerChange, SessionConsumerClientError,
-        SessionConsumerFencedTransitionBackend, SessionConsumerFencedTransitionMutationError,
-        SessionConsumerIdentity, SessionConsumerLeaseMutationError, SessionConsumerMutationError,
-        SessionConsumerRejection, SessionQuorumConsumer, SessionQuorumConsumerServer,
-        StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
-        DEFAULT_CONSUMER_MAX_CONNECTIONS, DEFAULT_CONSUMER_OPERATION_TIMEOUT,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+        PersistentFencedMutationRosterConfigError, PersistentFencedMutationRosterExecuteError,
+        PersistentFencedMutationRosterPoolPhase, PersistentSessionConsumerClient,
+        PersistentSessionConsumerConfig, PersistentSessionConsumerConfigError,
+        PersistentSessionConsumerExecuteError, PersistentSetupAttempt, PersistentShutdownPhase,
+        PersistentWatchRecovery, QueuedConsumerWatchItem, SessionConsumerAuthorizationError,
+        SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerChange,
+        SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
+        SessionConsumerFencedTransitionMutationError, SessionConsumerIdentity,
+        SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionConsumerRejection,
+        SessionQuorumConsumer, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
+        DEFAULT_CONSUMER_IDLE_TIMEOUT, DEFAULT_CONSUMER_MAX_CONNECTIONS,
+        DEFAULT_CONSUMER_OPERATION_TIMEOUT, DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
@@ -11904,6 +11998,7 @@ mod tests {
         DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+        MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES, MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES,
         MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
         MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
@@ -11915,20 +12010,24 @@ mod tests {
         FencedMutationRosterDescriptor, FencedMutationRosterOrdinal, FencedMutationRosterPlan,
     };
     use opc_session_store::{
-        checked_session_deadline, BackendCapabilities, CompareAndSet, CompareAndSetResult,
-        EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedMutationMemberAdoption,
+        checked_session_deadline, encode_fenced_mutation_roster_admission,
+        encode_fenced_mutation_roster_terminal, fenced_mutation_roster_profile_digest,
+        BackendCapabilities, CompareAndSet, CompareAndSetResult, EncryptedSessionPayload,
+        FakeSessionBackend, FenceToken, FencedMutationMemberAdoption,
         FencedMutationMemberDisposition, FencedMutationRosterAdmission,
         FencedMutationRosterCapability, FencedMutationRosterFenceIntent,
         FencedMutationRosterMember, FencedMutationRosterMembers, FencedMutationRosterOperationId,
-        FencedMutationRosterProtectedPlan, FencedMutationRosterProtectedResult,
-        FencedMutationRosterScope, FencedMutationRosterTerminal, FencedTransitionExecuteError,
-        FencedTransitionLease, FencedTransitionMutation, FencedTransitionObservation,
-        FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
-        FencedTransitionStatus, FencedTransitionV2CallerNonce, FencedTransitionV2Capability,
-        FencedTransitionV2HistoryEpoch, Generation, LeaseGuard, OwnerId, PreparedFencedTransition,
-        RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, SessionBackend,
-        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
+        FencedMutationRosterOutcome, FencedMutationRosterProtectedPlan,
+        FencedMutationRosterProtectedResult, FencedMutationRosterRequestId,
+        FencedMutationRosterScope, FencedMutationRosterStatus, FencedMutationRosterTerminal,
+        FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,
+        FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
+        FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
+        FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, Generation, LeaseGuard,
+        OwnerId, PreparedFencedTransition, RestoreScanCursorProfile, RestoreScanPage,
+        RestoreScanRequest, SessionBackend, SessionConsensusClusterId,
+        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+        SessionConsensusIdentity, SessionConsumerBatchResult,
         SessionConsumerFencedMutationRosterProfile, SessionConsumerFencedTransitionError,
         SessionConsumerFencedTransitionStatus, SessionConsumerLeaseError, SessionConsumerOperation,
         SessionConsumerOutcomeUnknown, SessionConsumerRequest, SessionConsumerRequestId,
@@ -11937,10 +12036,13 @@ mod tests {
         SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
         SessionConsumerV3Operation, SessionConsumerV3Request, SessionConsumerV3Response,
         SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType,
-        StoreError, StoredSessionRecord, MAX_SESSION_TTL,
+        StoreError, StoredSessionRecord, FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES,
+        FENCED_MUTATION_ROSTER_MAX_MEMBERS, FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES,
+        MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
     use tokio::sync::{mpsc, oneshot, watch, Notify, Semaphore};
 
@@ -12186,6 +12288,269 @@ mod tests {
             SessionConsensusConfigurationId::from_bytes([2; 32]),
             SessionConsensusConfigurationEpoch::new(1).expect("non-zero configuration epoch"),
         ))
+    }
+
+    fn maximum_roster_scope() -> SessionConsumerScope {
+        SessionConsumerScope::new(SessionConsensusIdentity::new(
+            SessionConsensusClusterId::from_bytes([u8::MAX; 32]),
+            SessionConsensusConfigurationId::from_bytes([u8::MAX; 32]),
+            SessionConsensusConfigurationEpoch::new(u64::MAX)
+                .expect("maximum configuration epoch is nonzero"),
+        ))
+    }
+
+    fn maximum_roster_admission(operation_id: [u8; 16]) -> FencedMutationRosterAdmission {
+        let members = (0..FENCED_MUTATION_ROSTER_MAX_MEMBERS)
+            .map(|ordinal| {
+                let mut caller_id = [u8::MAX; 16];
+                caller_id[15] = (u8::MAX - 7).saturating_add(ordinal as u8);
+                serde_json::json!({
+                    "ordinal": ordinal,
+                    "caller_id": caller_id,
+                    "descriptor": vec![u8::MAX; 4_096],
+                    "expected_generation": u64::MAX,
+                    "expected_version": u64::MAX,
+                    "disposition": "Indeterminate",
+                    "adoption": "Unreconciled",
+                })
+            })
+            .collect::<Vec<_>>();
+        let admission: FencedMutationRosterAdmission = serde_json::from_value(serde_json::json!({
+            "history_epoch": u64::MAX,
+            "operation_id": operation_id,
+            "scope": vec![u8::MAX; 32],
+            "fence_intent": {
+                "owner": "\u{0000}".repeat(OwnerId::MAX_BYTES),
+                "fence": u64::MAX,
+            },
+            "expected_generation": u64::MAX,
+            "members": members,
+            "protected_plan": vec![u8::MAX; FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES],
+            "terminal_result": vec![u8::MAX; FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES],
+        }))
+        .expect("maximum admission structure decodes");
+        admission.validate().expect("maximum admission is legal");
+        admission
+    }
+
+    fn maximum_legal_roster_terminalize_request(
+        operation_id: [u8; 16],
+    ) -> SessionConsumerV3Request {
+        let admission = maximum_roster_admission(operation_id);
+        let admission_commitment = maximum_roster_plan_commitment(&admission);
+        let request = SessionConsumerV3Request::new(
+            maximum_roster_scope(),
+            SessionConsumerV3Operation::FencedMutationRosterTerminalize {
+                admission: Box::new(admission),
+                terminal: Box::new(maximum_roster_terminal(admission_commitment, false)),
+            },
+        );
+        assert!(request.validate().is_ok());
+        request
+    }
+
+    fn maximum_roster_plan_commitment(admission: &FencedMutationRosterAdmission) -> [u8; 32] {
+        fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(bytes);
+        }
+
+        let mut canonical = Vec::new();
+        canonical.extend_from_slice(b"OPCFMRP1");
+        canonical.extend_from_slice(&1_u16.to_be_bytes());
+        canonical.extend_from_slice(&fenced_mutation_roster_profile_digest());
+        canonical.extend_from_slice(&admission.scope().digest());
+        put_bytes(
+            &mut canonical,
+            admission.fence_intent().owner().as_str().as_bytes(),
+        );
+        put_bytes(
+            &mut canonical,
+            &admission.fence_intent().fence().get().to_be_bytes(),
+        );
+        canonical.extend_from_slice(&admission.expected_generation().get().to_be_bytes());
+        canonical.push(admission.members().as_slice().len() as u8);
+        for member in admission.members().as_slice() {
+            canonical.push(member.ordinal().get());
+            canonical.extend_from_slice(member.caller_id());
+            put_bytes(&mut canonical, member.descriptor().as_bytes());
+            canonical.extend_from_slice(&member.expected_generation().to_be_bytes());
+            canonical.extend_from_slice(&member.expected_version().to_be_bytes());
+            canonical.push(member.disposition() as u8);
+            canonical.push(member.adoption() as u8);
+        }
+        put_bytes(&mut canonical, admission.protected_plan().as_bytes());
+        put_bytes(
+            &mut canonical,
+            &vec![u8::MAX; FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES],
+        );
+
+        let mut hash = Sha256::new();
+        hash.update(b"opc-session-store/fenced-mutation-roster/body/v1");
+        hash.update([0]);
+        hash.update((canonical.len() as u64).to_be_bytes());
+        hash.update(canonical);
+        hash.finalize().into()
+    }
+
+    fn maximum_roster_terminal(
+        admission_commitment: [u8; 32],
+        established: bool,
+    ) -> FencedMutationRosterTerminal {
+        let protected_result = vec![u8::MAX; FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES];
+        let members = (0..FENCED_MUTATION_ROSTER_MAX_MEMBERS)
+            .map(|ordinal| {
+                let mut caller_id = [u8::MAX; 16];
+                caller_id[15] = (u8::MAX - 7).saturating_add(ordinal as u8);
+                serde_json::json!({
+                    "ordinal": ordinal,
+                    "caller_id": caller_id,
+                    "disposition": if established { "Applied" } else { "Compensated" },
+                    "adoption": if established { "Executed" } else { "Reconciled" },
+                    "status": vec![u8::MAX; 4_096],
+                })
+            })
+            .collect::<Vec<_>>();
+        let terminal: FencedMutationRosterTerminal = serde_json::from_value(serde_json::json!({
+            "admission_commitment": admission_commitment,
+            "members": members,
+            "protected_checkpoint": vec![u8::MAX; FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES],
+            "protected_result": protected_result,
+        }))
+        .expect("maximum terminal structure decodes");
+        assert_eq!(terminal.members().len(), FENCED_MUTATION_ROSTER_MAX_MEMBERS);
+        assert_eq!(
+            terminal.protected_checkpoint().len(),
+            FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES
+        );
+        assert_eq!(terminal.protected_result().len(), protected_result.len());
+        terminal
+    }
+
+    #[test]
+    fn maximum_roster_v3_wire_frames_report_exact_json_lengths() {
+        let admission = maximum_roster_admission([u8::MAX; 16]);
+        let terminal = maximum_roster_terminal([u8::MAX; 32], false);
+        assert_eq!(
+            encode_fenced_mutation_roster_admission(&admission)
+                .expect("maximum admission encodes canonically")
+                .len(),
+            1_098_271
+        );
+        assert_eq!(
+            encode_fenced_mutation_roster_terminal(&terminal)
+                .expect("maximum terminal encodes canonically")
+                .len(),
+            1_097_963
+        );
+        let request = SessionConsumerV3Request::new(
+            maximum_roster_scope(),
+            SessionConsumerV3Operation::FencedMutationRosterTerminalize {
+                admission: Box::new(admission.clone()),
+                terminal: Box::new(terminal.clone()),
+            },
+        );
+        let inner_request_bytes = serde_json::to_vec(&request)
+            .expect("maximum terminalize request encodes")
+            .len();
+        let request = ConsumerV3WireRequest::Call(ConsumerV3Call {
+            correlation: NonZeroU32::new(4096).expect("connection call limit is nonzero"),
+            request: Box::new(request),
+        });
+        let request_bytes = serde_json::to_vec(&request)
+            .expect("maximum terminalize call encodes")
+            .len();
+
+        let maximum_request_id = FencedMutationRosterRequestId::new(
+            u64::MAX,
+            FencedMutationRosterOperationId::new([u8::MAX; 16])
+                .expect("maximum operation ID is nonzero"),
+            [u8::MAX; 32],
+        );
+        let status = FencedMutationRosterStatus::new(
+            opc_session_store::FencedMutationRosterPhase::Established,
+            maximum_request_id,
+            Some(maximum_roster_terminal([u8::MAX; 32], true)),
+        )
+        .expect("maximum terminal status is legal");
+        let response_bytes = |response| {
+            serde_json::to_vec(&ConsumerV3WireResponse::Response(ConsumerV3CallResponse {
+                correlation: NonZeroU32::new(4096).expect("connection call limit is nonzero"),
+                response: Box::new(response),
+            }))
+            .expect("maximum roster response encodes")
+            .len()
+        };
+        let terminalize_response_bytes =
+            response_bytes(SessionConsumerV3Response::FencedMutationRosterTerminalize(
+                Ok(FencedMutationRosterOutcome {
+                    status: status.clone(),
+                }),
+            ));
+        let admit_response_bytes = response_bytes(
+            SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(FencedMutationRosterOutcome {
+                status: status.clone(),
+            })),
+        );
+        let status_response_bytes = response_bytes(
+            SessionConsumerV3Response::FencedMutationRosterStatus(Ok(status.clone())),
+        );
+        let adoption_response_bytes = response_bytes(
+            SessionConsumerV3Response::FencedMutationRosterAdoption(Ok(status)),
+        );
+
+        assert!(request_bytes <= MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES);
+        assert_eq!(
+            terminalize_response_bytes,
+            MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES
+        );
+        assert!(
+            request_bytes > inner_request_bytes,
+            "the private Call envelope must be included in the wire bound"
+        );
+        assert!(request_bytes <= MAX_NEGOTIATED_FRAME_SIZE);
+        for response_bytes in [
+            terminalize_response_bytes,
+            admit_response_bytes,
+            status_response_bytes,
+            adoption_response_bytes,
+        ] {
+            assert!(response_bytes <= MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES);
+        }
+        assert!(terminalize_response_bytes <= MAX_NEGOTIATED_FRAME_SIZE);
+
+        let digest_width_admission = maximum_legal_roster_terminalize_request([
+            209, 148, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+        ]);
+        assert!(
+            super::roster_call_wire_bytes(
+                NonZeroU32::new(4096).expect("connection call limit is nonzero"),
+                &digest_width_admission,
+            )
+            .expect("maximum legal terminalize call encodes")
+                <= MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES
+        );
+
+        let mut request_one_over = PersistentFencedMutationRosterConfig::default();
+        assert!(request_one_over.validate().is_ok());
+        request_one_over.request_bytes = MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES - 1;
+        assert_eq!(
+            request_one_over.validate(),
+            Err(PersistentFencedMutationRosterConfigError::Capacity)
+        );
+        let mut response_one_over = PersistentFencedMutationRosterConfig::default();
+        response_one_over.response_bytes = MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES - 1;
+        assert_eq!(
+            response_one_over.validate(),
+            Err(PersistentFencedMutationRosterConfigError::Capacity)
+        );
+        assert_eq!(
+            consumer_v3_response_wire_frame_size(
+                PersistentFencedMutationRosterConfig::default().response_bytes
+            )
+            .expect("default reader cap is advertisable"),
+            MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES as u32
+        );
     }
 
     fn v2_serialized_body_conflict(status: bool) -> SessionConsumerV2Request {
@@ -13369,16 +13734,24 @@ mod tests {
             scope(),
             SessionConsumerV3Operation::FencedMutationRosterCapability,
         );
-        let request_bytes = serde_json::to_vec(&request)
+        let request_bytes = super::roster_request_wire_bytes(&request)
+            .expect("closed roster capability call envelope encodes");
+        let inner_request_bytes = serde_json::to_vec(&request)
             .expect("closed roster capability request encodes")
             .len();
+        assert!(request_bytes > inner_request_bytes);
         let mut config = PersistentFencedMutationRosterConfig::default();
         config.lane_workers = 1;
-        config.request_bytes = request_bytes;
         let control = SessionReauthenticationControl::new();
         let (stateless, _material) = stateless_test_client(control);
         let client = PersistentFencedMutationRosterClient::try_from_stateless(stateless, config)
             .expect("bounded roster configuration");
+        let _reserved = Arc::clone(&client.pool.request_bytes)
+            .try_acquire_many_owned(
+                u32::try_from(config.request_bytes.saturating_sub(request_bytes))
+                    .expect("remaining aggregate request bytes fit permits"),
+            )
+            .expect("reserve all but one call envelope");
         let (sender, mut receiver) = mpsc::channel(2);
         *client
             .pool
@@ -13536,9 +13909,8 @@ mod tests {
             scope(),
             SessionConsumerV3Operation::FencedMutationRosterCapability,
         );
-        let request_bytes = serde_json::to_vec(&request)
-            .expect("closed roster capability request encodes")
-            .len();
+        let request_bytes = super::roster_request_wire_bytes(&request)
+            .expect("closed roster capability call envelope encodes");
         let tenant_a = FencedMutationRosterTenant::new([3; 16]).expect("nonzero opaque tenant");
         let tenant_b = FencedMutationRosterTenant::new([4; 16]).expect("nonzero opaque tenant");
         let make_job = |tenant| {

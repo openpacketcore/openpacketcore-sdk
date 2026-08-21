@@ -22,8 +22,9 @@ use opc_session_net::{
     PersistentFencedMutationRosterClient, PersistentFencedMutationRosterConfig,
     PersistentFencedMutationRosterConfigError, PersistentFencedMutationRosterExecuteError,
     RemoteAddrResolver, SessionConsumerAuthorizer, SessionConsumerClientError,
-    SessionQuorumConsumerServer, StatelessSessionConsumerClient, SESSION_QUORUM_CONSUMER_V3_ALPN,
-    SESSION_QUORUM_CONSUMER_V3_TRANSPORT_REVISION,
+    SessionQuorumConsumerServer, StatelessSessionConsumerClient,
+    MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES, MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES,
+    SESSION_QUORUM_CONSUMER_V3_ALPN, SESSION_QUORUM_CONSUMER_V3_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     ConsensusSessionStore, FencedMutationRosterCapability, QuorumReplicaDescriptor,
@@ -199,8 +200,8 @@ fn load_config(lanes: usize) -> PersistentFencedMutationRosterConfig {
         256,
         8,
         256,
-        1024 * 1024,
-        16 * 1024,
+        MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES,
+        MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES,
         256,
         256,
         2,
