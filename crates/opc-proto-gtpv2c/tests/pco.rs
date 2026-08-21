@@ -1870,3 +1870,91 @@ fn an_mtu_only_value_still_reports_empty_for_the_dns_fallback() {
     assert!(decoded.is_empty());
     assert!(decoded.dns_server_ipv4_all().is_empty());
 }
+
+#[test]
+fn configuration_atomicity_discards_valid_siblings_of_a_malformed_address_container() {
+    // The per-container failure policy table documents whole-value rejection
+    // for address containers as a configuration-atomicity contract: a
+    // half-applied DNS or P-CSCF set is worse than none. This test pins that
+    // the policy is not merely "reject the malformed unit" but "reject
+    // everything, including units that parsed successfully before the fault."
+    let contents = vec![
+        0x80, //
+        0x00, 0x0c, 0x04, 198, 51, 100, 1, // valid P-CSCF IPv4
+        0x00, 0x0d, 0x04, 8, 8, 8, 8, // valid DNS IPv4
+        0x00, 0x01, 0x0f, // P-CSCF IPv6 with wrong length (15, not 16)
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    assert_eq!(
+        PcoAddressConfiguration::decode_network_contents(&contents),
+        Err(PcoDecodeError::InvalidIpv6AddressLength),
+        "the valid P-CSCF and DNS addresses before the fault must be discarded too"
+    );
+
+    // The same contract holds when the malformed container comes first: the
+    // valid containers after it are never reached.
+    let contents = vec![
+        0x80, //
+        0x00, 0x0d, 0x03, 8, 8, 8, // DNS IPv4 with wrong length (3, not 4)
+        0x00, 0x0c, 0x04, 198, 51, 100, 1, // valid P-CSCF IPv4 (unreachable)
+    ];
+
+    assert_eq!(
+        PcoAddressConfiguration::decode_network_contents(&contents),
+        Err(PcoDecodeError::InvalidIpv4AddressLength),
+    );
+}
+
+#[test]
+fn failure_policy_asymmetry_is_deliberate_ipcp_unit_local_vs_address_whole_value() {
+    // This test pins the documented asymmetry between IPCP (unit-local
+    // discard) and address containers (whole-value rejection) on values with
+    // the same shape: one valid DNS container, one malformed unit of each
+    // class. The IPCP fault leaves the sibling intact; the address fault
+    // destroys it. The difference is a protocol decision, not an accident of
+    // error-propagation style.
+
+    // Case 1: malformed IPCP unit — sibling DNS container survives.
+    // The IPCP unit precedes the container, matching TS 24.008's ordering of
+    // configuration protocol options before additional parameters.
+    let ipcp_malformed = vec![
+        0x80, //
+        0x80, 0x21, 0x02, 0xaa, 0xbb, // IPCP shorter than RFC 1661 header
+        0x00, 0x0d, 0x04, 8, 8, 8, 8, // valid DNS IPv4
+    ];
+    let outcome = decode_correlated(&ipcp_malformed);
+    assert_eq!(
+        outcome.ipcp_discards()[0].reason(),
+        PcoIpcpDiscardReason::Malformed(PcoDecodeError::IpcpHeaderTruncated)
+    );
+    assert_eq!(
+        outcome.configuration().dns_server_ipv4,
+        vec![[8, 8, 8, 8]],
+        "IPCP unit-local discard must preserve the sibling address"
+    );
+
+    // Case 2: malformed address container — the earlier valid DNS is lost.
+    let address_malformed = vec![
+        0x80, //
+        0x00, 0x0d, 0x04, 8, 8, 8, 8, // valid DNS IPv4
+        0x00, 0x0c, 0x03, 198, 51, 100, // P-CSCF IPv4 with wrong length
+    ];
+    assert_eq!(
+        PcoAddressConfiguration::decode_network_contents(&address_malformed),
+        Err(PcoDecodeError::InvalidIpv4AddressLength),
+        "configuration-atomicity must reject the whole value, losing the valid DNS"
+    );
+
+    // Case 3: malformed IPv4 Link MTU — sibling DNS container survives,
+    // because TS 24.008 §10.5.6.3 mandates the receiver ignore it.
+    let mtu_malformed = vec![
+        0x80, //
+        0x00, 0x0d, 0x04, 8, 8, 8, 8, // valid DNS IPv4
+        0x00, 0x10, 0x01, 0x05, // Link MTU with wrong length (1, not 2)
+    ];
+    let decoded = PcoAddressConfiguration::decode_network_contents(&mtu_malformed)
+        .expect("a wrong-length Link MTU is ignored, not an error");
+    assert_eq!(decoded.dns_server_ipv4, vec![[8, 8, 8, 8]]);
+    assert_eq!(decoded.ipv4_link_mtu, None);
+}
