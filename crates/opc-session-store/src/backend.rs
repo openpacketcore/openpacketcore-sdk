@@ -2275,6 +2275,63 @@ fn require_fenced_transition_v2_caller_plaintext(
     }
 }
 
+struct ProtectedFencedTransitionV2Batch {
+    requests: Vec<FencedTransitionV2Request>,
+    request_slots: Vec<usize>,
+    outcomes: Vec<Option<Result<FencedTransitionOutcome, StoreError>>>,
+}
+
+impl ProtectedFencedTransitionV2Batch {
+    fn prepare(requests: Vec<FencedTransitionV2Request>) -> Result<Self, StoreError> {
+        validate_fenced_transition_v2_batch(&requests)?;
+        let mut valid_requests = Vec::with_capacity(requests.len());
+        let mut request_slots = Vec::with_capacity(requests.len());
+        let mut outcomes = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+        for (slot, request) in requests.into_iter().enumerate() {
+            match request.validate() {
+                Ok(()) => {
+                    require_fenced_transition_v2_caller_plaintext(&request)?;
+                    request_slots.push(slot);
+                    valid_requests.push(request);
+                }
+                Err(StoreError::FencedTransitionRequestConflict) => {
+                    outcomes[slot] = Some(Err(StoreError::FencedTransitionRequestConflict));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Self {
+            requests: valid_requests,
+            request_slots,
+            outcomes,
+        })
+    }
+
+    fn merge(
+        mut self,
+        dispatched: Vec<Result<FencedTransitionOutcome, StoreError>>,
+    ) -> Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError> {
+        if dispatched.len() != self.request_slots.len() {
+            return Err(StoreError::BackendUnavailable(
+                "protected fenced-transition V2 batch result unavailable".into(),
+            ));
+        }
+        for (slot, outcome) in self.request_slots.into_iter().zip(dispatched) {
+            self.outcomes[slot] = Some(outcome);
+        }
+        self.outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.ok_or_else(|| {
+                    StoreError::BackendUnavailable(
+                        "protected fenced-transition V2 batch result unavailable".into(),
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
 fn require_fenced_transition_v2_physical_envelope(
     request: &FencedTransitionV2Request,
 ) -> Result<(), StoreError> {
@@ -2738,9 +2795,9 @@ where
         &self,
         requests: Vec<FencedTransitionV2Request>,
     ) -> Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError> {
-        validate_fenced_transition_v2_batch(&requests)?;
-        for request in &requests {
-            require_fenced_transition_v2_caller_plaintext(request)?;
+        let mut batch = ProtectedFencedTransitionV2Batch::prepare(requests)?;
+        if batch.requests.is_empty() {
+            return batch.merge(Vec::new());
         }
         let journal_scope = protected_fenced_transition_v2_journal_scope(
             self.inner.as_ref(),
@@ -2756,7 +2813,8 @@ where
         journal
             .reclaim_retired_through(journal_scope, history.retired_through())
             .await?;
-        let outer_ids = requests
+        let outer_ids = batch
+            .requests
             .iter()
             .map(FencedTransitionV2Request::request_id)
             .collect::<Vec<_>>();
@@ -2766,7 +2824,7 @@ where
             .await?;
         let mut missing_indices = Vec::new();
         let mut missing = Vec::new();
-        for (index, request) in requests.into_iter().enumerate() {
+        for (index, request) in batch.requests.drain(..).enumerate() {
             let outer_id = request.request_id();
             match &physical[index] {
                 Some(_) => {
@@ -2861,7 +2919,7 @@ where
             FencedTransitionV2Effect::OutcomeUnknown { .. } => {
                 Err(StoreError::FencedTransitionOutcomeUnknown)
             }
-            FencedTransitionV2Effect::Resolved(result) => result,
+            FencedTransitionV2Effect::Resolved(result) => batch.merge(result?),
         }
     }
 
@@ -3714,9 +3772,9 @@ where
         &self,
         requests: Vec<FencedTransitionV2Request>,
     ) -> Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError> {
-        validate_fenced_transition_v2_batch(&requests)?;
-        for request in &requests {
-            require_fenced_transition_v2_caller_plaintext(request)?;
+        let mut batch = ProtectedFencedTransitionV2Batch::prepare(requests)?;
+        if batch.requests.is_empty() {
+            return batch.merge(Vec::new());
         }
         let journal_scope = protected_fenced_transition_v2_journal_scope(
             self.inner.as_ref(),
@@ -3732,7 +3790,8 @@ where
         journal
             .reclaim_retired_through(journal_scope, history.retired_through())
             .await?;
-        let outer_ids = requests
+        let outer_ids = batch
+            .requests
             .iter()
             .map(FencedTransitionV2Request::request_id)
             .collect::<Vec<_>>();
@@ -3742,7 +3801,7 @@ where
             .await?;
         let mut missing_indices = Vec::new();
         let mut missing = Vec::new();
-        for (index, request) in requests.into_iter().enumerate() {
+        for (index, request) in batch.requests.drain(..).enumerate() {
             let outer_id = request.request_id();
             match &physical[index] {
                 Some(_) => {
@@ -3837,7 +3896,7 @@ where
             FencedTransitionV2Effect::OutcomeUnknown { .. } => {
                 Err(StoreError::FencedTransitionOutcomeUnknown)
             }
-            FencedTransitionV2Effect::Resolved(result) => result,
+            FencedTransitionV2Effect::Resolved(result) => batch.merge(result?),
         }
     }
 
