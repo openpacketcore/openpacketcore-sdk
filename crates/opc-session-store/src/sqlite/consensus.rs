@@ -29,10 +29,11 @@ use crate::capability::BackendCapabilities;
 use crate::consensus::storage::{ConsensusAuthorityProfile, SessionConsensusStorageError};
 use crate::consensus::types::{
     fenced_mutation_roster_voter_set_digest, fenced_transition_voter_set_digest,
-    SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-    SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusNodeId,
-    SessionConsensusRequestId, SessionConsensusResponse, SessionMutationIntent,
-    SessionMutationOutcome, SessionTopologyMemberBinding, SESSION_CONSENSUS_SCHEMA_VERSION,
+    ManagedProviderJobMutationOutcome, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
+    SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusIdentity,
+    SessionConsensusNodeId, SessionConsensusRequestId, SessionConsensusResponse,
+    SessionMutationIntent, SessionMutationOutcome, SessionTopologyMemberBinding,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::consensus::SessionRaftTypeConfig;
 use crate::error::{LeaseError, StoreError};
@@ -40,8 +41,11 @@ use crate::fenced_mutation_roster::{
     decode_fenced_mutation_roster_admission, decode_fenced_mutation_roster_terminal,
     encode_fenced_mutation_roster_admission, encode_fenced_mutation_roster_identity,
     encode_fenced_mutation_roster_terminal, fenced_mutation_roster_profile_digest,
-    FencedMutationRosterAdmission, FencedMutationRosterHistoryState, FencedMutationRosterOutcome,
-    FencedMutationRosterPhase, FencedMutationRosterStatus, FencedMutationRosterTerminal,
+    FencedMutationRosterAdmission, FencedMutationRosterAdoption, FencedMutationRosterDisposition,
+    FencedMutationRosterHistoryState, FencedMutationRosterMemberOutcome,
+    FencedMutationRosterOutcome, FencedMutationRosterPhase, FencedMutationRosterPlan,
+    FencedMutationRosterProviderOutcome, FencedMutationRosterStatus,
+    FencedMutationRosterStatusBytes, FencedMutationRosterTerminal,
     FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,
     FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES, FENCED_MUTATION_ROSTER_MAX_LIVE,
     FENCED_MUTATION_ROSTER_RECLAIM_BATCH, FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES,
@@ -4796,7 +4800,7 @@ CREATE TABLE consensus_fenced_mutation_roster_operations (
     ),
     CHECK (
         (phase = 1
-         AND protected_checkpoint IS NULL
+         AND (protected_checkpoint IS NULL OR length(protected_checkpoint) BETWEEN 0 AND 1048576)
          AND terminal_blob IS NULL
          AND terminal_digest IS NULL
          AND terminal_result IS NULL
@@ -4880,13 +4884,14 @@ CREATE TABLE consensus_fenced_mutation_roster_managed_provider_jobs (
         REFERENCES consensus_fenced_mutation_roster_members(request_id, ordinal)
         ON DELETE CASCADE,
     CHECK (
-        (phase = 0 AND effect_owner_digest IS NULL AND attempt_fence = 0
+        (phase = 0 AND (effect_owner_digest IS NULL OR length(effect_owner_digest) = 32) AND attempt_fence = 0
          AND receipt_digest IS NULL AND outcome IS NULL)
         OR
         (phase = 1 AND effect_owner_digest IS NOT NULL AND attempt_fence > 0
          AND receipt_digest IS NULL AND outcome IS NULL)
         OR
-        (phase IN (2, 3, 4, 5) AND receipt_digest IS NOT NULL AND outcome IS NOT NULL)
+        (phase IN (2, 4, 5) AND receipt_digest IS NOT NULL AND outcome IS NOT NULL)
+        OR (phase = 3 AND receipt_digest IS NULL AND outcome IS NULL)
     )
 );
 
@@ -7193,8 +7198,8 @@ const FENCED_MUTATION_ROSTER_OPERATIONS_TABLE_SCHEMA_SQL: &str = r#"
                 terminal_result_digest IS NULL OR length(terminal_result_digest) = 32
             ),
             CHECK (
-                (phase = 1
-                 AND protected_checkpoint IS NULL
+            (phase = 1
+                 AND (protected_checkpoint IS NULL OR length(protected_checkpoint) BETWEEN 0 AND 1048576)
                  AND terminal_blob IS NULL
                  AND terminal_digest IS NULL
                  AND terminal_result IS NULL
@@ -7274,13 +7279,14 @@ const FENCED_MUTATION_ROSTER_MANAGED_PROVIDER_JOBS_TABLE_SCHEMA_SQL: &str = r#"
                 REFERENCES consensus_fenced_mutation_roster_members(request_id, ordinal)
                 ON DELETE CASCADE,
             CHECK (
-                (phase = 0 AND effect_owner_digest IS NULL AND attempt_fence = 0
+                (phase = 0 AND (effect_owner_digest IS NULL OR length(effect_owner_digest) = 32) AND attempt_fence = 0
                  AND receipt_digest IS NULL AND outcome IS NULL)
                 OR
                 (phase = 1 AND effect_owner_digest IS NOT NULL AND attempt_fence > 0
                  AND receipt_digest IS NULL AND outcome IS NULL)
                 OR
-                (phase IN (2, 3, 4, 5) AND receipt_digest IS NOT NULL AND outcome IS NOT NULL)
+                (phase IN (2, 4, 5) AND receipt_digest IS NOT NULL AND outcome IS NOT NULL)
+                OR (phase = 3 AND receipt_digest IS NULL AND outcome IS NULL)
             )
         )
     "#;
@@ -9247,7 +9253,13 @@ impl MembershipLogProjection {
             | SessionMutationIntent::Authorized { .. } => Ok(()),
             SessionMutationIntent::AdmitFencedMutationRoster { .. }
             | SessionMutationIntent::TerminalizeFencedMutationRoster { .. }
-            | SessionMutationIntent::ReserveFencedMutationRosterV4VerifierDispatch { .. } => Ok(()),
+            | SessionMutationIntent::ReserveFencedMutationRosterV4VerifierDispatch { .. }
+            | SessionMutationIntent::EnsureManagedProviderJob { .. }
+            | SessionMutationIntent::StartManagedProviderMember { .. }
+            | SessionMutationIntent::RecordManagedProviderReceipt { .. }
+            | SessionMutationIntent::RequireManagedProviderReconciliation { .. }
+            | SessionMutationIntent::AbortManagedProviderNotApplied { .. }
+            | SessionMutationIntent::FinalizeManagedProviderJob { .. } => Ok(()),
         }
     }
 }
@@ -12388,7 +12400,7 @@ SELECT EXISTS (
        AND typeof(admission_blob) = 'blob' AND octet_length(admission_blob) BETWEEN 1 AND ?3
        AND typeof(protected_plan) = 'blob' AND octet_length(protected_plan) BETWEEN 0 AND 1048576
        AND (
-              (phase = 1 AND protected_checkpoint IS NULL AND terminal_blob IS NULL
+              (phase = 1 AND terminal_blob IS NULL
                            AND terminal_digest IS NULL AND terminal_result IS NULL
                            AND terminal_result_digest IS NULL)
            OR (phase = 2 AND typeof(protected_checkpoint) = 'blob'
@@ -12592,9 +12604,10 @@ OR EXISTS (
     WHERE job.request_id IS NULL
        OR job.phase NOT IN (0, 1, 2, 3, 4, 5)
        OR job.attempt_fence < 0
-       OR (job.phase = 0 AND (job.effect_owner_digest IS NOT NULL OR job.attempt_fence != 0 OR job.receipt_digest IS NOT NULL OR job.outcome IS NOT NULL))
+       OR (job.phase = 0 AND ((job.effect_owner_digest IS NOT NULL AND (typeof(job.effect_owner_digest) != 'blob' OR octet_length(job.effect_owner_digest) != 32 OR job.effect_owner_digest = zeroblob(32))) OR job.attempt_fence != 0 OR job.receipt_digest IS NOT NULL OR job.outcome IS NOT NULL OR (claim.mode = 2 AND job.effect_owner_digest IS NULL)))
        OR (job.phase = 1 AND (typeof(job.effect_owner_digest) != 'blob' OR octet_length(job.effect_owner_digest) != 32 OR job.effect_owner_digest = zeroblob(32) OR job.attempt_fence <= 0 OR job.receipt_digest IS NOT NULL OR job.outcome IS NOT NULL))
-       OR (job.phase IN (2, 3, 4, 5) AND (typeof(job.effect_owner_digest) != 'blob' OR octet_length(job.effect_owner_digest) != 32 OR job.effect_owner_digest = zeroblob(32) OR job.attempt_fence <= 0 OR typeof(job.receipt_digest) != 'blob' OR octet_length(job.receipt_digest) != 32 OR job.receipt_digest = zeroblob(32) OR job.outcome NOT IN (0, 1, 2, 3)))
+       OR (job.phase IN (2, 4, 5) AND (typeof(job.effect_owner_digest) != 'blob' OR octet_length(job.effect_owner_digest) != 32 OR job.effect_owner_digest = zeroblob(32) OR job.attempt_fence <= 0 OR typeof(job.receipt_digest) != 'blob' OR octet_length(job.receipt_digest) != 32 OR job.receipt_digest = zeroblob(32) OR job.outcome NOT IN (0, 1, 2, 3)))
+       OR (job.phase = 3 AND (typeof(job.effect_owner_digest) != 'blob' OR octet_length(job.effect_owner_digest) != 32 OR job.effect_owner_digest = zeroblob(32) OR job.attempt_fence <= 0 OR job.receipt_digest IS NOT NULL OR job.outcome IS NOT NULL))
        OR (claim.mode NOT IN (2, 3) AND job.phase != 0)
     LIMIT 1
 )
@@ -13368,6 +13381,39 @@ enum FencedMutationRosterCommand<'a> {
         request_digest: [u8; 32],
         worker_digest: [u8; 32],
     },
+    EnsureManaged {
+        admission: &'a FencedMutationRosterAdmission,
+        protected_checkpoint: &'a crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan,
+        worker_digest: [u8; 32],
+        verifier_digest: [u8; 32],
+    },
+    StartManaged {
+        admission: &'a FencedMutationRosterAdmission,
+        ordinal: u8,
+        worker_digest: [u8; 32],
+    },
+    RecordManagedReceipt {
+        admission: &'a FencedMutationRosterAdmission,
+        ordinal: u8,
+        worker_digest: [u8; 32],
+        verifier_digest: [u8; 32],
+        receipt_digest: [u8; 32],
+        outcome: u8,
+    },
+    RequireManagedReconciliation {
+        admission: &'a FencedMutationRosterAdmission,
+        ordinal: u8,
+        worker_digest: [u8; 32],
+    },
+    AbortManagedNotApplied {
+        admission: &'a FencedMutationRosterAdmission,
+        ordinal: u8,
+        worker_digest: [u8; 32],
+    },
+    FinalizeManaged {
+        admission: &'a FencedMutationRosterAdmission,
+        worker_digest: [u8; 32],
+    },
 }
 
 fn fenced_mutation_roster_command(
@@ -13405,6 +13451,66 @@ fn fenced_mutation_roster_command(
         } => Some(FencedMutationRosterCommand::ReserveV4VerifierDispatch {
             admission,
             request_digest: *request_digest,
+            worker_digest: *worker_digest,
+        }),
+        SessionMutationIntent::EnsureManagedProviderJob {
+            admission,
+            protected_checkpoint,
+            worker_digest,
+            verifier_digest,
+        } => Some(FencedMutationRosterCommand::EnsureManaged {
+            admission,
+            protected_checkpoint,
+            worker_digest: *worker_digest,
+            verifier_digest: *verifier_digest,
+        }),
+        SessionMutationIntent::StartManagedProviderMember {
+            admission,
+            ordinal,
+            worker_digest,
+        } => Some(FencedMutationRosterCommand::StartManaged {
+            admission,
+            ordinal: *ordinal,
+            worker_digest: *worker_digest,
+        }),
+        SessionMutationIntent::RecordManagedProviderReceipt {
+            admission,
+            ordinal,
+            worker_digest,
+            verifier_digest,
+            receipt_digest,
+            outcome,
+        } => Some(FencedMutationRosterCommand::RecordManagedReceipt {
+            admission,
+            ordinal: *ordinal,
+            worker_digest: *worker_digest,
+            verifier_digest: *verifier_digest,
+            receipt_digest: *receipt_digest,
+            outcome: *outcome,
+        }),
+        SessionMutationIntent::RequireManagedProviderReconciliation {
+            admission,
+            ordinal,
+            worker_digest,
+        } => Some(FencedMutationRosterCommand::RequireManagedReconciliation {
+            admission,
+            ordinal: *ordinal,
+            worker_digest: *worker_digest,
+        }),
+        SessionMutationIntent::AbortManagedProviderNotApplied {
+            admission,
+            ordinal,
+            worker_digest,
+        } => Some(FencedMutationRosterCommand::AbortManagedNotApplied {
+            admission,
+            ordinal: *ordinal,
+            worker_digest: *worker_digest,
+        }),
+        SessionMutationIntent::FinalizeManagedProviderJob {
+            admission,
+            worker_digest,
+        } => Some(FencedMutationRosterCommand::FinalizeManaged {
+            admission,
             worker_digest: *worker_digest,
         }),
         _ => None,
@@ -14016,6 +14122,406 @@ fn fenced_mutation_roster_reserve_v4_verifier_dispatch_sync(
     Ok((FencedMutationRosterOutcome { status }, Some(false)))
 }
 
+fn managed_provider_outcome(value: u8) -> Result<FencedMutationRosterProviderOutcome, StoreError> {
+    match value {
+        0 => Ok(FencedMutationRosterProviderOutcome::AppliedExecuted),
+        1 => Ok(FencedMutationRosterProviderOutcome::AppliedAdopted),
+        2 => Ok(FencedMutationRosterProviderOutcome::NotAppliedReconciled),
+        3 => Ok(FencedMutationRosterProviderOutcome::CompensatedReconciled),
+        _ => Err(fenced_mutation_roster_invalid(
+            "managed_provider_outcome_invalid",
+        )),
+    }
+}
+
+fn managed_provider_result(
+    mode: i64,
+    phase: i64,
+    execute: bool,
+) -> Result<ManagedProviderJobMutationOutcome, StoreError> {
+    if !(0..=3).contains(&mode) || !(0..=5).contains(&phase) {
+        return Err(fenced_mutation_roster_invalid(
+            "managed_provider_state_invalid",
+        ));
+    }
+    Ok(ManagedProviderJobMutationOutcome {
+        mode: mode as u8,
+        phase: phase as u8,
+        execute,
+    })
+}
+
+fn managed_provider_poll_outcome(
+    admission: &FencedMutationRosterAdmission,
+) -> Result<FencedMutationRosterOutcome, StoreError> {
+    Ok(FencedMutationRosterOutcome {
+        status: FencedMutationRosterStatus::new(
+            FencedMutationRosterPhase::PollAdmitted,
+            admission.request_id(),
+            None,
+        )
+        .map_err(|_| fenced_mutation_roster_invalid("managed_provider_status_invalid"))?,
+    })
+}
+
+fn managed_provider_admission_row(
+    conn: &Connection,
+    admission: &FencedMutationRosterAdmission,
+) -> Result<ManagedProviderAdmissionRow, StoreError> {
+    let canonical = encode_fenced_mutation_roster_admission(admission)
+        .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_admission_invalid"))?;
+    let request_id = encode_fenced_mutation_roster_identity(admission.request_id());
+    let row = conn.query_row(
+        "SELECT admission_blob, phase, protected_checkpoint FROM consensus_fenced_mutation_roster_operations WHERE request_id = ?1",
+        [request_id.as_slice()],
+        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<Vec<u8>>>(2)?)),
+    ).optional().map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+    let Some((stored, phase, checkpoint)) = row else {
+        return Err(fenced_mutation_roster_invalid(
+            "managed_provider_not_admitted",
+        ));
+    };
+    if stored != canonical {
+        return Err(fenced_mutation_roster_invalid(
+            "managed_provider_admission_conflict",
+        ));
+    }
+    Ok((request_id.to_vec(), phase, checkpoint))
+}
+
+fn ensure_managed_provider_job_sync(
+    conn: &Connection,
+    admission: &FencedMutationRosterAdmission,
+    checkpoint: &crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan,
+    worker_digest: [u8; 32],
+    verifier_digest: [u8; 32],
+) -> Result<ManagedProviderJobMutationOutcome, StoreError> {
+    if worker_digest == [0; 32] || verifier_digest == [0; 32] {
+        return Err(fenced_mutation_roster_invalid(
+            "managed_provider_authority_invalid",
+        ));
+    }
+    let (request_id, operation_phase, persisted_checkpoint) =
+        managed_provider_admission_row(conn, admission)?;
+    let mode: i64 = conn.query_row(
+        "SELECT mode FROM consensus_fenced_mutation_roster_protocol_claims WHERE request_id = ?1",
+        [request_id.as_slice()], |row| row.get(0),
+    ).map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+    if mode == 1 || mode == 3 || operation_phase != 1 {
+        return managed_provider_result(mode, 0, false);
+    }
+    if mode == 0 {
+        let changed = conn.execute(
+            "UPDATE consensus_fenced_mutation_roster_protocol_claims SET mode = 2 WHERE request_id = ?1 AND mode = 0",
+            [request_id.as_slice()],
+        ).map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+        if changed != 1 {
+            return Err(StoreError::BackendUnavailable(
+                "managed provider claim changed unexpectedly".into(),
+            ));
+        }
+    } else if mode != 2 {
+        return Err(fenced_mutation_roster_invalid(
+            "managed_provider_claim_invalid",
+        ));
+    }
+    if let Some(persisted) = persisted_checkpoint {
+        if persisted != checkpoint.as_bytes() {
+            return Err(fenced_mutation_roster_invalid(
+                "managed_provider_checkpoint_conflict",
+            ));
+        }
+    } else {
+        let changed = conn.execute(
+            "UPDATE consensus_fenced_mutation_roster_operations SET protected_checkpoint = ?1 WHERE request_id = ?2 AND phase = 1 AND protected_checkpoint IS NULL",
+            params![checkpoint.as_bytes(), request_id.as_slice()],
+        ).map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+        if changed != 1 {
+            return Err(StoreError::BackendUnavailable(
+                "managed provider checkpoint changed unexpectedly".into(),
+            ));
+        }
+    }
+    let changed = conn.execute(
+        "UPDATE consensus_fenced_mutation_roster_managed_provider_jobs SET effect_owner_digest = ?1 WHERE request_id = ?2 AND phase = 0 AND effect_owner_digest IS NULL",
+        params![worker_digest.as_slice(), request_id.as_slice()],
+    ).map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+    let existing: bool = conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM consensus_fenced_mutation_roster_managed_provider_jobs WHERE request_id = ?1 AND (phase = 0 AND effect_owner_digest != ?2 OR phase > 0 AND effect_owner_digest != ?2))",
+        params![request_id.as_slice(), worker_digest.as_slice()], |row| row.get(0),
+    ).map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+    if !existing || (changed == 0 && mode == 0) {
+        return Err(fenced_mutation_roster_invalid(
+            "managed_provider_worker_conflict",
+        ));
+    }
+    managed_provider_result(2, 0, false)
+}
+
+fn managed_provider_member_row(
+    conn: &Connection,
+    request_id: &[u8],
+    ordinal: u8,
+    worker_digest: [u8; 32],
+) -> Result<ManagedProviderMemberRow, StoreError> {
+    conn.query_row(
+        "SELECT phase, effect_owner_digest, outcome FROM consensus_fenced_mutation_roster_managed_provider_jobs WHERE request_id = ?1 AND ordinal = ?2",
+        params![request_id, i64::from(ordinal)],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?, row.get::<_, Option<i64>>(2)?)),
+    ).optional().map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?
+        .ok_or_else(|| fenced_mutation_roster_invalid("managed_provider_member_invalid"))
+        .and_then(|row| {
+            if row.1.as_deref() != Some(worker_digest.as_slice()) { Err(fenced_mutation_roster_invalid("managed_provider_worker_conflict")) } else { Ok(row) }
+        })
+}
+
+fn managed_provider_mutate_sync(
+    conn: &Connection,
+    admission: &FencedMutationRosterAdmission,
+    mutation: ManagedProviderMutation,
+) -> Result<ManagedProviderJobMutationOutcome, StoreError> {
+    let ManagedProviderMutation {
+        ordinal,
+        worker_digest,
+        operation,
+        verifier_digest,
+        receipt_digest,
+        outcome,
+    } = mutation;
+    let (request_id, operation_phase, _) = managed_provider_admission_row(conn, admission)?;
+    let mode: i64 = conn.query_row("SELECT mode FROM consensus_fenced_mutation_roster_protocol_claims WHERE request_id = ?1", [request_id.as_slice()], |row| row.get(0))
+        .map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+    if mode != 2 || operation_phase != 1 {
+        return managed_provider_result(mode, 0, false);
+    }
+    let (phase, _, stored_outcome) =
+        managed_provider_member_row(conn, &request_id, ordinal, worker_digest)?;
+    match operation {
+        1 => {
+            if phase == 0 {
+                let changed = conn.execute("UPDATE consensus_fenced_mutation_roster_managed_provider_jobs SET phase = 1, attempt_fence = 1 WHERE request_id = ?1 AND ordinal = ?2 AND phase = 0 AND effect_owner_digest = ?3", params![request_id.as_slice(), i64::from(ordinal), worker_digest.as_slice()])
+                    .map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+                if changed != 1 {
+                    return Err(StoreError::BackendUnavailable(
+                        "managed provider effect boundary changed unexpectedly".into(),
+                    ));
+                }
+                managed_provider_result(2, 1, true)
+            } else {
+                managed_provider_result(2, phase, false)
+            }
+        }
+        2 => {
+            let verifier_digest = verifier_digest.ok_or_else(|| {
+                fenced_mutation_roster_invalid("managed_provider_verifier_missing")
+            })?;
+            let receipt_digest = receipt_digest.ok_or_else(|| {
+                fenced_mutation_roster_invalid("managed_provider_receipt_missing")
+            })?;
+            let outcome = outcome.ok_or_else(|| {
+                fenced_mutation_roster_invalid("managed_provider_outcome_missing")
+            })?;
+            let _ = managed_provider_outcome(outcome)?;
+            if verifier_digest == [0; 32] || receipt_digest == [0; 32] {
+                return Err(fenced_mutation_roster_invalid(
+                    "managed_provider_receipt_invalid",
+                ));
+            }
+            if phase == 2 {
+                let same: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM consensus_fenced_mutation_roster_managed_provider_jobs WHERE request_id = ?1 AND ordinal = ?2 AND receipt_digest = ?3 AND outcome = ?4)", params![request_id.as_slice(), i64::from(ordinal), receipt_digest.as_slice(), i64::from(outcome)], |row| row.get(0)).map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+                if !same {
+                    return Err(fenced_mutation_roster_invalid(
+                        "managed_provider_receipt_conflict",
+                    ));
+                }
+                return managed_provider_result(2, phase, false);
+            }
+            if phase != 1 {
+                return Err(fenced_mutation_roster_invalid(
+                    "managed_provider_receipt_phase_invalid",
+                ));
+            }
+            let changed = conn.execute("UPDATE consensus_fenced_mutation_roster_managed_provider_jobs SET phase = 2, receipt_digest = ?1, outcome = ?2 WHERE request_id = ?3 AND ordinal = ?4 AND phase = 1 AND effect_owner_digest = ?5", params![receipt_digest.as_slice(), i64::from(outcome), request_id.as_slice(), i64::from(ordinal), worker_digest.as_slice()]).map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+            if changed != 1 {
+                return Err(StoreError::BackendUnavailable(
+                    "managed provider receipt changed unexpectedly".into(),
+                ));
+            }
+            managed_provider_result(2, 2, false)
+        }
+        3 => {
+            if phase == 3 {
+                return managed_provider_result(2, 3, false);
+            }
+            if phase != 1 {
+                return Err(fenced_mutation_roster_invalid(
+                    "managed_provider_reconciliation_phase_invalid",
+                ));
+            }
+            let changed = conn.execute("UPDATE consensus_fenced_mutation_roster_managed_provider_jobs SET phase = 3, receipt_digest = NULL, outcome = NULL WHERE request_id = ?1 AND ordinal = ?2 AND phase = 1 AND effect_owner_digest = ?3", params![request_id.as_slice(), i64::from(ordinal), worker_digest.as_slice()]).map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+            if changed != 1 {
+                return Err(StoreError::BackendUnavailable(
+                    "managed provider reconciliation changed unexpectedly".into(),
+                ));
+            }
+            managed_provider_result(2, 3, false)
+        }
+        4 => {
+            if phase != 2 || stored_outcome != Some(2) {
+                return Err(fenced_mutation_roster_invalid(
+                    "managed_provider_not_applied_unverified",
+                ));
+            }
+            let changed = conn.execute("UPDATE consensus_fenced_mutation_roster_managed_provider_jobs SET phase = 5 WHERE request_id = ?1 AND ordinal = ?2 AND phase = 2 AND outcome = 2 AND effect_owner_digest = ?3", params![request_id.as_slice(), i64::from(ordinal), worker_digest.as_slice()]).map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+            if changed != 1 {
+                return Err(StoreError::BackendUnavailable(
+                    "managed provider abort changed unexpectedly".into(),
+                ));
+            }
+            managed_provider_result(2, 5, false)
+        }
+        _ => Err(fenced_mutation_roster_invalid(
+            "managed_provider_operation_invalid",
+        )),
+    }
+}
+
+fn finalize_managed_provider_job_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    admission: &FencedMutationRosterAdmission,
+    worker_digest: [u8; 32],
+) -> Result<ManagedProviderJobMutationOutcome, StoreError> {
+    let (request_id, operation_phase, checkpoint) =
+        managed_provider_admission_row(conn, admission)?;
+    let mode: i64 = conn.query_row("SELECT mode FROM consensus_fenced_mutation_roster_protocol_claims WHERE request_id = ?1", [request_id.as_slice()], |row| row.get(0)).map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+    if mode != 2 || operation_phase != 1 {
+        return managed_provider_result(mode, 0, false);
+    }
+    let checkpoint = checkpoint
+        .ok_or_else(|| fenced_mutation_roster_invalid("managed_provider_checkpoint_missing"))?;
+    let mut statement = conn.prepare("SELECT ordinal, phase, effect_owner_digest, receipt_digest, outcome FROM consensus_fenced_mutation_roster_managed_provider_jobs WHERE request_id = ?1 ORDER BY ordinal").map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+    let rows = statement
+        .query_map([request_id.as_slice()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        })
+        .map_err(|_| {
+            StoreError::BackendUnavailable("managed provider persistence is unavailable".into())
+        })?;
+    let mut outcomes = Vec::with_capacity(admission.members().len());
+    for (member, row) in admission.members().as_slice().iter().zip(rows) {
+        let (ordinal, phase, owner, receipt, outcome) = row.map_err(|_| {
+            StoreError::BackendUnavailable("managed provider persistence is unavailable".into())
+        })?;
+        if ordinal != i64::from(member.ordinal().get())
+            || owner.as_slice() != worker_digest.as_slice()
+            || phase != 2
+            || receipt.as_ref().is_none_or(|value| value.len() != 32)
+        {
+            return Err(fenced_mutation_roster_invalid(
+                "managed_provider_finalization_incomplete",
+            ));
+        }
+        let outcome = managed_provider_outcome(outcome.ok_or_else(|| {
+            fenced_mutation_roster_invalid("managed_provider_finalization_incomplete")
+        })? as u8)?;
+        if outcome == FencedMutationRosterProviderOutcome::NotAppliedReconciled {
+            return Err(fenced_mutation_roster_invalid(
+                "managed_provider_finalization_not_applied",
+            ));
+        }
+        let (disposition, adoption) = match outcome {
+            FencedMutationRosterProviderOutcome::AppliedExecuted => (
+                FencedMutationRosterDisposition::Applied,
+                FencedMutationRosterAdoption::Executed,
+            ),
+            FencedMutationRosterProviderOutcome::AppliedAdopted => (
+                FencedMutationRosterDisposition::Applied,
+                FencedMutationRosterAdoption::Adopted,
+            ),
+            FencedMutationRosterProviderOutcome::CompensatedReconciled => (
+                FencedMutationRosterDisposition::Compensated,
+                FencedMutationRosterAdoption::Reconciled,
+            ),
+            FencedMutationRosterProviderOutcome::NotAppliedReconciled => unreachable!(),
+        };
+        outcomes.push(
+            FencedMutationRosterMemberOutcome::new(
+                member.ordinal(),
+                *member.caller_id(),
+                disposition,
+                adoption,
+                FencedMutationRosterStatusBytes::new(Vec::new()).map_err(|_| {
+                    fenced_mutation_roster_invalid("managed_provider_status_invalid")
+                })?,
+            )
+            .map_err(|_| fenced_mutation_roster_invalid("managed_provider_terminal_invalid"))?,
+        );
+    }
+    if outcomes.len() != admission.members().len() {
+        return Err(fenced_mutation_roster_invalid(
+            "managed_provider_finalization_incomplete",
+        ));
+    }
+    let plan = FencedMutationRosterPlan::new(
+        fenced_mutation_roster_profile_digest(),
+        admission.scope().digest(),
+        admission
+            .fence_intent()
+            .owner()
+            .as_str()
+            .as_bytes()
+            .to_vec(),
+        admission
+            .fence_intent()
+            .fence()
+            .get()
+            .to_be_bytes()
+            .to_vec(),
+        admission.expected_generation().get(),
+        admission.members().as_slice().to_vec(),
+        admission.protected_plan().as_bytes().to_vec(),
+        admission.terminal_result().as_bytes().to_vec(),
+    )
+    .map_err(|_| fenced_mutation_roster_invalid("managed_provider_plan_invalid"))?;
+    let terminal = FencedMutationRosterTerminal::new(
+        plan.admission_commitment(),
+        outcomes,
+        checkpoint,
+        admission.terminal_result().as_bytes().to_vec(),
+    )
+    .map_err(|_| fenced_mutation_roster_invalid("managed_provider_terminal_invalid"))?;
+    let protected_checkpoint =
+        crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan::new(
+            terminal.protected_checkpoint().to_vec().into_boxed_slice(),
+        )
+        .map_err(|_| fenced_mutation_roster_invalid("managed_provider_checkpoint_invalid"))?;
+    let _ = fenced_mutation_roster_terminalize_sync(
+        conn,
+        storage_identity,
+        admission,
+        &terminal,
+        &protected_checkpoint,
+    )?;
+    let changed = conn.execute("UPDATE consensus_fenced_mutation_roster_managed_provider_jobs SET phase = 4 WHERE request_id = ?1 AND phase = 2", [request_id.as_slice()]).map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+    if changed
+        != i64::try_from(admission.members().len())
+            .map_err(|_| fenced_mutation_roster_invalid("managed_provider_member_count_invalid"))?
+            as usize
+    {
+        return Err(StoreError::BackendUnavailable(
+            "managed provider terminal state changed unexpectedly".into(),
+        ));
+    }
+    managed_provider_result(3, 4, false)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FencedMutationRosterMaintenanceResult {
     Applied,
@@ -14031,6 +14537,24 @@ struct FencedMutationRosterMaintenanceExpectation {
     retired_through: u64,
     bound_entries: u64,
     live_entries: u64,
+}
+
+enum FencedMutationRosterCommandResult {
+    Roster,
+    V4Reserved(bool),
+    Managed(ManagedProviderJobMutationOutcome),
+}
+
+type ManagedProviderAdmissionRow = (Vec<u8>, i64, Option<Vec<u8>>);
+type ManagedProviderMemberRow = (i64, Option<Vec<u8>>, Option<i64>);
+
+struct ManagedProviderMutation {
+    ordinal: u8,
+    worker_digest: [u8; 32],
+    operation: u8,
+    verifier_digest: Option<[u8; 32]>,
+    receipt_digest: Option<[u8; 32]>,
+    outcome: Option<u8>,
 }
 
 /// Retire one wholly terminal roster epoch and reclaim one ordered bounded
@@ -14330,7 +14854,13 @@ fn apply_fenced_mutation_roster_command_sync(
     let admission = match &roster_command {
         FencedMutationRosterCommand::Admit { admission, .. }
         | FencedMutationRosterCommand::Terminalize { admission, .. }
-        | FencedMutationRosterCommand::ReserveV4VerifierDispatch { admission, .. } => admission,
+        | FencedMutationRosterCommand::ReserveV4VerifierDispatch { admission, .. }
+        | FencedMutationRosterCommand::EnsureManaged { admission, .. }
+        | FencedMutationRosterCommand::StartManaged { admission, .. }
+        | FencedMutationRosterCommand::RecordManagedReceipt { admission, .. }
+        | FencedMutationRosterCommand::RequireManagedReconciliation { admission, .. }
+        | FencedMutationRosterCommand::AbortManagedNotApplied { admission, .. }
+        | FencedMutationRosterCommand::FinalizeManaged { admission, .. } => admission,
     };
     admission
         .validate()
@@ -14389,7 +14919,7 @@ fn apply_fenced_mutation_roster_command_sync(
     let operation = match &roster_command {
         FencedMutationRosterCommand::Admit { admission, .. } => {
             fenced_mutation_roster_admit_sync(tx, storage_identity, admission, logical_time)
-                .map(|outcome| (outcome, None))
+                .map(|outcome| (outcome, FencedMutationRosterCommandResult::Roster))
         }
         FencedMutationRosterCommand::Terminalize {
             admission,
@@ -14402,7 +14932,7 @@ fn apply_fenced_mutation_roster_command_sync(
             terminal,
             protected_checkpoint,
         )
-        .map(|outcome| (outcome, None)),
+        .map(|outcome| (outcome, FencedMutationRosterCommandResult::Roster)),
         FencedMutationRosterCommand::ReserveV4VerifierDispatch {
             admission,
             request_digest,
@@ -14412,9 +14942,140 @@ fn apply_fenced_mutation_roster_command_sync(
             admission,
             request_digest,
             worker_digest,
-        ),
+        )
+        .and_then(|(outcome, reserved)| {
+            reserved
+                .map(|reserved| {
+                    (
+                        outcome,
+                        FencedMutationRosterCommandResult::V4Reserved(reserved),
+                    )
+                })
+                .ok_or_else(|| {
+                    fenced_mutation_roster_invalid("fenced_mutation_roster_v4_reservation_missing")
+                })
+        }),
+        FencedMutationRosterCommand::EnsureManaged {
+            admission,
+            protected_checkpoint,
+            worker_digest,
+            verifier_digest,
+        } => ensure_managed_provider_job_sync(
+            tx,
+            admission,
+            protected_checkpoint,
+            *worker_digest,
+            *verifier_digest,
+        )
+        .and_then(|outcome| {
+            Ok((
+                managed_provider_poll_outcome(admission)?,
+                FencedMutationRosterCommandResult::Managed(outcome),
+            ))
+        }),
+        FencedMutationRosterCommand::StartManaged {
+            admission,
+            ordinal,
+            worker_digest,
+        } => managed_provider_mutate_sync(
+            tx,
+            admission,
+            ManagedProviderMutation {
+                ordinal: *ordinal,
+                worker_digest: *worker_digest,
+                operation: 1,
+                verifier_digest: None,
+                receipt_digest: None,
+                outcome: None,
+            },
+        )
+        .and_then(|outcome| {
+            Ok((
+                managed_provider_poll_outcome(admission)?,
+                FencedMutationRosterCommandResult::Managed(outcome),
+            ))
+        }),
+        FencedMutationRosterCommand::RecordManagedReceipt {
+            admission,
+            ordinal,
+            worker_digest,
+            verifier_digest,
+            receipt_digest,
+            outcome,
+        } => managed_provider_mutate_sync(
+            tx,
+            admission,
+            ManagedProviderMutation {
+                ordinal: *ordinal,
+                worker_digest: *worker_digest,
+                operation: 2,
+                verifier_digest: Some(*verifier_digest),
+                receipt_digest: Some(*receipt_digest),
+                outcome: Some(*outcome),
+            },
+        )
+        .and_then(|outcome| {
+            Ok((
+                managed_provider_poll_outcome(admission)?,
+                FencedMutationRosterCommandResult::Managed(outcome),
+            ))
+        }),
+        FencedMutationRosterCommand::RequireManagedReconciliation {
+            admission,
+            ordinal,
+            worker_digest,
+        } => managed_provider_mutate_sync(
+            tx,
+            admission,
+            ManagedProviderMutation {
+                ordinal: *ordinal,
+                worker_digest: *worker_digest,
+                operation: 3,
+                verifier_digest: None,
+                receipt_digest: None,
+                outcome: None,
+            },
+        )
+        .and_then(|outcome| {
+            Ok((
+                managed_provider_poll_outcome(admission)?,
+                FencedMutationRosterCommandResult::Managed(outcome),
+            ))
+        }),
+        FencedMutationRosterCommand::AbortManagedNotApplied {
+            admission,
+            ordinal,
+            worker_digest,
+        } => managed_provider_mutate_sync(
+            tx,
+            admission,
+            ManagedProviderMutation {
+                ordinal: *ordinal,
+                worker_digest: *worker_digest,
+                operation: 4,
+                verifier_digest: None,
+                receipt_digest: None,
+                outcome: None,
+            },
+        )
+        .and_then(|outcome| {
+            Ok((
+                managed_provider_poll_outcome(admission)?,
+                FencedMutationRosterCommandResult::Managed(outcome),
+            ))
+        }),
+        FencedMutationRosterCommand::FinalizeManaged {
+            admission,
+            worker_digest,
+        } => finalize_managed_provider_job_sync(tx, storage_identity, admission, *worker_digest)
+            .and_then(|outcome| {
+                Ok((
+                    managed_provider_poll_outcome(admission)?,
+                    FencedMutationRosterCommandResult::Managed(outcome),
+                ))
+            }),
     };
-    let (outcome, reserved) = match operation {
+    let (outcome, command_result) = match operation {
         Ok(outcome) => outcome,
         Err(error @ StoreError::InvalidKey(_)) => {
             advance_fenced_replay_logical_time_sync(tx, storage_identity, logical_time, machine)?;
@@ -14447,11 +15108,16 @@ fn apply_fenced_mutation_roster_command_sync(
     machine.1 = command_digest;
     machine.2 = Some(logical_time);
     Ok(SessionConsensusResponse {
-        result: Ok(match reserved {
-            Some(reserved) => {
+        result: Ok(match command_result {
+            FencedMutationRosterCommandResult::Roster => {
+                SessionMutationOutcome::FencedMutationRoster(outcome)
+            }
+            FencedMutationRosterCommandResult::V4Reserved(reserved) => {
                 SessionMutationOutcome::FencedMutationRosterV4VerifierDispatchReserved(reserved)
             }
-            None => SessionMutationOutcome::FencedMutationRoster(outcome),
+            FencedMutationRosterCommandResult::Managed(managed) => {
+                SessionMutationOutcome::ManagedProviderJob(managed)
+            }
         }),
         sequence,
         digest: Some(command_digest),
@@ -15303,6 +15969,115 @@ pub(crate) fn logical_time_sync(
     read_machine_sync(conn, identity).map(|(_, _, logical_time, _)| logical_time)
 }
 
+pub(crate) fn managed_provider_job_status_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request_id: [u8; FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES],
+    ordinal: u8,
+    worker_digest: [u8; 32],
+) -> Result<(u8, u8), StoreError> {
+    read_storage_identity_sync(conn)
+        .map_err(|_| {
+            StoreError::BackendUnavailable("managed provider status is unavailable".into())
+        })?
+        .eq(&identity)
+        .then_some(())
+        .ok_or_else(|| {
+            StoreError::BackendUnavailable("managed provider status is unavailable".into())
+        })?;
+    let mode: i64 = conn.query_row(
+        "SELECT mode FROM consensus_fenced_mutation_roster_protocol_claims WHERE request_id = ?1",
+        [request_id.as_slice()], |row| row.get(0),
+    ).optional().map_err(|_| StoreError::BackendUnavailable("managed provider status is unavailable".into()))?
+        .ok_or_else(|| fenced_mutation_roster_invalid("managed_provider_not_admitted"))?;
+    let (phase, owner): (i64, Option<Vec<u8>>) = conn.query_row(
+        "SELECT phase, effect_owner_digest FROM consensus_fenced_mutation_roster_managed_provider_jobs WHERE request_id = ?1 AND ordinal = ?2",
+        params![request_id.as_slice(), i64::from(ordinal)], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional().map_err(|_| StoreError::BackendUnavailable("managed provider status is unavailable".into()))?
+        .ok_or_else(|| fenced_mutation_roster_invalid("managed_provider_member_invalid"))?;
+    if owner.as_deref() != Some(worker_digest.as_slice()) {
+        return Err(fenced_mutation_roster_invalid(
+            "managed_provider_worker_conflict",
+        ));
+    }
+    let result = managed_provider_result(mode, phase, false)?;
+    Ok((result.mode, result.phase))
+}
+
+pub(crate) fn managed_provider_admission_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request_id: [u8; FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES],
+) -> Result<FencedMutationRosterAdmission, StoreError> {
+    if read_storage_identity_sync(conn).map_err(|_| {
+        StoreError::BackendUnavailable("managed provider admission is unavailable".into())
+    })? != identity
+    {
+        return Err(StoreError::BackendUnavailable(
+            "managed provider admission is unavailable".into(),
+        ));
+    }
+    let encoded: Vec<u8> = conn.query_row(
+        "SELECT admission_blob FROM consensus_fenced_mutation_roster_operations WHERE request_id = ?1",
+        [request_id.as_slice()], |row| row.get(0),
+    ).optional().map_err(|_| StoreError::BackendUnavailable("managed provider admission is unavailable".into()))?
+        .ok_or_else(|| fenced_mutation_roster_invalid("managed_provider_not_admitted"))?;
+    decode_fenced_mutation_roster_admission(&encoded)
+        .map_err(|_| fenced_mutation_roster_invalid("managed_provider_admission_invalid"))
+}
+
+pub(crate) fn managed_provider_recovery_jobs_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    worker_digest: [u8; 32],
+) -> Result<Vec<([u8; FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES], u8)>, StoreError> {
+    if read_storage_identity_sync(conn).map_err(|_| {
+        StoreError::BackendUnavailable("managed provider recovery is unavailable".into())
+    })? != identity
+    {
+        return Err(StoreError::BackendUnavailable(
+            "managed provider recovery is unavailable".into(),
+        ));
+    }
+    let limit = FENCED_MUTATION_ROSTER_MAX_LIVE
+        .checked_mul(crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_MAX_MEMBERS)
+        .ok_or_else(|| {
+            StoreError::BackendUnavailable("managed provider recovery is unavailable".into())
+        })?;
+    let mut statement = conn.prepare(
+        "SELECT job.request_id, job.ordinal FROM consensus_fenced_mutation_roster_managed_provider_jobs AS job \
+         JOIN consensus_fenced_mutation_roster_protocol_claims AS claim ON claim.request_id = job.request_id \
+         WHERE claim.mode = 2 AND job.phase IN (1, 3) AND job.effect_owner_digest = ?1 \
+         ORDER BY job.request_id, job.ordinal LIMIT ?2",
+    ).map_err(|_| StoreError::BackendUnavailable("managed provider recovery is unavailable".into()))?;
+    let rows = statement
+        .query_map(
+            params![
+                worker_digest.as_slice(),
+                i64::try_from(limit).map_err(|_| StoreError::BackendUnavailable(
+                    "managed provider recovery is unavailable".into()
+                ))?
+            ],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(|_| {
+            StoreError::BackendUnavailable("managed provider recovery is unavailable".into())
+        })?;
+    let mut jobs = Vec::with_capacity(limit);
+    for row in rows {
+        let (request_id, ordinal) = row.map_err(|_| {
+            StoreError::BackendUnavailable("managed provider recovery is unavailable".into())
+        })?;
+        let request_id: [u8; FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES] = request_id
+            .try_into()
+            .map_err(|_| fenced_mutation_roster_invalid("managed_provider_recovery_invalid"))?;
+        let ordinal = u8::try_from(ordinal)
+            .map_err(|_| fenced_mutation_roster_invalid("managed_provider_recovery_invalid"))?;
+        jobs.push((request_id, ordinal));
+    }
+    Ok(jobs)
+}
+
 pub(crate) fn validate_consensus_outcome_records(
     outcome: &SessionMutationOutcome,
 ) -> Result<(), StoreError> {
@@ -15317,7 +16092,8 @@ pub(crate) fn validate_consensus_outcome_records(
         | SessionMutationOutcome::Lease(_)
         | SessionMutationOutcome::Unit
         | SessionMutationOutcome::FencedMutationRoster(_)
-        | SessionMutationOutcome::FencedMutationRosterV4VerifierDispatchReserved(_) => Ok(()),
+        | SessionMutationOutcome::FencedMutationRosterV4VerifierDispatchReserved(_)
+        | SessionMutationOutcome::ManagedProviderJob(_) => Ok(()),
     }
 }
 
@@ -15551,6 +16327,12 @@ fn execute_application_intent_sync(
         | SessionMutationIntent::AdmitFencedMutationRoster { .. }
         | SessionMutationIntent::TerminalizeFencedMutationRoster { .. }
         | SessionMutationIntent::ReserveFencedMutationRosterV4VerifierDispatch { .. }
+        | SessionMutationIntent::EnsureManagedProviderJob { .. }
+        | SessionMutationIntent::StartManagedProviderMember { .. }
+        | SessionMutationIntent::RecordManagedProviderReceipt { .. }
+        | SessionMutationIntent::RequireManagedProviderReconciliation { .. }
+        | SessionMutationIntent::AbortManagedProviderNotApplied { .. }
+        | SessionMutationIntent::FinalizeManagedProviderJob { .. }
         | SessionMutationIntent::Authorized { .. } => Err(StoreError::BackendUnavailable(
             "session consensus internal intent reached application executor".into(),
         )),
@@ -33889,5 +34671,123 @@ BEGIN IMMEDIATE;
             }]
         ));
         assert!(rejected.notifications.is_empty());
+    }
+
+    // Synthetic commitments only: this is SQLite state-machine coverage, not
+    // mTLS or network qualification evidence.
+    #[test]
+    fn managed_provider_receipt_terminalization_and_reconciliation_are_durable() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(
+                    1,
+                    fenced_transition_request(0xE1, "managed-provider-owner"),
+                    timestamp(1),
+                ),
+            ],
+        )
+        .expect("activation prerequisites");
+        activate_fenced_mutation_roster_scope_sync(
+            &conn,
+            identity(),
+            identity(),
+            &expected_members(),
+            fenced_mutation_roster_profile_digest(),
+            1,
+        )
+        .expect("activate roster");
+        let admission = fenced_mutation_roster_admission(0xE2, 0xE3);
+        fenced_mutation_roster_admit_sync(&conn, identity(), &admission, timestamp(2))
+            .expect("admit roster");
+        let checkpoint = crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan::new(
+            vec![0xE4].into_boxed_slice(),
+        )
+        .expect("checkpoint");
+        let worker = [0xE5; 32];
+        let verifier = [0xE6; 32];
+        let ensured =
+            ensure_managed_provider_job_sync(&conn, &admission, &checkpoint, worker, verifier)
+                .expect("claim V5");
+        assert_eq!((ensured.mode, ensured.phase), (2, 0));
+        let ordinal = admission.members().as_slice()[0].ordinal().get();
+        assert!(finalize_managed_provider_job_sync(&conn, identity(), &admission, worker).is_err());
+        let started = managed_provider_mutate_sync(
+            &conn,
+            &admission,
+            ManagedProviderMutation {
+                ordinal,
+                worker_digest: worker,
+                operation: 1,
+                verifier_digest: None,
+                receipt_digest: None,
+                outcome: None,
+            },
+        )
+        .expect("cross effect boundary");
+        assert!(started.execute);
+        assert!(managed_provider_mutate_sync(
+            &conn,
+            &admission,
+            ManagedProviderMutation {
+                ordinal,
+                worker_digest: [0xE8; 32],
+                operation: 2,
+                verifier_digest: Some(verifier),
+                receipt_digest: Some([0xE9; 32]),
+                outcome: Some(0),
+            },
+        )
+        .is_err());
+        assert!(fenced_mutation_roster_reserve_v4_verifier_dispatch_sync(
+            &conn,
+            &admission,
+            &[0xEA; 32],
+            &[0xEB; 32],
+        )
+        .is_err());
+        let receipt = [0xE7; 32];
+        let verified = managed_provider_mutate_sync(
+            &conn,
+            &admission,
+            ManagedProviderMutation {
+                ordinal,
+                worker_digest: worker,
+                operation: 2,
+                verifier_digest: Some(verifier),
+                receipt_digest: Some(receipt),
+                outcome: Some(0),
+            },
+        )
+        .expect("persist verified receipt");
+        assert_eq!((verified.mode, verified.phase), (2, 2));
+        assert!(managed_provider_mutate_sync(
+            &conn,
+            &admission,
+            ManagedProviderMutation {
+                ordinal,
+                worker_digest: worker,
+                operation: 2,
+                verifier_digest: Some(verifier),
+                receipt_digest: Some([0xEC; 32]),
+                outcome: Some(0),
+            },
+        )
+        .is_err());
+        let terminal = finalize_managed_provider_job_sync(&conn, identity(), &admission, worker)
+            .expect("derive terminal from store-owned receipt");
+        assert_eq!((terminal.mode, terminal.phase), (3, 4));
+        let (_, phase, stored_checkpoint) =
+            managed_provider_admission_row(&conn, &admission).expect("stored operation");
+        assert_eq!(phase, 2);
+        assert_eq!(stored_checkpoint.as_deref(), Some(checkpoint.as_bytes()));
+        validate_fenced_mutation_roster_receipts_sync(&conn, identity())
+            .expect("terminal survives durable validation");
     }
 }

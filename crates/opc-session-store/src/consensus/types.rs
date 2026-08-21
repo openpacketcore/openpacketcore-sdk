@@ -442,6 +442,52 @@ pub enum SessionMutationIntent {
         /// Domain-separated digest of the authenticated mTLS worker identity.
         worker_digest: [u8; 32],
     },
+    /// Atomically claim the managed V5 protocol and bind its server-owned
+    /// checkpoint and configured worker/verifier commitments before provider I/O.
+    #[doc(hidden)]
+    EnsureManagedProviderJob {
+        admission: Box<FencedMutationRosterAdmission>,
+        protected_checkpoint: FencedMutationRosterProtectedPlan,
+        worker_digest: [u8; 32],
+        verifier_digest: [u8; 32],
+    },
+    /// Cross one managed member's durable effect boundary exactly once.
+    #[doc(hidden)]
+    StartManagedProviderMember {
+        admission: Box<FencedMutationRosterAdmission>,
+        ordinal: u8,
+        worker_digest: [u8; 32],
+    },
+    /// Persist one private verifier-issued member receipt.
+    #[doc(hidden)]
+    RecordManagedProviderReceipt {
+        admission: Box<FencedMutationRosterAdmission>,
+        ordinal: u8,
+        worker_digest: [u8; 32],
+        verifier_digest: [u8; 32],
+        receipt_digest: [u8; 32],
+        outcome: u8,
+    },
+    /// Mark a managed member unreconciled without accepting an outcome-only status.
+    #[doc(hidden)]
+    RequireManagedProviderReconciliation {
+        admission: Box<FencedMutationRosterAdmission>,
+        ordinal: u8,
+        worker_digest: [u8; 32],
+    },
+    /// Abort only after a persisted verifier-issued NotApplied receipt.
+    #[doc(hidden)]
+    AbortManagedProviderNotApplied {
+        admission: Box<FencedMutationRosterAdmission>,
+        ordinal: u8,
+        worker_digest: [u8; 32],
+    },
+    /// Derive the roster terminal from durable managed receipts and checkpoint.
+    #[doc(hidden)]
+    FinalizeManagedProviderJob {
+        admission: Box<FencedMutationRosterAdmission>,
+        worker_digest: [u8; 32],
+    },
     /// SDK-internal bounded roster terminal-history maintenance.
     ///
     /// This replicated compare-and-set command is admitted only through the
@@ -597,6 +643,12 @@ impl SessionMutationIntent {
             Self::AdmitFencedMutationRoster { .. }
                 | Self::TerminalizeFencedMutationRoster { .. }
                 | Self::ReserveFencedMutationRosterV4VerifierDispatch { .. }
+                | Self::EnsureManagedProviderJob { .. }
+                | Self::StartManagedProviderMember { .. }
+                | Self::RecordManagedProviderReceipt { .. }
+                | Self::RequireManagedProviderReconciliation { .. }
+                | Self::AbortManagedProviderNotApplied { .. }
+                | Self::FinalizeManagedProviderJob { .. }
                 | Self::MaintainFencedMutationRosterHistory { .. }
         ) || matches!(self, Self::Authorized { mutation, .. } if mutation.contains_fenced_mutation_roster())
     }
@@ -666,6 +718,72 @@ fn append_roster_applied_intent(
             out.push(5);
             append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
             out.extend_from_slice(request_digest);
+            out.extend_from_slice(worker_digest);
+        }
+        SessionMutationIntent::EnsureManagedProviderJob {
+            admission,
+            protected_checkpoint,
+            worker_digest,
+            verifier_digest,
+        } => {
+            out.push(6);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            append_roster_applied_frame(out, protected_checkpoint.as_bytes().to_vec())?;
+            out.extend_from_slice(worker_digest);
+            out.extend_from_slice(verifier_digest);
+        }
+        SessionMutationIntent::StartManagedProviderMember {
+            admission,
+            ordinal,
+            worker_digest,
+        } => {
+            out.push(7);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            out.push(*ordinal);
+            out.extend_from_slice(worker_digest);
+        }
+        SessionMutationIntent::RecordManagedProviderReceipt {
+            admission,
+            ordinal,
+            worker_digest,
+            verifier_digest,
+            receipt_digest,
+            outcome,
+        } => {
+            out.push(8);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            out.push(*ordinal);
+            out.extend_from_slice(worker_digest);
+            out.extend_from_slice(verifier_digest);
+            out.extend_from_slice(receipt_digest);
+            out.push(*outcome);
+        }
+        SessionMutationIntent::RequireManagedProviderReconciliation {
+            admission,
+            ordinal,
+            worker_digest,
+        } => {
+            out.push(9);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            out.push(*ordinal);
+            out.extend_from_slice(worker_digest);
+        }
+        SessionMutationIntent::AbortManagedProviderNotApplied {
+            admission,
+            ordinal,
+            worker_digest,
+        } => {
+            out.push(10);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            out.push(*ordinal);
+            out.extend_from_slice(worker_digest);
+        }
+        SessionMutationIntent::FinalizeManagedProviderJob {
+            admission,
+            worker_digest,
+        } => {
+            out.push(11);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
             out.extend_from_slice(worker_digest);
         }
         SessionMutationIntent::Authorized {
@@ -856,6 +974,22 @@ pub enum SessionMutationOutcome {
     FencedMutationRoster(FencedMutationRosterOutcome),
     /// Result of one exact revision-6 verifier-dispatch reservation.
     FencedMutationRosterV4VerifierDispatchReserved(bool),
+    /// Redaction-safe result of one store-owned managed-provider state change.
+    #[doc(hidden)]
+    ManagedProviderJob(ManagedProviderJobMutationOutcome),
+}
+
+/// Fixed-width managed-provider command result.  It contains no evidence,
+/// subscriber identity, or caller-constructed terminal body.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[doc(hidden)]
+pub struct ManagedProviderJobMutationOutcome {
+    /// Durable protocol mode discriminator.
+    pub mode: u8,
+    /// Durable member phase.
+    pub phase: u8,
+    /// Whether this command alone crossed the external-effect boundary.
+    pub execute: bool,
 }
 
 impl fmt::Debug for SessionMutationOutcome {

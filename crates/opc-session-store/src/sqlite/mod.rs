@@ -926,6 +926,47 @@ impl SqliteSessionBackend {
         .await
     }
 
+    pub(crate) async fn consensus_managed_provider_job_status(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        request_id: [u8; crate::FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES],
+        ordinal: u8,
+        worker_digest: [u8; 32],
+    ) -> Result<(u8, u8), StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::managed_provider_job_status_sync(
+                conn,
+                identity,
+                request_id,
+                ordinal,
+                worker_digest,
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn consensus_managed_provider_admission(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        request_id: [u8; crate::FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES],
+    ) -> Result<crate::FencedMutationRosterAdmission, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::managed_provider_admission_sync(conn, identity, request_id)
+        })
+        .await
+    }
+
+    pub(crate) async fn consensus_managed_provider_recovery_jobs(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        worker_digest: [u8; 32],
+    ) -> Result<Vec<([u8; crate::FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES], u8)>, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::managed_provider_recovery_jobs_sync(conn, identity, worker_digest)
+        })
+        .await
+    }
+
     /// Report whether the durable V2 ledger layout has already been activated.
     ///
     /// This survives replication-authority changes even though the exact-scope

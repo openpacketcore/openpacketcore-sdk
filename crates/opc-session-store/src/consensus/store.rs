@@ -77,7 +77,8 @@ use crate::fenced_mutation_roster::{
     FencedMutationRosterMemberAttestationVerifier, FencedMutationRosterMemberExecutionContext,
     FencedMutationRosterMemberExecutionError, FencedMutationRosterMemberProof,
     FencedMutationRosterMemberProvider, FencedMutationRosterOrdinal, FencedMutationRosterOutcome,
-    FencedMutationRosterPhase, FencedMutationRosterStatus, FencedMutationRosterTerminal,
+    FencedMutationRosterPhase, FencedMutationRosterProtectedPlan, FencedMutationRosterRequestId,
+    FencedMutationRosterStatus, FencedMutationRosterTerminal,
     FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES, FENCED_MUTATION_ROSTER_SCHEMA_V2,
     FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
 };
@@ -93,6 +94,11 @@ use crate::fenced_transition::{
     FENCED_TRANSITION_V2_MIN_DURABLE_LOG_ENTRY_BYTES,
 };
 use crate::lease::{LeaseGuard, SessionLeaseManager};
+use crate::managed_provider_job::{
+    ManagedProviderJobAuthority, ManagedProviderJobEffectStart, ManagedProviderJobId,
+    ManagedProviderJobMemberPhase, ManagedProviderJobMode, ManagedProviderJobStatus,
+    ManagedProviderJobStore, ManagedProviderJobVerifiedReceipt,
+};
 use crate::model::{OwnerId, SessionKey};
 use crate::readiness::{
     DurableReadinessReport, DurableReadinessState, DurableRecoveryProgress, DurableRecoveryState,
@@ -835,7 +841,339 @@ impl fmt::Debug for ConsensusSessionStore {
     }
 }
 
+fn managed_provider_status(mode: u8, phase: u8) -> Result<ManagedProviderJobStatus, StoreError> {
+    let mode = match mode {
+        0 => ManagedProviderJobMode::Unselected,
+        1 => ManagedProviderJobMode::FrozenV4Terminal,
+        3 if phase == 4 => ManagedProviderJobMode::ManagedV5,
+        3 => ManagedProviderJobMode::FrozenV4Terminal,
+        2 => ManagedProviderJobMode::ManagedV5,
+        _ => return Err(consensus_unavailable()),
+    };
+    let phase = match phase {
+        0 => ManagedProviderJobMemberPhase::Ready,
+        1 => ManagedProviderJobMemberPhase::EffectStarted,
+        2 => ManagedProviderJobMemberPhase::Verified,
+        3 => ManagedProviderJobMemberPhase::ReconciliationRequired,
+        4 => ManagedProviderJobMemberPhase::Established,
+        5 => ManagedProviderJobMemberPhase::Aborted,
+        _ => return Err(consensus_unavailable()),
+    };
+    Ok(ManagedProviderJobStatus::new(mode, phase))
+}
+
+#[async_trait]
+impl ManagedProviderJobStore for ConsensusSessionStore {
+    type Error = StoreError;
+
+    async fn ensure_job(
+        &self,
+        admission: &FencedMutationRosterAdmission,
+        checkpoint: &[u8],
+        authority: ManagedProviderJobAuthority,
+    ) -> Result<ManagedProviderJobStatus, Self::Error> {
+        admission
+            .validate()
+            .map_err(|_| StoreError::InvalidKey("managed_provider_admission_invalid".into()))?;
+        let checkpoint =
+            FencedMutationRosterProtectedPlan::new(checkpoint.to_vec().into_boxed_slice())
+                .map_err(|_| {
+                    StoreError::InvalidKey("managed_provider_checkpoint_invalid".into())
+                })?;
+        let scope = authority.scope();
+        if scope.consensus_identity() != self.current_scope()?.0 {
+            return Err(StoreError::TopologyAuthorityRevoked);
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.consumer_fenced_mutation_roster_admit(scope, admission.clone(), deadline)
+            .await?;
+        let response = self
+            .submit_request_before(
+                SessionConsensusRequestId::new(),
+                SessionMutationIntent::EnsureManagedProviderJob {
+                    admission: Box::new(admission.clone()),
+                    protected_checkpoint: checkpoint,
+                    worker_digest: authority.worker_identity_commitment(),
+                    verifier_digest: authority.verifier_identity_commitment(),
+                },
+                Some(scope.consensus_identity()),
+                deadline,
+            )
+            .await?;
+        match response.result? {
+            SessionMutationOutcome::ManagedProviderJob(outcome) => {
+                managed_provider_status(outcome.mode, outcome.phase)
+            }
+            _ => Err(consensus_unavailable()),
+        }
+    }
+
+    async fn job_status(
+        &self,
+        id: ManagedProviderJobId,
+        authority: ManagedProviderJobAuthority,
+    ) -> Result<ManagedProviderJobStatus, Self::Error> {
+        let scope = authority.scope();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.logical_read_time_before(Some(scope.consensus_identity()), deadline)
+            .await?;
+        let (mode, phase) = self
+            .inner
+            .backend
+            .consensus_managed_provider_job_status(
+                self.inner.storage_identity,
+                id.roster().to_bytes(),
+                id.ordinal().get(),
+                authority.worker_identity_commitment(),
+            )
+            .await?;
+        managed_provider_status(mode, phase)
+    }
+
+    async fn mark_member_effect_started(
+        &self,
+        id: ManagedProviderJobId,
+        authority: ManagedProviderJobAuthority,
+    ) -> Result<ManagedProviderJobEffectStart, Self::Error> {
+        let scope = authority.scope();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        let admission = self
+            .managed_provider_admission(id.roster(), scope, deadline)
+            .await?;
+        let response = self
+            .submit_request_before(
+                SessionConsensusRequestId::new(),
+                SessionMutationIntent::StartManagedProviderMember {
+                    admission: Box::new(admission),
+                    ordinal: id.ordinal().get(),
+                    worker_digest: authority.worker_identity_commitment(),
+                },
+                Some(scope.consensus_identity()),
+                deadline,
+            )
+            .await?;
+        match response.result? {
+            SessionMutationOutcome::ManagedProviderJob(outcome) if outcome.execute => {
+                Ok(ManagedProviderJobEffectStart::Execute)
+            }
+            SessionMutationOutcome::ManagedProviderJob(outcome) => {
+                Ok(ManagedProviderJobEffectStart::Existing(
+                    managed_provider_status(outcome.mode, outcome.phase)?,
+                ))
+            }
+            _ => Err(consensus_unavailable()),
+        }
+    }
+
+    async fn record_verified_attestation(
+        &self,
+        id: ManagedProviderJobId,
+        receipt: ManagedProviderJobVerifiedReceipt,
+        authority: ManagedProviderJobAuthority,
+    ) -> Result<ManagedProviderJobStatus, Self::Error> {
+        let scope = authority.scope();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        let admission = self
+            .managed_provider_admission(id.roster(), scope, deadline)
+            .await?;
+        let response = self
+            .submit_request_before(
+                SessionConsensusRequestId::new(),
+                SessionMutationIntent::RecordManagedProviderReceipt {
+                    admission: Box::new(admission),
+                    ordinal: id.ordinal().get(),
+                    worker_digest: authority.worker_identity_commitment(),
+                    verifier_digest: authority.verifier_identity_commitment(),
+                    receipt_digest: receipt.digest(),
+                    outcome: receipt.outcome() as u8,
+                },
+                Some(scope.consensus_identity()),
+                deadline,
+            )
+            .await?;
+        match response.result? {
+            SessionMutationOutcome::ManagedProviderJob(outcome) => {
+                managed_provider_status(outcome.mode, outcome.phase)
+            }
+            _ => Err(consensus_unavailable()),
+        }
+    }
+
+    async fn finalize_job(
+        &self,
+        admission: &FencedMutationRosterAdmission,
+        authority: ManagedProviderJobAuthority,
+    ) -> Result<ManagedProviderJobStatus, Self::Error> {
+        let scope = authority.scope();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        let response = self
+            .submit_request_before(
+                SessionConsensusRequestId::new(),
+                SessionMutationIntent::FinalizeManagedProviderJob {
+                    admission: Box::new(admission.clone()),
+                    worker_digest: authority.worker_identity_commitment(),
+                },
+                Some(scope.consensus_identity()),
+                deadline,
+            )
+            .await?;
+        match response.result? {
+            SessionMutationOutcome::ManagedProviderJob(outcome) => {
+                managed_provider_status(outcome.mode, outcome.phase)
+            }
+            _ => Err(consensus_unavailable()),
+        }
+    }
+
+    async fn recover_owned_jobs(
+        &self,
+        authority: ManagedProviderJobAuthority,
+    ) -> Result<Box<[ManagedProviderJobId]>, Self::Error> {
+        let scope = authority.scope();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.logical_read_time_before(Some(scope.consensus_identity()), deadline)
+            .await?;
+        self.inner
+            .backend
+            .consensus_managed_provider_recovery_jobs(
+                self.inner.storage_identity,
+                authority.worker_identity_commitment(),
+            )
+            .await?
+            .into_iter()
+            .map(|(request_id, ordinal)| {
+                let roster = crate::decode_fenced_mutation_roster_identity(&request_id)
+                    .map_err(|_| consensus_unavailable())?;
+                let ordinal = FencedMutationRosterOrdinal::new(ordinal)
+                    .map_err(|_| consensus_unavailable())?;
+                Ok(ManagedProviderJobId::for_member(roster, ordinal))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()
+            .map(Vec::into_boxed_slice)
+    }
+
+    async fn abort_not_applied(
+        &self,
+        id: ManagedProviderJobId,
+        authority: ManagedProviderJobAuthority,
+    ) -> Result<ManagedProviderJobStatus, Self::Error> {
+        let scope = authority.scope();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        let admission = self
+            .managed_provider_admission(id.roster(), scope, deadline)
+            .await?;
+        let response = self
+            .submit_request_before(
+                SessionConsensusRequestId::new(),
+                SessionMutationIntent::AbortManagedProviderNotApplied {
+                    admission: Box::new(admission),
+                    ordinal: id.ordinal().get(),
+                    worker_digest: authority.worker_identity_commitment(),
+                },
+                Some(scope.consensus_identity()),
+                deadline,
+            )
+            .await?;
+        match response.result? {
+            SessionMutationOutcome::ManagedProviderJob(outcome) => {
+                managed_provider_status(outcome.mode, outcome.phase)
+            }
+            _ => Err(consensus_unavailable()),
+        }
+    }
+
+    async fn require_reconciliation(
+        &self,
+        id: ManagedProviderJobId,
+        authority: ManagedProviderJobAuthority,
+    ) -> Result<ManagedProviderJobStatus, Self::Error> {
+        let scope = authority.scope();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        let admission = self
+            .managed_provider_admission(id.roster(), scope, deadline)
+            .await?;
+        let response = self
+            .submit_request_before(
+                SessionConsensusRequestId::new(),
+                SessionMutationIntent::RequireManagedProviderReconciliation {
+                    admission: Box::new(admission),
+                    ordinal: id.ordinal().get(),
+                    worker_digest: authority.worker_identity_commitment(),
+                },
+                Some(scope.consensus_identity()),
+                deadline,
+            )
+            .await?;
+        match response.result? {
+            SessionMutationOutcome::ManagedProviderJob(outcome) => {
+                managed_provider_status(outcome.mode, outcome.phase)
+            }
+            _ => Err(consensus_unavailable()),
+        }
+    }
+}
+
 impl ConsensusSessionStore {
+    /// Mint the opaque managed-job authority only at authenticated server
+    /// composition.  The worker and verifier commitments are never sourced
+    /// from a managed request body.
+    #[doc(hidden)]
+    #[allow(dead_code)] // consumed by the crate-private authenticated server composition.
+    pub(crate) fn managed_provider_job_authority(
+        scope: SessionConsumerScope,
+        worker_identity_commitment: [u8; 32],
+        verifier_identity_commitment: [u8; 32],
+    ) -> Result<ManagedProviderJobAuthority, StoreError> {
+        if worker_identity_commitment == [0; 32] || verifier_identity_commitment == [0; 32] {
+            return Err(StoreError::InvalidKey(
+                "managed_provider_authority_invalid".into(),
+            ));
+        }
+        Ok(ManagedProviderJobAuthority::from_authenticated_scope(
+            scope,
+            worker_identity_commitment,
+            verifier_identity_commitment,
+        ))
+    }
+
+    async fn managed_provider_admission(
+        &self,
+        request_id: FencedMutationRosterRequestId,
+        scope: SessionConsumerScope,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedMutationRosterAdmission, StoreError> {
+        self.logical_read_time_before(Some(scope.consensus_identity()), deadline)
+            .await?;
+        let admission = self
+            .inner
+            .backend
+            .consensus_managed_provider_admission(
+                self.inner.storage_identity,
+                request_id.to_bytes(),
+            )
+            .await?;
+        if scope.consensus_identity() != self.current_scope()?.0 {
+            return Err(StoreError::TopologyAuthorityRevoked);
+        }
+        Ok(admission)
+    }
+
     fn require_dynamic_consensus_platform() -> Result<(), ConsensusSessionStoreOpenError> {
         if cfg!(target_os = "linux") {
             Ok(())
@@ -3563,6 +3901,12 @@ impl ConsensusSessionStore {
             &request.intent,
             SessionMutationIntent::AdmitFencedMutationRoster { .. }
                 | SessionMutationIntent::ReserveFencedMutationRosterV4VerifierDispatch { .. }
+                | SessionMutationIntent::EnsureManagedProviderJob { .. }
+                | SessionMutationIntent::StartManagedProviderMember { .. }
+                | SessionMutationIntent::RecordManagedProviderReceipt { .. }
+                | SessionMutationIntent::RequireManagedProviderReconciliation { .. }
+                | SessionMutationIntent::AbortManagedProviderNotApplied { .. }
+                | SessionMutationIntent::FinalizeManagedProviderJob { .. }
         ) {
             match self
                 .require_fenced_mutation_roster_capability_before(deadline)
@@ -5299,7 +5643,13 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
         ),
         SessionMutationIntent::AdmitFencedMutationRoster { .. }
         | SessionMutationIntent::TerminalizeFencedMutationRoster { .. }
-        | SessionMutationIntent::ReserveFencedMutationRosterV4VerifierDispatch { .. } => matches!(
+        | SessionMutationIntent::ReserveFencedMutationRosterV4VerifierDispatch { .. }
+        | SessionMutationIntent::EnsureManagedProviderJob { .. }
+        | SessionMutationIntent::StartManagedProviderMember { .. }
+        | SessionMutationIntent::RecordManagedProviderReceipt { .. }
+        | SessionMutationIntent::RequireManagedProviderReconciliation { .. }
+        | SessionMutationIntent::AbortManagedProviderNotApplied { .. }
+        | SessionMutationIntent::FinalizeManagedProviderJob { .. } => matches!(
             error,
             StoreError::InvalidKey(_) | StoreError::StaleFence | StoreError::NotFound
         ),
