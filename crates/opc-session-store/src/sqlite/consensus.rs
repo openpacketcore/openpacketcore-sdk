@@ -2088,12 +2088,6 @@ pub(crate) fn read_storage_identity_sync(
     ) {
         return Err(SessionConsensusStorageError::SchemaVersionMismatch);
     }
-    if schema == FENCED_MUTATION_ROSTER_DATABASE_FORMAT
-        && !table_exists(conn, "consensus_fenced_mutation_roster_operations")
-            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
-    {
-        return Err(SessionConsensusStorageError::SchemaVersionMismatch);
-    }
     let cluster: [u8; 32] = cluster
         .try_into()
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
@@ -18852,7 +18846,7 @@ mod tests {
 
         conn.execute(
             "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1",
-            [FENCED_TRANSITION_V2_DATABASE_FORMAT + 1],
+            [FENCED_MUTATION_ROSTER_DATABASE_FORMAT + 1],
         )
         .expect("inject unknown successor format");
         assert_eq!(
