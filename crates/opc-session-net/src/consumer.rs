@@ -1200,6 +1200,7 @@ struct PersistentFencedMutationRosterPool {
     client: StatelessSessionConsumerClient,
     config: PersistentFencedMutationRosterConfig,
     pending: Arc<Semaphore>,
+    request_bytes: Arc<Semaphore>,
     response_cells: Arc<Semaphore>,
     terminal_adoption: Arc<Semaphore>,
     scheduler: StdMutex<Option<mpsc::Sender<FencedMutationRosterSchedulerCommand>>>,
@@ -1262,6 +1263,7 @@ impl PersistentFencedMutationRosterClient {
                 client,
                 config,
                 pending: Arc::new(Semaphore::new(config.pending_calls)),
+                request_bytes: Arc::new(Semaphore::new(config.request_bytes)),
                 response_cells: Arc::new(Semaphore::new(config.response_cells)),
                 terminal_adoption: Arc::new(Semaphore::new(config.terminal_adoption_entries)),
                 scheduler: StdMutex::new(None),
@@ -1383,6 +1385,19 @@ impl PersistentFencedMutationRosterClient {
                 cause: SessionConsumerClientError::Overloaded,
             });
         }
+        let request_bytes_permits = u32::try_from(request_bytes).map_err(|_| {
+            PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Overloaded,
+            }
+        })?;
+        let request_byte_permit = Arc::clone(&self.pool.request_bytes)
+            .try_acquire_many_owned(request_bytes_permits)
+            .map_err(|_| {
+                counter_increment(&self.pool.counters.overload);
+                PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Overloaded,
+                }
+            })?;
         let pending = Arc::clone(&self.pool.pending)
             .try_acquire_owned()
             .map_err(|_| {
@@ -1427,6 +1442,7 @@ impl PersistentFencedMutationRosterClient {
             reply,
             inflight: false,
             _pending: pending,
+            _request_bytes: request_byte_permit,
             _response_cell: response_cell,
             _terminal_adoption: terminal_adoption,
         };
@@ -1558,6 +1574,7 @@ struct FencedMutationRosterJob {
     reply: oneshot::Sender<FencedMutationRosterReply>,
     inflight: bool,
     _pending: OwnedSemaphorePermit,
+    _request_bytes: OwnedSemaphorePermit,
     _response_cell: OwnedSemaphorePermit,
     _terminal_adoption: Option<OwnedSemaphorePermit>,
 }
@@ -1826,10 +1843,11 @@ fn dispatch_fenced_mutation_roster_jobs(
     idle: &mut VecDeque<usize>,
     workers: &[mpsc::Sender<FencedMutationRosterJob>],
 ) {
-    while let (Some(lane), Some(job)) = (
-        idle.pop_front(),
-        pop_fenced_mutation_roster_fair(queues, round_robin),
-    ) {
+    while let Some(lane) = idle.pop_front() {
+        let Some(job) = pop_fenced_mutation_roster_fair(queues, round_robin) else {
+            idle.push_front(lane);
+            break;
+        };
         match workers[lane].try_send(job) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(job)) => {
@@ -1878,6 +1896,7 @@ async fn fenced_mutation_roster_lane_worker(
     events: mpsc::Sender<FencedMutationRosterWorkerEvent>,
 ) {
     let mut was_connected = false;
+    let mut recovery = FencedMutationRosterSetupRecovery::default();
     'reconnect: loop {
         if PersistentFencedMutationRosterPoolPhase::load(&pool.phase)
             == PersistentFencedMutationRosterPoolPhase::Forced
@@ -1887,6 +1906,7 @@ async fn fenced_mutation_roster_lane_worker(
         let connection = connect_fenced_mutation_roster_lane(&pool).await;
         let mut connection = match connection {
             Ok(connection) => {
+                recovery.reset();
                 if events
                     .send(FencedMutationRosterWorkerEvent::Ready(lane))
                     .await
@@ -1905,9 +1925,13 @@ async fn fenced_mutation_roster_lane_worker(
                     was_connected = false;
                 }
                 counter_increment(&pool.counters.retries);
-                tokio::select! {
-                    _ = pool.force_notify.notified() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                if let Some(cooldown) =
+                    recovery.cooldown_after_failure(pool.config.retries, pool.config.setup_timeout)
+                {
+                    tokio::select! {
+                        _ = pool.force_notify.notified() => break,
+                        _ = tokio::time::sleep(cooldown) => {}
+                    }
                 }
                 continue;
             }
@@ -1933,18 +1957,22 @@ async fn fenced_mutation_roster_lane_worker(
             // Retain the job-owned request unchanged for the completion
             // boundary; the in-flight future owns this snapshot only.
             let request = job.request.clone();
-            let operation =
-                execute_fenced_mutation_roster_on_lane(&pool, &mut connection, &request, &progress);
-            tokio::pin!(operation);
-            let forced = pool.force_notify.notified();
-            tokio::pin!(forced);
-            forced.as_mut().enable();
-            let result = tokio::select! {
-                result = &mut operation => result,
-                _ = &mut forced => Err(roster_interrupted_call_error(&progress, SessionConsumerClientError::ShuttingDown)),
+            let result = {
+                let operation = execute_fenced_mutation_roster_on_lane(
+                    &pool,
+                    &mut connection,
+                    &request,
+                    &progress,
+                );
+                tokio::pin!(operation);
+                let forced = pool.force_notify.notified();
+                tokio::pin!(forced);
+                forced.as_mut().enable();
+                tokio::select! {
+                    result = &mut operation => result,
+                    _ = &mut forced => Err(roster_interrupted_call_error(&progress, SessionConsumerClientError::ShuttingDown)),
+                }
             };
-            drop(operation);
-            drop(forced);
             let keep_connection = result.is_ok()
                 && PersistentFencedMutationRosterPoolPhase::load(&pool.phase)
                     != PersistentFencedMutationRosterPoolPhase::Forced;
@@ -1974,6 +2002,13 @@ async fn fenced_mutation_roster_lane_worker(
                 was_connected = false;
                 continue 'reconnect;
             }
+            if connection.calls >= pool.config.connection_call_count {
+                let _ = events
+                    .send(FencedMutationRosterWorkerEvent::Lost(lane))
+                    .await;
+                was_connected = false;
+                continue 'reconnect;
+            }
             if events
                 .send(FencedMutationRosterWorkerEvent::Idle(lane))
                 .await
@@ -1987,6 +2022,31 @@ async fn fenced_mutation_roster_lane_worker(
         let _ = events
             .send(FencedMutationRosterWorkerEvent::Lost(lane))
             .await;
+    }
+}
+
+#[derive(Default)]
+struct FencedMutationRosterSetupRecovery {
+    immediate_retries: usize,
+}
+
+impl FencedMutationRosterSetupRecovery {
+    fn cooldown_after_failure(
+        &mut self,
+        retries: usize,
+        setup_timeout: Duration,
+    ) -> Option<Duration> {
+        if self.immediate_retries < retries {
+            self.immediate_retries += 1;
+            None
+        } else {
+            self.immediate_retries = 0;
+            Some(setup_timeout)
+        }
+    }
+
+    fn reset(&mut self) {
+        self.immediate_retries = 0;
     }
 }
 
@@ -2258,6 +2318,10 @@ async fn connect_fenced_mutation_roster_lane(
         counter_increment(&pool.counters.profile_mismatch);
         return Err(SessionConsumerClientError::Protocol);
     }
+    // The mandatory capability probe proves the lane's fixed profile before
+    // it can carry application work; it does not consume the application-call
+    // budget that triggers planned replacement.
+    connection.calls = 0;
     Ok(connection)
 }
 
@@ -4483,6 +4547,7 @@ fn consumer_client_tls_config_for_alpn(
     Arc::new(config)
 }
 
+#[cfg(test)]
 fn consumer_server_tls_config(config: Arc<opc_tls::ServerConfig>) -> Arc<opc_tls::ServerConfig> {
     consumer_server_tls_config_with_v3(config, false)
 }
@@ -11723,6 +11788,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::io;
     use std::num::NonZeroU32;
     use std::pin::Pin;
@@ -11752,8 +11818,11 @@ mod tests {
         ConsumerServerSetupTestHooks, ConsumerSessionResponseWire, ConsumerSetupPhase,
         ConsumerSetupPhaseAttempt, ConsumerV2Call, ConsumerV2WireRequest, ConsumerWatchTerminal,
         ConsumerWatchTerminalSlot, ConsumerWireRequest, ConsumerWireResponse,
+        FencedMutationRosterServicePort, FencedMutationRosterTenant,
         PersistentCheckedOutConnection, PersistentConsumerCounters, PersistentConsumerIoBarrier,
         PersistentConsumerShutdownReader, PersistentConsumerShutdownWriter,
+        PersistentFencedMutationRosterClient, PersistentFencedMutationRosterConfig,
+        PersistentFencedMutationRosterExecuteError, PersistentFencedMutationRosterPoolPhase,
         PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
         PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
         PersistentSetupAttempt, PersistentShutdownPhase, PersistentWatchRecovery,
@@ -11781,27 +11850,29 @@ mod tests {
     use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
     use opc_session_store::{
         checked_session_deadline, BackendCapabilities, CompareAndSet, CompareAndSetResult,
-        EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedTransitionExecuteError,
-        FencedTransitionLease, FencedTransitionMutation, FencedTransitionObservation,
-        FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
-        FencedTransitionStatus, FencedTransitionV2CallerNonce, FencedTransitionV2Capability,
-        FencedTransitionV2HistoryEpoch, Generation, LeaseGuard, OwnerId, PreparedFencedTransition,
-        RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, SessionBackend,
-        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
-        SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
-        SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-        SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-        SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
-        SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation,
-        SessionConsumerV2Request, SessionConsumerV2Response, SessionKey, SessionKeyType,
-        SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
-        MAX_SESSION_TTL,
+        EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedMutationRosterCapability,
+        FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,
+        FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
+        FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
+        FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, Generation, LeaseGuard,
+        OwnerId, PreparedFencedTransition, RestoreScanCursorProfile, RestoreScanPage,
+        RestoreScanRequest, SessionBackend, SessionConsensusClusterId,
+        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+        SessionConsensusIdentity, SessionConsumerBatchResult,
+        SessionConsumerFencedMutationRosterProfile, SessionConsumerFencedTransitionError,
+        SessionConsumerFencedTransitionStatus, SessionConsumerLeaseError, SessionConsumerOperation,
+        SessionConsumerOutcomeUnknown, SessionConsumerRequest, SessionConsumerRequestId,
+        SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+        SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
+        SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
+        SessionConsumerV3Operation, SessionConsumerV3Request, SessionConsumerV3Response,
+        SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType,
+        StoreError, StoredSessionRecord, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-    use tokio::sync::{mpsc, watch, Notify, Semaphore};
+    use tokio::sync::{mpsc, oneshot, watch, Notify, Semaphore};
 
     use crate::consensus::RemoteAddrResolver;
     use crate::error::ProtocolError;
@@ -11867,6 +11938,56 @@ mod tests {
 
     struct V2CountingRejectingTestConsumer {
         v2_calls: Arc<AtomicUsize>,
+    }
+
+    struct V3CountingRosterTestConsumer {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionQuorumConsumer for V3CountingRosterTestConsumer {
+        async fn execute(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _request: SessionConsumerRequest,
+        ) -> SessionConsumerResponse {
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+        }
+
+        fn fenced_mutation_roster_profile(
+            &self,
+        ) -> Option<SessionConsumerFencedMutationRosterProfile> {
+            Some(SessionConsumerFencedMutationRosterProfile::v1())
+        }
+
+        async fn execute_v3(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            request: SessionConsumerV3Request,
+        ) -> SessionConsumerV3Response {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match request.operation() {
+                SessionConsumerV3Operation::FencedMutationRosterCapability => {
+                    SessionConsumerV3Response::FencedMutationRosterCapability(Ok((
+                        FencedMutationRosterCapability::V1,
+                        SessionConsumerFencedMutationRosterProfile::v1(),
+                    )))
+                }
+                _ => SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unavailable),
+            }
+        }
+
+        async fn watch(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _scope: SessionConsumerScope,
+            _start_sequence: u64,
+        ) -> Result<
+            BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+            SessionConsumerRejection,
+        > {
+            Err(SessionConsumerRejection::Unavailable)
+        }
     }
 
     #[async_trait::async_trait]
@@ -12869,6 +12990,395 @@ mod tests {
         )
         .with_reauthentication_control(control);
         (client, material)
+    }
+
+    #[tokio::test]
+    async fn fenced_mutation_roster_request_bytes_are_an_aggregate_admission_bound() {
+        let request = SessionConsumerV3Request::new(
+            scope(),
+            SessionConsumerV3Operation::FencedMutationRosterCapability,
+        );
+        let request_bytes = serde_json::to_vec(&request)
+            .expect("closed roster capability request encodes")
+            .len();
+        let mut config = PersistentFencedMutationRosterConfig::default();
+        config.lane_workers = 1;
+        config.request_bytes = request_bytes;
+        let control = SessionReauthenticationControl::new();
+        let (stateless, _material) = stateless_test_client(control);
+        let client = PersistentFencedMutationRosterClient::try_from_stateless(stateless, config)
+            .expect("bounded roster configuration");
+        let (sender, mut receiver) = mpsc::channel(2);
+        *client
+            .pool
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
+        client.pool.ready.store(true, Ordering::Release);
+
+        let first = tokio::spawn({
+            let client = client.clone();
+            let request = request.clone();
+            async move {
+                client
+                    .execute(
+                        FencedMutationRosterTenant::new([1; 16]).expect("nonzero opaque tenant"),
+                        request,
+                    )
+                    .await
+            }
+        });
+        let Some(super::FencedMutationRosterSchedulerCommand::Submit(job)) = receiver.recv().await
+        else {
+            panic!("first request is retained as a scheduler submission");
+        };
+        assert_eq!(
+            client.diagnostics().request_bytes,
+            u64::try_from(request_bytes).expect("test request length fits diagnostics")
+        );
+
+        let second = client.execute(
+            FencedMutationRosterTenant::new([2; 16]).expect("nonzero opaque tenant"),
+            request,
+        );
+        tokio::pin!(second);
+        let second = std::future::poll_fn(|context| match second.as_mut().poll(context) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => panic!("aggregate request-byte exhaustion must fail immediately"),
+        })
+        .await;
+        assert_eq!(
+            second,
+            Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Overloaded,
+            })
+        );
+
+        job.complete(
+            Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Unavailable,
+            }),
+            0,
+            &client.pool,
+        );
+        assert_eq!(
+            first.await.expect("join retained request"),
+            Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Unavailable,
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fenced_mutation_roster_setup_retries_are_cooldown_bounded() {
+        let control = SessionReauthenticationControl::new();
+        let (mut stateless, _material) = stateless_test_client(control);
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        stateless.resolve = Arc::new({
+            let resolutions = Arc::clone(&resolutions);
+            move || {
+                let resolutions = Arc::clone(&resolutions);
+                Box::pin(async move {
+                    resolutions.fetch_add(1, Ordering::SeqCst);
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "test outage",
+                    ))
+                })
+            }
+        });
+        let mut config = PersistentFencedMutationRosterConfig::default();
+        config.lane_workers = 1;
+        config.retries = 1;
+        config.setup_timeout = Duration::from_millis(100);
+        let client = PersistentFencedMutationRosterClient::try_from_stateless(stateless, config)
+            .expect("bounded roster configuration");
+        client
+            .pool
+            .ensure_started()
+            .expect("start fixed roster worker");
+
+        for _ in 0..32 {
+            if resolutions.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            2,
+            "one configured immediate retry follows the initial failed setup"
+        );
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_millis(20)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                resolutions.load(Ordering::SeqCst),
+                2,
+                "exhausted retries wait for one full setup-timeout cooldown"
+            );
+        }
+        tokio::time::advance(Duration::from_millis(20)).await;
+        for _ in 0..32 {
+            if resolutions.load(Ordering::SeqCst) == 4 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            4,
+            "the cooldown reset permits only the next bounded initial-plus-retry group"
+        );
+        assert!(matches!(
+            PersistentFencedMutationRosterPoolPhase::load(&client.pool.phase),
+            PersistentFencedMutationRosterPoolPhase::Running
+        ));
+        let mut recovery = super::FencedMutationRosterSetupRecovery::default();
+        assert_eq!(
+            recovery.cooldown_after_failure(1, Duration::from_millis(100)),
+            None
+        );
+        assert_eq!(
+            recovery.cooldown_after_failure(1, Duration::from_millis(100)),
+            Some(Duration::from_millis(100))
+        );
+        recovery.reset();
+        assert_eq!(
+            recovery.cooldown_after_failure(1, Duration::from_millis(100)),
+            None,
+            "a successful setup clears exhausted retry state"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fenced_mutation_roster_scheduler_retains_busy_lane_work_and_dispatches_fairly() {
+        let control = SessionReauthenticationControl::new();
+        let (stateless, _material) = stateless_test_client(control);
+        let client = PersistentFencedMutationRosterClient::try_from_stateless(
+            stateless,
+            PersistentFencedMutationRosterConfig::default(),
+        )
+        .expect("bounded roster configuration");
+        let request = SessionConsumerV3Request::new(
+            scope(),
+            SessionConsumerV3Operation::FencedMutationRosterCapability,
+        );
+        let request_bytes = serde_json::to_vec(&request)
+            .expect("closed roster capability request encodes")
+            .len();
+        let tenant_a = FencedMutationRosterTenant::new([3; 16]).expect("nonzero opaque tenant");
+        let tenant_b = FencedMutationRosterTenant::new([4; 16]).expect("nonzero opaque tenant");
+        let make_job = |tenant| {
+            let (reply, response) = oneshot::channel();
+            let request_byte_permit = Arc::clone(&client.pool.request_bytes)
+                .try_acquire_many_owned(
+                    u32::try_from(request_bytes).expect("test request byte count fits permits"),
+                )
+                .expect("aggregate request byte capacity");
+            (
+                super::FencedMutationRosterJob {
+                    tenant,
+                    request: request.clone(),
+                    request_bytes,
+                    enqueued_at: tokio::time::Instant::now(),
+                    reply,
+                    inflight: false,
+                    _pending: Arc::clone(&client.pool.pending)
+                        .try_acquire_owned()
+                        .expect("pending capacity"),
+                    _request_bytes: request_byte_permit,
+                    _response_cell: Arc::clone(&client.pool.response_cells)
+                        .try_acquire_owned()
+                        .expect("response cell capacity"),
+                    _terminal_adoption: None,
+                },
+                response,
+            )
+        };
+        let (job_a, reply_a) = make_job(tenant_a);
+        let (job_b, reply_b) = make_job(tenant_b);
+        client.pool.counters.queued.store(2, Ordering::Relaxed);
+        client
+            .pool
+            .counters
+            .response_cells
+            .store(2, Ordering::Relaxed);
+        client.pool.counters.request_bytes.store(
+            u64::try_from(request_bytes.saturating_mul(2))
+                .expect("test aggregate request bytes fit diagnostics"),
+            Ordering::Relaxed,
+        );
+        let mut queues = std::collections::BTreeMap::from([
+            (tenant_a, std::collections::VecDeque::from([job_a])),
+            (tenant_b, std::collections::VecDeque::from([job_b])),
+        ]);
+        let mut round_robin = std::collections::VecDeque::from([tenant_a, tenant_b]);
+        let mut idle = std::collections::VecDeque::new();
+        let (worker, mut worker_rx) = mpsc::channel(1);
+        let workers = [worker];
+
+        super::dispatch_fenced_mutation_roster_jobs(
+            &client.pool,
+            &mut queues,
+            &mut round_robin,
+            &mut idle,
+            &workers,
+        );
+        assert_eq!(
+            queues.get(&tenant_a).map(std::collections::VecDeque::len),
+            Some(1)
+        );
+        assert_eq!(
+            queues.get(&tenant_b).map(std::collections::VecDeque::len),
+            Some(1)
+        );
+
+        idle.push_back(0);
+        super::dispatch_fenced_mutation_roster_jobs(
+            &client.pool,
+            &mut queues,
+            &mut round_robin,
+            &mut idle,
+            &workers,
+        );
+        let first = worker_rx.recv().await.expect("first queued job dispatches");
+        assert_eq!(first.tenant, tenant_a, "FIFO starts with the first tenant");
+        first.complete(
+            Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Unavailable,
+            }),
+            0,
+            &client.pool,
+        );
+        assert!(matches!(
+            reply_a.await,
+            Ok(super::FencedMutationRosterReply {
+                result: Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Unavailable,
+                }),
+                ..
+            })
+        ));
+
+        idle.push_back(0);
+        super::dispatch_fenced_mutation_roster_jobs(
+            &client.pool,
+            &mut queues,
+            &mut round_robin,
+            &mut idle,
+            &workers,
+        );
+        let second = worker_rx
+            .recv()
+            .await
+            .expect("second queued job dispatches");
+        assert_eq!(
+            second.tenant, tenant_b,
+            "round robin progresses to the next tenant"
+        );
+        second.complete(
+            Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Unavailable,
+            }),
+            0,
+            &client.pool,
+        );
+        assert!(reply_b.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn fenced_mutation_roster_replaces_capped_lanes_without_sacrificing_callers() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("roster-replacement-client");
+        let server_identity = material_spiffe("roster-replacement-server");
+        let client_material = RotatableClientMaterial::new(client_identity.as_str());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service: Arc<dyn SessionQuorumConsumer> = Arc::new(V3CountingRosterTestConsumer {
+            calls: Arc::clone(&calls),
+        });
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity.clone()],
+            std::iter::empty(),
+        )
+        .expect("roster test authorizer");
+        let roster_port = FencedMutationRosterServicePort::new(Arc::clone(&service))
+            .expect("exact roster service profile");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            service,
+            client_material.trusted_server_config(server_identity.as_str()),
+            authorizer,
+        )
+        .with_fenced_mutation_roster_service(roster_port)
+        .with_max_connections(1)
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for roster replacement test");
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver: RemoteAddrResolver = Arc::new({
+            let resolutions = Arc::clone(&resolutions);
+            move || {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(address) })
+            }
+        });
+        let stateless = StatelessSessionConsumerClient::new_with_resolver(
+            resolver,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            server_identity,
+            scope(),
+            client_material.config(),
+        );
+        let mut config = PersistentFencedMutationRosterConfig::default();
+        config.lane_workers = 1;
+        config.connection_call_count = 1;
+        let client = PersistentFencedMutationRosterClient::try_from_stateless(stateless, config)
+            .expect("one-call roster lane configuration");
+        client.prewarm().await.expect("initial fixed lane setup");
+
+        for expected_setups in 2..=3 {
+            let expected = Ok(SessionConsumerV3Response::FencedMutationRosterCapability(
+                Ok((
+                    FencedMutationRosterCapability::V1,
+                    SessionConsumerFencedMutationRosterProfile::v1(),
+                )),
+            ));
+            assert_eq!(
+                client
+                    .execute(
+                        FencedMutationRosterTenant::new([expected_setups as u8; 16])
+                            .expect("nonzero opaque tenant"),
+                        SessionConsumerV3Request::new(
+                            scope(),
+                            SessionConsumerV3Operation::FencedMutationRosterCapability,
+                        ),
+                    )
+                    .await,
+                expected,
+                "a caller operation never pays the planned replacement boundary"
+            );
+            client
+                .prewarm()
+                .await
+                .expect("capped lane is proactively replaced before its next caller");
+            assert_eq!(
+                resolutions.load(Ordering::SeqCst),
+                expected_setups,
+                "only the initial setup and one deliberate replacement per completed caller resolve"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "two caller operations and exactly three bootstrap probes reached the service"
+        );
+        assert_eq!(client.diagnostics().not_transmitted, 0);
+        client.shutdown().await;
+        server.abort_and_wait().await;
     }
 
     fn synthetic_consumer_connection(
