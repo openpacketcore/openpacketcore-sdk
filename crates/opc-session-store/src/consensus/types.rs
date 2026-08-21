@@ -43,6 +43,9 @@ const COMMAND_V2_DIGEST_MAGIC: &[u8] = b"OPC-SC-V2-APPLIED\0";
 const COMMAND_ROSTER_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-mutation-roster/command/v1\0";
 const COMMAND_ROSTER_DIGEST_MAGIC: &[u8] = b"OPC-SC-FMR-APPLIED\0";
+const COMMAND_MANAGED_PROVIDER_V5_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/fenced-mutation-roster/managed-provider-v5/command/v1\0";
+const COMMAND_MANAGED_PROVIDER_V5_DIGEST_MAGIC: &[u8] = b"OPC-SC-FMR-MV5-APPLIED\0";
 const ROSTER_OUTER_REQUEST_ID_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-mutation-roster/outer-request-id/v1\0";
 const ROSTER_TERMINAL_OUTER_REQUEST_ID_DOMAIN: &[u8] =
@@ -111,6 +114,43 @@ pub const SESSION_CONSENSUS_FENCED_MUTATION_ROSTER_COMMAND_WIRE_SCHEMA_DESCRIPTO
     "roster-admit:21|roster-terminalize:22|roster-maintain:23;",
     "roster-admission=canonical-framed;roster-terminal=canonical-framed;checkpoint=len32+protected-bytes;",
     "roster-admit-certificate=scope:identity|voters:bytes32|profile:bytes32;authorized=origin:node-id|authority:identity|box(intent)"
+);
+/// Fixed applied-command digest encoding revision for managed-provider V5.
+///
+/// Managed-provider intents have their own digest domain and revision because
+/// their tags are not part of the published roster V2 applied-digest profile.
+pub const SESSION_CONSENSUS_MANAGED_PROVIDER_V5_APPLIED_DIGEST_ENCODING_VERSION: u16 = 1;
+/// Frozen managed-provider V5 applied-command digest input descriptor.
+pub const SESSION_CONSENSUS_MANAGED_PROVIDER_V5_APPLIED_DIGEST_SCHEMA_DESCRIPTOR: &str = concat!(
+    "domain=openpacketcore/session-consensus/fenced-mutation-roster/managed-provider-v5/command/v1\\0;",
+    "magic=OPC-SC-FMR-MV5-APPLIED\\0;revision:u16be=1;",
+    "prefix=sequence:u64be|previous-digest:bytes32|effective-time:timestamp;",
+    "command=schema:u16be|storage-identity:identity|outer-id:bytes16|logical-time:timestamp|intent;",
+    "timestamp=unix-secs:i64be|nanos:u32be;identity=cluster:bytes32|configuration:bytes32|epoch:u64be;",
+    "intent=ensure-managed-provider-job(tag=6,admission:request-id-frame,checkpoint:len32+bytes,worker:bytes32,verifier:bytes32)|",
+    "start-managed-provider-member(tag=7,admission:request-id-frame,ordinal:u8,worker:bytes32)|",
+    "record-managed-provider-receipt(tag=8,admission:request-id-frame,ordinal:u8,worker:bytes32,verifier:bytes32,receipt:bytes32,outcome:u8)|",
+    "require-managed-provider-reconciliation(tag=9,admission:request-id-frame,ordinal:u8,worker:bytes32)|",
+    "abort-managed-provider-not-applied(tag=10,admission:request-id-frame,ordinal:u8,worker:bytes32)|",
+    "finalize-managed-provider-job(tag=11,admission:request-id-frame,worker:bytes32)|",
+    "authorized(tag=3,origin:u64be,authority:identity,mutation:intent)"
+);
+/// Frozen Postcard command-wire revision for managed-provider V5.
+pub const SESSION_CONSENSUS_MANAGED_PROVIDER_V5_COMMAND_WIRE_ENCODING_VERSION: u16 = 2;
+/// Frozen managed-provider V5 command-wire descriptor.
+///
+/// Existing published enum discriminants remain unchanged. Managed V5 was
+/// appended after the roster maintenance command and may never be inserted
+/// into the prior roster sequence.
+pub const SESSION_CONSENSUS_MANAGED_PROVIDER_V5_COMMAND_WIRE_SCHEMA_DESCRIPTOR: &str = concat!(
+    "wire-profile=2;raft-rpc-codec=postcard;durable-log-codec=serde-json;",
+    "command-fields=schema-version,identity,request-id,logical-time,intent;",
+    "published-intent-discriminants=authorized:15|fenced-v1:16|activate-v1:17|fenced-v2:18|activate-v2:19|maintain-v2:20|",
+    "roster-admit:21|roster-terminalize:22|roster-v4-reserve:23|roster-maintain:24;",
+    "managed-v5-intent-discriminants=ensure-job:25|start-member:26|record-receipt:27|require-reconciliation:28|abort-not-applied:29|finalize-job:30;",
+    "postcard=derive-serde,struct-fields-declaration-order,enum-tags=varint;",
+    "json=derive-serde,struct-field-names-declaration-order,enum-names-exact;",
+    "managed-v5=admission:box|checkpoint:protected-bytes|worker:bytes32|verifier:bytes32|receipt:bytes32|ordinal:u8|outcome:u8"
 );
 const FENCED_TRANSITION_VOTER_SET_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-transition-voter-set/v1\0";
@@ -442,8 +482,29 @@ pub enum SessionMutationIntent {
         /// Domain-separated digest of the authenticated mTLS worker identity.
         worker_digest: [u8; 32],
     },
+    /// SDK-internal bounded roster terminal-history maintenance.
+    ///
+    /// This replicated compare-and-set command is admitted only through the
+    /// local operator authority. It retires an entirely terminal epoch after
+    /// its exact retention window and reclaims at most the profile batch.
+    #[doc(hidden)]
+    MaintainFencedMutationRosterHistory {
+        /// Durable roster history generation observed before maintenance.
+        expected_generation: u64,
+        /// Active roster history epoch observed before maintenance.
+        expected_active_epoch: Option<u64>,
+        /// Highest permanently retired roster history epoch observed before maintenance.
+        expected_retired_through: u64,
+        /// Bound roster receipts observed before maintenance.
+        expected_bound_entries: u64,
+        /// Nonterminal roster receipts observed before maintenance.
+        expected_live_entries: u64,
+    },
     /// Atomically claim the managed V5 protocol and bind its server-owned
     /// checkpoint and configured worker/verifier commitments before provider I/O.
+    ///
+    /// This and the other V5 intents are appended so that every published
+    /// SessionMutationIntent Postcard discriminant remains immutable.
     #[doc(hidden)]
     EnsureManagedProviderJob {
         admission: Box<FencedMutationRosterAdmission>,
@@ -488,24 +549,6 @@ pub enum SessionMutationIntent {
         admission: Box<FencedMutationRosterAdmission>,
         worker_digest: [u8; 32],
     },
-    /// SDK-internal bounded roster terminal-history maintenance.
-    ///
-    /// This replicated compare-and-set command is admitted only through the
-    /// local operator authority. It retires an entirely terminal epoch after
-    /// its exact retention window and reclaims at most the profile batch.
-    #[doc(hidden)]
-    MaintainFencedMutationRosterHistory {
-        /// Durable roster history generation observed before maintenance.
-        expected_generation: u64,
-        /// Active roster history epoch observed before maintenance.
-        expected_active_epoch: Option<u64>,
-        /// Highest permanently retired roster history epoch observed before maintenance.
-        expected_retired_through: u64,
-        /// Bound roster receipts observed before maintenance.
-        expected_bound_entries: u64,
-        /// Nonterminal roster receipts observed before maintenance.
-        expected_live_entries: u64,
-    },
 }
 
 impl fmt::Debug for SessionMutationIntent {
@@ -546,7 +589,16 @@ impl SessionConsensusCommand {
         previous_digest: SessionConsensusEntryDigest,
         effective_logical_time: opc_types::Timestamp,
     ) -> Result<SessionConsensusEntryDigest, StoreError> {
-        let (domain, encoded) = if self.intent.contains_fenced_transition_v2() {
+        let (domain, encoded) = if self.intent.contains_managed_provider_v5() {
+            (
+                COMMAND_MANAGED_PROVIDER_V5_DIGEST_DOMAIN,
+                self.encode_managed_provider_v5_applied_digest_input(
+                    sequence,
+                    previous_digest,
+                    effective_logical_time,
+                )?,
+            )
+        } else if self.intent.contains_fenced_transition_v2() {
             (
                 COMMAND_V2_DIGEST_DOMAIN,
                 self.encode_v2_applied_digest_input(
@@ -625,9 +677,43 @@ impl SessionConsensusCommand {
         append_roster_applied_intent(&mut encoded, &self.intent)?;
         Ok(encoded)
     }
+
+    fn encode_managed_provider_v5_applied_digest_input(
+        &self,
+        sequence: u64,
+        previous_digest: SessionConsensusEntryDigest,
+        effective_logical_time: opc_types::Timestamp,
+    ) -> Result<Vec<u8>, StoreError> {
+        let mut encoded = Vec::with_capacity(256);
+        encoded.extend_from_slice(COMMAND_MANAGED_PROVIDER_V5_DIGEST_MAGIC);
+        encoded.extend_from_slice(
+            &SESSION_CONSENSUS_MANAGED_PROVIDER_V5_APPLIED_DIGEST_ENCODING_VERSION.to_be_bytes(),
+        );
+        encoded.extend_from_slice(&sequence.to_be_bytes());
+        encoded.extend_from_slice(previous_digest.as_bytes());
+        append_v2_applied_timestamp(&mut encoded, effective_logical_time);
+        encoded.extend_from_slice(&self.schema_version.to_be_bytes());
+        append_v2_applied_identity(&mut encoded, self.identity);
+        encoded.extend_from_slice(self.request_id.as_bytes());
+        append_v2_applied_timestamp(&mut encoded, self.logical_time);
+        append_managed_provider_v5_applied_intent(&mut encoded, &self.intent)?;
+        Ok(encoded)
+    }
 }
 
 impl SessionMutationIntent {
+    fn contains_managed_provider_v5(&self) -> bool {
+        matches!(
+            self,
+            Self::EnsureManagedProviderJob { .. }
+                | Self::StartManagedProviderMember { .. }
+                | Self::RecordManagedProviderReceipt { .. }
+                | Self::RequireManagedProviderReconciliation { .. }
+                | Self::AbortManagedProviderNotApplied { .. }
+                | Self::FinalizeManagedProviderJob { .. }
+        ) || matches!(self, Self::Authorized { mutation, .. } if mutation.contains_managed_provider_v5())
+    }
+
     fn contains_fenced_transition_v2(&self) -> bool {
         matches!(
             self,
@@ -674,6 +760,96 @@ fn roster_admission_frame(
 
 fn roster_terminal_frame(terminal: &FencedMutationRosterTerminal) -> Vec<u8> {
     terminal.encode_canonical()
+}
+
+fn append_managed_provider_v5_applied_intent(
+    out: &mut Vec<u8>,
+    intent: &SessionMutationIntent,
+) -> Result<(), StoreError> {
+    match intent {
+        SessionMutationIntent::EnsureManagedProviderJob {
+            admission,
+            protected_checkpoint,
+            worker_digest,
+            verifier_digest,
+        } => {
+            out.push(6);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            append_roster_applied_frame(out, protected_checkpoint.as_bytes().to_vec())?;
+            out.extend_from_slice(worker_digest);
+            out.extend_from_slice(verifier_digest);
+        }
+        SessionMutationIntent::StartManagedProviderMember {
+            admission,
+            ordinal,
+            worker_digest,
+        } => {
+            out.push(7);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            out.push(*ordinal);
+            out.extend_from_slice(worker_digest);
+        }
+        SessionMutationIntent::RecordManagedProviderReceipt {
+            admission,
+            ordinal,
+            worker_digest,
+            verifier_digest,
+            receipt_digest,
+            outcome,
+        } => {
+            out.push(8);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            out.push(*ordinal);
+            out.extend_from_slice(worker_digest);
+            out.extend_from_slice(verifier_digest);
+            out.extend_from_slice(receipt_digest);
+            out.push(*outcome);
+        }
+        SessionMutationIntent::RequireManagedProviderReconciliation {
+            admission,
+            ordinal,
+            worker_digest,
+        } => {
+            out.push(9);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            out.push(*ordinal);
+            out.extend_from_slice(worker_digest);
+        }
+        SessionMutationIntent::AbortManagedProviderNotApplied {
+            admission,
+            ordinal,
+            worker_digest,
+        } => {
+            out.push(10);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            out.push(*ordinal);
+            out.extend_from_slice(worker_digest);
+        }
+        SessionMutationIntent::FinalizeManagedProviderJob {
+            admission,
+            worker_digest,
+        } => {
+            out.push(11);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            out.extend_from_slice(worker_digest);
+        }
+        SessionMutationIntent::Authorized {
+            origin,
+            authority_identity,
+            mutation,
+        } if mutation.contains_managed_provider_v5() => {
+            out.push(3);
+            out.extend_from_slice(&origin.get().to_be_bytes());
+            append_v2_applied_identity(out, *authority_identity);
+            append_managed_provider_v5_applied_intent(out, mutation)?;
+        }
+        _ => {
+            return Err(StoreError::Serialization(
+                "session consensus managed-provider V5 digest intent is invalid".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn append_roster_applied_intent(
@@ -1347,6 +1523,17 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    fn decode_hex(input: &str) -> Vec<u8> {
+        assert_eq!(input.len() % 2, 0, "hex has complete bytes");
+        (0..(input.len() / 2))
+            .map(|index| {
+                let offset = index * 2;
+                let pair = &input[offset..offset + 2];
+                u8::from_str_radix(pair, 16).expect("hex byte")
+            })
+            .collect()
+    }
+
     #[test]
     fn roster_profile_is_append_only_and_has_an_independent_voter_binding() {
         // These discriminants sit strictly after the frozen #704 sequence
@@ -1371,6 +1558,73 @@ mod tests {
             fenced_mutation_roster_voter_set_digest(identity, &voters),
             fenced_transition_voter_set_digest(identity, &voters),
             "an identical topology must not borrow V1/V2 certificate material"
+        );
+    }
+
+    #[test]
+    fn published_roster_maintenance_postcard_bytes_still_decode_identically() {
+        let command =
+            v2_digest_command(SessionMutationIntent::MaintainFencedMutationRosterHistory {
+                expected_generation: 11,
+                expected_active_epoch: Some(7),
+                expected_retired_through: 6,
+                expected_bound_entries: 23,
+                expected_live_entries: 29,
+            });
+        let published = decode_hex("01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a180b010706171d");
+        assert_eq!(
+            opc_consensus::encode_bounded(&command).expect("postcard"),
+            published
+        );
+        assert_eq!(
+            opc_consensus::decode_bounded::<SessionConsensusCommand>(&published)
+                .expect("published postcard decodes"),
+            command
+        );
+    }
+
+    #[test]
+    fn managed_v5_postcard_and_digest_are_distinct_from_the_roster_profile() {
+        let managed = v2_digest_command(SessionMutationIntent::FinalizeManagedProviderJob {
+            admission: Box::new(roster_digest_admission()),
+            worker_digest: [0xC1; 32],
+        });
+        let encoded = opc_consensus::encode_bounded(&managed).expect("managed postcard");
+        assert!(
+            encoded.windows(2).any(|window| window == [0x5A, 30]),
+            "managed V5 must use the frozen appended Postcard discriminant"
+        );
+        assert_eq!(
+            opc_consensus::decode_bounded::<SessionConsensusCommand>(&encoded)
+                .expect("managed postcard decodes"),
+            managed
+        );
+        assert_ne!(
+            managed
+                .calculate_applied_digest(5, SessionConsensusEntryDigest::GENESIS, legacy_time(37))
+                .expect("managed digest"),
+            v2_digest_command(SessionMutationIntent::MaintainFencedMutationRosterHistory {
+                expected_generation: 11,
+                expected_active_epoch: Some(7),
+                expected_retired_through: 6,
+                expected_bound_entries: 23,
+                expected_live_entries: 29,
+            })
+            .calculate_applied_digest(5, SessionConsensusEntryDigest::GENESIS, legacy_time(37))
+            .expect("roster digest"),
+            "managed tags must not enter the predecessor roster digest profile"
+        );
+        assert!(
+            SESSION_CONSENSUS_MANAGED_PROVIDER_V5_APPLIED_DIGEST_SCHEMA_DESCRIPTOR
+                .contains("finalize-managed-provider-job(tag=11")
+        );
+        assert!(
+            SESSION_CONSENSUS_MANAGED_PROVIDER_V5_COMMAND_WIRE_SCHEMA_DESCRIPTOR
+                .contains("roster-maintain:24")
+        );
+        assert!(
+            SESSION_CONSENSUS_MANAGED_PROVIDER_V5_COMMAND_WIRE_SCHEMA_DESCRIPTOR
+                .contains("finalize-job:30")
         );
     }
 

@@ -72,16 +72,17 @@ use crate::consumer::{
 };
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_mutation_roster::{
+    fenced_mutation_roster_managed_provider_v5_profile_digest,
     fenced_mutation_roster_profile_digest, FencedMutationRosterAdmission,
     FencedMutationRosterCapability, FencedMutationRosterError, FencedMutationRosterHistoryState,
-    FencedMutationRosterMemberAttestation, FencedMutationRosterMemberAttestationError,
-    FencedMutationRosterMemberAttestationVerifier, FencedMutationRosterMemberExecutionContext,
-    FencedMutationRosterMemberExecutionError, FencedMutationRosterMemberProof,
-    FencedMutationRosterMemberProvider, FencedMutationRosterOrdinal, FencedMutationRosterOutcome,
-    FencedMutationRosterPhase, FencedMutationRosterProtectedPlan, FencedMutationRosterRequestId,
-    FencedMutationRosterStatus, FencedMutationRosterTerminal,
-    FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES, FENCED_MUTATION_ROSTER_SCHEMA_V2,
-    FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
+    FencedMutationRosterManagedProviderV5Capability, FencedMutationRosterMemberAttestation,
+    FencedMutationRosterMemberAttestationError, FencedMutationRosterMemberAttestationVerifier,
+    FencedMutationRosterMemberExecutionContext, FencedMutationRosterMemberExecutionError,
+    FencedMutationRosterMemberProof, FencedMutationRosterMemberProvider,
+    FencedMutationRosterOrdinal, FencedMutationRosterOutcome, FencedMutationRosterPhase,
+    FencedMutationRosterProtectedPlan, FencedMutationRosterRequestId, FencedMutationRosterStatus,
+    FencedMutationRosterTerminal, FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,
+    FENCED_MUTATION_ROSTER_SCHEMA_V2, FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
 };
 use crate::fenced_transition::{
     AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionObservation,
@@ -540,6 +541,46 @@ enum FencedMutationRosterCapabilityReply {
     Unsupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedProviderV5CapabilityProbe {
+    magic: [u8; 8],
+    schema_version: u16,
+    profile_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ManagedProviderV5CapabilityReply {
+    V5 {
+        magic: [u8; 8],
+        profile_digest: [u8; 32],
+    },
+    Unsupported,
+}
+
+const MANAGED_PROVIDER_V5_CAPABILITY_SCHEMA_VERSION: u16 = 5;
+const MANAGED_PROVIDER_V5_CAPABILITY_PROBE_MAGIC: [u8; 8] = *b"OPCMV5CP";
+const MANAGED_PROVIDER_V5_CAPABILITY_REPLY_MAGIC: [u8; 8] = *b"OPCMV5CR";
+
+fn managed_provider_v5_capability_probe_reply(
+    probe: ManagedProviderV5CapabilityProbe,
+    local_capability: Option<FencedMutationRosterManagedProviderV5Capability>,
+) -> ManagedProviderV5CapabilityReply {
+    let profile_digest = fenced_mutation_roster_managed_provider_v5_profile_digest();
+    if probe.magic == MANAGED_PROVIDER_V5_CAPABILITY_PROBE_MAGIC
+        && probe.schema_version == MANAGED_PROVIDER_V5_CAPABILITY_SCHEMA_VERSION
+        && probe.profile_digest == profile_digest
+        && local_capability == Some(FencedMutationRosterManagedProviderV5Capability::V5)
+    {
+        ManagedProviderV5CapabilityReply::V5 {
+            magic: MANAGED_PROVIDER_V5_CAPABILITY_REPLY_MAGIC,
+            profile_digest,
+        }
+    } else {
+        ManagedProviderV5CapabilityReply::Unsupported
+    }
+}
+
 fn fenced_mutation_roster_capability_probe_reply(
     probe: FencedMutationRosterCapabilityProbe,
     local_capability: Option<FencedMutationRosterCapability>,
@@ -586,6 +627,14 @@ enum FencedMutationRosterCapabilityAdmission {
     /// current voter scope and roster profile.
     Activated,
     /// Every current voter just returned the uniquely framed roster reply.
+    FreshUnanimous,
+}
+
+/// Managed V5 has no reusable durable activation certificate. Every managed
+/// command must observe a fresh exact all-voter acknowledgement of the V5
+/// wire and applied-digest profile before it can reach proposal admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedProviderV5CapabilityAdmission {
     FreshUnanimous,
 }
 
@@ -1671,6 +1720,17 @@ impl ConsensusSessionStore {
         }
     }
 
+    fn local_managed_provider_v5_capability(
+        &self,
+    ) -> Option<FencedMutationRosterManagedProviderV5Capability> {
+        // V5's proof is not inferred from the roster's activation certificate:
+        // this local check only establishes that this exact binary can carry
+        // the bounded command shape. Peer compatibility is proved separately
+        // by the V5-only probe immediately before every proposal.
+        self.local_fenced_mutation_roster_capability()
+            .map(|_| FencedMutationRosterManagedProviderV5Capability::V5)
+    }
+
     /// Admit V1 for one exact linearizable voter scope.
     ///
     /// A durable certificate first permits ordinary quorum availability.  In
@@ -1896,6 +1956,64 @@ impl ConsensusSessionStore {
             return Err(consensus_unavailable());
         }
         Ok(FencedMutationRosterCapabilityAdmission::FreshUnanimous)
+    }
+
+    async fn require_managed_provider_v5_capability_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<ManagedProviderV5CapabilityAdmission, StoreError> {
+        self.require_exact_membership_admission()?;
+        self.linearizable_barrier_before(deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        let expected_scope = self.current_scope()?;
+        if self.local_managed_provider_v5_capability()
+            != Some(FencedMutationRosterManagedProviderV5Capability::V5)
+            || !expected_scope.1.contains(&self.inner.local_node_id)
+        {
+            return Err(unsupported_fenced_mutation_roster());
+        }
+        let profile_digest = fenced_mutation_roster_managed_provider_v5_profile_digest();
+        let probes = expected_scope
+            .1
+            .iter()
+            .copied()
+            .filter(|member| *member != self.inner.local_node_id)
+            .map(|member| async move {
+                self.call_peer::<_, ManagedProviderV5CapabilityReply>(
+                    member,
+                    SessionConsensusRpcFamily::ReadBarrier,
+                    &ManagedProviderV5CapabilityProbe {
+                        magic: MANAGED_PROVIDER_V5_CAPABILITY_PROBE_MAGIC,
+                        schema_version: MANAGED_PROVIDER_V5_CAPABILITY_SCHEMA_VERSION,
+                        profile_digest,
+                    },
+                    deadline,
+                )
+                .await
+            });
+        if futures_util::future::join_all(probes)
+            .await
+            .into_iter()
+            .any(|reply| {
+                !matches!(
+                    reply,
+                    Ok(ManagedProviderV5CapabilityReply::V5 {
+                        magic,
+                        profile_digest: received,
+                    }) if magic == MANAGED_PROVIDER_V5_CAPABILITY_REPLY_MAGIC
+                        && received == profile_digest
+                )
+            })
+        {
+            return Err(unsupported_fenced_mutation_roster());
+        }
+        if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
+            return Err(consensus_unavailable());
+        }
+        Ok(ManagedProviderV5CapabilityAdmission::FreshUnanimous)
     }
 
     /// Advertise V1 after either the exact durable certificate or a fresh
@@ -3955,6 +4073,23 @@ impl ConsensusSessionStore {
                     ));
                 }
             }
+        }
+        if matches!(
+            &request.intent,
+            SessionMutationIntent::EnsureManagedProviderJob { .. }
+                | SessionMutationIntent::StartManagedProviderMember { .. }
+                | SessionMutationIntent::RecordManagedProviderReceipt { .. }
+                | SessionMutationIntent::RequireManagedProviderReconciliation { .. }
+                | SessionMutationIntent::AbortManagedProviderNotApplied { .. }
+                | SessionMutationIntent::FinalizeManagedProviderJob { .. }
+        ) && self
+            .require_managed_provider_v5_capability_before(deadline)
+            .await
+            .is_err()
+        {
+            return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
+                unsupported_fenced_mutation_roster(),
+            )));
         }
         let logical_time = match tokio::time::timeout_at(
             deadline,
@@ -6172,6 +6307,14 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                         self.store.local_fenced_transition_v2_capability(),
                     );
                     return encode_service_reply(&reply);
+                }
+                if let Ok(probe) =
+                    decode_bounded::<ManagedProviderV5CapabilityProbe>(&request.payload)
+                {
+                    return encode_service_reply(&managed_provider_v5_capability_probe_reply(
+                        probe,
+                        self.store.local_managed_provider_v5_capability(),
+                    ));
                 }
                 let probe =
                     match decode_bounded::<FencedMutationRosterCapabilityProbe>(&request.payload) {
@@ -10145,6 +10288,40 @@ mod membership_tests {
             mismatch,
             FencedTransitionV2CapabilityReply::V2 { profile_digest } if profile_digest == expected
         ));
+    }
+
+    #[test]
+    fn managed_v5_probe_rejects_predecessor_or_substituted_profile() {
+        let exact = ManagedProviderV5CapabilityProbe {
+            magic: MANAGED_PROVIDER_V5_CAPABILITY_PROBE_MAGIC,
+            schema_version: MANAGED_PROVIDER_V5_CAPABILITY_SCHEMA_VERSION,
+            profile_digest: fenced_mutation_roster_managed_provider_v5_profile_digest(),
+        };
+        assert!(matches!(
+            managed_provider_v5_capability_probe_reply(
+                exact,
+                Some(FencedMutationRosterManagedProviderV5Capability::V5),
+            ),
+            ManagedProviderV5CapabilityReply::V5 { magic, profile_digest }
+                if magic == MANAGED_PROVIDER_V5_CAPABILITY_REPLY_MAGIC
+                    && profile_digest == fenced_mutation_roster_managed_provider_v5_profile_digest()
+        ));
+        assert_eq!(
+            managed_provider_v5_capability_probe_reply(
+                ManagedProviderV5CapabilityProbe {
+                    profile_digest: fenced_mutation_roster_profile_digest(),
+                    ..exact
+                },
+                Some(FencedMutationRosterManagedProviderV5Capability::V5),
+            ),
+            ManagedProviderV5CapabilityReply::Unsupported,
+            "the predecessor roster profile cannot acknowledge managed V5"
+        );
+        assert_eq!(
+            managed_provider_v5_capability_probe_reply(exact, None),
+            ManagedProviderV5CapabilityReply::Unsupported,
+            "missing V5 capability fails closed"
+        );
     }
 
     #[test]

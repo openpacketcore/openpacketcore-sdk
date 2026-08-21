@@ -100,6 +100,8 @@ const TERMINAL_MAGIC: &[u8; 8] = b"OPCFMRT1";
 const BODY_DOMAIN: &[u8] = b"opc-session-store/fenced-mutation-roster/body/v1";
 const REQUEST_DOMAIN: &[u8] = b"opc-session-store/fenced-mutation-roster/request/v1";
 const PROFILE_DOMAIN: &[u8] = b"opc-session-store/fenced-mutation-roster/profile/v2";
+const MANAGED_PROVIDER_V5_PROFILE_DOMAIN: &[u8] =
+    b"opc-session-store/fenced-mutation-roster/managed-provider-v5/profile/v1";
 const MEMBER_ATTESTATION_CONTEXT_DOMAIN: &[u8] =
     b"opc-session-store/fenced-mutation-roster/member-attestation-context/v1";
 
@@ -1083,6 +1085,36 @@ pub fn fenced_mutation_roster_profile_digest() -> [u8; 32] {
     hash.finalize().into()
 }
 
+/// Return the fixed digest of the managed-provider V5 command compatibility
+/// profile. This is deliberately distinct from the roster V2 admission
+/// profile: a roster activation certificate cannot certify managed commands.
+pub fn fenced_mutation_roster_managed_provider_v5_profile_digest() -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(MANAGED_PROVIDER_V5_PROFILE_DOMAIN);
+    hash.update([0]);
+    hash.update(SCHEMA_V2.to_be_bytes());
+    hash.update(fenced_mutation_roster_profile_digest());
+    hash.update([0]);
+    hash.update(
+        crate::consensus::types::SESSION_CONSENSUS_MANAGED_PROVIDER_V5_APPLIED_DIGEST_ENCODING_VERSION
+            .to_be_bytes(),
+    );
+    hash.update(
+        crate::consensus::types::SESSION_CONSENSUS_MANAGED_PROVIDER_V5_APPLIED_DIGEST_SCHEMA_DESCRIPTOR
+            .as_bytes(),
+    );
+    hash.update([0]);
+    hash.update(
+        crate::consensus::types::SESSION_CONSENSUS_MANAGED_PROVIDER_V5_COMMAND_WIRE_ENCODING_VERSION
+            .to_be_bytes(),
+    );
+    hash.update(
+        crate::consensus::types::SESSION_CONSENSUS_MANAGED_PROVIDER_V5_COMMAND_WIRE_SCHEMA_DESCRIPTOR
+            .as_bytes(),
+    );
+    hash.finalize().into()
+}
+
 /// Compute the domain-separated body commitment for exact canonical plan bytes.
 pub fn roster_body_commitment(canonical_plan: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
@@ -1412,6 +1444,12 @@ impl fmt::Debug for FencedMutationMemberTerminalStatus {
 pub enum FencedMutationRosterCapability {
     /// Version-two bounded roster capability.
     V2,
+}
+/// Capability proof emitted only by a managed-provider V5-capable implementation.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+pub enum FencedMutationRosterManagedProviderV5Capability {
+    /// Exact managed-provider V5 command and digest profile.
+    V5,
 }
 /// Public immutable profile proof.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2793,6 +2831,11 @@ mod tests {
         assert_ne!(
             fenced_mutation_roster_profile_digest(),
             roster_body_commitment(&[])
+        );
+        assert_ne!(
+            fenced_mutation_roster_profile_digest(),
+            fenced_mutation_roster_managed_provider_v5_profile_digest(),
+            "the managed V5 command profile must not substitute for the roster profile"
         );
     }
 
