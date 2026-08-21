@@ -981,7 +981,7 @@ impl SqliteSessionBackend {
         .await
     }
 
-    /// Read the public roster history lifecycle after a caller-owned barrier.
+    /// Read the complete roster history lifecycle after a caller-owned barrier.
     pub(crate) async fn consensus_fenced_mutation_roster_history_state(
         &self,
         storage_identity: crate::consensus::SessionConsensusIdentity,

@@ -44,7 +44,8 @@ use crate::fenced_mutation_roster::{
     FencedMutationRosterPhase, FencedMutationRosterStatus, FencedMutationRosterTerminal,
     FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,
     FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES, FENCED_MUTATION_ROSTER_MAX_LIVE,
-    FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES, FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY,
+    FENCED_MUTATION_ROSTER_RECLAIM_BATCH, FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES,
+    FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY,
     FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
 };
 use crate::fenced_transition::{
@@ -5601,10 +5602,10 @@ pub(crate) fn read_fenced_transition_v2_history_state_sync(
     .map_err(|_| invalid_data("fenced transition V2 history state is invalid"))
 }
 
-/// Read the public roster history counters after a caller-owned consensus
-/// barrier. A reclaim-in-progress state has no active epoch, which the
-/// closed public roster response cannot represent, so that state is rejected
-/// rather than projected as a misleading live epoch.
+/// Read the complete roster history lifecycle after a caller-owned consensus
+/// barrier. A reclaim-in-progress state deliberately carries no active epoch
+/// so an operator can submit the next exact bounded-reclaim CAS without
+/// projecting a misleading successor.
 pub(crate) fn read_fenced_mutation_roster_history_state_sync(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
@@ -5615,7 +5616,7 @@ pub(crate) fn read_fenced_mutation_roster_history_state_sync(
         // starting point, just as the V2 reader does. It does not create or
         // imply an activation certificate.
         return Ok(FencedMutationRosterHistoryState {
-            active_epoch: FENCED_MUTATION_ROSTER_INITIAL_HISTORY_EPOCH,
+            active_epoch: Some(FENCED_MUTATION_ROSTER_INITIAL_HISTORY_EPOCH),
             retired_through: 0,
             generation: 0,
             bound: 0,
@@ -5623,11 +5624,8 @@ pub(crate) fn read_fenced_mutation_roster_history_state_sync(
         });
     }
     let state = read_fenced_mutation_roster_history_row_in_sync(conn, storage_identity, false)?;
-    let active_epoch = state
-        .active_epoch
-        .ok_or_else(|| invalid_data("fenced mutation roster public history has no active epoch"))?;
     Ok(FencedMutationRosterHistoryState {
-        active_epoch,
+        active_epoch: state.active_epoch,
         retired_through: state.retired_through,
         generation: state.generation,
         bound: state.current_bound_count,
@@ -8697,6 +8695,7 @@ impl MembershipLogProjection {
             | SessionMutationIntent::FencedTransitionV2(_)
             | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
             | SessionMutationIntent::MaintainFencedTransitionV2History { .. }
+            | SessionMutationIntent::MaintainFencedMutationRosterHistory { .. }
             | SessionMutationIntent::CompareAndSet(_)
             | SessionMutationIntent::DeleteFenced(_)
             | SessionMutationIntent::RefreshTtl { .. }
@@ -13244,6 +13243,306 @@ fn fenced_mutation_roster_terminalize_sync(
     Ok(FencedMutationRosterOutcome { status })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FencedMutationRosterMaintenanceResult {
+    Applied,
+    Noop,
+    Rejected,
+    Exhausted,
+}
+
+#[derive(Clone, Copy)]
+struct FencedMutationRosterMaintenanceExpectation {
+    generation: u64,
+    active_epoch: Option<u64>,
+    retired_through: u64,
+    bound_entries: u64,
+    live_entries: u64,
+}
+
+/// Retire one wholly terminal roster epoch and reclaim one ordered bounded
+/// batch. The caller supplies an exact lifecycle CAS and committed logical
+/// time, so no replica ever performs local wall-clock deletion.
+fn maintain_fenced_mutation_roster_history_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    expected: FencedMutationRosterMaintenanceExpectation,
+    effective_logical_time: Timestamp,
+) -> io::Result<FencedMutationRosterMaintenanceResult> {
+    validate_fenced_mutation_roster_receipts_sync(conn, storage_identity)?;
+    let history = read_fenced_mutation_roster_history_row_in_sync(conn, storage_identity, false)?;
+    if history.generation != expected.generation
+        || history.active_epoch != expected.active_epoch
+        || history.retired_through != expected.retired_through
+        || history.current_bound_count != expected.bound_entries
+        || history.current_live_count != expected.live_entries
+    {
+        return Ok(FencedMutationRosterMaintenanceResult::Rejected);
+    }
+    if history.generation >= i64::MAX as u64
+        || history
+            .active_epoch
+            .is_some_and(|epoch| epoch >= i64::MAX as u64)
+        || history
+            .reclaim_epoch
+            .is_some_and(|epoch| epoch >= i64::MAX as u64)
+    {
+        return Ok(FencedMutationRosterMaintenanceResult::Exhausted);
+    }
+    let next_generation = history
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("fenced mutation roster generation is exhausted"))?;
+    let batch = u64::try_from(FENCED_MUTATION_ROSTER_RECLAIM_BATCH)
+        .map_err(|_| invalid_data("fenced mutation roster reclaim batch is invalid"))?;
+    let (reclaim_epoch, cursor, remaining) = match history.active_epoch {
+        Some(active) => {
+            // A live admission must remain recoverable/adoptable. Do not
+            // retire its epoch, even if other terminal receipts are due.
+            if history.current_bound_count == 0 || history.current_live_count != 0 {
+                return Ok(FencedMutationRosterMaintenanceResult::Noop);
+            }
+            if history.reclaimed_entries
+                > (i64::MAX as u64).saturating_sub(history.current_bound_count.min(batch))
+            {
+                return Ok(FencedMutationRosterMaintenanceResult::Exhausted);
+            }
+            let maximum_retained_until: Option<String> = conn
+                .query_row(
+                    "SELECT retained_until FROM consensus_fenced_mutation_roster_operations WHERE history_epoch = ?1 ORDER BY ordinal DESC LIMIT 1",
+                    [checked_positive_i64(active)?],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_error)?;
+            let Some(maximum_retained_until) = maximum_retained_until else {
+                return Err(invalid_data(
+                    "fenced mutation roster receipt count is invalid",
+                ));
+            };
+            if Timestamp::from_str(&maximum_retained_until)
+                .map_err(|_| invalid_data("fenced mutation roster retention is invalid"))?
+                > effective_logical_time
+            {
+                return Ok(FencedMutationRosterMaintenanceResult::Noop);
+            }
+            let changed = conn
+                .execute(
+                    "UPDATE consensus_fenced_mutation_roster_history SET active_epoch = NULL, retired_through_epoch = ?1, generation = ?2, current_bound_count = 0, current_live_count = 0, reclaim_epoch = ?1, reclaim_cursor_ordinal = 0, reclaim_remaining = ?3 WHERE singleton = 1 AND active_epoch = ?1 AND generation = ?4 AND retired_through_epoch = ?5 AND current_bound_count = ?6 AND current_live_count = ?7",
+                    params![
+                        checked_positive_i64(active)?,
+                        checked_i64(next_generation)?,
+                        checked_i64(history.current_bound_count)?,
+                        checked_i64(expected.generation)?,
+                        checked_i64(expected.retired_through)?,
+                        checked_i64(expected.bound_entries)?,
+                        checked_i64(expected.live_entries)?,
+                    ],
+                )
+                .map_err(db_error)?;
+            if changed != 1 {
+                return Ok(FencedMutationRosterMaintenanceResult::Rejected);
+            }
+            (active, 0, history.current_bound_count)
+        }
+        None => (
+            history
+                .reclaim_epoch
+                .ok_or_else(|| invalid_data("fenced mutation roster reclaim epoch is invalid"))?,
+            history
+                .reclaim_cursor_ordinal
+                .ok_or_else(|| invalid_data("fenced mutation roster reclaim cursor is invalid"))?,
+            history
+                .reclaim_remaining
+                .ok_or_else(|| invalid_data("fenced mutation roster reclaim count is invalid"))?,
+        ),
+    };
+    let expected_batch = remaining.min(batch);
+    if expected_batch == 0 {
+        return Err(invalid_data(
+            "fenced mutation roster reclaim count is invalid",
+        ));
+    }
+    let ordinals = conn
+        .prepare(
+            "SELECT ordinal FROM consensus_fenced_mutation_roster_operations WHERE history_epoch = ?1 AND ordinal > ?2 AND phase IN (2, 3) ORDER BY history_epoch ASC, ordinal ASC LIMIT ?3",
+        )
+        .map_err(db_error)?
+        .query_map(
+            params![
+                checked_positive_i64(reclaim_epoch)?,
+                checked_i64(cursor)?,
+                checked_i64(batch)?,
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(db_error)?
+        .map(|row| row.map_err(db_error).and_then(checked_positive_u64))
+        .collect::<io::Result<Vec<_>>>()?;
+    if u64::try_from(ordinals.len())
+        .map_err(|_| invalid_data("fenced mutation roster reclaim count is invalid"))?
+        != expected_batch
+    {
+        return Err(invalid_data(
+            "fenced mutation roster reclaim eligibility is invalid",
+        ));
+    }
+    let last = ordinals
+        .last()
+        .copied()
+        .ok_or_else(|| invalid_data("fenced mutation roster reclaim count is invalid"))?;
+    let deleted = conn
+        .execute(
+            "DELETE FROM consensus_fenced_mutation_roster_operations WHERE history_epoch = ?1 AND ordinal > ?2 AND ordinal <= ?3 AND phase IN (2, 3)",
+            params![
+                checked_positive_i64(reclaim_epoch)?,
+                checked_i64(cursor)?,
+                checked_positive_i64(last)?,
+            ],
+        )
+        .map_err(db_error)?;
+    if deleted != ordinals.len() {
+        return Err(invalid_data(
+            "fenced mutation roster reclaim order is invalid",
+        ));
+    }
+    let deleted = u64::try_from(deleted)
+        .map_err(|_| invalid_data("fenced mutation roster reclaim count is invalid"))?;
+    let remaining = remaining
+        .checked_sub(deleted)
+        .ok_or_else(|| invalid_data("fenced mutation roster reclaim count is invalid"))?;
+    let reclaimed_entries = history
+        .reclaimed_entries
+        .checked_add(deleted)
+        .ok_or_else(|| invalid_data("fenced mutation roster reclaimed count is exhausted"))?;
+    if remaining == 0 {
+        let next_active = reclaim_epoch
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("fenced mutation roster epoch is exhausted"))?;
+        let changed = conn.execute(
+            "UPDATE consensus_fenced_mutation_roster_history SET active_epoch = ?1, generation = ?2, reclaim_epoch = NULL, reclaim_cursor_ordinal = NULL, reclaim_remaining = NULL, reclaimed_entries = ?3 WHERE singleton = 1 AND active_epoch IS NULL AND reclaim_epoch = ?4 AND reclaim_cursor_ordinal = ?5 AND reclaim_remaining = ?6",
+            params![
+                checked_positive_i64(next_active)?, checked_i64(next_generation)?,
+                checked_i64(reclaimed_entries)?, checked_positive_i64(reclaim_epoch)?,
+                checked_i64(cursor)?, checked_i64(remaining.checked_add(deleted).ok_or_else(|| invalid_data("fenced mutation roster reclaim count is invalid"))?)?,
+            ],
+        ).map_err(db_error)?;
+        if changed != 1 {
+            return Err(invalid_data(
+                "fenced mutation roster reclaim state is invalid",
+            ));
+        }
+    } else {
+        let changed = conn.execute(
+            "UPDATE consensus_fenced_mutation_roster_history SET generation = ?1, reclaim_cursor_ordinal = ?2, reclaim_remaining = ?3, reclaimed_entries = ?4 WHERE singleton = 1 AND active_epoch IS NULL AND reclaim_epoch = ?5 AND reclaim_cursor_ordinal = ?6 AND reclaim_remaining = ?7",
+            params![
+                checked_i64(next_generation)?, checked_i64(last)?, checked_i64(remaining)?,
+                checked_i64(reclaimed_entries)?, checked_positive_i64(reclaim_epoch)?,
+                checked_i64(cursor)?, checked_i64(remaining.checked_add(deleted).ok_or_else(|| invalid_data("fenced mutation roster reclaim count is invalid"))?)?,
+            ],
+        ).map_err(db_error)?;
+        if changed != 1 {
+            return Err(invalid_data(
+                "fenced mutation roster reclaim state is invalid",
+            ));
+        }
+    }
+    Ok(FencedMutationRosterMaintenanceResult::Applied)
+}
+
+fn apply_fenced_mutation_roster_maintenance_sync(
+    tx: &Transaction<'_>,
+    storage_identity: SessionConsensusIdentity,
+    command: &SessionConsensusCommand,
+    raft_log_index: u64,
+    machine: &mut (u64, SessionConsensusEntryDigest, Option<Timestamp>, u64),
+) -> io::Result<SessionConsensusResponse> {
+    let SessionMutationIntent::MaintainFencedMutationRosterHistory {
+        expected_generation,
+        expected_active_epoch,
+        expected_retired_through,
+        expected_bound_entries,
+        expected_live_entries,
+    } = &command.intent
+    else {
+        return Err(invalid_data(
+            "fenced mutation roster maintenance command is missing",
+        ));
+    };
+    let logical_time = machine
+        .2
+        .map_or(command.logical_time, |time| time.max(command.logical_time));
+    let result = maintain_fenced_mutation_roster_history_sync(
+        tx,
+        storage_identity,
+        FencedMutationRosterMaintenanceExpectation {
+            generation: *expected_generation,
+            active_epoch: *expected_active_epoch,
+            retired_through: *expected_retired_through,
+            bound_entries: *expected_bound_entries,
+            live_entries: *expected_live_entries,
+        },
+        logical_time,
+    )?;
+    if matches!(
+        result,
+        FencedMutationRosterMaintenanceResult::Rejected
+            | FencedMutationRosterMaintenanceResult::Exhausted
+    ) {
+        advance_fenced_replay_logical_time_sync(tx, storage_identity, logical_time, machine)?;
+        return Ok(replay_conflict_response(
+            machine,
+            raft_log_index,
+            StoreError::InvalidKey(
+                match result {
+                    FencedMutationRosterMaintenanceResult::Rejected => {
+                        "fenced_mutation_roster_history_not_current"
+                    }
+                    FencedMutationRosterMaintenanceResult::Exhausted => {
+                        "fenced_mutation_roster_history_storage_exhausted"
+                    }
+                    FencedMutationRosterMaintenanceResult::Applied
+                    | FencedMutationRosterMaintenanceResult::Noop => {
+                        unreachable!("only rejection results are handled here")
+                    }
+                }
+                .into(),
+            ),
+        ));
+    }
+    let sequence = machine
+        .0
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session consensus application sequence exhausted"))?;
+    let command_digest = command
+        .calculate_applied_digest(sequence, machine.1, logical_time)
+        .map_err(|_| invalid_data("session consensus command digest failed"))?;
+    let changed = tx
+        .execute(
+            "UPDATE consensus_machine SET application_sequence = ?1, last_digest = ?2, logical_time = ?3 WHERE singleton = 1 AND configuration_epoch = ?4",
+            params![
+                checked_positive_i64(sequence)?,
+                command_digest.as_bytes().as_slice(),
+                ops::format_rfc3339_normalized(logical_time),
+                epoch_i64(storage_identity)?,
+            ],
+        )
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Err(invalid_data("session consensus machine state is missing"));
+    }
+    machine.0 = sequence;
+    machine.1 = command_digest;
+    machine.2 = Some(logical_time);
+    Ok(SessionConsensusResponse {
+        result: Ok(SessionMutationOutcome::Unit),
+        sequence,
+        digest: Some(command_digest),
+        logical_time: Some(logical_time),
+        raft_log_index,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_fenced_mutation_roster_command_sync(
     tx: &mut Transaction<'_>,
@@ -14456,6 +14755,7 @@ fn execute_application_intent_sync(
         | SessionMutationIntent::AbortTopologyTransition { .. }
         | SessionMutationIntent::FinalizeTopologyTransition { .. }
         | SessionMutationIntent::MaintainFencedTransitionV2History { .. }
+        | SessionMutationIntent::MaintainFencedMutationRosterHistory { .. }
         | SessionMutationIntent::AdmitFencedMutationRoster { .. }
         | SessionMutationIntent::TerminalizeFencedMutationRoster { .. }
         | SessionMutationIntent::Authorized { .. } => Err(StoreError::BackendUnavailable(
@@ -14984,6 +15284,17 @@ pub(crate) fn apply_entries_with_authority_sync(
                             }
                         }
                     }
+                } else if matches!(
+                    &command.intent,
+                    SessionMutationIntent::MaintainFencedMutationRosterHistory { .. }
+                ) {
+                    apply_fenced_mutation_roster_maintenance_sync(
+                        &tx,
+                        identity,
+                        &command,
+                        entry.log_id.index,
+                        &mut machine,
+                    )?
                 } else if fenced_mutation_roster_command(&command.intent).is_some() {
                     apply_fenced_mutation_roster_command_sync(
                         &mut tx,
@@ -19435,6 +19746,64 @@ mod tests {
         .expect("roster admission")
     }
 
+    fn fenced_mutation_roster_admission_for_index(index: usize) -> FencedMutationRosterAdmission {
+        fenced_mutation_roster_admission_for_epoch(index, 1)
+    }
+
+    fn fenced_mutation_roster_admission_for_epoch(
+        index: usize,
+        history_epoch: u64,
+    ) -> FencedMutationRosterAdmission {
+        let ordinal = u64::try_from(index)
+            .expect("roster fixture index")
+            .saturating_add(1);
+        let mut stable_id = [0_u8; 16];
+        stable_id[8..].copy_from_slice(&ordinal.to_be_bytes());
+        let plan = ordinal.to_be_bytes().to_vec();
+        let member = crate::fenced_mutation_roster::FencedMutationRosterMember::new(
+            crate::fenced_mutation_roster::FencedMutationRosterOrdinal::new(0)
+                .expect("roster ordinal"),
+            stable_id,
+            crate::fenced_mutation_roster::FencedMutationRosterDescriptor::new(plan.clone())
+                .expect("roster descriptor"),
+            1,
+            1,
+            crate::fenced_mutation_roster::FencedMutationRosterDisposition::Pending,
+            crate::fenced_mutation_roster::FencedMutationRosterAdoption::Unreconciled,
+        )
+        .expect("roster member");
+        FencedMutationRosterAdmission::new(
+            history_epoch,
+            crate::fenced_mutation_roster::FencedMutationRosterOperationId::new(stable_id)
+                .expect("roster operation"),
+            crate::fenced_mutation_roster::FencedMutationRosterScope::from_digest([0xC3; 32]),
+            crate::fenced_mutation_roster::FencedMutationRosterFenceIntent::new(
+                OwnerId::new("roster-owner").expect("roster owner"),
+                FenceToken::new(1),
+            ),
+            Generation::new(1),
+            crate::fenced_mutation_roster::FencedMutationRosterMembers::new([member])
+                .expect("roster manifest"),
+            crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan::new(
+                plan.into_boxed_slice(),
+            )
+            .expect("roster protected plan"),
+        )
+        .expect("roster admission")
+    }
+
+    fn roster_history_expectation(
+        history: &FencedMutationRosterHistoryRow,
+    ) -> FencedMutationRosterMaintenanceExpectation {
+        FencedMutationRosterMaintenanceExpectation {
+            generation: history.generation,
+            active_epoch: history.active_epoch,
+            retired_through: history.retired_through,
+            bound_entries: history.current_bound_count,
+            live_entries: history.current_live_count,
+        }
+    }
+
     fn fenced_mutation_roster_admission_entry(
         index: u64,
         outer_request_byte: u8,
@@ -22129,6 +22498,250 @@ mod tests {
                 "one-over roster admission must not affect {table}",
             );
         }
+    }
+
+    #[test]
+    fn roster_terminal_history_maintenance_rotates_only_after_terminal_retention() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let admission = fenced_mutation_roster_admission(0x81, 0x91);
+        let (terminal, checkpoint) = fenced_mutation_roster_established_terminal(&admission, 0x01);
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(
+                    1,
+                    fenced_transition_request(0xF8, "roster-maintenance-owner"),
+                    timestamp(1),
+                ),
+                fenced_mutation_roster_admission_entry(2, 0xF8, admission.clone()),
+                fenced_mutation_roster_terminal_entry(
+                    3,
+                    0xF9,
+                    admission.clone(),
+                    terminal,
+                    checkpoint,
+                ),
+            ],
+        )
+        .expect("terminal roster receipt");
+        let before = read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+            .expect("history before maintenance");
+
+        assert_eq!(
+            maintain_fenced_mutation_roster_history_sync(
+                &conn,
+                identity(),
+                roster_history_expectation(&before),
+                timestamp(3),
+            )
+            .expect("maintenance before retention"),
+            FencedMutationRosterMaintenanceResult::Noop,
+        );
+        assert_eq!(
+            read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+                .expect("history before retention expiry"),
+            before,
+            "a terminal receipt remains replayable until its exact retention deadline",
+        );
+
+        let result = maintain_fenced_mutation_roster_history_sync(
+            &conn,
+            identity(),
+            roster_history_expectation(&before),
+            Timestamp::from_str("2026-08-22T00:00:00Z").expect("after retention"),
+        );
+
+        assert_eq!(
+            result.expect("maintenance"),
+            FencedMutationRosterMaintenanceResult::Applied
+        );
+        let after = read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+            .expect("history after maintenance");
+        assert_eq!(after.active_epoch, Some(2));
+        assert_eq!(after.retired_through, 1);
+        assert_eq!(after.current_bound_count, 0);
+        assert_eq!(after.current_live_count, 0);
+        assert_eq!(after.reclaimed_entries, 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_fenced_mutation_roster_operations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count reclaimed receipts"),
+            0,
+        );
+    }
+
+    #[test]
+    fn roster_terminal_history_reclaims_one_ordered_profile_batch_then_reopens_headroom() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(
+                    1,
+                    fenced_transition_request(0xFB, "roster-batch-maintenance-owner"),
+                    timestamp(1),
+                ),
+            ],
+        )
+        .expect("membership and receipt fence");
+        activate_fenced_mutation_roster_scope_sync(
+            &conn,
+            identity(),
+            identity(),
+            &expected_members(),
+            fenced_mutation_roster_profile_digest(),
+            1,
+        )
+        .expect("activate roster history");
+        let retained_at = timestamp(1);
+        for index in 0..=FENCED_MUTATION_ROSTER_RECLAIM_BATCH {
+            let admission = fenced_mutation_roster_admission_for_index(index);
+            fenced_mutation_roster_admit_sync(&conn, identity(), &admission, retained_at)
+                .expect("admit terminal fixture");
+            let (terminal, checkpoint) = fenced_mutation_roster_established_terminal(
+                &admission,
+                u8::try_from(index % 256).expect("status byte"),
+            );
+            fenced_mutation_roster_terminalize_sync(
+                &conn,
+                identity(),
+                &admission,
+                &terminal,
+                &checkpoint,
+            )
+            .expect("terminalize fixture");
+        }
+        let after_retention = Timestamp::from_str("2026-08-22T00:00:00Z").expect("after retention");
+        let before = read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+            .expect("full terminal history");
+        assert_eq!(
+            before.current_bound_count as usize,
+            FENCED_MUTATION_ROSTER_RECLAIM_BATCH + 1
+        );
+        assert_eq!(before.current_live_count, 0);
+
+        assert_eq!(
+            maintain_fenced_mutation_roster_history_sync(
+                &conn,
+                identity(),
+                roster_history_expectation(&before),
+                after_retention,
+            )
+            .expect("first bounded reclaim"),
+            FencedMutationRosterMaintenanceResult::Applied,
+        );
+        let partial = read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+            .expect("partial reclaim history");
+        assert_eq!(partial.active_epoch, None);
+        assert_eq!(partial.reclaim_epoch, Some(1));
+        assert_eq!(
+            partial.reclaim_cursor_ordinal,
+            Some(FENCED_MUTATION_ROSTER_RECLAIM_BATCH as u64)
+        );
+        assert_eq!(partial.reclaim_remaining, Some(1));
+        assert_eq!(
+            partial.reclaimed_entries as usize,
+            FENCED_MUTATION_ROSTER_RECLAIM_BATCH
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT ordinal FROM consensus_fenced_mutation_roster_operations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("only final ordinal remains"),
+            i64::try_from(FENCED_MUTATION_ROSTER_RECLAIM_BATCH + 1).expect("final ordinal"),
+        );
+
+        assert_eq!(
+            maintain_fenced_mutation_roster_history_sync(
+                &conn,
+                identity(),
+                roster_history_expectation(&partial),
+                after_retention,
+            )
+            .expect("final bounded reclaim"),
+            FencedMutationRosterMaintenanceResult::Applied,
+        );
+        let reopened = read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+            .expect("reopened history");
+        assert_eq!(reopened.active_epoch, Some(2));
+        assert_eq!(reopened.current_bound_count, 0);
+        assert_eq!(reopened.current_live_count, 0);
+        assert_eq!(
+            fenced_mutation_roster_admit_sync(
+                &conn,
+                identity(),
+                &fenced_mutation_roster_admission_for_epoch(9_999, 2),
+                after_retention,
+            )
+            .expect("next epoch has admission headroom")
+            .status
+            .phase(),
+            FencedMutationRosterPhase::PollAdmitted,
+        );
+    }
+
+    #[test]
+    fn roster_history_maintenance_keeps_live_or_not_yet_retained_entries() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let admission = fenced_mutation_roster_admission(0x82, 0x92);
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(
+                    1,
+                    fenced_transition_request(0xFA, "roster-live-maintenance-owner"),
+                    timestamp(1),
+                ),
+                fenced_mutation_roster_admission_entry(2, 0xFA, admission),
+            ],
+        )
+        .expect("live roster receipt");
+        let before = read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+            .expect("live history");
+        assert_eq!(
+            maintain_fenced_mutation_roster_history_sync(
+                &conn,
+                identity(),
+                roster_history_expectation(&before),
+                Timestamp::from_str("2026-08-22T00:00:00Z").expect("after retention"),
+            )
+            .expect("live maintenance result"),
+            FencedMutationRosterMaintenanceResult::Noop,
+        );
+        assert_eq!(
+            read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+                .expect("history after live maintenance"),
+            before,
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_fenced_mutation_roster_operations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("live receipt survives"),
+            1,
+        );
     }
 
     #[test]

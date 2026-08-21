@@ -1380,7 +1380,10 @@ impl fmt::Debug for FencedMutationRosterProfile {
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub struct FencedMutationRosterHistoryState {
     /// Active history epoch.
-    pub active_epoch: u64,
+    ///
+    /// This is temporarily absent while a bounded terminal-reclaim batch is
+    /// in progress; callers must carry that exact state into the next CAS.
+    pub active_epoch: Option<u64>,
     /// Highest retired epoch.
     pub retired_through: u64,
     /// Lifecycle generation.

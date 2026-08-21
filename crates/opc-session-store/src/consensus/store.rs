@@ -1658,6 +1658,100 @@ impl ConsensusSessionStore {
         }
     }
 
+    /// Read roster terminal-history state at a linearized exact voter scope.
+    ///
+    /// The result is the complete compare-and-set snapshot accepted by
+    /// [`Self::maintain_fenced_mutation_roster_history`]. This state-process
+    /// API is deliberately not a consumer RPC or forwarding operation.
+    pub async fn fenced_mutation_roster_history_state(
+        &self,
+    ) -> Result<FencedMutationRosterHistoryState, StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.require_fenced_mutation_roster_capability_before(deadline)
+            .await?;
+        self.logical_read_time_before(None, deadline).await?;
+        let (authority_identity, _) = self.current_scope()?;
+        let state = self
+            .inner
+            .backend
+            .consensus_fenced_mutation_roster_history_state(
+                self.inner.storage_identity,
+                authority_identity,
+            )
+            .await?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        if !self
+            .current_scope()
+            .is_ok_and(|(current_identity, _)| current_identity == authority_identity)
+        {
+            return Err(consensus_unavailable());
+        }
+        Ok(state)
+    }
+
+    /// Run one deterministic, bounded roster-history maintenance step as the
+    /// local operator authority.
+    ///
+    /// This is intentionally absent from consumer and remote-forwarding
+    /// surfaces. It can only originate on the current local leader after a
+    /// durable fixed-quorum admission; raw maintenance intents are rejected
+    /// unless this boundary supplies the internal operator marker.
+    pub async fn maintain_fenced_mutation_roster_history(
+        &self,
+        expected_state: FencedMutationRosterHistoryState,
+    ) -> Result<FencedMutationRosterHistoryState, StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        if self.inner.raft.metrics().borrow().current_leader != Some(self.inner.local_node_id) {
+            return Err(consensus_unavailable());
+        }
+        let reply = self
+            .apply_on_local_leader_inner(
+                ForwardMutationRequest {
+                    request_id: SessionConsensusRequestId::new(),
+                    intent: SessionMutationIntent::MaintainFencedMutationRosterHistory {
+                        expected_generation: expected_state.generation,
+                        expected_active_epoch: expected_state.active_epoch,
+                        expected_retired_through: expected_state.retired_through,
+                        expected_bound_entries: expected_state.bound,
+                        expected_live_entries: expected_state.live,
+                    },
+                    required_consumer_scope: ForwardConsumerScope::Internal,
+                },
+                self.inner.local_node_id,
+                deadline,
+                true,
+            )
+            .await;
+        match reply {
+            ForwardMutationReply::Applied(response)
+                if matches!(response.result, Ok(SessionMutationOutcome::Unit)) =>
+            {
+                self.inner
+                    .backend
+                    .consensus_fenced_mutation_roster_history_state(
+                        self.inner.storage_identity,
+                        self.current_scope().map_err(|_| consensus_unavailable())?.0,
+                    )
+                    .await
+            }
+            ForwardMutationReply::Applied(response) => match response.result {
+                Err(error) => Err(error),
+                Ok(_) => Err(consensus_unavailable()),
+            },
+            ForwardMutationReply::NotLeader { .. }
+            | ForwardMutationReply::Unavailable
+            | ForwardMutationReply::RecordExpiryPreflight(_) => Err(consensus_unavailable()),
+        }
+    }
+
     async fn consumer_scope_before(
         &self,
         deadline: tokio::time::Instant,
@@ -3336,6 +3430,7 @@ impl ConsensusSessionStore {
         let intent = match request.intent {
             intent @ SessionMutationIntent::FinalizeOperatorRecovery { .. }
             | intent @ SessionMutationIntent::MaintainFencedTransitionV2History { .. }
+            | intent @ SessionMutationIntent::MaintainFencedMutationRosterHistory { .. }
                 if authority.allows_operator_recovery =>
             {
                 intent
@@ -4531,6 +4626,10 @@ fn committed_response_matches_intent(
         | (
             Ok(SessionMutationOutcome::Unit),
             SessionMutationIntent::MaintainFencedTransitionV2History { .. },
+        )
+        | (
+            Ok(SessionMutationOutcome::Unit),
+            SessionMutationIntent::MaintainFencedMutationRosterHistory { .. },
         ) => true,
         (
             Ok(SessionMutationOutcome::ConsumerRecord(record)),
@@ -4817,6 +4916,9 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
                     | StoreError::FencedTransitionStorageExhausted
             )
         }
+        SessionMutationIntent::MaintainFencedMutationRosterHistory { .. } => {
+            matches!(error, StoreError::InvalidKey(_))
+        }
     }
 }
 
@@ -4931,6 +5033,7 @@ fn validate_consensus_intent_with_recovery(
         intent,
         SessionMutationIntent::FinalizeOperatorRecovery { .. }
             | SessionMutationIntent::MaintainFencedTransitionV2History { .. }
+            | SessionMutationIntent::MaintainFencedMutationRosterHistory { .. }
     ) && !allow_operator_recovery
     {
         return Err(StoreError::CapabilityNotSupported(
@@ -4963,6 +5066,28 @@ fn validate_consensus_intent_with_recovery(
         {
             return Err(StoreError::InvalidKey(
                 "fenced_transition_v2_expected_bound_entries_invalid".into(),
+            ));
+        }
+    }
+    if let SessionMutationIntent::MaintainFencedMutationRosterHistory {
+        expected_bound_entries,
+        expected_live_entries,
+        ..
+    } = intent
+    {
+        let bound_valid = usize::try_from(*expected_bound_entries)
+            .ok()
+            .is_some_and(|entries| {
+                entries <= crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY
+            });
+        let live_valid = usize::try_from(*expected_live_entries)
+            .ok()
+            .is_some_and(|entries| {
+                entries <= crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_MAX_LIVE
+            });
+        if !bound_valid || !live_valid || expected_live_entries > expected_bound_entries {
+            return Err(StoreError::InvalidKey(
+                "fenced_mutation_roster_maintenance_counts_invalid".into(),
             ));
         }
     }
@@ -7462,7 +7587,7 @@ mod membership_tests {
                 .await,
             SessionConsumerV3Response::FencedMutationRosterHistoryState(Ok(
                 FencedMutationRosterHistoryState {
-                    active_epoch: 1,
+                    active_epoch: Some(1),
                     retired_through: 0,
                     generation: 0,
                     bound: 0,
@@ -7733,6 +7858,20 @@ mod membership_tests {
                 "fenced_transition_v2_expected_bound_entries_invalid".into()
             ))
         );
+        let roster_maintenance = SessionMutationIntent::MaintainFencedMutationRosterHistory {
+            expected_generation: 0,
+            expected_active_epoch: None,
+            expected_retired_through: 0,
+            expected_bound_entries: 0,
+            expected_live_entries: 0,
+        };
+        assert_eq!(
+            validate_consensus_intent(&roster_maintenance),
+            Err(StoreError::CapabilityNotSupported(
+                "operator_recovery_requires_local_admin_authority".into()
+            ))
+        );
+        assert!(validate_consensus_intent_with_recovery(&roster_maintenance, true).is_ok());
     }
 
     #[test]

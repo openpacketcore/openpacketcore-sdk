@@ -98,7 +98,8 @@ pub const SESSION_CONSENSUS_FENCED_MUTATION_ROSTER_APPLIED_DIGEST_SCHEMA_DESCRIP
     "timestamp=unix-secs:i64be|nanos:u32be;identity=cluster:bytes32|configuration:bytes32|epoch:u64be;",
     "intent=admit(tag=1,admission:canonical-framed,scope:identity,voters:bytes32,profile:bytes32)|",
     "terminalize(tag=2,admission:canonical-framed,terminal:canonical-framed,checkpoint:len32+bytes)|",
-    "authorized(tag=3,origin:u64be,authority:identity,mutation:intent)"
+    "authorized(tag=3,origin:u64be,authority:identity,mutation:intent)|",
+    "maintain(tag=4,generation:u64be,active:option-tag-u8+epoch:u64be,retired:u64be,bound:u64be,live:u64be)"
 );
 /// Frozen command-wire profile for roster intents appended after every V1/V2
 /// discriminant. The protected domain bodies retain their own explicit framed
@@ -107,7 +108,7 @@ pub const SESSION_CONSENSUS_FENCED_MUTATION_ROSTER_COMMAND_WIRE_SCHEMA_DESCRIPTO
     "wire-profile=1;raft-rpc-codec=postcard;durable-log-codec=serde-json;",
     "command-fields=schema-version,identity,request-id,logical-time,intent;",
     "intent-discriminants=authorized:15|fenced-v1:16|activate-v1:17|fenced-v2:18|activate-v2:19|maintain-v2:20|",
-    "roster-admit:21|roster-terminalize:22;",
+    "roster-admit:21|roster-terminalize:22|roster-maintain:23;",
     "roster-admission=canonical-framed;roster-terminal=canonical-framed;checkpoint=len32+protected-bytes;",
     "roster-admit-certificate=scope:identity|voters:bytes32|profile:bytes32;authorized=origin:node-id|authority:identity|box(intent)"
 );
@@ -429,6 +430,24 @@ pub enum SessionMutationIntent {
         /// these only with the exact terminal transition, never on admission.
         protected_checkpoint: FencedMutationRosterProtectedPlan,
     },
+    /// SDK-internal bounded roster terminal-history maintenance.
+    ///
+    /// This replicated compare-and-set command is admitted only through the
+    /// local operator authority. It retires an entirely terminal epoch after
+    /// its exact retention window and reclaims at most the profile batch.
+    #[doc(hidden)]
+    MaintainFencedMutationRosterHistory {
+        /// Durable roster history generation observed before maintenance.
+        expected_generation: u64,
+        /// Active roster history epoch observed before maintenance.
+        expected_active_epoch: Option<u64>,
+        /// Highest permanently retired roster history epoch observed before maintenance.
+        expected_retired_through: u64,
+        /// Bound roster receipts observed before maintenance.
+        expected_bound_entries: u64,
+        /// Nonterminal roster receipts observed before maintenance.
+        expected_live_entries: u64,
+    },
 }
 
 impl fmt::Debug for SessionMutationIntent {
@@ -563,7 +582,9 @@ impl SessionMutationIntent {
     fn contains_fenced_mutation_roster(&self) -> bool {
         matches!(
             self,
-            Self::AdmitFencedMutationRoster { .. } | Self::TerminalizeFencedMutationRoster { .. }
+            Self::AdmitFencedMutationRoster { .. }
+                | Self::TerminalizeFencedMutationRoster { .. }
+                | Self::MaintainFencedMutationRosterHistory { .. }
         ) || matches!(self, Self::Authorized { mutation, .. } if mutation.contains_fenced_mutation_roster())
     }
 }
@@ -633,6 +654,26 @@ fn append_roster_applied_intent(
             out.extend_from_slice(&origin.get().to_be_bytes());
             append_v2_applied_identity(out, *authority_identity);
             append_roster_applied_intent(out, mutation)?;
+        }
+        SessionMutationIntent::MaintainFencedMutationRosterHistory {
+            expected_generation,
+            expected_active_epoch,
+            expected_retired_through,
+            expected_bound_entries,
+            expected_live_entries,
+        } => {
+            out.push(4);
+            out.extend_from_slice(&expected_generation.to_be_bytes());
+            match expected_active_epoch {
+                None => out.push(0),
+                Some(epoch) => {
+                    out.push(1);
+                    out.extend_from_slice(&epoch.to_be_bytes());
+                }
+            }
+            out.extend_from_slice(&expected_retired_through.to_be_bytes());
+            out.extend_from_slice(&expected_bound_entries.to_be_bytes());
+            out.extend_from_slice(&expected_live_entries.to_be_bytes());
         }
         _ => {
             return Err(StoreError::Serialization(
@@ -1048,6 +1089,39 @@ mod tests {
         .expect("V2 request")
     }
 
+    fn roster_digest_admission() -> FencedMutationRosterAdmission {
+        let member = crate::fenced_mutation_roster::FencedMutationRosterMember::new(
+            crate::fenced_mutation_roster::FencedMutationRosterOrdinal::new(0)
+                .expect("roster ordinal"),
+            [0xE1; 16],
+            crate::fenced_mutation_roster::FencedMutationRosterDescriptor::new(vec![0xE2])
+                .expect("roster descriptor"),
+            1,
+            1,
+            crate::fenced_mutation_roster::FencedMutationRosterDisposition::Pending,
+            crate::fenced_mutation_roster::FencedMutationRosterAdoption::Unreconciled,
+        )
+        .expect("roster member");
+        FencedMutationRosterAdmission::new(
+            1,
+            crate::fenced_mutation_roster::FencedMutationRosterOperationId::new([0xE1; 16])
+                .expect("roster operation"),
+            crate::fenced_mutation_roster::FencedMutationRosterScope::from_digest([0xE3; 32]),
+            crate::fenced_mutation_roster::FencedMutationRosterFenceIntent::new(
+                OwnerId::new("roster-digest-owner").expect("roster owner"),
+                FenceToken::new(1),
+            ),
+            Generation::new(1),
+            crate::fenced_mutation_roster::FencedMutationRosterMembers::new([member])
+                .expect("roster members"),
+            crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan::new(
+                vec![0xE2].into_boxed_slice(),
+            )
+            .expect("roster plan"),
+        )
+        .expect("roster admission")
+    }
+
     fn v2_digest_variant_requests() -> [FencedTransitionV2Request; 4] {
         let key = legacy_key();
         let owner = OwnerId::new("v2-digest-owner").expect("owner");
@@ -1122,7 +1196,7 @@ mod tests {
         // accidental insertion into that sequence visible in review.
         assert!(
             SESSION_CONSENSUS_FENCED_MUTATION_ROSTER_COMMAND_WIRE_SCHEMA_DESCRIPTOR
-                .contains("roster-admit:21|roster-terminalize:22")
+                .contains("roster-admit:21|roster-terminalize:22|roster-maintain:23")
         );
         assert!(
             !SESSION_CONSENSUS_FENCED_MUTATION_ROSTER_COMMAND_WIRE_SCHEMA_DESCRIPTOR
@@ -1138,6 +1212,33 @@ mod tests {
             fenced_mutation_roster_voter_set_digest(identity, &voters),
             fenced_transition_voter_set_digest(identity, &voters),
             "an identical topology must not borrow V1/V2 certificate material"
+        );
+    }
+
+    #[test]
+    fn roster_authorized_applied_digest_preserves_the_existing_semantic_encoding() {
+        let identity = legacy_identity();
+        let command = v2_digest_command(SessionMutationIntent::Authorized {
+            origin: SessionConsensusNodeId::new(9).expect("origin"),
+            authority_identity: identity,
+            mutation: Box::new(SessionMutationIntent::AdmitFencedMutationRoster {
+                admission: Box::new(roster_digest_admission()),
+                scope_identity: identity,
+                voter_set_digest: [0xE4; 32],
+                profile_digest: [0xE5; 32],
+            }),
+        });
+        let digest = command
+            .calculate_applied_digest(
+                5,
+                SessionConsensusEntryDigest::from_bytes([0xD3; 32]),
+                legacy_time(41),
+            )
+            .expect("roster authorized digest");
+        assert_eq!(
+            hex(digest.as_bytes()),
+            "8ec4996723aad35348f3f8724f732f2625eed2d64dc4e81448c58f9b23406eab",
+            "the existing authorized roster intent must retain its historical tag and bytes"
         );
     }
 
