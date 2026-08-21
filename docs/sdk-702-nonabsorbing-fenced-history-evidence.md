@@ -166,12 +166,30 @@ ACTUAL (passed, focused evidence):
   snapshot-install/reclaim/profile/topology cases listed above: passed in their
   owning source suites.
 
-PENDING RELEASE SCALE (not yet run; no outcome or metrics are claimed):
-  cargo test --locked -p opc-session-store --test fenced_transition_v2_qualification --all-features -- --ignored --exact sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity --nocapture
-PENDING result/metrics: elapsed, peak RSS, committed unique transitions,
-                        active/retired epoch, reclaimed rows, database bytes,
-                        snapshot bytes, restart/snapshot-recovery result.
+ACTUAL (passed, release scale at `cc9ac896858d64bc6f6a5424b094fb361a57caea`,
+tree `fbccc8fd5546c6bdefc6aee54bfe0d36b1012f63`):
+  cargo test --locked -p opc-session-store --test fenced_transition_v2_qualification --all-features sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity -- --ignored --exact --nocapture
+  committed unique transitions: 131,073
+  epoch-1 bindings admitted: 131,072
+  deterministic one-over rejections without business-state effect: 1
+  reclaimed bindings: 131,072 in ordered 1,024-row batches
+  successor-epoch transitions committed after reclamation: 1
+  transient exact-ID/body retries: 2,214
+  database envelope: 2,182,756,256 bytes
+  snapshot envelope: 2,077,053,072 bytes
+  elapsed: 10,637.78 seconds (2:57:18 wall clock)
+  peak RSS: 308,544 KiB
+  CPU: 260 percent
+  delayed exact retry and same-ID/different-body conflict: passed before,
+    during, and after physical reclamation
+  process exit: 0
 ```
+
+The complete 33-line output is retained on PR #704. Its 1,601 bytes have
+SHA-256 `910c98af114164cbee5ce740fab69708aef4f0713d6db847280c6af44040afe4`.
+The database and snapshot measurements are envelope sizes, not steady-state
+resident memory and not a production sizing recommendation. They bound this
+unoptimized qualification workload and make its storage cost explicit.
 
 The qualification workload records the machine/CI runner, command, commit,
 elapsed time, peak RSS, and the durable counters above. It must not substitute
