@@ -8,6 +8,7 @@
 use std::{error::Error, fmt};
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 
 use crate::fenced_mutation_roster::FencedMutationRosterOrdinal;
 use crate::{
@@ -19,6 +20,59 @@ use crate::{
 
 /// The sole immutable managed-provider-job protocol revision.
 pub const MANAGED_PROVIDER_JOB_V5_REVISION: u16 = 5;
+
+const MANAGED_PROVIDER_JOB_RECEIPT_DIGEST_DOMAIN: &[u8] =
+    b"opc-session-store/managed-provider-job/verified-receipt/v1\0";
+
+/// Private, verifier-issued commitment to one conclusive provider receipt.
+///
+/// It is deliberately neither serializable nor constructible by callers. The
+/// store persists only its fixed digest and typed outcome; opaque provider
+/// evidence never crosses the durable consensus boundary.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // consumed by the crate-private consensus adapter.
+pub struct ManagedProviderJobVerifiedReceipt {
+    digest: [u8; 32],
+    outcome: FencedMutationRosterProviderOutcome,
+}
+
+impl ManagedProviderJobVerifiedReceipt {
+    fn issue(
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+        attestation: &FencedMutationRosterMemberAttestation,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(MANAGED_PROVIDER_JOB_RECEIPT_DIGEST_DOMAIN);
+        hasher.update(context.attestation_commitment());
+        hasher.update([match attestation.outcome() {
+            FencedMutationRosterProviderOutcome::AppliedExecuted => 0,
+            FencedMutationRosterProviderOutcome::AppliedAdopted => 1,
+            FencedMutationRosterProviderOutcome::NotAppliedReconciled => 2,
+            FencedMutationRosterProviderOutcome::CompensatedReconciled => 3,
+        }]);
+        hasher.update(attestation.evidence());
+        Self {
+            digest: hasher.finalize().into(),
+            outcome: attestation.outcome(),
+        }
+    }
+
+    #[allow(dead_code)] // consumed by the crate-private consensus adapter.
+    pub(crate) const fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+
+    #[allow(dead_code)] // consumed by the crate-private consensus adapter.
+    pub(crate) const fn outcome(self) -> FencedMutationRosterProviderOutcome {
+        self.outcome
+    }
+}
+
+impl fmt::Debug for ManagedProviderJobVerifiedReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ManagedProviderJobVerifiedReceipt(<redacted>)")
+    }
+}
 
 /// Opaque authority to mutate one managed-provider-job scope.
 ///
@@ -336,7 +390,7 @@ pub trait ManagedProviderJobStore: Send + Sync {
     async fn record_verified_attestation(
         &self,
         id: ManagedProviderJobId,
-        outcome: FencedMutationRosterProviderOutcome,
+        receipt: ManagedProviderJobVerifiedReceipt,
     ) -> Result<ManagedProviderJobStatus, Self::Error>;
 
     /// Build terminal state from private durable receipts using the existing terminal CAS.
@@ -483,6 +537,11 @@ where
                 if outcome != attestation.outcome() {
                     return Err(ManagedProviderJobError::AttestationRejected);
                 }
+                let receipt = ManagedProviderJobVerifiedReceipt::issue(context, &attestation);
+                self.store
+                    .record_verified_attestation(id, receipt)
+                    .await
+                    .map_err(|_| ManagedProviderJobError::Unavailable)?;
                 match outcome {
                     FencedMutationRosterProviderOutcome::NotAppliedReconciled => {
                         self.store
@@ -493,16 +552,11 @@ where
                     }
                     FencedMutationRosterProviderOutcome::AppliedExecuted
                     | FencedMutationRosterProviderOutcome::AppliedAdopted
-                    | FencedMutationRosterProviderOutcome::CompensatedReconciled => {
-                        self.store
-                            .record_verified_attestation(id, outcome)
-                            .await
-                            .map_err(|_| ManagedProviderJobError::Unavailable)?;
-                        self.store
-                            .finalize_job(admission)
-                            .await
-                            .map_err(|_| ManagedProviderJobError::Unavailable)
-                    }
+                    | FencedMutationRosterProviderOutcome::CompensatedReconciled => self
+                        .store
+                        .finalize_job(admission)
+                        .await
+                        .map_err(|_| ManagedProviderJobError::Unavailable),
                 }
             }
             ManagedProviderMemberStatusEvidence::Inconclusive => {
@@ -533,7 +587,8 @@ where
         if outcome != attestation.outcome() {
             return Err(ManagedProviderJobError::AttestationRejected);
         }
-        match self.store.record_verified_attestation(id, outcome).await {
+        let receipt = ManagedProviderJobVerifiedReceipt::issue(context, &attestation);
+        match self.store.record_verified_attestation(id, receipt).await {
             Ok(_) => self
                 .store
                 .finalize_job(admission)
@@ -638,7 +693,7 @@ mod tests {
         async fn record_verified_attestation(
             &self,
             _id: ManagedProviderJobId,
-            _outcome: FencedMutationRosterProviderOutcome,
+            _receipt: ManagedProviderJobVerifiedReceipt,
         ) -> Result<ManagedProviderJobStatus, Self::Error> {
             let mut state = self.0.lock().expect("test state lock");
             state.phase = ManagedProviderJobMemberPhase::Verified;
