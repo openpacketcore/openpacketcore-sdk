@@ -1630,6 +1630,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
 
     use futures_util::future::BoxFuture;
@@ -1705,6 +1706,17 @@ mod tests {
         }
     }
 
+    fn test_scope() -> SessionConsumerScope {
+        let cluster = ConsensusClusterId::new("managed-provider-network-test")
+            .expect("test cluster identity");
+        let epoch = ConsensusConfigurationEpoch::new(1).expect("test epoch");
+        SessionConsumerScope::new(SessionConsensusIdentity::new(
+            cluster,
+            derive_configuration_id(cluster, epoch, &[]),
+            epoch,
+        ))
+    }
+
     struct NoopNetworkFacade;
 
     #[async_trait]
@@ -1730,6 +1742,33 @@ mod tests {
                 ManagedProviderJobMode::ManagedV5,
                 ManagedProviderJobMemberPhase::Established,
             ))
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingNetworkFacade {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ManagedProviderJobNetworkFacade for CountingNetworkFacade {
+        async fn run_member(
+            &self,
+            _: FencedMutationRosterAdmission,
+            _: Box<[u8]>,
+            _: FencedMutationRosterOrdinal,
+        ) -> Result<ManagedProviderJobStatus, ManagedProviderJobError> {
+            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(ManagedProviderJobError::Unavailable)
+        }
+
+        async fn job_status(
+            &self,
+            _: FencedMutationRosterAdmission,
+            _: FencedMutationRosterOrdinal,
+        ) -> Result<ManagedProviderJobStatus, ManagedProviderJobError> {
+            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(ManagedProviderJobError::Unavailable)
         }
     }
 
@@ -1853,14 +1892,7 @@ mod tests {
             "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/voter-1",
             "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/voter-2",
         ];
-        let cluster = ConsensusClusterId::new("managed-provider-network-test")
-            .expect("test cluster identity");
-        let epoch = ConsensusConfigurationEpoch::new(1).expect("test epoch");
-        let scope = SessionConsumerScope::new(SessionConsensusIdentity::new(
-            cluster,
-            derive_configuration_id(cluster, epoch, &[]),
-            epoch,
-        ));
+        let scope = test_scope();
         let facade = Arc::new(NoopNetworkFacade);
         let client_spiffe = SpiffeId::new(client_identity).expect("client SPIFFE identity");
         let mut handles = Vec::new();
@@ -1922,5 +1954,43 @@ mod tests {
         for handle in handles {
             handle.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_authenticated_frame_makes_zero_service_calls() {
+        let pki = TestPki::new();
+        let scope = test_scope();
+        let client_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/client";
+        let voter_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/voter";
+        let service = Arc::new(CountingNetworkFacade::default());
+        let (handle, address) = ManagedProviderJobServer::for_test(
+            service.clone(),
+            pki.server_config(voter_identity),
+            scope,
+            SpiffeId::new(voter_identity).expect("voter SPIFFE identity"),
+            SpiffeId::new(client_identity).expect("client SPIFFE identity"),
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("real host-local listener");
+        let client = pki.client_config(client_identity);
+        let mut config = client.rustls_config().as_ref().clone();
+        config.alpn_protocols = vec![MANAGED_PROVIDER_JOB_ALPN.to_vec()];
+        let stream = TcpStream::connect(address).await.expect("loopback connect");
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(ServerName::IpAddress(address.ip().into()), stream)
+            .await
+            .expect("real rustls mTLS handshake");
+        write_raw(
+            &mut tls,
+            br#"{"kind":"unexpected","nested":{"forbidden":true}}"#,
+        )
+        .await
+        .expect("malformed frame written");
+        let _ = tokio::time::timeout(Duration::from_millis(100), tls.read_u8()).await;
+        assert_eq!(service.calls.load(AtomicOrdering::Relaxed), 0);
+        handle.shutdown().await;
     }
 }
