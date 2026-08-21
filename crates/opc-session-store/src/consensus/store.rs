@@ -36,6 +36,7 @@ use super::storage::{self, SessionConsensusStorageError};
 use super::types::{
     fenced_mutation_roster_outer_request_id, fenced_mutation_roster_terminal_outer_request_id,
     fenced_mutation_roster_voter_set_digest, fenced_transition_voter_set_digest,
+    ManagedProviderJobMutationOutcome,
 };
 use super::{
     SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusIdentity,
@@ -95,9 +96,10 @@ use crate::fenced_transition::{
 };
 use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::managed_provider_job::{
-    ManagedProviderJobAuthority, ManagedProviderJobEffectStart, ManagedProviderJobId,
-    ManagedProviderJobMemberPhase, ManagedProviderJobMode, ManagedProviderJobStatus,
-    ManagedProviderJobStore, ManagedProviderJobVerifiedReceipt,
+    ManagedProviderJobAuthority, ManagedProviderJobEffectStart, ManagedProviderJobFacade,
+    ManagedProviderJobId, ManagedProviderJobMemberPhase, ManagedProviderJobMode,
+    ManagedProviderJobRemoteProvider, ManagedProviderJobStatus, ManagedProviderJobStore,
+    ManagedProviderJobVerifiedReceipt,
 };
 use crate::model::{OwnerId, SessionKey};
 use crate::readiness::{
@@ -1130,6 +1132,39 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
 }
 
 impl ConsensusSessionStore {
+    /// Create the only public managed-provider execution surface.
+    ///
+    /// This factory belongs at authenticated server composition: `scope`,
+    /// `worker`, and both commitments must come from that layer, never from a
+    /// request. The returned facade owns these fixed dependencies and exposes
+    /// no authority token or component-selection API.
+    pub fn managed_provider_job_facade<P, V>(
+        &self,
+        scope: SessionConsumerScope,
+        worker: SessionConsumerIdentity,
+        worker_identity_commitment: [u8; 32],
+        verifier_identity_commitment: [u8; 32],
+        provider: P,
+        verifier: V,
+    ) -> Result<ManagedProviderJobFacade, StoreError>
+    where
+        P: ManagedProviderJobRemoteProvider + 'static,
+        V: FencedMutationRosterMemberAttestationVerifier + 'static,
+    {
+        let authority = Self::managed_provider_job_authority(
+            scope,
+            worker_identity_commitment,
+            verifier_identity_commitment,
+        )?;
+        Ok(ManagedProviderJobFacade::new(
+            self.clone(),
+            provider,
+            verifier,
+            worker,
+            authority,
+        ))
+    }
+
     /// Mint the opaque managed-job authority only at authenticated server
     /// composition.  The worker and verifier commitments are never sourced
     /// from a managed request body.
@@ -5436,6 +5471,60 @@ fn committed_response_matches_intent(
             Ok(SessionMutationOutcome::FencedMutationRosterV4VerifierDispatchReserved(_)),
             SessionMutationIntent::ReserveFencedMutationRosterV4VerifierDispatch { .. },
         ) => true,
+        (
+            Ok(SessionMutationOutcome::ManagedProviderJob(outcome)),
+            intent @ (SessionMutationIntent::EnsureManagedProviderJob { .. }
+            | SessionMutationIntent::StartManagedProviderMember { .. }
+            | SessionMutationIntent::RecordManagedProviderReceipt { .. }
+            | SessionMutationIntent::RequireManagedProviderReconciliation { .. }
+            | SessionMutationIntent::AbortManagedProviderNotApplied { .. }
+            | SessionMutationIntent::FinalizeManagedProviderJob { .. }),
+        ) => managed_provider_outcome_matches_intent(intent, outcome),
+        _ => false,
+    }
+}
+
+/// Match the complete fixed-width outcome family for every managed command.
+/// This gate runs after a Raft commit before a public store method releases
+/// the outcome to its caller, so accepting only the enum variant would turn a
+/// valid commit into a spurious unavailable result (or, worse, authorize I/O
+/// from a mismatched result).
+fn managed_provider_outcome_matches_intent(
+    intent: &SessionMutationIntent,
+    outcome: &ManagedProviderJobMutationOutcome,
+) -> bool {
+    let valid_mode_phase =
+        |mode, phase| matches!((mode, phase), (0, 0) | (1, 0..=5) | (2, 0..=5) | (3, 4));
+    if !valid_mode_phase(outcome.mode, outcome.phase) {
+        return false;
+    }
+    match intent {
+        SessionMutationIntent::EnsureManagedProviderJob { .. } => {
+            !outcome.execute && matches!((outcome.mode, outcome.phase), (1, 0) | (2, 0) | (3, 4))
+        }
+        SessionMutationIntent::StartManagedProviderMember { .. } => {
+            (outcome.execute && (outcome.mode, outcome.phase) == (2, 1))
+                || (!outcome.execute
+                    && matches!(
+                        (outcome.mode, outcome.phase),
+                        (1, 0..=5) | (2, 1..=5) | (3, 4)
+                    ))
+        }
+        SessionMutationIntent::RecordManagedProviderReceipt { .. } => {
+            !outcome.execute
+                && matches!((outcome.mode, outcome.phase), (2, 2) | (1, 0..=5) | (3, 4))
+        }
+        SessionMutationIntent::RequireManagedProviderReconciliation { .. } => {
+            !outcome.execute
+                && matches!((outcome.mode, outcome.phase), (2, 3) | (1, 0..=5) | (3, 4))
+        }
+        SessionMutationIntent::AbortManagedProviderNotApplied { .. } => {
+            !outcome.execute
+                && matches!((outcome.mode, outcome.phase), (2, 5) | (1, 0..=5) | (3, 4))
+        }
+        SessionMutationIntent::FinalizeManagedProviderJob { .. } => {
+            !outcome.execute && matches!((outcome.mode, outcome.phase), (3, 4) | (1, 0..=5))
+        }
         _ => false,
     }
 }
@@ -8597,6 +8686,113 @@ mod membership_tests {
                 .expect("roster protected result"),
         )
         .expect("roster admission terminal result")
+    }
+
+    #[tokio::test]
+    async fn managed_provider_postcommit_gate_accepts_only_its_exact_command_outcomes() {
+        let (_directory, _store, scope, identity, _key, _lease) = consumer_boundary_store().await;
+        let admission = consumer_v3_roster_admission(scope, &identity);
+        let checkpoint = FencedMutationRosterProtectedPlan::new(vec![0x75].into_boxed_slice())
+            .expect("managed checkpoint");
+        let worker = [0x76; 32];
+        let verifier = [0x77; 32];
+        let ordinal = admission.members().as_slice()[0].ordinal().get();
+        let intents = [
+            (
+                SessionMutationIntent::EnsureManagedProviderJob {
+                    admission: Box::new(admission.clone()),
+                    protected_checkpoint: checkpoint,
+                    worker_digest: worker,
+                    verifier_digest: verifier,
+                },
+                ManagedProviderJobMutationOutcome {
+                    mode: 2,
+                    phase: 0,
+                    execute: false,
+                },
+            ),
+            (
+                SessionMutationIntent::StartManagedProviderMember {
+                    admission: Box::new(admission.clone()),
+                    ordinal,
+                    worker_digest: worker,
+                },
+                ManagedProviderJobMutationOutcome {
+                    mode: 2,
+                    phase: 1,
+                    execute: true,
+                },
+            ),
+            (
+                SessionMutationIntent::RecordManagedProviderReceipt {
+                    admission: Box::new(admission.clone()),
+                    ordinal,
+                    worker_digest: worker,
+                    verifier_digest: verifier,
+                    receipt_digest: [0x78; 32],
+                    outcome: 0,
+                },
+                ManagedProviderJobMutationOutcome {
+                    mode: 2,
+                    phase: 2,
+                    execute: false,
+                },
+            ),
+            (
+                SessionMutationIntent::RequireManagedProviderReconciliation {
+                    admission: Box::new(admission.clone()),
+                    ordinal,
+                    worker_digest: worker,
+                },
+                ManagedProviderJobMutationOutcome {
+                    mode: 2,
+                    phase: 3,
+                    execute: false,
+                },
+            ),
+            (
+                SessionMutationIntent::AbortManagedProviderNotApplied {
+                    admission: Box::new(admission.clone()),
+                    ordinal,
+                    worker_digest: worker,
+                },
+                ManagedProviderJobMutationOutcome {
+                    mode: 2,
+                    phase: 5,
+                    execute: false,
+                },
+            ),
+            (
+                SessionMutationIntent::FinalizeManagedProviderJob {
+                    admission: Box::new(admission),
+                    worker_digest: worker,
+                },
+                ManagedProviderJobMutationOutcome {
+                    mode: 3,
+                    phase: 4,
+                    execute: false,
+                },
+            ),
+        ];
+        for (intent, outcome) in intents {
+            assert!(managed_provider_outcome_matches_intent(&intent, &outcome));
+            let mismatched = if outcome.execute {
+                ManagedProviderJobMutationOutcome {
+                    mode: 2,
+                    phase: 0,
+                    execute: true,
+                }
+            } else {
+                ManagedProviderJobMutationOutcome {
+                    execute: true,
+                    ..outcome
+                }
+            };
+            assert!(
+                !managed_provider_outcome_matches_intent(&intent, &mismatched),
+                "execute is an I/O permit only for Ready -> EffectStarted"
+            );
+        }
     }
 
     struct ConsumerV3AppliedRosterProvider;

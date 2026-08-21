@@ -5,7 +5,7 @@
 //! port.  The port separates durable effect-start recording from provider I/O,
 //! so a restarted owner reconciles an uncertain effect instead of replaying it.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -31,7 +31,7 @@ const MANAGED_PROVIDER_JOB_RECEIPT_DIGEST_DOMAIN: &[u8] =
 /// evidence never crosses the durable consensus boundary.
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // consumed by the crate-private consensus adapter.
-pub struct ManagedProviderJobVerifiedReceipt {
+pub(crate) struct ManagedProviderJobVerifiedReceipt {
     digest: [u8; 32],
     outcome: FencedMutationRosterProviderOutcome,
 }
@@ -86,7 +86,7 @@ impl fmt::Debug for ManagedProviderJobVerifiedReceipt {
 /// commitment: callers can pass it to the coordinator, but cannot select a
 /// worker or widen its authority.
 #[derive(Clone, Copy)]
-pub struct ManagedProviderJobAuthority {
+pub(crate) struct ManagedProviderJobAuthority {
     scope: SessionConsumerScope,
     worker_identity_commitment: [u8; 32],
     verifier_identity_commitment: [u8; 32],
@@ -366,7 +366,7 @@ pub trait ManagedProviderJobRemoteProvider: Send + Sync {
 /// Receipt bytes remain private to the implementation; the public status only
 /// reports phase and mode.
 #[async_trait]
-pub trait ManagedProviderJobStore: Send + Sync {
+pub(crate) trait ManagedProviderJobStore: Send + Sync {
     /// Store failure, intentionally rendered only as `Unavailable` by the coordinator.
     type Error: Send + Sync + 'static;
 
@@ -408,6 +408,7 @@ pub trait ManagedProviderJobStore: Send + Sync {
     ) -> Result<ManagedProviderJobStatus, Self::Error>;
 
     /// Recover only already-owned nonterminal jobs.  It never creates jobs.
+    #[allow(dead_code)] // reserved for the sealed server recovery route.
     async fn recover_owned_jobs(
         &self,
         authority: ManagedProviderJobAuthority,
@@ -428,9 +429,118 @@ pub trait ManagedProviderJobStore: Send + Sync {
     ) -> Result<ManagedProviderJobStatus, Self::Error>;
 }
 
+/// Cloneable, server-owned entry point for managed provider jobs.
+///
+/// The facade closes over the authenticated consumer scope, worker identity,
+/// provider, verifier, and their immutable commitments at server composition.
+/// Callers can submit only an already-admitted roster member; they cannot mint
+/// authority or substitute any of those security-relevant components.
+#[derive(Clone)]
+pub struct ManagedProviderJobFacade {
+    store: crate::consensus::ConsensusSessionStore,
+    provider: Arc<dyn ManagedProviderJobRemoteProvider<Error = ()>>,
+    verifier: Arc<dyn FencedMutationRosterMemberAttestationVerifier>,
+    worker: Arc<SessionConsumerIdentity>,
+    authority: ManagedProviderJobAuthority,
+}
+
+impl fmt::Debug for ManagedProviderJobFacade {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ManagedProviderJobFacade(<redacted>)")
+    }
+}
+
+impl ManagedProviderJobFacade {
+    pub(crate) fn new<P, V>(
+        store: crate::consensus::ConsensusSessionStore,
+        provider: P,
+        verifier: V,
+        worker: SessionConsumerIdentity,
+        authority: ManagedProviderJobAuthority,
+    ) -> Self
+    where
+        P: ManagedProviderJobRemoteProvider + 'static,
+        V: FencedMutationRosterMemberAttestationVerifier + 'static,
+    {
+        Self {
+            store,
+            provider: Arc::new(OpaqueProvider(provider)),
+            verifier: Arc::new(verifier),
+            worker: Arc::new(worker),
+            authority,
+        }
+    }
+
+    /// Run one fixed member of an immutable admitted roster.
+    pub async fn run_member(
+        &self,
+        admission: FencedMutationRosterAdmission,
+        protected_checkpoint: Box<[u8]>,
+        ordinal: FencedMutationRosterOrdinal,
+    ) -> Result<ManagedProviderJobStatus, ManagedProviderJobError> {
+        ManagedProviderJobCoordinator::new(
+            &self.store,
+            self.provider.as_ref(),
+            self.verifier.as_ref(),
+            self.worker.as_ref(),
+            self.authority,
+        )
+        .run_member(&admission, &protected_checkpoint, ordinal)
+        .await
+    }
+
+    /// Return the durable status for one fixed member of an admitted roster.
+    pub async fn job_status(
+        &self,
+        admission: FencedMutationRosterAdmission,
+        ordinal: FencedMutationRosterOrdinal,
+    ) -> Result<ManagedProviderJobStatus, ManagedProviderJobError> {
+        if admission.validate().is_err() {
+            return Err(ManagedProviderJobError::InvalidMember);
+        }
+        let id = ManagedProviderJobId::for_member(admission.request_id(), ordinal);
+        self.store
+            .job_status(id, self.authority)
+            .await
+            .map_err(|_| ManagedProviderJobError::Unavailable)
+    }
+}
+
+struct OpaqueProvider<P>(P);
+
+#[async_trait]
+impl<P> ManagedProviderJobRemoteProvider for OpaqueProvider<P>
+where
+    P: ManagedProviderJobRemoteProvider,
+{
+    type Error = ();
+
+    async fn execute_member(
+        &self,
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+    ) -> Result<FencedMutationRosterMemberAttestation, Self::Error> {
+        self.0.execute_member(context).await.map_err(|_| ())
+    }
+
+    async fn member_status(
+        &self,
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+    ) -> Result<ManagedProviderMemberStatusEvidence, Self::Error> {
+        self.0.member_status(context).await.map_err(|_| ())
+    }
+
+    async fn adopt_member(
+        &self,
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+        status: ManagedProviderMemberStatus,
+    ) -> Result<FencedMutationRosterMemberAttestation, Self::Error> {
+        self.0.adopt_member(context, status).await.map_err(|_| ())
+    }
+}
+
 /// Server-side `/5` coordinator.  It owns no provider identity or verifier
 /// configuration; those are injected only by the authenticated server port.
-pub struct ManagedProviderJobCoordinator<'a, S, P, V: ?Sized> {
+pub(crate) struct ManagedProviderJobCoordinator<'a, S, P: ?Sized, V: ?Sized> {
     store: &'a S,
     provider: &'a P,
     verifier: &'a V,
@@ -438,14 +548,14 @@ pub struct ManagedProviderJobCoordinator<'a, S, P, V: ?Sized> {
     authority: ManagedProviderJobAuthority,
 }
 
-impl<'a, S, P, V> ManagedProviderJobCoordinator<'a, S, P, V>
+impl<'a, S, P: ?Sized, V: ?Sized> ManagedProviderJobCoordinator<'a, S, P, V>
 where
     S: ManagedProviderJobStore,
     P: ManagedProviderJobRemoteProvider,
-    V: FencedMutationRosterMemberAttestationVerifier + ?Sized,
+    V: FencedMutationRosterMemberAttestationVerifier,
 {
     /// Construct a server-owned coordinator after mTLS has supplied the worker identity.
-    pub const fn new(
+    pub(crate) const fn new(
         store: &'a S,
         provider: &'a P,
         verifier: &'a V,

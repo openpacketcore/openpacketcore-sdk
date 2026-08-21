@@ -223,11 +223,10 @@ pub use handover::{
 };
 pub use lease::{LeaseGuard, SessionLeaseManager};
 pub use managed_provider_job::{
-    ManagedProviderJobAuthority, ManagedProviderJobCoordinator, ManagedProviderJobEffectStart,
-    ManagedProviderJobError, ManagedProviderJobId, ManagedProviderJobMemberPhase,
-    ManagedProviderJobMode, ManagedProviderJobRemoteProvider, ManagedProviderJobStatus,
-    ManagedProviderJobStore, ManagedProviderMemberStatus, ManagedProviderMemberStatusEvidence,
-    MANAGED_PROVIDER_JOB_V5_REVISION,
+    ManagedProviderJobEffectStart, ManagedProviderJobError, ManagedProviderJobFacade,
+    ManagedProviderJobId, ManagedProviderJobMemberPhase, ManagedProviderJobMode,
+    ManagedProviderJobRemoteProvider, ManagedProviderJobStatus, ManagedProviderMemberStatus,
+    ManagedProviderMemberStatusEvidence, MANAGED_PROVIDER_JOB_V5_REVISION,
 };
 pub use membership::{
     SessionTopologyAbortAdmissionProof, SessionTopologyCandidateRetirementProof,

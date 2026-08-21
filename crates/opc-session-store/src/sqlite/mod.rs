@@ -956,6 +956,7 @@ impl SqliteSessionBackend {
         .await
     }
 
+    #[allow(dead_code)] // consumed by the sealed managed-provider recovery route.
     pub(crate) async fn consensus_managed_provider_recovery_jobs(
         &self,
         identity: crate::consensus::SessionConsensusIdentity,

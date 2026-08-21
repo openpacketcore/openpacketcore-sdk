@@ -16026,6 +16026,7 @@ pub(crate) fn managed_provider_admission_sync(
         .map_err(|_| fenced_mutation_roster_invalid("managed_provider_admission_invalid"))
 }
 
+#[allow(dead_code)] // consumed by the sealed managed-provider recovery route.
 pub(crate) fn managed_provider_recovery_jobs_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
