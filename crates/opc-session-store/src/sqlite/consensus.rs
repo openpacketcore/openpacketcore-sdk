@@ -111,12 +111,14 @@ const FENCED_TRANSITION_V2_DATABASE_FORMAT: i64 = 3;
 // Format four is the immutable V1 roster protocol. Format five is its V2
 // successor: it raises the retained-result bound and changes the profiled
 // admission wire/digest. Format six adds the exact V4 verifier-dispatch
-// reservation ledger. A V1 image is therefore an explicit upgrade boundary,
+// reservation ledger. Format seven adds the shared V4/V5 protocol claim and
+// bounded managed-provider member ledger. A V1 image is therefore an explicit upgrade boundary,
 // never a V2 exact-layout corruption or a silently reinterpreted receipt
 // history.
 const FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT: i64 = 4;
 pub(crate) const FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT: i64 = 5;
 pub(crate) const FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT: i64 = 6;
+pub(crate) const FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT: i64 = 7;
 const FENCED_MUTATION_ROSTER_V1_PROFILE_DIGEST: [u8; 32] = [
     0xa1, 0x84, 0x36, 0xce, 0xf6, 0x65, 0xf2, 0xdb, 0x3f, 0x25, 0x65, 0xf3, 0x4f, 0x36, 0x55, 0x7b,
     0x20, 0xa1, 0x30, 0x66, 0x1d, 0x6a, 0xad, 0x6c, 0xef, 0x84, 0xf3, 0x92, 0x91, 0x1f, 0x42, 0xda,
@@ -1632,6 +1634,7 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     if identity_table_exists {
         ensure_fenced_mutation_roster_v2_upgrade_boundary_sync(&tx)?;
         ensure_fenced_mutation_roster_v4_reservation_upgrade_sync(&tx)?;
+        ensure_fenced_mutation_roster_v5_managed_jobs_upgrade_sync(&tx)?;
     }
 
     let storage_identity = read_storage_identity_sync(&tx)?;
@@ -2102,6 +2105,7 @@ pub(crate) fn read_storage_identity_sync(
             || value == FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT
             || value == FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT
             || value == FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT
+            || value == FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT
     ) {
         return Err(SessionConsensusStorageError::SchemaVersionMismatch);
     }
@@ -4848,6 +4852,48 @@ CREATE TABLE consensus_fenced_mutation_roster_v4_verifier_reservations (
         ON DELETE CASCADE
 );
 
+-- Exactly one terminal protocol can claim an admitted roster.  This row is
+-- created atomically with admission; it is intentionally not inferred from a
+-- V4 reservation or a managed member row, so a crash cannot reopen a race.
+CREATE TABLE consensus_fenced_mutation_roster_protocol_claims (
+    request_id BLOB NOT NULL PRIMARY KEY CHECK (length(request_id) = 56),
+    mode INTEGER NOT NULL CHECK (mode IN (0, 1, 2, 3)),
+    FOREIGN KEY(request_id)
+        REFERENCES consensus_fenced_mutation_roster_operations(request_id)
+        ON DELETE CASCADE
+);
+
+-- V5 persists only fixed-width private evidence.  `effect_owner_digest` and
+-- `receipt_digest` are commitments, never subscriber/provider payloads.
+CREATE TABLE consensus_fenced_mutation_roster_managed_provider_jobs (
+    request_id BLOB NOT NULL CHECK (length(request_id) = 56),
+    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 7),
+    phase INTEGER NOT NULL CHECK (phase IN (0, 1, 2, 3, 4, 5)),
+    effect_owner_digest BLOB CHECK (
+        effect_owner_digest IS NULL OR length(effect_owner_digest) = 32
+    ),
+    attempt_fence INTEGER NOT NULL DEFAULT 0 CHECK (attempt_fence >= 0),
+    receipt_digest BLOB CHECK (receipt_digest IS NULL OR length(receipt_digest) = 32),
+    outcome INTEGER CHECK (outcome IN (0, 1, 2, 3)),
+    PRIMARY KEY (request_id, ordinal),
+    FOREIGN KEY(request_id, ordinal)
+        REFERENCES consensus_fenced_mutation_roster_members(request_id, ordinal)
+        ON DELETE CASCADE,
+    CHECK (
+        (phase = 0 AND effect_owner_digest IS NULL AND attempt_fence = 0
+         AND receipt_digest IS NULL AND outcome IS NULL)
+        OR
+        (phase = 1 AND effect_owner_digest IS NOT NULL AND attempt_fence > 0
+         AND receipt_digest IS NULL AND outcome IS NULL)
+        OR
+        (phase IN (2, 3, 4, 5) AND receipt_digest IS NOT NULL AND outcome IS NOT NULL)
+    )
+);
+
+CREATE INDEX consensus_fenced_mutation_roster_managed_provider_jobs_recovery
+    ON consensus_fenced_mutation_roster_managed_provider_jobs (phase, request_id, ordinal)
+    WHERE phase IN (1, 3);
+
 CREATE TABLE consensus_fenced_mutation_roster_activation (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     storage_configuration_epoch INTEGER NOT NULL CHECK (storage_configuration_epoch > 0),
@@ -4946,7 +4992,8 @@ fn fenced_transition_v2_ledger_layout_in_sync(
             FENCED_TRANSITION_V2_DATABASE_FORMAT
             | FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT
             | FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT
-            | FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT,
+            | FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT
+            | FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT,
             true,
             true,
             true,
@@ -4958,7 +5005,8 @@ fn fenced_transition_v2_ledger_layout_in_sync(
                 || version == FENCED_TRANSITION_V1_DATABASE_FORMAT
                 || version == FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT
                 || version == FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT
-                || version == FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT =>
+                || version == FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT
+                || version == FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT =>
         {
             Ok(FencedTransitionV2LedgerLayout::Absent)
         }
@@ -5061,6 +5109,8 @@ fn fenced_mutation_roster_ledger_layout_in_sync(
     let has_members = table_exists("consensus_fenced_mutation_roster_members")?;
     let has_v4_reservations =
         table_exists("consensus_fenced_mutation_roster_v4_verifier_reservations")?;
+    let has_protocol_claims = table_exists("consensus_fenced_mutation_roster_protocol_claims")?;
+    let has_managed_jobs = table_exists("consensus_fenced_mutation_roster_managed_provider_jobs")?;
     let has_activation = table_exists("consensus_fenced_mutation_roster_activation")?;
     let has_history = table_exists("consensus_fenced_mutation_roster_history")?;
     match (
@@ -5068,15 +5118,17 @@ fn fenced_mutation_roster_ledger_layout_in_sync(
         has_operations,
         has_members,
         has_v4_reservations,
+        has_protocol_claims,
+        has_managed_jobs,
         has_activation,
         has_history,
     ) {
-        (FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT, true, true, true, true, true)
+        (FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT, true, true, true, true, true, true, true)
             if fenced_mutation_roster_schema_is_exact_in_sync(conn, attached)? =>
         {
             Ok(FencedMutationRosterLedgerLayout::Activated)
         }
-        (version, false, false, false, false, false)
+        (version, false, false, false, false, false, false, false)
             if version == i64::from(SESSION_CONSENSUS_SCHEMA_VERSION)
                 || version == FENCED_TRANSITION_V1_DATABASE_FORMAT
                 || version == FENCED_TRANSITION_V2_DATABASE_FORMAT =>
@@ -5161,6 +5213,62 @@ fn ensure_fenced_mutation_roster_v4_reservation_upgrade_sync(
         )
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
     if changed != 1
+        || !fenced_mutation_roster_v3_schema_is_exact_in_sync(conn, false)
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+    {
+        return Err(SessionConsensusStorageError::SchemaVersionMismatch);
+    }
+    Ok(())
+}
+
+/// Upgrade the exact format-six V4 reservation image to the shared protocol
+/// claim layout.  Existing V4 reservations become durable V4 claims before
+/// the format marker moves, so neither a restarted V4 worker nor a new V5
+/// worker can win by observing half the migration.
+fn ensure_fenced_mutation_roster_v5_managed_jobs_upgrade_sync(
+    conn: &Connection,
+) -> Result<(), SessionConsensusStorageError> {
+    if persisted_schema_version_in_sync(conn, false)
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+        != FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT
+    {
+        return Ok(());
+    }
+    if !fenced_mutation_roster_v3_schema_is_exact_in_sync(conn, false)
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+    {
+        return Err(SessionConsensusStorageError::SchemaVersionMismatch);
+    }
+    conn.execute_batch(&format!(
+        "{FENCED_MUTATION_ROSTER_PROTOCOL_CLAIMS_TABLE_SCHEMA_SQL};\
+         {FENCED_MUTATION_ROSTER_MANAGED_PROVIDER_JOBS_TABLE_SCHEMA_SQL};\
+         {FENCED_MUTATION_ROSTER_MANAGED_PROVIDER_JOBS_RECOVERY_INDEX_SCHEMA_SQL};"
+    ))
+    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    conn.execute(
+        "INSERT INTO consensus_fenced_mutation_roster_protocol_claims (request_id, mode) \
+         SELECT request_id, CASE WHEN operation.phase IN (2, 3) THEN 3 WHEN EXISTS (SELECT 1 FROM consensus_fenced_mutation_roster_v4_verifier_reservations AS reservation WHERE reservation.request_id = operation.request_id) THEN 1 ELSE 0 END \
+         FROM consensus_fenced_mutation_roster_operations AS operation",
+        [],
+    )
+    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    conn.execute(
+        "INSERT INTO consensus_fenced_mutation_roster_managed_provider_jobs (request_id, ordinal, phase, effect_owner_digest, attempt_fence, receipt_digest, outcome) \
+         SELECT request_id, ordinal, 0, NULL, 0, NULL, NULL \
+         FROM consensus_fenced_mutation_roster_members",
+        [],
+    )
+    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    let changed = conn
+        .execute(
+            "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1 AND schema_version = ?2",
+            params![
+                FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT,
+                FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT,
+            ],
+        )
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    if changed != 1
         || fenced_mutation_roster_ledger_layout_sync(conn)
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
             != FencedMutationRosterLedgerLayout::Activated
@@ -5170,29 +5278,18 @@ fn ensure_fenced_mutation_roster_v4_reservation_upgrade_sync(
     Ok(())
 }
 
-fn fenced_mutation_roster_schema_is_exact_in_sync(
+fn fenced_mutation_roster_v3_schema_is_exact_in_sync(
     conn: &Connection,
     attached: bool,
 ) -> io::Result<bool> {
-    fenced_mutation_roster_schema_with_history_is_exact_in_sync(
+    fenced_mutation_roster_v3_schema_with_history_is_exact_in_sync(
         conn,
         attached,
         FENCED_MUTATION_ROSTER_HISTORY_TABLE_SCHEMA_SQL,
     )
 }
 
-fn fenced_mutation_roster_v1_schema_is_exact_in_sync(
-    conn: &Connection,
-    attached: bool,
-) -> io::Result<bool> {
-    fenced_mutation_roster_schema_with_history_is_exact_in_sync(
-        conn,
-        attached,
-        FENCED_MUTATION_ROSTER_V1_HISTORY_TABLE_SCHEMA_SQL,
-    )
-}
-
-fn fenced_mutation_roster_schema_with_history_is_exact_in_sync(
+fn fenced_mutation_roster_v3_schema_with_history_is_exact_in_sync(
     conn: &Connection,
     attached: bool,
     history_schema: &str,
@@ -5211,7 +5308,7 @@ fn fenced_mutation_roster_schema_with_history_is_exact_in_sync(
         "consensus_fenced_mutation_roster_members",
         FENCED_MUTATION_ROSTER_MEMBERS_TABLE_SCHEMA_SQL,
     )?;
-    let v4_reservations = schema_object_is_exact_in_sync(
+    let reservations = schema_object_is_exact_in_sync(
         conn,
         attached,
         "table",
@@ -5246,7 +5343,129 @@ fn fenced_mutation_roster_schema_with_history_is_exact_in_sync(
         "consensus_fenced_mutation_roster_operations_due",
         FENCED_MUTATION_ROSTER_DUE_INDEX_SCHEMA_SQL,
     )?;
-    if !(operations && members && v4_reservations && activation && history && reclaim && due) {
+    if !(operations && members && reservations && activation && history && reclaim && due) {
+        return Ok(false);
+    }
+    let master = if attached {
+        "consensus_incoming.sqlite_master"
+    } else {
+        "main.sqlite_master"
+    };
+    let unexpected: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM {master} WHERE sql IS NOT NULL AND ((tbl_name IN ('consensus_fenced_mutation_roster_operations', 'consensus_fenced_mutation_roster_members', 'consensus_fenced_mutation_roster_v4_verifier_reservations', 'consensus_fenced_mutation_roster_activation', 'consensus_fenced_mutation_roster_history') AND type IN ('index', 'trigger')) OR name IN ('consensus_fenced_mutation_roster_operations_reclaim', 'consensus_fenced_mutation_roster_operations_due'))"),
+        [], |row| row.get(0),
+    ).map_err(db_error)?;
+    Ok(unexpected == 2)
+}
+
+fn fenced_mutation_roster_schema_is_exact_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<bool> {
+    fenced_mutation_roster_schema_with_history_is_exact_in_sync(
+        conn,
+        attached,
+        FENCED_MUTATION_ROSTER_HISTORY_TABLE_SCHEMA_SQL,
+    )
+}
+
+fn fenced_mutation_roster_v1_schema_is_exact_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<bool> {
+    fenced_mutation_roster_v3_schema_with_history_is_exact_in_sync(
+        conn,
+        attached,
+        FENCED_MUTATION_ROSTER_V1_HISTORY_TABLE_SCHEMA_SQL,
+    )
+}
+
+fn fenced_mutation_roster_schema_with_history_is_exact_in_sync(
+    conn: &Connection,
+    attached: bool,
+    history_schema: &str,
+) -> io::Result<bool> {
+    let operations = schema_object_is_exact_in_sync(
+        conn,
+        attached,
+        "table",
+        "consensus_fenced_mutation_roster_operations",
+        FENCED_MUTATION_ROSTER_OPERATIONS_TABLE_SCHEMA_SQL,
+    )?;
+    let members = schema_object_is_exact_in_sync(
+        conn,
+        attached,
+        "table",
+        "consensus_fenced_mutation_roster_members",
+        FENCED_MUTATION_ROSTER_MEMBERS_TABLE_SCHEMA_SQL,
+    )?;
+    let v4_reservations = schema_object_is_exact_in_sync(
+        conn,
+        attached,
+        "table",
+        "consensus_fenced_mutation_roster_v4_verifier_reservations",
+        FENCED_MUTATION_ROSTER_V4_RESERVATIONS_TABLE_SCHEMA_SQL,
+    )?;
+    let protocol_claims = schema_object_is_exact_in_sync(
+        conn,
+        attached,
+        "table",
+        "consensus_fenced_mutation_roster_protocol_claims",
+        FENCED_MUTATION_ROSTER_PROTOCOL_CLAIMS_TABLE_SCHEMA_SQL,
+    )?;
+    let managed_jobs = schema_object_is_exact_in_sync(
+        conn,
+        attached,
+        "table",
+        "consensus_fenced_mutation_roster_managed_provider_jobs",
+        FENCED_MUTATION_ROSTER_MANAGED_PROVIDER_JOBS_TABLE_SCHEMA_SQL,
+    )?;
+    let activation = schema_object_is_exact_in_sync(
+        conn,
+        attached,
+        "table",
+        "consensus_fenced_mutation_roster_activation",
+        FENCED_MUTATION_ROSTER_ACTIVATION_TABLE_SCHEMA_SQL,
+    )?;
+    let history = schema_object_is_exact_in_sync(
+        conn,
+        attached,
+        "table",
+        "consensus_fenced_mutation_roster_history",
+        history_schema,
+    )?;
+    let reclaim = schema_object_is_exact_in_sync(
+        conn,
+        attached,
+        "index",
+        "consensus_fenced_mutation_roster_operations_reclaim",
+        FENCED_MUTATION_ROSTER_RECLAIM_INDEX_SCHEMA_SQL,
+    )?;
+    let due = schema_object_is_exact_in_sync(
+        conn,
+        attached,
+        "index",
+        "consensus_fenced_mutation_roster_operations_due",
+        FENCED_MUTATION_ROSTER_DUE_INDEX_SCHEMA_SQL,
+    )?;
+    let managed_recovery = schema_object_is_exact_in_sync(
+        conn,
+        attached,
+        "index",
+        "consensus_fenced_mutation_roster_managed_provider_jobs_recovery",
+        FENCED_MUTATION_ROSTER_MANAGED_PROVIDER_JOBS_RECOVERY_INDEX_SCHEMA_SQL,
+    )?;
+    if !(operations
+        && members
+        && v4_reservations
+        && protocol_claims
+        && managed_jobs
+        && activation
+        && history
+        && reclaim
+        && due
+        && managed_recovery)
+    {
         return Ok(false);
     }
     let master = if attached {
@@ -5257,18 +5476,30 @@ fn fenced_mutation_roster_schema_with_history_is_exact_in_sync(
     let unexpected: i64 = conn
         .query_row(
             &format!(
-                "SELECT COUNT(*) FROM {master} WHERE sql IS NOT NULL AND ((tbl_name IN ('consensus_fenced_mutation_roster_operations', 'consensus_fenced_mutation_roster_members', 'consensus_fenced_mutation_roster_v4_verifier_reservations', 'consensus_fenced_mutation_roster_activation', 'consensus_fenced_mutation_roster_history') AND type IN ('index', 'trigger')) OR name IN ('consensus_fenced_mutation_roster_operations_reclaim', 'consensus_fenced_mutation_roster_operations_due'))"
+                "SELECT COUNT(*) FROM {master} WHERE sql IS NOT NULL AND ((tbl_name IN ('consensus_fenced_mutation_roster_operations', 'consensus_fenced_mutation_roster_members', 'consensus_fenced_mutation_roster_v4_verifier_reservations', 'consensus_fenced_mutation_roster_protocol_claims', 'consensus_fenced_mutation_roster_managed_provider_jobs', 'consensus_fenced_mutation_roster_activation', 'consensus_fenced_mutation_roster_history') AND type IN ('index', 'trigger')) OR name IN ('consensus_fenced_mutation_roster_operations_reclaim', 'consensus_fenced_mutation_roster_operations_due', 'consensus_fenced_mutation_roster_managed_provider_jobs_recovery'))"
             ),
             [],
             |row| row.get(0),
         )
         .map_err(db_error)?;
-    Ok(unexpected == 2)
+    Ok(unexpected == 3)
 }
 
 fn fenced_mutation_roster_v2_schema_without_v4_reservations_is_exact_in_sync(
     conn: &Connection,
     attached: bool,
+) -> io::Result<bool> {
+    fenced_mutation_roster_schema_without_v4_reservations_with_history_is_exact_in_sync(
+        conn,
+        attached,
+        FENCED_MUTATION_ROSTER_HISTORY_TABLE_SCHEMA_SQL,
+    )
+}
+
+fn fenced_mutation_roster_schema_without_v4_reservations_with_history_is_exact_in_sync(
+    conn: &Connection,
+    attached: bool,
+    history_schema: &str,
 ) -> io::Result<bool> {
     let operations = schema_object_is_exact_in_sync(
         conn,
@@ -5296,7 +5527,7 @@ fn fenced_mutation_roster_v2_schema_without_v4_reservations_is_exact_in_sync(
         attached,
         "table",
         "consensus_fenced_mutation_roster_history",
-        FENCED_MUTATION_ROSTER_HISTORY_TABLE_SCHEMA_SQL,
+        history_schema,
     )?;
     let reclaim = schema_object_is_exact_in_sync(
         conn,
@@ -5993,7 +6224,7 @@ fn activate_fenced_transition_v2_scope_sync(
             .execute(
                 "UPDATE consensus_identity SET schema_version = CASE WHEN schema_version = ?1 THEN ?1 ELSE ?2 END, fenced_transition_receipt_ledger_activated = 1 WHERE singleton = 1 AND ((schema_version = ?3 AND fenced_transition_receipt_ledger_activated = 0) OR (schema_version = ?4 AND fenced_transition_receipt_ledger_activated = 1) OR (schema_version = ?1 AND fenced_transition_receipt_ledger_activated = 1))",
                 params![
-                    FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT,
+                    FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT,
                     FENCED_TRANSITION_V2_DATABASE_FORMAT,
                     i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
                     FENCED_TRANSITION_V1_DATABASE_FORMAT,
@@ -6347,7 +6578,7 @@ pub(crate) fn activate_fenced_mutation_roster_scope_sync(
             .execute(
                 "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1 AND schema_version IN (?2, ?3, ?4)",
                 params![
-                    FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT,
+                    FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT,
                     i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
                     FENCED_TRANSITION_V1_DATABASE_FORMAT,
                     FENCED_TRANSITION_V2_DATABASE_FORMAT,
@@ -6430,7 +6661,8 @@ fn fenced_transition_receipt_ledger_layout_in_sync(
                         || version == FENCED_TRANSITION_V2_DATABASE_FORMAT
                         || version == FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT
                         || version == FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT
-                        || version == FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT =>
+                        || version == FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT
+                        || version == FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT =>
                 {
                     // Format three retains the exact V1 ledger but must also
                     // carry the complete V2 layout.  Accepting only the V1
@@ -7014,6 +7246,49 @@ const FENCED_MUTATION_ROSTER_V4_RESERVATIONS_TABLE_SCHEMA_SQL: &str = r#"
                 REFERENCES consensus_fenced_mutation_roster_operations(request_id)
                 ON DELETE CASCADE
         )
+    "#;
+
+const FENCED_MUTATION_ROSTER_PROTOCOL_CLAIMS_TABLE_SCHEMA_SQL: &str = r#"
+        CREATE TABLE consensus_fenced_mutation_roster_protocol_claims (
+            request_id BLOB NOT NULL PRIMARY KEY CHECK (length(request_id) = 56),
+            mode INTEGER NOT NULL CHECK (mode IN (0, 1, 2, 3)),
+            FOREIGN KEY(request_id)
+                REFERENCES consensus_fenced_mutation_roster_operations(request_id)
+                ON DELETE CASCADE
+        )
+    "#;
+
+const FENCED_MUTATION_ROSTER_MANAGED_PROVIDER_JOBS_TABLE_SCHEMA_SQL: &str = r#"
+        CREATE TABLE consensus_fenced_mutation_roster_managed_provider_jobs (
+            request_id BLOB NOT NULL CHECK (length(request_id) = 56),
+            ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 7),
+            phase INTEGER NOT NULL CHECK (phase IN (0, 1, 2, 3, 4, 5)),
+            effect_owner_digest BLOB CHECK (
+                effect_owner_digest IS NULL OR length(effect_owner_digest) = 32
+            ),
+            attempt_fence INTEGER NOT NULL DEFAULT 0 CHECK (attempt_fence >= 0),
+            receipt_digest BLOB CHECK (receipt_digest IS NULL OR length(receipt_digest) = 32),
+            outcome INTEGER CHECK (outcome IN (0, 1, 2, 3)),
+            PRIMARY KEY (request_id, ordinal),
+            FOREIGN KEY(request_id, ordinal)
+                REFERENCES consensus_fenced_mutation_roster_members(request_id, ordinal)
+                ON DELETE CASCADE,
+            CHECK (
+                (phase = 0 AND effect_owner_digest IS NULL AND attempt_fence = 0
+                 AND receipt_digest IS NULL AND outcome IS NULL)
+                OR
+                (phase = 1 AND effect_owner_digest IS NOT NULL AND attempt_fence > 0
+                 AND receipt_digest IS NULL AND outcome IS NULL)
+                OR
+                (phase IN (2, 3, 4, 5) AND receipt_digest IS NOT NULL AND outcome IS NOT NULL)
+            )
+        )
+    "#;
+
+const FENCED_MUTATION_ROSTER_MANAGED_PROVIDER_JOBS_RECOVERY_INDEX_SCHEMA_SQL: &str = r#"
+        CREATE INDEX consensus_fenced_mutation_roster_managed_provider_jobs_recovery
+            ON consensus_fenced_mutation_roster_managed_provider_jobs (phase, request_id, ordinal)
+            WHERE phase IN (1, 3)
     "#;
 
 const FENCED_MUTATION_ROSTER_RECLAIM_INDEX_SCHEMA_SQL: &str = r#"
@@ -12277,6 +12552,70 @@ SELECT EXISTS (
             "persisted fenced mutation roster V4 reservation is invalid",
         ));
     }
+    let claims_source = if attached {
+        "consensus_incoming.consensus_fenced_mutation_roster_protocol_claims"
+    } else {
+        "main.consensus_fenced_mutation_roster_protocol_claims"
+    };
+    let jobs_source = if attached {
+        "consensus_incoming.consensus_fenced_mutation_roster_managed_provider_jobs"
+    } else {
+        "main.consensus_fenced_mutation_roster_managed_provider_jobs"
+    };
+    let invalid_shared_state: bool = conn
+        .query_row(
+            &format!(
+                r#"
+SELECT EXISTS (
+    SELECT 1 FROM {source} AS operation
+    LEFT JOIN {claims_source} AS claim ON claim.request_id = operation.request_id
+    LEFT JOIN {reservations_source} AS reservation ON reservation.request_id = operation.request_id
+    WHERE claim.request_id IS NULL
+       OR claim.mode NOT IN (0, 1, 2, 3)
+       OR (operation.phase = 1 AND claim.mode = 3)
+       OR (operation.phase IN (2, 3) AND claim.mode != 3)
+       OR (claim.mode = 1 AND reservation.request_id IS NULL)
+       OR (reservation.request_id IS NOT NULL AND claim.mode NOT IN (1, 3))
+    LIMIT 1
+)
+OR EXISTS (
+    SELECT 1 FROM {claims_source} AS claim
+    LEFT JOIN {source} AS operation ON operation.request_id = claim.request_id
+    WHERE operation.request_id IS NULL
+    LIMIT 1
+)
+OR EXISTS (
+    SELECT 1 FROM {members_source} AS member
+    LEFT JOIN {jobs_source} AS job
+      ON job.request_id = member.request_id AND job.ordinal = member.ordinal
+    LEFT JOIN {claims_source} AS claim ON claim.request_id = member.request_id
+    WHERE job.request_id IS NULL
+       OR job.phase NOT IN (0, 1, 2, 3, 4, 5)
+       OR job.attempt_fence < 0
+       OR (job.phase = 0 AND (job.effect_owner_digest IS NOT NULL OR job.attempt_fence != 0 OR job.receipt_digest IS NOT NULL OR job.outcome IS NOT NULL))
+       OR (job.phase = 1 AND (job.effect_owner_digest IS NULL OR job.attempt_fence <= 0 OR job.receipt_digest IS NOT NULL OR job.outcome IS NOT NULL))
+       OR (job.phase IN (2, 3, 4, 5) AND (job.receipt_digest IS NULL OR job.outcome IS NULL))
+       OR (claim.mode NOT IN (2, 3) AND job.phase != 0)
+    LIMIT 1
+)
+OR EXISTS (
+    SELECT 1 FROM {jobs_source} AS job
+    LEFT JOIN {members_source} AS member
+      ON member.request_id = job.request_id AND member.ordinal = job.ordinal
+    WHERE member.request_id IS NULL
+    LIMIT 1
+)
+"#
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if invalid_shared_state {
+        return Err(invalid_data(
+            "persisted fenced mutation roster shared protocol state is invalid",
+        ));
+    }
 
     let mut statement = conn
         .prepare(&format!(
@@ -13381,6 +13720,18 @@ fn fenced_mutation_roster_admit_sync(
         )
         .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
     }
+    conn.execute(
+        "INSERT INTO consensus_fenced_mutation_roster_protocol_claims (request_id, mode) VALUES (?1, 0)",
+        [request_id.as_slice()],
+    )
+    .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
+    for member in admission.members().as_slice() {
+        conn.execute(
+            "INSERT INTO consensus_fenced_mutation_roster_managed_provider_jobs (request_id, ordinal, phase, effect_owner_digest, attempt_fence, receipt_digest, outcome) VALUES (?1, ?2, 0, NULL, 0, NULL, NULL)",
+            params![request_id.as_slice(), i64::from(member.ordinal().get())],
+        )
+        .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
+    }
     let changed = conn
         .execute(
             "UPDATE consensus_fenced_mutation_roster_history SET current_bound_count = current_bound_count + 1, current_live_count = current_live_count + 1, generation = generation + 1 WHERE singleton = 1 AND active_epoch = ?1 AND current_bound_count = ?2 AND current_live_count = ?3",
@@ -13539,6 +13890,17 @@ fn fenced_mutation_roster_terminalize_sync(
             "fenced mutation roster persistence is unavailable".into(),
         ));
     }
+    let claimed = conn
+        .execute(
+            "UPDATE consensus_fenced_mutation_roster_protocol_claims SET mode = 3 WHERE request_id = ?1 AND mode IN (0, 1, 2)",
+            [request_id.as_slice()],
+        )
+        .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
+    if claimed != 1 {
+        return Err(StoreError::BackendUnavailable(
+            "fenced mutation roster persistence is unavailable".into(),
+        ));
+    }
     for outcome in terminal.members() {
         let changed = conn
             .execute(
@@ -13610,13 +13972,33 @@ fn fenced_mutation_roster_reserve_v4_verifier_dispatch_sync(
         ));
     }
     let request_id = encode_fenced_mutation_roster_identity(admission.request_id());
+    let claimed = conn
+        .execute(
+            "UPDATE consensus_fenced_mutation_roster_protocol_claims SET mode = 1 WHERE request_id = ?1 AND mode = 0",
+            [request_id.as_slice()],
+        )
+        .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
+    if claimed == 0 {
+        let matching_v4_claim: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM consensus_fenced_mutation_roster_protocol_claims WHERE request_id = ?1 AND mode = 1)",
+                [request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
+        if !matching_v4_claim {
+            return Err(fenced_mutation_roster_invalid(
+                "fenced_mutation_roster_protocol_claim_conflict",
+            ));
+        }
+    }
     let changed = conn
         .execute(
             "INSERT OR IGNORE INTO consensus_fenced_mutation_roster_v4_verifier_reservations (request_id, request_digest, worker_digest) VALUES (?1, ?2, ?3)",
             params![request_id.as_slice(), request_digest.as_slice(), worker_digest.as_slice()],
         )
         .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
-    if changed == 1 {
+    if changed == 1 && claimed == 1 {
         return Ok((FencedMutationRosterOutcome { status }, Some(true)));
     }
     let matching: bool = conn
@@ -13626,7 +14008,7 @@ fn fenced_mutation_roster_reserve_v4_verifier_dispatch_sync(
             |row| row.get(0),
         )
         .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
-    if !matching {
+    if !matching || claimed != 0 {
         return Err(fenced_mutation_roster_invalid(
             "fenced_mutation_roster_v4_reservation_conflict",
         ));
@@ -17618,6 +18000,9 @@ const ATTACHED_SNAPSHOT_VALIDATION_TABLES: &[&str] = &[
     "consensus_fenced_transition_v2_history",
     "consensus_fenced_mutation_roster_operations",
     "consensus_fenced_mutation_roster_members",
+    "consensus_fenced_mutation_roster_v4_verifier_reservations",
+    "consensus_fenced_mutation_roster_protocol_claims",
+    "consensus_fenced_mutation_roster_managed_provider_jobs",
     "consensus_fenced_mutation_roster_activation",
     "consensus_fenced_mutation_roster_history",
     "consensus_snapshot",
@@ -18335,6 +18720,16 @@ fn create_attached_snapshot_validation_views(
             "CREATE TEMP VIEW consensus_fenced_mutation_roster_operations AS SELECT CAST(NULL AS BLOB) AS request_id, CAST(NULL AS INTEGER) AS history_epoch, CAST(NULL AS INTEGER) AS ordinal, CAST(NULL AS INTEGER) AS configuration_epoch, CAST(NULL AS BLOB) AS body_digest, CAST(NULL AS BLOB) AS admission_digest, CAST(NULL AS BLOB) AS binding_digest, CAST(NULL AS TEXT) AS retained_until, CAST(NULL AS INTEGER) AS phase, CAST(NULL AS INTEGER) AS member_count, CAST(NULL AS BLOB) AS admission_blob, CAST(NULL AS BLOB) AS protected_plan, CAST(NULL AS BLOB) AS protected_checkpoint, CAST(NULL AS BLOB) AS terminal_blob, CAST(NULL AS BLOB) AS terminal_digest, CAST(NULL AS BLOB) AS terminal_result, CAST(NULL AS BLOB) AS terminal_result_digest WHERE 0".to_owned()
         } else if *table == "consensus_fenced_mutation_roster_members" && !source_exists {
             "CREATE TEMP VIEW consensus_fenced_mutation_roster_members AS SELECT CAST(NULL AS BLOB) AS request_id, CAST(NULL AS INTEGER) AS ordinal, CAST(NULL AS BLOB) AS stable_member_id, CAST(NULL AS INTEGER) AS disposition, CAST(NULL AS INTEGER) AS adoption WHERE 0".to_owned()
+        } else if *table == "consensus_fenced_mutation_roster_v4_verifier_reservations"
+            && !source_exists
+        {
+            "CREATE TEMP VIEW consensus_fenced_mutation_roster_v4_verifier_reservations AS SELECT CAST(NULL AS BLOB) AS request_id, CAST(NULL AS BLOB) AS request_digest, CAST(NULL AS BLOB) AS worker_digest WHERE 0".to_owned()
+        } else if *table == "consensus_fenced_mutation_roster_protocol_claims" && !source_exists {
+            "CREATE TEMP VIEW consensus_fenced_mutation_roster_protocol_claims AS SELECT CAST(NULL AS BLOB) AS request_id, CAST(NULL AS INTEGER) AS mode WHERE 0".to_owned()
+        } else if *table == "consensus_fenced_mutation_roster_managed_provider_jobs"
+            && !source_exists
+        {
+            "CREATE TEMP VIEW consensus_fenced_mutation_roster_managed_provider_jobs AS SELECT CAST(NULL AS BLOB) AS request_id, CAST(NULL AS INTEGER) AS ordinal, CAST(NULL AS INTEGER) AS phase, CAST(NULL AS BLOB) AS effect_owner_digest, CAST(NULL AS INTEGER) AS attempt_fence, CAST(NULL AS BLOB) AS receipt_digest, CAST(NULL AS INTEGER) AS outcome WHERE 0".to_owned()
         } else if *table == "consensus_fenced_mutation_roster_activation" && !source_exists {
             "CREATE TEMP VIEW consensus_fenced_mutation_roster_activation AS SELECT CAST(NULL AS INTEGER) AS singleton, CAST(NULL AS INTEGER) AS storage_configuration_epoch, CAST(NULL AS BLOB) AS scope_configuration_id, CAST(NULL AS INTEGER) AS scope_configuration_epoch, CAST(NULL AS BLOB) AS voter_set_digest, CAST(NULL AS BLOB) AS profile_digest WHERE 0".to_owned()
         } else if *table == "consensus_fenced_mutation_roster_history" && !source_exists {
@@ -18891,6 +19286,18 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
                 "request_id, ordinal, stable_member_id, disposition, adoption",
             ),
             (
+                "consensus_fenced_mutation_roster_v4_verifier_reservations",
+                "request_id, request_digest, worker_digest",
+            ),
+            (
+                "consensus_fenced_mutation_roster_protocol_claims",
+                "request_id, mode",
+            ),
+            (
+                "consensus_fenced_mutation_roster_managed_provider_jobs",
+                "request_id, ordinal, phase, effect_owner_digest, attempt_fence, receipt_digest, outcome",
+            ),
+            (
                 "consensus_fenced_mutation_roster_activation",
                 "singleton, storage_configuration_epoch, scope_configuration_id, scope_configuration_epoch, voter_set_digest, profile_digest",
             ),
@@ -18944,6 +19351,9 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
                     table,
                     "consensus_fenced_mutation_roster_operations"
                         | "consensus_fenced_mutation_roster_members"
+                        | "consensus_fenced_mutation_roster_v4_verifier_reservations"
+                        | "consensus_fenced_mutation_roster_protocol_claims"
+                        | "consensus_fenced_mutation_roster_managed_provider_jobs"
                         | "consensus_fenced_mutation_roster_activation"
                         | "consensus_fenced_mutation_roster_history"
                 ) && !incoming_has_roster)
@@ -19581,7 +19991,7 @@ mod tests {
     }
 
     #[test]
-    fn current_reader_accepts_exact_v3_identity_and_rejects_unknown_successor() {
+    fn current_reader_accepts_exact_v7_identity_and_rejects_unknown_successor() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.blocking_lock();
         let identity = identity();
@@ -19604,7 +20014,7 @@ mod tests {
 
         conn.execute(
             "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1",
-            [FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT + 1],
+            [FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT + 1],
         )
         .expect("inject unknown successor format");
         assert_eq!(
@@ -22409,7 +22819,10 @@ mod tests {
             .unchecked_transaction()
             .expect("legacy upgrade-boundary transaction");
         tx.execute_batch(
-            "ALTER TABLE consensus_fenced_mutation_roster_history RENAME TO consensus_fenced_mutation_roster_history_v1;",
+            "DROP INDEX consensus_fenced_mutation_roster_managed_provider_jobs_recovery; \
+             DROP TABLE consensus_fenced_mutation_roster_managed_provider_jobs; \
+             DROP TABLE consensus_fenced_mutation_roster_protocol_claims; \
+             ALTER TABLE consensus_fenced_mutation_roster_history RENAME TO consensus_fenced_mutation_roster_history_v1;",
         )
         .expect("rename V2 history");
         tx.execute_batch(FENCED_MUTATION_ROSTER_V1_HISTORY_TABLE_SCHEMA_SQL)
@@ -22567,8 +22980,8 @@ mod tests {
         );
         assert_eq!(
             persisted_schema_version_in_sync(&conn, false).expect("inspect format marker"),
-            FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT,
-            "later V2 activation must never lower the format-six marker",
+            FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT,
+            "later V2 activation must never lower the format-seven marker",
         );
         validate_fenced_mutation_roster_receipts_sync(&conn, identity())
             .expect("empty V5 history remains canonical after V2 activation");
@@ -22611,8 +23024,13 @@ mod tests {
         let tx = conn
             .unchecked_transaction()
             .expect("format-five fixture transaction");
-        tx.execute_batch("DROP TABLE consensus_fenced_mutation_roster_v4_verifier_reservations;")
-            .expect("remove V4 reservation table from exact V2 fixture");
+        tx.execute_batch(
+            "DROP INDEX consensus_fenced_mutation_roster_managed_provider_jobs_recovery; \
+             DROP TABLE consensus_fenced_mutation_roster_managed_provider_jobs; \
+             DROP TABLE consensus_fenced_mutation_roster_protocol_claims; \
+             DROP TABLE consensus_fenced_mutation_roster_v4_verifier_reservations;",
+        )
+        .expect("remove V4 reservation table from exact V2 fixture");
         tx.execute(
             "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1",
             [FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT],
@@ -22627,13 +23045,76 @@ mod tests {
         initialize_schema(&conn, identity(), &voters)
             .expect("atomically upgrade reservation fence");
         assert_eq!(
-            persisted_schema_version_in_sync(&conn, false).expect("format-six marker"),
-            FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT,
+            persisted_schema_version_in_sync(&conn, false).expect("format-seven marker"),
+            FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT,
         );
         assert_eq!(
             fenced_mutation_roster_ledger_layout_sync(&conn).expect("upgraded roster layout"),
             FencedMutationRosterLedgerLayout::Activated,
         );
+
+        let admission = fenced_mutation_roster_admission(0xF0, 0x81);
+        let tx = conn
+            .unchecked_transaction()
+            .expect("format-six populated fixture transaction");
+        fenced_mutation_roster_admit_sync(&tx, identity(), &admission, timestamp(2))
+            .expect("admit roster before downgrade");
+        let reserved = fenced_mutation_roster_reserve_v4_verifier_dispatch_sync(
+            &tx,
+            &admission,
+            &[0x61; 32],
+            &[0x62; 32],
+        )
+        .expect("reserve V4 verifier before downgrade");
+        assert_eq!(reserved.1, Some(true));
+        tx.execute_batch(
+            "DROP INDEX consensus_fenced_mutation_roster_managed_provider_jobs_recovery; \
+             DROP TABLE consensus_fenced_mutation_roster_managed_provider_jobs; \
+             DROP TABLE consensus_fenced_mutation_roster_protocol_claims;",
+        )
+        .expect("remove format-seven tables from exact format-six fixture");
+        tx.execute(
+            "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1",
+            [FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT],
+        )
+        .expect("restore exact format-six marker");
+        tx.commit().expect("commit populated format-six fixture");
+        assert!(
+            fenced_mutation_roster_v3_schema_is_exact_in_sync(&conn, false)
+                .expect("recognize exact format-six roster")
+        );
+
+        initialize_schema(&conn, identity(), &voters)
+            .expect("atomically upgrade populated format-six roster");
+        let request_id = admission.request_id().to_bytes();
+        let member_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_fenced_mutation_roster_members WHERE request_id = ?1",
+                [request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("count admitted members");
+        let job_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_fenced_mutation_roster_managed_provider_jobs WHERE request_id = ?1 AND phase = 0",
+                [request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("count migrated jobs");
+        assert_eq!(
+            job_count, member_count,
+            "every legacy member gets one ready job"
+        );
+        let mode: i64 = conn
+            .query_row(
+                "SELECT mode FROM consensus_fenced_mutation_roster_protocol_claims WHERE request_id = ?1",
+                [request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read migrated V4 claim");
+        assert_eq!(mode, 1, "the V4 reservation remains the durable winner");
+        validate_fenced_mutation_roster_receipts_sync(&conn, identity())
+            .expect("migrated populated roster is valid");
     }
 
     #[test]

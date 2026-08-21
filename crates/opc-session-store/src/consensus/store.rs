@@ -9191,8 +9191,8 @@ mod membership_tests {
             service
                 .execute_v4(&identity, outcome_mismatch_request)
                 .await,
-            crate::SessionConsumerV4Response::Rejected(SessionConsumerRejection::Unauthorized),
-            "a verifier result cannot silently reinterpret a claimed wire outcome"
+            crate::SessionConsumerV4Response::Rejected(SessionConsumerRejection::Unavailable),
+            "a failed verifier attempt retains its shared one-shot V4 claim"
         );
         assert!(matches!(
             service

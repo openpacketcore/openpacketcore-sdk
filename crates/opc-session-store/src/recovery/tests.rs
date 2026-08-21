@@ -1819,7 +1819,7 @@ fn current_recovery_inspection_accepts_activated_v5_roster() {
             |row| row.get(0),
         )
         .expect("read V5 format marker");
-    assert_eq!(format, consensus::FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT);
+    assert_eq!(format, consensus::FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT);
     drop(conn);
 
     inspect_current_fixture(&replica, &members)

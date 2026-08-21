@@ -47,8 +47,10 @@ const FILE_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file/v1\0";
 const WORKFLOW_VERSION: u16 = 2;
 // Six base SQLite objects plus bounded consensus/recovery tables. V3 adds
 // three ledger objects and two required indexes; V5 independently adds four
-// roster objects and two required indexes.
-const MAX_CURRENT_SCHEMA_OBJECTS: usize = 34;
+// roster objects and two required indexes.  V7 extends the roster with the
+// V4 reservation, a shared protocol claim, managed-member rows, and their
+// bounded recovery index.
+const MAX_CURRENT_SCHEMA_OBJECTS: usize = 38;
 const MAX_SCHEMA_SQL_BYTES: usize = 16_384;
 
 type FencedTransitionV2HistorySqlRow = (
@@ -415,7 +417,7 @@ fn inspect_current(
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let expected_schema_version = match roster_ledger_layout {
         consensus::FencedMutationRosterLedgerLayout::Activated => {
-            consensus::FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT
+            consensus::FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT
         }
         consensus::FencedMutationRosterLedgerLayout::Absent => match v2_ledger_layout {
             consensus::FencedTransitionV2LedgerLayout::Activated => {
@@ -696,6 +698,9 @@ fn preflight_current_tables(
             "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(body_digest), length(admission_digest), length(binding_digest), length(retained_until), length(admission_blob), length(protected_plan), COALESCE(length(protected_checkpoint), 0), COALESCE(length(terminal_blob), 0), COALESCE(length(terminal_digest), 0), COALESCE(length(terminal_result), 0), COALESCE(length(terminal_result_digest), 0))), 0), COALESCE(SUM(length(request_id) + length(body_digest) + length(admission_digest) + length(binding_digest) + length(retained_until) + length(admission_blob) + length(protected_plan) + COALESCE(length(protected_checkpoint), 0) + COALESCE(length(terminal_blob), 0) + COALESCE(length(terminal_digest), 0) + COALESCE(length(terminal_result), 0) + COALESCE(length(terminal_result_digest), 0)), 0) FROM consensus_fenced_mutation_roster_operations",
             "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(stable_member_id))), 0), COALESCE(SUM(length(request_id) + length(stable_member_id)), 0) FROM consensus_fenced_mutation_roster_members",
             "SELECT COUNT(*), COALESCE(MAX(MAX(length(scope_configuration_id), length(voter_set_digest), length(profile_digest))), 0), COALESCE(SUM(length(scope_configuration_id) + length(voter_set_digest) + length(profile_digest)), 0) FROM consensus_fenced_mutation_roster_activation",
+            "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(request_digest), length(worker_digest))), 0), COALESCE(SUM(length(request_id) + length(request_digest) + length(worker_digest)), 0) FROM consensus_fenced_mutation_roster_v4_verifier_reservations",
+            "SELECT COUNT(*), COALESCE(MAX(length(request_id)), 0), COALESCE(SUM(length(request_id)), 0) FROM consensus_fenced_mutation_roster_protocol_claims",
+            "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), COALESCE(length(effect_owner_digest), 0), COALESCE(length(receipt_digest), 0))), 0), COALESCE(SUM(length(request_id) + COALESCE(length(effect_owner_digest), 0) + COALESCE(length(receipt_digest), 0)), 0) FROM consensus_fenced_mutation_roster_managed_provider_jobs",
         ] {
             let (count, maximum, total): (i64, i64, i64) = conn
                 .query_row(query, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -896,6 +901,28 @@ fn preflight_fenced_mutation_roster_count(conn: &Connection) -> Result<usize, Re
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let members = usize::try_from(members).map_err(|_| RecoveryError::CorruptReplica)?;
     if members > FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY * 8 {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    let claims: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (SELECT request_id FROM consensus_fenced_mutation_roster_protocol_claims LIMIT ?1)",
+            [limit],
+            |row| row.get(0),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let claims = usize::try_from(claims).map_err(|_| RecoveryError::CorruptReplica)?;
+    if claims > FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    let jobs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (SELECT request_id FROM consensus_fenced_mutation_roster_managed_provider_jobs LIMIT ?1)",
+            [member_limit],
+            |row| row.get(0),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let jobs = usize::try_from(jobs).map_err(|_| RecoveryError::CorruptReplica)?;
+    if jobs > FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY * 8 {
         return Err(RecoveryError::CorruptReplica);
     }
     Ok(count)
@@ -1407,6 +1434,9 @@ fn hash_current_checkpoint(
             "SELECT * FROM consensus_fenced_mutation_roster_activation ORDER BY singleton",
             "SELECT * FROM consensus_fenced_mutation_roster_operations ORDER BY history_epoch, ordinal, request_id",
             "SELECT * FROM consensus_fenced_mutation_roster_members ORDER BY request_id, ordinal",
+            "SELECT * FROM consensus_fenced_mutation_roster_v4_verifier_reservations ORDER BY request_id",
+            "SELECT * FROM consensus_fenced_mutation_roster_protocol_claims ORDER BY request_id",
+            "SELECT * FROM consensus_fenced_mutation_roster_managed_provider_jobs ORDER BY request_id, ordinal",
         ] {
             hash_query_rows_with_identity(conn, query, query, budget, hasher)?;
         }
@@ -1812,6 +1842,9 @@ fn validate_exact_recovery_schema(
         for table in [
             "consensus_fenced_mutation_roster_operations",
             "consensus_fenced_mutation_roster_members",
+            "consensus_fenced_mutation_roster_v4_verifier_reservations",
+            "consensus_fenced_mutation_roster_protocol_claims",
+            "consensus_fenced_mutation_roster_managed_provider_jobs",
             "consensus_fenced_mutation_roster_activation",
             "consensus_fenced_mutation_roster_history",
         ] {
@@ -1977,6 +2010,9 @@ fn recovery_schema_manifest(conn: &Connection) -> Result<BTreeMap<String, String
                 ),
                 "consensus_fenced_mutation_roster_operations_due" => normalize_schema_sql(
                     "CREATE INDEX consensus_fenced_mutation_roster_operations_due ON consensus_fenced_mutation_roster_operations (retained_until, request_id) WHERE phase IN (2, 3)",
+                ),
+                "consensus_fenced_mutation_roster_managed_provider_jobs_recovery" => normalize_schema_sql(
+                    "CREATE INDEX consensus_fenced_mutation_roster_managed_provider_jobs_recovery ON consensus_fenced_mutation_roster_managed_provider_jobs (phase, request_id, ordinal) WHERE phase IN (1, 3)",
                 ),
                 _ => return Err(RecoveryError::CorruptReplica),
             };
