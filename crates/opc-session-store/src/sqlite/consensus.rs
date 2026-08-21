@@ -40,8 +40,8 @@ use crate::fenced_mutation_roster::{
     decode_fenced_mutation_roster_admission, decode_fenced_mutation_roster_terminal,
     encode_fenced_mutation_roster_admission, encode_fenced_mutation_roster_identity,
     encode_fenced_mutation_roster_terminal, fenced_mutation_roster_profile_digest,
-    FencedMutationRosterAdmission, FencedMutationRosterOutcome, FencedMutationRosterPhase,
-    FencedMutationRosterStatus, FencedMutationRosterTerminal,
+    FencedMutationRosterAdmission, FencedMutationRosterHistoryState, FencedMutationRosterOutcome,
+    FencedMutationRosterPhase, FencedMutationRosterStatus, FencedMutationRosterTerminal,
     FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,
     FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES, FENCED_MUTATION_ROSTER_MAX_LIVE,
     FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES, FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY,
@@ -4917,7 +4917,7 @@ fn fenced_transition_v2_ledger_layout_in_sync(
     };
     match (schema_version, has_receipts, has_activation, has_history) {
         (
-            (FENCED_TRANSITION_V2_DATABASE_FORMAT | FENCED_MUTATION_ROSTER_DATABASE_FORMAT),
+            FENCED_TRANSITION_V2_DATABASE_FORMAT | FENCED_MUTATION_ROSTER_DATABASE_FORMAT,
             true,
             true,
             true,
@@ -5599,6 +5599,40 @@ pub(crate) fn read_fenced_transition_v2_history_state_sync(
         state.reclaimed_entries,
     )
     .map_err(|_| invalid_data("fenced transition V2 history state is invalid"))
+}
+
+/// Read the public roster history counters after a caller-owned consensus
+/// barrier. A reclaim-in-progress state has no active epoch, which the
+/// closed public roster response cannot represent, so that state is rejected
+/// rather than projected as a misleading live epoch.
+pub(crate) fn read_fenced_mutation_roster_history_state_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+) -> io::Result<FencedMutationRosterHistoryState> {
+    if fenced_mutation_roster_ledger_layout_sync(conn)? == FencedMutationRosterLedgerLayout::Absent
+    {
+        // A read before the first roster activation exposes its single legal
+        // starting point, just as the V2 reader does. It does not create or
+        // imply an activation certificate.
+        return Ok(FencedMutationRosterHistoryState {
+            active_epoch: FENCED_MUTATION_ROSTER_INITIAL_HISTORY_EPOCH,
+            retired_through: 0,
+            generation: 0,
+            bound: 0,
+            live: 0,
+        });
+    }
+    let state = read_fenced_mutation_roster_history_row_in_sync(conn, storage_identity, false)?;
+    let active_epoch = state
+        .active_epoch
+        .ok_or_else(|| invalid_data("fenced mutation roster public history has no active epoch"))?;
+    Ok(FencedMutationRosterHistoryState {
+        active_epoch,
+        retired_through: state.retired_through,
+        generation: state.generation,
+        bound: state.current_bound_count,
+        live: state.current_live_count,
+    })
 }
 
 pub(crate) fn fenced_transition_v2_activation_matches_scope_sync(

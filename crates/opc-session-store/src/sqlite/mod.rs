@@ -981,6 +981,23 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Read the public roster history lifecycle after a caller-owned barrier.
+    pub(crate) async fn consensus_fenced_mutation_roster_history_state(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        _authority_identity: crate::consensus::SessionConsensusIdentity,
+    ) -> Result<crate::FencedMutationRosterHistoryState, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::read_fenced_mutation_roster_history_state_sync(conn, storage_identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "fenced mutation roster history is unavailable".into(),
+                    )
+                })
+        })
+        .await
+    }
+
     /// Read the durable V2 history lifecycle after a caller-owned barrier.
     pub(crate) async fn consensus_fenced_transition_v2_history_state(
         &self,
