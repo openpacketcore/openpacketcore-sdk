@@ -12593,8 +12593,8 @@ OR EXISTS (
        OR job.phase NOT IN (0, 1, 2, 3, 4, 5)
        OR job.attempt_fence < 0
        OR (job.phase = 0 AND (job.effect_owner_digest IS NOT NULL OR job.attempt_fence != 0 OR job.receipt_digest IS NOT NULL OR job.outcome IS NOT NULL))
-       OR (job.phase = 1 AND (job.effect_owner_digest IS NULL OR job.attempt_fence <= 0 OR job.receipt_digest IS NOT NULL OR job.outcome IS NOT NULL))
-       OR (job.phase IN (2, 3, 4, 5) AND (job.receipt_digest IS NULL OR job.outcome IS NULL))
+       OR (job.phase = 1 AND (typeof(job.effect_owner_digest) != 'blob' OR octet_length(job.effect_owner_digest) != 32 OR job.effect_owner_digest = zeroblob(32) OR job.attempt_fence <= 0 OR job.receipt_digest IS NOT NULL OR job.outcome IS NOT NULL))
+       OR (job.phase IN (2, 3, 4, 5) AND (typeof(job.effect_owner_digest) != 'blob' OR octet_length(job.effect_owner_digest) != 32 OR job.effect_owner_digest = zeroblob(32) OR job.attempt_fence <= 0 OR typeof(job.receipt_digest) != 'blob' OR octet_length(job.receipt_digest) != 32 OR job.receipt_digest = zeroblob(32) OR job.outcome NOT IN (0, 1, 2, 3)))
        OR (claim.mode NOT IN (2, 3) AND job.phase != 0)
     LIMIT 1
 )
