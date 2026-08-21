@@ -26,22 +26,22 @@ use opc_session_store::{
     session_consumer_batch_result_into_store, validate_stored_record_expiry_profile,
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
     FencedMutationRosterAdmission, FencedMutationRosterCapability,
-    FencedMutationRosterMemberAttestationProvider, FencedMutationRosterMemberAttestationVerifier,
-    FencedMutationRosterOutcome, FencedMutationRosterPhase, FencedMutationRosterRequestId,
-    FencedMutationRosterStatus, FencedTransitionExecuteError, FencedTransitionObservation,
-    FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
-    FencedTransitionStatus, LeaseError, LeaseGuard, OwnerId, PreparedFencedTransition,
-    RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionBackend,
-    SessionConsumerAuthorizationManifest, SessionConsumerBatchResult, SessionConsumerChange,
-    SessionConsumerFencedMutationRosterProfile, SessionConsumerFencedTransitionError,
-    SessionConsumerFencedTransitionStatus, SessionConsumerIdentity, SessionConsumerLeaseError,
-    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2Operation,
-    SessionConsumerV2Request, SessionConsumerV2Response, SessionConsumerV3Operation,
-    SessionConsumerV3Request, SessionConsumerV3Response, SessionConsumerV4Operation,
-    SessionConsumerV4Request, SessionConsumerV4Response, SessionOp, SessionOpResult,
-    SessionPayloadEncoding, SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
+    FencedMutationRosterMemberAttestationProvider, FencedMutationRosterOutcome,
+    FencedMutationRosterPhase, FencedMutationRosterRequestId, FencedMutationRosterStatus,
+    FencedTransitionExecuteError, FencedTransitionObservation, FencedTransitionOutcome,
+    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus, LeaseError,
+    LeaseGuard, OwnerId, PreparedFencedTransition, RecordExpiryPreflight, RestoreScanPage,
+    RestoreScanRequest, SessionBackend, SessionConsumerAuthorizationManifest,
+    SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerFencedMutationRosterProfile,
+    SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+    SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
+    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
+    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerStoreError, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionConsumerV3Operation, SessionConsumerV3Request,
+    SessionConsumerV3Response, SessionConsumerV4Operation, SessionConsumerV4Request,
+    SessionConsumerV4Response, SessionOp, SessionOpResult, SessionPayloadEncoding,
+    SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
     MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use opc_types::SpiffeId;
@@ -10628,7 +10628,6 @@ fn consumer_fenced_transition_request_id_from_fenced(
 #[derive(Clone)]
 pub struct FencedMutationRosterServicePort {
     service: Arc<dyn SessionQuorumConsumer>,
-    attestation_verifier: Option<Arc<dyn FencedMutationRosterMemberAttestationVerifier>>,
 }
 
 /// Redaction-safe failure while enabling the protected roster listener lane.
@@ -10646,33 +10645,7 @@ impl FencedMutationRosterServicePort {
             .fenced_mutation_roster_profile()
             .is_some_and(SessionConsumerFencedMutationRosterProfile::is_exact)
         {
-            Ok(Self {
-                service,
-                attestation_verifier: None,
-            })
-        } else {
-            Err(FencedMutationRosterServicePortError)
-        }
-    }
-
-    /// Validate and enable the separate revision-6 attested terminalization
-    /// lane. The verifier is a server trust boundary: without it `/4` is not
-    /// advertised, even when the generic service implements its V4 method.
-    pub fn with_attestation_verifier(
-        service: Arc<dyn SessionQuorumConsumer>,
-        verifier: Arc<dyn FencedMutationRosterMemberAttestationVerifier>,
-    ) -> Result<Self, FencedMutationRosterServicePortError> {
-        if service
-            .fenced_mutation_roster_profile()
-            .is_some_and(SessionConsumerFencedMutationRosterProfile::is_exact)
-            && service
-                .fenced_mutation_roster_attested_profile()
-                .is_some_and(SessionConsumerFencedMutationRosterProfile::is_exact_v3)
-        {
-            Ok(Self {
-                service,
-                attestation_verifier: Some(verifier),
-            })
+            Ok(Self { service })
         } else {
             Err(FencedMutationRosterServicePortError)
         }
@@ -10682,18 +10655,10 @@ impl FencedMutationRosterServicePort {
         Arc::clone(&self.service)
     }
 
-    fn attestation_verifier(
-        &self,
-    ) -> Option<Arc<dyn FencedMutationRosterMemberAttestationVerifier>> {
-        self.attestation_verifier.as_ref().map(Arc::clone)
-    }
-
     fn attested_enabled(&self) -> bool {
-        self.attestation_verifier.is_some()
-            && self
-                .service
-                .fenced_mutation_roster_attested_profile()
-                .is_some_and(SessionConsumerFencedMutationRosterProfile::is_exact_v3)
+        self.service
+            .fenced_mutation_roster_attested_profile()
+            .is_some_and(SessionConsumerFencedMutationRosterProfile::is_exact_v3)
     }
 }
 
@@ -11514,11 +11479,10 @@ where
 }
 
 /// Serve the revision-6 attested terminal lane after the same final mTLS
-/// admission used by V3. The verifier is supplied only by the validated
-/// server port, never by a client frame or generic service implementation.
+/// admission used by V3. The configured service owns its verifier; this
+/// network boundary receives no verifier capability.
 struct ConsumerV4ServerConnectionContext {
     service: Arc<dyn SessionQuorumConsumer>,
-    verifier: Arc<dyn FencedMutationRosterMemberAttestationVerifier>,
     identity: SessionConsumerIdentity,
     scope: SessionConsumerScope,
     max_frame_size: usize,
@@ -11543,7 +11507,6 @@ where
 {
     let ConsumerV4ServerConnectionContext {
         service,
-        verifier,
         identity,
         scope,
         max_frame_size,
@@ -11663,7 +11626,7 @@ where
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Ok(()),
-                response = service.execute_v4(&identity, request.clone(), verifier.as_ref()) => response,
+                response = service.execute_v4(&identity, request.clone()) => response,
                 _ = tokio::time::sleep_until(deadline) => SessionConsumerV4Response::Rejected(SessionConsumerRejection::Unavailable),
             }
         };
@@ -11843,9 +11806,6 @@ async fn handle_server_connection(
             return Err(ProtocolError::UnexpectedResponse);
         };
         if selected_alpn.as_deref() == Some(SESSION_QUORUM_CONSUMER_V4_ALPN) {
-            let Some(verifier) = roster_service.attestation_verifier() else {
-                return Err(ProtocolError::UnexpectedResponse);
-            };
             let roster_service = roster_service.service();
             if !roster_service
                 .fenced_mutation_roster_attested_profile()
@@ -11858,7 +11818,6 @@ async fn handle_server_connection(
                 &mut writer,
                 ConsumerV4ServerConnectionContext {
                     service: roster_service,
-                    verifier,
                     identity,
                     scope: authorizer.scope(),
                     max_frame_size,

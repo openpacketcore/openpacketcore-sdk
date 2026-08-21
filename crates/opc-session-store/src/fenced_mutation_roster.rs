@@ -652,7 +652,7 @@ impl FencedMutationRosterTerminal {
     /// Build a terminal receipt only from SDK-issued conclusive member proofs.
     pub fn from_member_proofs(
         admission: &FencedMutationRosterAdmission,
-        proofs: &[FencedMutationRosterMemberProof],
+        proofs: Vec<FencedMutationRosterMemberProof>,
         protected_checkpoint: Vec<u8>,
         protected_result: Vec<u8>,
     ) -> Result<Self, FencedMutationRosterError> {
@@ -666,7 +666,7 @@ impl FencedMutationRosterTerminal {
             return Err(FencedMutationRosterError::LifecycleConflict);
         }
         let mut outcomes = Vec::with_capacity(proofs.len());
-        for (proof, member) in proofs.iter().zip(admission.members().as_slice()) {
+        for (proof, member) in proofs.into_iter().zip(admission.members().as_slice()) {
             proof.validate_for(admission)?;
             // The canonical proof order is part of the terminal body.  Do
             // not let a duplicated or reordered valid proof stand in for a
@@ -1537,10 +1537,15 @@ pub enum FencedMutationRosterProviderOutcome {
 /// ```
 ///
 /// ```compile_fail
+/// fn assert_clone<T: Clone>() {}
+/// assert_clone::<opc_session_store::FencedMutationRosterMemberProof>();
+/// ```
+///
+/// ```compile_fail
 /// use opc_session_store::FencedMutationRosterMemberExecutor;
 /// let _ = FencedMutationRosterMemberExecutor::new();
 /// ```
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct FencedMutationRosterMemberProof {
     roster_id: FencedMutationRosterRequestId,
     phase_commitment: [u8; 32],
@@ -2391,14 +2396,14 @@ mod tests {
             FencedMutationRosterProtectedPlan::new(vec![3].into_boxed_slice()).unwrap(),
         )
         .unwrap();
-        let first = FencedMutationRosterMemberProof::issue(
+        let reordered_first = FencedMutationRosterMemberProof::issue(
             &FencedMutationRosterMemberExecutionContext::new(
                 &admission,
                 &admission.members().as_slice()[0],
             ),
             FencedMutationRosterProviderOutcome::AppliedExecuted,
         );
-        let second = FencedMutationRosterMemberProof::issue(
+        let reordered_second = FencedMutationRosterMemberProof::issue(
             &FencedMutationRosterMemberExecutionContext::new(
                 &admission,
                 &admission.members().as_slice()[1],
@@ -2409,7 +2414,7 @@ mod tests {
         assert_eq!(
             FencedMutationRosterTerminal::from_member_proofs(
                 &admission,
-                &[second.clone(), first.clone()],
+                vec![reordered_second, reordered_first],
                 Vec::new(),
                 admission.terminal_result().as_bytes().to_vec(),
             ),
@@ -2418,7 +2423,22 @@ mod tests {
         assert_eq!(
             FencedMutationRosterTerminal::from_member_proofs(
                 &admission,
-                &[first.clone(), first],
+                vec![
+                    FencedMutationRosterMemberProof::issue(
+                        &FencedMutationRosterMemberExecutionContext::new(
+                            &admission,
+                            &admission.members().as_slice()[0],
+                        ),
+                        FencedMutationRosterProviderOutcome::AppliedExecuted,
+                    ),
+                    FencedMutationRosterMemberProof::issue(
+                        &FencedMutationRosterMemberExecutionContext::new(
+                            &admission,
+                            &admission.members().as_slice()[0],
+                        ),
+                        FencedMutationRosterProviderOutcome::AppliedExecuted,
+                    ),
+                ],
                 Vec::new(),
                 admission.terminal_result().as_bytes().to_vec(),
             ),
@@ -2426,7 +2446,7 @@ mod tests {
         );
         assert!(FencedMutationRosterTerminal::from_member_proofs(
             &admission,
-            &[
+            vec![
                 FencedMutationRosterMemberProof::issue(
                     &FencedMutationRosterMemberExecutionContext::new(
                         &admission,
@@ -2434,7 +2454,13 @@ mod tests {
                     ),
                     FencedMutationRosterProviderOutcome::AppliedExecuted,
                 ),
-                second
+                FencedMutationRosterMemberProof::issue(
+                    &FencedMutationRosterMemberExecutionContext::new(
+                        &admission,
+                        &admission.members().as_slice()[1],
+                    ),
+                    FencedMutationRosterProviderOutcome::AppliedExecuted,
+                )
             ],
             Vec::new(),
             admission.terminal_result().as_bytes().to_vec(),

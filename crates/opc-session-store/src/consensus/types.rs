@@ -430,6 +430,18 @@ pub enum SessionMutationIntent {
         /// these only with the exact terminal transition, never on admission.
         protected_checkpoint: FencedMutationRosterProtectedPlan,
     },
+    /// Reserve one exact revision-6 verifier dispatch before any verifier I/O.
+    ///
+    /// The digests bind the complete attested request and authenticated worker
+    /// identity without retaining either cleartext value in the roster ledger.
+    ReserveFencedMutationRosterV4VerifierDispatch {
+        /// Exact previously admitted immutable roster body.
+        admission: Box<FencedMutationRosterAdmission>,
+        /// Domain-separated digest of the complete revision-6 request.
+        request_digest: [u8; 32],
+        /// Domain-separated digest of the authenticated mTLS worker identity.
+        worker_digest: [u8; 32],
+    },
     /// SDK-internal bounded roster terminal-history maintenance.
     ///
     /// This replicated compare-and-set command is admitted only through the
@@ -584,6 +596,7 @@ impl SessionMutationIntent {
             self,
             Self::AdmitFencedMutationRoster { .. }
                 | Self::TerminalizeFencedMutationRoster { .. }
+                | Self::ReserveFencedMutationRosterV4VerifierDispatch { .. }
                 | Self::MaintainFencedMutationRosterHistory { .. }
         ) || matches!(self, Self::Authorized { mutation, .. } if mutation.contains_fenced_mutation_roster())
     }
@@ -644,6 +657,16 @@ fn append_roster_applied_intent(
                 })?;
             out.extend_from_slice(&checkpoint_len.to_be_bytes());
             out.extend_from_slice(protected_checkpoint.as_bytes());
+        }
+        SessionMutationIntent::ReserveFencedMutationRosterV4VerifierDispatch {
+            admission,
+            request_digest,
+            worker_digest,
+        } => {
+            out.push(5);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            out.extend_from_slice(request_digest);
+            out.extend_from_slice(worker_digest);
         }
         SessionMutationIntent::Authorized {
             origin,
@@ -831,6 +854,8 @@ pub enum SessionMutationOutcome {
     FencedTransition(FencedTransitionOutcome),
     /// Typed durable result of one protected atomic mutation roster phase.
     FencedMutationRoster(FencedMutationRosterOutcome),
+    /// Result of one exact revision-6 verifier-dispatch reservation.
+    FencedMutationRosterV4VerifierDispatchReserved(bool),
 }
 
 impl fmt::Debug for SessionMutationOutcome {

@@ -437,16 +437,15 @@ async fn three_persistent_mtls_endpoints_terminalize_only_hmac_attested_provider
     let worker_identity =
         SessionConsumerIdentity::new(client_spiffe.clone()).expect("authenticated worker identity");
     activate_roster_capability(&store, scope, &worker_identity).await;
-    let service: Arc<dyn SessionQuorumConsumer> = Arc::new(store.consumer_service());
+    let service: Arc<dyn SessionQuorumConsumer> = Arc::new(
+        store.consumer_service_with_attestation_verifier(Arc::new(HmacAttestationVerifier)),
+    );
     let mut handles = Vec::with_capacity(ENDPOINTS);
     let mut clients = Vec::with_capacity(ENDPOINTS);
     for endpoint in 0..ENDPOINTS {
         let server_spiffe = spiffe(&format!("attested-server-{endpoint}"));
-        let roster_port = FencedMutationRosterServicePort::with_attestation_verifier(
-            Arc::clone(&service),
-            Arc::new(HmacAttestationVerifier),
-        )
-        .expect("attested server verifier port");
+        let roster_port = FencedMutationRosterServicePort::new(Arc::clone(&service))
+            .expect("configured attested server roster port");
         let (handle, address) = SessionQuorumConsumerServer::new(
             Arc::clone(&service),
             pki.server_config(&server_spiffe),

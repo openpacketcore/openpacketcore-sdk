@@ -19,9 +19,9 @@ use crate::fenced_mutation_roster::{
     compute_fenced_mutation_roster_profile_digest, FencedMutationRosterAdmission,
     FencedMutationRosterCapability, FencedMutationRosterErrorStatus,
     FencedMutationRosterHistoryState, FencedMutationRosterMemberAttestation,
-    FencedMutationRosterMemberAttestationVerifier, FencedMutationRosterMemberExecutionContext,
-    FencedMutationRosterOutcome, FencedMutationRosterProfile, FencedMutationRosterRequestId,
-    FencedMutationRosterScope, FencedMutationRosterStatus, FencedMutationRosterTerminal,
+    FencedMutationRosterMemberExecutionContext, FencedMutationRosterOutcome,
+    FencedMutationRosterProfile, FencedMutationRosterRequestId, FencedMutationRosterScope,
+    FencedMutationRosterStatus, FencedMutationRosterTerminal,
     FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES,
 };
 use crate::{
@@ -1957,15 +1957,14 @@ pub trait SessionQuorumConsumer: Send + Sync {
 
     /// Execute an authenticated revision-6 provider-attested terminalization.
     ///
-    /// The listener supplies only a server-configured verifier. Implementors
-    /// must bind the mTLS identity, exact scope, and durable admission before
-    /// deriving a terminal from private SDK proofs. The default performs no
-    /// backend work and remains fail-closed.
+    /// Implementors own their server-configured verifier. They must bind the
+    /// mTLS identity, exact scope, and durable admission before deriving a
+    /// terminal from private SDK proofs. The default performs no backend work
+    /// and remains fail-closed.
     async fn execute_v4(
         &self,
         _identity: &SessionConsumerIdentity,
         _request: SessionConsumerV4Request,
-        _verifier: &dyn FencedMutationRosterMemberAttestationVerifier,
     ) -> SessionConsumerV4Response {
         SessionConsumerV4Response::Rejected(SessionConsumerRejection::Unavailable)
     }
