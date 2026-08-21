@@ -1327,7 +1327,9 @@ struct PersistentFencedMutationRosterPool {
     ready_notify: Notify,
     force_notify: Notify,
     drained_notify: Notify,
+    shutdown_started: AtomicBool,
     shutdown_report: StdMutex<Option<PersistentFencedMutationRosterShutdownReport>>,
+    shutdown_complete: Notify,
     counters: PersistentFencedMutationRosterCounters,
 }
 
@@ -1396,7 +1398,9 @@ impl PersistentFencedMutationRosterClient {
                 ready_notify: Notify::new(),
                 force_notify: Notify::new(),
                 drained_notify: Notify::new(),
+                shutdown_started: AtomicBool::new(false),
                 shutdown_report: StdMutex::new(None),
+                shutdown_complete: Notify::new(),
                 counters: PersistentFencedMutationRosterCounters::default(),
             }),
         })
@@ -1873,46 +1877,59 @@ impl PersistentFencedMutationRosterClient {
 
     /// Stop admission, boundedly drain fixed work, then force remaining lane I/O.
     pub async fn shutdown(&self) -> PersistentFencedMutationRosterShutdownReport {
-        let previous = {
-            let _state = self.pool.attested_state.lock().await;
-            self.pool.phase.compare_exchange(
+        self.pool.start_shutdown();
+        self.pool.shutdown_report().await
+    }
+}
+
+impl PersistentFencedMutationRosterPool {
+    fn start_shutdown(self: &Arc<Self>) {
+        if self
+            .shutdown_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            pool.complete_shutdown().await;
+        });
+    }
+
+    async fn complete_shutdown(self: &Arc<Self>) {
+        let _previous = {
+            let _state = self.attested_state.lock().await;
+            self.phase.compare_exchange(
                 PersistentFencedMutationRosterPoolPhase::Running as u8,
                 PersistentFencedMutationRosterPoolPhase::Draining as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
         };
-        if previous.is_err() {
-            return self
-                .pool
-                .shutdown_report
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .unwrap_or_default();
-        }
-        self.pool.counters.phase.store(
+        self.counters.phase.store(
             PersistentFencedMutationRosterSetupPhase::Draining as u8,
             Ordering::Relaxed,
         );
-        counter_increment(&self.pool.counters.drain);
-        let attested_accepted_at_drain = self.pool.attested_calls_inflight.load(Ordering::Acquire);
-        if let Some(sender) = self.pool.scheduler_sender() {
+        counter_increment(&self.counters.drain);
+        let attested_accepted_at_drain = self.attested_calls_inflight.load(Ordering::Acquire);
+        if let Some(sender) = self.scheduler_sender() {
             let _ = sender
                 .send(FencedMutationRosterSchedulerCommand::Drain)
                 .await;
         }
         let deadline = tokio::time::Instant::now()
-            .checked_add(self.pool.config.shutdown_drain)
+            .checked_add(self.config.shutdown_drain)
             .expect("validated protected roster drain deadline");
         loop {
-            if self.pool.counters.queued.load(Ordering::Acquire) == 0
-                && self.pool.counters.inflight.load(Ordering::Acquire) == 0
-                && self.pool.attested_setup_inflight.load(Ordering::Acquire) == 0
-                && self.pool.attested_calls_inflight.load(Ordering::Acquire) == 0
+            if self.counters.queued.load(Ordering::Acquire) == 0
+                && self.counters.inflight.load(Ordering::Acquire) == 0
+                && self.attested_setup_inflight.load(Ordering::Acquire) == 0
+                && self.attested_calls_inflight.load(Ordering::Acquire) == 0
             {
                 break;
             }
-            let drained = self.pool.drained_notify.notified();
+            let drained = self.drained_notify.notified();
             tokio::pin!(drained);
             drained.as_mut().enable();
             if tokio::time::timeout_at(deadline, &mut drained)
@@ -1923,36 +1940,34 @@ impl PersistentFencedMutationRosterClient {
             }
         }
         let forced_calls = self
-            .pool
             .counters
             .queued
             .load(Ordering::Relaxed)
-            .saturating_add(self.pool.counters.inflight.load(Ordering::Relaxed));
-        let attested_forced_calls = self.pool.attested_calls_inflight.load(Ordering::Relaxed);
+            .saturating_add(self.counters.inflight.load(Ordering::Relaxed));
+        let attested_forced_calls = self.attested_calls_inflight.load(Ordering::Relaxed);
         let forced_calls = forced_calls.saturating_add(attested_forced_calls);
-        self.pool.phase.store(
+        self.phase.store(
             PersistentFencedMutationRosterPoolPhase::Forced as u8,
             Ordering::Release,
         );
-        self.pool.counters.phase.store(
+        self.counters.phase.store(
             PersistentFencedMutationRosterSetupPhase::Forced as u8,
             Ordering::Relaxed,
         );
-        counter_increment(&self.pool.counters.forced);
-        self.pool.force_notify.notify_waiters();
+        counter_increment(&self.counters.forced);
+        self.force_notify.notify_waiters();
         {
-            let _state = self.pool.attested_state.lock().await;
-            self.pool.attested_lane.lock().await.take();
-            self.pool.attested_warm.store(false, Ordering::Release);
+            let _state = self.attested_state.lock().await;
+            self.attested_lane.lock().await.take();
+            self.attested_warm.store(false, Ordering::Release);
         }
-        if let Some(sender) = self.pool.scheduler_sender() {
+        if let Some(sender) = self.scheduler_sender() {
             let _ = sender
                 .send(FencedMutationRosterSchedulerCommand::Force)
                 .await;
         }
         let report = PersistentFencedMutationRosterShutdownReport {
             drained_calls: self
-                .pool
                 .counters
                 .drain
                 .load(Ordering::Relaxed)
@@ -1961,11 +1976,28 @@ impl PersistentFencedMutationRosterClient {
             forced_calls,
         };
         *self
-            .pool
             .shutdown_report
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
-        report
+        self.shutdown_complete.notify_waiters();
+    }
+
+    async fn shutdown_report(&self) -> PersistentFencedMutationRosterShutdownReport {
+        loop {
+            let completed = self.shutdown_complete.notified();
+            tokio::pin!(completed);
+            completed.as_mut().enable();
+            let report = {
+                *self
+                    .shutdown_report
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            };
+            if let Some(report) = report {
+                return report;
+            }
+            completed.await;
+        }
     }
 }
 
@@ -14743,7 +14775,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn attested_shutdown_snapshots_real_call_and_excludes_setup_from_forced_calls() {
+    async fn attested_shutdown_callers_share_real_call_report_and_exclude_setup_from_force() {
         let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
         let client = PersistentFencedMutationRosterClient::try_from_stateless(
             stateless,
@@ -14760,17 +14792,24 @@ mod tests {
             tokio::task::yield_now().await;
         }
         let setup = super::FencedMutationRosterAttestedSetupInFlight::new(&client.pool);
-        let shutdown_client = client.clone();
-        let shutdown = tokio::spawn(async move { shutdown_client.shutdown().await });
+        let first_shutdown_client = client.clone();
+        let first_shutdown = tokio::spawn(async move { first_shutdown_client.shutdown().await });
+        let second_shutdown_client = client.clone();
+        let second_shutdown = tokio::spawn(async move { second_shutdown_client.shutdown().await });
         while PersistentFencedMutationRosterPoolPhase::load(&client.pool.phase)
             == PersistentFencedMutationRosterPoolPhase::Running
         {
             tokio::task::yield_now().await;
         }
         tokio::time::advance(DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN).await;
-        let report = shutdown.await.expect("shutdown task completes");
-        assert_eq!(report.drained_calls, 0);
-        assert_eq!(report.forced_calls, 1, "only the accepted call is forced");
+        let first_report = first_shutdown.await.expect("first shutdown completes");
+        let second_report = second_shutdown.await.expect("second shutdown completes");
+        assert_eq!(first_report, second_report);
+        assert_eq!(first_report.drained_calls, 0);
+        assert_eq!(
+            first_report.forced_calls, 1,
+            "only the accepted call is forced"
+        );
         assert!(call.await.expect("call task completes").is_err());
         drop(setup);
         assert_eq!(client.diagnostics().persistent_connections, 0);
