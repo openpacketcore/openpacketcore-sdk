@@ -44,6 +44,7 @@ pub mod consumer;
 pub mod error;
 pub mod identity;
 mod lifecycle;
+pub mod managed_provider;
 pub mod membership;
 #[cfg(not(feature = "legacy-session-net-compat"))]
 mod protocol;
@@ -124,6 +125,17 @@ pub use lifecycle::{
     ConnectionLifecycleError, ConnectionLifecyclePolicy, SessionReauthenticationControl,
     DEFAULT_MAX_AUTHENTICATION_AGE, DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN,
     DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
+};
+pub use managed_provider::{
+    ManagedProviderClientAuthority, ManagedProviderClientError, ManagedProviderJobServer,
+    ManagedProviderJobServerHandle, ManagedProviderJobService, ManagedProviderJobServicePort,
+    ManagedProviderPoolConfig, ManagedProviderPoolConfigError, ManagedProviderPoolDiagnostics,
+    ManagedProviderReadiness, ManagedProviderShutdownReport, ManagedVoterEndpoint,
+    PersistentManagedProviderJobClient, DEFAULT_MANAGED_PROVIDER_POOL_LANES,
+    DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES, DEFAULT_MANAGED_PROVIDER_POOL_RESPONSE_BYTES,
+    MANAGED_PROVIDER_JOB_ALPN, MANAGED_PROVIDER_JOB_SEMANTIC_REVISION,
+    MANAGED_PROVIDER_JOB_TRANSPORT_REVISION, MANAGED_PROVIDER_JOB_VOTERS,
+    MANAGED_PROVIDER_POOL_QUEUE_CAPACITY, MAX_MANAGED_PROVIDER_POOL_LANES,
 };
 pub use membership::{
     SessionMembershipAdmission, SessionMembershipAdmissionError,
