@@ -742,6 +742,9 @@ where
             .record_verified_attestation(id, receipt, self.authority)
             .await
         {
+            Ok(_) if outcome == FencedMutationRosterProviderOutcome::NotAppliedReconciled => {
+                Err(ManagedProviderJobError::FreshAdmissionRequired)
+            }
             Ok(_) => self
                 .store
                 .finalize_job(admission, self.authority)

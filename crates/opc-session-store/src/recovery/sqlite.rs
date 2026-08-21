@@ -47,10 +47,10 @@ const FILE_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file/v1\0";
 const WORKFLOW_VERSION: u16 = 2;
 // Six base SQLite objects plus bounded consensus/recovery tables. V3 adds
 // three ledger objects and two required indexes; V5 independently adds four
-// roster objects and two required indexes.  V7 extends the roster with the
+// roster objects and two required indexes.  V8 extends the roster with the
 // V4 reservation, a shared protocol claim, managed-member rows, and their
-// bounded recovery index.
-const MAX_CURRENT_SCHEMA_OBJECTS: usize = 38;
+// bounded recovery index, plus immutable managed authority commitments.
+const MAX_CURRENT_SCHEMA_OBJECTS: usize = 39;
 const MAX_SCHEMA_SQL_BYTES: usize = 16_384;
 
 type FencedTransitionV2HistorySqlRow = (
@@ -419,6 +419,9 @@ fn inspect_current(
         consensus::FencedMutationRosterLedgerLayout::Activated => {
             consensus::FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT
         }
+        consensus::FencedMutationRosterLedgerLayout::PublishedFormatSeven => {
+            consensus::FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT
+        }
         consensus::FencedMutationRosterLedgerLayout::Absent => match v2_ledger_layout {
             consensus::FencedTransitionV2LedgerLayout::Activated => {
                 i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 2
@@ -700,6 +703,7 @@ fn preflight_current_tables(
             "SELECT COUNT(*), COALESCE(MAX(MAX(length(scope_configuration_id), length(voter_set_digest), length(profile_digest))), 0), COALESCE(SUM(length(scope_configuration_id) + length(voter_set_digest) + length(profile_digest)), 0) FROM consensus_fenced_mutation_roster_activation",
             "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(request_digest), length(worker_digest))), 0), COALESCE(SUM(length(request_id) + length(request_digest) + length(worker_digest)), 0) FROM consensus_fenced_mutation_roster_v4_verifier_reservations",
             "SELECT COUNT(*), COALESCE(MAX(length(request_id)), 0), COALESCE(SUM(length(request_id)), 0) FROM consensus_fenced_mutation_roster_protocol_claims",
+            "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(worker_digest), length(verifier_digest))), 0), COALESCE(SUM(length(request_id) + length(worker_digest) + length(verifier_digest)), 0) FROM consensus_fenced_mutation_roster_managed_provider_authorities",
             "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), COALESCE(length(effect_owner_digest), 0), COALESCE(length(receipt_digest), 0))), 0), COALESCE(SUM(length(request_id) + COALESCE(length(effect_owner_digest), 0) + COALESCE(length(receipt_digest), 0)), 0) FROM consensus_fenced_mutation_roster_managed_provider_jobs",
         ] {
             let (count, maximum, total): (i64, i64, i64) = conn
@@ -912,6 +916,17 @@ fn preflight_fenced_mutation_roster_count(conn: &Connection) -> Result<usize, Re
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let claims = usize::try_from(claims).map_err(|_| RecoveryError::CorruptReplica)?;
     if claims > FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    let authorities: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (SELECT request_id FROM consensus_fenced_mutation_roster_managed_provider_authorities LIMIT ?1)",
+            [limit],
+            |row| row.get(0),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let authorities = usize::try_from(authorities).map_err(|_| RecoveryError::CorruptReplica)?;
+    if authorities > FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY {
         return Err(RecoveryError::CorruptReplica);
     }
     let jobs: i64 = conn
@@ -1404,6 +1419,7 @@ fn hash_current_checkpoint(
     hasher.update(match roster_ledger_layout {
         consensus::FencedMutationRosterLedgerLayout::Absent => [0],
         consensus::FencedMutationRosterLedgerLayout::Activated => [1],
+        consensus::FencedMutationRosterLedgerLayout::PublishedFormatSeven => [2],
     });
     let schema_version: i64 = conn
         .query_row(
@@ -1436,6 +1452,7 @@ fn hash_current_checkpoint(
             "SELECT * FROM consensus_fenced_mutation_roster_members ORDER BY request_id, ordinal",
             "SELECT * FROM consensus_fenced_mutation_roster_v4_verifier_reservations ORDER BY request_id",
             "SELECT * FROM consensus_fenced_mutation_roster_protocol_claims ORDER BY request_id",
+            "SELECT * FROM consensus_fenced_mutation_roster_managed_provider_authorities ORDER BY request_id",
             "SELECT * FROM consensus_fenced_mutation_roster_managed_provider_jobs ORDER BY request_id, ordinal",
         ] {
             hash_query_rows_with_identity(conn, query, query, budget, hasher)?;
@@ -1844,6 +1861,7 @@ fn validate_exact_recovery_schema(
             "consensus_fenced_mutation_roster_members",
             "consensus_fenced_mutation_roster_v4_verifier_reservations",
             "consensus_fenced_mutation_roster_protocol_claims",
+            "consensus_fenced_mutation_roster_managed_provider_authorities",
             "consensus_fenced_mutation_roster_managed_provider_jobs",
             "consensus_fenced_mutation_roster_activation",
             "consensus_fenced_mutation_roster_history",
