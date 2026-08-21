@@ -44,8 +44,7 @@ use crate::fenced_mutation_roster::{
     FencedMutationRosterStatus, FencedMutationRosterTerminal,
     FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,
     FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES, FENCED_MUTATION_ROSTER_MAX_LIVE,
-    FENCED_MUTATION_ROSTER_RECLAIM_BATCH, FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES,
-    FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY, FENCED_MUTATION_ROSTER_RETENTION_SECONDS,
+    FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES, FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY,
     FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
 };
 use crate::fenced_transition::{
@@ -2087,6 +2086,12 @@ pub(crate) fn read_storage_identity_sync(
             || value == FENCED_TRANSITION_V2_DATABASE_FORMAT
             || value == FENCED_MUTATION_ROSTER_DATABASE_FORMAT
     ) {
+        return Err(SessionConsensusStorageError::SchemaVersionMismatch);
+    }
+    if schema == FENCED_MUTATION_ROSTER_DATABASE_FORMAT
+        && !table_exists(conn, "consensus_fenced_mutation_roster_operations")
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+    {
         return Err(SessionConsensusStorageError::SchemaVersionMismatch);
     }
     let cluster: [u8; 32] = cluster
@@ -6130,9 +6135,9 @@ pub(crate) fn activate_fenced_mutation_roster_scope_sync(
         .map_err(db_error)?;
     }
     let history = read_fenced_mutation_roster_history_row_in_sync(conn, storage_identity, false)?;
-    if history.profile_digest != profile_digest
-        || history.active_epoch != Some(initial_active_epoch)
-    {
+    // `initial_active_epoch` binds only the first installation. A completed
+    // reclaim later opens a successor epoch under the same immutable profile.
+    if history.profile_digest != profile_digest || history.active_epoch.is_none() {
         return Err(invalid_data(
             "fenced mutation roster activation epoch is not active",
         ));
@@ -11794,6 +11799,7 @@ SELECT EXISTS (
         SELECT request_id, history_epoch, ordinal, configuration_epoch,
                body_digest, admission_digest, binding_digest, retained_until,
                phase, member_count, admission_blob, protected_plan,
+               protected_checkpoint, terminal_blob, terminal_digest,
                terminal_result, terminal_result_digest
         FROM {source} LIMIT ?1
     ) AS bounded
@@ -11811,12 +11817,26 @@ SELECT EXISTS (
        AND typeof(admission_blob) = 'blob' AND octet_length(admission_blob) BETWEEN 1 AND ?3
        AND typeof(protected_plan) = 'blob' AND octet_length(protected_plan) BETWEEN 0 AND 1048576
        AND (
-              (phase = 1 AND terminal_result IS NULL AND terminal_result_digest IS NULL)
-           OR (phase = 2 AND typeof(terminal_result) = 'blob'
-                            AND octet_length(terminal_result) BETWEEN 0 AND ?4
+              (phase = 1 AND protected_checkpoint IS NULL AND terminal_blob IS NULL
+                           AND terminal_digest IS NULL AND terminal_result IS NULL
+                           AND terminal_result_digest IS NULL)
+           OR (phase = 2 AND typeof(protected_checkpoint) = 'blob'
+                            AND octet_length(protected_checkpoint) BETWEEN 0 AND 1048576
+                            AND typeof(terminal_blob) = 'blob'
+                            AND octet_length(terminal_blob) BETWEEN 1 AND ?4
+                            AND typeof(terminal_digest) = 'blob'
+                            AND octet_length(terminal_digest) = 32
+                            AND typeof(terminal_result) = 'blob'
+                            AND octet_length(terminal_result) BETWEEN 0 AND ?5
                             AND typeof(terminal_result_digest) = 'blob'
                             AND octet_length(terminal_result_digest) = 32)
-           OR (phase = 3 AND terminal_result IS NULL AND terminal_result_digest IS NULL)
+           OR (phase = 3 AND typeof(protected_checkpoint) = 'blob'
+                            AND octet_length(protected_checkpoint) BETWEEN 0 AND 1048576
+                            AND typeof(terminal_blob) = 'blob'
+                            AND octet_length(terminal_blob) BETWEEN 1 AND ?4
+                            AND typeof(terminal_digest) = 'blob'
+                            AND octet_length(terminal_digest) = 32
+                            AND terminal_result IS NULL AND terminal_result_digest IS NULL)
        )
     ) LIMIT 1
 )
@@ -11827,6 +11847,8 @@ SELECT EXISTS (
                 i64::try_from(FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES)
                     .map_err(|_| invalid_data("fenced mutation roster bound is invalid"))?,
                 i64::try_from(FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES)
+                    .map_err(|_| invalid_data("fenced mutation roster bound is invalid"))?,
+                i64::try_from(FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES)
                     .map_err(|_| invalid_data("fenced mutation roster bound is invalid"))?,
                 i64::try_from(FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES)
                     .map_err(|_| invalid_data("fenced mutation roster bound is invalid"))?,
@@ -11901,7 +11923,7 @@ SELECT EXISTS (
 
     let mut statement = conn
         .prepare(&format!(
-            "SELECT request_id, history_epoch, ordinal, configuration_epoch, body_digest, admission_digest, binding_digest, retained_until, phase, member_count, admission_blob, protected_plan, terminal_result, terminal_result_digest FROM {source} ORDER BY history_epoch ASC, ordinal ASC LIMIT ?1"
+            "SELECT request_id, history_epoch, ordinal, configuration_epoch, body_digest, admission_digest, binding_digest, retained_until, phase, member_count, admission_blob, protected_plan, protected_checkpoint, terminal_blob, terminal_digest, terminal_result, terminal_result_digest FROM {source} ORDER BY history_epoch ASC, ordinal ASC LIMIT ?1"
         ))
         .map_err(db_error)?;
     let rows = statement
@@ -11921,6 +11943,9 @@ SELECT EXISTS (
                 row.get::<_, Vec<u8>>(11)?,
                 row.get::<_, Option<Vec<u8>>>(12)?,
                 row.get::<_, Option<Vec<u8>>>(13)?,
+                row.get::<_, Option<Vec<u8>>>(14)?,
+                row.get::<_, Option<Vec<u8>>>(15)?,
+                row.get::<_, Option<Vec<u8>>>(16)?,
             ))
         })
         .map_err(db_error)?;
@@ -11940,6 +11965,9 @@ SELECT EXISTS (
             member_count,
             admission_blob,
             protected_plan,
+            protected_checkpoint,
+            terminal_blob,
+            terminal_digest,
             terminal_result,
             terminal_result_digest,
         ) = row.map_err(db_error)?;
@@ -12014,31 +12042,80 @@ SELECT EXISTS (
         {
             return Err(invalid_data("fenced mutation roster binding is invalid"));
         }
-        match (phase, terminal_result, terminal_result_digest) {
-            (1, None, None) => {
+        let terminal = match (
+            phase,
+            protected_checkpoint,
+            terminal_blob,
+            terminal_digest,
+            terminal_result,
+            terminal_result_digest,
+        ) {
+            (1, None, None, None, None, None) => {
                 live = live
                     .checked_add(1)
-                    .ok_or_else(|| invalid_data("fenced mutation roster live count is invalid"))?
+                    .ok_or_else(|| invalid_data("fenced mutation roster live count is invalid"))?;
+                None
             }
-            (2, Some(result), Some(digest)) => {
+            (2, Some(checkpoint), Some(blob), Some(digest), Some(result), Some(result_digest)) => {
                 let digest: [u8; 32] = digest.try_into().map_err(|_| {
                     invalid_data("fenced mutation roster terminal digest is invalid")
                 })?;
-                if digest != fenced_mutation_roster_terminal_digest(&result) {
+                if digest != fenced_mutation_roster_terminal_digest(&blob) {
                     return Err(invalid_data(
                         "fenced mutation roster terminal digest is invalid",
                     ));
                 }
+                let result_digest: [u8; 32] = result_digest.try_into().map_err(|_| {
+                    invalid_data("fenced mutation roster terminal digest is invalid")
+                })?;
+                if result_digest != fenced_mutation_roster_terminal_digest(&result) {
+                    return Err(invalid_data(
+                        "fenced mutation roster terminal digest is invalid",
+                    ));
+                }
+                let terminal = decode_fenced_mutation_roster_terminal(&blob)
+                    .map_err(|_| invalid_data("fenced mutation roster terminal is invalid"))?;
+                terminal
+                    .validate_for_admission(&admission)
+                    .map_err(|_| invalid_data("fenced mutation roster terminal is invalid"))?;
+                if terminal.phase() != FencedMutationRosterPhase::Established
+                    || terminal.protected_checkpoint() != checkpoint
+                    || terminal.protected_result() != result
+                {
+                    return Err(invalid_data("fenced mutation roster terminal is invalid"));
+                }
+                Some(terminal)
             }
-            (3, None, None) => {}
+            (3, Some(checkpoint), Some(blob), Some(digest), None, None) => {
+                let digest: [u8; 32] = digest.try_into().map_err(|_| {
+                    invalid_data("fenced mutation roster terminal digest is invalid")
+                })?;
+                if digest != fenced_mutation_roster_terminal_digest(&blob) {
+                    return Err(invalid_data(
+                        "fenced mutation roster terminal digest is invalid",
+                    ));
+                }
+                let terminal = decode_fenced_mutation_roster_terminal(&blob)
+                    .map_err(|_| invalid_data("fenced mutation roster terminal is invalid"))?;
+                terminal
+                    .validate_for_admission(&admission)
+                    .map_err(|_| invalid_data("fenced mutation roster terminal is invalid"))?;
+                if terminal.phase() != FencedMutationRosterPhase::Aborted
+                    || terminal.protected_checkpoint() != checkpoint
+                {
+                    return Err(invalid_data("fenced mutation roster terminal is invalid"));
+                }
+                Some(terminal)
+            }
             _ => return Err(invalid_data("fenced mutation roster phase is invalid")),
-        }
+        };
         validate_fenced_mutation_roster_member_rows_sync(
             conn,
             members_source,
             &request_id,
             &admission,
             phase,
+            terminal.as_ref(),
         )?;
     }
     if history.active_epoch.is_some() {
@@ -12059,6 +12136,7 @@ fn validate_fenced_mutation_roster_member_rows_sync(
     request_id: &[u8; FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES],
     admission: &FencedMutationRosterAdmission,
     phase: i64,
+    terminal: Option<&FencedMutationRosterTerminal>,
 ) -> io::Result<()> {
     let mut statement = conn
         .prepare(&format!(
@@ -12090,6 +12168,20 @@ fn validate_fenced_mutation_roster_member_rows_sync(
             return Err(invalid_data(
                 "fenced mutation roster member identity is invalid",
             ));
+        }
+        if let Some(terminal) = terminal {
+            let outcome = terminal
+                .members()
+                .get(ordinal)
+                .ok_or_else(|| invalid_data("fenced mutation roster terminal member is invalid"))?;
+            if outcome.caller_id() != member.caller_id()
+                || disposition != outcome.disposition() as i64
+                || adoption != outcome.adoption() as i64
+            {
+                return Err(invalid_data(
+                    "fenced mutation roster terminal member is invalid",
+                ));
+            }
         }
         let conclusive = adoption != 0;
         let phase_valid = match phase {
@@ -12557,6 +12649,695 @@ fn replay_fenced_transition_receipt_sync(
         )));
     }
     Ok(receipt.response)
+}
+
+/// The roster has a separate durable request space.  The outer consensus
+/// request ID is deliberately not used as its persistence key: it is only a
+/// transport correlation value and can never replace the full 56-byte,
+/// self-authenticating roster identity.
+enum FencedMutationRosterCommand<'a> {
+    Admit {
+        admission: &'a FencedMutationRosterAdmission,
+        scope_identity: SessionConsensusIdentity,
+        voter_set_digest: [u8; 32],
+        profile_digest: [u8; 32],
+    },
+    Terminalize {
+        admission: &'a FencedMutationRosterAdmission,
+        terminal: &'a FencedMutationRosterTerminal,
+        protected_checkpoint: &'a crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan,
+    },
+}
+
+fn fenced_mutation_roster_command(
+    intent: &SessionMutationIntent,
+) -> Option<FencedMutationRosterCommand<'_>> {
+    let intent = match intent {
+        SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
+        intent => intent,
+    };
+    match intent {
+        SessionMutationIntent::AdmitFencedMutationRoster {
+            admission,
+            scope_identity,
+            voter_set_digest,
+            profile_digest,
+        } => Some(FencedMutationRosterCommand::Admit {
+            admission,
+            scope_identity: *scope_identity,
+            voter_set_digest: *voter_set_digest,
+            profile_digest: *profile_digest,
+        }),
+        SessionMutationIntent::TerminalizeFencedMutationRoster {
+            admission,
+            terminal,
+            protected_checkpoint,
+        } => Some(FencedMutationRosterCommand::Terminalize {
+            admission,
+            terminal,
+            protected_checkpoint,
+        }),
+        _ => None,
+    }
+}
+
+fn fenced_mutation_roster_access_is_authorized_sync(
+    scope: &MembershipValidationScope,
+    storage_identity: SessionConsensusIdentity,
+    intent: &SessionMutationIntent,
+) -> io::Result<bool> {
+    match intent {
+        SessionMutationIntent::Authorized {
+            origin,
+            authority_identity,
+            mutation,
+        } if fenced_mutation_roster_command(mutation).is_some() => Ok(
+            application_authority_matches(scope, *origin, *authority_identity),
+        ),
+        intent if fenced_mutation_roster_command(intent).is_some() => {
+            Ok(untouched_initial_membership_scope(scope, storage_identity))
+        }
+        _ => Err(invalid_data(
+            "fenced mutation roster authority envelope is invalid",
+        )),
+    }
+}
+
+fn fenced_mutation_roster_invalid(reason: &'static str) -> StoreError {
+    StoreError::InvalidKey(reason.into())
+}
+
+fn fenced_mutation_roster_status_from_row(
+    admission: &FencedMutationRosterAdmission,
+    phase: i64,
+    terminal_blob: Option<Vec<u8>>,
+) -> Result<FencedMutationRosterStatus, StoreError> {
+    let phase = match phase {
+        1 => FencedMutationRosterPhase::PollAdmitted,
+        2 => FencedMutationRosterPhase::Established,
+        3 => FencedMutationRosterPhase::Aborted,
+        _ => {
+            return Err(fenced_mutation_roster_invalid(
+                "fenced_mutation_roster_phase_invalid",
+            ))
+        }
+    };
+    let terminal = match (phase, terminal_blob) {
+        (FencedMutationRosterPhase::Established, Some(bytes)) => {
+            let terminal = decode_fenced_mutation_roster_terminal(&bytes).map_err(|_| {
+                fenced_mutation_roster_invalid("fenced_mutation_roster_terminal_invalid")
+            })?;
+            terminal.validate_for_admission(admission).map_err(|_| {
+                fenced_mutation_roster_invalid("fenced_mutation_roster_terminal_invalid")
+            })?;
+            Some(terminal)
+        }
+        (FencedMutationRosterPhase::PollAdmitted, None)
+        | (FencedMutationRosterPhase::Aborted, Some(_)) => None,
+        _ => {
+            return Err(fenced_mutation_roster_invalid(
+                "fenced_mutation_roster_phase_invalid",
+            ))
+        }
+    };
+    FencedMutationRosterStatus::new(phase, admission.request_id(), terminal)
+        .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_status_invalid"))
+}
+
+fn read_fenced_mutation_roster_operation_status_sync(
+    conn: &Connection,
+    admission: &FencedMutationRosterAdmission,
+) -> Result<Option<(Vec<u8>, FencedMutationRosterStatus)>, StoreError> {
+    let request_id = encode_fenced_mutation_roster_identity(admission.request_id());
+    let row = conn
+        .query_row(
+            "SELECT admission_blob, phase, terminal_blob FROM consensus_fenced_mutation_roster_operations WHERE request_id = ?1",
+            [request_id.as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| {
+            StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into())
+        })?;
+    row.map(|(admission_blob, phase, terminal_blob)| {
+        let decoded = decode_fenced_mutation_roster_admission(&admission_blob).map_err(|_| {
+            fenced_mutation_roster_invalid("fenced_mutation_roster_admission_invalid")
+        })?;
+        let canonical = encode_fenced_mutation_roster_admission(&decoded).map_err(|_| {
+            fenced_mutation_roster_invalid("fenced_mutation_roster_admission_invalid")
+        })?;
+        if canonical != admission_blob {
+            return Err(fenced_mutation_roster_invalid(
+                "fenced_mutation_roster_admission_invalid",
+            ));
+        }
+        let status = fenced_mutation_roster_status_from_row(&decoded, phase, terminal_blob)?;
+        Ok((admission_blob, status))
+    })
+    .transpose()
+}
+
+/// Read an exact V4 roster receipt without executing adapters, checkpoints,
+/// publications, or compaction.  A body whose immutable identity differs is
+/// reported before lifecycle/capacity state, and a retired epoch stays closed
+/// after physical reclamation.
+pub(crate) fn read_fenced_mutation_roster_status_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    admission: &FencedMutationRosterAdmission,
+) -> Result<FencedMutationRosterStatus, StoreError> {
+    admission
+        .validate()
+        .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_admission_invalid"))?;
+    if admission.members().is_empty() {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_member_count_invalid",
+        ));
+    }
+    if fenced_mutation_roster_ledger_layout_sync(conn).map_err(|_| {
+        StoreError::BackendUnavailable("fenced mutation roster status is unavailable".into())
+    })? == FencedMutationRosterLedgerLayout::Absent
+    {
+        return FencedMutationRosterStatus::new(
+            FencedMutationRosterPhase::Absent,
+            admission.request_id(),
+            None,
+        )
+        .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_status_invalid"));
+    }
+    validate_fenced_mutation_roster_receipts_sync(conn, storage_identity).map_err(|_| {
+        StoreError::BackendUnavailable("fenced mutation roster status is unavailable".into())
+    })?;
+    let history = read_fenced_mutation_roster_history_row_in_sync(conn, storage_identity, false)
+        .map_err(|_| {
+            StoreError::BackendUnavailable("fenced mutation roster status is unavailable".into())
+        })?;
+    let epoch = admission.request_id().epoch();
+    if epoch <= history.retired_through {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_epoch_retired",
+        ));
+    }
+    let canonical = encode_fenced_mutation_roster_admission(admission)
+        .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_admission_invalid"))?;
+    if let Some((stored, status)) =
+        read_fenced_mutation_roster_operation_status_sync(conn, admission)?
+    {
+        if stored != canonical {
+            return Err(fenced_mutation_roster_invalid(
+                "fenced_mutation_roster_request_conflict",
+            ));
+        }
+        return Ok(status);
+    }
+    let request_id = encode_fenced_mutation_roster_identity(admission.request_id());
+    let operation_conflict: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM consensus_fenced_mutation_roster_operations WHERE history_epoch = ?1 AND substr(request_id, 9, 16) = ?2 LIMIT 1)",
+            params![
+                checked_positive_i64(epoch).map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_epoch_invalid"))?,
+                &request_id[8..24],
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            StoreError::BackendUnavailable("fenced mutation roster status is unavailable".into())
+        })?;
+    if operation_conflict {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_request_conflict",
+        ));
+    }
+    if history.active_epoch != Some(epoch) {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_epoch_not_active",
+        ));
+    }
+    FencedMutationRosterStatus::new(
+        FencedMutationRosterPhase::Absent,
+        admission.request_id(),
+        None,
+    )
+    .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_status_invalid"))
+}
+
+fn fenced_mutation_roster_retained_until(logical_time: Timestamp) -> Result<Timestamp, StoreError> {
+    crate::ttl::checked_session_deadline(logical_time, FENCED_MUTATION_ROSTER_RETENTION)
+        .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_retention_exhausted"))
+}
+
+fn fenced_mutation_roster_admit_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    admission: &FencedMutationRosterAdmission,
+    logical_time: Timestamp,
+) -> Result<FencedMutationRosterOutcome, StoreError> {
+    admission
+        .validate()
+        .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_admission_invalid"))?;
+    if admission.members().is_empty() {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_member_count_invalid",
+        ));
+    }
+    let history = read_fenced_mutation_roster_history_row_in_sync(conn, storage_identity, false)
+        .map_err(|_| {
+            StoreError::BackendUnavailable(
+                "fenced mutation roster persistence is unavailable".into(),
+            )
+        })?;
+    let epoch = admission.request_id().epoch();
+    if epoch <= history.retired_through {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_epoch_retired",
+        ));
+    }
+    let canonical = encode_fenced_mutation_roster_admission(admission)
+        .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_admission_invalid"))?;
+    if let Some((stored, status)) =
+        read_fenced_mutation_roster_operation_status_sync(conn, admission)?
+    {
+        if stored != canonical {
+            return Err(fenced_mutation_roster_invalid(
+                "fenced_mutation_roster_request_conflict",
+            ));
+        }
+        return Ok(FencedMutationRosterOutcome { status });
+    }
+    let request_id = encode_fenced_mutation_roster_identity(admission.request_id());
+    let operation_conflict: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM consensus_fenced_mutation_roster_operations WHERE history_epoch = ?1 AND substr(request_id, 9, 16) = ?2 LIMIT 1)",
+            params![
+                checked_positive_i64(epoch).map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_epoch_invalid"))?,
+                &request_id[8..24],
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into())
+        })?;
+    if operation_conflict {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_request_conflict",
+        ));
+    }
+    if history.active_epoch != Some(epoch) {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_epoch_not_active",
+        ));
+    }
+    if history.current_bound_count >= FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY as u64 {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_history_full",
+        ));
+    }
+    if history.current_live_count >= FENCED_MUTATION_ROSTER_MAX_LIVE as u64 {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_live_full",
+        ));
+    }
+    let retained_until = fenced_mutation_roster_retained_until(logical_time)?;
+    let ordinal = history.current_bound_count.checked_add(1).ok_or_else(|| {
+        fenced_mutation_roster_invalid("fenced_mutation_roster_ordinal_exhausted")
+    })?;
+    let body_digest = admission.request_id().body_commitment();
+    let admission_digest = fenced_mutation_roster_admission_digest(&canonical);
+    let retained_until_text = ops::format_rfc3339_normalized(retained_until);
+    let binding_digest = fenced_mutation_roster_binding_digest(
+        storage_identity,
+        &request_id,
+        epoch,
+        ordinal,
+        body_digest,
+        admission_digest,
+        &retained_until_text,
+    )
+    .map_err(|_| {
+        StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into())
+    })?;
+    conn.execute(
+        "INSERT INTO consensus_fenced_mutation_roster_operations (request_id, history_epoch, ordinal, configuration_epoch, body_digest, admission_digest, binding_digest, retained_until, phase, member_count, admission_blob, protected_plan, protected_checkpoint, terminal_blob, terminal_digest, terminal_result, terminal_result_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, NULL, NULL, NULL, NULL, NULL)",
+        params![
+            request_id.as_slice(),
+            checked_positive_i64(epoch).map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_epoch_invalid"))?,
+            checked_positive_i64(ordinal).map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_ordinal_exhausted"))?,
+            epoch_i64(storage_identity).map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?,
+            body_digest.as_slice(),
+            admission_digest.as_slice(),
+            binding_digest.as_slice(),
+            retained_until_text,
+            i64::try_from(admission.members().len()).map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_member_count_invalid"))?,
+            canonical,
+            admission.protected_plan().as_bytes(),
+        ],
+    )
+    .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
+    for member in admission.members().as_slice() {
+        conn.execute(
+            "INSERT INTO consensus_fenced_mutation_roster_members (request_id, ordinal, stable_member_id, disposition, adoption) VALUES (?1, ?2, ?3, 0, 0)",
+            params![
+                request_id.as_slice(),
+                i64::from(member.ordinal().get()),
+                member.caller_id().as_slice(),
+            ],
+        )
+        .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
+    }
+    let changed = conn
+        .execute(
+            "UPDATE consensus_fenced_mutation_roster_history SET current_bound_count = current_bound_count + 1, current_live_count = current_live_count + 1, generation = generation + 1 WHERE singleton = 1 AND active_epoch = ?1 AND current_bound_count = ?2 AND current_live_count = ?3",
+            params![
+                checked_positive_i64(epoch).map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_epoch_invalid"))?,
+                i64::try_from(history.current_bound_count)
+                    .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_history_invalid"))?,
+                i64::try_from(history.current_live_count)
+                    .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_history_invalid"))?,
+            ],
+        )
+        .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
+    if changed != 1 {
+        return Err(StoreError::BackendUnavailable(
+            "fenced mutation roster persistence is unavailable".into(),
+        ));
+    }
+    let status = FencedMutationRosterStatus::new(
+        FencedMutationRosterPhase::PollAdmitted,
+        admission.request_id(),
+        None,
+    )
+    .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_status_invalid"))?;
+    Ok(FencedMutationRosterOutcome { status })
+}
+
+fn fenced_mutation_roster_terminalize_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    admission: &FencedMutationRosterAdmission,
+    terminal: &FencedMutationRosterTerminal,
+    protected_checkpoint: &crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan,
+) -> Result<FencedMutationRosterOutcome, StoreError> {
+    admission
+        .validate()
+        .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_admission_invalid"))?;
+    if admission.members().is_empty() {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_member_count_invalid",
+        ));
+    }
+    terminal
+        .validate_for_admission(admission)
+        .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_terminal_invalid"))?;
+    if terminal.protected_checkpoint() != protected_checkpoint.as_bytes() {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_checkpoint_mismatch",
+        ));
+    }
+    let history = read_fenced_mutation_roster_history_row_in_sync(conn, storage_identity, false)
+        .map_err(|_| {
+            StoreError::BackendUnavailable(
+                "fenced mutation roster persistence is unavailable".into(),
+            )
+        })?;
+    let epoch = admission.request_id().epoch();
+    if epoch <= history.retired_through {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_epoch_retired",
+        ));
+    }
+    let canonical_admission = encode_fenced_mutation_roster_admission(admission)
+        .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_admission_invalid"))?;
+    let request_id = encode_fenced_mutation_roster_identity(admission.request_id());
+    let row = conn
+        .query_row(
+            "SELECT admission_blob, phase, terminal_blob FROM consensus_fenced_mutation_roster_operations WHERE request_id = ?1",
+            [request_id.as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| {
+            StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into())
+        })?;
+    let Some((stored_admission, phase, stored_terminal)) = row else {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_not_admitted",
+        ));
+    };
+    if stored_admission != canonical_admission {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_request_conflict",
+        ));
+    }
+    let canonical_terminal = encode_fenced_mutation_roster_terminal(terminal)
+        .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_terminal_invalid"))?;
+    if phase != 1 {
+        if stored_terminal.as_deref() != Some(canonical_terminal.as_slice()) {
+            return Err(fenced_mutation_roster_invalid(
+                "fenced_mutation_roster_terminal_conflict",
+            ));
+        }
+        let status = fenced_mutation_roster_status_from_row(admission, phase, stored_terminal)?;
+        return Ok(FencedMutationRosterOutcome { status });
+    }
+    let terminal_phase = terminal.phase();
+    if !matches!(
+        terminal_phase,
+        FencedMutationRosterPhase::Established | FencedMutationRosterPhase::Aborted
+    ) {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_terminal_invalid",
+        ));
+    }
+    let stored_members = admission.members().as_slice();
+    if terminal.members().len() != stored_members.len()
+        || terminal
+            .members()
+            .iter()
+            .zip(stored_members)
+            .any(|(outcome, member)| {
+                outcome.ordinal() != member.ordinal() || outcome.caller_id() != member.caller_id()
+            })
+    {
+        return Err(fenced_mutation_roster_invalid(
+            "fenced_mutation_roster_terminal_invalid",
+        ));
+    }
+    let terminal_digest = fenced_mutation_roster_terminal_digest(&canonical_terminal);
+    let (phase_value, result, result_digest): (i64, Option<&[u8]>, Option<[u8; 32]>) =
+        match terminal_phase {
+            FencedMutationRosterPhase::Established => {
+                let result = terminal.protected_result();
+                (
+                    2,
+                    Some(result),
+                    Some(fenced_mutation_roster_terminal_digest(result)),
+                )
+            }
+            FencedMutationRosterPhase::Aborted => (3, None, None),
+            _ => unreachable!("terminal phase is checked above"),
+        };
+    let changed = conn
+        .execute(
+            "UPDATE consensus_fenced_mutation_roster_operations SET phase = ?1, protected_checkpoint = ?2, terminal_blob = ?3, terminal_digest = ?4, terminal_result = ?5, terminal_result_digest = ?6 WHERE request_id = ?7 AND phase = 1 AND admission_blob = ?8",
+            params![
+                phase_value,
+                protected_checkpoint.as_bytes(),
+                canonical_terminal.as_slice(),
+                terminal_digest.as_slice(),
+                result,
+                result_digest.as_ref().map(|digest| digest.as_slice()),
+                request_id.as_slice(),
+                canonical_admission.as_slice(),
+            ],
+        )
+        .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
+    if changed != 1 {
+        return Err(StoreError::BackendUnavailable(
+            "fenced mutation roster persistence is unavailable".into(),
+        ));
+    }
+    for outcome in terminal.members() {
+        let changed = conn
+            .execute(
+                "UPDATE consensus_fenced_mutation_roster_members SET disposition = ?1, adoption = ?2 WHERE request_id = ?3 AND ordinal = ?4",
+                params![
+                    outcome.disposition() as i64,
+                    outcome.adoption() as i64,
+                    request_id.as_slice(),
+                    i64::from(outcome.ordinal().get()),
+                ],
+            )
+            .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
+        if changed != 1 {
+            return Err(StoreError::BackendUnavailable(
+                "fenced mutation roster persistence is unavailable".into(),
+            ));
+        }
+    }
+    let changed = conn
+        .execute(
+            "UPDATE consensus_fenced_mutation_roster_history SET current_live_count = current_live_count - 1, generation = generation + 1 WHERE singleton = 1 AND current_live_count > 0",
+            [],
+        )
+        .map_err(|_| StoreError::BackendUnavailable("fenced mutation roster persistence is unavailable".into()))?;
+    if changed != 1 {
+        return Err(StoreError::BackendUnavailable(
+            "fenced mutation roster persistence is unavailable".into(),
+        ));
+    }
+    let status = match terminal_phase {
+        FencedMutationRosterPhase::Established => fenced_mutation_roster_status_from_row(
+            admission,
+            phase_value,
+            Some(canonical_terminal),
+        )?,
+        FencedMutationRosterPhase::Aborted => FencedMutationRosterStatus::new(
+            FencedMutationRosterPhase::Aborted,
+            admission.request_id(),
+            None,
+        )
+        .map_err(|_| fenced_mutation_roster_invalid("fenced_mutation_roster_status_invalid"))?,
+        _ => unreachable!("terminal phase is checked above"),
+    };
+    Ok(FencedMutationRosterOutcome { status })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_fenced_mutation_roster_command_sync(
+    tx: &mut Transaction<'_>,
+    storage_identity: SessionConsensusIdentity,
+    scope: &MembershipValidationScope,
+    command: &SessionConsensusCommand,
+    raft_log_index: u64,
+    machine: &mut (u64, SessionConsensusEntryDigest, Option<Timestamp>, u64),
+) -> io::Result<SessionConsensusResponse> {
+    let roster_command = fenced_mutation_roster_command(&command.intent)
+        .ok_or_else(|| invalid_data("fenced mutation roster command is missing"))?;
+    let admission = match &roster_command {
+        FencedMutationRosterCommand::Admit { admission, .. }
+        | FencedMutationRosterCommand::Terminalize { admission, .. } => admission,
+    };
+    admission
+        .validate()
+        .map_err(|_| invalid_data("fenced mutation roster admission is invalid"))?;
+    if admission.members().is_empty() {
+        return Err(invalid_data(
+            "fenced mutation roster member count is invalid",
+        ));
+    }
+    let authorized =
+        fenced_mutation_roster_access_is_authorized_sync(scope, storage_identity, &command.intent)?;
+    if !authorized {
+        advance_fenced_replay_logical_time_sync(
+            tx,
+            storage_identity,
+            command.logical_time,
+            machine,
+        )?;
+        return Ok(replay_conflict_response(
+            machine,
+            raft_log_index,
+            StoreError::TopologyAuthorityRevoked,
+        ));
+    }
+    if let FencedMutationRosterCommand::Admit {
+        scope_identity,
+        voter_set_digest,
+        profile_digest,
+        ..
+    } = &roster_command
+    {
+        if *scope_identity != scope.current_identity
+            || *voter_set_digest
+                != fenced_transition_voter_set_digest(
+                    scope.current_identity,
+                    &scope.current_members,
+                )
+            || *profile_digest != fenced_mutation_roster_profile_digest()
+        {
+            return Err(invalid_data(
+                "fenced mutation roster activation scope is stale",
+            ));
+        }
+        activate_fenced_mutation_roster_scope_sync(
+            tx,
+            storage_identity,
+            scope.current_identity,
+            &scope.current_members,
+            *profile_digest,
+            FENCED_MUTATION_ROSTER_INITIAL_HISTORY_EPOCH,
+        )?;
+    }
+    let logical_time = machine
+        .2
+        .map_or(command.logical_time, |time| time.max(command.logical_time));
+    let operation = match &roster_command {
+        FencedMutationRosterCommand::Admit { admission, .. } => {
+            fenced_mutation_roster_admit_sync(tx, storage_identity, admission, logical_time)
+        }
+        FencedMutationRosterCommand::Terminalize {
+            admission,
+            terminal,
+            protected_checkpoint,
+        } => fenced_mutation_roster_terminalize_sync(
+            tx,
+            storage_identity,
+            admission,
+            terminal,
+            protected_checkpoint,
+        ),
+    };
+    let outcome = match operation {
+        Ok(outcome) => outcome,
+        Err(error @ StoreError::InvalidKey(_)) => {
+            advance_fenced_replay_logical_time_sync(tx, storage_identity, logical_time, machine)?;
+            return Ok(replay_conflict_response(machine, raft_log_index, error));
+        }
+        Err(error) => return Err(io::Error::other(error.to_string())),
+    };
+    let sequence = machine
+        .0
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session consensus application sequence exhausted"))?;
+    let command_digest = command
+        .calculate_applied_digest(sequence, machine.1, logical_time)
+        .map_err(|_| invalid_data("session consensus command digest failed"))?;
+    let changed = tx
+        .execute(
+            "UPDATE consensus_machine SET application_sequence = ?1, last_digest = ?2, logical_time = ?3 WHERE singleton = 1 AND configuration_epoch = ?4",
+            params![
+                checked_positive_i64(sequence)?,
+                command_digest.as_bytes().as_slice(),
+                ops::format_rfc3339_normalized(logical_time),
+                epoch_i64(storage_identity)?,
+            ],
+        )
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Err(invalid_data("session consensus machine state is missing"));
+    }
+    machine.0 = sequence;
+    machine.1 = command_digest;
+    machine.2 = Some(logical_time);
+    Ok(SessionConsensusResponse {
+        result: Ok(SessionMutationOutcome::FencedMutationRoster(outcome)),
+        sequence,
+        digest: Some(command_digest),
+        logical_time: Some(logical_time),
+        raft_log_index,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14173,6 +14954,15 @@ pub(crate) fn apply_entries_with_authority_sync(
                             }
                         }
                     }
+                } else if fenced_mutation_roster_command(&command.intent).is_some() {
+                    apply_fenced_mutation_roster_command_sync(
+                        &mut tx,
+                        identity,
+                        &scope,
+                        &command,
+                        entry.log_id.index,
+                        &mut machine,
+                    )?
                 } else if fenced_transition_v2_request(&command.intent).is_some() {
                     apply_fenced_transition_v2_command_sync(
                         &mut tx,
@@ -16413,7 +17203,7 @@ fn validate_attached_snapshot_preserves_fenced_mutation_roster_history_sync(
         .map_err(|_| invalid_data("fenced mutation roster bound is invalid"))?;
     let mut statement = conn
         .prepare(
-            "SELECT request_id, history_epoch, ordinal, configuration_epoch, body_digest, admission_digest, binding_digest, retained_until, phase, member_count, admission_blob, protected_plan, terminal_result, terminal_result_digest FROM main.consensus_fenced_mutation_roster_operations ORDER BY history_epoch, ordinal LIMIT ?1",
+            "SELECT request_id, history_epoch, ordinal, configuration_epoch, body_digest, admission_digest, binding_digest, retained_until, phase, member_count, admission_blob, protected_plan, protected_checkpoint, terminal_blob, terminal_digest, terminal_result, terminal_result_digest FROM main.consensus_fenced_mutation_roster_operations ORDER BY history_epoch, ordinal LIMIT ?1",
         )
         .map_err(db_error)?;
     let rows = statement
@@ -16433,6 +17223,9 @@ fn validate_attached_snapshot_preserves_fenced_mutation_roster_history_sync(
                 row.get::<_, Vec<u8>>(11)?,
                 row.get::<_, Option<Vec<u8>>>(12)?,
                 row.get::<_, Option<Vec<u8>>>(13)?,
+                row.get::<_, Option<Vec<u8>>>(14)?,
+                row.get::<_, Option<Vec<u8>>>(15)?,
+                row.get::<_, Option<Vec<u8>>>(16)?,
             ))
         })
         .map_err(db_error)?;
@@ -16450,6 +17243,9 @@ fn validate_attached_snapshot_preserves_fenced_mutation_roster_history_sync(
             member_count,
             admission_blob,
             protected_plan,
+            protected_checkpoint,
+            terminal_blob,
+            terminal_digest,
             terminal_result,
             terminal_result_digest,
         ) = row.map_err(db_error)?;
@@ -16457,7 +17253,7 @@ fn validate_attached_snapshot_preserves_fenced_mutation_roster_history_sync(
             .map_err(|_| invalid_data("persisted fenced mutation roster retention is invalid"))?;
         let incoming_row = conn
             .query_row(
-                "SELECT history_epoch, ordinal, configuration_epoch, body_digest, admission_digest, binding_digest, retained_until, phase, member_count, admission_blob, protected_plan, terminal_result, terminal_result_digest FROM consensus_incoming.consensus_fenced_mutation_roster_operations WHERE request_id = ?1",
+                "SELECT history_epoch, ordinal, configuration_epoch, body_digest, admission_digest, binding_digest, retained_until, phase, member_count, admission_blob, protected_plan, protected_checkpoint, terminal_blob, terminal_digest, terminal_result, terminal_result_digest FROM consensus_incoming.consensus_fenced_mutation_roster_operations WHERE request_id = ?1",
                 [request_id.as_slice()],
                 |row| {
                     Ok((
@@ -16474,6 +17270,9 @@ fn validate_attached_snapshot_preserves_fenced_mutation_roster_history_sync(
                         row.get::<_, Vec<u8>>(10)?,
                         row.get::<_, Option<Vec<u8>>>(11)?,
                         row.get::<_, Option<Vec<u8>>>(12)?,
+                        row.get::<_, Option<Vec<u8>>>(13)?,
+                        row.get::<_, Option<Vec<u8>>>(14)?,
+                        row.get::<_, Option<Vec<u8>>>(15)?,
                     ))
                 },
             )
@@ -16492,6 +17291,9 @@ fn validate_attached_snapshot_preserves_fenced_mutation_roster_history_sync(
                 incoming_member_count,
                 incoming_admission_blob,
                 incoming_protected_plan,
+                incoming_protected_checkpoint,
+                incoming_terminal_blob,
+                incoming_terminal_digest,
                 incoming_terminal_result,
                 incoming_terminal_result_digest,
             )) => {
@@ -16509,11 +17311,17 @@ fn validate_attached_snapshot_preserves_fenced_mutation_roster_history_sync(
                     1 => matches!(incoming_phase, 1 | 2 | 3),
                     2 => {
                         incoming_phase == 2
+                            && protected_checkpoint == incoming_protected_checkpoint
+                            && terminal_blob == incoming_terminal_blob
+                            && terminal_digest == incoming_terminal_digest
                             && terminal_result == incoming_terminal_result
                             && terminal_result_digest == incoming_terminal_result_digest
                     }
                     3 => {
                         incoming_phase == 3
+                            && protected_checkpoint == incoming_protected_checkpoint
+                            && terminal_blob == incoming_terminal_blob
+                            && terminal_digest == incoming_terminal_digest
                             && incoming_terminal_result.is_none()
                             && incoming_terminal_result_digest.is_none()
                     }
@@ -16772,7 +17580,7 @@ fn create_attached_snapshot_validation_views(
         } else if *table == "consensus_fenced_transition_v2_history" && !source_exists {
             "CREATE TEMP VIEW consensus_fenced_transition_v2_history AS SELECT CAST(NULL AS INTEGER) AS singleton, CAST(NULL AS INTEGER) AS storage_configuration_epoch, CAST(NULL AS BLOB) AS profile_digest, CAST(NULL AS INTEGER) AS active_epoch, CAST(NULL AS INTEGER) AS retired_through_epoch, CAST(NULL AS INTEGER) AS generation, CAST(NULL AS INTEGER) AS current_bound_count, CAST(NULL AS INTEGER) AS reclaim_epoch, CAST(NULL AS INTEGER) AS reclaim_cursor_ordinal, CAST(NULL AS INTEGER) AS reclaim_remaining, CAST(NULL AS INTEGER) AS reclaimed_entries WHERE 0".to_owned()
         } else if *table == "consensus_fenced_mutation_roster_operations" && !source_exists {
-            "CREATE TEMP VIEW consensus_fenced_mutation_roster_operations AS SELECT CAST(NULL AS BLOB) AS request_id, CAST(NULL AS INTEGER) AS history_epoch, CAST(NULL AS INTEGER) AS ordinal, CAST(NULL AS INTEGER) AS configuration_epoch, CAST(NULL AS BLOB) AS body_digest, CAST(NULL AS BLOB) AS admission_digest, CAST(NULL AS BLOB) AS binding_digest, CAST(NULL AS TEXT) AS retained_until, CAST(NULL AS INTEGER) AS phase, CAST(NULL AS INTEGER) AS member_count, CAST(NULL AS BLOB) AS admission_blob, CAST(NULL AS BLOB) AS protected_plan, CAST(NULL AS BLOB) AS terminal_result, CAST(NULL AS BLOB) AS terminal_result_digest WHERE 0".to_owned()
+            "CREATE TEMP VIEW consensus_fenced_mutation_roster_operations AS SELECT CAST(NULL AS BLOB) AS request_id, CAST(NULL AS INTEGER) AS history_epoch, CAST(NULL AS INTEGER) AS ordinal, CAST(NULL AS INTEGER) AS configuration_epoch, CAST(NULL AS BLOB) AS body_digest, CAST(NULL AS BLOB) AS admission_digest, CAST(NULL AS BLOB) AS binding_digest, CAST(NULL AS TEXT) AS retained_until, CAST(NULL AS INTEGER) AS phase, CAST(NULL AS INTEGER) AS member_count, CAST(NULL AS BLOB) AS admission_blob, CAST(NULL AS BLOB) AS protected_plan, CAST(NULL AS BLOB) AS protected_checkpoint, CAST(NULL AS BLOB) AS terminal_blob, CAST(NULL AS BLOB) AS terminal_digest, CAST(NULL AS BLOB) AS terminal_result, CAST(NULL AS BLOB) AS terminal_result_digest WHERE 0".to_owned()
         } else if *table == "consensus_fenced_mutation_roster_members" && !source_exists {
             "CREATE TEMP VIEW consensus_fenced_mutation_roster_members AS SELECT CAST(NULL AS BLOB) AS request_id, CAST(NULL AS INTEGER) AS ordinal, CAST(NULL AS BLOB) AS stable_member_id, CAST(NULL AS INTEGER) AS disposition, CAST(NULL AS INTEGER) AS adoption WHERE 0".to_owned()
         } else if *table == "consensus_fenced_mutation_roster_activation" && !source_exists {
@@ -17324,7 +18132,7 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             ),
             (
                 "consensus_fenced_mutation_roster_operations",
-                "request_id, history_epoch, ordinal, configuration_epoch, body_digest, admission_digest, binding_digest, retained_until, phase, member_count, admission_blob, protected_plan, terminal_result, terminal_result_digest",
+                "request_id, history_epoch, ordinal, configuration_epoch, body_digest, admission_digest, binding_digest, retained_until, phase, member_count, admission_blob, protected_plan, protected_checkpoint, terminal_blob, terminal_digest, terminal_result, terminal_result_digest",
             ),
             (
                 "consensus_fenced_mutation_roster_members",
@@ -18553,6 +19361,158 @@ mod tests {
                 ),
                 logical_time,
                 intent: SessionMutationIntent::FencedTransitionV2(Box::new(request)),
+            }),
+        }
+    }
+
+    fn fenced_mutation_roster_admission(
+        operation_byte: u8,
+        protected_plan_byte: u8,
+    ) -> FencedMutationRosterAdmission {
+        let member = crate::fenced_mutation_roster::FencedMutationRosterMember::new(
+            crate::fenced_mutation_roster::FencedMutationRosterOrdinal::new(0)
+                .expect("roster ordinal"),
+            [operation_byte; 16],
+            crate::fenced_mutation_roster::FencedMutationRosterDescriptor::new(vec![
+                protected_plan_byte,
+            ])
+            .expect("roster descriptor"),
+            1,
+            1,
+            crate::fenced_mutation_roster::FencedMutationRosterDisposition::Pending,
+            crate::fenced_mutation_roster::FencedMutationRosterAdoption::Unreconciled,
+        )
+        .expect("roster member");
+        FencedMutationRosterAdmission::new(
+            1,
+            crate::fenced_mutation_roster::FencedMutationRosterOperationId::new(
+                [operation_byte; 16],
+            )
+            .expect("roster operation"),
+            crate::fenced_mutation_roster::FencedMutationRosterScope::from_digest([0xC3; 32]),
+            crate::fenced_mutation_roster::FencedMutationRosterFenceIntent::new(
+                OwnerId::new("roster-owner").expect("roster owner"),
+                FenceToken::new(1),
+            ),
+            Generation::new(1),
+            crate::fenced_mutation_roster::FencedMutationRosterMembers::new([member])
+                .expect("roster manifest"),
+            crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan::new(
+                vec![protected_plan_byte].into_boxed_slice(),
+            )
+            .expect("roster protected plan"),
+        )
+        .expect("roster admission")
+    }
+
+    fn fenced_mutation_roster_admission_entry(
+        index: u64,
+        outer_request_byte: u8,
+        admission: FencedMutationRosterAdmission,
+    ) -> Entry<SessionRaftTypeConfig> {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes([outer_request_byte; 16]),
+                logical_time: timestamp(u8::try_from(index).expect("test log index")),
+                intent: SessionMutationIntent::Authorized {
+                    origin: node_id(),
+                    authority_identity: identity(),
+                    mutation: Box::new(SessionMutationIntent::AdmitFencedMutationRoster {
+                        admission: Box::new(admission),
+                        scope_identity: identity(),
+                        voter_set_digest: fenced_transition_voter_set_digest(
+                            identity(),
+                            &expected_members(),
+                        ),
+                        profile_digest: fenced_mutation_roster_profile_digest(),
+                    }),
+                },
+            }),
+        }
+    }
+
+    fn fenced_mutation_roster_established_terminal(
+        admission: &FencedMutationRosterAdmission,
+        status_byte: u8,
+    ) -> (
+        FencedMutationRosterTerminal,
+        crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan,
+    ) {
+        let result = vec![0xD1].into_boxed_slice();
+        let plan = crate::fenced_mutation_roster::FencedMutationRosterPlan::new(
+            fenced_mutation_roster_profile_digest(),
+            admission.scope().digest(),
+            admission
+                .fence_intent()
+                .owner()
+                .as_str()
+                .as_bytes()
+                .to_vec(),
+            admission
+                .fence_intent()
+                .fence()
+                .get()
+                .to_be_bytes()
+                .to_vec(),
+            admission.expected_generation().get(),
+            admission.members().as_slice().to_vec(),
+            admission.protected_plan().as_bytes().to_vec(),
+            result.to_vec(),
+        )
+        .expect("terminal roster plan");
+        let member = admission.members().as_slice()[0].clone();
+        let terminal = FencedMutationRosterTerminal::new(
+            plan.admission_commitment(),
+            vec![
+                crate::fenced_mutation_roster::FencedMutationRosterMemberOutcome::new(
+                    member.ordinal(),
+                    *member.caller_id(),
+                    crate::fenced_mutation_roster::FencedMutationRosterDisposition::Applied,
+                    crate::fenced_mutation_roster::FencedMutationRosterAdoption::Executed,
+                    crate::fenced_mutation_roster::FencedMutationRosterStatusBytes::new(vec![
+                        status_byte,
+                    ])
+                    .expect("terminal member status"),
+                )
+                .expect("terminal member"),
+            ],
+            vec![0xD0],
+            result.into_vec(),
+        )
+        .expect("established terminal");
+        let checkpoint = crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan::new(
+            terminal.protected_checkpoint().to_vec().into_boxed_slice(),
+        )
+        .expect("terminal checkpoint");
+        (terminal, checkpoint)
+    }
+
+    fn fenced_mutation_roster_terminal_entry(
+        index: u64,
+        outer_request_byte: u8,
+        admission: FencedMutationRosterAdmission,
+        terminal: FencedMutationRosterTerminal,
+        protected_checkpoint: crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan,
+    ) -> Entry<SessionRaftTypeConfig> {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes([outer_request_byte; 16]),
+                logical_time: timestamp(u8::try_from(index).expect("test log index")),
+                intent: SessionMutationIntent::Authorized {
+                    origin: node_id(),
+                    authority_identity: identity(),
+                    mutation: Box::new(SessionMutationIntent::TerminalizeFencedMutationRoster {
+                        admission: Box::new(admission),
+                        terminal: Box::new(terminal),
+                        protected_checkpoint,
+                    }),
+                },
             }),
         }
     }
@@ -20594,6 +21554,640 @@ mod tests {
         // renumber an existing SQLite image.
         assert_eq!(FENCED_TRANSITION_V1_DATABASE_FORMAT, 2);
         assert_eq!(FENCED_TRANSITION_V2_DATABASE_FORMAT, 3);
+        assert_eq!(FENCED_MUTATION_ROSTER_DATABASE_FORMAT, 4);
+    }
+
+    #[test]
+    fn roster_activation_is_lazy_and_v2_can_activate_under_format_four() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        let voters = expected_members();
+        initialize_schema(&conn, identity(), &voters).expect("consensus schema");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(
+                    1,
+                    fenced_transition_request(0xE7, "roster-activation-owner"),
+                    timestamp(1),
+                ),
+            ],
+        )
+        .expect("activate the pre-existing V1 receipt fence");
+
+        assert_eq!(
+            fenced_transition_v2_ledger_layout_sync(&conn).expect("inspect V2 layout"),
+            FencedTransitionV2LedgerLayout::Absent,
+            "V4 activation does not require V2 activation",
+        );
+        assert_eq!(
+            fenced_mutation_roster_ledger_layout_sync(&conn).expect("inspect V4 layout"),
+            FencedMutationRosterLedgerLayout::Absent,
+            "a writable open does not materialize V4",
+        );
+
+        let tx = conn
+            .unchecked_transaction()
+            .expect("roster activation transaction");
+        activate_fenced_mutation_roster_scope_sync(
+            &tx,
+            identity(),
+            identity(),
+            &voters,
+            fenced_mutation_roster_profile_digest(),
+            FENCED_MUTATION_ROSTER_INITIAL_HISTORY_EPOCH,
+        )
+        .expect("lazy roster activation");
+        tx.commit().expect("commit roster activation");
+        assert_eq!(
+            fenced_mutation_roster_ledger_layout_sync(&conn).expect("inspect V4 layout"),
+            FencedMutationRosterLedgerLayout::Activated,
+        );
+        assert!(fenced_mutation_roster_activation_matches_scope_sync(
+            &conn,
+            identity(),
+            identity(),
+            &voters,
+            fenced_mutation_roster_profile_digest(),
+        )
+        .expect("validate V4 certificate"),);
+
+        // Re-certification after a completed roster reclaim must retain the
+        // successor epoch; `initial_active_epoch` is not an instruction to
+        // rewind the irreversible floor back to one.
+        conn.execute(
+            "UPDATE consensus_fenced_mutation_roster_history SET active_epoch = 2, retired_through_epoch = 1, generation = 1 WHERE singleton = 1",
+            [],
+        )
+        .expect("fixture successor roster epoch");
+        let tx = conn
+            .unchecked_transaction()
+            .expect("successor roster certificate transaction");
+        activate_fenced_mutation_roster_scope_sync(
+            &tx,
+            identity(),
+            identity(),
+            &voters,
+            fenced_mutation_roster_profile_digest(),
+            FENCED_MUTATION_ROSTER_INITIAL_HISTORY_EPOCH,
+        )
+        .expect("successor roster epoch remains certifiable");
+        tx.commit().expect("commit successor roster certificate");
+        assert_eq!(
+            read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+                .expect("successor roster history")
+                .active_epoch,
+            Some(2),
+        );
+
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![activating_fenced_transition_v2_entry(
+                2,
+                fenced_transition_v2_request(0xE8, 1, "later-v2-owner"),
+                timestamp(2),
+            )],
+        )
+        .expect("V2 activation preserves the V4 format fence");
+        assert_eq!(
+            fenced_transition_v2_ledger_layout_sync(&conn).expect("inspect V2 layout"),
+            FencedTransitionV2LedgerLayout::Activated,
+        );
+        assert_eq!(
+            fenced_mutation_roster_ledger_layout_sync(&conn).expect("inspect V4 layout"),
+            FencedMutationRosterLedgerLayout::Activated,
+        );
+        assert_eq!(
+            persisted_schema_version_in_sync(&conn, false).expect("inspect format marker"),
+            FENCED_MUTATION_ROSTER_DATABASE_FORMAT,
+            "later V2 activation must never lower the format-four marker",
+        );
+        validate_fenced_mutation_roster_receipts_sync(&conn, identity())
+            .expect("empty V4 history remains canonical after V2 activation");
+    }
+
+    #[test]
+    fn roster_admission_is_exact_replayable_and_has_no_business_effect() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(
+                    1,
+                    fenced_transition_request(0xE9, "roster-admission-owner"),
+                    timestamp(1),
+                ),
+            ],
+        )
+        .expect("activate the pre-existing V1 receipt fence");
+
+        let admission = fenced_mutation_roster_admission(0x61, 0x71);
+        let business_before = ["session_records", "leases", "key_fences"]
+            .into_iter()
+            .map(|table| {
+                (
+                    table,
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("count business state"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let first = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_mutation_roster_admission_entry(
+                2,
+                0xE9,
+                admission.clone(),
+            )],
+        )
+        .expect("admit roster");
+        assert!(matches!(
+            first.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::FencedMutationRoster(outcome)),
+                ..
+            }] if outcome.status.phase() == FencedMutationRosterPhase::PollAdmitted
+                && outcome.status.request_id() == admission.request_id()
+        ));
+        assert!(
+            first.notifications.is_empty(),
+            "admission has no adapter effect"
+        );
+        assert_eq!(
+            read_fenced_mutation_roster_status_sync(&conn, identity(), &admission)
+                .expect("read admitted roster")
+                .phase(),
+            FencedMutationRosterPhase::PollAdmitted,
+        );
+        let history = read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+            .expect("roster history");
+        assert_eq!(
+            (history.current_bound_count, history.current_live_count),
+            (1, 1)
+        );
+
+        let replay = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_mutation_roster_admission_entry(
+                3,
+                0xEA,
+                admission.clone(),
+            )],
+        )
+        .expect("exact roster replay");
+        assert!(matches!(
+            replay.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::FencedMutationRoster(outcome)),
+                ..
+            }] if outcome.status.phase() == FencedMutationRosterPhase::PollAdmitted
+                && outcome.status.request_id() == admission.request_id()
+        ));
+        assert!(
+            replay.notifications.is_empty(),
+            "replay has no adapter effect"
+        );
+        assert_eq!(
+            read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+                .expect("history after replay"),
+            history,
+            "exact replay must not consume another live or retained reservation",
+        );
+
+        let changed_body = fenced_mutation_roster_admission(0x61, 0x72);
+        let conflict = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_mutation_roster_admission_entry(
+                4,
+                0xEB,
+                changed_body,
+            )],
+        )
+        .expect("changed roster body is a deterministic conflict");
+        assert!(matches!(
+            conflict.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::InvalidKey(_)),
+                ..
+            }]
+        ));
+        assert!(
+            conflict.notifications.is_empty(),
+            "conflict has no adapter effect"
+        );
+        assert_eq!(
+            read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+                .expect("history after conflict"),
+            history,
+            "a changed body cannot consume a reservation",
+        );
+        for (table, count) in business_before {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count business state after roster admission"),
+                count,
+                "roster admission/replay/conflict must not affect {table}",
+            );
+        }
+        validate_fenced_mutation_roster_receipts_sync(&conn, identity())
+            .expect("admitted roster receipt is canonical");
+    }
+
+    #[test]
+    fn roster_terminal_is_one_way_canonical_and_result_capacity_is_reserved() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(
+                    1,
+                    fenced_transition_request(0xEC, "roster-terminal-owner"),
+                    timestamp(1),
+                ),
+            ],
+        )
+        .expect("activate the pre-existing V1 receipt fence");
+        let admission = fenced_mutation_roster_admission(0x62, 0x73);
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_mutation_roster_admission_entry(
+                2,
+                0xEC,
+                admission.clone(),
+            )],
+        )
+        .expect("admit roster");
+        let history_before =
+            read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+                .expect("history before terminal");
+        let (terminal, checkpoint) = fenced_mutation_roster_established_terminal(&admission, 0x01);
+        let terminalized = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_mutation_roster_terminal_entry(
+                3,
+                0xED,
+                admission.clone(),
+                terminal.clone(),
+                checkpoint.clone(),
+            )],
+        )
+        .expect("terminalize roster");
+        assert!(matches!(
+            terminalized.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::FencedMutationRoster(outcome)),
+                ..
+            }] if outcome.status.phase() == FencedMutationRosterPhase::Established
+                && outcome.status.terminal() == Some(&terminal)
+        ));
+        assert!(
+            terminalized.notifications.is_empty(),
+            "terminalization does not execute adapters"
+        );
+        let history_after =
+            read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+                .expect("history after terminal");
+        assert_eq!(
+            history_after.current_bound_count,
+            history_before.current_bound_count
+        );
+        assert_eq!(history_after.current_live_count, 0);
+        assert!(history_after.generation > history_before.generation);
+        let stored: (i64, Vec<u8>, Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT phase, protected_checkpoint, terminal_blob, terminal_result FROM consensus_fenced_mutation_roster_operations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read terminal row");
+        assert_eq!(stored.0, 2);
+        assert_eq!(stored.1, checkpoint.as_bytes());
+        assert_eq!(
+            stored.2,
+            encode_fenced_mutation_roster_terminal(&terminal).expect("terminal codec")
+        );
+        assert_eq!(stored.3, terminal.protected_result());
+
+        let replay = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_mutation_roster_terminal_entry(
+                4,
+                0xEE,
+                admission.clone(),
+                terminal.clone(),
+                checkpoint,
+            )],
+        )
+        .expect("exact terminal replay");
+        assert!(matches!(
+            replay.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::FencedMutationRoster(outcome)),
+                ..
+            }] if outcome.status.phase() == FencedMutationRosterPhase::Established
+                && outcome.status.terminal() == Some(&terminal)
+        ));
+        assert_eq!(
+            read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+                .expect("history after terminal replay"),
+            history_after,
+            "terminal replay cannot re-open live work or reserve another result",
+        );
+
+        let (different_terminal, different_checkpoint) =
+            fenced_mutation_roster_established_terminal(&admission, 0x02);
+        let conflict = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_mutation_roster_terminal_entry(
+                5,
+                0xEF,
+                admission.clone(),
+                different_terminal,
+                different_checkpoint,
+            )],
+        )
+        .expect("different terminal is a deterministic conflict");
+        assert!(matches!(
+            conflict.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::InvalidKey(_)),
+                ..
+            }]
+        ));
+        assert_eq!(
+            read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+                .expect("history after terminal conflict"),
+            history_after,
+            "one terminal result is immutable",
+        );
+        validate_fenced_mutation_roster_receipts_sync(&conn, identity())
+            .expect("terminal roster receipt is canonical");
+    }
+
+    #[test]
+    fn roster_reservation_and_live_caps_reject_one_over_without_business_effect() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(
+                    1,
+                    fenced_transition_request(0xF0, "roster-cap-owner"),
+                    timestamp(1),
+                ),
+            ],
+        )
+        .expect("activate the pre-existing V1 receipt fence");
+        let first = fenced_mutation_roster_admission(0x63, 0x74);
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_mutation_roster_admission_entry(2, 0xF0, first)],
+        )
+        .expect("initialize roster history");
+        // This bounded fixture represents the preceding 131071 retained
+        // admissions and 1023 live reservations without generating a large
+        // business-independent ledger in the unit test.
+        conn.execute(
+            "UPDATE consensus_fenced_mutation_roster_history SET current_bound_count = ?1, current_live_count = ?2 WHERE singleton = 1",
+            params![
+                i64::try_from(FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY - 1)
+                    .expect("roster retained cap fits SQLite"),
+                i64::try_from(FENCED_MUTATION_ROSTER_MAX_LIVE - 1)
+                    .expect("roster live cap fits SQLite"),
+            ],
+        )
+        .expect("seed exact roster capacity boundary");
+        let final_admission = fenced_mutation_roster_admission(0x64, 0x75);
+        let final_apply = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_mutation_roster_admission_entry(
+                3,
+                0xF1,
+                final_admission.clone(),
+            )],
+        )
+        .expect("1024th live and 131072nd reservation admit");
+        assert!(matches!(
+            final_apply.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::FencedMutationRoster(outcome)),
+                ..
+            }] if outcome.status.phase() == FencedMutationRosterPhase::PollAdmitted
+        ));
+        let at_cap = read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+            .expect("history at cap");
+        assert_eq!(
+            (at_cap.current_bound_count, at_cap.current_live_count),
+            (
+                FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY as u64,
+                FENCED_MUTATION_ROSTER_MAX_LIVE as u64,
+            ),
+        );
+        let (terminal, checkpoint) =
+            fenced_mutation_roster_established_terminal(&final_admission, 0x03);
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_mutation_roster_terminal_entry(
+                4,
+                0xF2,
+                final_admission,
+                terminal,
+                checkpoint,
+            )],
+        )
+        .expect("already-reserved terminal result must not need another slot");
+        let after_terminal =
+            read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+                .expect("history after terminal");
+        assert_eq!(
+            after_terminal.current_bound_count,
+            FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY as u64,
+            "terminalization retains its reservation",
+        );
+        assert_eq!(
+            after_terminal.current_live_count,
+            (FENCED_MUTATION_ROSTER_MAX_LIVE - 1) as u64,
+        );
+
+        let business_before = ["session_records", "leases", "key_fences"]
+            .into_iter()
+            .map(|table| {
+                (
+                    table,
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("count business state"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let rejected = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_mutation_roster_admission_entry(
+                5,
+                0xF3,
+                fenced_mutation_roster_admission(0x65, 0x76),
+            )],
+        )
+        .expect("one-over roster reservation is deterministic");
+        assert!(matches!(
+            rejected.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::InvalidKey(_)),
+                ..
+            }]
+        ));
+        assert!(rejected.notifications.is_empty());
+        assert_eq!(
+            read_fenced_mutation_roster_history_row_in_sync(&conn, identity(), false)
+                .expect("history after one-over"),
+            after_terminal,
+        );
+        for (table, count) in business_before {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count business state after one-over"),
+                count,
+                "one-over roster admission must not affect {table}",
+            );
+        }
+    }
+
+    #[test]
+    fn roster_terminal_snapshot_round_trips_exact_canonical_bytes() {
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.blocking_lock();
+        initialize_schema(&source_conn, identity(), &expected_members())
+            .expect("source consensus schema");
+        let admission = fenced_mutation_roster_admission(0x66, 0x77);
+        let (terminal, checkpoint) = fenced_mutation_roster_established_terminal(&admission, 0x04);
+        apply_entries_sync(
+            &source_conn,
+            identity(),
+            &source.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(
+                    1,
+                    fenced_transition_request(0xF4, "roster-snapshot-owner"),
+                    timestamp(1),
+                ),
+                fenced_mutation_roster_admission_entry(2, 0xF5, admission.clone()),
+                fenced_mutation_roster_terminal_entry(
+                    3,
+                    0xF6,
+                    admission.clone(),
+                    terminal.clone(),
+                    checkpoint,
+                ),
+            ],
+        )
+        .expect("source roster terminal");
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("roster-terminal.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                .expect("build roster snapshot");
+        let source_terminal_blob: Vec<u8> = source_conn
+            .query_row(
+                "SELECT terminal_blob FROM consensus_fenced_mutation_roster_operations",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read source terminal blob");
+        drop(source_conn);
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.blocking_lock();
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("target consensus schema");
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "roster-terminal".to_owned(),
+        };
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "roster-terminal.opc",
+            [0xF7; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("snapshot metadata")
+                .len(),
+        )
+        .expect("install roster snapshot");
+        assert_eq!(
+            fenced_mutation_roster_ledger_layout_sync(&target_conn)
+                .expect("inspect installed roster layout"),
+            FencedMutationRosterLedgerLayout::Activated,
+        );
+        let status = read_fenced_mutation_roster_status_sync(&target_conn, identity(), &admission)
+            .expect("read installed terminal status");
+        assert_eq!(status.phase(), FencedMutationRosterPhase::Established);
+        assert_eq!(status.terminal(), Some(&terminal));
+        assert_eq!(
+            target_conn
+                .query_row(
+                    "SELECT terminal_blob FROM consensus_fenced_mutation_roster_operations",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .expect("read installed terminal blob"),
+            source_terminal_blob,
+            "snapshot installation preserves the canonical terminal frame byte-for-byte",
+        );
+        validate_fenced_mutation_roster_receipts_sync(&target_conn, identity())
+            .expect("installed roster snapshot validates");
     }
 
     #[test]

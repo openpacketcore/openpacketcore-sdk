@@ -25,12 +25,10 @@ use crate::consensus::{
 };
 use crate::sqlite::{consensus, ops};
 use crate::{
-    ReplicationEntry, ReplicationTxId, FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,
-    FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES, FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES,
-    FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
-    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES,
-    FENCED_TRANSITION_V2_REQUEST_ID_BYTES, REPLICATION_TX_ID_MAX_BYTES,
-    REPLICATION_TX_ID_MIN_BYTES,
+    ReplicationEntry, ReplicationTxId, FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY,
+    FENCED_TRANSITION_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES, FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
+    REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 
 const PATH_MAX_BYTES: usize = 4_096;
@@ -695,7 +693,7 @@ fn preflight_current_tables(
     {
         preflight_fenced_mutation_roster_count(conn)?;
         for query in [
-            "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(body_digest), length(admission_digest), length(binding_digest), length(retained_until), length(admission_blob), length(protected_plan), COALESCE(length(terminal_result), 0), COALESCE(length(terminal_result_digest), 0))), 0), COALESCE(SUM(length(request_id) + length(body_digest) + length(admission_digest) + length(binding_digest) + length(retained_until) + length(admission_blob) + length(protected_plan) + COALESCE(length(terminal_result), 0) + COALESCE(length(terminal_result_digest), 0)), 0) FROM consensus_fenced_mutation_roster_operations",
+            "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(body_digest), length(admission_digest), length(binding_digest), length(retained_until), length(admission_blob), length(protected_plan), COALESCE(length(protected_checkpoint), 0), COALESCE(length(terminal_blob), 0), COALESCE(length(terminal_digest), 0), COALESCE(length(terminal_result), 0), COALESCE(length(terminal_result_digest), 0))), 0), COALESCE(SUM(length(request_id) + length(body_digest) + length(admission_digest) + length(binding_digest) + length(retained_until) + length(admission_blob) + length(protected_plan) + COALESCE(length(protected_checkpoint), 0) + COALESCE(length(terminal_blob), 0) + COALESCE(length(terminal_digest), 0) + COALESCE(length(terminal_result), 0) + COALESCE(length(terminal_result_digest), 0)), 0) FROM consensus_fenced_mutation_roster_operations",
             "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(stable_member_id))), 0), COALESCE(SUM(length(request_id) + length(stable_member_id)), 0) FROM consensus_fenced_mutation_roster_members",
             "SELECT COUNT(*), COALESCE(MAX(MAX(length(scope_configuration_id), length(voter_set_digest), length(profile_digest))), 0), COALESCE(SUM(length(scope_configuration_id) + length(voter_set_digest) + length(profile_digest)), 0) FROM consensus_fenced_mutation_roster_activation",
         ] {

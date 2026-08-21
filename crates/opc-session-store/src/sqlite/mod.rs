@@ -761,12 +761,21 @@ impl SqliteSessionBackend {
         voters: &std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
         profile_digest: [u8; 32],
     ) -> Result<bool, StoreError> {
-        self.consensus_fenced_transition_v2_activation_matches_scope(
-            storage_identity,
-            scope_identity,
-            voters.clone(),
-            profile_digest,
-        )
+        let voters = voters.clone();
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::fenced_mutation_roster_activation_matches_scope_sync(
+                conn,
+                storage_identity,
+                scope_identity,
+                &voters,
+                profile_digest,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "fenced mutation roster activation is unavailable".into(),
+                )
+            })
+        })
         .await
     }
 
@@ -886,6 +895,37 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Read one exact protected roster receipt after a caller-owned barrier.
+    /// This is a pure SQLite lookup: no adapter, checkpoint, or publication
+    /// hook is available from this path.
+    pub(crate) async fn consensus_fenced_mutation_roster_status(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        _authority_identity: crate::consensus::SessionConsensusIdentity,
+        admission: &crate::FencedMutationRosterAdmission,
+    ) -> Result<crate::FencedMutationRosterStatus, StoreError> {
+        let admission = admission.clone();
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn.unchecked_transaction().map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "fenced mutation roster status is unavailable".into(),
+                )
+            })?;
+            let status = consensus::read_fenced_mutation_roster_status_sync(
+                &tx,
+                storage_identity,
+                &admission,
+            )?;
+            tx.commit().map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "fenced mutation roster status is unavailable".into(),
+                )
+            })?;
+            Ok(status)
+        })
+        .await
+    }
+
     /// Report whether the durable V2 ledger layout has already been activated.
     ///
     /// This survives replication-authority changes even though the exact-scope
@@ -919,8 +959,26 @@ impl SqliteSessionBackend {
         &self,
         storage_identity: crate::consensus::SessionConsensusIdentity,
     ) -> Result<bool, StoreError> {
-        self.consensus_fenced_transition_v2_history_is_activated(storage_identity)
-            .await
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let persisted_identity = consensus::read_storage_identity_sync(conn).map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "fenced mutation roster history is unavailable".into(),
+                )
+            })?;
+            if persisted_identity != storage_identity {
+                return Err(StoreError::BackendUnavailable(
+                    "fenced mutation roster history is unavailable".into(),
+                ));
+            }
+            consensus::fenced_mutation_roster_ledger_layout_sync(conn)
+                .map(|layout| layout == consensus::FencedMutationRosterLedgerLayout::Activated)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "fenced mutation roster history is unavailable".into(),
+                    )
+                })
+        })
+        .await
     }
 
     /// Read the durable V2 history lifecycle after a caller-owned barrier.
