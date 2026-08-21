@@ -1967,7 +1967,7 @@ async fn flush_outbound(
     io: &mut Box<dyn SctpMessageIo>,
     state: &mut PumpState,
 ) -> Result<(), DiameterTlsError> {
-    let datagrams: Vec<Bytes> = state.outbound.drain(..).collect();
+    let datagrams = std::mem::take(&mut state.outbound);
     for datagram in datagrams {
         for record in split_dtls_records(&datagram)? {
             io.send_dtls_record(record).await?;
