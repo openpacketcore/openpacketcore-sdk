@@ -108,10 +108,17 @@ const CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES: i64 = 16 * 1024;
 // revision they must never be derived from a future `SESSION_*` bump.
 const FENCED_TRANSITION_V1_DATABASE_FORMAT: i64 = 2;
 const FENCED_TRANSITION_V2_DATABASE_FORMAT: i64 = 3;
-// Format four is deliberately an independent, optional roster protocol.  Its
-// presence must fence format-three readers, but it must not reinterpret any
-// V1/V2 object, profile, receipt codec, or lifecycle state.
-const FENCED_MUTATION_ROSTER_DATABASE_FORMAT: i64 = 4;
+// Format four is the immutable V1 roster protocol. Format five is its V2
+// successor: it raises the retained-result bound and changes the profiled
+// admission wire/digest.  A V1 image is therefore an explicit upgrade
+// boundary, never a V2 exact-layout corruption or a silently reinterpreted
+// receipt history.
+const FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT: i64 = 4;
+const FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT: i64 = 5;
+const FENCED_MUTATION_ROSTER_V1_PROFILE_DIGEST: [u8; 32] = [
+    0xa1, 0x84, 0x36, 0xce, 0xf6, 0x65, 0xf2, 0xdb, 0x3f, 0x25, 0x65, 0xf3, 0x4f, 0x36, 0x55, 0x7b,
+    0x20, 0xa1, 0x30, 0x66, 0x1d, 0x6a, 0xad, 0x6c, 0xef, 0x84, 0xf3, 0x92, 0x91, 0x1f, 0x42, 0xda,
+];
 const FENCED_MUTATION_ROSTER_INITIAL_HISTORY_EPOCH: u64 = 1;
 const FENCED_MUTATION_ROSTER_RETENTION: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
@@ -1620,6 +1627,10 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
     }
 
+    if identity_table_exists {
+        ensure_fenced_mutation_roster_v2_upgrade_boundary_sync(&tx)?;
+    }
+
     let storage_identity = read_storage_identity_sync(&tx)?;
     ensure_consensus_authority_profile_sync(&tx, authority_profile, identity_table_exists)?;
     ensure_fixed_placement_policy_sync(&tx, authority_profile, fixed_placement_policy)?;
@@ -2085,7 +2096,8 @@ pub(crate) fn read_storage_identity_sync(
         value if value == i64::from(SESSION_CONSENSUS_SCHEMA_VERSION)
             || value == FENCED_TRANSITION_V1_DATABASE_FORMAT
             || value == FENCED_TRANSITION_V2_DATABASE_FORMAT
-            || value == FENCED_MUTATION_ROSTER_DATABASE_FORMAT
+            || value == FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT
+            || value == FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT
     ) {
         return Err(SessionConsensusStorageError::SchemaVersionMismatch);
     }
@@ -4336,7 +4348,7 @@ fn promote_membership_scope_at_in_tx(
             return Err(MembershipScopeMutationError::CorruptState);
         }
     }
-    // V4 has its own scope certificate.  Its physical roster rows and
+    // V5 has its own scope certificate.  Its physical roster rows and
     // irreversible history floor remain intact across a topology cutover, but
     // the prior quorum proof must never authorize the successor scope.
     if fenced_mutation_roster_ledger_layout_sync(conn)
@@ -4741,8 +4753,8 @@ CREATE TABLE consensus_fenced_transition_v2_history (
 "#;
 
 // There is intentionally no `IF NOT EXISTS` in this schema.  Roster admission
-// creates the complete V4 object set, its activation certificate, and the
-// format-four identity fence in the same state-machine transaction.  In
+// creates the complete V5 object set, its activation certificate, and the
+// format-five identity fence in the same state-machine transaction.  In
 // particular, opening a V2 database must never materialize an empty roster
 // table that an older exact-layout reader could mistake for a supported image.
 const FENCED_MUTATION_ROSTER_SCHEMA: &str = r#"
@@ -4918,7 +4930,9 @@ fn fenced_transition_v2_ledger_layout_in_sync(
     };
     match (schema_version, has_receipts, has_activation, has_history) {
         (
-            FENCED_TRANSITION_V2_DATABASE_FORMAT | FENCED_MUTATION_ROSTER_DATABASE_FORMAT,
+            FENCED_TRANSITION_V2_DATABASE_FORMAT
+            | FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT
+            | FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT,
             true,
             true,
             true,
@@ -4928,7 +4942,8 @@ fn fenced_transition_v2_ledger_layout_in_sync(
         (version, false, false, false)
             if version == i64::from(SESSION_CONSENSUS_SCHEMA_VERSION)
                 || version == FENCED_TRANSITION_V1_DATABASE_FORMAT
-                || version == FENCED_MUTATION_ROSTER_DATABASE_FORMAT =>
+                || version == FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT
+                || version == FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT =>
         {
             Ok(FencedTransitionV2LedgerLayout::Absent)
         }
@@ -5000,8 +5015,8 @@ fn fenced_transition_v2_schema_is_exact_in_sync(
     Ok(unexpected == 2)
 }
 
-/// V4 is optional even after V2 activates.  The two feature histories are
-/// intentionally independent: a V4 image can contain the exact V2 object set
+/// V5 is optional even after V2 activates.  The two feature histories are
+/// intentionally independent: a V5 image can contain the exact V2 object set
 /// or no V2 objects at all, but it can never contain a partial roster set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FencedMutationRosterLedgerLayout {
@@ -5038,7 +5053,7 @@ fn fenced_mutation_roster_ledger_layout_in_sync(
         has_activation,
         has_history,
     ) {
-        (FENCED_MUTATION_ROSTER_DATABASE_FORMAT, true, true, true, true)
+        (FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT, true, true, true, true)
             if fenced_mutation_roster_schema_is_exact_in_sync(conn, attached)? =>
         {
             Ok(FencedMutationRosterLedgerLayout::Activated)
@@ -5056,9 +5071,63 @@ fn fenced_mutation_roster_ledger_layout_in_sync(
     }
 }
 
+/// A complete V1 roster is durable but cannot be decoded under V2: V2's
+/// profile digest and canonical admission frame deliberately changed together
+/// with the increased retained-result bound.  Reject that exact legacy image
+/// as an upgrade boundary rather than treating its old CHECK constraint as
+/// corruption.  No write is made here, so a failed V2 open never rewrites or
+/// discards V1 receipts.
+fn ensure_fenced_mutation_roster_v2_upgrade_boundary_sync(
+    conn: &Connection,
+) -> Result<(), SessionConsensusStorageError> {
+    let schema_version = persisted_schema_version_in_sync(conn, false)
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    if schema_version != FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT {
+        return Ok(());
+    }
+    if fenced_mutation_roster_v1_schema_is_exact_in_sync(conn, false)
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+    {
+        let profile: Vec<u8> = conn
+            .query_row(
+                "SELECT profile_digest FROM consensus_fenced_mutation_roster_history WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        if profile.as_slice() == FENCED_MUTATION_ROSTER_V1_PROFILE_DIGEST {
+            return Err(SessionConsensusStorageError::SchemaVersionMismatch);
+        }
+    }
+    Err(SessionConsensusStorageError::CorruptState)
+}
+
 fn fenced_mutation_roster_schema_is_exact_in_sync(
     conn: &Connection,
     attached: bool,
+) -> io::Result<bool> {
+    fenced_mutation_roster_schema_with_history_is_exact_in_sync(
+        conn,
+        attached,
+        FENCED_MUTATION_ROSTER_HISTORY_TABLE_SCHEMA_SQL,
+    )
+}
+
+fn fenced_mutation_roster_v1_schema_is_exact_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<bool> {
+    fenced_mutation_roster_schema_with_history_is_exact_in_sync(
+        conn,
+        attached,
+        FENCED_MUTATION_ROSTER_V1_HISTORY_TABLE_SCHEMA_SQL,
+    )
+}
+
+fn fenced_mutation_roster_schema_with_history_is_exact_in_sync(
+    conn: &Connection,
+    attached: bool,
+    history_schema: &str,
 ) -> io::Result<bool> {
     let operations = schema_object_is_exact_in_sync(
         conn,
@@ -5086,7 +5155,7 @@ fn fenced_mutation_roster_schema_is_exact_in_sync(
         attached,
         "table",
         "consensus_fenced_mutation_roster_history",
-        FENCED_MUTATION_ROSTER_HISTORY_TABLE_SCHEMA_SQL,
+        history_schema,
     )?;
     let reclaim = schema_object_is_exact_in_sync(
         conn,
@@ -5783,7 +5852,7 @@ fn activate_fenced_transition_v2_scope_sync(
             .execute(
                 "UPDATE consensus_identity SET schema_version = CASE WHEN schema_version = ?1 THEN ?1 ELSE ?2 END, fenced_transition_receipt_ledger_activated = 1 WHERE singleton = 1 AND ((schema_version = ?3 AND fenced_transition_receipt_ledger_activated = 0) OR (schema_version = ?4 AND fenced_transition_receipt_ledger_activated = 1) OR (schema_version = ?1 AND fenced_transition_receipt_ledger_activated = 1))",
                 params![
-                    FENCED_MUTATION_ROSTER_DATABASE_FORMAT,
+                    FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT,
                     FENCED_TRANSITION_V2_DATABASE_FORMAT,
                     i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
                     FENCED_TRANSITION_V1_DATABASE_FORMAT,
@@ -6098,7 +6167,7 @@ pub(crate) fn fenced_mutation_roster_activation_matches_scope_sync(
         && history.profile_digest == profile_digest)
 }
 
-/// Create the complete independent V4 roster layout at its exact replicated
+/// Create the complete independent V5 roster layout at its exact replicated
 /// activation point.  This accepts both V2 states, but never rewrites V2's
 /// format-three DDL or lowers the format marker when V2 activates later.
 pub(crate) fn activate_fenced_mutation_roster_scope_sync(
@@ -6137,7 +6206,7 @@ pub(crate) fn activate_fenced_mutation_roster_scope_sync(
             .execute(
                 "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1 AND schema_version IN (?2, ?3, ?4)",
                 params![
-                    FENCED_MUTATION_ROSTER_DATABASE_FORMAT,
+                    FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT,
                     i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
                     FENCED_TRANSITION_V1_DATABASE_FORMAT,
                     FENCED_TRANSITION_V2_DATABASE_FORMAT,
@@ -6218,7 +6287,8 @@ fn fenced_transition_receipt_ledger_layout_in_sync(
                 (true, version)
                     if version == FENCED_TRANSITION_V1_DATABASE_FORMAT
                         || version == FENCED_TRANSITION_V2_DATABASE_FORMAT
-                        || version == FENCED_MUTATION_ROSTER_DATABASE_FORMAT =>
+                        || version == FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT
+                        || version == FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT =>
                 {
                     // Format three retains the exact V1 ledger but must also
                     // carry the complete V2 layout.  Accepting only the V1
@@ -6826,6 +6896,49 @@ const FENCED_MUTATION_ROSTER_HISTORY_TABLE_SCHEMA_SQL: &str = r#"
             retired_through_epoch INTEGER NOT NULL CHECK (retired_through_epoch >= 0),
             generation INTEGER NOT NULL CHECK (generation >= 0),
             current_bound_count INTEGER NOT NULL CHECK (current_bound_count BETWEEN 0 AND 1048576),
+            current_live_count INTEGER NOT NULL CHECK (current_live_count BETWEEN 0 AND 1024),
+            reclaim_epoch INTEGER CHECK (reclaim_epoch IS NULL OR reclaim_epoch > 0),
+            reclaim_cursor_ordinal INTEGER CHECK (
+                reclaim_cursor_ordinal IS NULL OR reclaim_cursor_ordinal >= 0
+            ),
+            reclaim_remaining INTEGER CHECK (
+                reclaim_remaining IS NULL OR reclaim_remaining >= 0
+            ),
+            reclaimed_entries INTEGER NOT NULL DEFAULT 0 CHECK (reclaimed_entries >= 0),
+            CHECK (current_live_count <= current_bound_count),
+            CHECK (
+                (active_epoch IS NOT NULL
+                 AND active_epoch > retired_through_epoch
+                 AND reclaim_epoch IS NULL
+                 AND reclaim_cursor_ordinal IS NULL
+                 AND reclaim_remaining IS NULL)
+                OR
+                (active_epoch IS NULL
+                 AND reclaim_epoch IS NOT NULL
+                 AND reclaim_epoch = retired_through_epoch
+                 AND reclaim_cursor_ordinal IS NOT NULL
+                 AND reclaim_remaining IS NOT NULL
+                 AND current_bound_count = 0
+                 AND current_live_count = 0)
+            ),
+            FOREIGN KEY(storage_configuration_epoch)
+                REFERENCES consensus_identity(configuration_epoch)
+        )
+    "#;
+
+// The exact persisted V1 history constraint remains part of the V2 upgrade
+// classifier.  It is deliberately not accepted as a V2 layout: its matching
+// V1 profile digest and admission codec must remain intact for an explicit
+// compatible migration, rather than being reinterpreted on a writable open.
+const FENCED_MUTATION_ROSTER_V1_HISTORY_TABLE_SCHEMA_SQL: &str = r#"
+        CREATE TABLE consensus_fenced_mutation_roster_history (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            storage_configuration_epoch INTEGER NOT NULL CHECK (storage_configuration_epoch > 0),
+            profile_digest BLOB NOT NULL CHECK (length(profile_digest) = 32),
+            active_epoch INTEGER CHECK (active_epoch IS NULL OR active_epoch > 0),
+            retired_through_epoch INTEGER NOT NULL CHECK (retired_through_epoch >= 0),
+            generation INTEGER NOT NULL CHECK (generation >= 0),
+            current_bound_count INTEGER NOT NULL CHECK (current_bound_count BETWEEN 0 AND 131072),
             current_live_count INTEGER NOT NULL CHECK (current_live_count BETWEEN 0 AND 1024),
             reclaim_epoch INTEGER CHECK (reclaim_epoch IS NULL OR reclaim_epoch > 0),
             reclaim_cursor_ordinal INTEGER CHECK (
@@ -11757,7 +11870,7 @@ fn fenced_mutation_roster_binding_digest(
     Ok(digest.finalize().into())
 }
 
-/// Validate the complete independent V4 roster image.  All expensive values
+/// Validate the complete independent V5 roster image.  All expensive values
 /// are first constrained with a `LIMIT cap + 1` and SQLite metadata checks;
 /// the only attacker-controlled byte vectors decoded below are the frozen,
 /// bounded canonical admission frames.
@@ -12832,7 +12945,7 @@ fn read_fenced_mutation_roster_operation_status_sync(
     .transpose()
 }
 
-/// Read an exact V4 roster receipt without executing adapters, checkpoints,
+/// Read an exact V5 roster receipt without executing adapters, checkpoints,
 /// publications, or compaction.  A body whose immutable identity differs is
 /// reported before lifecycle/capacity state, and a retired epoch stays closed
 /// after physical reclamation.
@@ -18415,8 +18528,8 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
                 .map_err(db_error)?;
         }
         if incoming_has_roster && local_roster_layout == FencedMutationRosterLedgerLayout::Absent {
-            // Materialize V4 only inside the installation transaction that is
-            // about to copy its format-four marker and complete object set.
+            // Materialize V5 only inside the installation transaction that is
+            // about to copy its format-five marker and complete object set.
             tx.execute_batch(FENCED_MUTATION_ROSTER_SCHEMA)
                 .map_err(db_error)?;
         }
@@ -19193,7 +19306,7 @@ mod tests {
 
         conn.execute(
             "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1",
-            [FENCED_MUTATION_ROSTER_DATABASE_FORMAT + 1],
+            [FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT + 1],
         )
         .expect("inject unknown successor format");
         assert_eq!(
@@ -21953,11 +22066,103 @@ mod tests {
         // renumber an existing SQLite image.
         assert_eq!(FENCED_TRANSITION_V1_DATABASE_FORMAT, 2);
         assert_eq!(FENCED_TRANSITION_V2_DATABASE_FORMAT, 3);
-        assert_eq!(FENCED_MUTATION_ROSTER_DATABASE_FORMAT, 4);
+        assert_eq!(FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT, 4);
+        assert_eq!(FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT, 5);
     }
 
     #[test]
-    fn roster_activation_is_lazy_and_v2_can_activate_under_format_four() {
+    fn activated_v1_roster_requires_an_explicit_v2_format_upgrade() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        let roster_identity = identity();
+        let voters = expected_members();
+        initialize_schema(&conn, roster_identity, &voters).expect("consensus schema");
+        apply_entries_sync(
+            &conn,
+            roster_identity,
+            &backend.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(
+                    1,
+                    fenced_transition_request(0xE6, "legacy-roster-owner"),
+                    timestamp(1),
+                ),
+            ],
+        )
+        .expect("activate receipt fence");
+        let tx = conn
+            .unchecked_transaction()
+            .expect("roster activation transaction");
+        activate_fenced_mutation_roster_scope_sync(
+            &tx,
+            roster_identity,
+            roster_identity,
+            &voters,
+            fenced_mutation_roster_profile_digest(),
+            FENCED_MUTATION_ROSTER_INITIAL_HISTORY_EPOCH,
+        )
+        .expect("activate V2 roster");
+        tx.commit().expect("commit V2 roster activation");
+
+        let legacy_profile = FENCED_MUTATION_ROSTER_V1_PROFILE_DIGEST;
+        let tx = conn
+            .unchecked_transaction()
+            .expect("legacy upgrade-boundary transaction");
+        tx.execute_batch(
+            "ALTER TABLE consensus_fenced_mutation_roster_history RENAME TO consensus_fenced_mutation_roster_history_v1;",
+        )
+        .expect("rename V2 history");
+        tx.execute_batch(FENCED_MUTATION_ROSTER_V1_HISTORY_TABLE_SCHEMA_SQL)
+            .expect("create exact V1 history");
+        tx.execute_batch(
+            "INSERT INTO consensus_fenced_mutation_roster_history SELECT * FROM consensus_fenced_mutation_roster_history_v1; DROP TABLE consensus_fenced_mutation_roster_history_v1;",
+        )
+        .expect("copy V1 history");
+        tx.execute(
+            "UPDATE consensus_fenced_mutation_roster_history SET profile_digest = ?1 WHERE singleton = 1",
+            [legacy_profile.as_slice()],
+        )
+        .expect("restore V1 history profile");
+        tx.execute(
+            "UPDATE consensus_fenced_mutation_roster_activation SET profile_digest = ?1 WHERE singleton = 1",
+            [legacy_profile.as_slice()],
+        )
+        .expect("restore V1 activation profile");
+        tx.execute(
+            "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1",
+            [FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT],
+        )
+        .expect("restore V1 format marker");
+        tx.commit().expect("commit exact V1 image");
+
+        assert!(
+            fenced_mutation_roster_v1_schema_is_exact_in_sync(&conn, false)
+                .expect("recognize exact V1 image")
+        );
+        assert_eq!(
+            initialize_schema(&conn, roster_identity, &voters),
+            Err(SessionConsensusStorageError::SchemaVersionMismatch),
+            "an activated V1 image is an explicit V2 upgrade boundary, not corruption",
+        );
+        assert_eq!(
+            persisted_schema_version_in_sync(&conn, false).expect("preserve V1 marker"),
+            FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT,
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT profile_digest FROM consensus_fenced_mutation_roster_history WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .expect("preserve V1 history profile")
+            .as_slice(),
+            legacy_profile.as_slice(),
+        );
+    }
+
+    #[test]
+    fn roster_activation_is_lazy_and_v2_can_activate_under_format_five() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.blocking_lock();
         let voters = expected_members();
@@ -21980,12 +22185,12 @@ mod tests {
         assert_eq!(
             fenced_transition_v2_ledger_layout_sync(&conn).expect("inspect V2 layout"),
             FencedTransitionV2LedgerLayout::Absent,
-            "V4 activation does not require V2 activation",
+            "V5 activation does not require V2 activation",
         );
         assert_eq!(
-            fenced_mutation_roster_ledger_layout_sync(&conn).expect("inspect V4 layout"),
+            fenced_mutation_roster_ledger_layout_sync(&conn).expect("inspect V5 layout"),
             FencedMutationRosterLedgerLayout::Absent,
-            "a writable open does not materialize V4",
+            "a writable open does not materialize V5",
         );
 
         let tx = conn
@@ -22002,7 +22207,7 @@ mod tests {
         .expect("lazy roster activation");
         tx.commit().expect("commit roster activation");
         assert_eq!(
-            fenced_mutation_roster_ledger_layout_sync(&conn).expect("inspect V4 layout"),
+            fenced_mutation_roster_ledger_layout_sync(&conn).expect("inspect V5 layout"),
             FencedMutationRosterLedgerLayout::Activated,
         );
         assert!(fenced_mutation_roster_activation_matches_scope_sync(
@@ -22012,7 +22217,7 @@ mod tests {
             &voters,
             fenced_mutation_roster_profile_digest(),
         )
-        .expect("validate V4 certificate"),);
+        .expect("validate V5 certificate"),);
 
         // Re-certification after a completed roster reclaim must retain the
         // successor epoch; `initial_active_epoch` is not an instruction to
@@ -22052,22 +22257,22 @@ mod tests {
                 timestamp(2),
             )],
         )
-        .expect("V2 activation preserves the V4 format fence");
+        .expect("V2 activation preserves the V5 format fence");
         assert_eq!(
             fenced_transition_v2_ledger_layout_sync(&conn).expect("inspect V2 layout"),
             FencedTransitionV2LedgerLayout::Activated,
         );
         assert_eq!(
-            fenced_mutation_roster_ledger_layout_sync(&conn).expect("inspect V4 layout"),
+            fenced_mutation_roster_ledger_layout_sync(&conn).expect("inspect V5 layout"),
             FencedMutationRosterLedgerLayout::Activated,
         );
         assert_eq!(
             persisted_schema_version_in_sync(&conn, false).expect("inspect format marker"),
-            FENCED_MUTATION_ROSTER_DATABASE_FORMAT,
-            "later V2 activation must never lower the format-four marker",
+            FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT,
+            "later V2 activation must never lower the format-five marker",
         );
         validate_fenced_mutation_roster_receipts_sync(&conn, identity())
-            .expect("empty V4 history remains canonical after V2 activation");
+            .expect("empty V5 history remains canonical after V2 activation");
     }
 
     #[test]

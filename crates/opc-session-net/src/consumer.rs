@@ -12038,7 +12038,7 @@ mod tests {
         SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType,
         StoreError, StoredSessionRecord, FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES,
         FENCED_MUTATION_ROSTER_MAX_MEMBERS, FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES,
-        MAX_SESSION_TTL,
+        FENCED_MUTATION_ROSTER_SCHEMA_V2, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
@@ -12357,7 +12357,7 @@ mod tests {
 
         let mut canonical = Vec::new();
         canonical.extend_from_slice(b"OPCFMRP1");
-        canonical.extend_from_slice(&1_u16.to_be_bytes());
+        canonical.extend_from_slice(&FENCED_MUTATION_ROSTER_SCHEMA_V2.to_be_bytes());
         canonical.extend_from_slice(&fenced_mutation_roster_profile_digest());
         canonical.extend_from_slice(&admission.scope().digest());
         put_bytes(

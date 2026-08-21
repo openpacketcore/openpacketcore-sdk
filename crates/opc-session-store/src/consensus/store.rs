@@ -1101,7 +1101,7 @@ impl ConsensusSessionStore {
         }
     }
 
-    /// Admit V2 for one exact linearizable voter scope.
+    /// Admit V1 for one exact linearizable voter scope.
     ///
     /// A durable certificate first permits ordinary quorum availability.  In
     /// its absence every exact voter must answer the authenticated V1 probe;
@@ -1169,7 +1169,7 @@ impl ConsensusSessionStore {
         Ok(FencedTransitionCapabilityAdmission::FreshUnanimous)
     }
 
-    /// Admit V2 for one exact linearizable voter scope and one immutable
+    /// Admit V1 for one exact linearizable voter scope and one immutable
     /// fixed-profile digest. V1 activation evidence is deliberately never
     /// consulted here: a V2 receipt/history change requires every exact voter
     /// to freshly acknowledge the exact V2 profile before the first command.
