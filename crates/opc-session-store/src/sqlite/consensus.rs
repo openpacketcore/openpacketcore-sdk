@@ -34676,7 +34676,7 @@ BEGIN IMMEDIATE;
     // Synthetic commitments only: this is SQLite state-machine coverage, not
     // mTLS or network qualification evidence.
     #[test]
-    fn managed_provider_receipt_terminalization_and_reconciliation_are_durable() {
+    fn managed_provider_receipt_terminalization_is_durable() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.blocking_lock();
         initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
