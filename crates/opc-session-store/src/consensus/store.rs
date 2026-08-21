@@ -1353,20 +1353,6 @@ impl ConsensusSessionStore {
             .map(|_| Some(FencedTransitionV2Capability::V2))
     }
 
-    /// Expose roster support only inside the sealed crate flow after a fresh
-    /// unanimous exact-profile proof. It has no durable V1/V2 activation
-    /// certificate to borrow across topology changes.
-    pub(crate) async fn fenced_mutation_roster_capability(
-        &self,
-    ) -> Result<Option<FencedMutationRosterCapability>, StoreError> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.inner.operation_timeout)
-            .ok_or_else(consensus_unavailable)?;
-        self.require_fenced_mutation_roster_capability_before(deadline)
-            .await
-            .map(|_| Some(FencedMutationRosterCapability::V1))
-    }
-
     /// Obtain a fresh record plus the durable fence floor for one exact key.
     ///
     /// This observation owns one consensus logical-time barrier. It does not

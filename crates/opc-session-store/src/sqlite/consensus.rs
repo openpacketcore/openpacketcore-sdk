@@ -5846,6 +5846,20 @@ fn activate_fenced_transition_v2_scope_sync(
 
 type FencedMutationRosterActivationCertificate = (SessionConsensusIdentity, [u8; 32], [u8; 32]);
 
+type FencedMutationRosterHistorySqlRow = (
+    i64,
+    Vec<u8>,
+    Option<i64>,
+    i64,
+    i64,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    i64,
+);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FencedMutationRosterHistoryRow {
     pub(crate) profile_digest: [u8; 32],
@@ -5892,19 +5906,7 @@ fn read_fenced_mutation_roster_history_row_in_sync(
         reclaim_cursor_ordinal,
         reclaim_remaining,
         reclaimed_entries,
-    ): (
-        i64,
-        Vec<u8>,
-        Option<i64>,
-        i64,
-        i64,
-        i64,
-        i64,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        i64,
-    ) = conn
+    ): FencedMutationRosterHistorySqlRow = conn
         .query_row(
             &format!(
                 "SELECT storage_configuration_epoch, profile_digest, active_epoch, retired_through_epoch, generation, current_bound_count, current_live_count, reclaim_epoch, reclaim_cursor_ordinal, reclaim_remaining, reclaimed_entries FROM {source} WHERE singleton = 1"
@@ -17336,7 +17338,7 @@ fn validate_attached_snapshot_preserves_fenced_mutation_roster_history_sync(
                     && admission_blob == incoming_admission_blob
                     && protected_plan == incoming_protected_plan;
                 let terminal_is_monotonic = match phase {
-                    1 => matches!(incoming_phase, 1 | 2 | 3),
+                    1 => matches!(incoming_phase, 1..=3),
                     2 => {
                         incoming_phase == 2
                             && protected_checkpoint == incoming_protected_checkpoint
