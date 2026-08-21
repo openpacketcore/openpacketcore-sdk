@@ -14,11 +14,64 @@ use crate::{
     FencedMutationRosterAdmission, FencedMutationRosterMemberAttestation,
     FencedMutationRosterMemberAttestationError, FencedMutationRosterMemberAttestationVerifier,
     FencedMutationRosterMemberExecutionContext, FencedMutationRosterProviderOutcome,
-    FencedMutationRosterRequestId, SessionConsumerIdentity,
+    FencedMutationRosterRequestId, SessionConsumerIdentity, SessionConsumerScope,
 };
 
 /// The sole immutable managed-provider-job protocol revision.
 pub const MANAGED_PROVIDER_JOB_V5_REVISION: u16 = 5;
+
+/// Opaque authority to mutate one managed-provider-job scope.
+///
+/// Only the SDK consensus adapter can mint this value after it has admitted an
+/// authenticated consumer scope and bound the configured server/verifier
+/// identity.  It intentionally exposes neither the scope nor either identity
+/// commitment: callers can pass it to the coordinator, but cannot select a
+/// worker or widen its authority.
+#[derive(Clone, Copy)]
+pub struct ManagedProviderJobAuthority {
+    scope: SessionConsumerScope,
+    worker_identity_commitment: [u8; 32],
+    verifier_identity_commitment: [u8; 32],
+}
+
+impl ManagedProviderJobAuthority {
+    /// Mint authority only after authenticated server composition has checked
+    /// the exact consumer scope and configured verifier identity.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub(crate) const fn from_authenticated_scope(
+        scope: SessionConsumerScope,
+        worker_identity_commitment: [u8; 32],
+        verifier_identity_commitment: [u8; 32],
+    ) -> Self {
+        Self {
+            scope,
+            worker_identity_commitment,
+            verifier_identity_commitment,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn scope(self) -> SessionConsumerScope {
+        self.scope
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn worker_identity_commitment(self) -> [u8; 32] {
+        self.worker_identity_commitment
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn verifier_identity_commitment(self) -> [u8; 32] {
+        self.verifier_identity_commitment
+    }
+}
+
+impl fmt::Debug for ManagedProviderJobAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ManagedProviderJobAuthority(<redacted>)")
+    }
+}
 
 /// Durable roster execution mode.  Once selected it can never be changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +99,19 @@ pub enum ManagedProviderJobMemberPhase {
     Established,
     /// The immutable roster was aborted after conclusive reconciliation.
     Aborted,
+}
+
+/// Result of the atomic effect-start transition.
+///
+/// Only [`Self::Execute`] authorizes provider I/O.  Returning an existing
+/// status is deliberately not an execution permit: a concurrent caller must
+/// recover or observe the durable state instead of replaying the effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedProviderJobEffectStart {
+    /// This caller alone crossed `Ready -> EffectStarted` and may execute.
+    Execute,
+    /// Another caller already owns or completed the transition.
+    Existing(ManagedProviderJobStatus),
 }
 
 /// Stable derived identity for a provider job.
@@ -132,6 +198,36 @@ pub enum ManagedProviderMemberStatus {
     Inconclusive,
 }
 
+/// Opaque conclusive reconciliation evidence.
+///
+/// A provider may report `Inconclusive` without evidence.  Every conclusive
+/// status, including `NotApplied`, carries an attestation and is verified by
+/// the configured verifier before it can alter durable state.
+pub enum ManagedProviderMemberStatusEvidence {
+    /// A verifier-bound provider observation for the exact member context.
+    Attested(FencedMutationRosterMemberAttestation),
+    /// The provider cannot make a conclusive statement.
+    Inconclusive,
+}
+
+impl ManagedProviderMemberStatusEvidence {
+    /// Wrap one conclusive provider attestation for verifier validation.
+    pub const fn attested(attestation: FencedMutationRosterMemberAttestation) -> Self {
+        Self::Attested(attestation)
+    }
+}
+
+impl fmt::Debug for ManagedProviderMemberStatusEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Attested(_) => {
+                formatter.write_str("ManagedProviderMemberStatusEvidence(<redacted>)")
+            }
+            Self::Inconclusive => formatter.write_str("Inconclusive"),
+        }
+    }
+}
+
 impl fmt::Debug for ManagedProviderMemberStatus {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -195,7 +291,7 @@ pub trait ManagedProviderJobRemoteProvider: Send + Sync {
     async fn member_status(
         &self,
         context: &FencedMutationRosterMemberExecutionContext<'_>,
-    ) -> Result<ManagedProviderMemberStatus, Self::Error>;
+    ) -> Result<ManagedProviderMemberStatusEvidence, Self::Error>;
 
     /// Adopt one conclusive remote state and return its verifier-bound receipt.
     async fn adopt_member(
@@ -221,7 +317,7 @@ pub trait ManagedProviderJobStore: Send + Sync {
         &self,
         admission: &FencedMutationRosterAdmission,
         checkpoint: &[u8],
-        worker_identity_commitment: [u8; 32],
+        authority: ManagedProviderJobAuthority,
     ) -> Result<ManagedProviderJobStatus, Self::Error>;
 
     /// Read one durable sibling job status.
@@ -234,7 +330,7 @@ pub trait ManagedProviderJobStore: Send + Sync {
     async fn mark_member_effect_started(
         &self,
         id: ManagedProviderJobId,
-    ) -> Result<ManagedProviderJobStatus, Self::Error>;
+    ) -> Result<ManagedProviderJobEffectStart, Self::Error>;
 
     /// Persist only a private verifier-authenticated receipt/digest.
     async fn record_verified_attestation(
@@ -272,7 +368,7 @@ pub struct ManagedProviderJobCoordinator<'a, S, P, V: ?Sized> {
     provider: &'a P,
     verifier: &'a V,
     worker: &'a SessionConsumerIdentity,
-    worker_identity_commitment: [u8; 32],
+    authority: ManagedProviderJobAuthority,
 }
 
 impl<'a, S, P, V> ManagedProviderJobCoordinator<'a, S, P, V>
@@ -287,14 +383,14 @@ where
         provider: &'a P,
         verifier: &'a V,
         worker: &'a SessionConsumerIdentity,
-        worker_identity_commitment: [u8; 32],
+        authority: ManagedProviderJobAuthority,
     ) -> Self {
         Self {
             store,
             provider,
             verifier,
             worker,
-            worker_identity_commitment,
+            authority,
         }
     }
 
@@ -307,7 +403,7 @@ where
     ) -> Result<ManagedProviderJobStatus, ManagedProviderJobError> {
         let ensured = self
             .store
-            .ensure_job(admission, checkpoint, self.worker_identity_commitment)
+            .ensure_job(admission, checkpoint, self.authority)
             .await
             .map_err(|_| ManagedProviderJobError::Unavailable)?;
         if ensured.mode() == ManagedProviderJobMode::FrozenV4Terminal {
@@ -332,7 +428,7 @@ where
                     .mark_member_effect_started(id)
                     .await
                     .map_err(|_| ManagedProviderJobError::Unavailable)?;
-                if started.phase() == ManagedProviderJobMemberPhase::EffectStarted {
+                if matches!(started, ManagedProviderJobEffectStart::Execute) {
                     let attestation = self
                         .provider
                         .execute_member(&context)
@@ -340,8 +436,10 @@ where
                         .map_err(|_| ManagedProviderJobError::ReconciliationRequired)?;
                     self.verify_record_and_finalize(admission, id, &context, attestation)
                         .await
+                } else if let ManagedProviderJobEffectStart::Existing(status) = started {
+                    Ok(status)
                 } else {
-                    Ok(started)
+                    Err(ManagedProviderJobError::Unavailable)
                 }
             }
             ManagedProviderJobMemberPhase::EffectStarted => {
@@ -373,24 +471,41 @@ where
             .await
             .map_err(|_| ManagedProviderJobError::ReconciliationRequired)?
         {
-            status @ (ManagedProviderMemberStatus::Established
-            | ManagedProviderMemberStatus::Compensated) => {
-                let attestation = self
-                    .provider
-                    .adopt_member(context, status)
+            ManagedProviderMemberStatusEvidence::Attested(attestation) => {
+                attestation
+                    .validate_for(context)
+                    .map_err(|_| ManagedProviderJobError::AttestationRejected)?;
+                let outcome = self
+                    .verifier
+                    .verify_member_attestation(self.worker, context, &attestation)
                     .await
-                    .map_err(|_| ManagedProviderJobError::ReconciliationRequired)?;
-                self.verify_record_and_finalize(admission, id, context, attestation)
-                    .await
+                    .map_err(map_verifier_error)?;
+                if outcome != attestation.outcome() {
+                    return Err(ManagedProviderJobError::AttestationRejected);
+                }
+                match outcome {
+                    FencedMutationRosterProviderOutcome::NotAppliedReconciled => {
+                        self.store
+                            .abort_not_applied(id)
+                            .await
+                            .map_err(|_| ManagedProviderJobError::Unavailable)?;
+                        Err(ManagedProviderJobError::FreshAdmissionRequired)
+                    }
+                    FencedMutationRosterProviderOutcome::AppliedExecuted
+                    | FencedMutationRosterProviderOutcome::AppliedAdopted
+                    | FencedMutationRosterProviderOutcome::CompensatedReconciled => {
+                        self.store
+                            .record_verified_attestation(id, outcome)
+                            .await
+                            .map_err(|_| ManagedProviderJobError::Unavailable)?;
+                        self.store
+                            .finalize_job(admission)
+                            .await
+                            .map_err(|_| ManagedProviderJobError::Unavailable)
+                    }
+                }
             }
-            ManagedProviderMemberStatus::NotApplied => {
-                self.store
-                    .abort_not_applied(id)
-                    .await
-                    .map_err(|_| ManagedProviderJobError::Unavailable)?;
-                Err(ManagedProviderJobError::FreshAdmissionRequired)
-            }
-            ManagedProviderMemberStatus::Inconclusive => {
+            ManagedProviderMemberStatusEvidence::Inconclusive => {
                 self.store
                     .require_reconciliation(id)
                     .await
@@ -407,11 +522,17 @@ where
         context: &FencedMutationRosterMemberExecutionContext<'_>,
         attestation: FencedMutationRosterMemberAttestation,
     ) -> Result<ManagedProviderJobStatus, ManagedProviderJobError> {
+        attestation
+            .validate_for(context)
+            .map_err(|_| ManagedProviderJobError::AttestationRejected)?;
         let outcome = self
             .verifier
             .verify_member_attestation(self.worker, context, &attestation)
             .await
             .map_err(map_verifier_error)?;
+        if outcome != attestation.outcome() {
+            return Err(ManagedProviderJobError::AttestationRejected);
+        }
         match self.store.record_verified_attestation(id, outcome).await {
             Ok(_) => self
                 .store
@@ -486,7 +607,7 @@ mod tests {
             &self,
             _admission: &FencedMutationRosterAdmission,
             _checkpoint: &[u8],
-            _worker_identity_commitment: [u8; 32],
+            _authority: ManagedProviderJobAuthority,
         ) -> Result<ManagedProviderJobStatus, Self::Error> {
             let state = self.0.lock().expect("test state lock");
             Ok(ManagedProviderJobStatus::new(state.mode, state.phase))
@@ -503,12 +624,15 @@ mod tests {
         async fn mark_member_effect_started(
             &self,
             _id: ManagedProviderJobId,
-        ) -> Result<ManagedProviderJobStatus, Self::Error> {
+        ) -> Result<ManagedProviderJobEffectStart, Self::Error> {
             let mut state = self.0.lock().expect("test state lock");
             if state.phase == ManagedProviderJobMemberPhase::Ready {
                 state.phase = ManagedProviderJobMemberPhase::EffectStarted;
+                return Ok(ManagedProviderJobEffectStart::Execute);
             }
-            Ok(ManagedProviderJobStatus::new(state.mode, state.phase))
+            Ok(ManagedProviderJobEffectStart::Existing(
+                ManagedProviderJobStatus::new(state.mode, state.phase),
+            ))
         }
 
         async fn record_verified_attestation(
@@ -583,9 +707,26 @@ mod tests {
 
         async fn member_status(
             &self,
-            _context: &FencedMutationRosterMemberExecutionContext<'_>,
-        ) -> Result<ManagedProviderMemberStatus, Self::Error> {
-            Ok(self.status)
+            context: &FencedMutationRosterMemberExecutionContext<'_>,
+        ) -> Result<ManagedProviderMemberStatusEvidence, Self::Error> {
+            let outcome = match self.status {
+                ManagedProviderMemberStatus::Established => {
+                    FencedMutationRosterProviderOutcome::AppliedAdopted
+                }
+                ManagedProviderMemberStatus::Compensated => {
+                    FencedMutationRosterProviderOutcome::CompensatedReconciled
+                }
+                ManagedProviderMemberStatus::NotApplied => {
+                    FencedMutationRosterProviderOutcome::NotAppliedReconciled
+                }
+                ManagedProviderMemberStatus::Inconclusive => {
+                    return Ok(ManagedProviderMemberStatusEvidence::Inconclusive);
+                }
+            };
+            let attestation =
+                FencedMutationRosterMemberAttestation::new(context, outcome, Box::new([0x5a]))
+                    .unwrap_or_else(|_| unreachable!("fixed test attestation is valid"));
+            Ok(ManagedProviderMemberStatusEvidence::attested(attestation))
         }
 
         async fn adopt_member(
@@ -663,7 +804,63 @@ mod tests {
         let identity = Box::leak(Box::new(
             SessionConsumerIdentity::new("spiffe://test/worker").expect("identity"),
         ));
-        ManagedProviderJobCoordinator::new(store, provider, &VERIFIER, identity, [4; 32])
+        let authority = ManagedProviderJobAuthority::from_authenticated_scope(
+            SessionConsumerScope::new(crate::consensus::SessionConsensusIdentity::new(
+                crate::consensus::SessionConsensusClusterId::new("test-cluster").expect("cluster"),
+                crate::consensus::SessionConsensusConfigurationId::from_bytes([5; 32]),
+                crate::consensus::SessionConsensusConfigurationEpoch::new(1).expect("epoch"),
+            )),
+            [4; 32],
+            [6; 32],
+        );
+        ManagedProviderJobCoordinator::new(store, provider, &VERIFIER, identity, authority)
+    }
+
+    #[test]
+    fn authority_debug_is_redacted() {
+        let authority = ManagedProviderJobAuthority::from_authenticated_scope(
+            SessionConsumerScope::new(crate::consensus::SessionConsensusIdentity::new(
+                crate::consensus::SessionConsensusClusterId::new("test-cluster").expect("cluster"),
+                crate::consensus::SessionConsensusConfigurationId::from_bytes([7; 32]),
+                crate::consensus::SessionConsensusConfigurationEpoch::new(1).expect("epoch"),
+            )),
+            [8; 32],
+            [9; 32],
+        );
+        assert_eq!(
+            format!("{authority:?}"),
+            "ManagedProviderJobAuthority(<redacted>)"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_one_effect_start_caller_receives_execution_permit() {
+        let store = Store(Mutex::new(State {
+            mode: ManagedProviderJobMode::ManagedV5,
+            phase: ManagedProviderJobMemberPhase::Ready,
+            lose_record_ack: false,
+        }));
+        let id = ManagedProviderJobId::for_member(
+            admission().request_id(),
+            FencedMutationRosterOrdinal::new(0).expect("ordinal"),
+        );
+        assert_eq!(
+            store
+                .mark_member_effect_started(id)
+                .await
+                .expect("first durable start"),
+            ManagedProviderJobEffectStart::Execute
+        );
+        assert_eq!(
+            store
+                .mark_member_effect_started(id)
+                .await
+                .expect("second durable observation"),
+            ManagedProviderJobEffectStart::Existing(ManagedProviderJobStatus::new(
+                ManagedProviderJobMode::ManagedV5,
+                ManagedProviderJobMemberPhase::EffectStarted,
+            ))
+        );
     }
 
     #[tokio::test]
@@ -690,7 +887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn effect_started_recovery_adopts_without_reexecution() {
+    async fn effect_started_recovery_uses_attested_status_without_reexecution() {
         let store = Store(Mutex::new(State {
             mode: ManagedProviderJobMode::ManagedV5,
             phase: ManagedProviderJobMemberPhase::EffectStarted,
@@ -708,10 +905,10 @@ mod tests {
                 FencedMutationRosterOrdinal::new(0).expect("ordinal"),
             )
             .await
-            .expect("adopts and finalizes");
+            .expect("verifies status and finalizes");
         assert_eq!(result.phase(), ManagedProviderJobMemberPhase::Established);
         assert_eq!(provider.executes.load(Ordering::Relaxed), 0);
-        assert_eq!(provider.adopts.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.adopts.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
