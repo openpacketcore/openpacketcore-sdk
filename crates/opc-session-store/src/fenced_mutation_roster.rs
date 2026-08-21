@@ -1337,6 +1337,117 @@ pub trait FencedMutationRosterProfileApi {
         terminal: &FencedMutationRosterTerminal,
     ) -> Result<FencedMutationRosterOutcome, FencedMutationRosterError>;
 }
+
+/// Conclusive provider result used to issue a member proof.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+pub enum FencedMutationRosterProviderOutcome {
+    /// Provider conclusively executed the effect.
+    AppliedExecuted,
+    /// Provider conclusively adopted the effect.
+    AppliedAdopted,
+    /// Provider conclusively proved the effect was not applied.
+    NotAppliedReconciled,
+    /// Provider conclusively compensated and reconciled the effect.
+    CompensatedReconciled,
+}
+
+/// Opaque SDK-issued evidence for one member operation.  Fields are private
+/// so a consumer cannot manufacture `Applied` or `NotApplied` terminal state.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FencedMutationRosterMemberProof {
+    roster_id: FencedMutationRosterRequestId,
+    phase_commitment: [u8; 32],
+    ordinal: FencedMutationRosterOrdinal,
+    member_operation_id: [u8; MEMBER_ID_BYTES],
+    descriptor_commitment: [u8; 32],
+    expected_version: u64,
+    execution_fence: FenceToken,
+    outcome: FencedMutationRosterProviderOutcome,
+}
+
+impl fmt::Debug for FencedMutationRosterMemberProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FencedMutationRosterMemberProof(<redacted>)")
+    }
+}
+
+impl FencedMutationRosterMemberProof {
+    pub(crate) fn issue(
+        admission: &FencedMutationRosterAdmission,
+        member: &FencedMutationRosterMember,
+        current_fence: FenceToken,
+        outcome: FencedMutationRosterProviderOutcome,
+    ) -> Self {
+        Self {
+            roster_id: admission.request_id(),
+            phase_commitment: roster_body_commitment(&admission.canonical_body()),
+            ordinal: member.ordinal(),
+            member_operation_id: *member.caller_id(),
+            descriptor_commitment: roster_body_commitment(member.descriptor().as_bytes()),
+            expected_version: member.expected_version(),
+            execution_fence: current_fence,
+            outcome,
+        }
+    }
+    /// Validate that this proof belongs to the exact immutable roster member.
+    pub fn validate_for(
+        &self,
+        admission: &FencedMutationRosterAdmission,
+        current_fence: FenceToken,
+    ) -> Result<(), FencedMutationRosterError> {
+        if self.roster_id != admission.request_id()
+            || self.execution_fence != current_fence
+            || self.phase_commitment != roster_body_commitment(&admission.canonical_body())
+        {
+            return Err(FencedMutationRosterError::RequestConflict);
+        }
+        let member = admission
+            .members()
+            .as_slice()
+            .iter()
+            .find(|member| member.ordinal() == self.ordinal)
+            .ok_or(FencedMutationRosterError::LifecycleConflict)?;
+        if member.caller_id() != &self.member_operation_id
+            || roster_body_commitment(member.descriptor().as_bytes()) != self.descriptor_commitment
+            || member.expected_version() != self.expected_version
+        {
+            return Err(FencedMutationRosterError::RequestConflict);
+        }
+        Ok(())
+    }
+    /// Return the conclusive provider outcome.
+    pub fn outcome(&self) -> FencedMutationRosterProviderOutcome {
+        self.outcome
+    }
+}
+
+/// Generic opaque member provider.  The SDK owns proof issuance and all
+/// ambiguity handling; providers never assert terminal dispositions directly.
+pub trait FencedMutationRosterMemberProvider {
+    /// Provider error returned without creating a terminal proof.
+    type Error;
+    /// Execute one member under the current guard.
+    fn execute_member(
+        &self,
+        recovered: &FencedMutationRosterAdmission,
+        ordinal: FencedMutationRosterOrdinal,
+        current_fence: FenceToken,
+    ) -> Result<FencedMutationRosterMemberProof, Self::Error>;
+    /// Read exact durable status for one member.
+    fn member_status(
+        &self,
+        recovered: &FencedMutationRosterAdmission,
+        ordinal: FencedMutationRosterOrdinal,
+        current_fence: FenceToken,
+    ) -> Result<FencedMutationRosterMemberProof, Self::Error>;
+    /// Adopt or reconcile one ambiguous member using durable evidence.
+    fn adopt_member(
+        &self,
+        recovered: &FencedMutationRosterAdmission,
+        ordinal: FencedMutationRosterOrdinal,
+        current_fence: FenceToken,
+    ) -> Result<FencedMutationRosterMemberProof, Self::Error>;
+}
 /// Compatibility alias for callers using the profile digest spelling.
 pub fn compute_fenced_mutation_roster_profile_digest() -> [u8; 32] {
     fenced_mutation_roster_profile_digest()
