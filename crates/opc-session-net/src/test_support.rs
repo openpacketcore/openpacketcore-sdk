@@ -1,8 +1,74 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 
-pub(crate) static SESSION_CONNECTION_METRICS_TEST_LOCK: std::sync::LazyLock<
-    tokio::sync::Mutex<()>,
-> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+#[derive(Clone, Copy)]
+pub(crate) struct ConnectionOutcomeMetricSnapshot {
+    pub(crate) idle_retirements: u64,
+    pub(crate) timeout_failures: u64,
+    pub(crate) successes: u64,
+    pub(crate) drain_started: u64,
+    pub(crate) drain_completed: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ConnectionOutcomeTestAccounting {
+    idle_retirements: AtomicU64,
+    timeout_failures: AtomicU64,
+    successes: AtomicU64,
+    drain_started: AtomicU64,
+    drain_completed: AtomicU64,
+}
+
+impl ConnectionOutcomeTestAccounting {
+    pub(crate) fn snapshot(&self) -> ConnectionOutcomeMetricSnapshot {
+        ConnectionOutcomeMetricSnapshot {
+            idle_retirements: self.idle_retirements.load(Ordering::Relaxed),
+            timeout_failures: self.timeout_failures.load(Ordering::Relaxed),
+            successes: self.successes.load(Ordering::Relaxed),
+            drain_started: self.drain_started.load(Ordering::Relaxed),
+            drain_completed: self.drain_completed.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn record_retirement(&self, reason: crate::lifecycle::RetirementReason) {
+        if reason == crate::lifecycle::RetirementReason::IdleTimeout {
+            self.idle_retirements.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_drain_started(&self) {
+        self.drain_started.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_drain_completed(&self) {
+        self.drain_completed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// Tokio task-local state deliberately excludes unrelated spawned test writers. Lifecycle
+// instances capture this `Arc` when constructed so their eventual drop stays attributed.
+tokio::task_local! {
+    pub(crate) static CONNECTION_OUTCOME_TEST_ACCOUNTING: Arc<ConnectionOutcomeTestAccounting>;
+}
+
+pub(crate) fn current_connection_outcome_test_accounting(
+) -> Option<Arc<ConnectionOutcomeTestAccounting>> {
+    CONNECTION_OUTCOME_TEST_ACCOUNTING.try_with(Arc::clone).ok()
+}
+
+pub(crate) fn record_connection_success() {
+    let _ = CONNECTION_OUTCOME_TEST_ACCOUNTING.try_with(|accounting| {
+        accounting.successes.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+pub(crate) fn record_connection_timeout_failure() {
+    let _ = CONNECTION_OUTCOME_TEST_ACCOUNTING.try_with(|accounting| {
+        accounting.timeout_failures.fetch_add(1, Ordering::Relaxed);
+    });
+}
 
 pub(crate) struct RotatableServerMaterial {
     ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
