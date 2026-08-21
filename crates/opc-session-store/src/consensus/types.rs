@@ -109,7 +109,7 @@ pub const SESSION_CONSENSUS_FENCED_MUTATION_ROSTER_COMMAND_WIRE_SCHEMA_DESCRIPTO
     "intent-discriminants=authorized:15|fenced-v1:16|activate-v1:17|fenced-v2:18|activate-v2:19|maintain-v2:20|",
     "roster-admit:21|roster-terminalize:22;",
     "roster-admission=canonical-framed;roster-terminal=canonical-framed;checkpoint=len32+protected-bytes;",
-    "roster-activate=scope:identity|voters:bytes32|profile:bytes32;authorized=origin:node-id|authority:identity|box(intent)"
+    "roster-admit-certificate=scope:identity|voters:bytes32|profile:bytes32;authorized=origin:node-id|authority:identity|box(intent)"
 );
 const FENCED_TRANSITION_VOTER_SET_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-transition-voter-set/v1\0";

@@ -406,8 +406,6 @@ fn inspect_current(
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let roster_ledger_layout = consensus::fenced_mutation_roster_ledger_layout_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    let roster_ledger_layout = consensus::fenced_mutation_roster_ledger_layout_sync(conn)
-        .map_err(|_| RecoveryError::CorruptReplica)?;
     let receipt_ledger_layout = consensus::fenced_transition_receipt_ledger_layout_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let (schema_version, cluster, configuration, epoch): (i64, Vec<u8>, Vec<u8>, i64) = conn
@@ -588,18 +586,6 @@ fn preflight_current_tables(
             || total_bytes > budget.limits.max_total_value_bytes()
         {
             return Err(RecoveryError::WorkLimitExceeded);
-        }
-    }
-    if roster_ledger_layout == consensus::FencedMutationRosterLedgerLayout::Activated {
-        for table in [
-            "consensus_fenced_mutation_roster_operations",
-            "consensus_fenced_mutation_roster_members",
-            "consensus_fenced_mutation_roster_activation",
-            "consensus_fenced_mutation_roster_history",
-        ] {
-            observed
-                .remove(table)
-                .ok_or(RecoveryError::CorruptReplica)?;
         }
     }
     if table_exists(conn, "consensus_fenced_transition_receipts")? {
@@ -1745,6 +1731,8 @@ fn validate_exact_recovery_schema(
 ) -> Result<(), RecoveryError> {
     let v2_ledger_layout = consensus::fenced_transition_v2_ledger_layout_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
+    let roster_ledger_layout = consensus::fenced_mutation_roster_ledger_layout_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
     let receipt_ledger_layout = consensus::fenced_transition_receipt_ledger_layout_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     if receipt_ledger_layout == consensus::FencedTransitionReceiptLedgerLayout::Published684 {
@@ -1816,6 +1804,18 @@ fn validate_exact_recovery_schema(
             "consensus_fenced_transition_v2_receipts",
             "consensus_fenced_transition_v2_activation",
             "consensus_fenced_transition_v2_history",
+        ] {
+            observed
+                .remove(table)
+                .ok_or(RecoveryError::CorruptReplica)?;
+        }
+    }
+    if roster_ledger_layout == consensus::FencedMutationRosterLedgerLayout::Activated {
+        for table in [
+            "consensus_fenced_mutation_roster_operations",
+            "consensus_fenced_mutation_roster_members",
+            "consensus_fenced_mutation_roster_activation",
+            "consensus_fenced_mutation_roster_history",
         ] {
             observed
                 .remove(table)
