@@ -41,20 +41,21 @@ const COMMAND_V2_DIGEST_MAGIC: &[u8] = b"OPC-SC-V2-APPLIED\0";
 /// This applies only to commands which carry a V2 intent (directly or in the
 /// one permitted [`SessionMutationIntent::Authorized`] envelope). Older
 /// commands retain their byte-for-byte JSON digest encoding.
-pub const SESSION_CONSENSUS_V2_APPLIED_DIGEST_ENCODING_VERSION: u16 = 1;
+pub const SESSION_CONSENSUS_V2_APPLIED_DIGEST_ENCODING_VERSION: u16 = 2;
 /// Frozen descriptor of V2's fixed applied-command digest input.
 ///
 /// The V2 fenced-transition profile must bind this descriptor: changing any
 /// tag, width, field order, or domain changes the replicated digest chain.
 pub const SESSION_CONSENSUS_V2_APPLIED_DIGEST_SCHEMA_DESCRIPTOR: &str = concat!(
     "domain=openpacketcore/session-consensus/command/v2-fixed\\0;",
-    "magic=OPC-SC-V2-APPLIED\\0;revision:u16be=1;",
+    "magic=OPC-SC-V2-APPLIED\\0;revision:u16be=2;",
     "prefix=sequence:u64be|previous-digest:bytes32|effective-time:timestamp;",
     "command=schema:u16be|storage-identity:identity|outer-id:bytes16|logical-time:timestamp|intent;",
     "timestamp=unix-secs:i64be|nanos:u32be;identity=cluster:bytes32|configuration:bytes32|epoch:u64be;",
     "intent=fenced-v2(tag=1,id:bytes56)|activate-v2(tag=2,id:bytes56,scope:identity,voters:bytes32,profile:bytes32)|",
     "maintain-v2(tag=3,generation:u64be,active:option-tag-u8+epoch:u64be,retired:u64be,bound:u64be)|",
-    "authorized(tag=4,origin:u64be,authority:identity,mutation:intent)"
+    "authorized(tag=4,origin:u64be,authority:identity,mutation:intent)|",
+    "fenced-v2-batch(tag=5,count:u16be,items:ordered-full-id:bytes56)"
 );
 /// Frozen Postcard command-wire shape for V2 replicated intents.
 ///
@@ -65,7 +66,7 @@ pub const SESSION_CONSENSUS_V2_COMMAND_WIRE_SCHEMA_DESCRIPTOR: &str = concat!(
     "wire-profile=1;raft-rpc-codec=postcard;durable-log-codec=serde-json;",
     "command-fields=schema-version,identity,request-id,logical-time,intent;",
     "intent-discriminants=authorized:15|fenced-v1:16|activate-v1:17|",
-    "fenced-v2:18|activate-v2:19|maintain-v2:20;",
+    "fenced-v2:18|activate-v2:19|maintain-v2:20|fenced-v2-batch:21;",
     "postcard=derive-serde,struct-fields-declaration-order,enum-tags=varint;",
     "json=derive-serde,struct-field-names-declaration-order,enum-names-exact;",
     "fenced-v2=box(request-fields=request-id:epoch:u64,nonce:bytes16,commitment:bytes32|lease|mutation);",
@@ -73,10 +74,31 @@ pub const SESSION_CONSENSUS_V2_COMMAND_WIRE_SCHEMA_DESCRIPTOR: &str = concat!(
     "mutation-discriminants=create:0(record)|update:1(generation,record)|delete:2(generation)|refresh-ttl:3(generation,ttl);",
     "activate-v2=box(request)|scope:identity|voters:bytes32|profile:bytes32;",
     "maintain-v2=generation:u64|active:option(epoch:u64)|retired:u64|bound:u64;",
+    "fenced-v2-batch=vec(request-fields=request-id:epoch:u64,nonce:bytes16,commitment:bytes32|lease|mutation),",
+    "count=1..=256,ordered,unique-full-ids,single-history-epoch,postcard-bytes<=1048576,",
+    "outer-id=sha256(domain=openpacketcore/session-consensus/fenced-transition/v2/batch/outer-id/v1\\0,",
+    "count:u16be,ordered-full-ids:bytes56)[0..16];",
     "authorized=origin:node-id|authority:identity|box(intent)"
 );
 const FENCED_TRANSITION_VOTER_SET_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-transition-voter-set/v1\0";
+const FENCED_TRANSITION_V2_BATCH_OUTER_REQUEST_ID_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/fenced-transition/v2/batch/outer-id/v1\0";
+
+/// Maximum ordered V2 transitions admitted by one replicated batch command.
+pub const MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS: usize = 256;
+
+/// Maximum fully Postcard-encoded V2 batch request bytes.
+///
+/// This leaves one MiB of deterministic command-envelope headroom beneath
+/// the existing two MiB consensus RPC ceiling.
+pub const MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Maximum fully Postcard-encoded V2 batch outcome bytes.
+///
+/// The same fixed cap keeps a complete correlated outcome vector within the
+/// existing consensus response and consumer frame profiles.
+pub const MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Produce the canonical, non-describing binding of one exact voter scope.
 ///
@@ -306,6 +328,17 @@ pub enum SessionMutationIntent {
     /// command selected by local apply state.  Every replica therefore applies
     /// the fixed V2 receipt/history semantics encoded by this log entry.
     FencedTransitionV2(Box<FencedTransitionV2Request>),
+    /// Coalesce an ordered, same-epoch batch of independent V2 fenced
+    /// transitions into one replicated command.
+    ///
+    /// Each item retains its complete self-authenticating 56-byte request ID.
+    /// The store layer derives the command's outer id from those ordered full
+    /// IDs; this replicated vocabulary deliberately never truncates or
+    /// replaces them with a batch-local identity. One physical log entry is a
+    /// throughput optimization only: items have independent logical effects,
+    /// results, and singleton status identities. This is not an inter-item
+    /// conditional or all-or-nothing distributed transaction.
+    FencedTransitionV2Batch(Vec<FencedTransitionV2Request>),
     /// The first V2 fenced transition for one exact voter scope and immutable
     /// V2 history profile.
     ///
@@ -438,10 +471,113 @@ impl SessionMutationIntent {
         matches!(
             self,
             Self::FencedTransitionV2(_)
+                | Self::FencedTransitionV2Batch(_)
                 | Self::ActivateFencedTransitionV2 { .. }
                 | Self::MaintainFencedTransitionV2History { .. }
         ) || matches!(self, Self::Authorized { mutation, .. } if mutation.contains_fenced_transition_v2())
     }
+}
+
+/// Validate the fixed V2 batch request profile before a command can have an
+/// effect.
+///
+/// The full vector is encoded with the same bounded Postcard codec used by
+/// consensus transport.  This intentionally measures the whole encoded input
+/// rather than summing estimates of nested request bodies.
+pub(crate) fn validate_fenced_transition_v2_batch(
+    requests: &[FencedTransitionV2Request],
+) -> Result<(), StoreError> {
+    if requests.is_empty() || requests.len() > MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS {
+        return Err(StoreError::InvalidKey(
+            "fenced_transition_v2_batch_count_invalid".into(),
+        ));
+    }
+    let epoch = requests[0].request_id().epoch();
+    let mut ids = BTreeSet::new();
+    for request in requests {
+        // Retain an otherwise structurally valid substituted body for
+        // deterministic request-conflict handling, matching singleton V2.
+        match request.validate() {
+            Ok(()) | Err(StoreError::FencedTransitionRequestConflict) => {}
+            Err(error) => return Err(error),
+        }
+        if request.request_id().epoch() != epoch {
+            return Err(StoreError::InvalidKey(
+                "fenced_transition_v2_batch_epoch_mismatch".into(),
+            ));
+        }
+        if !ids.insert(request.request_id().to_bytes()) {
+            return Err(StoreError::InvalidKey(
+                "fenced_transition_v2_batch_duplicate_request_id".into(),
+            ));
+        }
+    }
+    validate_fenced_transition_v2_batch_encoded_bytes(
+        requests,
+        MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
+        "fenced_transition_v2_batch_request_encoding_failed",
+    )
+}
+
+/// Derive the durable outer request ID for one validated ordered V2 batch.
+///
+/// This is intentionally not a caller-controlled batch identity. It binds
+/// the ordered complete 56-byte item IDs (and the count) under a dedicated
+/// domain so a reordered batch or any substituted item cannot reuse a
+/// consensus idempotency receipt.
+pub(crate) fn fenced_transition_v2_batch_outer_request_id(
+    requests: &[FencedTransitionV2Request],
+) -> Result<[u8; 16], StoreError> {
+    validate_fenced_transition_v2_batch(requests)?;
+    let count = u16::try_from(requests.len()).map_err(|_| {
+        StoreError::Serialization("session consensus V2 batch count encoding failed".into())
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(FENCED_TRANSITION_V2_BATCH_OUTER_REQUEST_ID_DOMAIN);
+    hasher.update(count.to_be_bytes());
+    for request in requests {
+        hasher.update(request.request_id().to_bytes());
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut outer = [0_u8; 16];
+    outer.copy_from_slice(&digest[..16]);
+    Ok(outer)
+}
+
+/// Validate the persisted V2 batch outcome vector before it is returned or
+/// retained by a consensus adapter.
+pub(crate) fn validate_fenced_transition_v2_batch_outcomes(
+    outcomes: &[Result<FencedTransitionOutcome, StoreError>],
+) -> Result<(), StoreError> {
+    if outcomes.is_empty() || outcomes.len() > MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS {
+        return Err(StoreError::InvalidKey(
+            "fenced_transition_v2_batch_outcome_count_invalid".into(),
+        ));
+    }
+    validate_fenced_transition_v2_batch_encoded_bytes(
+        outcomes,
+        MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES,
+        "fenced_transition_v2_batch_outcome_encoding_failed",
+    )
+}
+
+fn validate_fenced_transition_v2_batch_encoded_bytes<T>(
+    value: &T,
+    maximum: usize,
+    encoding_error: &'static str,
+) -> Result<(), StoreError>
+where
+    T: Serialize + ?Sized,
+{
+    let encoded = opc_consensus::encode_bounded(value)
+        .map_err(|_| StoreError::InvalidKey(encoding_error.into()))?;
+    if encoded.len() > maximum {
+        return Err(StoreError::PayloadTooLarge {
+            actual: encoded.len(),
+            max: maximum,
+        });
+    }
+    Ok(())
 }
 
 fn append_v2_applied_timestamp(out: &mut Vec<u8>, timestamp: opc_types::Timestamp) {
@@ -464,6 +600,22 @@ fn append_v2_applied_intent(
         SessionMutationIntent::FencedTransitionV2(request) => {
             out.push(1);
             out.extend_from_slice(&request.request_id().to_bytes());
+        }
+        SessionMutationIntent::FencedTransitionV2Batch(requests) => {
+            validate_fenced_transition_v2_batch(requests)?;
+            out.push(5);
+            out.extend_from_slice(
+                &u16::try_from(requests.len())
+                    .map_err(|_| {
+                        StoreError::Serialization(
+                            "session consensus V2 batch count encoding failed".into(),
+                        )
+                    })?
+                    .to_be_bytes(),
+            );
+            for request in requests {
+                out.extend_from_slice(&request.request_id().to_bytes());
+            }
         }
         SessionMutationIntent::ActivateFencedTransitionV2 {
             request,
@@ -529,6 +681,14 @@ pub enum SessionMutationOutcome {
     Unit,
     /// Result of one atomic single-record fenced transition.
     FencedTransition(FencedTransitionOutcome),
+    /// Ordered exact outcomes for one coalesced V2 fenced-transition batch.
+    ///
+    /// Position `n` corresponds to position `n` in the replicated batch
+    /// intent. Consumer projections additionally carry each full request ID
+    /// so callers never infer correlation from a truncated identifier. A
+    /// successful item does not make sibling logical effects conditional or
+    /// all-or-nothing.
+    FencedTransitionV2Batch(Vec<Result<FencedTransitionOutcome, StoreError>>),
 }
 
 impl fmt::Debug for SessionMutationOutcome {
@@ -849,6 +1009,64 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn v2_batch_validation_binds_ordered_full_ids_and_one_epoch() {
+        let [first, second, ..] = v2_digest_variant_requests();
+        assert!(validate_fenced_transition_v2_batch(&[first.clone(), second.clone()]).is_ok());
+        assert!(validate_fenced_transition_v2_batch(&[]).is_err());
+        assert!(validate_fenced_transition_v2_batch(&[first.clone(), first.clone()]).is_err());
+
+        let mismatched_epoch = FencedTransitionV2Request::new(
+            FencedTransitionV2HistoryEpoch::new(8).expect("epoch"),
+            FencedTransitionV2CallerNonce::from_bytes([0xDA; 16]),
+            second.lease().clone(),
+            second.mutation().clone(),
+        )
+        .expect("different epoch request");
+        assert!(validate_fenced_transition_v2_batch(&[first.clone(), mismatched_epoch]).is_err());
+
+        let first_outer =
+            fenced_transition_v2_batch_outer_request_id(&[first.clone(), second.clone()])
+                .expect("batch outer ID");
+        assert_eq!(
+            first_outer,
+            fenced_transition_v2_batch_outer_request_id(&[first.clone(), second.clone()])
+                .expect("stable batch outer ID")
+        );
+        assert_ne!(
+            first_outer,
+            fenced_transition_v2_batch_outer_request_id(&[second, first])
+                .expect("reordered batch outer ID"),
+            "ordered full IDs, rather than a set, define the durable batch identity"
+        );
+    }
+
+    #[test]
+    fn v2_batch_intent_uses_a_fixed_full_id_digest_shape() {
+        let [first, second, ..] = v2_digest_variant_requests();
+        let command = v2_digest_command(SessionMutationIntent::FencedTransitionV2Batch(vec![
+            first.clone(),
+            second.clone(),
+        ]));
+        let encoded = command
+            .encode_v2_applied_digest_input(
+                5,
+                SessionConsensusEntryDigest::from_bytes([0xD3; 32]),
+                legacy_time(41),
+            )
+            .expect("batch digest encoding");
+        let suffix = &encoded[encoded.len() - (1 + 2 + (2 * 56))..];
+        assert_eq!(suffix[0], 5, "V2 batch applied-digest tag");
+        assert_eq!(&suffix[1..3], &2_u16.to_be_bytes());
+        assert_eq!(&suffix[3..59], &first.request_id().to_bytes());
+        assert_eq!(&suffix[59..115], &second.request_id().to_bytes());
+
+        let outcomes = vec![Err(StoreError::LeaseHeld), Err(StoreError::LeaseExpired)];
+        assert!(validate_fenced_transition_v2_batch_outcomes(&outcomes).is_ok());
+        let outcome = SessionMutationOutcome::FencedTransitionV2Batch(outcomes);
+        assert!(opc_consensus::encode_bounded(&outcome).is_ok());
+    }
+
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
@@ -882,10 +1100,10 @@ mod tests {
             }),
         ];
         let expected_digests = [
-            "81f1ae844edba53caa9a6f4cc46df55db66eef7ba53390367ea532abff9b52a2",
-            "2f7b5672a1d3f652f97468d14050449dd6c6ed7300fdf2bbcd594f3dc66e7578",
-            "0c0f7fd76cb88ae0cbf6aac1cbf5db9cb65cff499bdf27f029fae0b238091c56",
-            "44d5c5bea27a3e0f62c64a9e33e0ca7a22da4db6734ee9ce4b38f7fea1c0b551",
+            "2da22c549efc00b3757fd393a6afd6eaeb58f26b92a63e2393fe47e92ade8be7",
+            "0486c039d926654753bf5641cb55c345813212a1df3371f0338822c9e65cccc4",
+            "137599aca38dbb4142f99d49016f80dc2b27d2930026d25096adeaa0a062f067",
+            "34aaad50947be0d34959ebf15b900bfbc86f966ed378a99f5c5897a79124734d",
         ];
         for (index, (command, expected_digest)) in commands.iter().zip(expected_digests).enumerate()
         {
@@ -1051,9 +1269,9 @@ mod tests {
         ];
         let expected = [
             "01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a1207d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d22ef551462247eb23931fd020dfc974ff9ff0cfc495735cf66c5bbd98b2047482000f6c65676163792d706f73746361726403736d660b7064752d73657373696f6e0a6c65676163792d6b65790f76322d6469676573742d6f776e6572003c000201",
-            "01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a1307d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d22ef551462247eb23931fd020dfc974ff9ff0cfc495735cf66c5bbd98b2047482000f6c65676163792d706f73746361726403736d660b7064752d73657373696f6e0a6c65676163792d6b65790f76322d6469676573742d6f776e6572003c000201e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5",
-            "01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a0f09e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a383864141414141414141414141414141414141414141414141414141414141414141021307d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d22ef551462247eb23931fd020dfc974ff9ff0cfc495735cf66c5bbd98b2047482000f6c65676163792d706f73746361726403736d660b7064752d73657373696f6e0a6c65676163792d6b65790f76322d6469676573742d6f776e6572003c000201e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5",
-            "01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a140b01070617",
+            "01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a1407d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d22ef551462247eb23931fd020dfc974ff9ff0cfc495735cf66c5bbd98b2047482000f6c65676163792d706f73746361726403736d660b7064752d73657373696f6e0a6c65676163792d6b65790f76322d6469676573742d6f776e6572003c000201e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5",
+            "01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a0f09e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a383864141414141414141414141414141414141414141414141414141414141414141021407d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d22ef551462247eb23931fd020dfc974ff9ff0cfc495735cf66c5bbd98b2047482000f6c65676163792d706f73746361726403736d660b7064752d73657373696f6e0a6c65676163792d6b65790f76322d6469676573742d6f776e6572003c000201e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5",
+            "01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a150b01070617",
         ];
         for (index, (command, expected)) in commands.iter().zip(expected).enumerate() {
             let encoded = opc_consensus::encode_bounded(command).expect("V2 command postcard");

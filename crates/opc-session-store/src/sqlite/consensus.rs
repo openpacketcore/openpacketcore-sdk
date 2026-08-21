@@ -31,8 +31,9 @@ use crate::backend::{
 use crate::capability::BackendCapabilities;
 use crate::consensus::storage::{ConsensusAuthorityProfile, SessionConsensusStorageError};
 use crate::consensus::types::{
-    fenced_transition_voter_set_digest, SessionConsensusCommand,
-    SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+    fenced_transition_v2_batch_outer_request_id, fenced_transition_voter_set_digest,
+    validate_fenced_transition_v2_batch, validate_fenced_transition_v2_batch_outcomes,
+    SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
     SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusNodeId,
     SessionConsensusRequestId, SessionConsensusResponse, SessionMutationIntent,
     SessionMutationOutcome, SessionTopologyMemberBinding, SESSION_CONSENSUS_SCHEMA_VERSION,
@@ -50,7 +51,8 @@ use crate::fenced_transition::{
     FENCED_TRANSITION_SCHEMA_V1, FENCED_TRANSITION_SCHEMA_V2,
     FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
     FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
-    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES,
+    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS,
+    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES,
     FENCED_TRANSITION_V2_MIN_DURABLE_LOG_ENTRY_BYTES,
     FENCED_TRANSITION_V2_RECEIPT_RESPONSE_CODEC_MAGIC,
     FENCED_TRANSITION_V2_RECEIPT_RESPONSE_CODEC_REVISION,
@@ -4793,7 +4795,7 @@ CREATE TABLE consensus_fenced_transition_v2_history (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     storage_configuration_epoch INTEGER NOT NULL CHECK (storage_configuration_epoch > 0),
     profile_digest BLOB NOT NULL CHECK (length(profile_digest) = 32),
-    active_epoch INTEGER CHECK (active_epoch IS NULL OR active_epoch > 0),
+    active_epoch INTEGER NOT NULL CHECK (active_epoch > 0),
     retired_through_epoch INTEGER NOT NULL CHECK (retired_through_epoch >= 0),
     generation INTEGER NOT NULL CHECK (generation >= 0),
     current_bound_count INTEGER NOT NULL CHECK (
@@ -4808,18 +4810,16 @@ CREATE TABLE consensus_fenced_transition_v2_history (
     ),
     reclaimed_entries INTEGER NOT NULL DEFAULT 0 CHECK (reclaimed_entries >= 0),
     CHECK (
-        (active_epoch IS NOT NULL
-         AND active_epoch > retired_through_epoch
-         AND reclaim_epoch IS NULL
+        (reclaim_epoch IS NULL
          AND reclaim_cursor_ordinal IS NULL
-         AND reclaim_remaining IS NULL)
+         AND reclaim_remaining IS NULL
+         AND active_epoch - retired_through_epoch BETWEEN 1 AND 8)
         OR
-        (active_epoch IS NULL
-         AND reclaim_epoch IS NOT NULL
+        (reclaim_epoch IS NOT NULL
          AND reclaim_epoch = retired_through_epoch
          AND reclaim_cursor_ordinal IS NOT NULL
          AND reclaim_remaining IS NOT NULL
-         AND current_bound_count = 0)
+         AND active_epoch - retired_through_epoch BETWEEN 1 AND 7)
     ),
     FOREIGN KEY(storage_configuration_epoch)
         REFERENCES consensus_identity(configuration_epoch)
@@ -5255,6 +5255,86 @@ type FencedTransitionV2HistorySqlRow = (
 
 type FencedTransitionV2ActivationCertificate = (SessionConsensusIdentity, [u8; 32], [u8; 32]);
 
+/// A closed V2 epoch is an immutable, complete replay namespace.  The active
+/// epoch alone may be partially filled.  A reclaiming epoch has already had a
+/// contiguous prefix physically removed, so its cursor plus retained suffix
+/// must still describe that same complete namespace.
+fn fenced_transition_v2_closed_epoch_is_exact_with_maximum(
+    epoch: u64,
+    active_epoch: u64,
+    reclaim_epoch: Option<u64>,
+    reclaim_cursor_ordinal: Option<u64>,
+    reclaim_remaining: Option<u64>,
+    retained_rows: usize,
+    maximum_history_entries: u64,
+) -> bool {
+    if epoch == active_epoch {
+        return true;
+    }
+    if reclaim_epoch == Some(epoch) {
+        return reclaim_remaining
+            .zip(reclaim_cursor_ordinal)
+            .is_some_and(|(remaining, cursor)| {
+                u64::try_from(retained_rows).ok() == Some(remaining)
+                    && cursor.checked_add(remaining) == Some(maximum_history_entries)
+            });
+    }
+    u64::try_from(retained_rows).ok() == Some(maximum_history_entries)
+}
+
+pub(crate) fn fenced_transition_v2_closed_epoch_is_exact(
+    epoch: u64,
+    active_epoch: u64,
+    reclaim_epoch: Option<u64>,
+    reclaim_cursor_ordinal: Option<u64>,
+    reclaim_remaining: Option<u64>,
+    retained_rows: usize,
+) -> bool {
+    fenced_transition_v2_closed_epoch_is_exact_with_maximum(
+        epoch,
+        active_epoch,
+        reclaim_epoch,
+        reclaim_cursor_ordinal,
+        reclaim_remaining,
+        retained_rows,
+        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64,
+    )
+}
+
+fn fenced_transition_v2_epoch_has_exact_ordinal_range_sync(
+    conn: &Connection,
+    epoch: u64,
+    first_ordinal: u64,
+    count: u64,
+) -> io::Result<bool> {
+    let (observed_count, first, last): (i64, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT COUNT(*), MIN(ordinal), MAX(ordinal) FROM consensus_fenced_transition_v2_receipts WHERE history_epoch = ?1",
+            [checked_positive_i64(epoch)?],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(db_error)?;
+    let last_ordinal = first_ordinal
+        .checked_add(count)
+        .and_then(|exclusive| exclusive.checked_sub(1))
+        .ok_or_else(|| invalid_data("fenced transition V2 ordinal range is invalid"))?;
+    Ok(checked_u64(observed_count)? == count
+        && first.map(checked_positive_u64).transpose()? == Some(first_ordinal)
+        && last.map(checked_positive_u64).transpose()? == Some(last_ordinal))
+}
+
+fn fenced_transition_v2_epoch_has_complete_ordinals_sync(
+    conn: &Connection,
+    epoch: u64,
+) -> io::Result<bool> {
+    fenced_transition_v2_epoch_has_exact_ordinal_range_sync(
+        conn,
+        epoch,
+        1,
+        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64,
+    )
+}
+
 fn read_fenced_transition_v2_history_row_in_sync(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
@@ -5336,39 +5416,42 @@ fn read_fenced_transition_v2_history_row_in_sync(
     let reclaim_cursor_ordinal = reclaim_cursor_ordinal.map(checked_u64).transpose()?;
     let reclaim_remaining = reclaim_remaining.map(checked_u64).transpose()?;
     let reclaimed_entries = checked_u64(reclaimed_entries)?;
-    let reclaimed_state_is_valid = match (
-        active_epoch,
-        reclaim_epoch,
-        reclaim_cursor_ordinal,
-        reclaim_remaining,
-    ) {
-        (Some(active), None, None, None) => {
-            // Activation starts only at epoch one.  Every later live epoch is
-            // the immediate successor of the durable retirement floor; a
-            // larger value would silently skip a permanently closed namespace.
-            (retired_through == 0 && active.get() == FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
-                || (retired_through != 0
-                    && retired_through
-                        .checked_add(1)
-                        .is_some_and(|expected| active.get() == expected))
-        }
-        (None, Some(epoch), Some(cursor), Some(remaining)) => {
-            let maximum = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64;
-            // A reclaim phase always owns at least one physical row.  The
-            // cursor is the last deleted ordinal, so cursor + remaining is
-            // the original active bound count and cannot exceed the fixed
-            // capacity.  Receipt-order validation below separately proves
-            // that the surviving ordinals begin at cursor + 1.
-            epoch == retired_through
-                && retired_through != 0
-                && current_bound_count == 0
-                && (1..=maximum).contains(&remaining)
-                && cursor
-                    .checked_add(remaining)
-                    .is_some_and(|original_count| original_count <= maximum)
-        }
-        _ => false,
-    };
+    let reclaimed_state_is_valid =
+        match (
+            active_epoch,
+            reclaim_epoch,
+            reclaim_cursor_ordinal,
+            reclaim_remaining,
+        ) {
+            // The active namespace is never withdrawn.  Closed namespaces are a
+            // contiguous bounded suffix above the irreversible floor; every one
+            // remains exactly replayable until it becomes that floor.
+            (Some(active), None, None, None) => active
+                .get()
+                .checked_sub(retired_through)
+                .is_some_and(|retained| {
+                    (1..=u64::try_from(FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS + 1)
+                        .unwrap_or(u64::MAX))
+                        .contains(&retained)
+                }),
+            // Physical reclaim owns the newly advanced floor.  It may coexist
+            // with up to seven newer exact epochs and the writable successor.
+            (Some(active), Some(epoch), Some(cursor), Some(remaining)) => {
+                let maximum = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64;
+                epoch == retired_through
+                    && active
+                        .get()
+                        .checked_sub(retired_through)
+                        .is_some_and(|retained| {
+                            (1..=u64::try_from(FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS)
+                                .unwrap_or(u64::MAX))
+                                .contains(&retained)
+                        })
+                    && (1..=maximum).contains(&remaining)
+                    && cursor.checked_add(remaining) == Some(maximum)
+            }
+            _ => false,
+        };
     if !reclaimed_state_is_valid {
         return Err(invalid_data(
             "fenced transition V2 history lifecycle is invalid",
@@ -6128,7 +6211,7 @@ const FENCED_TRANSITION_V2_HISTORY_TABLE_SCHEMA_SQL: &str = r#"
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             storage_configuration_epoch INTEGER NOT NULL CHECK (storage_configuration_epoch > 0),
             profile_digest BLOB NOT NULL CHECK (length(profile_digest) = 32),
-            active_epoch INTEGER CHECK (active_epoch IS NULL OR active_epoch > 0),
+            active_epoch INTEGER NOT NULL CHECK (active_epoch > 0),
             retired_through_epoch INTEGER NOT NULL CHECK (retired_through_epoch >= 0),
             generation INTEGER NOT NULL CHECK (generation >= 0),
             current_bound_count INTEGER NOT NULL CHECK (
@@ -6143,18 +6226,16 @@ const FENCED_TRANSITION_V2_HISTORY_TABLE_SCHEMA_SQL: &str = r#"
             ),
             reclaimed_entries INTEGER NOT NULL DEFAULT 0 CHECK (reclaimed_entries >= 0),
             CHECK (
-                (active_epoch IS NOT NULL
-                 AND active_epoch > retired_through_epoch
-                 AND reclaim_epoch IS NULL
+                (reclaim_epoch IS NULL
                  AND reclaim_cursor_ordinal IS NULL
-                 AND reclaim_remaining IS NULL)
+                 AND reclaim_remaining IS NULL
+                 AND active_epoch - retired_through_epoch BETWEEN 1 AND 8)
                 OR
-                (active_epoch IS NULL
-                 AND reclaim_epoch IS NOT NULL
+                (reclaim_epoch IS NOT NULL
                  AND reclaim_epoch = retired_through_epoch
                  AND reclaim_cursor_ordinal IS NOT NULL
                  AND reclaim_remaining IS NOT NULL
-                 AND current_bound_count = 0)
+                 AND active_epoch - retired_through_epoch BETWEEN 1 AND 7)
             ),
             FOREIGN KEY(storage_configuration_epoch)
                 REFERENCES consensus_identity(configuration_epoch)
@@ -6996,6 +7077,58 @@ pub(crate) fn validate_command_for_log(
             }
         }
     }
+    if let Some(requests) = fenced_transition_v2_batch(semantic_intent) {
+        if !fenced_transition_v2_payload_cap_matches_local_storage() {
+            return Err(invalid_data(
+                "session fenced transition V2 payload profile is incompatible with local storage",
+            ));
+        }
+        validate_fenced_transition_v2_batch(requests)
+            .map_err(|_| invalid_data("session fenced transition V2 batch is invalid"))?;
+        let outer = fenced_transition_v2_batch_outer_request_id(requests)
+            .map_err(|_| invalid_data("session fenced transition V2 batch identity is invalid"))?;
+        if command.request_id != SessionConsensusRequestId::from_bytes(outer) {
+            return Err(invalid_data(
+                "session fenced transition V2 batch request identity mismatch",
+            ));
+        }
+        if !fenced_transition_v2_timestamp_is_in_range(command.logical_time) {
+            return Err(invalid_data(
+                "session fenced transition V2 batch logical time is outside the profiled range",
+            ));
+        }
+        for request in requests {
+            // A substituted self-authenticated body is a committed conflict
+            // and must not be reclassified as a malformed record envelope
+            // before receipt lookup.
+            if matches!(
+                request.validate(),
+                Err(StoreError::FencedTransitionRequestConflict)
+            ) {
+                continue;
+            }
+            if let Some(record) = request.mutation().record() {
+                match validate_fenced_transition_v2_record(record) {
+                    Ok(()) => {}
+                    Err(StoreError::PayloadTooLarge { .. }) => {
+                        return Err(invalid_data(
+                            "session consensus record payload exceeds the consensus limit",
+                        ));
+                    }
+                    Err(StoreError::Crypto(_))
+                        if record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 =>
+                    {
+                        return Err(invalid_data(
+                            "session consensus requires a sealed record payload",
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(invalid_data("session consensus record envelope is invalid"));
+                    }
+                }
+            }
+        }
+    }
     if let Some((scope_identity, voters, profile)) =
         fenced_transition_v2_activation(semantic_intent)
     {
@@ -7045,7 +7178,7 @@ struct MembershipLogProjection {
     projected_v2_bound_requests: BTreeSet<[u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES]>,
     projected_v2_history: Option<FencedTransitionV2HistoryRow>,
     projected_v2_scope_activated: bool,
-    projected_v2_max_retained_until: Option<Timestamp>,
+    projected_v2_max_retained_until: BTreeMap<u64, Timestamp>,
     // Projection must model the durable signed sequence horizon for V2
     // commands.  In particular, a maintenance entry following another V2
     // command in the same append batch must observe the sequence that apply
@@ -7114,7 +7247,7 @@ impl MembershipLogProjection {
             projected_v2_bound_requests: BTreeSet::new(),
             projected_v2_history,
             projected_v2_scope_activated,
-            projected_v2_max_retained_until: None,
+            projected_v2_max_retained_until: BTreeMap::new(),
             projected_application_sequence: application_sequence,
             projected_logical_time: logical_time,
         })
@@ -7317,10 +7450,91 @@ impl MembershipLogProjection {
             .checked_add(1)
             .ok_or_else(|| invalid_data("projected fenced transition V2 count exhausted"))?;
         self.advance_projected_v2_application_sequence()?;
-        self.projected_v2_max_retained_until = Some(
-            self.projected_v2_max_retained_until
-                .map_or(retained_until, |current| current.max(retained_until)),
-        );
+        self.projected_v2_max_retained_until
+            .entry(epoch)
+            .and_modify(|current| *current = (*current).max(retained_until))
+            .or_insert(retained_until);
+        Ok(())
+    }
+
+    fn project_fenced_transition_v2_batch(
+        &mut self,
+        conn: &Connection,
+        command: &SessionConsensusCommand,
+        storage_identity: SessionConsensusIdentity,
+    ) -> io::Result<()> {
+        let requests = fenced_transition_v2_batch(&command.intent)
+            .ok_or_else(|| invalid_data("projected fenced transition V2 batch is missing"))?;
+        validate_fenced_transition_v2_batch(requests)
+            .map_err(|_| invalid_data("projected fenced transition V2 batch is invalid"))?;
+        if !fenced_transition_v2_timestamp_is_in_range(command.logical_time) {
+            return Err(invalid_data(
+                "projected fenced transition V2 batch logical time is outside the profiled range",
+            ));
+        }
+        let access_is_authorized = fenced_transition_access_is_authorized_sync(
+            &self.scope,
+            storage_identity,
+            &command.intent,
+        )?;
+        if !access_is_authorized {
+            self.advance_projected_logical_time(command.logical_time);
+            return Ok(());
+        }
+        let Some(history) = self.projected_v2_history else {
+            return Err(invalid_data(
+                "projected fenced transition V2 batch lacks an activated history",
+            ));
+        };
+        if !self.projected_v2_scope_activated {
+            return Err(invalid_data(
+                "projected fenced transition V2 batch lacks an exact activation certificate",
+            ));
+        }
+        if history.active_epoch != Some(requests[0].request_id().epoch()) {
+            self.advance_projected_logical_time(command.logical_time);
+            return Ok(());
+        }
+        let available = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+            .checked_sub(history.current_bound_count)
+            .ok_or_else(|| invalid_data("projected fenced transition V2 count is invalid"))?;
+        let before_sequence = self.projected_application_sequence;
+        let mut admitted_fresh = 0usize;
+        for request in requests {
+            let is_fresh = matches!(request.validate(), Ok(()))
+                && history.active_epoch == Some(request.request_id().epoch())
+                && request.request_id().epoch().get() > history.retired_through
+                && !self
+                    .projected_v2_bound_requests
+                    .contains(&request.request_id().to_bytes())
+                && (fenced_transition_v2_ledger_layout_sync(conn)?
+                    == FencedTransitionV2LedgerLayout::Activated
+                    && read_fenced_transition_v2_receipt_sync(conn, storage_identity, request)?
+                        .is_none());
+            if is_fresh {
+                if admitted_fresh >= available {
+                    continue;
+                }
+                admitted_fresh += 1;
+            }
+            let intent = fenced_transition_v2_singleton_intent(&command.intent, request)?;
+            let singleton = SessionConsensusCommand {
+                schema_version: command.schema_version,
+                identity: command.identity,
+                request_id: SessionConsensusRequestId::from_bytes(
+                    fenced_transition_v2_outer_request_id(request.request_id()),
+                ),
+                logical_time: command.logical_time,
+                intent,
+            };
+            self.project_fenced_transition_v2(conn, &singleton, storage_identity)?;
+        }
+        if self.projected_application_sequence > before_sequence {
+            self.projected_application_sequence =
+                before_sequence.checked_add(1).ok_or_else(|| {
+                    invalid_data("projected session consensus application sequence exhausted")
+                })?;
+        }
         Ok(())
     }
 
@@ -7387,33 +7601,73 @@ impl MembershipLogProjection {
         {
             return Ok(());
         }
-        let candidate_reclaim_count = match history.active_epoch {
-            Some(_) => u64::try_from(history.current_bound_count)
-                .map_err(|_| invalid_data("projected fenced transition V2 count is invalid"))?,
-            None => history.reclaim_remaining.ok_or_else(|| {
-                invalid_data("projected fenced transition V2 reclaim count is invalid")
-            })?,
-        };
-        let deleted_in_batch = candidate_reclaim_count.min(
-            u64::try_from(FENCED_TRANSITION_V2_RECLAIM_BATCH)
-                .map_err(|_| invalid_data("projected fenced transition V2 batch is invalid"))?,
-        );
-        if history.reclaimed_entries > (i64::MAX as u64).saturating_sub(deleted_in_batch) {
-            return Ok(());
-        }
         let next_generation = history.generation.checked_add(1).ok_or_else(|| {
             invalid_data("projected fenced transition V2 generation is exhausted")
         })?;
-        let (reclaim_epoch, cursor, remaining) = match history.active_epoch {
-            Some(active) => {
-                if history.current_bound_count == 0 {
+        let active = history.active_epoch.ok_or_else(|| {
+            invalid_data("projected fenced transition V2 active epoch is invalid")
+        })?;
+        if history.reclaim_epoch.is_none() {
+            let retained_epochs = active
+                .get()
+                .checked_sub(history.retired_through)
+                .ok_or_else(|| {
+                    invalid_data("projected fenced transition V2 lifecycle is invalid")
+                })?;
+            let maximum_retained_epochs = u64::try_from(FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS + 1)
+                .map_err(|_| {
+                    invalid_data("projected fenced transition V2 retained epoch bound is invalid")
+                })?;
+            if retained_epochs < maximum_retained_epochs {
+                if history.current_bound_count < FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
                     self.advance_projected_v2_application_sequence()?;
                     return Ok(());
                 }
+                history.active_epoch = Some(
+                    FencedTransitionV2HistoryEpoch::new(active.get().checked_add(1).ok_or_else(
+                        || invalid_data("projected fenced transition V2 epoch is exhausted"),
+                    )?)
+                    .map_err(|_| invalid_data("projected fenced transition V2 epoch is invalid"))?,
+                );
+                history.generation = next_generation;
+                history.current_bound_count = 0;
+                self.projected_v2_history = Some(history);
+                self.advance_projected_v2_application_sequence()?;
+                return Ok(());
+            }
+        }
+        let (reclaim_epoch, cursor, remaining, advancing_floor) = match history.reclaim_epoch {
+            Some(epoch) => {
+                let cursor = history.reclaim_cursor_ordinal.ok_or_else(|| {
+                    invalid_data("projected fenced transition V2 reclaim cursor is invalid")
+                })?;
+                let remaining = history.reclaim_remaining.ok_or_else(|| {
+                    invalid_data("projected fenced transition V2 reclaim count is invalid")
+                })?;
+                if !fenced_transition_v2_closed_epoch_is_exact(
+                    epoch,
+                    active.get(),
+                    Some(epoch),
+                    Some(cursor),
+                    Some(remaining),
+                    usize::try_from(remaining).map_err(|_| {
+                        invalid_data("projected fenced transition V2 reclaim count is invalid")
+                    })?,
+                ) {
+                    return Err(invalid_data(
+                        "projected fenced transition V2 reclaim lifecycle is invalid",
+                    ));
+                }
+                (epoch, cursor, remaining, false)
+            }
+            None => {
+                let oldest = history.retired_through.checked_add(1).ok_or_else(|| {
+                    invalid_data("projected fenced transition V2 epoch is exhausted")
+                })?;
                 let durable_maximum: Option<String> = conn
                     .query_row(
                         "SELECT retained_until FROM consensus_fenced_transition_v2_receipts WHERE history_epoch = ?1 ORDER BY ordinal DESC LIMIT 1",
-                        [checked_positive_i64(active.get())?],
+                        [checked_positive_i64(oldest)?],
                         |row| row.get(0),
                     )
                     .optional()
@@ -7427,35 +7681,27 @@ impl MembershipLogProjection {
                     .transpose()?;
                 if durable_maximum
                     .into_iter()
-                    .chain(self.projected_v2_max_retained_until)
+                    .chain(self.projected_v2_max_retained_until.get(&oldest).copied())
                     .any(|maximum| maximum > logical_time)
                 {
                     self.advance_projected_v2_application_sequence()?;
                     return Ok(());
                 }
-                let remaining = u64::try_from(history.current_bound_count)
-                    .map_err(|_| invalid_data("projected fenced transition V2 count is invalid"))?;
-                history.active_epoch = None;
-                history.retired_through = active.get();
-                history.generation = next_generation;
-                history.current_bound_count = 0;
-                history.reclaim_epoch = Some(active.get());
-                history.reclaim_cursor_ordinal = Some(0);
-                history.reclaim_remaining = Some(remaining);
-                (active.get(), 0, remaining)
+                (
+                    oldest,
+                    0,
+                    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64,
+                    true,
+                )
             }
-            None => (
-                history.reclaim_epoch.ok_or_else(|| {
-                    invalid_data("projected fenced transition V2 reclaim epoch is invalid")
-                })?,
-                history.reclaim_cursor_ordinal.ok_or_else(|| {
-                    invalid_data("projected fenced transition V2 reclaim cursor is invalid")
-                })?,
-                history.reclaim_remaining.ok_or_else(|| {
-                    invalid_data("projected fenced transition V2 reclaim count is invalid")
-                })?,
-            ),
         };
+        let deleted_in_batch = remaining.min(
+            u64::try_from(FENCED_TRANSITION_V2_RECLAIM_BATCH)
+                .map_err(|_| invalid_data("projected fenced transition V2 batch is invalid"))?,
+        );
+        if history.reclaimed_entries > (i64::MAX as u64).saturating_sub(deleted_in_batch) {
+            return Ok(());
+        }
         let deleted = remaining.min(
             u64::try_from(FENCED_TRANSITION_V2_RECLAIM_BATCH)
                 .map_err(|_| invalid_data("projected fenced transition V2 batch is invalid"))?,
@@ -7474,21 +7720,22 @@ impl MembershipLogProjection {
                     invalid_data("projected fenced transition V2 reclaimed count exhausted")
                 })?;
         if new_remaining == 0 {
-            history.active_epoch = Some(
-                FencedTransitionV2HistoryEpoch::new(reclaim_epoch.checked_add(1).ok_or_else(
-                    || invalid_data("projected fenced transition V2 epoch is exhausted"),
-                )?)
-                .map_err(|_| invalid_data("projected fenced transition V2 epoch is invalid"))?,
-            );
             history.generation = next_generation;
             history.reclaim_epoch = None;
             history.reclaim_cursor_ordinal = None;
             history.reclaim_remaining = None;
-            self.projected_v2_max_retained_until = None;
+            self.projected_v2_max_retained_until.remove(&reclaim_epoch);
         } else {
             history.generation = next_generation;
+            if advancing_floor {
+                history.retired_through = reclaim_epoch;
+                history.reclaim_epoch = Some(reclaim_epoch);
+            }
             history.reclaim_cursor_ordinal = Some(next_cursor);
             history.reclaim_remaining = Some(new_remaining);
+        }
+        if advancing_floor {
+            history.retired_through = reclaim_epoch;
         }
         self.projected_v2_history = Some(history);
         self.advance_projected_v2_application_sequence()?;
@@ -7570,6 +7817,13 @@ impl MembershipLogProjection {
                 }
                 if fenced_transition_v2_request(&command.intent).is_some() {
                     return self.project_fenced_transition_v2(conn, command, storage_identity);
+                }
+                if fenced_transition_v2_batch(&command.intent).is_some() {
+                    return self.project_fenced_transition_v2_batch(
+                        conn,
+                        command,
+                        storage_identity,
+                    );
                 }
                 let request_id = *command.request_id.as_bytes();
                 let is_fenced_transition = fenced_transition_request(&command.intent).is_some();
@@ -7998,6 +8252,7 @@ impl MembershipLogProjection {
             | SessionMutationIntent::FencedTransition(_)
             | SessionMutationIntent::ActivateFencedTransition { .. }
             | SessionMutationIntent::FencedTransitionV2(_)
+            | SessionMutationIntent::FencedTransitionV2Batch(_)
             | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
             | SessionMutationIntent::MaintainFencedTransitionV2History { .. }
             | SessionMutationIntent::CompareAndSet(_)
@@ -9169,6 +9424,23 @@ fn fenced_transition_v2_request(
     }
 }
 
+/// Return the ordered V2 requests carried by a batch intent. A batch is
+/// deliberately not treated as a singleton at any layer: each item retains
+/// its own receipt identity, deterministic result, and ordered capacity
+/// decision even though all items share one physical consensus position.
+fn fenced_transition_v2_batch(
+    intent: &SessionMutationIntent,
+) -> Option<&[FencedTransitionV2Request]> {
+    match intent {
+        SessionMutationIntent::FencedTransitionV2Batch(requests) => Some(requests),
+        SessionMutationIntent::Authorized { mutation, .. } => match mutation.as_ref() {
+            SessionMutationIntent::FencedTransitionV2Batch(requests) => Some(requests),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn fenced_transition_activation(
     intent: &SessionMutationIntent,
 ) -> Option<(SessionConsensusIdentity, [u8; 32])> {
@@ -10011,7 +10283,7 @@ fn store_fenced_transition_v2_receipt_sync(
     let history_epoch = request.request_id().epoch().get();
     let changed = conn
         .execute(
-            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = current_bound_count + 1 WHERE singleton = 1 AND active_epoch = ?1 AND current_bound_count = ?2 AND reclaim_epoch IS NULL",
+            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = current_bound_count + 1 WHERE singleton = 1 AND active_epoch = ?1 AND current_bound_count = ?2",
             params![checked_positive_i64(history_epoch)?, checked_i64(ordinal.checked_sub(1).ok_or_else(|| invalid_data("fenced transition V2 ordinal is invalid"))?)?],
         )
         .map_err(db_error)?;
@@ -10108,75 +10380,118 @@ fn maintain_fenced_transition_v2_history_sync(
         .generation
         .checked_add(1)
         .ok_or_else(|| invalid_data("fenced transition V2 generation is exhausted"))?;
-    let (reclaim_epoch, cursor, remaining) = match history.active_epoch {
-        Some(active) => {
-            if history.current_bound_count == 0 {
-                // Do not enter a zero-length reclaim state: it is not a
-                // useful retirement boundary and would make an empty epoch
-                // appear permanently retired without ever carrying a V2
-                // binding.  This is a deterministic operator no-op.
+    let active = history
+        .active_epoch
+        .ok_or_else(|| invalid_data("fenced transition V2 active epoch is invalid"))?;
+    // A full writable epoch opens its immediate successor without waiting for
+    // the result window.  The old epoch remains in the contiguous exact
+    // replay range above `retired_through`; only the eighth retained epoch
+    // blocks another rotation.
+    if history.reclaim_epoch.is_none() {
+        let retained_epochs = active
+            .get()
+            .checked_sub(history.retired_through)
+            .ok_or_else(|| invalid_data("fenced transition V2 lifecycle is invalid"))?;
+        let maximum_retained_epochs = u64::try_from(FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS + 1)
+            .map_err(|_| invalid_data("fenced transition V2 retained epoch bound is invalid"))?;
+        if retained_epochs < maximum_retained_epochs {
+            if history.current_bound_count < FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
                 return Ok(FencedTransitionV2MaintenanceResult::Noop);
             }
-            let batch = u64::try_from(FENCED_TRANSITION_V2_RECLAIM_BATCH)
-                .map_err(|_| invalid_data("fenced transition V2 reclaim batch is invalid"))?;
-            if history.reclaimed_entries
-                > (i64::MAX as u64).saturating_sub(
-                    u64::try_from(history.current_bound_count)
-                        .map_err(|_| {
-                            invalid_data("fenced transition V2 maintenance count is invalid")
-                        })?
-                        .min(batch),
-                )
-            {
-                return Ok(FencedTransitionV2MaintenanceResult::Exhausted);
-            }
-            // Rotation starts only after the complete active epoch's exact
-            // result window has elapsed at committed logical time.  The
-            // bounded point read uses the reclaim index, never a row scan.
-            let maximum_retained_until: Option<String> = conn
-                .query_row(
-                    "SELECT retained_until FROM consensus_fenced_transition_v2_receipts WHERE history_epoch = ?1 ORDER BY ordinal DESC LIMIT 1",
-                    [checked_positive_i64(active.get())?],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(db_error)?;
-            if let Some(maximum) = maximum_retained_until {
-                let maximum = Timestamp::from_str(&maximum)
-                    .map_err(|_| invalid_data("fenced transition V2 retention is invalid"))?;
-                if maximum > effective_logical_time {
-                    return Ok(FencedTransitionV2MaintenanceResult::Noop);
-                }
-            }
+            let successor = active
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("fenced transition V2 epoch is exhausted"))?;
             let changed = conn
                 .execute(
-                    "UPDATE consensus_fenced_transition_v2_history SET active_epoch = NULL, retired_through_epoch = ?1, generation = ?2, current_bound_count = 0, reclaim_epoch = ?1, reclaim_cursor_ordinal = 0, reclaim_remaining = ?3 WHERE singleton = 1 AND active_epoch = ?1 AND generation = ?4 AND retired_through_epoch = ?5 AND current_bound_count = ?6",
+                    "UPDATE consensus_fenced_transition_v2_history SET active_epoch = ?1, generation = ?2, current_bound_count = 0 WHERE singleton = 1 AND active_epoch = ?3 AND reclaim_epoch IS NULL AND generation = ?4 AND retired_through_epoch = ?5 AND current_bound_count = ?6",
                     params![
-                        checked_positive_i64(active.get())?,
+                        checked_positive_i64(successor)?,
                         checked_i64(next_generation)?,
-                        checked_i64(history.current_bound_count as u64)?,
+                        checked_positive_i64(active.get())?,
                         checked_i64(expected_generation)?,
                         checked_i64(expected_retired_through)?,
                         checked_i64(expected_bound_entries)?,
                     ],
                 )
                 .map_err(db_error)?;
-            if changed != 1 {
-                return Ok(FencedTransitionV2MaintenanceResult::Rejected);
-            }
-            (active.get(), 0, history.current_bound_count as u64)
+            return Ok(if changed == 1 {
+                FencedTransitionV2MaintenanceResult::Applied
+            } else {
+                FencedTransitionV2MaintenanceResult::Rejected
+            });
         }
-        None => (
-            history
-                .reclaim_epoch
-                .ok_or_else(|| invalid_data("fenced transition V2 reclaim epoch is invalid"))?,
-            history
+    }
+
+    // At the retained-epoch bound, only the oldest exact epoch can advance
+    // the irreversible floor.  Its last receipt deadline gates the command;
+    // the floor update and first ordered physical batch share this one
+    // transaction/consensus linearization.
+    let (reclaim_epoch, cursor, remaining, advancing_floor) = match history.reclaim_epoch {
+        Some(epoch) => {
+            let cursor = history
                 .reclaim_cursor_ordinal
-                .ok_or_else(|| invalid_data("fenced transition V2 reclaim cursor is invalid"))?,
-            history
+                .ok_or_else(|| invalid_data("fenced transition V2 reclaim cursor is invalid"))?;
+            let remaining = history
                 .reclaim_remaining
-                .ok_or_else(|| invalid_data("fenced transition V2 reclaim count is invalid"))?,
-        ),
+                .ok_or_else(|| invalid_data("fenced transition V2 reclaim count is invalid"))?;
+            if !fenced_transition_v2_epoch_has_exact_ordinal_range_sync(
+                conn,
+                epoch,
+                cursor.checked_add(1).ok_or_else(|| {
+                    invalid_data("fenced transition V2 reclaim cursor is invalid")
+                })?,
+                remaining,
+            )? {
+                return Err(invalid_data(
+                    "fenced transition V2 reclaim ordinal range is invalid",
+                ));
+            }
+            (epoch, cursor, remaining, false)
+        }
+        None => {
+            let oldest = history
+                .retired_through
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("fenced transition V2 epoch is exhausted"))?;
+            if !fenced_transition_v2_epoch_has_complete_ordinals_sync(conn, oldest)? {
+                return Err(invalid_data(
+                    "fenced transition V2 retiring epoch is incomplete",
+                ));
+            }
+            let maximum_retained_until: Option<String> = conn
+                .query_row(
+                    "SELECT retained_until FROM consensus_fenced_transition_v2_receipts WHERE history_epoch = ?1 ORDER BY ordinal DESC LIMIT 1",
+                    [checked_positive_i64(oldest)?],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_error)?;
+            let Some(maximum_retained_until) = maximum_retained_until else {
+                return Err(invalid_data(
+                    "fenced transition V2 retained epoch is missing",
+                ));
+            };
+            let maximum_retained_until = Timestamp::from_str(&maximum_retained_until)
+                .map_err(|_| invalid_data("fenced transition V2 retention is invalid"))?;
+            if maximum_retained_until > effective_logical_time {
+                return Ok(FencedTransitionV2MaintenanceResult::Noop);
+            }
+            let remaining: u64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM consensus_fenced_transition_v2_receipts WHERE history_epoch = ?1",
+                    [checked_positive_i64(oldest)?],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(db_error)
+                .and_then(checked_u64)?;
+            if remaining != FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64 {
+                return Err(invalid_data(
+                    "fenced transition V2 reclaim count is invalid",
+                ));
+            }
+            (oldest, 0, remaining, true)
+        }
     };
     if history.reclaimed_entries
         > (i64::MAX as u64).saturating_sub(
@@ -10250,19 +10565,21 @@ fn maintain_fenced_transition_v2_history_sync(
         .checked_add(deleted.1)
         .ok_or_else(|| invalid_data("fenced transition V2 reclaimed count is exhausted"))?;
     if new_remaining == 0 {
-        let next_active = reclaim_epoch
-            .checked_add(1)
-            .ok_or_else(|| invalid_data("fenced transition V2 epoch is exhausted"))?;
         let changed = conn
             .execute(
-                "UPDATE consensus_fenced_transition_v2_history SET active_epoch = ?1, generation = ?2, reclaim_epoch = NULL, reclaim_cursor_ordinal = NULL, reclaim_remaining = NULL, reclaimed_entries = ?3 WHERE singleton = 1 AND active_epoch IS NULL AND reclaim_epoch = ?4 AND reclaim_cursor_ordinal = ?5 AND reclaim_remaining = ?6",
+                "UPDATE consensus_fenced_transition_v2_history SET retired_through_epoch = CASE WHEN ?1 THEN ?2 ELSE retired_through_epoch END, generation = ?3, reclaim_epoch = NULL, reclaim_cursor_ordinal = NULL, reclaim_remaining = NULL, reclaimed_entries = ?4 WHERE singleton = 1 AND active_epoch = ?5 AND reclaim_epoch IS ?6 AND reclaim_cursor_ordinal IS ?7 AND reclaim_remaining IS ?8 AND generation = ?9 AND retired_through_epoch = ?10 AND current_bound_count = ?11",
                 params![
-                    checked_positive_i64(next_active)?,
+                    advancing_floor,
+                    checked_positive_i64(reclaim_epoch)?,
                     checked_i64(next_generation)?,
                     checked_i64(reclaimed_entries)?,
-                    checked_positive_i64(reclaim_epoch)?,
-                    checked_i64(cursor)?,
-                    checked_i64(remaining)?,
+                    checked_positive_i64(active.get())?,
+                    history.reclaim_epoch.map(checked_positive_i64).transpose()?,
+                    history.reclaim_cursor_ordinal.map(checked_i64).transpose()?,
+                    history.reclaim_remaining.map(checked_i64).transpose()?,
+                    checked_i64(expected_generation)?,
+                    checked_i64(expected_retired_through)?,
+                    checked_i64(expected_bound_entries)?,
                 ],
             )
             .map_err(db_error)?;
@@ -10274,15 +10591,21 @@ fn maintain_fenced_transition_v2_history_sync(
     } else {
         let changed = conn
             .execute(
-                "UPDATE consensus_fenced_transition_v2_history SET generation = ?1, reclaim_cursor_ordinal = ?2, reclaim_remaining = ?3, reclaimed_entries = ?4 WHERE singleton = 1 AND active_epoch IS NULL AND reclaim_epoch = ?5 AND reclaim_cursor_ordinal = ?6 AND reclaim_remaining = ?7",
+                "UPDATE consensus_fenced_transition_v2_history SET retired_through_epoch = CASE WHEN ?1 THEN ?2 ELSE retired_through_epoch END, generation = ?3, reclaim_epoch = ?2, reclaim_cursor_ordinal = ?4, reclaim_remaining = ?5, reclaimed_entries = ?6 WHERE singleton = 1 AND active_epoch = ?7 AND reclaim_epoch IS ?8 AND reclaim_cursor_ordinal IS ?9 AND reclaim_remaining IS ?10 AND generation = ?11 AND retired_through_epoch = ?12 AND current_bound_count = ?13",
                 params![
+                    advancing_floor,
+                    checked_positive_i64(reclaim_epoch)?,
                     checked_i64(next_generation)?,
                     checked_i64(deleted.0)?,
                     checked_i64(new_remaining)?,
                     checked_i64(reclaimed_entries)?,
-                    checked_positive_i64(reclaim_epoch)?,
-                    checked_i64(cursor)?,
-                    checked_i64(remaining)?,
+                    checked_positive_i64(active.get())?,
+                    history.reclaim_epoch.map(checked_positive_i64).transpose()?,
+                    history.reclaim_cursor_ordinal.map(checked_i64).transpose()?,
+                    history.reclaim_remaining.map(checked_i64).transpose()?,
+                    checked_i64(expected_generation)?,
+                    checked_i64(expected_retired_through)?,
+                    checked_i64(expected_bound_entries)?,
                 ],
             )
             .map_err(db_error)?;
@@ -10836,7 +11159,7 @@ pub(crate) fn validate_fenced_transition_v2_receipts_sync(
         "main.consensus_fenced_transition_v2_receipts"
     };
     let maximum = i64::try_from(
-        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+        FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES
             .checked_add(1)
             .ok_or_else(|| invalid_data("fenced transition V2 bound is invalid"))?,
     )
@@ -10850,30 +11173,23 @@ pub(crate) fn validate_fenced_transition_v2_receipts_sync(
         .map_err(db_error)?;
     let rows = usize::try_from(rows)
         .map_err(|_| invalid_data("fenced transition V2 receipt count is invalid"))?;
-    if rows > FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
+    if rows > FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES {
         return Err(invalid_data(
             "fenced transition V2 receipt history exceeds bound",
         ));
     }
-    let (expected_epoch, expected_count, expected_cursor) =
-        match history.active_epoch {
-            Some(active) => (active.get(), history.current_bound_count, None),
-            None => (
-                history
-                    .reclaim_epoch
-                    .ok_or_else(|| invalid_data("fenced transition V2 reclaim epoch is invalid"))?,
-                usize::try_from(history.reclaim_remaining.ok_or_else(|| {
-                    invalid_data("fenced transition V2 reclaim count is invalid")
-                })?)
-                .map_err(|_| invalid_data("fenced transition V2 reclaim count is invalid"))?,
-                history.reclaim_cursor_ordinal,
-            ),
-        };
-    if rows != expected_count {
-        return Err(invalid_data(
-            "fenced transition V2 persisted count is invalid",
-        ));
-    }
+    let active = history
+        .active_epoch
+        .ok_or_else(|| invalid_data("fenced transition V2 active epoch is invalid"))?
+        .get();
+    let minimum_epoch = if history.reclaim_epoch.is_some() {
+        history.retired_through
+    } else {
+        history
+            .retired_through
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("persisted fenced transition V2 epoch is exhausted"))?
+    };
     // `consensus_machine` and `consensus_applied` resolve through the
     // attached validation views when validating an incoming snapshot.  Apply
     // the same floor checks as V1 to every V2 row, so a copied response cannot
@@ -10901,7 +11217,8 @@ pub(crate) fn validate_fenced_transition_v2_receipts_sync(
             ))
         })
         .map_err(db_error)?;
-    let mut previous_ordinal = expected_cursor.unwrap_or(0);
+    let mut previous_ordinals = BTreeMap::<u64, u64>::new();
+    let mut epoch_counts = BTreeMap::<u64, usize>::new();
     let mut previous_retained_until = None;
     for receipt in receipts {
         let (
@@ -10921,20 +11238,40 @@ pub(crate) fn validate_fenced_transition_v2_receipts_sync(
             .map_err(|_| invalid_data("persisted fenced transition V2 request ID is invalid"))?;
         let history_epoch = checked_positive_u64(history_epoch)?;
         let ordinal = checked_positive_u64(ordinal)?;
-        if history_epoch != expected_epoch
+        if !(minimum_epoch..=active).contains(&history_epoch)
             || u64::from_be_bytes(request_id[..8].try_into().map_err(|_| {
                 invalid_data("persisted fenced transition V2 request ID is invalid")
             })?) != history_epoch
             || ordinal
-                != previous_ordinal.checked_add(1).ok_or_else(|| {
-                    invalid_data("persisted fenced transition V2 ordinal is exhausted")
-                })?
+                != previous_ordinals
+                    .get(&history_epoch)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        if history.reclaim_epoch == Some(history_epoch) {
+                            history.reclaim_cursor_ordinal.unwrap_or(0)
+                        } else {
+                            0
+                        }
+                    })
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        invalid_data("persisted fenced transition V2 ordinal is exhausted")
+                    })?
         {
             return Err(invalid_data(
                 "persisted fenced transition V2 lifecycle is invalid",
             ));
         }
-        previous_ordinal = ordinal;
+        previous_ordinals.insert(history_epoch, ordinal);
+        let count = epoch_counts.entry(history_epoch).or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("persisted fenced transition V2 count is invalid"))?;
+        if *count > FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
+            return Err(invalid_data(
+                "persisted fenced transition V2 count is invalid",
+            ));
+        }
         let payload_digest: [u8; 32] = payload_digest
             .try_into()
             .map_err(|_| invalid_data("persisted fenced transition V2 digest is invalid"))?;
@@ -11034,6 +11371,24 @@ pub(crate) fn validate_fenced_transition_v2_receipts_sync(
                     "persisted fenced transition V2 response is invalid",
                 ));
             }
+        }
+    }
+    if epoch_counts.get(&active).copied().unwrap_or(0) != history.current_bound_count {
+        return Err(invalid_data("fenced transition V2 active count is invalid"));
+    }
+    for epoch in minimum_epoch..=active {
+        let count = epoch_counts.get(&epoch).copied().unwrap_or(0);
+        if !fenced_transition_v2_closed_epoch_is_exact(
+            epoch,
+            active,
+            history.reclaim_epoch,
+            history.reclaim_cursor_ordinal,
+            history.reclaim_remaining,
+            count,
+        ) {
+            return Err(invalid_data(
+                "fenced transition V2 closed epoch is incomplete",
+            ));
         }
     }
     Ok(())
@@ -11718,6 +12073,338 @@ fn replay_fenced_transition_receipt_sync(
         )));
     }
     Ok(receipt.response)
+}
+
+fn fenced_transition_v2_singleton_intent(
+    intent: &SessionMutationIntent,
+    request: &FencedTransitionV2Request,
+) -> io::Result<SessionMutationIntent> {
+    let singleton = SessionMutationIntent::FencedTransitionV2(Box::new(request.clone()));
+    match intent {
+        SessionMutationIntent::FencedTransitionV2Batch(_) => Ok(singleton),
+        SessionMutationIntent::Authorized {
+            origin,
+            authority_identity,
+            mutation,
+        } if matches!(
+            mutation.as_ref(),
+            SessionMutationIntent::FencedTransitionV2Batch(_)
+        ) =>
+        {
+            Ok(SessionMutationIntent::Authorized {
+                origin: *origin,
+                authority_identity: *authority_identity,
+                mutation: Box::new(singleton),
+            })
+        }
+        _ => Err(invalid_data(
+            "fenced transition V2 batch authority envelope is invalid",
+        )),
+    }
+}
+
+fn fenced_transition_v2_replayed_outcome(
+    receipt: &FencedTransitionV2Receipt,
+    payload_digest: [u8; 32],
+    logical_time: Timestamp,
+) -> io::Result<Result<FencedTransitionOutcome, StoreError>> {
+    if receipt.payload_digest != payload_digest {
+        return Ok(Err(StoreError::FencedTransitionRequestConflict));
+    }
+    if receipt.response.is_none() || receipt.retained_until <= logical_time {
+        return Ok(Err(StoreError::FencedTransitionRequestExpired));
+    }
+    match receipt
+        .response
+        .as_ref()
+        .expect("checked above")
+        .result
+        .clone()
+    {
+        Ok(SessionMutationOutcome::FencedTransition(outcome)) => Ok(Ok(outcome)),
+        Err(error) => Ok(Err(error)),
+        _ => Err(invalid_data(
+            "persisted fenced transition V2 receipt result is invalid",
+        )),
+    }
+}
+
+/// Apply one ordered V2 batch under the already-open outer SQLite
+/// transaction. Fresh identities consume the remaining receipt capacity in
+/// slot order; deterministic item failures bind and return in slot order,
+/// while any infrastructure failure aborts this entire outer apply.
+#[allow(clippy::too_many_arguments)]
+fn apply_fenced_transition_v2_batch_command_sync(
+    tx: &mut Transaction<'_>,
+    storage_identity: SessionConsensusIdentity,
+    scope: &MembershipValidationScope,
+    caps: &BackendCapabilities,
+    command: &SessionConsensusCommand,
+    raft_log_index: u64,
+    machine: &mut (u64, SessionConsensusEntryDigest, Option<Timestamp>, u64),
+    notifications: &mut Vec<ReplicationEntry>,
+) -> io::Result<SessionConsensusResponse> {
+    let requests = fenced_transition_v2_batch(&command.intent)
+        .ok_or_else(|| invalid_data("fenced transition V2 batch is missing"))?;
+    validate_fenced_transition_v2_batch(requests)
+        .map_err(|_| invalid_data("fenced transition V2 batch is invalid"))?;
+    if !fenced_transition_v2_timestamp_is_in_range(command.logical_time) {
+        return Err(invalid_data(
+            "fenced transition V2 batch logical time is outside the profiled range",
+        ));
+    }
+    let logical_time = machine
+        .2
+        .map_or(command.logical_time, |time| time.max(command.logical_time));
+    let access_is_authorized =
+        fenced_transition_access_is_authorized_sync(scope, storage_identity, &command.intent)?;
+    if !access_is_authorized {
+        let outcomes = requests
+            .iter()
+            .map(|request| match request.validate() {
+                Err(StoreError::FencedTransitionRequestConflict) => {
+                    Err(StoreError::FencedTransitionRequestConflict)
+                }
+                _ => Err(StoreError::TopologyAuthorityRevoked),
+            })
+            .collect::<Vec<_>>();
+        validate_fenced_transition_v2_batch_outcomes(&outcomes)
+            .map_err(|_| invalid_data("fenced transition V2 batch outcome is invalid"))?;
+        advance_fenced_replay_logical_time_sync(tx, storage_identity, logical_time, machine)?;
+        return Ok(SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+            sequence: machine.0,
+            digest: Some(machine.1),
+            logical_time: Some(logical_time),
+            raft_log_index,
+        });
+    }
+    if fenced_transition_v2_ledger_layout_sync(tx)? != FencedTransitionV2LedgerLayout::Activated
+        || !fenced_transition_v2_activation_matches_scope_sync(
+            tx,
+            storage_identity,
+            scope.current_identity,
+            &scope.current_members,
+            crate::fenced_transition::fenced_transition_v2_profile_digest(),
+        )?
+    {
+        return Err(invalid_data(
+            "fenced transition V2 batch lacks an exact activation certificate",
+        ));
+    }
+    let history = read_fenced_transition_v2_history_row_in_sync(tx, storage_identity, false)?;
+    if history.active_epoch != Some(requests[0].request_id().epoch()) {
+        let outcomes = requests
+            .iter()
+            .map(|request| {
+                if matches!(
+                    request.validate(),
+                    Err(StoreError::FencedTransitionRequestConflict)
+                ) {
+                    Err(StoreError::FencedTransitionRequestConflict)
+                } else {
+                    Err(StoreError::FencedTransitionHistoryEpochNotActive)
+                }
+            })
+            .collect::<Vec<_>>();
+        validate_fenced_transition_v2_batch_outcomes(&outcomes)
+            .map_err(|_| invalid_data("fenced transition V2 batch outcome is invalid"))?;
+        advance_fenced_replay_logical_time_sync(tx, storage_identity, logical_time, machine)?;
+        return Ok(SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+            sequence: machine.0,
+            digest: Some(machine.1),
+            logical_time: Some(logical_time),
+            raft_log_index,
+        });
+    }
+    let mut outcomes = vec![None; requests.len()];
+    let mut fresh = Vec::new();
+    for (slot, request) in requests.iter().enumerate() {
+        if matches!(
+            request.validate(),
+            Err(StoreError::FencedTransitionRequestConflict)
+        ) {
+            outcomes[slot] = Some(Err(StoreError::FencedTransitionRequestConflict));
+            continue;
+        }
+        let payload_digest = fenced_transition_v2_payload_digest(storage_identity, request)?;
+        let epoch = request.request_id().epoch().get();
+        if epoch <= history.retired_through {
+            outcomes[slot] = Some(Err(StoreError::FencedTransitionHistoryEpochRetired));
+            continue;
+        }
+        if let Some(receipt) =
+            read_fenced_transition_v2_receipt_sync(tx, storage_identity, request)?
+        {
+            outcomes[slot] = Some(fenced_transition_v2_replayed_outcome(
+                &receipt,
+                payload_digest,
+                logical_time,
+            )?);
+            continue;
+        }
+        if history.active_epoch != Some(request.request_id().epoch()) {
+            outcomes[slot] = Some(Err(StoreError::FencedTransitionHistoryEpochNotActive));
+            continue;
+        }
+        fresh.push((slot, payload_digest));
+    }
+    let remaining = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+        .checked_sub(history.current_bound_count)
+        .ok_or_else(|| invalid_data("fenced transition V2 history count is invalid"))?;
+    let retained_until = match crate::ttl::checked_session_deadline(
+        logical_time,
+        FENCED_TRANSITION_OUTCOME_RETENTION,
+    ) {
+        Ok(until) if fenced_transition_v2_timestamp_is_in_range(until) => Some(until),
+        Ok(_) | Err(_) => None,
+    };
+    if remaining == 0 {
+        // Capacity precedes the retention horizon for an unbound singleton,
+        // so an already-full epoch returns HistoryFull for every fresh item.
+        for (slot, _) in &fresh {
+            outcomes[*slot] = Some(Err(StoreError::FencedTransitionHistoryFull));
+        }
+    } else if retained_until.is_none() {
+        // Retention exhaustion binds no receipt, so it consumes no capacity:
+        // every fresh item observes the same result as consecutive singleton
+        // commands while at least one slot remains.
+        for (slot, _) in &fresh {
+            outcomes[*slot] = Some(Err(StoreError::FencedTransitionRetentionExhausted));
+        }
+    } else if fresh.len() > remaining {
+        // A batch is only a physical consensus optimization. Its ordered
+        // items retain the same independent effects they would have had as
+        // consecutive singleton commands, so the remaining receipt slots
+        // bind the fresh prefix and only the capacity-exceeding suffix is
+        // rejected. Replays and earlier deterministic rejections do not
+        // consume a slot and therefore never displace a later fresh item.
+        for (slot, _) in fresh.iter().skip(remaining) {
+            outcomes[*slot] = Some(Err(StoreError::FencedTransitionHistoryFull));
+        }
+    }
+    let binds = retained_until.is_some() && fresh.iter().any(|(slot, _)| outcomes[*slot].is_none());
+    let (sequence, command_digest) = if binds && machine.0 < i64::MAX as u64 {
+        let sequence = machine
+            .0
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session consensus application sequence exhausted"))?;
+        let digest = command
+            .calculate_applied_digest(sequence, machine.1, logical_time)
+            .map_err(|_| invalid_data("session consensus batch digest failed"))?;
+        (sequence, digest)
+    } else {
+        (machine.0, machine.1)
+    };
+    let mut ordinal = u64::try_from(history.current_bound_count)
+        .map_err(|_| invalid_data("fenced transition V2 ordinal is invalid"))?;
+    for (slot, payload_digest) in fresh {
+        if outcomes[slot].is_some() {
+            continue;
+        }
+        let request = &requests[slot];
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("fenced transition V2 ordinal is exhausted"))?;
+        let result = if machine.0 >= i64::MAX as u64 {
+            Err(StoreError::FencedTransitionStorageExhausted)
+        } else {
+            let singleton = fenced_transition_v2_singleton_intent(&command.intent, request)?;
+            let mut savepoint = tx.savepoint().map_err(db_error)?;
+            match execute_intent_sync(
+                &savepoint,
+                storage_identity,
+                raft_log_index,
+                &singleton,
+                caps,
+                logical_time,
+            ) {
+                Ok((SessionMutationOutcome::FencedTransition(outcome), replication)) => {
+                    savepoint.commit().map_err(db_error)?;
+                    if let Some(replication) = replication {
+                        machine.3 = machine.3.checked_add(1).ok_or_else(|| {
+                            invalid_data("session consensus watch sequence exhausted")
+                        })?;
+                        notifications.push(store_replication_notification_sync(
+                            tx,
+                            storage_identity,
+                            machine.3,
+                            SessionConsensusRequestId::from_bytes(
+                                fenced_transition_v2_outer_request_id(request.request_id()),
+                            ),
+                            replication,
+                            logical_time,
+                        )?);
+                    }
+                    Ok(outcome)
+                }
+                Ok((_, _)) => {
+                    savepoint.rollback().map_err(db_error)?;
+                    return Err(invalid_data("fenced transition V2 batch result is invalid"));
+                }
+                Err(error) if is_deterministic_intent_rejection(&error) => {
+                    savepoint.rollback().map_err(db_error)?;
+                    Err(error)
+                }
+                Err(_) => {
+                    savepoint.rollback().map_err(db_error)?;
+                    return Err(state_machine_intent_fault());
+                }
+            }
+        };
+        let response = SessionConsensusResponse {
+            result: result.clone().map(SessionMutationOutcome::FencedTransition),
+            sequence,
+            digest: Some(command_digest),
+            logical_time: Some(logical_time),
+            raft_log_index,
+        };
+        store_fenced_transition_v2_receipt_sync(
+            tx,
+            storage_identity,
+            request,
+            ordinal,
+            payload_digest,
+            retained_until.expect("checked above"),
+            &response,
+        )?;
+        outcomes[slot] = Some(result);
+    }
+    let outcomes = outcomes
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| invalid_data("fenced transition V2 batch outcome is missing"))?;
+    validate_fenced_transition_v2_batch_outcomes(&outcomes)
+        .map_err(|_| invalid_data("fenced transition V2 batch outcome is invalid"))?;
+    if binds && machine.0 < i64::MAX as u64 {
+        let changed = tx
+            .execute(
+                "UPDATE consensus_machine SET application_sequence = ?1, last_digest = ?2, logical_time = ?3 WHERE singleton = 1 AND configuration_epoch = ?4",
+                params![
+                    checked_positive_i64(sequence)?,
+                    command_digest.as_bytes().as_slice(),
+                    ops::format_rfc3339_normalized(logical_time),
+                    epoch_i64(storage_identity)?,
+                ],
+            )
+            .map_err(db_error)?;
+        if changed != 1 {
+            return Err(invalid_data("session consensus machine state is missing"));
+        }
+        machine.0 = sequence;
+        machine.1 = command_digest;
+        machine.2 = Some(logical_time);
+    } else {
+        advance_fenced_replay_logical_time_sync(tx, storage_identity, logical_time, machine)?;
+    }
+    Ok(SessionConsensusResponse {
+        result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+        sequence: machine.0,
+        digest: Some(machine.1),
+        logical_time: Some(logical_time),
+        raft_log_index,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12572,6 +13259,9 @@ pub(crate) fn validate_consensus_outcome_records(
             current: Some(record),
         }) => super::validate_consensus_record(record),
         SessionMutationOutcome::FencedTransition(outcome) => outcome.validate(),
+        SessionMutationOutcome::FencedTransitionV2Batch(outcomes) => {
+            validate_fenced_transition_v2_batch_outcomes(outcomes)
+        }
         SessionMutationOutcome::CompareAndSet(_)
         | SessionMutationOutcome::ConsumerRecord(None)
         | SessionMutationOutcome::Lease(_)
@@ -12805,6 +13495,7 @@ fn execute_application_intent_sync(
         | SessionMutationIntent::AbortTopologyTransition { .. }
         | SessionMutationIntent::FinalizeTopologyTransition { .. }
         | SessionMutationIntent::MaintainFencedTransitionV2History { .. }
+        | SessionMutationIntent::FencedTransitionV2Batch(_)
         | SessionMutationIntent::Authorized { .. } => Err(StoreError::BackendUnavailable(
             "session consensus internal intent reached application executor".into(),
         )),
@@ -12864,6 +13555,7 @@ fn fenced_transition_access_is_authorized_sync(
             SessionMutationIntent::FencedTransition(_)
                 | SessionMutationIntent::ActivateFencedTransition { .. }
                 | SessionMutationIntent::FencedTransitionV2(_)
+                | SessionMutationIntent::FencedTransitionV2Batch(_)
                 | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
         ) =>
         {
@@ -12876,6 +13568,7 @@ fn fenced_transition_access_is_authorized_sync(
         SessionMutationIntent::FencedTransition(_)
         | SessionMutationIntent::ActivateFencedTransition { .. }
         | SessionMutationIntent::FencedTransitionV2(_)
+        | SessionMutationIntent::FencedTransitionV2Batch(_)
         | SessionMutationIntent::ActivateFencedTransitionV2 { .. } => {
             Ok(untouched_initial_membership_scope(scope, storage_identity))
         }
@@ -13331,6 +14024,17 @@ pub(crate) fn apply_entries_with_authority_sync(
                             }
                         }
                     }
+                } else if fenced_transition_v2_batch(&command.intent).is_some() {
+                    apply_fenced_transition_v2_batch_command_sync(
+                        &mut tx,
+                        identity,
+                        &scope,
+                        caps,
+                        &command,
+                        entry.log_id.index,
+                        &mut machine,
+                        &mut notifications,
+                    )?
                 } else if fenced_transition_v2_request(&command.intent).is_some() {
                     apply_fenced_transition_v2_command_sync(
                         &mut tx,
@@ -15863,6 +16567,7 @@ fn validate_attached_snapshot_preserves_fenced_transition_v2_history_sync(
     let local = read_fenced_transition_v2_history_row_in_sync(conn, identity, false)?;
     let incoming = read_fenced_transition_v2_history_row_in_sync(conn, identity, true)?;
     if incoming.retired_through < local.retired_through
+        || incoming.active_epoch < local.active_epoch
         || incoming.profile_digest != local.profile_digest
         || incoming.generation < local.generation
         || incoming.reclaimed_entries < local.reclaimed_entries
@@ -15888,7 +16593,7 @@ fn validate_attached_snapshot_preserves_fenced_transition_v2_history_sync(
                 .map_err(|_| invalid_data("session consensus snapshot V2 logical time is invalid"))
         })
         .transpose()?;
-    let maximum = i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+    let maximum = i64::try_from(FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES)
         .map_err(|_| invalid_data("fenced transition V2 bound is invalid"))?;
     let mut statement = conn
         .prepare(
@@ -17015,6 +17720,149 @@ mod tests {
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn fenced_transition_v2_closed_epoch_integrity_is_fail_closed() {
+        const SMALL_MAXIMUM: u64 = 4;
+
+        assert!(fenced_transition_v2_closed_epoch_is_exact_with_maximum(
+            2,
+            2,
+            None,
+            None,
+            None,
+            1,
+            SMALL_MAXIMUM,
+        ));
+        assert!(!fenced_transition_v2_closed_epoch_is_exact_with_maximum(
+            1,
+            2,
+            None,
+            None,
+            None,
+            3,
+            SMALL_MAXIMUM,
+        ));
+        assert!(fenced_transition_v2_closed_epoch_is_exact_with_maximum(
+            1,
+            2,
+            None,
+            None,
+            None,
+            4,
+            SMALL_MAXIMUM,
+        ));
+        assert!(!fenced_transition_v2_closed_epoch_is_exact_with_maximum(
+            1,
+            2,
+            Some(1),
+            Some(0),
+            Some(3),
+            3,
+            SMALL_MAXIMUM,
+        ));
+        assert!(!fenced_transition_v2_closed_epoch_is_exact_with_maximum(
+            1,
+            2,
+            Some(1),
+            Some(1),
+            Some(2),
+            2,
+            SMALL_MAXIMUM,
+        ));
+        assert!(fenced_transition_v2_closed_epoch_is_exact_with_maximum(
+            1,
+            2,
+            Some(1),
+            Some(1),
+            Some(3),
+            3,
+            SMALL_MAXIMUM,
+        ));
+    }
+
+    #[test]
+    fn fenced_transition_v2_truncated_closed_epoch_blocks_validation_snapshot_and_reclaim() {
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.blocking_lock();
+        initialize_schema(&source_conn, identity(), &expected_members())
+            .expect("source consensus schema");
+        apply_entries_sync(
+            &source_conn,
+            identity(),
+            &source.caps,
+            vec![membership_entry()],
+        )
+        .expect("form source membership");
+        seed_v2_tombstones(&source_conn, 1, timestamp(0));
+
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("truncated-v2.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                .expect("build valid source snapshot");
+        Connection::open(&snapshot_path)
+            .expect("open snapshot")
+            .execute(
+                "UPDATE consensus_fenced_transition_v2_history \
+                 SET active_epoch = 8, current_bound_count = 0 \
+                 WHERE singleton = 1",
+                [],
+            )
+            .expect("inject truncated closed epoch into snapshot");
+
+        source_conn
+            .execute(
+                "UPDATE consensus_fenced_transition_v2_history \
+                 SET active_epoch = 8, current_bound_count = 0 \
+                 WHERE singleton = 1",
+                [],
+            )
+            .expect("inject truncated closed epoch");
+        assert!(matches!(
+            validate_existing_schema(&source_conn, identity()),
+            Err(SessionConsensusStorageError::CorruptState)
+        ));
+        let before = read_fenced_transition_v2_history_row_in_sync(&source_conn, identity(), false)
+            .expect("read incomplete history");
+        assert!(maintain_fenced_transition_v2_history_sync(
+            &source_conn,
+            identity(),
+            before.generation,
+            before.active_epoch,
+            before.retired_through,
+            0,
+            timestamp(1),
+        )
+        .is_err());
+        assert_eq!(
+            read_fenced_transition_v2_history_row_in_sync(&source_conn, identity(), false)
+                .expect("read history after rejected reclaim"),
+            before,
+        );
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.blocking_lock();
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("target consensus schema");
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "truncated-v2".into(),
+        };
+        assert!(install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "truncated-v2.opc",
+            [0xE1; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("snapshot metadata")
+                .len(),
+        )
+        .is_err());
+    }
     #[cfg(target_os = "linux")]
     use crate::consensus::snapshot::PinnedSqliteFile;
     use crate::model::{OwnerId, SessionKey, SessionKeyType};
@@ -18364,6 +19212,27 @@ mod tests {
         }
     }
 
+    fn fenced_transition_v2_batch_entry(
+        index: u64,
+        requests: Vec<FencedTransitionV2Request>,
+        logical_time: Timestamp,
+    ) -> Entry<SessionRaftTypeConfig> {
+        let request_id = SessionConsensusRequestId::from_bytes(
+            fenced_transition_v2_batch_outer_request_id(&requests)
+                .expect("valid V2 batch outer identity"),
+        );
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id,
+                logical_time,
+                intent: SessionMutationIntent::FencedTransitionV2Batch(requests),
+            }),
+        }
+    }
+
     fn fenced_transition_v2_authorized_entry(
         index: u64,
         request: FencedTransitionV2Request,
@@ -18461,6 +19330,65 @@ mod tests {
             .expect("valid V2 tombstone fixture");
     }
 
+    fn seed_v2_full_closed_epoch(conn: &Connection, machine_time: Timestamp) {
+        seed_v2_tombstones(conn, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, machine_time);
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history SET active_epoch = 2, current_bound_count = 0 WHERE singleton = 1",
+            [],
+        )
+        .expect("close complete V2 fixture epoch");
+        validate_fenced_transition_v2_receipts_sync(conn, identity())
+            .expect("valid full closed V2 fixture epoch");
+    }
+
+    fn seed_v2_full_reclaim_epoch(conn: &Connection, machine_time: Timestamp) {
+        seed_v2_full_closed_epoch(conn, machine_time);
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history \
+             SET retired_through_epoch = 1, reclaim_epoch = 1, \
+                 reclaim_cursor_ordinal = 0, reclaim_remaining = ?1 \
+             WHERE singleton = 1",
+            [checked_i64(
+                u64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                    .expect("V2 maximum fits SQLite"),
+            )
+            .expect("V2 maximum fits SQLite")],
+        )
+        .expect("start full V2 reclaim fixture");
+        validate_fenced_transition_v2_receipts_sync(conn, identity())
+            .expect("valid full V2 reclaim fixture");
+    }
+
+    fn seed_v2_full_retained_window(conn: &Connection, machine_time: Timestamp) {
+        activate_v2_ledger_fixture(conn);
+        for epoch in 1..=u64::try_from(FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS)
+            .expect("V2 retained epoch bound fits u64")
+        {
+            insert_v2_tombstone_rows_in_epoch(
+                conn,
+                epoch,
+                1,
+                FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+                machine_time,
+            );
+        }
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history \
+             SET active_epoch = ?1, retired_through_epoch = 0, current_bound_count = 0 \
+             WHERE singleton = 1",
+            [i64::try_from(FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS + 1)
+                .expect("V2 active epoch fits SQLite")],
+        )
+        .expect("seed full retained V2 epoch window");
+        conn.execute(
+            "UPDATE consensus_machine SET logical_time = ?1 WHERE singleton = 1",
+            [ops::format_rfc3339_normalized(machine_time)],
+        )
+        .expect("set full V2 retained window clock");
+        validate_fenced_transition_v2_receipts_sync(conn, identity())
+            .expect("valid full retained V2 epoch window");
+    }
+
     /// Insert compacted V2 receipt rows at an exact ordinal range while
     /// leaving the caller in control of the history hot count and machine
     /// floors.  This lets a focused test retain one real applied receipt at
@@ -18472,14 +19400,34 @@ mod tests {
         count: usize,
         retained_until: Timestamp,
     ) {
+        insert_v2_tombstone_rows_in_epoch(
+            conn,
+            FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH,
+            first_ordinal,
+            count,
+            retained_until,
+        );
+    }
+
+    fn insert_v2_tombstone_rows_in_epoch(
+        conn: &Connection,
+        epoch: u64,
+        first_ordinal: u64,
+        count: usize,
+        retained_until: Timestamp,
+    ) {
         let retained_until = ops::format_rfc3339_normalized(retained_until);
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO consensus_fenced_transition_v2_receipts (request_id, history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
+            )
+            .expect("prepare V2 tombstone insert");
         for offset in 0..count {
             let ordinal = first_ordinal
                 .checked_add(u64::try_from(offset).expect("fixture offset"))
                 .expect("fixture ordinal");
             let mut request_id = [0_u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES];
-            request_id[..8]
-                .copy_from_slice(&FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH.to_be_bytes());
+            request_id[..8].copy_from_slice(&epoch.to_be_bytes());
             request_id[48..].copy_from_slice(&ordinal.to_be_bytes());
             let payload_digest =
                 fenced_transition_v2_payload_digest_for_request_id(identity(), request_id)
@@ -18487,26 +19435,23 @@ mod tests {
             let binding_digest = fenced_transition_v2_receipt_binding_digest(
                 identity(),
                 request_id,
-                FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH,
+                epoch,
                 ordinal,
                 payload_digest,
                 &retained_until,
             )
             .expect("V2 tombstone binding");
-            conn.execute(
-                "INSERT INTO consensus_fenced_transition_v2_receipts (request_id, history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
-                params![
+            insert
+                .execute(params![
                     request_id.as_slice(),
-                    checked_positive_i64(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
-                        .expect("V2 epoch"),
+                    checked_positive_i64(epoch).expect("V2 epoch"),
                     checked_positive_i64(ordinal).expect("V2 ordinal"),
                     epoch_i64(identity()).expect("identity epoch"),
                     payload_digest.as_slice(),
                     retained_until.as_str(),
                     binding_digest.as_slice(),
-                ],
-            )
-            .expect("insert V2 tombstone");
+                ])
+                .expect("insert V2 tombstone");
         }
     }
 
@@ -20990,19 +21935,24 @@ LIMIT 20000;
         )
         .expect("activate V2 fixture");
 
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow lifecycle corruption fixture");
+
         conn.execute(
-            "UPDATE consensus_fenced_transition_v2_history SET active_epoch = 3, retired_through_epoch = 1 WHERE singleton = 1",
+            "UPDATE consensus_fenced_transition_v2_history SET active_epoch = 10, retired_through_epoch = 1 WHERE singleton = 1",
             [],
         )
         .expect("inject skipped active epoch");
         assert!(read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false).is_err());
 
         conn.execute(
-            "UPDATE consensus_fenced_transition_v2_history SET active_epoch = NULL, retired_through_epoch = 1, reclaim_epoch = 1, reclaim_cursor_ordinal = 0, reclaim_remaining = 0, current_bound_count = 0 WHERE singleton = 1",
+            "UPDATE consensus_fenced_transition_v2_history SET active_epoch = 2, retired_through_epoch = 1, reclaim_epoch = 1, reclaim_cursor_ordinal = 0, reclaim_remaining = 0, current_bound_count = 0 WHERE singleton = 1",
             [],
         )
         .expect("inject empty reclaim state");
         assert!(read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false).is_err());
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore lifecycle constraints");
     }
 
     #[test]
@@ -21230,11 +22180,7 @@ LIMIT 20000;
         )
         .expect("form source membership");
         let retained_until = timestamp(1);
-        seed_v2_tombstones(
-            &source_conn,
-            FENCED_TRANSITION_V2_RECLAIM_BATCH + 1,
-            retained_until,
-        );
+        seed_v2_full_reclaim_epoch(&source_conn, retained_until);
         let after_retention =
             Timestamp::from_str("2026-07-13T00:00:01Z").expect("retention horizon timestamp");
         assert_eq!(
@@ -21242,9 +22188,9 @@ LIMIT 20000;
                 &source_conn,
                 identity(),
                 0,
-                Some(FencedTransitionV2HistoryEpoch::new(1).expect("initial epoch")),
+                Some(FencedTransitionV2HistoryEpoch::new(2).expect("active epoch")),
+                1,
                 0,
-                u64::try_from(FENCED_TRANSITION_V2_RECLAIM_BATCH + 1).expect("fixture count"),
                 after_retention,
             )
             .expect("start reclaim"),
@@ -21262,10 +22208,19 @@ LIMIT 20000;
         let source_history =
             read_fenced_transition_v2_history_row_in_sync(&source_conn, identity(), false)
                 .expect("source reclaim history");
-        assert_eq!(source_history.active_epoch, None);
+        assert_eq!(
+            source_history.active_epoch.map(|epoch| epoch.get()),
+            Some(2)
+        );
         assert_eq!(source_history.retired_through, 1);
         assert_eq!(source_history.reclaim_cursor_ordinal, Some(1_024));
-        assert_eq!(source_history.reclaim_remaining, Some(1));
+        assert_eq!(
+            source_history.reclaim_remaining,
+            Some(
+                (FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - FENCED_TRANSITION_V2_RECLAIM_BATCH)
+                    as u64
+            )
+        );
 
         let directory = tempfile::tempdir().expect("snapshot directory");
         let snapshot_path = directory.path().join("v2-reclaim.sqlite");
@@ -21310,7 +22265,7 @@ LIMIT 20000;
                 &target_conn,
                 identity(),
                 1,
-                None,
+                Some(FencedTransitionV2HistoryEpoch::new(2).expect("active epoch")),
                 1,
                 0,
                 after_retention,
@@ -21831,89 +22786,147 @@ LIMIT 20000;
 
     #[test]
     fn fenced_transition_v2_reclaims_exactly_1024_then_opens_next_epoch() {
-        for count in [
-            FENCED_TRANSITION_V2_RECLAIM_BATCH,
-            FENCED_TRANSITION_V2_RECLAIM_BATCH + 1,
-        ] {
-            let backend = SqliteSessionBackend::in_memory().expect("backend");
-            let conn = backend.conn.blocking_lock();
-            initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
-            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
-                .expect("form membership");
-            let now = timestamp(10);
-            seed_v2_tombstones(&conn, count, now);
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("form membership");
+        let now = timestamp(10);
+        seed_v2_full_reclaim_epoch(&conn, now);
 
-            assert_eq!(
-                maintain_fenced_transition_v2_history_sync(
-                    &conn,
-                    identity(),
-                    0,
-                    Some(
-                        FencedTransitionV2HistoryEpoch::new(
-                            FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH,
-                        )
-                        .expect("initial V2 epoch"),
+        assert_eq!(
+            maintain_fenced_transition_v2_history_sync(
+                &conn,
+                identity(),
+                0,
+                Some(FencedTransitionV2HistoryEpoch::new(2).expect("active V2 epoch")),
+                1,
+                0,
+                now,
+            )
+            .expect("first reclaim"),
+            FencedTransitionV2MaintenanceResult::Applied
+        );
+        let history = read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+            .expect("history after first reclaim");
+        assert_eq!(history.reclaim_epoch, Some(1));
+        assert_eq!(history.reclaim_cursor_ordinal, Some(1_024));
+        assert_eq!(
+            history.reclaim_remaining,
+            Some(
+                (FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - FENCED_TRANSITION_V2_RECLAIM_BATCH)
+                    as u64
+            )
+        );
+        assert_eq!(history.generation, 1);
+        assert_eq!(history.reclaimed_entries, 1_024);
+
+        assert_eq!(
+            maintain_fenced_transition_v2_history_sync(
+                &conn,
+                identity(),
+                1,
+                Some(FencedTransitionV2HistoryEpoch::new(2).expect("active V2 epoch")),
+                1,
+                0,
+                now,
+            )
+            .expect("second reclaim"),
+            FencedTransitionV2MaintenanceResult::Applied
+        );
+        let second_history =
+            read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+                .expect("history after second reclaim");
+        assert_eq!(second_history.reclaim_cursor_ordinal, Some(2_048));
+        assert_eq!(
+            second_history.reclaim_remaining,
+            Some(
+                (FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - 2 * FENCED_TRANSITION_V2_RECLAIM_BATCH)
+                    as u64
+            )
+        );
+        assert_eq!(second_history.generation, 2);
+        assert_eq!(second_history.reclaimed_entries, 2_048);
+    }
+
+    #[test]
+    fn fenced_transition_v2_projection_reclaims_two_unapplied_tail_batches() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("form membership");
+        activate_v2_ledger_fixture(&conn);
+
+        let maximum =
+            u64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES).expect("V2 maximum fits u64");
+        let tail = 1_025_u64;
+        let cursor = maximum
+            .checked_sub(tail)
+            .expect("tail is within V2 maximum");
+        insert_v2_tombstone_rows(
+            &conn,
+            cursor.checked_add(1).expect("first retained ordinal"),
+            usize::try_from(tail).expect("tail fits usize"),
+            timestamp(0),
+        );
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history \
+             SET active_epoch = 2, retired_through_epoch = 1, current_bound_count = 0, \
+                 reclaim_epoch = 1, reclaim_cursor_ordinal = ?1, reclaim_remaining = ?2, \
+                 reclaimed_entries = ?1 \
+             WHERE singleton = 1",
+            params![
+                checked_i64(cursor).expect("reclaim cursor fits SQLite"),
+                checked_i64(tail).expect("reclaim tail fits SQLite"),
+            ],
+        )
+        .expect("seed valid V2 reclaim tail");
+        conn.execute(
+            "UPDATE consensus_machine SET logical_time = ?1 WHERE singleton = 1",
+            [ops::format_rfc3339_normalized(timestamp(0))],
+        )
+        .expect("set V2 reclaim tail clock");
+        validate_fenced_transition_v2_receipts_sync(&conn, identity())
+            .expect("valid V2 reclaim tail fixture");
+
+        let maintenance = |index, generation, logical_time| Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes(
+                    [u8::try_from(index).expect("test log index fits request ID byte"); 16],
+                ),
+                logical_time,
+                intent: SessionMutationIntent::MaintainFencedTransitionV2History {
+                    expected_generation: generation,
+                    expected_active_epoch: Some(
+                        FencedTransitionV2HistoryEpoch::new(2).expect("active epoch"),
                     ),
-                    0,
-                    u64::try_from(count).expect("fixture count"),
-                    now,
-                )
-                .expect("first reclaim"),
-                FencedTransitionV2MaintenanceResult::Applied
-            );
-            let remaining_rows: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM consensus_fenced_transition_v2_receipts",
-                    [],
-                    |row| row.get(0),
-                )
-                .expect("count rows after first reclaim");
-            let history = read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
-                .expect("history after first reclaim");
-            if count == FENCED_TRANSITION_V2_RECLAIM_BATCH {
-                assert_eq!(remaining_rows, 0);
-                assert_eq!(
-                    history.active_epoch,
-                    Some(FencedTransitionV2HistoryEpoch::new(2).expect("next V2 epoch"))
-                );
-                assert_eq!(history.retired_through, 1);
-                assert_eq!(history.generation, 1);
-                assert_eq!(history.reclaimed_entries, 1_024);
-            } else {
-                assert_eq!(remaining_rows, 1);
-                assert_eq!(history.active_epoch, None);
-                assert_eq!(history.retired_through, 1);
-                assert_eq!(history.reclaim_epoch, Some(1));
-                assert_eq!(history.reclaim_cursor_ordinal, Some(1_024));
-                assert_eq!(history.reclaim_remaining, Some(1));
-                assert_eq!(history.generation, 1);
-                assert_eq!(history.reclaimed_entries, 1_024);
-
-                assert_eq!(
-                    maintain_fenced_transition_v2_history_sync(
-                        &conn,
-                        identity(),
-                        1,
-                        None,
-                        1,
-                        0,
-                        now,
-                    )
-                    .expect("final reclaim"),
-                    FencedTransitionV2MaintenanceResult::Applied
-                );
-                let final_history =
-                    read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
-                        .expect("final history");
-                assert_eq!(
-                    final_history.active_epoch,
-                    Some(FencedTransitionV2HistoryEpoch::new(2).expect("next V2 epoch"))
-                );
-                assert_eq!(final_history.reclaim_epoch, None);
-                assert_eq!(final_history.generation, 2);
-                assert_eq!(final_history.reclaimed_entries, 1_025);
-            }
-        }
+                    expected_retired_through: 1,
+                    expected_bound_entries: 0,
+                },
+            }),
+        };
+        let first = maintenance(1, 0, timestamp(1));
+        let second = maintenance(2, 1, timestamp(2));
+        let mut projection = MembershipLogProjection::load(&conn, identity(), false)
+            .expect("load reclaim-tail projection");
+        projection
+            .project(&conn, &first, identity())
+            .expect("project first reclaim batch");
+        projection
+            .project(&conn, &second, identity())
+            .expect("project second reclaim batch without applying the first");
+        let history = projection
+            .projected_v2_history
+            .expect("projected reclaim-tail history");
+        assert_eq!(history.generation, 2);
+        assert_eq!(history.reclaim_epoch, None);
+        assert_eq!(history.reclaim_cursor_ordinal, None);
+        assert_eq!(history.reclaim_remaining, None);
+        assert_eq!(history.reclaimed_entries, maximum);
     }
 
     #[test]
@@ -21925,8 +22938,8 @@ LIMIT 20000;
             .expect("form membership");
 
         // Bind ordinal one through the real activation/apply path.  The
-        // remaining entries are compact fixture tombstones solely to force
-        // the exact two ordered 1,024-row physical reclaim batches.
+        // remaining entries are compact fixture tombstones solely to form a
+        // complete closed epoch for physical reclaim.
         let request = fenced_transition_v2_request(0xDA, 1, "v2-reclaimed-owner");
         let activation = apply_entries_sync(
             &conn,
@@ -21948,8 +22961,13 @@ LIMIT 20000;
         ));
         let retired_at = Timestamp::from_str("2026-07-13T00:00:01Z")
             .expect("exact V2 result-retention deadline");
-        insert_v2_tombstone_rows(&conn, 2, FENCED_TRANSITION_V2_RECLAIM_BATCH, retired_at);
-        let total_entries = FENCED_TRANSITION_V2_RECLAIM_BATCH + 1;
+        insert_v2_tombstone_rows(
+            &conn,
+            2,
+            FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - 1,
+            retired_at,
+        );
+        let total_entries = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES;
         conn.execute(
             "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = ?1 WHERE singleton = 1",
             [i64::try_from(total_entries).expect("fixture count fits SQLite")],
@@ -21965,44 +22983,64 @@ LIMIT 20000;
         .expect("advance fixture machine floors through retention");
         validate_fenced_transition_v2_receipts_sync(&conn, identity())
             .expect("fixture preserves the real receipt and ordered tombstones");
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history \
+             SET active_epoch = 2, retired_through_epoch = 1, current_bound_count = 0, \
+                 reclaim_epoch = 1, reclaim_cursor_ordinal = 0, reclaim_remaining = ?1 \
+             WHERE singleton = 1",
+            [i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                .expect("V2 maximum fits SQLite")],
+        )
+        .expect("seed full V2 reclaim window");
+        validate_fenced_transition_v2_receipts_sync(&conn, identity())
+            .expect("valid full V2 reclaim window");
 
         assert_eq!(
             maintain_fenced_transition_v2_history_sync(
                 &conn,
                 identity(),
                 0,
-                Some(FencedTransitionV2HistoryEpoch::new(1).expect("initial epoch")),
+                Some(FencedTransitionV2HistoryEpoch::new(2).expect("active epoch")),
+                1,
                 0,
-                u64::try_from(total_entries).expect("fixture count"),
                 retired_at,
             )
             .expect("retire and delete the first ordered batch"),
             FencedTransitionV2MaintenanceResult::Applied,
         );
-        let remaining: (i64, i64) = conn
+        let remaining: i64 = conn
             .query_row(
-                "SELECT history_epoch, ordinal FROM consensus_fenced_transition_v2_receipts",
+                "SELECT COUNT(*) FROM consensus_fenced_transition_v2_receipts",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
-            .expect("one final ordered receipt remains");
+            .expect("count ordered receipts after first reclaim");
         assert_eq!(
             remaining,
-            (1, i64::try_from(total_entries).expect("fixture ordinal"))
-        );
-        assert_eq!(
-            maintain_fenced_transition_v2_history_sync(
-                &conn,
-                identity(),
-                1,
-                None,
-                1,
-                0,
-                retired_at,
+            i64::try_from(
+                FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - FENCED_TRANSITION_V2_RECLAIM_BATCH
             )
-            .expect("delete the final ordered receipt and open epoch two"),
-            FencedTransitionV2MaintenanceResult::Applied,
+            .expect("remaining count fits SQLite")
         );
+        for generation in 1..u64::try_from(
+            FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES / FENCED_TRANSITION_V2_RECLAIM_BATCH,
+        )
+        .expect("reclaim batch count fits u64")
+        {
+            assert_eq!(
+                maintain_fenced_transition_v2_history_sync(
+                    &conn,
+                    identity(),
+                    generation,
+                    Some(FencedTransitionV2HistoryEpoch::new(2).expect("active epoch")),
+                    1,
+                    0,
+                    retired_at,
+                )
+                .expect("delete the next ordered reclaim batch"),
+                FencedTransitionV2MaintenanceResult::Applied,
+            );
+        }
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM consensus_fenced_transition_v2_receipts",
@@ -22285,34 +23323,361 @@ LIMIT 20000;
                 .current_bound_count,
             FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
         );
-        let records_before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM session_records", [], |row| row.get(0))
-            .expect("count records before cap rejection");
-        let rejected = apply_entries_sync(
+        let next_request = fenced_transition_v2_request(0xD9, 1, "v2-cap-next-owner");
+        let business_key = next_request.lease().key().clone();
+        let machine_before = read_machine_sync(&conn, identity()).expect("machine at V2 cap");
+        let record_before =
+            ops::get_sync(&conn, &business_key, timestamp(1)).expect("record at V2 cap");
+        let fence_before = ops::current_fence_sync(&conn, &business_key).expect("fence at V2 cap");
+        let receipt_count_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_fenced_transition_v2_receipts",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count V2 receipts at cap");
+        let lease_count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM leases", [], |row| row.get(0))
+            .expect("count leases at V2 cap");
+        type LeaseRow = (i64, i64, String, i64, i64, String, Option<String>);
+        let lease_before: Option<LeaseRow> = conn
+            .query_row(
+                "SELECT active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at, acquired_at FROM leases WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4",
+                params![
+                    business_key.tenant.as_str(),
+                    business_key.nf_kind.as_str(),
+                    business_key.key_type.to_string(),
+                    business_key.stable_id.as_ref(),
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .expect("read lease at V2 cap");
+
+        let assert_unbound = |index, candidate: FencedTransitionV2Request, expected| {
+            let logical_time = timestamp(u8::try_from(index).expect("fixture index fits"));
+            let rejected = apply_entries_sync(
+                &conn,
+                identity(),
+                &backend.caps,
+                vec![fenced_transition_v2_entry(index, candidate, logical_time)],
+            )
+            .expect("V2 capacity retry is a committed no-effect response");
+            assert_eq!(rejected.responses.len(), 1);
+            assert_eq!(rejected.responses[0].result, Err(expected));
+            assert!(rejected.notifications.is_empty());
+            let machine_after =
+                read_machine_sync(&conn, identity()).expect("machine after V2 cap rejection");
+            assert_eq!(
+                (machine_after.0, machine_after.1, machine_after.3),
+                (machine_before.0, machine_before.1, machine_before.3),
+                "V2 capacity rejection cannot advance application or watch state",
+            );
+            assert_eq!(
+                ops::get_sync(&conn, &business_key, logical_time)
+                    .expect("record after V2 cap rejection"),
+                record_before,
+                "V2 capacity rejection cannot mutate business state",
+            );
+            assert_eq!(
+                ops::current_fence_sync(&conn, &business_key)
+                    .expect("fence after V2 cap rejection"),
+                fence_before,
+                "V2 capacity rejection cannot mutate the fence",
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM leases", [], |row| row
+                    .get::<_, i64>(0))
+                    .expect("count leases after V2 cap rejection"),
+                lease_count_before,
+                "V2 capacity rejection cannot create or delete a lease",
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT active, credential_id, owner, fence, expires_at_unix_ms, guard_expires_at, acquired_at FROM leases WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4",
+                    params![
+                        business_key.tenant.as_str(),
+                        business_key.nf_kind.as_str(),
+                        business_key.key_type.to_string(),
+                        business_key.stable_id.as_ref(),
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                        ))
+                    },
+                )
+                .optional()
+                .expect("read lease after V2 cap rejection"),
+                lease_before,
+                "V2 capacity rejection cannot renew the lease or change its expiry",
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM consensus_fenced_transition_v2_receipts",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count V2 receipts after cap rejection"),
+                receipt_count_before,
+                "V2 capacity rejection cannot retain the unbound request",
+            );
+            assert!(
+                read_fenced_transition_v2_receipt_sync(&conn, identity(), &next_request)
+                    .expect("read unbound V2 receipt")
+                    .is_none(),
+            );
+        };
+
+        assert_unbound(
+            2,
+            next_request.clone(),
+            StoreError::FencedTransitionHistoryFull,
+        );
+        assert_unbound(
+            3,
+            next_request.clone(),
+            StoreError::FencedTransitionHistoryFull,
+        );
+        assert_unbound(
+            4,
+            altered_fenced_transition_v2_request(&next_request),
+            StoreError::FencedTransitionRequestConflict,
+        );
+        assert_eq!(
+            read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &next_request,),
+            Ok(FencedTransitionV2Status::HistoryFull),
+        );
+        assert_eq!(
+            read_fenced_transition_v2_status_sync(
+                &conn,
+                identity(),
+                identity(),
+                &altered_fenced_transition_v2_request(&next_request),
+            ),
+            Ok(FencedTransitionV2Status::RequestConflict),
+        );
+    }
+
+    #[test]
+    fn fenced_transition_v2_capacity_opens_successor_and_bounds_eight_exact_epochs() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("form membership");
+        let predecessor = fenced_transition_v2_request(0xE7, 1, "v2-predecessor-owner");
+        let original = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![activating_fenced_transition_v2_entry(
+                1,
+                predecessor.clone(),
+                timestamp(1),
+            )],
+        )
+        .expect("bind predecessor")
+        .responses
+        .pop()
+        .expect("predecessor response");
+        insert_v2_tombstone_rows_in_epoch(
+            &conn,
+            1,
+            2,
+            FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - 1,
+            crate::checked_session_deadline(timestamp(1), FENCED_TRANSITION_OUTCOME_RETENTION)
+                .expect("predecessor tombstone retention"),
+        );
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = ?1 WHERE singleton = 1",
+            [i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                .expect("V2 cap fits SQLite")],
+        )
+        .expect("seed full active epoch");
+        let epoch_one = FencedTransitionV2HistoryEpoch::new(1).expect("initial epoch");
+        assert_eq!(
+            maintain_fenced_transition_v2_history_sync(
+                &conn,
+                identity(),
+                0,
+                Some(epoch_one),
+                0,
+                FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64,
+                timestamp(2),
+            )
+            .expect("capacity rotation"),
+            FencedTransitionV2MaintenanceResult::Applied
+        );
+        let successor = read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+            .expect("successor history");
+        assert_eq!(
+            successor
+                .active_epoch
+                .map(FencedTransitionV2HistoryEpoch::get),
+            Some(2)
+        );
+        assert_eq!(successor.retired_through, 0);
+        assert_eq!(successor.reclaim_epoch, None);
+        assert_eq!(
+            read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &predecessor),
+            Ok(FencedTransitionV2Status::Recorded(Box::new(
+                match original.result {
+                    Ok(SessionMutationOutcome::FencedTransition(outcome)) => Ok(outcome),
+                    Err(error) => Err(error),
+                    Ok(_) => panic!("predecessor must be a V2 transition"),
+                }
+            )))
+        );
+        assert_eq!(
+            read_fenced_transition_v2_status_sync(
+                &conn,
+                identity(),
+                identity(),
+                &altered_fenced_transition_v2_request(&predecessor),
+            ),
+            Ok(FencedTransitionV2Status::RequestConflict)
+        );
+
+        let successor_request = fenced_transition_v2_request(0xE8, 2, "v2-successor-owner");
+        apply_entries_sync(
             &conn,
             identity(),
             &backend.caps,
             vec![fenced_transition_v2_entry(
                 2,
-                fenced_transition_v2_request(0xD9, 1, "v2-cap-next-owner"),
+                successor_request,
                 timestamp(2),
             )],
         )
-        .expect("cap rejection is a committed no-effect response");
+        .expect("successor stays writable while predecessor is retained");
+
+        // The remaining six immediate capacity rotations establish the
+        // fixed eight-epoch envelope. At its edge an unexpired oldest epoch
+        // prevents a ninth namespace from being opened.
+        for epoch in 2_u64..=8 {
+            let history = read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+                .expect("history before bounded rotation");
+            let active_epoch = history.active_epoch.expect("active history epoch").get();
+            let first_missing_ordinal = u64::try_from(history.current_bound_count)
+                .expect("V2 count fits ordinal")
+                .checked_add(1)
+                .expect("V2 ordinal remains bounded");
+            insert_v2_tombstone_rows_in_epoch(
+                &conn,
+                active_epoch,
+                first_missing_ordinal,
+                FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - history.current_bound_count,
+                crate::checked_session_deadline(timestamp(2), FENCED_TRANSITION_OUTCOME_RETENTION)
+                    .expect("successor tombstone retention"),
+            );
+            conn.execute(
+                "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = ?1 WHERE singleton = 1",
+                [i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                    .expect("V2 cap fits SQLite")],
+            )
+            .expect("seed full active epoch");
+            let result = maintain_fenced_transition_v2_history_sync(
+                &conn,
+                identity(),
+                history.generation,
+                history.active_epoch,
+                history.retired_through,
+                FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64,
+                timestamp(2),
+            )
+            .expect("bounded maintenance");
+            if epoch < 8 {
+                assert_eq!(result, FencedTransitionV2MaintenanceResult::Applied);
+            } else {
+                assert_eq!(result, FencedTransitionV2MaintenanceResult::Noop);
+            }
+        }
+        let bounded = read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+            .expect("bounded history");
+        assert_eq!(
+            bounded
+                .active_epoch
+                .map(FencedTransitionV2HistoryEpoch::get),
+            Some(8)
+        );
+        assert_eq!(bounded.reclaim_epoch, None);
+    }
+
+    #[test]
+    fn fenced_transition_v2_floor_reclaims_oldest_while_successor_remains_writable() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("form membership");
+        seed_v2_full_retained_window(&conn, timestamp(0));
+        assert_eq!(
+            maintain_fenced_transition_v2_history_sync(
+                &conn,
+                identity(),
+                0,
+                Some(FencedTransitionV2HistoryEpoch::new(8).expect("active epoch")),
+                0,
+                0,
+                timestamp(1),
+            )
+            .expect("floor and first ordered reclaim"),
+            FencedTransitionV2MaintenanceResult::Applied
+        );
+        let reclaiming = read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+            .expect("reclaiming successor history");
+        assert_eq!(
+            reclaiming
+                .active_epoch
+                .map(FencedTransitionV2HistoryEpoch::get),
+            Some(8)
+        );
+        assert_eq!(reclaiming.retired_through, 1);
+        assert_eq!(reclaiming.reclaim_epoch, Some(1));
+        assert_eq!(
+            reclaiming.reclaim_remaining,
+            Some(
+                (FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - FENCED_TRANSITION_V2_RECLAIM_BATCH)
+                    as u64
+            )
+        );
+
+        let successor = fenced_transition_v2_request(0xE9, 8, "v2-reclaim-successor");
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_entry(1, successor, timestamp(2))],
+        )
+        .expect("successor write during reclaim");
         assert!(matches!(
-            rejected.responses.as_slice(),
+            applied.responses.as_slice(),
             [SessionConsensusResponse {
-                result: Err(StoreError::FencedTransitionHistoryFull),
+                result: Ok(SessionMutationOutcome::FencedTransition(_)),
                 ..
             }]
         ));
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM session_records", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("count records after cap rejection"),
-            records_before
-        );
+        let writable = read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+            .expect("writable successor history");
+        assert_eq!(writable.current_bound_count, 1);
+        assert_eq!(writable.reclaim_epoch, Some(1));
     }
 
     #[test]
@@ -28557,6 +29922,476 @@ BEGIN IMMEDIATE;
     }
 
     #[tokio::test]
+    async fn fixed_application_traffic_snapshot_fails_closed_for_recovery_sidecars() {
+        let directory = tempfile::tempdir().expect("fixed authority snapshot directory");
+        let database = directory.path().join("sessions.sqlite");
+        let identity = identity();
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        let placement_policy = FIXED_TEST_PLACEMENT_POLICY.expect("fixed placement policy");
+        let backend = SqliteSessionBackend::open(&database).expect("fixed backend");
+        let conn = backend.conn.lock().await;
+        initialize_schema_with_profile(
+            &conn,
+            identity,
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed authority");
+        apply_entries_with_authority_sync(
+            &conn,
+            identity,
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            vec![membership_entry_at(
+                0,
+                vec![members.clone()],
+                members.clone(),
+            )],
+        )
+        .expect("form fixed quorum");
+        drop(conn);
+
+        assert!(backend
+            .fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members.clone(),
+                bindings.clone(),
+                placement_policy,
+            )
+            .await
+            .expect("exact fixed authority snapshot"));
+
+        let conn = backend.conn.lock().await;
+        mark_operator_recovery_pending_sync(&conn, identity, 1, [0x71; 32])
+            .expect("mark recovery pending");
+        drop(conn);
+        assert!(!backend
+            .fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members.clone(),
+                bindings.clone(),
+                placement_policy,
+            )
+            .await
+            .expect("pending recovery snapshot"));
+
+        ensure_operator_recovery_latch_sync(
+            &database,
+            OperatorRecoveryLatch {
+                identity: identity_at(2, 0x52),
+                recovery_epoch: 1,
+                plan_digest: [0x72; 32],
+                audit_pending: false,
+            },
+        )
+        .expect("write mismatched recovery latch");
+        assert!(backend
+            .fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members.clone(),
+                bindings.clone(),
+                placement_policy,
+            )
+            .await
+            .is_err());
+
+        std::fs::write(
+            operator_recovery_latch_path(&database).expect("recovery latch path"),
+            b"corrupt",
+        )
+        .expect("corrupt recovery latch");
+        assert!(backend
+            .fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members.clone(),
+                bindings.clone(),
+                placement_policy,
+            )
+            .await
+            .is_err());
+
+        backend.inject_consensus_operator_recovery_failure(true);
+        assert!(backend
+            .fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members,
+                bindings,
+                placement_policy,
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fixed_v2_status_acceptance_binds_authority_activation_and_status_together() {
+        let backend = SqliteSessionBackend::in_memory().expect("fixed backend");
+        let identity = identity();
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        let placement_policy = FIXED_TEST_PLACEMENT_POLICY.expect("fixed placement policy");
+        let request = fenced_transition_v2_request(0x75, 1, "fixed-v2-status");
+        let conn = backend.conn.lock().await;
+        initialize_schema_with_profile(
+            &conn,
+            identity,
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed authority");
+        apply_entries_with_authority_sync(
+            &conn,
+            identity,
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            vec![membership_entry_at(
+                0,
+                vec![members.clone()],
+                members.clone(),
+            )],
+        )
+        .expect("form fixed quorum");
+        activate_fenced_transition_v2_scope_sync(
+            &conn,
+            identity,
+            identity,
+            &members,
+            fenced_transition_v2_profile_digest(),
+            FencedTransitionV2HistoryEpoch::new(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
+                .expect("initial V2 epoch"),
+        )
+        .expect("activate V2 fixture");
+        drop(conn);
+
+        assert!(matches!(
+            backend
+                .fixed_quorum_fenced_transition_v2_status_at_scope(
+                    crate::sqlite::FixedQuorumFencedTransitionV2StatusReadRequest {
+                        storage_identity: identity,
+                        scope_identity: identity,
+                        voters: members.clone(),
+                        expected_members: members.clone(),
+                        expected_bindings: bindings.clone(),
+                        expected_placement_policy: placement_policy,
+                        profile_digest: fenced_transition_v2_profile_digest(),
+                        require_activation: true,
+                    },
+                    &request,
+                )
+                .await,
+            Ok(
+                crate::sqlite::FixedQuorumFencedTransitionV2StatusRead::Activated(
+                    FencedTransitionV2Status::NotFound
+                )
+            )
+        ));
+
+        let conn = backend.conn.lock().await;
+        conn.execute(
+            "DELETE FROM consensus_fenced_transition_v2_activation WHERE singleton = 1",
+            [],
+        )
+        .expect("clear activation certificate");
+        drop(conn);
+        assert!(matches!(
+            backend
+                .fixed_quorum_fenced_transition_v2_status_at_scope(
+                    crate::sqlite::FixedQuorumFencedTransitionV2StatusReadRequest {
+                        storage_identity: identity,
+                        scope_identity: identity,
+                        voters: members.clone(),
+                        expected_members: members.clone(),
+                        expected_bindings: bindings.clone(),
+                        expected_placement_policy: placement_policy,
+                        profile_digest: fenced_transition_v2_profile_digest(),
+                        require_activation: true,
+                    },
+                    &request,
+                )
+                .await,
+            Ok(crate::sqlite::FixedQuorumFencedTransitionV2StatusRead::Unactivated)
+        ));
+
+        let conn = backend.conn.lock().await;
+        mark_operator_recovery_pending_sync(&conn, identity, 1, [0x76; 32])
+            .expect("mark recovery pending");
+        drop(conn);
+        assert!(backend
+            .fixed_quorum_fenced_transition_v2_status_at_scope(
+                crate::sqlite::FixedQuorumFencedTransitionV2StatusReadRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: members.clone(),
+                    expected_members: members,
+                    expected_bindings: bindings,
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                    require_activation: false,
+                },
+                &request,
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fixed_quorum_activated_v2_mutation_snapshot_is_atomic_and_fail_closed() {
+        let backend = SqliteSessionBackend::in_memory().expect("fixed backend");
+        let identity = identity();
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        let placement_policy = FIXED_TEST_PLACEMENT_POLICY.expect("fixed placement policy");
+        let logical_time = timestamp(42);
+        let conn = backend.conn.lock().await;
+        initialize_schema_with_profile(
+            &conn,
+            identity,
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed authority");
+        apply_entries_with_authority_sync(
+            &conn,
+            identity,
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            vec![membership_entry_at(
+                0,
+                vec![members.clone()],
+                members.clone(),
+            )],
+        )
+        .expect("form fixed quorum");
+        activate_fenced_transition_v2_scope_sync(
+            &conn,
+            identity,
+            identity,
+            &members,
+            fenced_transition_v2_profile_digest(),
+            FencedTransitionV2HistoryEpoch::new(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
+                .expect("initial V2 epoch"),
+        )
+        .expect("activate V2 fixture");
+        conn.execute(
+            "UPDATE consensus_machine SET logical_time = ?1 WHERE singleton = 1",
+            [ops::format_rfc3339_normalized(logical_time)],
+        )
+        .expect("set applied logical time");
+        drop(conn);
+
+        let snapshot = backend
+            .fixed_quorum_activated_v2_mutation_snapshot(
+                crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: members.clone(),
+                    expected_members: members.clone(),
+                    expected_bindings: bindings.clone(),
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                },
+            )
+            .await
+            .expect("activated snapshot");
+        assert!(matches!(
+            snapshot,
+            crate::sqlite::FixedQuorumActivatedV2MutationSnapshot::Activated {
+                applied_logical_time: Some(observed),
+            } if observed == logical_time
+        ));
+
+        assert!(backend
+            .fixed_quorum_activated_v2_mutation_snapshot(
+                crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                    storage_identity: identity,
+                    scope_identity: identity_at(2, 0x7A),
+                    voters: members.clone(),
+                    expected_members: members.clone(),
+                    expected_bindings: bindings.clone(),
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                },
+            )
+            .await
+            .is_err());
+
+        let wrong_members = BTreeSet::from([member(7), member(8), member(10)]);
+        assert!(backend
+            .fixed_quorum_activated_v2_mutation_snapshot(
+                crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: wrong_members.clone(),
+                    expected_members: wrong_members.clone(),
+                    expected_bindings: test_member_bindings(&wrong_members),
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                },
+            )
+            .await
+            .is_err());
+
+        assert!(matches!(
+            backend
+                .fixed_quorum_activated_v2_mutation_snapshot(
+                    crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                        storage_identity: identity,
+                        scope_identity: identity,
+                        voters: members.clone(),
+                        expected_members: members.clone(),
+                        expected_bindings: bindings.clone(),
+                        expected_placement_policy: placement_policy,
+                        profile_digest: [0xA1; 32],
+                    },
+                )
+                .await,
+            Ok(crate::sqlite::FixedQuorumActivatedV2MutationSnapshot::Unactivated)
+        ));
+
+        // Cut after authority, recovery, and activation have been read but
+        // before logical time can be returned. No partial or stale snapshot
+        // may cross that pre-proposal boundary.
+        backend.inject_fixed_quorum_v2_mutation_snapshot_cut(true);
+        assert!(backend
+            .fixed_quorum_activated_v2_mutation_snapshot(
+                crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: members.clone(),
+                    expected_members: members.clone(),
+                    expected_bindings: bindings.clone(),
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                },
+            )
+            .await
+            .is_err());
+        backend.inject_fixed_quorum_v2_mutation_snapshot_cut(false);
+
+        let conn = backend.conn.lock().await;
+        conn.execute(
+            "DELETE FROM consensus_fenced_transition_v2_activation WHERE singleton = 1",
+            [],
+        )
+        .expect("clear activation certificate");
+        drop(conn);
+        assert!(matches!(
+            backend
+                .fixed_quorum_activated_v2_mutation_snapshot(
+                    crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                        storage_identity: identity,
+                        scope_identity: identity,
+                        voters: members.clone(),
+                        expected_members: members.clone(),
+                        expected_bindings: bindings.clone(),
+                        expected_placement_policy: placement_policy,
+                        profile_digest: fenced_transition_v2_profile_digest(),
+                    },
+                )
+                .await,
+            Ok(crate::sqlite::FixedQuorumActivatedV2MutationSnapshot::Unactivated)
+        ));
+
+        let conn = backend.conn.lock().await;
+        mark_operator_recovery_pending_sync(&conn, identity, 1, [0x7B; 32])
+            .expect("mark recovery pending");
+        drop(conn);
+        assert!(backend
+            .fixed_quorum_activated_v2_mutation_snapshot(
+                crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: members.clone(),
+                    expected_members: members,
+                    expected_bindings: bindings,
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                },
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fixed_quorum_activated_v2_mutation_snapshot_rejects_a_recovery_latch() {
+        let directory = tempfile::tempdir().expect("fixed snapshot directory");
+        let database = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&database).expect("fixed backend");
+        let identity = identity();
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        let placement_policy = FIXED_TEST_PLACEMENT_POLICY.expect("fixed placement policy");
+        let conn = backend.conn.lock().await;
+        initialize_schema_with_profile(
+            &conn,
+            identity,
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed authority");
+        apply_entries_with_authority_sync(
+            &conn,
+            identity,
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            vec![membership_entry_at(
+                0,
+                vec![members.clone()],
+                members.clone(),
+            )],
+        )
+        .expect("form fixed quorum");
+        activate_fenced_transition_v2_scope_sync(
+            &conn,
+            identity,
+            identity,
+            &members,
+            fenced_transition_v2_profile_digest(),
+            FencedTransitionV2HistoryEpoch::new(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
+                .expect("initial V2 epoch"),
+        )
+        .expect("activate V2 fixture");
+        drop(conn);
+        ensure_operator_recovery_latch_sync(
+            &database,
+            OperatorRecoveryLatch {
+                identity,
+                recovery_epoch: 1,
+                plan_digest: [0x7C; 32],
+                audit_pending: false,
+            },
+        )
+        .expect("write recovery latch");
+
+        assert!(backend
+            .fixed_quorum_activated_v2_mutation_snapshot(
+                crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: members.clone(),
+                    expected_members: members,
+                    expected_bindings: bindings,
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                },
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn fixed_apply_rejects_prepare_transition_without_scope_drift() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.lock().await;
@@ -30417,5 +32252,211 @@ BEGIN IMMEDIATE;
             }]
         ));
         assert!(rejected.notifications.is_empty());
+    }
+
+    #[test]
+    fn fenced_transition_v2_batch_is_ordered_replayable_and_preflights_capacity() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let activation = fenced_transition_v2_request(0xC1, 1, "v2-batch-activation");
+        let first = fenced_transition_v2_request(0xC2, 1, "v2-batch-first");
+        let second = fenced_transition_v2_request(0xC3, 1, "v2-batch-second");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                activating_fenced_transition_v2_entry(1, activation, timestamp(1)),
+            ],
+        )
+        .expect("activate V2");
+
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_batch_entry(
+                2,
+                vec![first.clone(), second.clone()],
+                timestamp(2),
+            )],
+        )
+        .expect("apply ordered V2 batch");
+        let outcomes = match &applied.responses[0].result {
+            Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)) => outcomes,
+            other => panic!("unexpected V2 batch result: {other:?}"),
+        };
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(
+            read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &first),
+            Ok(FencedTransitionV2Status::Recorded(Box::new(
+                outcomes[0].clone()
+            )))
+        );
+        let replay = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_batch_entry(
+                3,
+                vec![first.clone(), second.clone()],
+                timestamp(3),
+            )],
+        )
+        .expect("exact batch replay");
+        assert_eq!(replay.responses[0].result, applied.responses[0].result);
+        let altered = altered_fenced_transition_v2_request(&first);
+        let conflict = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_batch_entry(
+                4,
+                vec![altered, second],
+                timestamp(4),
+            )],
+        )
+        .expect("mixed conflict/replay batch");
+        assert!(matches!(
+            &conflict.responses[0].result,
+            Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes))
+                if matches!(outcomes.as_slice(), [Err(StoreError::FencedTransitionRequestConflict), _])
+        ));
+
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = ?1 WHERE singleton = 1",
+            [checked_i64(
+                u64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - 1)
+                    .expect("bounded fixture"),
+            )
+            .expect("bounded count")],
+        )
+        .expect("leave one active receipt slot");
+        let third = fenced_transition_v2_request(0xC4, 1, "v2-batch-third");
+        let fourth = fenced_transition_v2_request(0xC5, 1, "v2-batch-fourth");
+        let full = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_batch_entry(
+                5,
+                vec![third.clone(), fourth.clone()],
+                timestamp(5),
+            )],
+        )
+        .expect("capacity-preflight batch");
+        let capacity_outcomes = match &full.responses[0].result {
+            Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)) => outcomes,
+            other => panic!("unexpected capacity-boundary result: {other:?}"),
+        };
+        assert_eq!(capacity_outcomes.len(), 2);
+        assert!(matches!(
+            capacity_outcomes[1],
+            Err(StoreError::FencedTransitionHistoryFull)
+        ));
+        assert_eq!(
+            read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &third),
+            Ok(FencedTransitionV2Status::Recorded(Box::new(
+                capacity_outcomes[0].clone(),
+            ))),
+            "the final available slot durably binds the ordered fresh prefix",
+        );
+        assert_eq!(
+            read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &fourth),
+            Ok(FencedTransitionV2Status::HistoryFull),
+        );
+        assert_eq!(
+            read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+                .expect("history after full batch")
+                .current_bound_count,
+            FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+            "the last capacity slot binds exactly the fresh batch prefix",
+        );
+        let (
+            application_sequence_after_capacity,
+            application_digest_after_capacity,
+            _,
+            watch_sequence_after_capacity,
+        ) = read_machine_sync(&conn, identity()).expect("machine after capacity-boundary apply");
+
+        let capacity_replay = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_batch_entry(
+                6,
+                vec![third.clone(), fourth.clone()],
+                timestamp(6),
+            )],
+        )
+        .expect("capacity-boundary exact replay");
+        assert_eq!(
+            capacity_replay.responses[0].result, full.responses[0].result,
+            "the bound prefix replays exactly while the unbound suffix remains full",
+        );
+        assert!(capacity_replay.notifications.is_empty());
+        let (replay_application_sequence, replay_application_digest, _, replay_watch_sequence) =
+            read_machine_sync(&conn, identity()).expect("machine after capacity replay");
+        assert_eq!(
+            (
+                replay_application_sequence,
+                replay_application_digest,
+                replay_watch_sequence,
+            ),
+            (
+                application_sequence_after_capacity,
+                application_digest_after_capacity,
+                watch_sequence_after_capacity,
+            ),
+            "exact replay must not advance the application or watch sequence or digest",
+        );
+
+        let capacity_conflict = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_batch_entry(
+                7,
+                vec![altered_fenced_transition_v2_request(&third), fourth],
+                timestamp(7),
+            )],
+        )
+        .expect("capacity-boundary conflicting retry");
+        assert!(matches!(
+            &capacity_conflict.responses[0].result,
+            Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes))
+                if matches!(outcomes.as_slice(), [
+                    Err(StoreError::FencedTransitionRequestConflict),
+                    Err(StoreError::FencedTransitionHistoryFull),
+                ])
+        ));
+        assert!(capacity_conflict.notifications.is_empty());
+        let (
+            conflict_application_sequence,
+            conflict_application_digest,
+            _,
+            conflict_watch_sequence,
+        ) = read_machine_sync(&conn, identity()).expect("machine after capacity conflict");
+        assert_eq!(
+            (
+                conflict_application_sequence,
+                conflict_application_digest,
+                conflict_watch_sequence,
+            ),
+            (
+                application_sequence_after_capacity,
+                application_digest_after_capacity,
+                watch_sequence_after_capacity,
+            ),
+            "a conflicting bound prefix and full suffix must not advance application state",
+        );
+        assert_eq!(
+            read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+                .expect("history after capacity retries")
+                .current_bound_count,
+            FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+        );
     }
 }

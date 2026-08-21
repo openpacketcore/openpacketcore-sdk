@@ -1275,6 +1275,8 @@ impl ConsensusSessionStore {
         let current_bindings = topology_node_bindings(&current_topology);
         let desired_members = request.desired_consensus_node_ids();
         let desired_bindings = request.desired_node_bindings();
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let backend = backend.with_consensus_diagnostics(Arc::clone(&diagnostics));
         let (log_store, state_machine, storage_identity) = storage::open_with_pending_membership(
             &backend,
             snapshot_dir,
@@ -1309,7 +1311,17 @@ impl ConsensusSessionStore {
             local_node_id,
             linearizability.clone(),
             raft.metrics(),
+            // Reopened readiness and generic reads still require a fresh
+            // point-in-time quorum proof.
             LinearizableReadLease::Disabled,
+        );
+        let raw_v2_read_barrier = LinearizableReadBarrier::new(
+            local_node_id,
+            linearizability.clone(),
+            raft.metrics(),
+            // Reopened raw V2 admission alone may reuse the bounded,
+            // same-term leader lease.
+            LinearizableReadLease::Enabled,
         );
         let topology_summary = desired_topology.summary().clone();
         let topology_attestation_time_high_water = topology_summary
@@ -1317,31 +1329,60 @@ impl ConsensusSessionStore {
             .production_verified_at()
             .map(TopologyAttestationTime::unix_seconds)
             .unwrap_or(0);
-        let store = Self {
-            inner: Arc::new(ConsensusSessionStoreInner {
-                raft,
-                raft_handler,
-                backend,
-                storage_identity,
-                local_node_id,
-                peer_directory,
-                topology_coordinator,
-                bootstrap_members: current_members,
-                bootstrap_bindings: current_bindings,
-                topology: topology_summary,
-                clock: Arc::new(SystemClock),
-                operation_timeout: DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
-                admitted: Arc::new(AtomicBool::new(false)),
-                topology_attestation_time_high_water: AtomicU64::new(
-                    topology_attestation_time_high_water,
-                ),
-                linearizability,
-                read_barrier,
-                proposal_admission: Arc::new(tokio::sync::Semaphore::new(
-                    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
-                )),
-            }),
-        };
+        let (logical_read_time, logical_read_time_receiver) = LogicalReadTimeSupervisor::new();
+        let (
+            fenced_transition_v2_status_logical_time_ingress,
+            fenced_transition_v2_status_logical_time_ingress_receiver,
+        ) = FencedTransitionV2StatusLogicalTimeIngressSupervisor::new();
+        let (
+            fenced_transition_v2_status_logical_time,
+            fenced_transition_v2_status_logical_time_receiver,
+        ) = FencedTransitionV2StatusLogicalTimeSupervisor::new();
+        let (fenced_transition_v2_status_batch, fenced_transition_v2_status_batch_receiver) =
+            FencedTransitionV2StatusBatchSupervisor::new();
+        let inner = Arc::new(ConsensusSessionStoreInner {
+            raft,
+            raft_handler,
+            backend,
+            storage_identity,
+            local_node_id,
+            peer_directory,
+            topology_coordinator,
+            bootstrap_members: current_members,
+            bootstrap_bindings: current_bindings,
+            topology: topology_summary,
+            clock: Arc::new(SystemClock),
+            operation_timeout: DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+            admitted: Arc::new(AtomicBool::new(false)),
+            topology_attestation_time_high_water: AtomicU64::new(
+                topology_attestation_time_high_water,
+            ),
+            linearizability,
+            read_barrier,
+            raw_v2_read_barrier,
+            logical_read_time,
+            fenced_transition_v2_status_logical_time_ingress,
+            fenced_transition_v2_status_logical_time,
+            fenced_transition_v2_status_batch,
+            proposal_admission: Arc::new(tokio::sync::Semaphore::new(
+                DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+            )),
+            diagnostics,
+        });
+        LogicalReadTimeSupervisor::start(logical_read_time_receiver, Arc::downgrade(&inner));
+        FencedTransitionV2StatusLogicalTimeIngressSupervisor::start(
+            fenced_transition_v2_status_logical_time_ingress_receiver,
+            Arc::downgrade(&inner),
+        );
+        FencedTransitionV2StatusLogicalTimeSupervisor::start(
+            fenced_transition_v2_status_logical_time_receiver,
+            Arc::downgrade(&inner),
+        );
+        FencedTransitionV2StatusBatchSupervisor::start(
+            fenced_transition_v2_status_batch_receiver,
+            Arc::downgrade(&inner),
+        );
+        let store = Self { inner };
         store
             .stage_topology_transition_peers(&request, desired_peers)
             .map_err(|_| ConsensusSessionStoreOpenError::PeerSetMismatch)?;

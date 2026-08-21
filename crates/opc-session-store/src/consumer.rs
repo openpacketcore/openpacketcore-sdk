@@ -15,6 +15,11 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
+use crate::consensus::types::{
+    validate_fenced_transition_v2_batch, MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES,
+};
 use crate::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
     FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
@@ -36,6 +41,18 @@ pub const MAX_SESSION_CONSUMER_BATCH_OPERATIONS: usize = 256;
 /// aggregate of otherwise individually valid point-read results before the
 /// quorum service retains them in a batch response.
 pub const MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum V2 fenced transitions admitted by one protected batch request.
+pub const MAX_SESSION_CONSUMER_V2_FENCED_TRANSITION_BATCH_OPERATIONS: usize =
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS;
+
+/// Maximum fully Postcard-encoded V2 fenced-transition batch request bytes.
+pub const MAX_SESSION_CONSUMER_V2_FENCED_TRANSITION_BATCH_REQUEST_BYTES: usize =
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES;
+
+/// Maximum fully Postcard-encoded V2 fenced-transition batch response bytes.
+pub const MAX_SESSION_CONSUMER_V2_FENCED_TRANSITION_BATCH_RESPONSE_BYTES: usize =
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES;
 
 /// Maximum projected watch bytes queued for one authenticated consumer.
 ///
@@ -599,6 +616,17 @@ pub enum SessionConsumerV2Operation {
         /// Complete canonical V2 transition body.
         request: Box<FencedTransitionV2Request>,
     },
+    /// Execute an ordered coalescing of independent protected V2 transitions.
+    ///
+    /// Every item carries its complete 56-byte identity. The outer batch
+    /// request ID is intentionally absent here: the quorum store derives its
+    /// durable command identity from the ordered full IDs at dispatch time.
+    /// One physical command is an optimization; this is not an all-or-nothing
+    /// multi-key transaction and every item keeps its own status identity.
+    FencedTransitionV2Batch {
+        /// Canonical ordered V2 transition bodies.
+        requests: Vec<FencedTransitionV2Request>,
+    },
     /// Read status for exactly one complete V2 transition body.
     FencedTransitionV2Status {
         /// Complete canonical V2 transition body.
@@ -612,6 +640,7 @@ impl fmt::Debug for SessionConsumerV2Operation {
             Self::FencedTransitionV2Capability => "FencedTransitionV2Capability",
             Self::FencedTransitionV2HistoryState => "FencedTransitionV2HistoryState",
             Self::FencedTransitionV2 { .. } => "FencedTransitionV2",
+            Self::FencedTransitionV2Batch { .. } => "FencedTransitionV2Batch",
             Self::FencedTransitionV2Status { .. } => "FencedTransitionV2Status",
         };
         formatter.write_str(name)
@@ -624,7 +653,9 @@ impl SessionConsumerV2Operation {
             Self::FencedTransitionV2 { request } | Self::FencedTransitionV2Status { request } => {
                 Some(request.request_id())
             }
-            Self::FencedTransitionV2Capability | Self::FencedTransitionV2HistoryState => None,
+            Self::FencedTransitionV2Capability
+            | Self::FencedTransitionV2HistoryState
+            | Self::FencedTransitionV2Batch { .. } => None,
         }
     }
 
@@ -643,8 +674,21 @@ impl SessionConsumerV2Operation {
                     Err(_) => Err(SessionConsumerRejection::MalformedRequest),
                 }
             }
+            Self::FencedTransitionV2Batch { requests } => {
+                validate_fenced_transition_v2_batch(requests)
+                    .map_err(|_| SessionConsumerRejection::MalformedRequest)
+            }
             Self::FencedTransitionV2Capability | Self::FencedTransitionV2HistoryState => Ok(()),
         }
+    }
+
+    /// Whether this operation may have crossed a state-machine effect point
+    /// after it has been accepted for quorum dispatch.
+    pub const fn is_effectful(&self) -> bool {
+        matches!(
+            self,
+            Self::FencedTransitionV2 { .. } | Self::FencedTransitionV2Batch { .. }
+        )
     }
 }
 
@@ -679,8 +723,10 @@ impl SessionConsumerV2Request {
         self.scope
     }
 
-    /// Full V2 stable identity for execute/status, if this is an effectful
-    /// V2 operation.
+    /// Full V2 stable identity for singleton execute/status, if present.
+    ///
+    /// A V2 batch deliberately has no caller-controlled outer identity: its
+    /// durable batch ID is derived by the store from ordered full item IDs.
     pub const fn request_id(&self) -> Option<FencedTransitionV2RequestId> {
         self.request_id
     }
@@ -1046,6 +1092,23 @@ impl SessionConsumerV2FencedTransitionError {
         )
     }
 
+    /// Whether the error is a deterministic admission result that is known
+    /// not to have crossed the effect boundary.  This is narrower than the
+    /// recorded-receipt set: it is used only to safely reuse a live call lane.
+    pub fn is_pre_dispatch_deterministic(self) -> bool {
+        self.is_wire_valid()
+            && matches!(
+                self,
+                Self::RequestConflict
+                    | Self::Retired
+                    | Self::EpochNotActive
+                    | Self::Expired
+                    | Self::HistoryFull
+                    | Self::RetentionExhausted
+                    | Self::StorageExhausted
+            )
+    }
+
     /// Project a deterministic V2 receipt error into its closed wire form.
     ///
     /// Only errors that the V2 consensus command can durably retain are
@@ -1119,6 +1182,127 @@ impl SessionConsumerV2FencedTransitionError {
             Self::StorageExhausted => StoreError::FencedTransitionStorageExhausted,
         }
     }
+}
+
+/// Exact correlated result for one item in a protected V2 batch.
+///
+/// The complete V2 request ID is repeated beside its result so callers can
+/// recover each outcome without relying on a position or a truncated ID.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsumerV2FencedTransitionBatchResult {
+    request_id: FencedTransitionV2RequestId,
+    result: Result<FencedTransitionOutcome, SessionConsumerV2FencedTransitionError>,
+}
+
+impl SessionConsumerV2FencedTransitionBatchResult {
+    /// Construct one exact V2 batch item result.
+    pub const fn new(
+        request_id: FencedTransitionV2RequestId,
+        result: Result<FencedTransitionOutcome, SessionConsumerV2FencedTransitionError>,
+    ) -> Self {
+        Self { request_id, result }
+    }
+
+    /// Complete 56-byte request identity correlated with this result.
+    pub const fn request_id(&self) -> FencedTransitionV2RequestId {
+        self.request_id
+    }
+
+    /// Deterministic success or safe V2 execution error for this item.
+    pub const fn result(
+        &self,
+    ) -> &Result<FencedTransitionOutcome, SessionConsumerV2FencedTransitionError> {
+        &self.result
+    }
+}
+
+impl fmt::Debug for SessionConsumerV2FencedTransitionBatchResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerV2FencedTransitionBatchResult(<redacted>)")
+    }
+}
+
+/// Safe batch-level error for a protected V2 transition batch.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub enum SessionConsumerV2FencedTransitionBatchError {
+    /// A deterministic request-level error represented by the common safe
+    /// consumer error family.
+    Store(SessionConsumerStoreError),
+    /// The batch may have crossed its effect point. Every item identity is
+    /// retained for exact singleton-status recovery; automatic replay is
+    /// forbidden.
+    OutcomeUnknown {
+        /// Ordered complete V2 request identities from the ambiguous batch.
+        request_ids: Vec<FencedTransitionV2RequestId>,
+    },
+}
+
+impl SessionConsumerV2FencedTransitionBatchError {
+    /// Build the explicit ambiguous-outcome classification for one batch.
+    pub fn outcome_unknown(
+        request_ids: Vec<FencedTransitionV2RequestId>,
+    ) -> Result<Self, SessionConsumerRejection> {
+        validate_v2_batch_ids(&request_ids)?;
+        Ok(Self::OutcomeUnknown { request_ids })
+    }
+
+    /// Validate fixed correlation and full encoded response bounds.
+    pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
+        match self {
+            Self::Store(_) => Ok(()),
+            Self::OutcomeUnknown { request_ids } => validate_v2_batch_ids(request_ids),
+        }
+    }
+}
+
+impl fmt::Debug for SessionConsumerV2FencedTransitionBatchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerV2FencedTransitionBatchError(<redacted>)")
+    }
+}
+
+impl From<StoreError> for SessionConsumerV2FencedTransitionBatchError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(SessionConsumerStoreError::from(error))
+    }
+}
+
+/// Validate ordered protected V2 batch response items before transmission.
+pub fn validate_session_consumer_v2_fenced_transition_batch_results(
+    results: &[SessionConsumerV2FencedTransitionBatchResult],
+) -> Result<(), SessionConsumerRejection> {
+    let ids = results
+        .iter()
+        .map(SessionConsumerV2FencedTransitionBatchResult::request_id)
+        .collect::<Vec<_>>();
+    validate_v2_batch_ids(&ids)?;
+    let encoded = opc_consensus::encode_bounded(results)
+        .map_err(|_| SessionConsumerRejection::MalformedRequest)?;
+    if encoded.len() > MAX_SESSION_CONSUMER_V2_FENCED_TRANSITION_BATCH_RESPONSE_BYTES {
+        return Err(SessionConsumerRejection::MalformedRequest);
+    }
+    Ok(())
+}
+
+fn validate_v2_batch_ids(
+    request_ids: &[FencedTransitionV2RequestId],
+) -> Result<(), SessionConsumerRejection> {
+    if request_ids.is_empty()
+        || request_ids.len() > MAX_SESSION_CONSUMER_V2_FENCED_TRANSITION_BATCH_OPERATIONS
+    {
+        return Err(SessionConsumerRejection::MalformedRequest);
+    }
+    let epoch = request_ids[0].epoch();
+    let mut ids = BTreeSet::new();
+    for request_id in request_ids {
+        if request_id.epoch() != epoch || !ids.insert(request_id.to_bytes()) {
+            return Err(SessionConsumerRejection::MalformedRequest);
+        }
+    }
+    Ok(())
 }
 
 impl From<StoreError> for SessionConsumerFencedTransitionError {
@@ -1475,6 +1659,13 @@ pub enum SessionConsumerV2Response {
     ),
     /// Exact V2 execution result.
     FencedTransitionV2(Result<FencedTransitionOutcome, SessionConsumerV2FencedTransitionError>),
+    /// Ordered, full-ID-correlated V2 batch execution result.
+    FencedTransitionV2Batch(
+        Result<
+            Vec<SessionConsumerV2FencedTransitionBatchResult>,
+            SessionConsumerV2FencedTransitionBatchError,
+        >,
+    ),
     /// Exact V2 retained-status result.
     FencedTransitionV2Status(
         Result<SessionConsumerV2FencedTransitionStatus, SessionConsumerStoreError>,
@@ -1489,6 +1680,7 @@ impl fmt::Debug for SessionConsumerV2Response {
             Self::FencedTransitionV2Capability(_) => "FencedTransitionV2Capability",
             Self::FencedTransitionV2HistoryState(_) => "FencedTransitionV2HistoryState",
             Self::FencedTransitionV2(_) => "FencedTransitionV2",
+            Self::FencedTransitionV2Batch(_) => "FencedTransitionV2Batch",
             Self::FencedTransitionV2Status(_) => "FencedTransitionV2Status",
             Self::Rejected(_) => "Rejected",
         };
@@ -2051,6 +2243,55 @@ mod tests {
         assert_eq!(
             request.validate(),
             Err(StoreError::FencedTransitionRequestConflict)
+        );
+    }
+
+    #[test]
+    fn v2_batch_admits_only_unique_same_epoch_items_and_returns_full_id_correlation() {
+        let make = |nonce, id| {
+            let transition = transition(id);
+            FencedTransitionV2Request::new(
+                FencedTransitionV2HistoryEpoch::new(7).expect("epoch"),
+                FencedTransitionV2CallerNonce::from_bytes([nonce; 16]),
+                transition.lease().clone(),
+                transition.mutation().clone(),
+            )
+            .expect("V2 transition")
+        };
+        let first = make(0x61, 0x62);
+        let second = make(0x63, 0x64);
+        let request = SessionConsumerV2Request::new(
+            scope(2, 1),
+            SessionConsumerV2Operation::FencedTransitionV2Batch {
+                requests: vec![first.clone(), second.clone()],
+            },
+        );
+        assert_eq!(request.request_id(), None);
+        assert!(request.validate().is_ok());
+        assert!(request.operation().is_effectful());
+
+        let duplicate = SessionConsumerV2Request::new(
+            scope(2, 1),
+            SessionConsumerV2Operation::FencedTransitionV2Batch {
+                requests: vec![first.clone(), first.clone()],
+            },
+        );
+        assert_eq!(
+            duplicate.validate(),
+            Err(SessionConsumerRejection::MalformedRequest)
+        );
+        let ambiguous = super::SessionConsumerV2FencedTransitionBatchError::outcome_unknown(vec![
+            first.request_id(),
+            second.request_id(),
+        ])
+        .expect("unique full IDs");
+        let response = SessionConsumerV2Response::FencedTransitionV2Batch(Err(ambiguous));
+        assert_eq!(
+            serde_json::from_str::<SessionConsumerV2Response>(
+                &serde_json::to_string(&response).expect("response encodes"),
+            )
+            .expect("response decodes"),
+            response,
         );
     }
 

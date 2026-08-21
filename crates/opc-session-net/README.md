@@ -246,10 +246,17 @@ and compatibility fresh-authentication typed least-authority surface required by
 `PersistentSessionConsumerClient` with `SessionQuorumConsumerServer` is the
 required warm fixed-pool primitive for #695/ePDG latency. Production deployments
 that require warm reuse should use it. Both use mutual TLS with the unchanged
-`opc-session-consumer/1` ALPN and exact consumer transport revision 4. Earlier
-revisions will not fall back or interoperate. The unreleased SDK requires one
-coordinated, drained client/listener cutover; there is no dual mode. Revision-4
-private JSON DTO bytes are canonical; reordered or
+`opc-session-consumer/1` ALPN and exact consumer transport revision 4. The
+additive V2 fenced-transition family instead uses only
+`opc-session-consumer/2` with transport revision 5. A V2 offer never falls
+back to V1, and neither revision reuses the other's authenticated connection,
+Hello, or JSON envelope. A listener may provision both exact ALPNs during a
+cutover, but a V2-only operation requires a revision-5-capable listener and
+client; a V1-only peer fails before dispatch. Deploy listener support and any
+required V2 store/journal provisioning before enabling the explicit V2 API,
+then drain V2 callers before removing it. This is coexistence of separate
+protocols, not dual-mode negotiation or mixed-revision equivalence.
+Revision-4 V1 and revision-5 V2 private JSON DTO bytes are canonical; reordered or
 otherwise noncanonical encodings, aliases, omissions, and unknown fields fail
 closed. This does not add `RemoteSessionBackend` or any
 consensus/replication/snapshot/rebuild/membership/admin authority, and it
@@ -257,6 +264,15 @@ retains #696's generic, single-record atomic fenced-transition capability,
 observation, execution, and exact-status operations, and adds exact retained
 status recovery for ordinary acquire, renew, and release requests. Product
 composition and ePDG-specific semantics remain excluded.
+
+V2 is deliberately narrower: its only typed operations are V2 capability,
+active-history state, one epoch-fenced transition, and exact V2 transition
+status. It does not expose raw consensus, replication, membership, or product
+roster/policy authority. A protected `EncryptingSessionBackend` or
+`RemoteSealingSessionBackend` must independently be configured with the
+separately scoped `FencedTransitionV2PreparedJournal` described in the
+session-store README; V2 transport does not create, substitute for, or fall
+back to that durable recovery boundary.
 
 For a fenced transition, the public consumer request ID is byte-identical to
 the nested transition ID. The internal receipt ID is domain-separated by
@@ -282,6 +298,27 @@ absolutely; queue wait/age is at most 250 ms. Watches have two separate slots
 by default and at most 16 configured slots, so they cannot consume request
 capacity.
 
+`PersistentSessionConsumerClient` keeps an additional, independent fixed V2
+request pool of the same configured width. `prewarm_v2` establishes those
+revision-5 lanes without a V2 operation, `execute_v2` uses only a V2 lane, and
+`v2_diagnostics` reports only that pool's redaction-safe counters. Each V1 or
+V2 lane still permits one in-flight request. Their queues and sockets are
+never cross-reused, but both pools share a bounded physical request-admission
+ceiling sized so their legal V1 and V2 widths can coexist. This preserves
+least authority without adding per-subscriber connections, tasks, channels, or
+pools. DNS resolution, TCP, TLS, and the authenticated Hello occur only while
+establishing or re-establishing that lane, never while reusing an established
+lane.
+
+One continuously owned actor holds both TLS halves and the physical permits
+for each V2 lane. Its decoder grows the single retained frame only in fixed
+8 KiB chunks as bytes arrive rather than reserving the 16 MiB frame ceiling per
+lane. Authenticated unsolicited plaintext creates bounded, front-priority
+protocol debt. That debt survives reaping and prewarm, never counts as an
+authenticated lane or ready capacity, and the next logical checkout consumes
+it as `NotTransmitted` before selecting, reconnecting, or writing on a lane;
+prewarm independently restores the configured physical lane width.
+
 An establishment has a 1,500 ms setup limit and a call makes at most two
 pre-write attempts. Resolution occurs only when establishing or
 re-establishing a connection. With two attempts there is one between-attempt
@@ -301,9 +338,10 @@ digest used only to compute bounded jitter; neither identities nor digest bytes
 enter diagnostics. A rejected same-epoch material publication retains the
 authenticated lane.
 
-One stateless client lineage shares fail-fast physical-admission caps of 16
-request connections and 16 watch connections across its clones. The permits are
-acquired before resolve/TCP and remain held for the physical connection
+One stateless client lineage shares a bounded physical-admission ceiling across
+its clones: request admission is sized for the legal simultaneous fixed V1 and
+V2 persistent widths, and watch admission remains capped at 16. The permits
+are acquired before resolve/TCP and remain held for the physical connection
 lifetime, including for persistent clients derived from that lineage.
 Independent stateless constructors create independent logical clients, as
 independent persistent constructors do. The typed persistent watch surface
@@ -349,6 +387,19 @@ claim. Synthetic warm evidence gates only the structural accept/reuse method;
 its elapsed samples are explicitly non-gating. The exact method and bounded raw
 samples are retained in
 [`qualification-695-persistent-consumer.md`](../../docs/qualification-695-persistent-consumer.md).
+
+For stateless and persistent V2 calls, `execute_v2` returns the same exact
+effect-boundary error. `NotTransmitted` means the transport proved that zero
+Call-frame bytes were accepted.
+`ReadUnavailable` means a post-write read failed for a non-effectful V2
+capability/history/status operation and can be retried as that read.
+`OutcomeUnknown { request_id }` means a V2 fenced transition may have reached
+the service; the lane is discarded, the caller retains that exact stable V2
+request ID and complete body, and recovery uses exact V2 status rather than a
+successor ID or replay on another lane. Reauthentication, accepted material
+rotation, idle/lifecycle retirement, and the public bounded shutdown apply to
+both ALPN-isolated pools; shutdown begins both drains together so V2 cannot add
+a second drain window.
 
 The revision-2 persistent-consumer transport qualification contract remains
 recorded in the v7 profile and the published v6 profile remains the unchanged

@@ -99,24 +99,27 @@ pub use capability::{
 };
 pub use clock::{Clock, MonotonicClock, SystemClock, TokioVirtualClock};
 pub use consensus::types::{
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES,
     SESSION_CONSENSUS_V2_APPLIED_DIGEST_ENCODING_VERSION,
     SESSION_CONSENSUS_V2_APPLIED_DIGEST_SCHEMA_DESCRIPTOR,
     SESSION_CONSENSUS_V2_COMMAND_WIRE_SCHEMA_DESCRIPTOR,
 };
 pub use consensus::{
     validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
-    ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusClusterId,
-    SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-    SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusIdentityError,
-    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpc,
-    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusStatus,
-    SessionConsensusStorageAnchor, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionMutationIntent, SessionMutationOutcome, SessionTopologyCandidateBootstrap,
-    SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
-    SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
-    SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    ConsensusSessionStore, ConsensusSessionStoreOpenError, ConsensusStoreDiagnosticSnapshot,
+    SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
+    SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusIdentity,
+    SessionConsensusIdentityError, SessionConsensusNodeId, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusRequestId, SessionConsensusResponse,
+    SessionConsensusRpc, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
+    SessionConsensusStatus, SessionConsensusStorageAnchor, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionMutationIntent, SessionMutationOutcome,
+    SessionTopologyCandidateBootstrap, SessionTopologyTransitionPeers,
+    SessionTopologyTransportAdmission, SessionTopologyTransportAdmissionError,
+    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
+    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 pub use consumer::{
     derive_consumer_consensus_request_id, session_consumer_batch_result,
@@ -155,10 +158,14 @@ pub use fenced_transition::{
     FENCED_TRANSITION_V2_COMMAND_TRANSPORT_SCHEMA_DESCRIPTOR,
     FENCED_TRANSITION_V2_COMMAND_TRANSPORT_SCHEMA_REVISION,
     FENCED_TRANSITION_V2_CONSENSUS_SCHEMA_VERSION, FENCED_TRANSITION_V2_ERROR_STATUS_REVISION,
-    FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH, FENCED_TRANSITION_V2_MAX_DURABLE_GENERATION,
-    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_HISTORY_EPOCH,
+    FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH, FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS,
+    FENCED_TRANSITION_V2_MAX_DURABLE_GENERATION, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_MAX_HISTORY_EPOCH,
     FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
-    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, FENCED_TRANSITION_V2_MAX_TIMESTAMP_UNIX_SECONDS,
+    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS,
+    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES,
+    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_MAX_TIMESTAMP_UNIX_SECONDS,
     FENCED_TRANSITION_V2_MIN_CONSENSUS_RPC_PAYLOAD_BYTES,
     FENCED_TRANSITION_V2_MIN_DURABLE_LOG_ENTRY_BYTES,
     FENCED_TRANSITION_V2_MIN_TIMESTAMP_UNIX_SECONDS,
@@ -177,7 +184,9 @@ pub use fenced_transition::{
     FENCED_TRANSITION_V2_VALIDATION_SCHEMA_REVISION,
 };
 pub use fenced_transition_journal::{
-    PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
+    FencedTransitionV2JournalScope, FencedTransitionV2PreparedJournal,
+    FencedTransitionV2PreparedJournalKey, PreparedFencedTransitionJournal,
+    PreparedFencedTransitionJournalKey, FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES,
     PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES,
 };
 pub use handover::{

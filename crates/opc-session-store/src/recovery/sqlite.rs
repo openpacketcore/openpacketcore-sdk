@@ -26,9 +26,10 @@ use crate::consensus::{
 use crate::sqlite::{consensus, ops};
 use crate::{
     ReplicationEntry, ReplicationTxId, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
-    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES,
-    FENCED_TRANSITION_V2_REQUEST_ID_BYTES, REPLICATION_TX_ID_MAX_BYTES,
-    REPLICATION_TX_ID_MIN_BYTES,
+    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS,
+    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES, FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
+    REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 
 const PATH_MAX_BYTES: usize = 4_096;
@@ -793,7 +794,7 @@ fn preflight_fenced_transition_receipt_count(conn: &Connection) -> Result<usize,
 /// resource limits: accepting a larger persisted ledger would redefine V2.
 fn preflight_fenced_transition_v2_receipt_count(conn: &Connection) -> Result<usize, RecoveryError> {
     let limit = i64::try_from(
-        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+        FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES
             .checked_add(1)
             .ok_or(RecoveryError::CorruptReplica)?,
     )
@@ -806,7 +807,7 @@ fn preflight_fenced_transition_v2_receipt_count(conn: &Connection) -> Result<usi
         )
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let count = usize::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
-    if count > FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
+    if count > FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES {
         return Err(RecoveryError::CorruptReplica);
     }
     Ok(count)
@@ -899,15 +900,10 @@ fn validate_fenced_transition_v2_recovery_state(
     if bound_count > FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
         return Err(RecoveryError::CorruptReplica);
     }
-    let active_epoch = match active_epoch {
-        Some(value) => Some(
-            u64::try_from(value)
-                .ok()
-                .filter(|value| *value != 0)
-                .ok_or(RecoveryError::CorruptReplica)?,
-        ),
-        None => None,
-    };
+    let active_epoch = u64::try_from(active_epoch.ok_or(RecoveryError::CorruptReplica)?)
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or(RecoveryError::CorruptReplica)?;
     let reclaim_epoch = match reclaim_epoch {
         Some(value) => Some(
             u64::try_from(value)
@@ -1031,66 +1027,90 @@ fn validate_fenced_transition_v2_recovery_state(
     drop(receipt_rows);
     drop(statement);
 
-    match (
-        active_epoch,
-        reclaim_epoch,
-        reclaim_cursor,
-        reclaim_remaining,
-    ) {
-        (Some(active), None, None, None)
-            if (retired_through == 0 && active == 1)
-                || retired_through
-                    .checked_add(1)
-                    .is_some_and(|expected| active == expected) =>
-        {
-            if receipts.len() != bound_count
-                || receipts
-                    .iter()
-                    .enumerate()
-                    .any(|(offset, (epoch, ordinal))| {
-                        *epoch != active || *ordinal != u64::try_from(offset + 1).unwrap_or(0)
-                    })
-            {
+    let maximum_history_entries = u64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let retained_epochs = active_epoch.checked_sub(retired_through);
+    let reclaiming = match (reclaim_epoch, reclaim_cursor, reclaim_remaining) {
+        (None, None, None) => {
+            if !retained_epochs.is_some_and(|count| {
+                (1..=u64::try_from(FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS + 1).unwrap_or(u64::MAX))
+                    .contains(&count)
+            }) {
                 return Err(RecoveryError::CorruptReplica);
             }
+            false
         }
-        (None, Some(reclaim), Some(cursor), Some(remaining))
-            if reclaim == retired_through
-                && reclaim != 0
-                && bound_count == 0
-                && (1..=FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES).contains(&remaining)
-                && cursor
-                    .checked_add(remaining as u64)
-                    .is_some_and(|original_count| {
-                        original_count <= FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64
-                    }) =>
-        {
-            let observed_remaining = receipts
-                .iter()
-                .filter(|(epoch, ordinal)| *epoch == reclaim && *ordinal > cursor)
-                .count();
-            if observed_remaining != remaining
-                || receipts
-                    .iter()
-                    .enumerate()
-                    .any(|(offset, (epoch, ordinal))| {
-                        *epoch != reclaim
-                            || *ordinal
-                                != cursor
-                                    .checked_add(u64::try_from(offset + 1).unwrap_or(0))
-                                    .unwrap_or(0)
-                    })
+        (Some(reclaim), Some(cursor), Some(remaining)) => {
+            if reclaim != retired_through
+                || !retained_epochs.is_some_and(|count| {
+                    (1..=u64::try_from(FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS).unwrap_or(u64::MAX))
+                        .contains(&count)
+                })
+                || !(1..=FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES).contains(&remaining)
+                || cursor.checked_add(
+                    u64::try_from(remaining).map_err(|_| RecoveryError::CorruptReplica)?,
+                ) != Some(maximum_history_entries)
             {
                 return Err(RecoveryError::CorruptReplica);
             }
+            true
         }
         _ => return Err(RecoveryError::CorruptReplica),
+    };
+    let minimum_epoch = if reclaiming {
+        retired_through
+    } else {
+        retired_through
+            .checked_add(1)
+            .ok_or(RecoveryError::CorruptReplica)?
+    };
+    let mut epoch_counts = BTreeMap::<u64, usize>::new();
+    let mut previous_ordinals = BTreeMap::<u64, u64>::new();
+    for (epoch, ordinal) in receipts {
+        if !(minimum_epoch..=active_epoch).contains(&epoch) {
+            return Err(RecoveryError::CorruptReplica);
+        }
+        let expected_ordinal = previous_ordinals
+            .get(&epoch)
+            .copied()
+            .unwrap_or_else(|| {
+                if reclaim_epoch == Some(epoch) {
+                    reclaim_cursor.unwrap_or(0)
+                } else {
+                    0
+                }
+            })
+            .checked_add(1)
+            .ok_or(RecoveryError::CorruptReplica)?;
+        if ordinal != expected_ordinal {
+            return Err(RecoveryError::CorruptReplica);
+        }
+        previous_ordinals.insert(epoch, ordinal);
+        let count = epoch_counts.entry(epoch).or_default();
+        *count = count.checked_add(1).ok_or(RecoveryError::CorruptReplica)?;
+        if *count > FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
+            return Err(RecoveryError::CorruptReplica);
+        }
     }
-    if receipts
-        .iter()
-        .any(|(epoch, _)| *epoch <= retired_through && reclaim_epoch != Some(*epoch))
-    {
+    if epoch_counts.get(&active_epoch).copied().unwrap_or(0) != bound_count {
         return Err(RecoveryError::CorruptReplica);
+    }
+    for epoch in minimum_epoch..=active_epoch {
+        let count = epoch_counts.get(&epoch).copied().unwrap_or(0);
+        if !consensus::fenced_transition_v2_closed_epoch_is_exact(
+            epoch,
+            active_epoch,
+            reclaim_epoch,
+            reclaim_cursor,
+            reclaim_remaining
+                .map(|remaining| {
+                    u64::try_from(remaining).map_err(|_| RecoveryError::CorruptReplica)
+                })
+                .transpose()?,
+            count,
+        ) {
+            return Err(RecoveryError::CorruptReplica);
+        }
     }
     consensus::validate_fenced_transition_v2_receipts_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
@@ -4842,6 +4862,83 @@ mod terminal_history_digest_tests {
     }
 
     #[test]
+    fn offline_recovery_rejects_a_truncated_closed_v2_epoch() {
+        let conn = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .expect("canonical database");
+        conn.execute_batch(
+            r#"
+CREATE TABLE consensus_fenced_transition_v2_history (
+    singleton INTEGER PRIMARY KEY,
+    storage_configuration_epoch INTEGER NOT NULL,
+    profile_digest BLOB NOT NULL,
+    active_epoch INTEGER NOT NULL,
+    retired_through_epoch INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    current_bound_count INTEGER NOT NULL,
+    reclaim_epoch INTEGER,
+    reclaim_cursor_ordinal INTEGER,
+    reclaim_remaining INTEGER,
+    reclaimed_entries INTEGER NOT NULL
+);
+CREATE TABLE consensus_fenced_transition_v2_activation (singleton INTEGER PRIMARY KEY);
+CREATE TABLE consensus_fenced_transition_v2_receipts (
+    request_id BLOB NOT NULL,
+    history_epoch INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    configuration_epoch INTEGER NOT NULL,
+    payload_digest BLOB NOT NULL,
+    retained_until TEXT NOT NULL,
+    binding_digest BLOB NOT NULL,
+    response_json BLOB,
+    response_digest BLOB
+);
+"#,
+        )
+        .expect("install V2 recovery fixture");
+        let identity = SessionConsensusIdentity::new(
+            crate::consensus::SessionConsensusClusterId::from_bytes([0x71; 32]),
+            SessionConsensusConfigurationId::from_bytes([0x72; 32]),
+            SessionConsensusConfigurationEpoch::new(1).expect("configuration epoch"),
+        );
+        conn.execute(
+            "INSERT INTO consensus_fenced_transition_v2_history VALUES (1, 1, ?1, 2, 0, 0, 0, NULL, NULL, NULL, 0)",
+            [crate::fenced_transition::fenced_transition_v2_profile_digest().as_slice()],
+        )
+        .expect("insert truncated closed epoch");
+        let mut request_id = [0_u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES];
+        request_id[..8].copy_from_slice(&1_u64.to_be_bytes());
+        request_id[48..].copy_from_slice(&1_u64.to_be_bytes());
+        let retained_until = "2026-08-17T00:00:00.000000000Z";
+        let payload_digest =
+            consensus::fenced_transition_v2_payload_digest_for_request_id(identity, request_id)
+                .expect("payload digest");
+        let binding_digest = consensus::fenced_transition_v2_receipt_binding_digest(
+            identity,
+            request_id,
+            1,
+            1,
+            payload_digest,
+            retained_until,
+        )
+        .expect("binding digest");
+        conn.execute(
+            "INSERT INTO consensus_fenced_transition_v2_receipts VALUES (?1, 1, 1, 1, ?2, ?3, ?4, NULL, NULL)",
+            rusqlite::params![
+                request_id.as_slice(),
+                payload_digest.as_slice(),
+                retained_until,
+                binding_digest.as_slice(),
+            ],
+        )
+        .expect("insert truncated receipt");
+
+        assert!(matches!(
+            validate_fenced_transition_v2_recovery_state(&conn, identity),
+            Err(RecoveryError::CorruptReplica)
+        ));
+    }
+
+    #[test]
     fn terminal_history_changes_the_recovery_branch_digest() {
         let missing_history = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
             .expect("canonical database");
@@ -5049,14 +5146,22 @@ mod terminal_history_digest_tests {
         conn.execute_batch(
             r#"
 WITH digits(value) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)),
-ordinals(value) AS (
-    SELECT a.value + 10 * b.value + 100 * c.value + 1000 * d.value
-         + 10000 * e.value + 100000 * f.value
+thousands(value) AS (
+    SELECT a.value + 10 * b.value + 100 * c.value
     FROM digits AS a CROSS JOIN digits AS b CROSS JOIN digits AS c
-    CROSS JOIN digits AS d CROSS JOIN digits AS e CROSS JOIN digits AS f
+),
+ordinals(value) AS (
+    SELECT low.value + 1000 * high.value
+    FROM thousands AS low CROSS JOIN thousands AS high
+    UNION ALL
+    SELECT 1000000 + low.value + 1000 * high.value
+    FROM thousands AS low CROSS JOIN thousands AS high
+    WHERE low.value + 1000 * high.value < 48577
 )
 INSERT INTO consensus_fenced_transition_v2_receipts (request_id)
-SELECT randomblob(56) FROM ordinals WHERE value < 131073;
+SELECT CAST(printf('%056d', value) AS BLOB)
+FROM ordinals
+WHERE value <= 1048576;
 "#,
         )
         .expect("one-over V2 receipt fixture");

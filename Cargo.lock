@@ -3662,6 +3662,7 @@ dependencies = [
  "opc-session-store",
  "opc-tls",
  "opc-types",
+ "rand 0.10.2",
  "rcgen",
  "rustls-pki-types",
  "serde",
