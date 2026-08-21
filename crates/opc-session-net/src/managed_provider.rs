@@ -29,6 +29,9 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::consensus::RemoteAddrResolver;
 use crate::error::classify_tls_io_error;
+use crate::protocol::{
+    write_frame_bounded_until_classified, FrameWriteError as ProtocolFrameWriteError,
+};
 
 /// The dedicated managed-provider ALPN. No predecessor ALPN is offered.
 pub const MANAGED_PROVIDER_JOB_ALPN: &[u8] = b"opc-session-consumer/5";
@@ -525,24 +528,19 @@ impl PersistentManagedProviderJobClient {
                 self.pool.counters.overload.fetch_add(1, Ordering::Relaxed);
                 ManagedProviderClientError::Overloaded
             })?;
-        let mut encoded = Vec::with_capacity(frame_bytes);
-        serde_json::to_writer(&mut encoded, &frame)
-            .map_err(|_| ManagedProviderClientError::Protocol)?;
-        if encoded.len() != frame_bytes {
-            return Err(ManagedProviderClientError::Protocol);
-        }
         let (reply_tx, reply_rx) = oneshot::channel();
         let key = job_key(&frame);
         let job = Job {
             key,
-            encoded: Arc::<[u8]>::from(encoded),
+            frame,
+            frame_bytes,
             deadline: tokio::time::Instant::now() + self.pool.config.queue_deadline,
             reply: reply_tx,
             _pending: pending,
             _bytes: bytes,
             _cell: cells,
         };
-        self.pool.track_enqueue(job.encoded.len());
+        self.pool.track_enqueue(job.frame_bytes);
         let tx = self
             .pool
             .scheduler
@@ -550,7 +548,7 @@ impl PersistentManagedProviderJobClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or(ManagedProviderClientError::Unavailable)?;
-        if tx.try_send(Command::Submit(job)).is_err() {
+        if tx.try_send(Command::Submit(Box::new(job))).is_err() {
             self.pool.release_enqueue(frame_bytes);
             self.pool.counters.overload.fetch_add(1, Ordering::Relaxed);
             return Err(ManagedProviderClientError::Overloaded);
@@ -781,7 +779,8 @@ fn job_key(request: &WireRequest) -> FairKey {
 }
 struct Job {
     key: FairKey,
-    encoded: Arc<[u8]>,
+    frame: WireRequest,
+    frame_bytes: usize,
     deadline: tokio::time::Instant,
     reply: oneshot::Sender<Result<ManagedProviderJobStatus, ManagedProviderClientError>>,
     _pending: OwnedSemaphorePermit,
@@ -789,7 +788,7 @@ struct Job {
     _cell: OwnedSemaphorePermit,
 }
 enum Command {
-    Submit(Job),
+    Submit(Box<Job>),
     Drain,
     Force,
 }
@@ -860,6 +859,7 @@ async fn scheduler(
         tokio::select! {
             command = commands.recv() => match command {
                 Some(Command::Submit(job)) => {
+                    let job = *job;
                     let Some(p) = pool.upgrade() else { return };
                     if Phase::load(&p.phase) != Phase::Running {
                         complete(&p, job, Err(ManagedProviderClientError::ShuttingDown));
@@ -950,7 +950,7 @@ fn complete(
     job: Job,
     result: Result<ManagedProviderJobStatus, ManagedProviderClientError>,
 ) {
-    pool.release_enqueue(job.encoded.len());
+    pool.release_enqueue(job.frame_bytes);
     let _ = job.reply.send(result);
 }
 
@@ -1014,8 +1014,14 @@ async fn lane_worker(
             let now = pool.counters.inflight.fetch_add(1, Ordering::Relaxed) + 1;
             high(&pool.counters.inflight_high_water, now);
             let key = job.key;
-            let result =
-                call_on_lane(&mut connection.0, &job.encoded, pool.config.response_bytes).await;
+            let result = call_on_lane(
+                &mut connection.0,
+                &job.frame,
+                pool.config.request_bytes,
+                pool.config.response_bytes,
+                job.deadline,
+            )
+            .await;
             pool.counters.inflight.fetch_sub(1, Ordering::Relaxed);
             match result {
                 Ok(value) => {
@@ -1117,16 +1123,26 @@ async fn connect_lane(pool: &Pool, voter: usize) -> Result<ClientLane, ManagedPr
 }
 async fn call_on_lane(
     connection: &mut ClientLane,
-    encoded: &[u8],
+    request: &WireRequest,
+    request_bound: usize,
     response_bound: usize,
+    deadline: tokio::time::Instant,
 ) -> Result<Result<ManagedProviderJobStatus, ManagedProviderClientError>, ManagedProviderClientError>
 {
-    write_raw(connection, encoded)
-        .await
-        .map_err(FrameWriteError::client_error)?;
-    let response: WireResponse = read_json(connection, response_bound)
-        .await
-        .map_err(|_| ManagedProviderClientError::OutcomeUnknown)?;
+    match write_frame_bounded_until_classified(connection, request, request_bound, deadline).await {
+        Ok(()) => {}
+        Err(ProtocolFrameWriteError::BeforeWrite(_)) => {
+            return Err(ManagedProviderClientError::Unavailable);
+        }
+        Err(ProtocolFrameWriteError::MayHaveWritten(_)) => {
+            return Err(ManagedProviderClientError::OutcomeUnknown);
+        }
+    }
+    let response: WireResponse =
+        tokio::time::timeout_at(deadline, read_json(connection, response_bound))
+            .await
+            .map_err(|_| ManagedProviderClientError::OutcomeUnknown)?
+            .map_err(|_| ManagedProviderClientError::OutcomeUnknown)?;
     match response {
         WireResponse::Call(result) => Ok(result.into_result()),
         _ => Err(ManagedProviderClientError::Protocol),
