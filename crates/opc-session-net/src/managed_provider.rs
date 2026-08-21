@@ -311,6 +311,17 @@ struct Counters {
     shutdown_drained: AtomicU64,
     shutdown_forced: AtomicU64,
 }
+
+struct ConnectionCounterGuard<'a> {
+    counters: &'a Counters,
+}
+
+impl Drop for ConnectionCounterGuard<'_> {
+    fn drop(&mut self) {
+        self.counters.connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn high(value: &AtomicU64, current: u64) {
     let mut old = value.load(Ordering::Relaxed);
     while current > old {
@@ -918,6 +929,9 @@ async fn lane_worker(
                 generation = generation.wrapping_add(1);
                 reconnect_attempt = 0;
                 pool.counters.connections.fetch_add(1, Ordering::Relaxed);
+                let connection_counter = ConnectionCounterGuard {
+                    counters: &pool.counters,
+                };
                 high(
                     &pool.counters.connection_high_water,
                     pool.counters.connections.load(Ordering::Relaxed),
@@ -925,7 +939,7 @@ async fn lane_worker(
                 if events.send(Event::Ready(index, generation)).await.is_err() {
                     return;
                 };
-                c
+                (c, connection_counter)
             }
             Err(_) => {
                 // Capped lane-local jitter prevents a failed voter from
@@ -956,7 +970,7 @@ async fn lane_worker(
             high(&pool.counters.inflight_high_water, now);
             let key = job.key;
             let result =
-                call_on_lane(&mut connection, &job.encoded, pool.config.response_bytes).await;
+                call_on_lane(&mut connection.0, &job.encoded, pool.config.response_bytes).await;
             pool.counters.inflight.fetch_sub(1, Ordering::Relaxed);
             match result {
                 Ok(value) => {
@@ -982,7 +996,7 @@ async fn lane_worker(
                 }
             }
         }
-        pool.counters.connections.fetch_sub(1, Ordering::Relaxed);
+        drop(connection.1);
         let _ = events.send(Event::Lost(index, generation, None)).await;
     }
 }
@@ -1557,9 +1571,105 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
+    use futures_util::future::BoxFuture;
+    use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
+    use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
+    use opc_session_store::SessionConsensusIdentity;
+    use opc_tls::TlsConfigBuilder;
+
     struct FaultWriter {
         limits: VecDeque<usize>,
         flush_fails: bool,
+    }
+
+    struct TestPki {
+        ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
+    }
+
+    impl TestPki {
+        fn new() -> Self {
+            let key = rcgen::KeyPair::generate().expect("test CA key");
+            let mut parameters = rcgen::CertificateParams::default();
+            parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            parameters
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "managed provider test CA");
+            Self {
+                ca: rcgen::CertifiedIssuer::self_signed(parameters, key)
+                    .expect("test CA certificate"),
+            }
+        }
+
+        fn client_config(&self, identity: &str) -> opc_tls::AuthenticatedClientConfig {
+            let (_source, receiver) = tokio::sync::watch::channel(Some(self.identity(identity)));
+            TlsConfigBuilder::new(receiver)
+                .allow_any_trusted_peer()
+                .build_authenticated_client_config()
+                .expect("test client mTLS configuration")
+        }
+
+        fn server_config(&self, identity: &str) -> opc_tls::AuthenticatedServerConfig {
+            let (_source, receiver) = tokio::sync::watch::channel(Some(self.identity(identity)));
+            TlsConfigBuilder::new(receiver)
+                .allow_any_trusted_peer()
+                .build_authenticated_server_config()
+                .expect("test server mTLS configuration")
+        }
+
+        fn identity(&self, identity: &str) -> opc_identity::IdentityState {
+            let mut parameters = rcgen::CertificateParams::default();
+            parameters
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "managed provider test leaf");
+            parameters.subject_alt_names.push(rcgen::SanType::URI(
+                rcgen::string::Ia5String::try_from(identity).expect("test SPIFFE URI"),
+            ));
+            let now = time::OffsetDateTime::now_utc();
+            parameters.not_before = now - time::Duration::days(1);
+            parameters.not_after = now + time::Duration::days(1);
+            let key = rcgen::KeyPair::generate().expect("test leaf key");
+            let certificate = parameters
+                .signed_by(&key, &self.ca)
+                .expect("test leaf certificate");
+            let certificates = parse_certs_pem(&(certificate.pem() + &self.ca.pem()))
+                .expect("test certificate chain");
+            let private_key = parse_key_pem(&key.serialize_pem()).expect("test private key");
+            let mut bundles = opc_identity::TrustBundleSet::new();
+            bundles.insert(TrustBundle {
+                trust_domain: opc_identity::TrustDomain::new("test.example")
+                    .expect("test trust domain"),
+                certificates: parse_certs_pem(&self.ca.pem()).expect("test trust bundle"),
+            });
+            build_identity_state(certificates, private_key, bundles).expect("test identity state")
+        }
+    }
+
+    struct NoopNetworkFacade;
+
+    #[async_trait]
+    impl ManagedProviderJobNetworkFacade for NoopNetworkFacade {
+        async fn run_member(
+            &self,
+            _: FencedMutationRosterAdmission,
+            _: Box<[u8]>,
+            _: FencedMutationRosterOrdinal,
+        ) -> Result<ManagedProviderJobStatus, ManagedProviderJobError> {
+            Ok(ManagedProviderJobStatus::new(
+                ManagedProviderJobMode::ManagedV5,
+                ManagedProviderJobMemberPhase::Established,
+            ))
+        }
+
+        async fn job_status(
+            &self,
+            _: FencedMutationRosterAdmission,
+            _: FencedMutationRosterOrdinal,
+        ) -> Result<ManagedProviderJobStatus, ManagedProviderJobError> {
+            Ok(ManagedProviderJobStatus::new(
+                ManagedProviderJobMode::ManagedV5,
+                ManagedProviderJobMemberPhase::Established,
+            ))
+        }
     }
 
     impl AsyncWrite for FaultWriter {
@@ -1658,6 +1768,89 @@ mod tests {
                 flush_fails,
             };
             assert_eq!(write_raw(&mut writer, b"body").await, Err(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn prefinal_real_tcp_rustls_exact_three_voter_prewarm_is_fixed_width() {
+        // This is deliberately a short host-local behavioral proof, not the
+        // deferred 960k production scale-qualification acceptance run.
+        let pki = TestPki::new();
+        let client_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/client";
+        let voter_identities = [
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/voter-0",
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/voter-1",
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/voter-2",
+        ];
+        let cluster = ConsensusClusterId::new("managed-provider-network-test")
+            .expect("test cluster identity");
+        let epoch = ConsensusConfigurationEpoch::new(1).expect("test epoch");
+        let scope = SessionConsumerScope::new(SessionConsensusIdentity::new(
+            cluster,
+            derive_configuration_id(cluster, epoch, &[]),
+            epoch,
+        ));
+        let facade = Arc::new(NoopNetworkFacade);
+        let client_spiffe = SpiffeId::new(client_identity).expect("client SPIFFE identity");
+        let mut handles = Vec::new();
+        let mut endpoints = Vec::new();
+        for identity in voter_identities {
+            let voter = SpiffeId::new(identity).expect("voter SPIFFE identity");
+            let (handle, address) = ManagedProviderJobServer::for_test(
+                facade.clone(),
+                pki.server_config(identity),
+                scope,
+                voter.clone(),
+                client_spiffe.clone(),
+            )
+            .with_max_connections(DEFAULT_MANAGED_PROVIDER_POOL_LANES * 2)
+            .listen("127.0.0.1:0".parse().expect("loopback address"))
+            .await
+            .expect("real host-local listener");
+            let resolver: RemoteAddrResolver = Arc::new(move || {
+                Box::pin(async move { Ok(address) }) as BoxFuture<'static, io::Result<_>>
+            });
+            endpoints.push(ManagedVoterEndpoint::new(
+                resolver,
+                ServerName::IpAddress(address.ip().into()),
+                voter,
+            ));
+            handles.push(handle);
+        }
+        let endpoints: [ManagedVoterEndpoint; MANAGED_PROVIDER_JOB_VOTERS] =
+            endpoints.try_into().expect("exactly three voter endpoints");
+        let client = PersistentManagedProviderJobClient::new(
+            ManagedProviderClientAuthority::new(scope, pki.client_config(client_identity))
+                .expect("authenticated client authority"),
+            endpoints,
+            ManagedProviderPoolConfig::try_new(
+                DEFAULT_MANAGED_PROVIDER_POOL_LANES,
+                DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES,
+                DEFAULT_MANAGED_PROVIDER_POOL_RESPONSE_BYTES,
+                Duration::from_millis(250),
+                Duration::from_secs(2),
+                Duration::from_millis(1),
+            )
+            .expect("short test shutdown drain"),
+        )
+        .expect("bounded client pool");
+
+        assert_eq!(client.prewarm().await, Ok(ManagedProviderReadiness::Ready));
+        let diagnostics = client.diagnostics();
+        assert_eq!(
+            diagnostics.connections,
+            DEFAULT_MANAGED_PROVIDER_POOL_LANES as u64 * 3
+        );
+        assert_eq!(
+            diagnostics.connection_high_water,
+            DEFAULT_MANAGED_PROVIDER_POOL_LANES as u64 * 3
+        );
+        let report = client.shutdown().await;
+        assert_eq!(report.remaining_connections, 0);
+        assert_eq!(report.remaining_tasks, 0);
+        for handle in handles {
+            handle.shutdown().await;
         }
     }
 }
