@@ -46,7 +46,7 @@ const LOGICAL_STATE_DOMAIN: &[u8] = b"openpacketcore/session-recovery/logical-st
 const FILE_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file/v1\0";
 const WORKFLOW_VERSION: u16 = 2;
 // Six base SQLite objects plus bounded consensus/recovery tables. V3 adds
-// three ledger objects and two required indexes; V4 independently adds four
+// three ledger objects and two required indexes; V5 independently adds four
 // roster objects and two required indexes.
 const MAX_CURRENT_SCHEMA_OBJECTS: usize = 34;
 const MAX_SCHEMA_SQL_BYTES: usize = 16_384;
@@ -415,7 +415,7 @@ fn inspect_current(
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let expected_schema_version = match roster_ledger_layout {
         consensus::FencedMutationRosterLedgerLayout::Activated => {
-            i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 3
+            consensus::FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT
         }
         consensus::FencedMutationRosterLedgerLayout::Absent => match v2_ledger_layout {
             consensus::FencedTransitionV2LedgerLayout::Activated => {
@@ -860,7 +860,7 @@ fn preflight_fenced_transition_v2_receipt_count(conn: &Connection) -> Result<usi
     Ok(count)
 }
 
-/// Probe the format-four parent cap before fetching even a single admission
+/// Probe the format-five parent cap before fetching even a single admission
 /// blob.  Members are separately bounded at eight per retained parent.
 fn preflight_fenced_mutation_roster_count(conn: &Connection) -> Result<usize, RecoveryError> {
     let limit = i64::try_from(

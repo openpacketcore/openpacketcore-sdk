@@ -1791,6 +1791,42 @@ fn current_recovery_inspection_accepts_populated_v3_history_and_reopen_preserves
 }
 
 #[test]
+fn current_recovery_inspection_accepts_activated_v5_roster() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (replica, members) = current_receipt_inspection_fixture(temp.path());
+    activate_current_replica_for_recovery_fixture(&replica, &members);
+
+    let conn = Connection::open(&replica.database_path).expect("open roster fixture");
+    let tx = conn
+        .unchecked_transaction()
+        .expect("roster activation transaction");
+    consensus::activate_fenced_mutation_roster_scope_sync(
+        &tx,
+        identity(),
+        identity(),
+        &members,
+        crate::fenced_mutation_roster_profile_digest(),
+        1,
+    )
+    .expect("activate exact V5 roster");
+    tx.commit().expect("commit V5 roster activation");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("checkpoint V5 roster fixture");
+    let format: i64 = conn
+        .query_row(
+            "SELECT schema_version FROM consensus_identity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read V5 format marker");
+    assert_eq!(format, consensus::FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT);
+    drop(conn);
+
+    inspect_current_fixture(&replica, &members)
+        .expect("read-only recovery inspection accepts an activated V5 roster");
+}
+
+#[test]
 fn current_recovery_v3_rejects_lifecycle_corruption_and_distinguishes_floor() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let (valid, members) = current_receipt_inspection_fixture(&temp.path().join("valid"));
