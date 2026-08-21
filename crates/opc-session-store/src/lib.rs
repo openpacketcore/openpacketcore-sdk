@@ -56,6 +56,7 @@ pub mod fenced_transition_journal;
 pub mod handover;
 mod hex;
 pub mod lease;
+pub mod managed_provider_job;
 pub mod membership;
 pub mod model;
 pub mod owned_session;
@@ -221,6 +222,12 @@ pub use handover::{
     HANDOVER_PHASE_HEADER_MAX_BYTES,
 };
 pub use lease::{LeaseGuard, SessionLeaseManager};
+pub use managed_provider_job::{
+    ManagedProviderJobCoordinator, ManagedProviderJobError, ManagedProviderJobId,
+    ManagedProviderJobMemberPhase, ManagedProviderJobMode, ManagedProviderJobRemoteProvider,
+    ManagedProviderJobStatus, ManagedProviderJobStore, ManagedProviderMemberStatus,
+    MANAGED_PROVIDER_JOB_V5_REVISION,
+};
 pub use membership::{
     SessionTopologyAbortAdmissionProof, SessionTopologyCandidateRetirementProof,
     SessionTopologyJointCommitAdmissionProof, SessionTopologyLearnersReadyAdmissionProof,
