@@ -934,6 +934,9 @@ impl fmt::Debug for SessionRaftNetwork {
 }
 
 impl SessionRaftNetwork {
+    // OpenRaft requires this transport error type; boxing it would change the
+    // adapter's prescribed RPC error contract.
+    #[allow(clippy::result_large_err)]
     async fn call<Resp, E>(
         &self,
         family: SessionConsensusRpcFamily,
@@ -988,6 +991,8 @@ impl SessionRaftNetwork {
         result.map_err(|error| EngineRpcError::RemoteError(RemoteError::new(self.target, error)))
     }
 
+    // OpenRaft's append RPC must retain its prescribed transport error type.
+    #[allow(clippy::result_large_err)]
     async fn append(
         &self,
         request: &AppendEntriesRequest<SessionRaftTypeConfig>,
@@ -2281,6 +2286,8 @@ mod tests {
             .collect()
     }
 
+    // The test preserves OpenRaft's transport error shape for its assertions.
+    #[allow(clippy::result_large_err)]
     async fn call_test_network(network: &SessionRaftNetwork) -> Result<u64, EngineRpcError> {
         network
             .call::<u64, opc_consensus::engine::error::Infallible>(

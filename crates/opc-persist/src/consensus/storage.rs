@@ -1466,7 +1466,6 @@ mod tests {
         Zeroizing, AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN,
     };
     use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp, TxId};
-    use sha2::Digest as _;
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
     use super::*;

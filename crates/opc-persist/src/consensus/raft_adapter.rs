@@ -111,6 +111,9 @@ impl fmt::Debug for ConfigRaftNetwork {
 }
 
 impl ConfigRaftNetwork {
+    // OpenRaft requires this transport error type; boxing it would change the
+    // adapter's prescribed RPC error contract.
+    #[allow(clippy::result_large_err)]
     async fn call<Resp, E>(
         &self,
         family: ConsensusRpcFamily,
@@ -160,6 +163,8 @@ impl ConfigRaftNetwork {
         result.map_err(|error| EngineRpcError::RemoteError(RemoteError::new(self.target, error)))
     }
 
+    // OpenRaft's append RPC must retain its prescribed transport error type.
+    #[allow(clippy::result_large_err)]
     async fn append(
         &self,
         request: &AppendEntriesRequest<ConfigRaftTypeConfig>,

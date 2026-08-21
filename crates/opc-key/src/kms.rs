@@ -72,7 +72,7 @@ fn decode_hex_32(hex: &str) -> Result<Zeroizing<[u8; 32]>, KeyError> {
         return Err(KeyError::Unavailable);
     }
     let mut bytes = Zeroizing::new([0u8; 32]);
-    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (i, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = decode_hex_nibble(chunk[0])?;
         let low = decode_hex_nibble(chunk[1])?;
         bytes[i] = (high << 4) | low;
@@ -99,8 +99,8 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex_vec(hex: &str) -> Result<Vec<u8>, KeyError> {
-    let chunks = hex.as_bytes().chunks_exact(2);
-    if !chunks.remainder().is_empty() || !hex.is_ascii() {
+    let (chunks, remainder) = hex.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() || !hex.is_ascii() {
         return Err(KeyError::Unavailable);
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);

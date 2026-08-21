@@ -332,7 +332,10 @@ fn capture_boot_id() -> Option<[u8; 16]> {
         return None;
     }
     let mut boot_id = [0_u8; 16];
-    for (output, pair) in boot_id.iter_mut().zip(hexadecimal.chunks_exact(2)) {
+    for (output, pair) in boot_id
+        .iter_mut()
+        .zip(hexadecimal.as_chunks::<2>().0.iter())
+    {
         *output = (namespace_hex_nibble(pair[0])? << 4) | namespace_hex_nibble(pair[1])?;
     }
     if boot_id.iter().all(|byte| *byte == 0) {

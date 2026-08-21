@@ -507,7 +507,7 @@ fn inbound_mark_rule_packets(comment: &str) -> u64 {
 }
 
 fn ipv4_checksum_is_valid(header: &[u8]) -> bool {
-    header.chunks_exact(2).fold(0_u32, |sum, word| {
+    header.as_chunks::<2>().0.iter().fold(0_u32, |sum, word| {
         let sum = sum + u32::from(u16::from_be_bytes([word[0], word[1]]));
         (sum & 0xffff) + (sum >> 16)
     }) == 0xffff
