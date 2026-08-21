@@ -500,24 +500,8 @@ impl PersistentManagedProviderJobClient {
         if !operation_matches_authority(&operation, &self.pool.authority) {
             return Err(ManagedProviderClientError::Protocol);
         }
-        let frame = WireRequest::Call { operation };
-        let encoded =
-            serde_json::to_vec(&frame).map_err(|_| ManagedProviderClientError::Protocol)?;
-        if encoded.len() > self.pool.config.request_bytes {
-            self.pool.counters.overload.fetch_add(1, Ordering::Relaxed);
-            return Err(ManagedProviderClientError::Overloaded);
-        }
         let pending = Arc::clone(&self.pool.pending)
             .try_acquire_owned()
-            .map_err(|_| {
-                self.pool.counters.overload.fetch_add(1, Ordering::Relaxed);
-                ManagedProviderClientError::Overloaded
-            })?;
-        let frame_bytes = encoded.len();
-        let byte_count =
-            u32::try_from(frame_bytes).map_err(|_| ManagedProviderClientError::Overloaded)?;
-        let bytes = Arc::clone(&self.pool.bytes)
-            .try_acquire_many_owned(byte_count)
             .map_err(|_| {
                 self.pool.counters.overload.fetch_add(1, Ordering::Relaxed);
                 ManagedProviderClientError::Overloaded
@@ -528,6 +512,25 @@ impl PersistentManagedProviderJobClient {
                 self.pool.counters.overload.fetch_add(1, Ordering::Relaxed);
                 ManagedProviderClientError::Overloaded
             })?;
+        let frame = WireRequest::Call { operation };
+        // Count against the configured allocation bound before retaining an
+        // encoded request. The second serializer pass fills exact capacity;
+        // no queued or in-flight request can allocate past the byte semaphore.
+        let frame_bytes = bounded_json_len(&frame, self.pool.config.request_bytes)?;
+        let byte_count =
+            u32::try_from(frame_bytes).map_err(|_| ManagedProviderClientError::Overloaded)?;
+        let bytes = Arc::clone(&self.pool.bytes)
+            .try_acquire_many_owned(byte_count)
+            .map_err(|_| {
+                self.pool.counters.overload.fetch_add(1, Ordering::Relaxed);
+                ManagedProviderClientError::Overloaded
+            })?;
+        let mut encoded = Vec::with_capacity(frame_bytes);
+        serde_json::to_writer(&mut encoded, &frame)
+            .map_err(|_| ManagedProviderClientError::Protocol)?;
+        if encoded.len() != frame_bytes {
+            return Err(ManagedProviderClientError::Protocol);
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         let key = job_key(&frame);
         let job = Job {
@@ -561,6 +564,48 @@ impl PersistentManagedProviderJobClient {
         self.pool.request_shutdown();
         self.pool.wait_shutdown().await
     }
+}
+
+fn bounded_json_len<T: Serialize>(
+    value: &T,
+    maximum: usize,
+) -> Result<usize, ManagedProviderClientError> {
+    struct Counter {
+        len: usize,
+        maximum: usize,
+        exceeded: bool,
+    }
+    impl io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let Some(next) = self.len.checked_add(bytes.len()) else {
+                self.exceeded = true;
+                return Err(io::Error::other("managed provider frame overflow"));
+            };
+            if next > self.maximum {
+                self.exceeded = true;
+                return Err(io::Error::other("managed provider frame exceeds bound"));
+            }
+            self.len = next;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter {
+        len: 0,
+        maximum,
+        exceeded: false,
+    };
+    serde_json::to_writer(&mut counter, value).map_err(|_| {
+        if counter.exceeded {
+            ManagedProviderClientError::Overloaded
+        } else {
+            ManagedProviderClientError::Protocol
+        }
+    })?;
+    Ok(counter.len)
 }
 
 fn operation_matches_authority(
@@ -1753,6 +1798,15 @@ mod tests {
             .into_result(),
             Err(ManagedProviderClientError::ServiceUnavailable)
         );
+    }
+
+    #[test]
+    fn encoded_frame_length_is_checked_before_retention() {
+        assert_eq!(
+            bounded_json_len(&WireResponse::Reject, 1),
+            Err(ManagedProviderClientError::Overloaded)
+        );
+        assert!(bounded_json_len(&WireResponse::Reject, 64).is_ok());
     }
 
     #[tokio::test]
