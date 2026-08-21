@@ -2030,7 +2030,7 @@ fn recovery_schema_manifest(conn: &Connection) -> Result<BTreeMap<String, String
                     "CREATE INDEX consensus_fenced_mutation_roster_operations_due ON consensus_fenced_mutation_roster_operations (retained_until, request_id) WHERE phase IN (2, 3)",
                 ),
                 "consensus_fenced_mutation_roster_managed_provider_jobs_recovery" => normalize_schema_sql(
-                    "CREATE INDEX consensus_fenced_mutation_roster_managed_provider_jobs_recovery ON consensus_fenced_mutation_roster_managed_provider_jobs (phase, request_id, ordinal) WHERE phase IN (1, 3)",
+                    "CREATE INDEX consensus_fenced_mutation_roster_managed_provider_jobs_recovery ON consensus_fenced_mutation_roster_managed_provider_jobs (effect_owner_digest, phase, request_id, ordinal) WHERE phase IN (1, 2, 3)",
                 ),
                 _ => return Err(RecoveryError::CorruptReplica),
             };

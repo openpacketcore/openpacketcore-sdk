@@ -4915,8 +4915,8 @@ CREATE TABLE consensus_fenced_mutation_roster_managed_provider_jobs (
 );
 
 CREATE INDEX consensus_fenced_mutation_roster_managed_provider_jobs_recovery
-    ON consensus_fenced_mutation_roster_managed_provider_jobs (phase, request_id, ordinal)
-    WHERE phase IN (1, 3);
+    ON consensus_fenced_mutation_roster_managed_provider_jobs (effect_owner_digest, phase, request_id, ordinal)
+    WHERE phase IN (1, 2, 3);
 
 CREATE TABLE consensus_fenced_mutation_roster_activation (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -7396,8 +7396,8 @@ const FENCED_MUTATION_ROSTER_MANAGED_PROVIDER_JOBS_TABLE_SCHEMA_SQL: &str = r#"
 
 const FENCED_MUTATION_ROSTER_MANAGED_PROVIDER_JOBS_RECOVERY_INDEX_SCHEMA_SQL: &str = r#"
         CREATE INDEX consensus_fenced_mutation_roster_managed_provider_jobs_recovery
-            ON consensus_fenced_mutation_roster_managed_provider_jobs (phase, request_id, ordinal)
-            WHERE phase IN (1, 3)
+            ON consensus_fenced_mutation_roster_managed_provider_jobs (effect_owner_digest, phase, request_id, ordinal)
+            WHERE phase IN (1, 2, 3)
     "#;
 
 const FENCED_MUTATION_ROSTER_RECLAIM_INDEX_SCHEMA_SQL: &str = r#"
@@ -12741,7 +12741,11 @@ OR EXISTS (
        OR (job.phase = 3 AND (typeof(job.effect_owner_digest) != 'blob' OR octet_length(job.effect_owner_digest) != 32 OR job.effect_owner_digest = zeroblob(32) OR job.attempt_fence <= 0 OR job.receipt_digest IS NOT NULL OR job.outcome IS NOT NULL))
        OR (claim.mode NOT IN (2, 3) AND job.phase != 0)
        OR (authority.request_id IS NOT NULL AND job.effect_owner_digest != authority.worker_digest)
-       OR (job.phase = 5 AND (job.outcome != 2 OR authority.abort_latched != 1))
+       OR (job.phase = 5 AND (
+              job.outcome NOT IN (2, 3)
+           OR (job.outcome = 2 AND authority.abort_latched != 1)
+           OR (job.outcome = 3 AND authority.abort_latched != 0)
+          ))
     LIMIT 1
 )
 OR EXISTS (
@@ -14743,6 +14747,7 @@ fn finalize_managed_provider_job_sync(
             terminal.protected_checkpoint().to_vec().into_boxed_slice(),
         )
         .map_err(|_| fenced_mutation_roster_invalid("managed_provider_checkpoint_invalid"))?;
+    let terminal_phase = terminal.phase();
     let _ = fenced_mutation_roster_terminalize_sync(
         conn,
         storage_identity,
@@ -14750,7 +14755,16 @@ fn finalize_managed_provider_job_sync(
         &terminal,
         &protected_checkpoint,
     )?;
-    let changed = conn.execute("UPDATE consensus_fenced_mutation_roster_managed_provider_jobs SET phase = 4 WHERE request_id = ?1 AND phase = 2", [request_id.as_slice()]).map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
+    let managed_terminal_phase = match terminal_phase {
+        FencedMutationRosterPhase::Established => 4,
+        FencedMutationRosterPhase::Aborted => 5,
+        _ => {
+            return Err(fenced_mutation_roster_invalid(
+                "managed_provider_terminal_invalid",
+            ))
+        }
+    };
+    let changed = conn.execute("UPDATE consensus_fenced_mutation_roster_managed_provider_jobs SET phase = ?1 WHERE request_id = ?2 AND phase = 2", params![managed_terminal_phase, request_id.as_slice()]).map_err(|_| StoreError::BackendUnavailable("managed provider persistence is unavailable".into()))?;
     if changed
         != i64::try_from(admission.members().len())
             .map_err(|_| fenced_mutation_roster_invalid("managed_provider_member_count_invalid"))?
@@ -14760,7 +14774,7 @@ fn finalize_managed_provider_job_sync(
             "managed provider terminal state changed unexpectedly".into(),
         ));
     }
-    managed_provider_result(3, 4, false)
+    managed_provider_result(3, managed_terminal_phase, false)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16306,7 +16320,7 @@ pub(crate) fn managed_provider_recovery_jobs_sync(
     let mut statement = conn.prepare(
         "SELECT job.request_id, job.ordinal FROM consensus_fenced_mutation_roster_managed_provider_jobs AS job \
          JOIN consensus_fenced_mutation_roster_protocol_claims AS claim ON claim.request_id = job.request_id \
-         WHERE claim.mode = 2 AND job.phase IN (1, 3) AND job.effect_owner_digest = ?1 \
+         WHERE job.effect_owner_digest = ?1 AND job.phase IN (1, 2, 3) AND claim.mode = 2 \
          ORDER BY job.request_id, job.ordinal LIMIT ?2",
     ).map_err(|_| StoreError::BackendUnavailable("managed provider recovery is unavailable".into()))?;
     let rows = statement
@@ -35222,6 +35236,27 @@ BEGIN IMMEDIATE;
         )
         .expect("persist verified receipt");
         assert_eq!((verified.mode, verified.phase), (2, 2));
+        let recovery = managed_provider_recovery_jobs_sync(&conn, identity(), worker)
+            .expect("phase-two receipt remains recoverable for finalization");
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].1, ordinal);
+        let mut plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT job.request_id, job.ordinal FROM consensus_fenced_mutation_roster_managed_provider_jobs AS job JOIN consensus_fenced_mutation_roster_protocol_claims AS claim ON claim.request_id = job.request_id WHERE job.effect_owner_digest = ?1 AND job.phase IN (1, 2, 3) AND claim.mode = 2 ORDER BY job.request_id, job.ordinal LIMIT ?2",
+            )
+            .expect("prepare owner-first recovery plan");
+        let plan = plan
+            .query_map(params![worker.as_slice(), 8_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("read owner-first recovery plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode owner-first recovery plan");
+        assert!(
+            plan.iter().any(|detail| detail
+                .contains("consensus_fenced_mutation_roster_managed_provider_jobs_recovery")),
+            "recovery must use its owner-first bounded index: {plan:?}"
+        );
         assert!(managed_provider_mutate_sync(
             &conn,
             &admission,
@@ -35244,6 +35279,120 @@ BEGIN IMMEDIATE;
         assert_eq!(stored_checkpoint.as_deref(), Some(checkpoint.as_bytes()));
         validate_fenced_mutation_roster_receipts_sync(&conn, identity())
             .expect("terminal survives durable validation");
+
+        let reconciliation_admission = fenced_mutation_roster_admission(0xED, 0xEE);
+        fenced_mutation_roster_admit_sync(
+            &conn,
+            identity(),
+            &reconciliation_admission,
+            timestamp(3),
+        )
+        .expect("admit reconciliation recovery fixture");
+        ensure_managed_provider_job_sync(
+            &conn,
+            &reconciliation_admission,
+            &checkpoint,
+            worker,
+            verifier,
+        )
+        .expect("bind reconciliation recovery fixture");
+        let reconciliation_ordinal = reconciliation_admission.members().as_slice()[0]
+            .ordinal()
+            .get();
+        managed_provider_mutate_sync(
+            &conn,
+            &reconciliation_admission,
+            ManagedProviderMutation {
+                ordinal: reconciliation_ordinal,
+                worker_digest: worker,
+                operation: 1,
+                verifier_digest: None,
+                receipt_digest: None,
+                outcome: None,
+            },
+        )
+        .expect("start reconciliation recovery fixture");
+        let reconciliation = managed_provider_mutate_sync(
+            &conn,
+            &reconciliation_admission,
+            ManagedProviderMutation {
+                ordinal: reconciliation_ordinal,
+                worker_digest: worker,
+                operation: 3,
+                verifier_digest: None,
+                receipt_digest: None,
+                outcome: None,
+            },
+        )
+        .expect("persist reconciliation requirement");
+        assert_eq!((reconciliation.mode, reconciliation.phase), (2, 3));
+        let recovery = managed_provider_recovery_jobs_sync(&conn, identity(), worker)
+            .expect("phase-three reconciliation remains recoverable");
+        assert!(recovery
+            .iter()
+            .any(|(_, recovered_ordinal)| { *recovered_ordinal == reconciliation_ordinal }));
+
+        let compensated_admission = fenced_mutation_roster_admission(0xEF, 0xF0);
+        fenced_mutation_roster_admit_sync(&conn, identity(), &compensated_admission, timestamp(4))
+            .expect("admit compensated terminal fixture");
+        ensure_managed_provider_job_sync(
+            &conn,
+            &compensated_admission,
+            &checkpoint,
+            worker,
+            verifier,
+        )
+        .expect("bind compensated terminal fixture");
+        let compensated_ordinal = compensated_admission.members().as_slice()[0]
+            .ordinal()
+            .get();
+        managed_provider_mutate_sync(
+            &conn,
+            &compensated_admission,
+            ManagedProviderMutation {
+                ordinal: compensated_ordinal,
+                worker_digest: worker,
+                operation: 1,
+                verifier_digest: None,
+                receipt_digest: None,
+                outcome: None,
+            },
+        )
+        .expect("start compensated terminal fixture");
+        managed_provider_mutate_sync(
+            &conn,
+            &compensated_admission,
+            ManagedProviderMutation {
+                ordinal: compensated_ordinal,
+                worker_digest: worker,
+                operation: 2,
+                verifier_digest: Some(verifier),
+                receipt_digest: Some([0xF1; 32]),
+                outcome: Some(3),
+            },
+        )
+        .expect("persist compensated receipt");
+        let compensated =
+            finalize_managed_provider_job_sync(&conn, identity(), &compensated_admission, worker)
+                .expect("derive compensated terminal from durable receipt");
+        assert_eq!(
+            (compensated.mode, compensated.phase),
+            (3, 5),
+            "compensated abort must not be projected as established"
+        );
+        assert_eq!(
+            managed_provider_job_status_sync(
+                &conn,
+                identity(),
+                compensated_admission.request_id().to_bytes(),
+                compensated_ordinal,
+                worker,
+            )
+            .expect("read compensated terminal status"),
+            (3, 5)
+        );
+        validate_fenced_mutation_roster_receipts_sync(&conn, identity())
+            .expect("compensated terminal survives durable validation");
     }
 
     #[test]
