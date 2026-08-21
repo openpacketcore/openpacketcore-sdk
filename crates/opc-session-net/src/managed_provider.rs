@@ -1948,7 +1948,18 @@ mod tests {
             diagnostics.connection_high_water,
             DEFAULT_MANAGED_PROVIDER_POOL_LANES as u64 * 3
         );
+        let cancelled_waiter = tokio::spawn({
+            let client = client.clone();
+            async move { client.shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        cancelled_waiter.abort();
+        let shared_waiter = tokio::spawn({
+            let client = client.clone();
+            async move { client.shutdown().await }
+        });
         let report = client.shutdown().await;
+        assert_eq!(shared_waiter.await.expect("shared shutdown waiter"), report);
         assert_eq!(report.remaining_connections, 0);
         assert_eq!(report.remaining_tasks, 0);
         for handle in handles {
