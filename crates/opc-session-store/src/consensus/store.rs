@@ -4553,6 +4553,10 @@ impl ConsensusSessionStore {
         }
     }
 
+    // This is retained solely for the forthcoming attested successor
+    // transport. Revision 5 has no caller into it: its serde terminal is not
+    // evidence of a member effect.
+    #[allow(dead_code)]
     async fn consumer_fenced_mutation_roster_terminalize(
         &self,
         scope: SessionConsumerScope,
@@ -6547,20 +6551,19 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                         .map_err(|_| FencedMutationRosterError::Indeterminate),
                 )
             }
-            SessionConsumerV3Operation::FencedMutationRosterTerminalize {
-                admission,
-                terminal,
-            } => SessionConsumerV3Response::FencedMutationRosterTerminalize(
-                self.store
-                    .consumer_fenced_mutation_roster_terminalize(
-                        request.scope(),
-                        *admission,
-                        *terminal,
-                        deadline,
-                    )
-                    .await
-                    .map_err(|_| FencedMutationRosterError::Indeterminate),
-            ),
+            SessionConsumerV3Operation::FencedMutationRosterTerminalize { .. } => {
+                // Revision 5 carried a serde terminal receipt.  Its public
+                // fields can be made internally consistent by an authenticated
+                // caller, but they do not prove that the member effect ran.
+                // Do not turn the store-owned, non-serde member proof into a
+                // wire claim by validating those fields again here.
+                //
+                // Keep the frozen V3 DTO decodable for wire isolation, but
+                // close this terminal endpoint until a successor transport
+                // carries a provider-attestation verifier contract.  In
+                // particular, never submit a terminal mutation from V3.
+                return SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unavailable);
+            }
         };
 
         // Match V2's successor-scope guard: a response derived under the
@@ -7993,7 +7996,7 @@ mod membership_tests {
                         ),
                     )
                     .await,
-                SessionConsumerV3Response::FencedMutationRosterTerminalize(Ok(_))
+                SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unavailable)
             ));
             Ok(crate::FencedMutationRosterProviderOutcome::AppliedExecuted)
         }
@@ -8457,7 +8460,7 @@ mod membership_tests {
     }
 
     #[tokio::test]
-    async fn consumer_v3_effects_reach_consensus_only_after_verified_roster_authority() {
+    async fn consumer_v3_rejects_a_proof_derived_terminal_before_consensus_submission() {
         let (_directory, store, scope, identity, _key, _lease) = consumer_boundary_store().await;
         activate_roster_predecessor(&store, scope, &identity).await;
         let admission = consumer_v3_roster_admission(scope, &identity);
@@ -8477,7 +8480,11 @@ mod membership_tests {
             SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_))
         ));
         let terminal = consumer_v3_roster_terminal(&store, scope, &identity, &admission).await;
-        assert!(matches!(
+        let terminal: FencedMutationRosterTerminal = serde_json::from_slice(
+            &serde_json::to_vec(&terminal).expect("proof-shaped terminal JSON encodes"),
+        )
+        .expect("caller-authored proof-shaped terminal JSON decodes");
+        assert_eq!(
             store
                 .consumer_service()
                 .execute_v3(
@@ -8485,14 +8492,38 @@ mod membership_tests {
                     SessionConsumerV3Request::new(
                         scope,
                         SessionConsumerV3Operation::FencedMutationRosterTerminalize {
-                            admission: Box::new(admission),
+                            admission: Box::new(admission.clone()),
                             terminal: Box::new(terminal),
                         },
                     ),
                 )
                 .await,
-            SessionConsumerV3Response::FencedMutationRosterTerminalize(Ok(_))
-        ));
+            SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unavailable),
+            "revision-5 terminal JSON is never a proof authority"
+        );
+        assert_eq!(
+            store
+                .consumer_service()
+                .execute_v3(
+                    &identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterStatus {
+                            admission: Box::new(admission.clone()),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::FencedMutationRosterStatus(Ok(
+                FencedMutationRosterStatus::new(
+                    FencedMutationRosterPhase::PollAdmitted,
+                    admission.request_id(),
+                    None,
+                )
+                .expect("admitted roster status"),
+            )),
+            "a rejected V3 terminal never reaches the durable terminal mutation"
+        );
     }
 
     #[tokio::test]
@@ -8639,7 +8670,7 @@ mod membership_tests {
     }
 
     #[tokio::test]
-    async fn roster_member_proof_authority_revalidates_after_provider_io() {
+    async fn roster_member_proof_authority_does_not_let_a_provider_reopen_v3_terminalization() {
         let (_directory, store, scope, identity, _key, _lease) = consumer_boundary_store().await;
         activate_roster_predecessor(&store, scope, &identity).await;
         let admission = consumer_v3_roster_admission(scope, &identity);
@@ -8665,19 +8696,18 @@ mod membership_tests {
             scope,
             identity: identity.clone(),
         };
-        assert!(matches!(
+        assert!(
             store
                 .fenced_mutation_roster_member_execution_authority(
-                    &identity, scope, admission, ordinal,
+                    &identity, scope, admission, ordinal
                 )
                 .await
                 .expect("durably admitted authority")
                 .execute_member(&provider)
-                .await,
-            Err(crate::FencedMutationRosterMemberExecutionError::Authority(
-                _
-            ))
-        ));
+                .await
+                .is_ok(),
+            "a rejected V3 terminal attempt cannot consume or forge the authority"
+        );
     }
 
     #[tokio::test]
