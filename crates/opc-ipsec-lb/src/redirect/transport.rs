@@ -2591,6 +2591,93 @@ mod tests {
             .unwrap_or_else(|error| panic!("valid test profile: {error}"))
     }
 
+    struct PausedTimeGuard {
+        active: bool,
+    }
+
+    impl PausedTimeGuard {
+        fn new() -> Self {
+            tokio::time::pause();
+            Self { active: true }
+        }
+
+        fn resume(mut self) {
+            self.active = false;
+            tokio::time::resume();
+        }
+    }
+
+    impl Drop for PausedTimeGuard {
+        fn drop(&mut self) {
+            if self.active {
+                self.active = false;
+                tokio::time::resume();
+            }
+        }
+    }
+
+    fn profile_completion_bound(profile: super::super::IngressRedirectProfile) -> Duration {
+        profile
+            .receipt_retry_horizon()
+            .saturating_add(profile.receipt_timeout())
+    }
+
+    async fn within_profile_completion_bound<T>(
+        profile: super::super::IngressRedirectProfile,
+        future: impl std::future::Future<Output = T>,
+    ) -> Result<T, tokio::time::error::Elapsed> {
+        tokio::time::timeout(profile_completion_bound(profile), future).await
+    }
+
+    // Live channel round trips need executor scheduling; paused auto-advance
+    // can outrun the channel. Retain the existing one-second contention margin.
+    fn profile_channel_completion_bound(profile: super::super::IngressRedirectProfile) -> Duration {
+        profile
+            .receipt_retry_horizon()
+            .saturating_add(Duration::from_secs(1))
+    }
+
+    async fn within_profile_channel_completion_bound<T>(
+        profile: super::super::IngressRedirectProfile,
+        future: impl std::future::Future<Output = T>,
+    ) -> Result<T, tokio::time::error::Elapsed> {
+        tokio::time::timeout(profile_channel_completion_bound(profile), future).await
+    }
+
+    async fn wait_for_profile_condition(
+        profile: super::super::IngressRedirectProfile,
+        mut condition: impl FnMut() -> bool,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout(profile.receipt_timeout(), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn profile_derived_virtual_bound_rejects_stalled_waits() {
+        let profile = test_profile();
+        let paused_time = PausedTimeGuard::new();
+        let started_at = tokio::time::Instant::now();
+        let outcome = within_profile_completion_bound(
+            profile,
+            std::future::pending::<IngressRedirectOperationOutcome>(),
+        )
+        .await;
+        let elapsed = started_at.elapsed();
+        paused_time.resume();
+
+        assert!(outcome.is_err(), "a stalled wait must reach the test bound");
+        let completion_bound = profile_completion_bound(profile);
+        assert!(
+            elapsed >= completion_bound
+                && elapsed < completion_bound.saturating_add(profile.receipt_timeout()),
+            "a stalled wait must fail within one additional receipt interval of the profile bound"
+        );
+    }
+
     #[derive(Debug, Clone)]
     struct ManualClock {
         now: Arc<Mutex<Timestamp>>,
@@ -3666,6 +3753,7 @@ mod tests {
             Arc::new(RecordingReporter::default()),
         )
         .unwrap_or_else(|error| panic!("start second: {error}"));
+        let _paused_time = PausedTimeGuard::new();
         let packet = synthetic_native_esp_packet(128);
         let mut tampered = first_session
             .seal_data(&packet, ownership_key(), generation)
@@ -3674,28 +3762,26 @@ mod tests {
             .last_mut()
             .unwrap_or_else(|| panic!("sealed frame has authentication tag"));
         *last ^= 0x01;
-        sender_datagram
-            .send(&tampered)
+        within_profile_completion_bound(profile, sender_datagram.send(&tampered))
             .await
+            .unwrap_or_else(|_| panic!("tampered-frame injection exceeded profile bound"))
             .unwrap_or_else(|error| panic!("inject tampered frame: {error}"));
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while second_session.metrics().authentication_drops == 0 {
-                tokio::task::yield_now().await;
-            }
+        wait_for_profile_condition(profile, || {
+            second_session.metrics().authentication_drops != 0
         })
         .await
-        .unwrap_or_else(|_| panic!("tampered frame was processed"));
+        .unwrap_or_else(|_| panic!("tampered-frame processing exceeded profile bound"));
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), second_rx.receive())
+            tokio::time::timeout(profile.receipt_timeout(), second_rx.receive())
                 .await
                 .is_err(),
             "unauthenticated data must not enter any delivery outcome queue"
         );
         assert_eq!(second_session.metrics().authentication_drops, 1);
         assert_eq!(second_session.metrics().delivered, 0);
-        second
-            .shutdown()
+        within_profile_completion_bound(profile, second.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("second endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown second: {error}"));
     }
 
@@ -3733,12 +3819,17 @@ mod tests {
         .unwrap_or_else(|error| panic!("start second: {error}"));
         let packet = synthetic_native_esp_packet(128);
         assert_eq!(
-            first.redirect(&packet, ownership_key(), generation).await,
+            within_profile_channel_completion_bound(
+                profile,
+                first.redirect(&packet, ownership_key(), generation),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("lost-receipt redirect exceeded profile bound")),
             Ok(IngressRedirectReceiptCode::Delivered)
         );
-        let outcome = second_rx
-            .receive()
+        let outcome = within_profile_channel_completion_bound(profile, second_rx.receive())
             .await
+            .unwrap_or_else(|_| panic!("lost-receipt delivery exceeded profile bound"))
             .unwrap_or_else(|error| panic!("one delivery: {error}"));
         assert!(matches!(
             outcome,
@@ -3748,7 +3839,7 @@ mod tests {
         assert_eq!(second.metrics().cached_receipts_replayed, 1);
         assert_eq!(second_session.metrics().delivered, 1);
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), second_rx.receive())
+            tokio::time::timeout(profile.receipt_timeout(), second_rx.receive())
                 .await
                 .is_err()
         );
@@ -3780,26 +3871,26 @@ mod tests {
                 .exact_receipt(identity, &digest, after_expiry)
                 .is_none());
         }
-        first_datagram
-            .send(&captured)
+        within_profile_channel_completion_bound(profile, first_datagram.send(&captured))
             .await
+            .unwrap_or_else(|_| panic!("captured-replay injection exceeded profile bound"))
             .unwrap_or_else(|error| panic!("inject captured replay: {error}"));
-        tokio::time::timeout(Duration::from_millis(100), async {
+        within_profile_channel_completion_bound(profile, async {
             while second_session.metrics().replay_drops == 0 {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("captured replay processed"));
+        .unwrap_or_else(|_| panic!("captured-replay processing exceeded profile bound"));
         assert_eq!(second_session.metrics().replay_drops, 1);
         assert_eq!(second_session.metrics().delivered, 1);
-        first
-            .shutdown()
+        within_profile_channel_completion_bound(profile, first.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("first endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown first: {error}"));
-        second
-            .shutdown()
+        within_profile_channel_completion_bound(profile, second.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("second endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown second: {error}"));
     }
 
@@ -3835,26 +3926,28 @@ mod tests {
             .begin_redirect(&packet, ownership_key(), generation)
             .unwrap_or_else(|error| panic!("begin redirect: {error}"));
         assert!(matches!(
-            second_rx.receive().await,
+            within_profile_channel_completion_bound(profile, second_rx.receive())
+                .await
+                .unwrap_or_else(|_| panic!("observer-drop delivery exceeded profile bound")),
             Ok(IngressRedirectInboundOutcome::Delivered(_))
         ));
         drop(operation);
-        tokio::time::timeout(Duration::from_millis(100), async {
+        within_profile_channel_completion_bound(profile, async {
             while first.metrics().delivery_receipts == 0 {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("endpoint-owned operation completed after observer drop"));
+        .unwrap_or_else(|_| panic!("endpoint-owned completion exceeded profile bound"));
         assert_eq!(first.metrics().send_attempts, 2);
         assert_eq!(second.metrics().cached_receipts_replayed, 1);
-        first
-            .shutdown()
+        within_profile_channel_completion_bound(profile, first.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("first endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown first: {error}"));
-        second
-            .shutdown()
+        within_profile_channel_completion_bound(profile, second.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("second endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown second: {error}"));
     }
 
@@ -3891,13 +3984,21 @@ mod tests {
             reporter,
         )
         .unwrap_or_else(|error| panic!("start second: {error}"));
+        let _paused_time = PausedTimeGuard::new();
         let packet = synthetic_native_esp_packet(128);
         assert_eq!(
-            first.redirect(&packet, ownership_key(), generation).await,
+            within_profile_completion_bound(
+                profile,
+                first.redirect(&packet, ownership_key(), generation),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("initial redirect exceeded profile bound")),
             Ok(IngressRedirectReceiptCode::Delivered)
         );
         assert!(matches!(
-            second_rx.receive().await,
+            within_profile_completion_bound(profile, second_rx.receive())
+                .await
+                .unwrap_or_else(|_| panic!("initial delivery exceeded profile bound")),
             Ok(IngressRedirectInboundOutcome::Delivered(_))
         ));
         let captured = second_wrapper
@@ -3915,27 +4016,25 @@ mod tests {
                 .unwrap_or_else(|| panic!("unshared current epoch"));
             epoch.hard_authenticated_deadline = Instant::now();
         }
-        first_datagram
-            .send(&captured)
+        within_profile_completion_bound(profile, first_datagram.send(&captured))
             .await
+            .unwrap_or_else(|_| panic!("post-expiry injection exceeded profile bound"))
             .unwrap_or_else(|error| panic!("inject post-expiry capture: {error}"));
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while second_session.metrics().authentication_expired_drops == 0 {
-                tokio::task::yield_now().await;
-            }
+        wait_for_profile_condition(profile, || {
+            second_session.metrics().authentication_expired_drops != 0
         })
         .await
-        .unwrap_or_else(|_| panic!("post-expiry frame processed"));
+        .unwrap_or_else(|_| panic!("post-expiry processing exceeded profile bound"));
         assert_eq!(second.metrics().cached_receipts_replayed, 0);
         assert_eq!(second_session.metrics().authentication_expired_drops, 1);
         assert_eq!(second_session.metrics().delivered, 1);
-        first
-            .shutdown()
+        within_profile_completion_bound(profile, first.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("first endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown first: {error}"));
-        second
-            .shutdown()
+        within_profile_completion_bound(profile, second.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("second endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown second: {error}"));
     }
 
@@ -4445,13 +4544,19 @@ mod tests {
             .lock()
             .unwrap_or_else(|_| panic!("receipt cache lock")) =
             ReceiptCache::new(0, profile.rotation_overlap());
+        let _paused_time = PausedTimeGuard::new();
         let packet = synthetic_native_esp_packet(128);
         assert!(matches!(
-            first.redirect(&packet, ownership_key(), generation).await,
+            within_profile_completion_bound(
+                profile,
+                first.redirect(&packet, ownership_key(), generation),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("cache-pressure redirect exceeded profile bound")),
             Err(IngressRedirectError::ReceiptTimeout)
         ));
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), second_rx.receive())
+            tokio::time::timeout(profile.receipt_timeout(), second_rx.receive())
                 .await
                 .is_err(),
             "cache exhaustion must not publish an application effect"
@@ -4461,13 +4566,13 @@ mod tests {
             second.metrics().receipt_cache_load_shed,
             u64::from(profile.max_retries()).saturating_add(1)
         );
-        first
-            .shutdown()
+        within_profile_completion_bound(profile, first.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("first endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown first: {error}"));
-        second
-            .shutdown()
+        within_profile_completion_bound(profile, second.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("second endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown second: {error}"));
     }
 
@@ -4508,13 +4613,19 @@ mod tests {
             .unwrap_or_else(|_| panic!("receipt cache lock"))
             .fail_next_commit = true;
 
+        let _paused_time = PausedTimeGuard::new();
         let packet = synthetic_native_esp_packet(128);
         assert_eq!(
-            first.redirect(&packet, ownership_key(), generation).await,
+            within_profile_completion_bound(
+                profile,
+                first.redirect(&packet, ownership_key(), generation),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("commit-failure redirect exceeded profile bound")),
             Err(IngressRedirectError::ReceiptTimeout)
         );
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), second_rx.receive())
+            tokio::time::timeout(profile.receipt_timeout(), second_rx.receive())
                 .await
                 .is_err(),
             "an uncommitted receipt must never publish an application effect"
@@ -4524,13 +4635,13 @@ mod tests {
         assert_eq!(metrics.receipt_cache_entries_current, 0);
         assert_eq!(metrics.delivery_admissions, 0);
         assert_eq!(second_session.metrics().delivery_admissions, 0);
-        first
-            .shutdown()
+        within_profile_completion_bound(profile, first.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("first endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown first: {error}"));
-        second
-            .shutdown()
+        within_profile_completion_bound(profile, second.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("second endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown second: {error}"));
     }
 
@@ -4621,35 +4732,37 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("start first: {error}"));
         let first = Arc::new(first);
+        let _paused_time = PausedTimeGuard::new();
         let packet = synthetic_native_esp_packet(128);
         let mut operation = first
             .begin_redirect(&packet, ownership_key(), generation)
             .unwrap_or_else(|error| panic!("begin redirect: {error}"));
-        let redirect = tokio::spawn(async move { operation.wait().await });
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while first.metrics().send_attempts == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("first send attempt observed"));
-        first
-            .shutdown()
+        let redirect = tokio::spawn(async move {
+            within_profile_completion_bound(profile, operation.wait()).await
+        });
+        wait_for_profile_condition(profile, || first.metrics().send_attempts != 0)
             .await
+            .unwrap_or_else(|_| panic!("first send attempt exceeded profile bound"));
+        within_profile_completion_bound(profile, first.shutdown())
+            .await
+            .unwrap_or_else(|_| panic!("endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown and reap: {error}"));
         assert_eq!(
-            redirect
+            within_profile_completion_bound(profile, redirect)
                 .await
+                .unwrap_or_else(|_| panic!("redirect join exceeded profile bound"))
                 .unwrap_or_else(|error| panic!("redirect task joined: {error}")),
-            IngressRedirectOperationOutcome::DeliveryOutcomeUnknown
+            Ok(IngressRedirectOperationOutcome::DeliveryOutcomeUnknown)
         );
         assert!(matches!(
-            first_rx.receive().await,
+            within_profile_completion_bound(profile, first_rx.receive())
+                .await
+                .unwrap_or_else(|_| panic!("terminal receive exceeded profile bound")),
             Err(IngressRedirectError::ShuttingDown)
         ));
-        first
-            .shutdown()
+        within_profile_completion_bound(profile, first.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("idempotent shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("idempotent shutdown: {error}"));
     }
 
@@ -4886,24 +4999,27 @@ mod tests {
             Arc::new(RecordingReporter::default()),
         )
         .unwrap_or_else(|error| panic!("start first: {error}"));
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while first.inner.lifecycle.phase() != EndpointPhase::Failed {
-                tokio::task::yield_now().await;
-            }
+        let _paused_time = PausedTimeGuard::new();
+        wait_for_profile_condition(profile, || {
+            first.inner.lifecycle.phase() == EndpointPhase::Failed
         })
         .await
-        .unwrap_or_else(|_| panic!("receive failure became terminal"));
+        .unwrap_or_else(|_| panic!("receive failure exceeded profile bound"));
         let packet = synthetic_native_esp_packet(128);
         assert!(matches!(
             first.begin_redirect(&packet, ownership_key(), generation),
             Err(IngressRedirectError::TransportFailed)
         ));
         assert!(matches!(
-            receiver.receive().await,
+            within_profile_completion_bound(profile, receiver.receive())
+                .await
+                .unwrap_or_else(|_| panic!("terminal receive exceeded profile bound")),
             Err(IngressRedirectError::TransportFailed)
         ));
         assert_eq!(
-            first.shutdown().await,
+            within_profile_completion_bound(profile, first.shutdown())
+                .await
+                .unwrap_or_else(|_| panic!("failed endpoint shutdown exceeded profile bound")),
             Err(IngressRedirectError::TransportFailed)
         );
         assert!(matches!(
@@ -5041,14 +5157,15 @@ mod tests {
             Arc::new(HangingReporter),
         )
         .unwrap_or_else(|error| panic!("start first: {error}"));
+        let _paused_time = PausedTimeGuard::new();
         let packet = synthetic_native_esp_packet(128);
         let mut operation = first
             .begin_redirect(&packet, ownership_key(), generation)
             .unwrap_or_else(|error| panic!("begin hung send: {error}"));
         assert_eq!(
-            tokio::time::timeout(Duration::from_millis(100), operation.wait())
+            within_profile_completion_bound(profile, operation.wait())
                 .await
-                .unwrap_or_else(|_| panic!("bounded adapter send")),
+                .unwrap_or_else(|_| panic!("hung send exceeded profile bound")),
             IngressRedirectOperationOutcome::DeliveryOutcomeUnknown
         );
         assert_eq!(first.metrics().transport_drops, 3);
@@ -5064,16 +5181,16 @@ mod tests {
             .begin_redirect(&oversize, ownership_key(), generation)
             .unwrap_or_else(|error| panic!("begin oversize redirect: {error}"));
         assert_eq!(
-            tokio::time::timeout(Duration::from_millis(100), operation.wait())
+            within_profile_completion_bound(profile, operation.wait())
                 .await
-                .unwrap_or_else(|_| panic!("bounded PTB reporter")),
+                .unwrap_or_else(|_| panic!("hung reporter exceeded profile bound")),
             IngressRedirectOperationOutcome::NotSent(
                 IngressRedirectNotSentReason::PacketTooBigFeedbackFailed
             )
         );
-        tokio::time::timeout(Duration::from_millis(100), first.shutdown())
+        within_profile_completion_bound(profile, first.shutdown())
             .await
-            .unwrap_or_else(|_| panic!("bounded shutdown"))
+            .unwrap_or_else(|_| panic!("endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown and reap: {error}"));
     }
 
@@ -5163,14 +5280,17 @@ mod tests {
                 Arc::new(RecordingReporter::default()),
             )
             .unwrap_or_else(|error| panic!("start first: {error}"));
+            let _paused_time = PausedTimeGuard::new();
             let packet = synthetic_native_esp_packet(128);
             let mut operation = first
                 .begin_redirect(&packet, ownership_key(), generation)
                 .unwrap_or_else(|error| panic!("begin adapter error operation: {error}"));
             assert_eq!(
-                tokio::time::timeout(Duration::from_millis(100), operation.wait())
+                within_profile_completion_bound(profile, operation.wait())
                     .await
-                    .unwrap_or_else(|_| panic!("bounded adapter error {adapter_error:?}")),
+                    .unwrap_or_else(|_| {
+                        panic!("adapter error {adapter_error:?} exceeded profile bound")
+                    }),
                 expected,
                 "adapter error {adapter_error:?}",
             );
@@ -5181,9 +5301,11 @@ mod tests {
             assert_eq!(metrics.transport_drops, transport_drops);
             assert_eq!(metrics.queue_drops, queue_drops);
             assert_eq!(metrics.receipt_timeouts, receipt_timeouts);
-            first
-                .shutdown()
+            within_profile_completion_bound(profile, first.shutdown())
                 .await
+                .unwrap_or_else(|_| {
+                    panic!("adapter error {adapter_error:?} shutdown exceeded profile bound")
+                })
                 .unwrap_or_else(|error| panic!("shutdown failed adapter endpoint: {error}"));
         }
     }
@@ -5231,10 +5353,11 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| panic!("late receipt gate: {error}")) = Some(receipt);
 
+        let _paused_time = PausedTimeGuard::new();
         assert_eq!(
-            tokio::time::timeout(Duration::from_millis(100), operation.wait())
+            within_profile_completion_bound(profile, operation.wait())
                 .await
-                .unwrap_or_else(|_| panic!("late receipt completed operation")),
+                .unwrap_or_else(|_| panic!("late receipt exceeded profile bound")),
             IngressRedirectOperationOutcome::AuthenticatedReceipt(
                 IngressRedirectReceiptCode::Delivered
             )
@@ -5242,9 +5365,9 @@ mod tests {
         assert_eq!(datagram.sends.load(Ordering::Relaxed), 1);
         assert_eq!(first.metrics().send_attempts, 1);
         assert_eq!(first.metrics().retries, 0);
-        first
-            .shutdown()
+        within_profile_completion_bound(profile, first.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown first: {error}"));
     }
 
@@ -5280,29 +5403,32 @@ mod tests {
             reporter,
         )
         .unwrap_or_else(|error| panic!("start second: {error}"));
+        let _paused_time = PausedTimeGuard::new();
         let packet = synthetic_native_esp_packet(128);
         assert_eq!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
+            within_profile_completion_bound(
+                profile,
                 first.redirect(&packet, ownership_key(), generation),
             )
             .await
-            .unwrap_or_else(|_| panic!("receipt won shared attempt deadline")),
+            .unwrap_or_else(|_| panic!("stalled-send redirect exceeded profile bound")),
             Ok(IngressRedirectReceiptCode::Delivered)
         );
         assert!(matches!(
-            second_rx.receive().await,
+            within_profile_completion_bound(profile, second_rx.receive())
+                .await
+                .unwrap_or_else(|_| panic!("stalled-send delivery exceeded profile bound")),
             Ok(IngressRedirectInboundOutcome::Delivered(_))
         ));
         assert_eq!(first.metrics().send_attempts, 1);
         assert_eq!(first.metrics().retries, 0);
-        first
-            .shutdown()
+        within_profile_completion_bound(profile, first.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("first endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown first: {error}"));
-        second
-            .shutdown()
+        within_profile_completion_bound(profile, second.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("second endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown second: {error}"));
     }
 
@@ -5338,35 +5464,98 @@ mod tests {
             reporter,
         )
         .unwrap_or_else(|error| panic!("start second: {error}"));
+        let _paused_time = PausedTimeGuard::new();
         let packet = synthetic_native_esp_packet(128);
         assert_eq!(
-            tokio::time::timeout(
-                Duration::from_millis(200),
+            within_profile_completion_bound(
+                profile,
                 first.redirect(&packet, ownership_key(), generation),
             )
             .await
-            .unwrap_or_else(|_| panic!("bounded receipt retry policy")),
+            .unwrap_or_else(|_| panic!("hung-receipt redirect exceeded profile bound")),
             Err(IngressRedirectError::ReceiptTimeout)
         );
         assert!(matches!(
-            second_rx.receive().await,
+            within_profile_completion_bound(profile, second_rx.receive())
+                .await
+                .unwrap_or_else(|_| panic!("hung-receipt delivery exceeded profile bound")),
             Ok(IngressRedirectInboundOutcome::Delivered(_))
         ));
-        tokio::time::timeout(Duration::from_millis(100), async {
+        within_profile_completion_bound(profile, async {
             while second.metrics().transport_drops < 3 {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("all receipt sends reached their bound"));
+        .unwrap_or_else(|_| panic!("receipt-send retries exceeded profile bound"));
         assert_eq!(second.metrics().transport_drops, 3);
-        tokio::time::timeout(Duration::from_millis(100), second.shutdown())
+        within_profile_completion_bound(profile, second.shutdown())
             .await
-            .unwrap_or_else(|_| panic!("receipt task shutdown bounded"))
+            .unwrap_or_else(|_| panic!("second endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown second: {error}"));
-        first
-            .shutdown()
+        within_profile_completion_bound(profile, first.shutdown())
             .await
+            .unwrap_or_else(|_| panic!("first endpoint shutdown exceeded profile bound"))
+            .unwrap_or_else(|error| panic!("shutdown first: {error}"));
+    }
+
+    /// Mutation check: the retry sequence completes only because the
+    /// profile's `receipt_timeout` drives each per-attempt deadline inside
+    /// `run_outbound_operation`. Under paused Tokio time the timers
+    /// auto-advance deterministically. The independent profile-derived test
+    /// bound fails promptly if the receipt-timeout arm is removed from the
+    /// retry `select!`; it cannot wedge the test process. If the retry count
+    /// diverges from `max_retries + 1`, the send-attempts assertion fails.
+    #[tokio::test]
+    async fn mutation_check_receipt_timeout_drives_retry_completion() {
+        let profile = test_profile();
+        let (first_session, second_session) = test_sessions(profile);
+        let (record, namespace, clock) = ownership_record("owner-b").await;
+        let generation = record.generation();
+        let first_cache = ownership_cache(record, namespace, clock);
+        let (first_datagram, _unserved_peer) = InMemoryIngressRedirectDatagram::pair(
+            first_session.local_udp_endpoint(),
+            second_session.local_udp_endpoint(),
+            profile.steering_path_mtu(),
+            profile.queue_packets(),
+        )
+        .unwrap_or_else(|error| panic!("in-memory pair: {error}"));
+        let (first, _first_rx) = IngressRedirectEndpoint::start(
+            first_session,
+            first_cache,
+            Arc::new(NeverSendDatagram {
+                inner: Arc::new(first_datagram),
+            }),
+            Arc::new(RecordingReporter::default()),
+        )
+        .unwrap_or_else(|error| panic!("start first: {error}"));
+        let paused_time = PausedTimeGuard::new();
+        let packet = synthetic_native_esp_packet(128);
+        let mut operation = first
+            .begin_redirect(&packet, ownership_key(), generation)
+            .unwrap_or_else(|error| panic!("begin redirect: {error}"));
+        let outcome = within_profile_completion_bound(profile, operation.wait()).await;
+        let metrics = first.metrics();
+        let shutdown = within_profile_completion_bound(profile, first.shutdown()).await;
+        paused_time.resume();
+        drop(first);
+
+        assert_eq!(
+            outcome.unwrap_or_else(|_| panic!("retry completion exceeded profile bound")),
+            IngressRedirectOperationOutcome::DeliveryOutcomeUnknown
+        );
+        let expected_attempts = u64::from(profile.max_retries()).saturating_add(1);
+        assert_eq!(
+            metrics.send_attempts, expected_attempts,
+            "retry count must equal max_retries + 1"
+        );
+        assert_eq!(
+            metrics.transport_drops, expected_attempts,
+            "every timed-out send must be counted as a transport drop"
+        );
+        assert_eq!(metrics.receipt_timeouts, 1);
+        shutdown
+            .unwrap_or_else(|_| panic!("endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown first: {error}"));
     }
 
