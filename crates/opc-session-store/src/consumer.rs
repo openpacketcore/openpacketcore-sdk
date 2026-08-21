@@ -19,7 +19,8 @@ use crate::fenced_mutation_roster::{
     compute_fenced_mutation_roster_profile_digest, FencedMutationRosterAdmission,
     FencedMutationRosterCapability, FencedMutationRosterErrorStatus,
     FencedMutationRosterHistoryState, FencedMutationRosterOutcome, FencedMutationRosterProfile,
-    FencedMutationRosterRequestId, FencedMutationRosterStatus, FencedMutationRosterTerminal,
+    FencedMutationRosterRequestId, FencedMutationRosterScope, FencedMutationRosterStatus,
+    FencedMutationRosterTerminal,
 };
 use crate::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
@@ -56,6 +57,11 @@ pub const SESSION_CONSUMER_REQUEST_ID_BYTES: usize = 16;
 /// Maximum UTF-8 width of an authenticated consumer identity.
 pub const SESSION_CONSUMER_IDENTITY_MAX_BYTES: usize = 253;
 
+const SESSION_CONSUMER_SPIFFE_IDENTITY_COMMITMENT_DOMAIN: &[u8] =
+    b"openpacketcore/tls/local-spiffe-identity-commitment/v1\0";
+const FENCED_MUTATION_ROSTER_AUTHORITY_SCOPE_DOMAIN: &[u8] =
+    b"openpacketcore/session-consumer/fenced-mutation-roster/authority-scope/v1\0";
+
 /// Redaction-safe construction failure for [`SessionConsumerIdentity`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("invalid session consumer identity")]
@@ -87,6 +93,25 @@ impl SessionConsumerIdentity {
     /// Borrow the identity for authenticated authorization and request binding.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+
+    /// Return the redaction-safe commitment shared with local TLS material.
+    ///
+    /// A consumer identity is admitted only after mTLS SPIFFE authorization.
+    /// The commitment deliberately preserves neither the SPIFFE text nor any
+    /// certificate/key material in request, receipt, or diagnostic surfaces.
+    pub(crate) fn spiffe_identity_commitment(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        let mut digest = Sha256::new();
+        digest.update(SESSION_CONSUMER_SPIFFE_IDENTITY_COMMITMENT_DOMAIN);
+        digest.update(
+            u16::try_from(self.0.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
+        digest.update(self.0.as_bytes());
+        digest.finalize().into()
     }
 }
 
@@ -155,6 +180,47 @@ impl fmt::Debug for SessionConsumerScope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SessionConsumerScope(<redacted>)")
     }
+}
+
+/// Derive the sole V3 roster scope permitted for one authenticated consumer
+/// identity at one exact consensus scope.
+///
+/// `local_identity_commitment` must be obtained from the authenticated local
+/// TLS material. The server independently derives the same value from its
+/// authenticated [`SessionConsumerIdentity`]. Fixed-width framing makes each
+/// domain input unambiguous and keeps all identity material opaque.
+pub fn derive_fenced_mutation_roster_scope(
+    local_identity_commitment: [u8; 32],
+    scope: SessionConsumerScope,
+) -> FencedMutationRosterScope {
+    use sha2::{Digest, Sha256};
+
+    let identity = scope.consensus_identity();
+    let mut digest = Sha256::new();
+    digest.update(
+        u16::try_from(FENCED_MUTATION_ROSTER_AUTHORITY_SCOPE_DOMAIN.len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes(),
+    );
+    digest.update(FENCED_MUTATION_ROSTER_AUTHORITY_SCOPE_DOMAIN);
+    digest.update(32_u16.to_be_bytes());
+    digest.update(local_identity_commitment);
+    digest.update(32_u16.to_be_bytes());
+    digest.update(identity.cluster_id().as_bytes());
+    digest.update(32_u16.to_be_bytes());
+    digest.update(identity.configuration_id().as_bytes());
+    digest.update(8_u16.to_be_bytes());
+    digest.update(identity.configuration_epoch().get().to_be_bytes());
+    FencedMutationRosterScope::from_digest(digest.finalize().into())
+}
+
+/// Derive the V3 roster scope expected by the server for its authenticated
+/// mTLS consumer identity and authoritative consensus scope.
+pub(crate) fn derive_fenced_mutation_roster_scope_for_consumer(
+    identity: &SessionConsumerIdentity,
+    scope: SessionConsumerScope,
+) -> FencedMutationRosterScope {
+    derive_fenced_mutation_roster_scope(identity.spiffe_identity_commitment(), scope)
 }
 
 /// Store-issued, scope-bound manifest of currently admitted consensus-member
@@ -1853,6 +1919,7 @@ pub trait StatelessSessionConsumer: Send + Sync {}
 mod tests {
     use super::{
         derive_consumer_consensus_request_id, derive_consumer_fenced_transition_request,
+        derive_fenced_mutation_roster_scope, derive_fenced_mutation_roster_scope_for_consumer,
         SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
         SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerRejection,
         SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerScope,
@@ -1982,6 +2049,41 @@ mod tests {
         assert!(!format!("{identity:?}").contains(identity.as_str()));
         assert!(!format!("{request_id:?}").contains("090909"));
         assert_eq!(format!("{scope:?}"), "SessionConsumerScope(<redacted>)");
+    }
+
+    #[test]
+    fn roster_authority_scope_matches_tls_and_server_derivations_without_identity_exposure() {
+        let identity = SessionConsumerIdentity::new("spiffe://test.example/consumer/opaque")
+            .expect("valid consumer identity");
+        let other_identity = SessionConsumerIdentity::new("spiffe://test.example/consumer/other")
+            .expect("valid other consumer identity");
+        let current_scope = scope(7, 3);
+        let successor_scope = scope(7, 4);
+
+        let client_scope = derive_fenced_mutation_roster_scope(
+            identity.spiffe_identity_commitment(),
+            current_scope,
+        );
+        assert_eq!(
+            client_scope,
+            derive_fenced_mutation_roster_scope_for_consumer(&identity, current_scope),
+            "the authenticated local TLS and server mTLS derivations must agree"
+        );
+        assert_ne!(
+            client_scope,
+            derive_fenced_mutation_roster_scope_for_consumer(&other_identity, current_scope),
+            "distinct authenticated consumers must not share a roster receipt namespace"
+        );
+        assert_ne!(
+            client_scope,
+            derive_fenced_mutation_roster_scope_for_consumer(&identity, successor_scope),
+            "a different authoritative consensus scope must not share a roster receipt namespace"
+        );
+        assert_eq!(
+            format!("{client_scope:?}"),
+            "FencedMutationRosterScope(<redacted>)"
+        );
+        assert!(!format!("{identity:?}").contains(identity.as_str()));
     }
 
     #[test]

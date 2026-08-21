@@ -58,22 +58,23 @@ use crate::clock::{Clock, SystemClock};
 use crate::consumer::{
     consumer_request_commitment, derive_consumer_consensus_request_id,
     derive_consumer_fenced_transition_request, derive_consumer_request_binding_id,
-    SessionConsumerAuthorizationManifest, SessionConsumerBatchResult, SessionConsumerChange,
-    SessionConsumerFencedMutationRosterProfile, SessionConsumerFencedTransitionError,
-    SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
-    SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
-    SessionConsumerV2Response, SessionConsumerV3Operation, SessionConsumerV3Request,
-    SessionConsumerV3Response, SessionQuorumConsumer, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    derive_fenced_mutation_roster_scope_for_consumer, SessionConsumerAuthorizationManifest,
+    SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerFencedMutationRosterProfile,
+    SessionConsumerFencedTransitionError, SessionConsumerIdentity, SessionConsumerOperation,
+    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
+    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+    SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
+    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
+    SessionConsumerV3Operation, SessionConsumerV3Request, SessionConsumerV3Response,
+    SessionQuorumConsumer, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_mutation_roster::{
     fenced_mutation_roster_profile_digest, FencedMutationRosterAdmission,
-    FencedMutationRosterCapability, FencedMutationRosterHistoryState, FencedMutationRosterOutcome,
-    FencedMutationRosterPhase, FencedMutationRosterStatus, FencedMutationRosterTerminal,
-    FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES, FENCED_MUTATION_ROSTER_SCHEMA_V1,
-    FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
+    FencedMutationRosterCapability, FencedMutationRosterError, FencedMutationRosterHistoryState,
+    FencedMutationRosterOutcome, FencedMutationRosterPhase, FencedMutationRosterStatus,
+    FencedMutationRosterTerminal, FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,
+    FENCED_MUTATION_ROSTER_SCHEMA_V1, FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
 };
 use crate::fenced_transition::{
     AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionObservation,
@@ -4314,6 +4315,102 @@ impl ConsensusSessionStore {
         Ok(status)
     }
 
+    async fn consumer_fenced_mutation_roster_admit(
+        &self,
+        scope: SessionConsumerScope,
+        admission: FencedMutationRosterAdmission,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedMutationRosterOutcome, StoreError> {
+        admission
+            .validate()
+            .map_err(|_| StoreError::InvalidKey("fenced_mutation_roster_invalid".into()))?;
+        let scope_admission = self.admit_consumer_scope(scope, deadline).await.map_err(
+            |rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            },
+        )?;
+        drop(scope_admission);
+        self.require_fenced_mutation_roster_capability_before(deadline)
+            .await?;
+        let (scope_identity, voters) = self.current_scope()?;
+        if scope_identity != scope.consensus_identity() {
+            return Err(StoreError::TopologyAuthorityRevoked);
+        }
+        let request_id = fenced_mutation_roster_outer_request_id(admission.request_id());
+        let response = self
+            .submit_request_before(
+                request_id,
+                SessionMutationIntent::AdmitFencedMutationRoster {
+                    admission: Box::new(admission),
+                    scope_identity,
+                    voter_set_digest: fenced_mutation_roster_voter_set_digest(
+                        scope_identity,
+                        &voters,
+                    ),
+                    profile_digest: fenced_mutation_roster_profile_digest(),
+                },
+                Some(scope.consensus_identity()),
+                deadline,
+            )
+            .await?;
+        match response.result? {
+            SessionMutationOutcome::FencedMutationRoster(outcome) => Ok(outcome),
+            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+        }
+    }
+
+    async fn consumer_fenced_mutation_roster_terminalize(
+        &self,
+        scope: SessionConsumerScope,
+        admission: FencedMutationRosterAdmission,
+        terminal: FencedMutationRosterTerminal,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedMutationRosterOutcome, StoreError> {
+        admission
+            .validate()
+            .and_then(|()| terminal.validate_for_admission(&admission))
+            .map_err(|_| {
+                StoreError::InvalidKey("fenced_mutation_roster_terminal_invalid".into())
+            })?;
+        let scope_admission = self.admit_consumer_scope(scope, deadline).await.map_err(
+            |rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            },
+        )?;
+        drop(scope_admission);
+        self.require_fenced_mutation_roster_capability_before(deadline)
+            .await?;
+        if self.current_scope()?.0 != scope.consensus_identity() {
+            return Err(StoreError::TopologyAuthorityRevoked);
+        }
+        let request_id = fenced_mutation_roster_terminal_outer_request_id(&admission, &terminal)?;
+        let protected_checkpoint =
+            crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan::new(
+                terminal.protected_checkpoint().to_vec().into_boxed_slice(),
+            )
+            .map_err(|_| {
+                StoreError::InvalidKey("fenced_mutation_roster_terminal_invalid".into())
+            })?;
+        let response = self
+            .submit_request_before(
+                request_id,
+                SessionMutationIntent::TerminalizeFencedMutationRoster {
+                    admission: Box::new(admission),
+                    terminal: Box::new(terminal),
+                    protected_checkpoint,
+                },
+                Some(scope.consensus_identity()),
+                deadline,
+            )
+            .await?;
+        match response.result? {
+            SessionMutationOutcome::FencedMutationRoster(outcome) => Ok(outcome),
+            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
+        }
+    }
+
     async fn consumer_scan_restore_records(
         &self,
         scope: SessionConsumerScope,
@@ -6166,7 +6263,7 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
 
     async fn execute_v3(
         &self,
-        _identity: &SessionConsumerIdentity,
+        identity: &SessionConsumerIdentity,
         request: SessionConsumerV3Request,
     ) -> SessionConsumerV3Response {
         let deadline = match self.operation_deadline() {
@@ -6186,9 +6283,21 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
             Ok(admission) => admission,
             Err(rejection) => return SessionConsumerV3Response::Rejected(rejection),
         };
-        drop(admission);
+        let authority_scope = derive_fenced_mutation_roster_scope_for_consumer(
+            identity,
+            SessionConsumerScope::new(admission.required_scope),
+        );
 
         let operation = request.operation().clone();
+        // The opaque scope in every admission-bearing V3 body is the durable
+        // receipt namespace. Derive it from authenticated mTLS identity plus
+        // the exact scope admitted by this store before any roster capability
+        // probe, read barrier, receipt lookup, or proposal. The body itself is
+        // never rewritten server-side: mismatch is a pre-dispatch rejection.
+        if !fenced_mutation_roster_operation_has_authority_scope(&operation, authority_scope) {
+            return SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unauthorized);
+        }
+        drop(admission);
         let response = match operation {
             SessionConsumerV3Operation::FencedMutationRosterCapability => {
                 SessionConsumerV3Response::FencedMutationRosterCapability(
@@ -6233,16 +6342,32 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                         .map_err(SessionConsumerStoreError::from),
                 )
             }
-            SessionConsumerV3Operation::FencedMutationRosterAdmit { .. }
-            | SessionConsumerV3Operation::FencedMutationRosterTerminalize { .. } => {
-                // The replicated roster receipt ID currently commits only to
-                // the immutable roster body. No existing consensus intent
-                // carries the authenticated consumer identity, so accepting
-                // an effect here would let distinct mTLS consumers share a
-                // durable receipt domain. Reject before dispatch until that
-                // binding primitive exists.
-                SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unavailable)
+            SessionConsumerV3Operation::FencedMutationRosterAdmit { admission } => {
+                SessionConsumerV3Response::FencedMutationRosterAdmit(
+                    self.store
+                        .consumer_fenced_mutation_roster_admit(
+                            request.scope(),
+                            *admission,
+                            deadline,
+                        )
+                        .await
+                        .map_err(|_| FencedMutationRosterError::Indeterminate),
+                )
             }
+            SessionConsumerV3Operation::FencedMutationRosterTerminalize {
+                admission,
+                terminal,
+            } => SessionConsumerV3Response::FencedMutationRosterTerminalize(
+                self.store
+                    .consumer_fenced_mutation_roster_terminalize(
+                        request.scope(),
+                        *admission,
+                        *terminal,
+                        deadline,
+                    )
+                    .await
+                    .map_err(|_| FencedMutationRosterError::Indeterminate),
+            ),
         };
 
         // Match V2's successor-scope guard: a response derived under the
@@ -6293,6 +6418,25 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                 .boxed())
             }
             Err(_) => Err(SessionConsumerRejection::Unavailable),
+        }
+    }
+}
+
+fn fenced_mutation_roster_operation_has_authority_scope(
+    operation: &SessionConsumerV3Operation,
+    authority_scope: crate::fenced_mutation_roster::FencedMutationRosterScope,
+) -> bool {
+    match operation {
+        // These operations expose no roster body or receipt namespace. Their
+        // exact store-scope admission remains sufficient and does not turn a
+        // capability/history observation into an identity oracle.
+        SessionConsumerV3Operation::FencedMutationRosterCapability
+        | SessionConsumerV3Operation::FencedMutationRosterHistoryState => true,
+        SessionConsumerV3Operation::FencedMutationRosterAdmit { admission }
+        | SessionConsumerV3Operation::FencedMutationRosterStatus { admission }
+        | SessionConsumerV3Operation::FencedMutationRosterAdoption { admission }
+        | SessionConsumerV3Operation::FencedMutationRosterTerminalize { admission, .. } => {
+            admission.scope() == authority_scope
         }
     }
 }
@@ -7516,7 +7660,10 @@ mod membership_tests {
         );
     }
 
-    fn consumer_v3_roster_admission() -> FencedMutationRosterAdmission {
+    fn consumer_v3_roster_admission(
+        scope: SessionConsumerScope,
+        identity: &SessionConsumerIdentity,
+    ) -> FencedMutationRosterAdmission {
         let member = crate::fenced_mutation_roster::FencedMutationRosterMember::new(
             crate::fenced_mutation_roster::FencedMutationRosterOrdinal::new(0)
                 .expect("roster ordinal"),
@@ -7532,7 +7679,7 @@ mod membership_tests {
         FencedMutationRosterAdmission::new(
             1,
             crate::FencedMutationRosterOperationId::new([0x72; 16]).expect("roster operation ID"),
-            crate::FencedMutationRosterScope::from_digest([0x73; 32]),
+            derive_fenced_mutation_roster_scope_for_consumer(identity, scope),
             crate::FencedMutationRosterFenceIntent::new(
                 OwnerId::new("consumer-v3-roster-owner").expect("roster owner"),
                 FenceToken::new(1),
@@ -7543,6 +7690,122 @@ mod membership_tests {
                 .expect("roster protected plan"),
         )
         .expect("roster admission")
+        .with_terminal_result(
+            crate::FencedMutationRosterProtectedResult::new(vec![0x74].into_boxed_slice())
+                .expect("roster protected result"),
+        )
+        .expect("roster admission terminal result")
+    }
+
+    fn consumer_v3_roster_terminal(
+        admission: &FencedMutationRosterAdmission,
+    ) -> FencedMutationRosterTerminal {
+        let member = &admission.members().as_slice()[0];
+        let proof = crate::FencedMutationRosterMemberProof::issue(
+            admission,
+            member,
+            admission.fence_intent().fence(),
+            crate::FencedMutationRosterProviderOutcome::AppliedExecuted,
+        );
+        FencedMutationRosterTerminal::from_member_proofs(
+            admission,
+            &[proof],
+            admission.fence_intent().fence(),
+            vec![0x75],
+            admission.terminal_result().as_bytes().to_vec(),
+        )
+        .expect("terminal roster")
+    }
+
+    // Model a malformed-but-wire-deserializable terminal that would have
+    // selected its own replacement result before the admission-bound check.
+    fn consumer_v3_self_attested_roster_terminal(
+        admission: &FencedMutationRosterAdmission,
+        protected_result: Vec<u8>,
+    ) -> FencedMutationRosterTerminal {
+        let plan = crate::fenced_mutation_roster::FencedMutationRosterPlan::new(
+            fenced_mutation_roster_profile_digest(),
+            admission.scope().digest(),
+            admission
+                .fence_intent()
+                .owner()
+                .as_str()
+                .as_bytes()
+                .to_vec(),
+            admission
+                .fence_intent()
+                .fence()
+                .get()
+                .to_be_bytes()
+                .to_vec(),
+            admission.expected_generation().get(),
+            admission.members().as_slice().to_vec(),
+            admission.protected_plan().as_bytes().to_vec(),
+            protected_result.clone(),
+        )
+        .expect("self-attested terminal plan");
+        let member = &admission.members().as_slice()[0];
+        FencedMutationRosterTerminal::new(
+            plan.admission_commitment(),
+            vec![
+                crate::fenced_mutation_roster::FencedMutationRosterMemberOutcome::new(
+                    member.ordinal(),
+                    *member.caller_id(),
+                    crate::fenced_mutation_roster::FencedMutationRosterDisposition::Applied,
+                    crate::fenced_mutation_roster::FencedMutationRosterAdoption::Executed,
+                    crate::fenced_mutation_roster::FencedMutationRosterStatusBytes::new(Vec::new())
+                        .expect("terminal status"),
+                )
+                .expect("terminal member"),
+            ],
+            vec![0x75],
+            protected_result,
+        )
+        .expect("self-attested terminal")
+    }
+
+    async fn activate_roster_predecessor(
+        store: &ConsensusSessionStore,
+        scope: SessionConsumerScope,
+        identity: &SessionConsumerIdentity,
+    ) {
+        let key = SessionKey {
+            tenant: TenantId::new("consumer-v3-roster-activation").expect("activation tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"consumer-v3-roster-activation")
+                .try_into()
+                .expect("activation stable ID"),
+        };
+        let transition = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x76; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("consumer-v3-roster-activation-owner").expect("activation owner"),
+                FenceToken::new(0),
+                Duration::from_secs(30),
+            )
+            .expect("activation lease"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("activation transition");
+        let response = store
+            .consumer_service()
+            .execute(
+                identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    SessionConsumerRequestId::from_bytes([0x76; 16]),
+                    SessionConsumerOperation::FencedTransition {
+                        request: Box::new(transition),
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            response,
+            SessionConsumerResponse::FencedTransition(_)
+        ));
     }
 
     #[tokio::test]
@@ -7601,7 +7864,7 @@ mod membership_tests {
     async fn consumer_v3_dispatches_status_and_adoption_through_the_durable_store() {
         let (_directory, store, scope, identity, _key, _lease) = consumer_boundary_store().await;
         let service = store.consumer_service();
-        let admission = consumer_v3_roster_admission();
+        let admission = consumer_v3_roster_admission(scope, &identity);
         let expected = FencedMutationRosterStatus::new(
             FencedMutationRosterPhase::Absent,
             admission.request_id(),
@@ -7666,8 +7929,137 @@ mod membership_tests {
     }
 
     #[tokio::test]
-    async fn consumer_v3_fails_closed_for_effects_without_consumer_bound_receipts() {
+    async fn consumer_v3_rejects_cross_identity_roster_replay_before_dispatch() {
         let (_directory, store, scope, identity, _key, _lease) = consumer_boundary_store().await;
+        let other_identity = SessionConsumerIdentity::new("spiffe://test.example/consumer/other")
+            .expect("other consumer identity");
+        let admission = consumer_v3_roster_admission(scope, &identity);
+        let terminal = consumer_v3_roster_terminal(&admission);
+
+        assert_eq!(
+            store
+                .consumer_service()
+                .execute_v3(
+                    &other_identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterAdmit {
+                            admission: Box::new(admission.clone()),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unauthorized)
+        );
+        assert_eq!(
+            store
+                .consumer_service()
+                .execute_v3(
+                    &other_identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterStatus {
+                            admission: Box::new(admission.clone()),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unauthorized)
+        );
+        assert_eq!(
+            store
+                .consumer_service()
+                .execute_v3(
+                    &other_identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterAdoption {
+                            admission: Box::new(admission.clone()),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unauthorized)
+        );
+        assert_eq!(
+            store
+                .consumer_service()
+                .execute_v3(
+                    &other_identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterTerminalize {
+                            admission: Box::new(admission),
+                            terminal: Box::new(terminal),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_v3_rejects_terminal_result_substitution_before_proposal() {
+        let (_directory, store, scope, identity, _key, _lease) = consumer_boundary_store().await;
+        activate_roster_predecessor(&store, scope, &identity).await;
+        let admission = consumer_v3_roster_admission(scope, &identity);
+        assert!(matches!(
+            store
+                .consumer_service()
+                .execute_v3(
+                    &identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterAdmit {
+                            admission: Box::new(admission.clone()),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_))
+        ));
+
+        let member = &admission.members().as_slice()[0];
+        let proof = crate::FencedMutationRosterMemberProof::issue(
+            &admission,
+            member,
+            admission.fence_intent().fence(),
+            crate::FencedMutationRosterProviderOutcome::AppliedExecuted,
+        );
+        assert_eq!(
+            FencedMutationRosterTerminal::from_member_proofs(
+                &admission,
+                &[proof],
+                admission.fence_intent().fence(),
+                vec![0x75],
+                vec![0x7a],
+            ),
+            Err(FencedMutationRosterError::RequestConflict),
+            "SDK proof issuance cannot replace the result frozen by admission"
+        );
+        let replacement = serde_json::from_slice::<FencedMutationRosterTerminal>(
+            &serde_json::to_vec(&consumer_v3_self_attested_roster_terminal(
+                &admission,
+                vec![0x7a],
+            ))
+            .expect("replacement terminal encodes"),
+        )
+        .expect("replacement terminal decodes from the typed wire body");
+        assert!(
+            replacement.validate_for_admission(&admission).is_err(),
+            "a wire terminal cannot self-attest a replacement admitted result"
+        );
+        let history_before = store
+            .consumer_service()
+            .execute_v3(
+                &identity,
+                SessionConsumerV3Request::new(
+                    scope,
+                    SessionConsumerV3Operation::FencedMutationRosterHistoryState,
+                ),
+            )
+            .await;
 
         assert_eq!(
             store
@@ -7676,14 +8068,97 @@ mod membership_tests {
                     &identity,
                     SessionConsumerV3Request::new(
                         scope,
-                        SessionConsumerV3Operation::FencedMutationRosterAdmit {
-                            admission: Box::new(consumer_v3_roster_admission()),
+                        SessionConsumerV3Operation::FencedMutationRosterTerminalize {
+                            admission: Box::new(admission.clone()),
+                            terminal: Box::new(replacement),
                         },
                     ),
                 )
                 .await,
-            SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unavailable)
+            SessionConsumerV3Response::Rejected(SessionConsumerRejection::MalformedRequest)
         );
+        assert_eq!(
+            store
+                .consumer_service()
+                .execute_v3(
+                    &identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterHistoryState,
+                    ),
+                )
+                .await,
+            history_before,
+            "rejected terminal result substitution changes no receipt or history"
+        );
+        assert_eq!(
+            store
+                .consumer_service()
+                .execute_v3(
+                    &identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterStatus {
+                            admission: Box::new(admission.clone()),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::FencedMutationRosterStatus(Ok(
+                FencedMutationRosterStatus::new(
+                    FencedMutationRosterPhase::PollAdmitted,
+                    admission.request_id(),
+                    None,
+                )
+                .expect("admitted roster status"),
+            ))
+        );
+        assert!(
+            consumer_v3_roster_terminal(&admission)
+                .validate_for_admission(&admission)
+                .is_ok(),
+            "the frozen admission result remains terminalizable"
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_v3_effects_reach_consensus_only_after_verified_roster_authority() {
+        let (_directory, store, scope, identity, _key, _lease) = consumer_boundary_store().await;
+        activate_roster_predecessor(&store, scope, &identity).await;
+        let admission = consumer_v3_roster_admission(scope, &identity);
+        let terminal = consumer_v3_roster_terminal(&admission);
+
+        assert!(matches!(
+            store
+                .consumer_service()
+                .execute_v3(
+                    &identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterAdmit {
+                            admission: Box::new(admission.clone()),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_))
+        ));
+        assert!(matches!(
+            store
+                .consumer_service()
+                .execute_v3(
+                    &identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterTerminalize {
+                            admission: Box::new(admission),
+                            terminal: Box::new(terminal),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::FencedMutationRosterTerminalize(Ok(_))
+        ));
     }
 
     #[tokio::test]

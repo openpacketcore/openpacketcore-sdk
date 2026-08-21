@@ -22,16 +22,16 @@ use std::time::Duration;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use futures_util::FutureExt;
 use opc_session_store::{
-    checked_session_deadline, session_consumer_batch_result_into_store,
-    validate_stored_record_expiry_profile, AtomicFencedTransitionCapability, BackendCapabilities,
-    CompareAndSet, CompareAndSetResult, FencedMutationRosterAdmission,
-    FencedMutationRosterCapability, FencedMutationRosterOutcome, FencedMutationRosterPhase,
-    FencedMutationRosterRequestId, FencedMutationRosterStatus, FencedTransitionExecuteError,
-    FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
-    FencedTransitionRequestId, FencedTransitionStatus, LeaseError, LeaseGuard, OwnerId,
-    PreparedFencedTransition, RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest,
-    SessionBackend, SessionConsumerAuthorizationManifest, SessionConsumerBatchResult,
-    SessionConsumerChange, SessionConsumerFencedMutationRosterProfile,
+    checked_session_deadline, derive_fenced_mutation_roster_scope,
+    session_consumer_batch_result_into_store, validate_stored_record_expiry_profile,
+    AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
+    FencedMutationRosterAdmission, FencedMutationRosterCapability, FencedMutationRosterOutcome,
+    FencedMutationRosterPhase, FencedMutationRosterRequestId, FencedMutationRosterStatus,
+    FencedTransitionExecuteError, FencedTransitionObservation, FencedTransitionOutcome,
+    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus, LeaseError,
+    LeaseGuard, OwnerId, PreparedFencedTransition, RecordExpiryPreflight, RestoreScanPage,
+    RestoreScanRequest, SessionBackend, SessionConsumerAuthorizationManifest,
+    SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerFencedMutationRosterProfile,
     SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
     SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
     SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
@@ -1348,6 +1348,34 @@ impl PersistentFencedMutationRosterClient {
         self.pool.diagnostics()
     }
 
+    /// Bind an admission to this client's authenticated local mTLS identity.
+    ///
+    /// Call this before constructing member proofs or a terminal receipt, and
+    /// retain the returned admission for every later roster operation. The
+    /// identity commitment is obtained only from the configured local TLS
+    /// material; callers cannot provide or synthesize it.
+    pub fn bind_fenced_mutation_roster_admission(
+        &self,
+        admission: FencedMutationRosterAdmission,
+    ) -> Result<FencedMutationRosterAdmission, SessionConsumerClientError> {
+        Ok(admission.with_scope(self.fenced_mutation_roster_authority_scope()?))
+    }
+
+    fn fenced_mutation_roster_authority_scope(
+        &self,
+    ) -> Result<opc_session_store::FencedMutationRosterScope, SessionConsumerClientError> {
+        let local_identity_commitment = self
+            .pool
+            .client
+            .tls_config
+            .local_spiffe_identity_commitment()
+            .ok_or(SessionConsumerClientError::Authentication)?;
+        Ok(derive_fenced_mutation_roster_scope(
+            local_identity_commitment,
+            self.pool.client.scope,
+        ))
+    }
+
     /// Queue exactly one /3 request behind its opaque tenant's FIFO.
     ///
     /// Cancelling this future drops only the caller's response receiver. The
@@ -1365,7 +1393,24 @@ impl PersistentFencedMutationRosterClient {
                 cause: SessionConsumerClientError::ShuttingDown,
             });
         }
-        if request.scope() != self.pool.client.scope || request.validate().is_err() {
+        if request.scope() != self.pool.client.scope {
+            return Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            });
+        }
+        let authority_scope = self
+            .fenced_mutation_roster_authority_scope()
+            .map_err(
+                |cause| PersistentFencedMutationRosterExecuteError::NotTransmitted { cause },
+            )?;
+        // The caller must retain the exact admission returned by
+        // `bind_fenced_mutation_roster_admission`. Rewriting it here could
+        // invalidate a terminal receipt whose commitment was derived from the
+        // original body, so an unbound or cross-identity body is rejected
+        // before scheduler enqueue instead.
+        if !roster_request_has_authority_scope(&request, authority_scope)
+            || request.validate().is_err()
+        {
             return Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             });
@@ -2062,6 +2107,24 @@ fn roster_size_bucket_max(target: &AtomicU8, candidate: u8) {
             Ok(_) => break,
             Err(current) => observed = current,
         }
+    }
+}
+
+fn roster_request_has_authority_scope(
+    request: &SessionConsumerV3Request,
+    authority_scope: opc_session_store::FencedMutationRosterScope,
+) -> bool {
+    match request.operation() {
+        // Capability and history contain no roster receipt namespace.
+        SessionConsumerV3Operation::FencedMutationRosterCapability
+        | SessionConsumerV3Operation::FencedMutationRosterHistoryState => true,
+        SessionConsumerV3Operation::FencedMutationRosterAdmit { admission }
+        | SessionConsumerV3Operation::FencedMutationRosterStatus { admission }
+        | SessionConsumerV3Operation::FencedMutationRosterAdoption { admission }
+        | SessionConsumerV3Operation::FencedMutationRosterTerminalize { admission, .. } => {
+            admission.scope() == authority_scope
+        }
+        _ => false,
     }
 }
 
@@ -11848,17 +11911,24 @@ mod tests {
     use bytes::Bytes;
     use futures_util::StreamExt;
     use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
+    use opc_session_store::fenced_mutation_roster::{
+        FencedMutationRosterDescriptor, FencedMutationRosterOrdinal, FencedMutationRosterPlan,
+    };
     use opc_session_store::{
         checked_session_deadline, BackendCapabilities, CompareAndSet, CompareAndSetResult,
-        EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedMutationRosterCapability,
-        FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,
-        FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
-        FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
-        FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, Generation, LeaseGuard,
-        OwnerId, PreparedFencedTransition, RestoreScanCursorProfile, RestoreScanPage,
-        RestoreScanRequest, SessionBackend, SessionConsensusClusterId,
-        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-        SessionConsensusIdentity, SessionConsumerBatchResult,
+        EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedMutationMemberAdoption,
+        FencedMutationMemberDisposition, FencedMutationRosterAdmission,
+        FencedMutationRosterCapability, FencedMutationRosterFenceIntent,
+        FencedMutationRosterMember, FencedMutationRosterMembers, FencedMutationRosterOperationId,
+        FencedMutationRosterProtectedPlan, FencedMutationRosterProtectedResult,
+        FencedMutationRosterScope, FencedMutationRosterTerminal, FencedTransitionExecuteError,
+        FencedTransitionLease, FencedTransitionMutation, FencedTransitionObservation,
+        FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
+        FencedTransitionStatus, FencedTransitionV2CallerNonce, FencedTransitionV2Capability,
+        FencedTransitionV2HistoryEpoch, Generation, LeaseGuard, OwnerId, PreparedFencedTransition,
+        RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, SessionBackend,
+        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
+        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
         SessionConsumerFencedMutationRosterProfile, SessionConsumerFencedTransitionError,
         SessionConsumerFencedTransitionStatus, SessionConsumerLeaseError, SessionConsumerOperation,
         SessionConsumerOutcomeUnknown, SessionConsumerRequest, SessionConsumerRequestId,
@@ -12990,6 +13060,307 @@ mod tests {
         )
         .with_reauthentication_control(control);
         (client, material)
+    }
+
+    fn roster_admission_with_caller_scope() -> FencedMutationRosterAdmission {
+        let member = FencedMutationRosterMember::new(
+            FencedMutationRosterOrdinal::new(0).expect("roster ordinal"),
+            [0x81; 16],
+            FencedMutationRosterDescriptor::new(Vec::new()).expect("roster descriptor"),
+            1,
+            1,
+            FencedMutationMemberDisposition::Pending,
+            FencedMutationMemberAdoption::Unreconciled,
+        )
+        .expect("roster member");
+        FencedMutationRosterAdmission::new(
+            1,
+            FencedMutationRosterOperationId::new([0x82; 16]).expect("roster operation"),
+            FencedMutationRosterScope::from_digest([0x83; 32]),
+            FencedMutationRosterFenceIntent::new(
+                OwnerId::new("roster-client-owner").expect("roster owner"),
+                FenceToken::new(1),
+            ),
+            Generation::new(1),
+            FencedMutationRosterMembers::new([member]).expect("roster members"),
+            FencedMutationRosterProtectedPlan::new(Box::new([])).expect("roster plan"),
+        )
+        .expect("roster admission")
+        .with_terminal_result(
+            FencedMutationRosterProtectedResult::new(vec![0x85].into_boxed_slice())
+                .expect("roster protected result"),
+        )
+        .expect("roster admission terminal result")
+    }
+
+    fn roster_terminal_for_admission(
+        admission: &FencedMutationRosterAdmission,
+    ) -> FencedMutationRosterTerminal {
+        let caller_id = vec![0x81_u8; 16];
+        let plan = FencedMutationRosterPlan::new(
+            opc_session_store::fenced_mutation_roster_profile_digest(),
+            admission.scope().digest(),
+            admission
+                .fence_intent()
+                .owner()
+                .as_str()
+                .as_bytes()
+                .to_vec(),
+            admission
+                .fence_intent()
+                .fence()
+                .get()
+                .to_be_bytes()
+                .to_vec(),
+            admission.expected_generation().get(),
+            admission.members().as_slice().to_vec(),
+            admission.protected_plan().as_bytes().to_vec(),
+            admission.terminal_result().as_bytes().to_vec(),
+        )
+        .expect("terminal roster plan");
+        serde_json::from_value(serde_json::json!({
+            "admission_commitment": plan.admission_commitment(),
+            "members": [{
+                "ordinal": 0,
+                "caller_id": caller_id,
+                "disposition": "Applied",
+                "adoption": "Executed",
+                "status": [],
+            }],
+            "protected_checkpoint": [0x86_u8],
+            "protected_result": admission.terminal_result().as_bytes(),
+        }))
+        .expect("SDK terminal wire receipt")
+    }
+
+    #[tokio::test]
+    async fn persistent_roster_client_binds_admission_before_scheduler_enqueue() {
+        let control = SessionReauthenticationControl::new();
+        let (stateless, material) = stateless_test_client(control);
+        let client = PersistentFencedMutationRosterClient::try_from_stateless(
+            stateless,
+            PersistentFencedMutationRosterConfig::default(),
+        )
+        .expect("persistent roster client");
+        let (sender, mut receiver) = mpsc::channel(1);
+        *client
+            .pool
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
+        client.pool.ready.store(true, Ordering::Release);
+        let admission = client
+            .bind_fenced_mutation_roster_admission(roster_admission_with_caller_scope())
+            .expect("authenticated local roster authority");
+        let request = SessionConsumerV3Request::new(
+            scope(),
+            SessionConsumerV3Operation::FencedMutationRosterAdmit {
+                admission: Box::new(admission.clone()),
+            },
+        );
+        let expected_scope = opc_session_store::derive_fenced_mutation_roster_scope(
+            material
+                .config()
+                .local_spiffe_identity_commitment()
+                .expect("pinned local SPIFFE identity"),
+            scope(),
+        );
+
+        let submitted = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .execute(
+                        FencedMutationRosterTenant::new([0x84; 16]).expect("roster tenant"),
+                        request,
+                    )
+                    .await
+            }
+        });
+        let Some(super::FencedMutationRosterSchedulerCommand::Submit(job)) = receiver.recv().await
+        else {
+            panic!("bound roster request reaches the scheduler");
+        };
+        let SessionConsumerV3Operation::FencedMutationRosterAdmit {
+            admission: queued_admission,
+        } = job.request.operation()
+        else {
+            panic!("scheduler retains roster admission");
+        };
+        assert_eq!(queued_admission.scope(), expected_scope);
+        assert_eq!(&admission, &**queued_admission);
+        job.complete(
+            Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Unavailable,
+            }),
+            0,
+            &client.pool,
+        );
+        assert!(matches!(
+            submitted.await,
+            Ok(Err(
+                PersistentFencedMutationRosterExecuteError::NotTransmitted { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistent_roster_terminalize_retains_the_prebound_admission_commitment() {
+        let control = SessionReauthenticationControl::new();
+        let (stateless, _material) = stateless_test_client(control);
+        let client = PersistentFencedMutationRosterClient::try_from_stateless(
+            stateless,
+            PersistentFencedMutationRosterConfig::default(),
+        )
+        .expect("persistent roster client");
+        let (sender, mut receiver) = mpsc::channel(1);
+        *client
+            .pool
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
+        client.pool.ready.store(true, Ordering::Release);
+
+        // The client returns the exact admission the caller must retain while
+        // an SDK/provider terminal receipt is constructed from that body.
+        let admission = client
+            .bind_fenced_mutation_roster_admission(roster_admission_with_caller_scope())
+            .expect("authenticated local roster authority");
+        let terminal = roster_terminal_for_admission(&admission);
+        terminal
+            .validate_for_admission(&admission)
+            .expect("terminal commits to the retained bound admission");
+        let request = SessionConsumerV3Request::new(
+            scope(),
+            SessionConsumerV3Operation::FencedMutationRosterTerminalize {
+                admission: Box::new(admission.clone()),
+                terminal: Box::new(terminal.clone()),
+            },
+        );
+
+        let submitted = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .execute(
+                        FencedMutationRosterTenant::new([0x87; 16]).expect("roster tenant"),
+                        request,
+                    )
+                    .await
+            }
+        });
+        let Some(super::FencedMutationRosterSchedulerCommand::Submit(job)) = receiver.recv().await
+        else {
+            panic!("validated terminal roster request reaches the scheduler");
+        };
+        let SessionConsumerV3Operation::FencedMutationRosterTerminalize {
+            admission: queued_admission,
+            terminal: queued_terminal,
+        } = job.request.operation()
+        else {
+            panic!("scheduler retains roster terminal");
+        };
+        assert_eq!(&admission, &**queued_admission);
+        assert_eq!(
+            terminal.admission_commitment(),
+            queued_terminal.admission_commitment(),
+            "execute must preserve, never rewrite, the proof-derived terminal commitment"
+        );
+        queued_terminal
+            .validate_for_admission(queued_admission)
+            .expect("scheduler sees an exact valid terminal binding");
+        job.complete(
+            Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Unavailable,
+            }),
+            0,
+            &client.pool,
+        );
+        assert!(matches!(
+            submitted.await,
+            Ok(Err(
+                PersistentFencedMutationRosterExecuteError::NotTransmitted { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistent_roster_client_rejects_unbound_or_other_identity_terminal_before_enqueue() {
+        let control = SessionReauthenticationControl::new();
+        let (stateless, _material) = stateless_test_client(control);
+        let client = PersistentFencedMutationRosterClient::try_from_stateless(
+            stateless,
+            PersistentFencedMutationRosterConfig::default(),
+        )
+        .expect("persistent roster client");
+        let (sender, mut receiver) = mpsc::channel(2);
+        *client
+            .pool
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
+        client.pool.ready.store(true, Ordering::Release);
+
+        let unbound = roster_admission_with_caller_scope();
+        let unbound_terminal = roster_terminal_for_admission(&unbound);
+        assert!(matches!(
+            client
+                .execute(
+                    FencedMutationRosterTenant::new([0x88; 16]).expect("roster tenant"),
+                    SessionConsumerV3Request::new(
+                        scope(),
+                        SessionConsumerV3Operation::FencedMutationRosterTerminalize {
+                            admission: Box::new(unbound),
+                            terminal: Box::new(unbound_terminal),
+                        },
+                    ),
+                )
+                .await,
+            Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            })
+        ));
+
+        let other_material = RotatableClientMaterial::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/consumer/instance/other",
+        );
+        let other_stateless = StatelessSessionConsumerClient::new(
+            "127.0.0.1:9".parse().expect("test socket address"),
+            rustls_pki_types::ServerName::try_from("consumer.test").expect("test TLS server name"),
+            spiffe("server"),
+            scope(),
+            other_material.config(),
+        );
+        let other_client = PersistentFencedMutationRosterClient::try_from_stateless(
+            other_stateless,
+            PersistentFencedMutationRosterConfig::default(),
+        )
+        .expect("other persistent roster client");
+        let other_admission = other_client
+            .bind_fenced_mutation_roster_admission(roster_admission_with_caller_scope())
+            .expect("other authenticated local roster authority");
+        let other_terminal = roster_terminal_for_admission(&other_admission);
+        assert!(matches!(
+            client
+                .execute(
+                    FencedMutationRosterTenant::new([0x89; 16]).expect("roster tenant"),
+                    SessionConsumerV3Request::new(
+                        scope(),
+                        SessionConsumerV3Operation::FencedMutationRosterTerminalize {
+                            admission: Box::new(other_admission),
+                            terminal: Box::new(other_terminal),
+                        },
+                    ),
+                )
+                .await,
+            Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            })
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "rejected terminals never enqueue"
+        );
     }
 
     #[tokio::test]

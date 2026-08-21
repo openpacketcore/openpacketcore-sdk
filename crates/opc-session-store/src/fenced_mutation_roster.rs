@@ -649,6 +649,12 @@ impl FencedMutationRosterTerminal {
         protected_checkpoint: Vec<u8>,
         protected_result: Vec<u8>,
     ) -> Result<Self, FencedMutationRosterError> {
+        // The result was frozen into the admission request identity. A later
+        // terminal must not self-attest a replacement result under the same
+        // admitted receipt namespace.
+        if protected_result.as_slice() != admission.terminal_result().as_bytes() {
+            return Err(FencedMutationRosterError::RequestConflict);
+        }
         if proofs.len() != admission.members().len() {
             return Err(FencedMutationRosterError::LifecycleConflict);
         }
@@ -681,8 +687,28 @@ impl FencedMutationRosterTerminal {
                 FencedMutationRosterStatusBytes::new(Vec::new())?,
             )?);
         }
+        let plan = FencedMutationRosterPlan::new(
+            fenced_mutation_roster_profile_digest(),
+            admission.scope().digest(),
+            admission
+                .fence_intent()
+                .owner()
+                .as_str()
+                .as_bytes()
+                .to_vec(),
+            admission
+                .fence_intent()
+                .fence()
+                .get()
+                .to_be_bytes()
+                .to_vec(),
+            admission.expected_generation().get(),
+            admission.members().as_slice().to_vec(),
+            admission.protected_plan().as_bytes().to_vec(),
+            admission.terminal_result().as_bytes().to_vec(),
+        )?;
         Self::new(
-            admission.request_id().body_commitment(),
+            plan.admission_commitment(),
             outcomes,
             protected_checkpoint,
             protected_result,
@@ -748,6 +774,12 @@ impl FencedMutationRosterTerminal {
         &self,
         admission: &FencedMutationRosterAdmission,
     ) -> Result<(), FencedMutationRosterError> {
+        // This comparison is deliberately before plan reconstruction: the
+        // terminal is wire-deserializable, so its own result can never select
+        // the commitment basis for an admission already stored durably.
+        if self.protected_result.as_slice() != admission.terminal_result().as_bytes() {
+            return Err(FencedMutationRosterError::RequestConflict);
+        }
         if !self.belongs_to(&FencedMutationRosterPlan::new(
             fenced_mutation_roster_profile_digest(),
             admission.scope().digest(),
@@ -766,7 +798,7 @@ impl FencedMutationRosterTerminal {
             admission.expected_generation().get(),
             admission.members().as_slice().to_vec(),
             admission.protected_plan().as_bytes().to_vec(),
-            self.protected_result.clone(),
+            admission.terminal_result().as_bytes().to_vec(),
         )?) {
             return Err(FencedMutationRosterError::RequestConflict);
         }
@@ -1248,6 +1280,19 @@ impl FencedMutationRosterAdmission {
         value.validate()?;
         Ok(value)
     }
+
+    /// Replace the opaque authority scope while preserving every other
+    /// immutable admission field.
+    ///
+    /// Authenticated consumer transports use this to construct the exact
+    /// roster body bound to their local mTLS identity before it crosses the
+    /// wire. The receiving authority independently verifies the resulting
+    /// scope and never calls this method on a caller body.
+    pub fn with_scope(mut self, scope: FencedMutationRosterScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
     /// Return the stable self-authenticating request identity.
     pub fn request_id(&self) -> FencedMutationRosterRequestId {
         FencedMutationRosterRequestId::new(

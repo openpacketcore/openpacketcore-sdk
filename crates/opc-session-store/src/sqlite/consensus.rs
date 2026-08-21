@@ -28,8 +28,8 @@ use crate::backend::{
 use crate::capability::BackendCapabilities;
 use crate::consensus::storage::{ConsensusAuthorityProfile, SessionConsensusStorageError};
 use crate::consensus::types::{
-    fenced_transition_voter_set_digest, SessionConsensusCommand,
-    SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+    fenced_mutation_roster_voter_set_digest, fenced_transition_voter_set_digest,
+    SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
     SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusNodeId,
     SessionConsensusRequestId, SessionConsensusResponse, SessionMutationIntent,
     SessionMutationOutcome, SessionTopologyMemberBinding, SESSION_CONSENSUS_SCHEMA_VERSION,
@@ -6093,7 +6093,7 @@ pub(crate) fn fenced_mutation_roster_activation_matches_scope_sync(
         return Ok(false);
     };
     Ok(certificate_scope == scope_identity
-        && certificate_voters == fenced_transition_voter_set_digest(scope_identity, voters)
+        && certificate_voters == fenced_mutation_roster_voter_set_digest(scope_identity, voters)
         && certificate_profile == profile_digest
         && history.profile_digest == profile_digest)
 }
@@ -6176,7 +6176,7 @@ pub(crate) fn activate_fenced_mutation_roster_scope_sync(
             epoch_i64(storage_identity)?,
             scope_identity.configuration_id().as_bytes().as_slice(),
             epoch_i64(scope_identity)?,
-            fenced_transition_voter_set_digest(scope_identity, voters).as_slice(),
+            fenced_mutation_roster_voter_set_digest(scope_identity, voters).as_slice(),
             profile_digest.as_slice(),
         ],
     )
@@ -12256,7 +12256,7 @@ fn validate_fenced_mutation_roster_activation_certificate_in_sync(
     if history.profile_digest != fenced_mutation_roster_profile_digest()
         || profile != history.profile_digest
         || scope != membership.current_identity
-        || voters != fenced_transition_voter_set_digest(scope, &membership.current_members)
+        || voters != fenced_mutation_roster_voter_set_digest(scope, &membership.current_members)
     {
         return Err(invalid_data(
             "fenced mutation roster activation certificate is stale",
@@ -13590,7 +13590,7 @@ fn apply_fenced_mutation_roster_command_sync(
     {
         if *scope_identity != scope.current_identity
             || *voter_set_digest
-                != fenced_transition_voter_set_digest(
+                != fenced_mutation_roster_voter_set_digest(
                     scope.current_identity,
                     &scope.current_members,
                 )
@@ -19822,7 +19822,7 @@ mod tests {
                     mutation: Box::new(SessionMutationIntent::AdmitFencedMutationRoster {
                         admission: Box::new(admission),
                         scope_identity: identity(),
-                        voter_set_digest: fenced_transition_voter_set_digest(
+                        voter_set_digest: fenced_mutation_roster_voter_set_digest(
                             identity(),
                             &expected_members(),
                         ),
