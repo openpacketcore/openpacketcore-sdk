@@ -126,15 +126,15 @@ pub use lifecycle::{
     DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
 };
 pub use managed_provider::{
-    ManagedProviderClientAuthority, ManagedProviderClientError, ManagedProviderJobServer,
-    ManagedProviderJobServerHandle, ManagedProviderJobService, ManagedProviderJobServicePort,
-    ManagedProviderPoolConfig, ManagedProviderPoolConfigError, ManagedProviderPoolDiagnostics,
-    ManagedProviderReadiness, ManagedProviderShutdownReport, ManagedVoterEndpoint,
-    PersistentManagedProviderJobClient, DEFAULT_MANAGED_PROVIDER_POOL_LANES,
-    DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES, DEFAULT_MANAGED_PROVIDER_POOL_RESPONSE_BYTES,
-    MANAGED_PROVIDER_JOB_ALPN, MANAGED_PROVIDER_JOB_SEMANTIC_REVISION,
-    MANAGED_PROVIDER_JOB_TRANSPORT_REVISION, MANAGED_PROVIDER_JOB_VOTERS,
-    MANAGED_PROVIDER_POOL_QUEUE_CAPACITY, MAX_MANAGED_PROVIDER_POOL_LANES,
+    ManagedProviderClientAuthority, ManagedProviderClientError, ManagedProviderJobNetworkFacade,
+    ManagedProviderJobServer, ManagedProviderJobServerHandle, ManagedProviderPoolConfig,
+    ManagedProviderPoolConfigError, ManagedProviderPoolDiagnostics, ManagedProviderReadiness,
+    ManagedProviderShutdownReport, ManagedVoterEndpoint, PersistentManagedProviderJobClient,
+    DEFAULT_MANAGED_PROVIDER_POOL_LANES, DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES,
+    DEFAULT_MANAGED_PROVIDER_POOL_RESPONSE_BYTES, MANAGED_PROVIDER_JOB_ALPN,
+    MANAGED_PROVIDER_JOB_SEMANTIC_REVISION, MANAGED_PROVIDER_JOB_TRANSPORT_REVISION,
+    MANAGED_PROVIDER_JOB_VOTERS, MANAGED_PROVIDER_POOL_QUEUE_CAPACITY,
+    MAX_MANAGED_PROVIDER_POOL_LANES,
 };
 pub use membership::{
     SessionMembershipAdmission, SessionMembershipAdmissionError,
