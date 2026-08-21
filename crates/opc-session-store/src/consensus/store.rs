@@ -555,11 +555,16 @@ enum FencedTransitionV2CapabilityAdmission {
     FreshUnanimous,
 }
 
-/// Roster compatibility is a fresh unanimous proof over the current exact
-/// voter scope.  It deliberately has no V2 lifecycle coupling and is never
-/// inferred from a quorum response or an older transition certificate.
+/// Roster compatibility is either its independently persisted exact-scope
+/// certificate or a fresh unanimous proof over the current voters. It
+/// deliberately has no V2 lifecycle coupling and is never inferred from a
+/// quorum response or an older transition certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FencedMutationRosterCapabilityAdmission {
+    /// The independently persisted certificate is still bound to this exact
+    /// current voter scope and roster profile.
+    Activated,
+    /// Every current voter just returned the uniquely framed roster reply.
     FreshUnanimous,
 }
 
@@ -1236,10 +1241,10 @@ impl ConsensusSessionStore {
         Ok(FencedTransitionV2CapabilityAdmission::FreshUnanimous)
     }
 
-    /// Require a fresh all-voter acknowledgement of the roster's immutable
-    /// profile.  There is intentionally no quorum shortcut: an old or
-    /// profile-mismatched voter must make admission fail before the command
-    /// reaches a leader proposal.
+    /// Require the independently certified roster profile at the exact
+    /// current voter scope, or obtain a fresh all-voter acknowledgement. A
+    /// profile-mismatched voter must make a new admission fail before its
+    /// command reaches a leader proposal.
     async fn require_fenced_mutation_roster_capability_before(
         &self,
         deadline: tokio::time::Instant,
@@ -1260,6 +1265,26 @@ impl ConsensusSessionStore {
             return Err(consensus_unavailable());
         }
         let profile_digest = fenced_mutation_roster_profile_digest();
+        // A prior Admit is the only durable roster profile certificate. It is
+        // valid only while it names this precise scope; topology cutover
+        // clears it without touching PollAdmitted history. Do not borrow V2's
+        // certificate or infer this result from a quorum reply.
+        if self
+            .inner
+            .backend
+            .consensus_fenced_mutation_roster_activation_matches_scope(
+                self.inner.storage_identity,
+                expected_scope.0,
+                &expected_scope.1,
+                profile_digest,
+            )
+            .await?
+        {
+            if self.current_scope()? == expected_scope && self.exact_membership_is_admitted() {
+                return Ok(FencedMutationRosterCapabilityAdmission::Activated);
+            }
+            return Err(consensus_unavailable());
+        }
         let probes = expected_scope
             .1
             .iter()
@@ -3204,25 +3229,14 @@ impl ConsensusSessionStore {
                 .require_fenced_mutation_roster_capability_before(deadline)
                 .await
             {
-                Ok(FencedMutationRosterCapabilityAdmission::FreshUnanimous) => {}
+                Ok(FencedMutationRosterCapabilityAdmission::Activated)
+                | Ok(FencedMutationRosterCapabilityAdmission::FreshUnanimous) => {}
                 Err(_) => {
                     return ForwardMutationReply::Applied(Box::new(
                         SessionConsensusResponse::rejected(unsupported_fenced_mutation_roster()),
                     ));
                 }
             }
-        }
-        if matches!(
-            &request.intent,
-            SessionMutationIntent::TerminalizeFencedMutationRoster { .. }
-        ) && self
-            .require_fenced_mutation_roster_capability_before(deadline)
-            .await
-            .is_err()
-        {
-            return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
-                unsupported_fenced_mutation_roster(),
-            )));
         }
         let logical_time = match tokio::time::timeout_at(
             deadline,

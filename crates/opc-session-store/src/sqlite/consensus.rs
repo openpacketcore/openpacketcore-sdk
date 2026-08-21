@@ -37,13 +37,16 @@ use crate::consensus::types::{
 use crate::consensus::SessionRaftTypeConfig;
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_mutation_roster::{
-    decode_fenced_mutation_roster_admission, encode_fenced_mutation_roster_admission,
-    encode_fenced_mutation_roster_identity, fenced_mutation_roster_profile_digest,
-    FencedMutationRosterAdmission, FencedMutationRosterPhase, FencedMutationRosterStatus,
-    FencedMutationRosterTerminal, FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,
+    decode_fenced_mutation_roster_admission, decode_fenced_mutation_roster_terminal,
+    encode_fenced_mutation_roster_admission, encode_fenced_mutation_roster_identity,
+    encode_fenced_mutation_roster_terminal, fenced_mutation_roster_profile_digest,
+    FencedMutationRosterAdmission, FencedMutationRosterOutcome, FencedMutationRosterPhase,
+    FencedMutationRosterStatus, FencedMutationRosterTerminal,
+    FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,
     FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES, FENCED_MUTATION_ROSTER_MAX_LIVE,
     FENCED_MUTATION_ROSTER_RECLAIM_BATCH, FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES,
     FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY, FENCED_MUTATION_ROSTER_RETENTION_SECONDS,
+    FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
 };
 use crate::fenced_transition::{
     fenced_transition_v2_outer_request_id, fenced_transition_v2_profile_digest,
@@ -4756,6 +4759,15 @@ CREATE TABLE consensus_fenced_mutation_roster_operations (
     member_count INTEGER NOT NULL CHECK (member_count BETWEEN 1 AND 8),
     admission_blob BLOB NOT NULL CHECK (length(admission_blob) BETWEEN 1 AND 1081344),
     protected_plan BLOB NOT NULL CHECK (length(protected_plan) BETWEEN 0 AND 1048576),
+    protected_checkpoint BLOB CHECK (
+        protected_checkpoint IS NULL OR length(protected_checkpoint) BETWEEN 0 AND 1048576
+    ),
+    terminal_blob BLOB CHECK (
+        terminal_blob IS NULL OR length(terminal_blob) BETWEEN 1 AND 49152
+    ),
+    terminal_digest BLOB CHECK (
+        terminal_digest IS NULL OR length(terminal_digest) = 32
+    ),
     terminal_result BLOB CHECK (
         terminal_result IS NULL OR length(terminal_result) BETWEEN 0 AND 16384
     ),
@@ -4763,13 +4775,26 @@ CREATE TABLE consensus_fenced_mutation_roster_operations (
         terminal_result_digest IS NULL OR length(terminal_result_digest) = 32
     ),
     CHECK (
-        (phase IN (1, 3)
+        (phase = 1
+         AND protected_checkpoint IS NULL
+         AND terminal_blob IS NULL
+         AND terminal_digest IS NULL
          AND terminal_result IS NULL
          AND terminal_result_digest IS NULL)
         OR
         (phase = 2
+         AND protected_checkpoint IS NOT NULL
+         AND terminal_blob IS NOT NULL
+         AND terminal_digest IS NOT NULL
          AND terminal_result IS NOT NULL
          AND terminal_result_digest IS NOT NULL)
+        OR
+        (phase = 3
+         AND protected_checkpoint IS NOT NULL
+         AND terminal_blob IS NOT NULL
+         AND terminal_digest IS NOT NULL
+         AND terminal_result IS NULL
+         AND terminal_result_digest IS NULL)
     ),
     UNIQUE (history_epoch, ordinal),
     FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
@@ -6675,6 +6700,15 @@ const FENCED_MUTATION_ROSTER_OPERATIONS_TABLE_SCHEMA_SQL: &str = r#"
             member_count INTEGER NOT NULL CHECK (member_count BETWEEN 1 AND 8),
             admission_blob BLOB NOT NULL CHECK (length(admission_blob) BETWEEN 1 AND 1081344),
             protected_plan BLOB NOT NULL CHECK (length(protected_plan) BETWEEN 0 AND 1048576),
+            protected_checkpoint BLOB CHECK (
+                protected_checkpoint IS NULL OR length(protected_checkpoint) BETWEEN 0 AND 1048576
+            ),
+            terminal_blob BLOB CHECK (
+                terminal_blob IS NULL OR length(terminal_blob) BETWEEN 1 AND 49152
+            ),
+            terminal_digest BLOB CHECK (
+                terminal_digest IS NULL OR length(terminal_digest) = 32
+            ),
             terminal_result BLOB CHECK (
                 terminal_result IS NULL OR length(terminal_result) BETWEEN 0 AND 16384
             ),
@@ -6682,13 +6716,26 @@ const FENCED_MUTATION_ROSTER_OPERATIONS_TABLE_SCHEMA_SQL: &str = r#"
                 terminal_result_digest IS NULL OR length(terminal_result_digest) = 32
             ),
             CHECK (
-                (phase IN (1, 3)
+                (phase = 1
+                 AND protected_checkpoint IS NULL
+                 AND terminal_blob IS NULL
+                 AND terminal_digest IS NULL
                  AND terminal_result IS NULL
                  AND terminal_result_digest IS NULL)
                 OR
                 (phase = 2
+                 AND protected_checkpoint IS NOT NULL
+                 AND terminal_blob IS NOT NULL
+                 AND terminal_digest IS NOT NULL
                  AND terminal_result IS NOT NULL
-                 AND terminal_result_digest IS NOT NULL)
+                AND terminal_result_digest IS NOT NULL)
+                OR
+                (phase = 3
+                 AND protected_checkpoint IS NOT NULL
+                 AND terminal_blob IS NOT NULL
+                 AND terminal_digest IS NOT NULL
+                 AND terminal_result IS NULL
+                 AND terminal_result_digest IS NULL)
             ),
             UNIQUE (history_epoch, ordinal),
             FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
