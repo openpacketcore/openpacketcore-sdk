@@ -14,8 +14,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use opc_session_store::fenced_mutation_roster::FencedMutationRosterOrdinal;
 use opc_session_store::{
-    FencedMutationRosterAdmission, ManagedProviderJobError, ManagedProviderJobMemberPhase,
-    ManagedProviderJobMode, ManagedProviderJobStatus, SessionConsumerScope,
+    derive_fenced_mutation_roster_scope, FencedMutationRosterAdmission, ManagedProviderJobError,
+    ManagedProviderJobMemberPhase, ManagedProviderJobMode, ManagedProviderJobStatus,
+    SessionConsumerScope,
 };
 use opc_types::SpiffeId;
 use rustls_pki_types::ServerName;
@@ -119,6 +120,10 @@ impl ManagedProviderPoolConfig {
             || self.request_bytes == 0
             || self.response_bytes == 0
             || self.response_bytes > 4096
+            || self.request_bytes > u32::MAX as usize
+            || self.response_bytes > u32::MAX as usize
+            || self.request_bytes > Semaphore::MAX_PERMITS
+            || self.queued_and_inflight > Semaphore::MAX_PERMITS
             || self.queue_deadline.is_zero()
             || self.setup_timeout.is_zero()
             || self.shutdown_drain.is_zero()
@@ -204,11 +209,14 @@ impl fmt::Debug for ManagedVoterEndpoint {
     }
 }
 
-/// Closed server-side service port. A production composition adapter owns the
-/// store, remote provider, verifier, worker identity and coordinator; none can
-/// cross this transport's public DTO boundary.
+/// Narrow server-side adapter boundary.
+///
+/// The store's concrete least-authority facade implements this boundary. It
+/// deliberately accepts only validated transport values and exposes neither a
+/// store handle nor an authority token. This temporary boundary is kept small
+/// so replacing the private adapter with that concrete facade is mechanical.
 #[async_trait]
-pub trait ManagedProviderJobService: Send + Sync {
+pub trait ManagedProviderJobNetworkFacade: Send + Sync {
     async fn run_member(
         &self,
         admission: FencedMutationRosterAdmission,
@@ -223,15 +231,16 @@ pub trait ManagedProviderJobService: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct ManagedProviderJobServicePort(Arc<dyn ManagedProviderJobService>);
-impl ManagedProviderJobServicePort {
-    pub fn new(service: Arc<dyn ManagedProviderJobService>) -> Self {
+struct ManagedProviderJobServiceAdapter(Arc<dyn ManagedProviderJobNetworkFacade>);
+impl ManagedProviderJobServiceAdapter {
+    #[cfg(test)]
+    fn for_test(service: Arc<dyn ManagedProviderJobNetworkFacade>) -> Self {
         Self(service)
     }
 }
-impl fmt::Debug for ManagedProviderJobServicePort {
+impl fmt::Debug for ManagedProviderJobServiceAdapter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ManagedProviderJobServicePort(<closed>)")
+        f.write_str("ManagedProviderJobServiceAdapter(<closed>)")
     }
 }
 
@@ -281,6 +290,8 @@ pub enum ManagedProviderClientError {
     ShuttingDown,
     #[error("managed provider request outcome is unknown")]
     OutcomeUnknown,
+    #[error("managed provider service is unavailable")]
+    ServiceUnavailable,
 }
 
 #[derive(Default)]
@@ -297,6 +308,8 @@ struct Counters {
     request_bytes_high_water: AtomicU64,
     overload: AtomicU64,
     outcome_unknown: AtomicU64,
+    shutdown_drained: AtomicU64,
+    shutdown_forced: AtomicU64,
 }
 fn high(value: &AtomicU64, current: u64) {
     let mut old = value.load(Ordering::Relaxed);
@@ -473,6 +486,9 @@ impl PersistentManagedProviderJobClient {
         if self.readiness() == ManagedProviderReadiness::Unready {
             return Err(ManagedProviderClientError::Unavailable);
         }
+        if !operation_matches_authority(&operation, &self.pool.authority) {
+            return Err(ManagedProviderClientError::Protocol);
+        }
         let frame = WireRequest::Call { operation };
         let encoded =
             serde_json::to_vec(&frame).map_err(|_| ManagedProviderClientError::Protocol)?;
@@ -536,13 +552,30 @@ impl PersistentManagedProviderJobClient {
     }
 }
 
+fn operation_matches_authority(
+    operation: &WireOperation,
+    authority: &ManagedProviderClientAuthority,
+) -> bool {
+    let admission = match operation {
+        WireOperation::Run { admission, .. } | WireOperation::Status { admission, .. } => admission,
+    };
+    let Some(commitment) = authority.tls.local_spiffe_identity_commitment() else {
+        return false;
+    };
+    admission.validate().is_ok()
+        && admission.scope() == derive_fenced_mutation_roster_scope(commitment, authority.scope)
+}
+
 impl Pool {
     fn start(self: &Arc<Self>) -> Result<(), ManagedProviderClientError> {
-        if self.started.swap(true, Ordering::AcqRel) {
+        if self.started.load(Ordering::Acquire) {
             return Ok(());
         }
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(ManagedProviderClientError::Unavailable);
+        }
+        if self.started.swap(true, Ordering::AcqRel) {
+            return Ok(());
         }
         let (tx, rx) = mpsc::channel(self.config.queued_and_inflight);
         let (event_tx, event_rx) = mpsc::channel(self.config.total_lanes() * 2);
@@ -629,16 +662,28 @@ impl Pool {
         let pool = Arc::clone(self);
         tokio::spawn(async move {
             if let Some(tx) = scheduler {
+                let _ = tx.send(Command::Drain).await;
+                tokio::time::sleep(pool.config.shutdown_drain).await;
+                pool.phase.store(Phase::Forced as u8, Ordering::Release);
                 let _ = tx.send(Command::Force).await;
             }
             let handles = std::mem::take(&mut *pool.tasks.lock().await);
+            // A hung TLS peer or service cannot hold a retained supervisor
+            // beyond its drain deadline. Abort only after the bounded drain.
+            pool.counters.shutdown_forced.fetch_add(
+                pool.counters.inflight.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            for handle in &handles {
+                handle.abort();
+            }
             for mut handle in handles {
                 let _ = (&mut handle).await;
             }
             pool.phase.store(Phase::Stopped as u8, Ordering::Release);
             let report = ManagedProviderShutdownReport {
-                drained: 0,
-                forced: 0,
+                drained: pool.counters.shutdown_drained.load(Ordering::Relaxed),
+                forced: pool.counters.shutdown_forced.load(Ordering::Relaxed),
                 remaining_connections: pool.counters.connections.load(Ordering::Relaxed),
                 remaining_tasks: 0,
             };
@@ -689,12 +734,13 @@ struct Job {
 }
 enum Command {
     Submit(Job),
+    Drain,
     Force,
 }
 enum Event {
-    Ready(usize),
-    Lost(usize),
-    Idle(usize, FairKey),
+    Ready(usize, u64),
+    Lost(usize, u64, Option<FairKey>),
+    Idle(usize, u64, FairKey),
 }
 
 async fn scheduler(
@@ -707,6 +753,7 @@ async fn scheduler(
     let mut rr: VecDeque<FairKey> = VecDeque::new();
     let mut idle: VecDeque<usize> = VecDeque::new();
     let mut live = vec![false; workers.len()];
+    let mut generation = vec![0_u64; workers.len()];
     let mut active = BTreeSet::new();
     let mut expiry = tokio::time::interval(Duration::from_millis(10));
     expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -725,6 +772,11 @@ async fn scheduler(
                 None => continue,
             };
             if job.deadline <= tokio::time::Instant::now() {
+                if empty {
+                    queues.remove(&key);
+                } else {
+                    rr.push_back(key);
+                }
                 complete(&p, job, Err(ManagedProviderClientError::Overloaded));
                 continue;
             }
@@ -749,7 +801,92 @@ async fn scheduler(
             }
         }
         drop(p);
-        tokio::select! { command=commands.recv()=>match command {Some(Command::Submit(job))=>{let Some(p)=pool.upgrade() else{return}; if Phase::load(&p.phase)!=Phase::Running {complete(&p,job,Err(ManagedProviderClientError::ShuttingDown))} else if active.contains(&job.key) || queues.contains_key(&job.key) {complete(&p,job,Err(ManagedProviderClientError::Overloaded))} else {let key=job.key;queues.entry(key).or_default().push_back(job);rr.push_back(key)}},Some(Command::Force)|None=>{if let Some(p)=pool.upgrade(){for (_,q) in queues {for job in q {complete(&p,job,Err(ManagedProviderClientError::ShuttingDown))}}}return}}, event=events.recv()=>match event {Some(Event::Ready(lane))=>{if !live[lane]{live[lane]=true;idle.push_back(lane);if let Some(p)=pool.upgrade(){let voter=lane/p.config.lanes_per_voter;p.warm[voter].fetch_add(1,Ordering::AcqRel);p.update_readiness()}}},Some(Event::Lost(lane))=>{if live[lane]{live[lane]=false;if let Some(p)=pool.upgrade(){let voter=lane/p.config.lanes_per_voter;p.warm[voter].fetch_sub(1,Ordering::AcqRel);p.update_readiness()}}},Some(Event::Idle(lane,key))=>{active.remove(&key);if live[lane]&&!idle.contains(&lane){idle.push_back(lane)}},None=>return}, _=expiry.tick()=>{let Some(p)=pool.upgrade() else{return}; let now=tokio::time::Instant::now(); let mut expired=Vec::new(); for queue in queues.values_mut(){while queue.front().is_some_and(|job| job.deadline<=now){if let Some(job)=queue.pop_front(){expired.push(job)}}} queues.retain(|_,queue|!queue.is_empty());rr.retain(|key|queues.contains_key(key));for job in expired{complete(&p,job,Err(ManagedProviderClientError::Overloaded))}} }
+        tokio::select! {
+            command = commands.recv() => match command {
+                Some(Command::Submit(job)) => {
+                    let Some(p) = pool.upgrade() else { return };
+                    if Phase::load(&p.phase) != Phase::Running {
+                        complete(&p, job, Err(ManagedProviderClientError::ShuttingDown));
+                    } else if active.contains(&job.key) || queues.contains_key(&job.key) {
+                        complete(&p, job, Err(ManagedProviderClientError::Overloaded));
+                    } else {
+                        let key = job.key;
+                        queues.entry(key).or_default().push_back(job);
+                        rr.push_back(key);
+                    }
+                }
+                Some(Command::Drain) => {}
+                Some(Command::Force) | None => {
+                    if let Some(p) = pool.upgrade() {
+                        for (_, queue) in queues {
+                            for job in queue {
+                                p.counters.shutdown_forced.fetch_add(1, Ordering::Relaxed);
+                                complete(&p, job, Err(ManagedProviderClientError::ShuttingDown));
+                            }
+                        }
+                    }
+                    return;
+                }
+            },
+            event = events.recv() => match event {
+                Some(Event::Ready(lane, next_generation)) => {
+                    if next_generation >= generation[lane] {
+                        generation[lane] = next_generation;
+                        if !live[lane] {
+                            live[lane] = true;
+                            idle.push_back(lane);
+                            if let Some(p) = pool.upgrade() {
+                                let voter = lane / p.config.lanes_per_voter;
+                                p.warm[voter].fetch_add(1, Ordering::AcqRel);
+                                p.update_readiness();
+                            }
+                        }
+                    }
+                }
+                Some(Event::Lost(lane, lost_generation, key)) => {
+                    if lost_generation == generation[lane] {
+                        idle.retain(|idle_lane| *idle_lane != lane);
+                        if let Some(key) = key {
+                            active.remove(&key);
+                        }
+                        if live[lane] {
+                            live[lane] = false;
+                            if let Some(p) = pool.upgrade() {
+                                let voter = lane / p.config.lanes_per_voter;
+                                p.warm[voter].fetch_sub(1, Ordering::AcqRel);
+                                p.update_readiness();
+                            }
+                        }
+                    }
+                }
+                Some(Event::Idle(lane, idle_generation, key)) => {
+                    if idle_generation == generation[lane] {
+                        active.remove(&key);
+                        if live[lane] && !idle.contains(&lane) {
+                            idle.push_back(lane);
+                        }
+                    }
+                }
+                None => return,
+            },
+            _ = expiry.tick() => {
+                let Some(p) = pool.upgrade() else { return };
+                let now = tokio::time::Instant::now();
+                let mut expired = Vec::new();
+                for queue in queues.values_mut() {
+                    while queue.front().is_some_and(|job| job.deadline <= now) {
+                        if let Some(job) = queue.pop_front() {
+                            expired.push(job);
+                        }
+                    }
+                }
+                queues.retain(|_, queue| !queue.is_empty());
+                rr.retain(|key| queues.contains_key(key));
+                for job in expired {
+                    complete(&p, job, Err(ManagedProviderClientError::Overloaded));
+                }
+            }
+        }
     }
 }
 fn complete(
@@ -769,31 +906,50 @@ async fn lane_worker(
     events: mpsc::Sender<Event>,
 ) {
     let index = voter * pool.config.lanes_per_voter + _lane;
+    let mut generation = 0_u64;
+    let mut reconnect_attempt = 0_u8;
     loop {
-        if Phase::load(&pool.phase) != Phase::Running {
+        if matches!(Phase::load(&pool.phase), Phase::Forced | Phase::Stopped) {
             return;
         }
         let connection = connect_lane(&pool, voter).await;
         let mut connection = match connection {
             Ok(c) => {
+                generation = generation.wrapping_add(1);
+                reconnect_attempt = 0;
                 pool.counters.connections.fetch_add(1, Ordering::Relaxed);
                 high(
                     &pool.counters.connection_high_water,
                     pool.counters.connections.load(Ordering::Relaxed),
                 );
-                if events.send(Event::Ready(index)).await.is_err() {
+                if events.send(Event::Ready(index, generation)).await.is_err() {
                     return;
                 };
                 c
             }
             Err(_) => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                // Capped lane-local jitter prevents a failed voter from
+                // synchronising all of its replacements into one reconnect
+                // burst. No subscriber creates a retry task.
+                reconnect_attempt = reconnect_attempt.saturating_add(1).min(6);
+                let base = 5_u64 << reconnect_attempt;
+                let jitter = ((index as u64 * 17) + generation) % 11;
+                tokio::time::sleep(Duration::from_millis((base + jitter).min(250))).await;
                 continue;
             }
         };
         while let Some(job) = jobs.recv().await {
-            if Phase::load(&pool.phase) != Phase::Running {
+            if matches!(Phase::load(&pool.phase), Phase::Forced | Phase::Stopped) {
+                pool.counters
+                    .shutdown_forced
+                    .fetch_add(1, Ordering::Relaxed);
                 complete(&pool, job, Err(ManagedProviderClientError::ShuttingDown));
+                continue;
+            }
+            if job.deadline <= tokio::time::Instant::now() {
+                let key = job.key;
+                complete(&pool, job, Err(ManagedProviderClientError::Overloaded));
+                let _ = events.send(Event::Idle(index, generation, key)).await;
                 continue;
             }
             let now = pool.counters.inflight.fetch_add(1, Ordering::Relaxed) + 1;
@@ -804,8 +960,13 @@ async fn lane_worker(
             pool.counters.inflight.fetch_sub(1, Ordering::Relaxed);
             match result {
                 Ok(value) => {
+                    if Phase::load(&pool.phase) == Phase::Draining {
+                        pool.counters
+                            .shutdown_drained
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     complete(&pool, job, value);
-                    let _ = events.send(Event::Idle(index, key)).await;
+                    let _ = events.send(Event::Idle(index, generation, key)).await;
                 }
                 Err(error) => {
                     if error == ManagedProviderClientError::OutcomeUnknown {
@@ -814,13 +975,15 @@ async fn lane_worker(
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     complete(&pool, job, Err(error));
-                    let _ = events.send(Event::Idle(index, key)).await;
+                    // A failed lane must never advertise itself as idle. The
+                    // generation-bound Lost event purges a stale idle slot.
+                    let _ = events.send(Event::Lost(index, generation, Some(key))).await;
                     break;
                 }
             }
         }
         pool.counters.connections.fetch_sub(1, Ordering::Relaxed);
-        let _ = events.send(Event::Lost(index)).await;
+        let _ = events.send(Event::Lost(index, generation, None)).await;
     }
 }
 
@@ -901,7 +1064,7 @@ async fn call_on_lane(
 {
     write_raw(connection, encoded)
         .await
-        .map_err(|_| ManagedProviderClientError::OutcomeUnknown)?;
+        .map_err(FrameWriteError::client_error)?;
     let response: WireResponse = read_json(connection, response_bound)
         .await
         .map_err(|_| ManagedProviderClientError::OutcomeUnknown)?;
@@ -911,23 +1074,52 @@ async fn call_on_lane(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameWriteError {
+    NotTransmitted,
+    OutcomeUnknown,
+}
+impl FrameWriteError {
+    const fn client_error(self) -> ManagedProviderClientError {
+        match self {
+            Self::NotTransmitted => ManagedProviderClientError::Unavailable,
+            Self::OutcomeUnknown => ManagedProviderClientError::OutcomeUnknown,
+        }
+    }
+}
+
 async fn write_raw<W: AsyncWrite + Unpin>(
     writer: &mut W,
     bytes: &[u8],
-) -> Result<(), ManagedProviderClientError> {
-    let length = u32::try_from(bytes.len()).map_err(|_| ManagedProviderClientError::Protocol)?;
-    writer
-        .write_u32(length)
-        .await
-        .map_err(|_| ManagedProviderClientError::Unavailable)?;
-    writer
-        .write_all(bytes)
-        .await
-        .map_err(|_| ManagedProviderClientError::Unavailable)?;
+) -> Result<(), FrameWriteError> {
+    let length = u32::try_from(bytes.len()).map_err(|_| FrameWriteError::NotTransmitted)?;
+    let mut frame = Vec::with_capacity(4 + bytes.len());
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(bytes);
+    let mut offset = 0;
+    while offset < frame.len() {
+        match writer.write(&frame[offset..]).await {
+            Ok(0) => {
+                return Err(if offset == 0 {
+                    FrameWriteError::NotTransmitted
+                } else {
+                    FrameWriteError::OutcomeUnknown
+                });
+            }
+            Err(_) => {
+                return Err(if offset == 0 {
+                    FrameWriteError::NotTransmitted
+                } else {
+                    FrameWriteError::OutcomeUnknown
+                });
+            }
+            Ok(written) => offset = offset.saturating_add(written),
+        }
+    }
     writer
         .flush()
         .await
-        .map_err(|_| ManagedProviderClientError::Unavailable)
+        .map_err(|_| FrameWriteError::OutcomeUnknown)
 }
 async fn write_json<W: AsyncWrite + Unpin, T: Serialize>(
     writer: &mut W,
@@ -938,7 +1130,9 @@ async fn write_json<W: AsyncWrite + Unpin, T: Serialize>(
     if bytes.len() > bound {
         return Err(ManagedProviderClientError::Protocol);
     }
-    write_raw(writer, &bytes).await
+    write_raw(writer, &bytes)
+        .await
+        .map_err(FrameWriteError::client_error)
 }
 async fn read_json<R: AsyncRead + Unpin, T: for<'a> Deserialize<'a>>(
     reader: &mut R,
@@ -956,7 +1150,14 @@ async fn read_json<R: AsyncRead + Unpin, T: for<'a> Deserialize<'a>>(
         .read_exact(&mut bytes)
         .await
         .map_err(|_| ManagedProviderClientError::Unavailable)?;
-    serde_json::from_slice(&bytes).map_err(|_| ManagedProviderClientError::Protocol)
+    let mut unknown = false;
+    let mut decoder = serde_json::Deserializer::from_slice(&bytes);
+    let value = serde_ignored::deserialize(&mut decoder, |_| unknown = true)
+        .map_err(|_| ManagedProviderClientError::Protocol)?;
+    if unknown {
+        return Err(ManagedProviderClientError::Protocol);
+    }
+    Ok(value)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1018,6 +1219,7 @@ struct WireStatus {
     phase: u8,
 }
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 enum WireError {
     Frozen,
     Reconciliation,
@@ -1032,7 +1234,12 @@ impl WireCallResult {
             (Some(status), None) => status
                 .into_status()
                 .ok_or(ManagedProviderClientError::Protocol),
-            (None, Some(WireError::Unavailable)) => Err(ManagedProviderClientError::Unavailable),
+            // A returned application response proves transmission. It is not
+            // interchangeable with a pre-write transport failure and must not
+            // be treated as automatically replay-safe by a caller.
+            (None, Some(WireError::Unavailable)) => {
+                Err(ManagedProviderClientError::ServiceUnavailable)
+            }
             (None, Some(_)) => Err(ManagedProviderClientError::Protocol),
             _ => Err(ManagedProviderClientError::Protocol),
         }
@@ -1079,7 +1286,7 @@ impl WireStatus {
 /// Closed `/5` mTLS listener. It admits only an exact Hello and the two public
 /// operations; unknown fields are rejected before the closed service port runs.
 pub struct ManagedProviderJobServer {
-    service: ManagedProviderJobServicePort,
+    service: ManagedProviderJobServiceAdapter,
     tls: opc_tls::AuthenticatedServerConfig,
     scope: SessionConsumerScope,
     voter: SpiffeId,
@@ -1087,8 +1294,12 @@ pub struct ManagedProviderJobServer {
     max_connections: usize,
 }
 impl ManagedProviderJobServer {
-    pub fn new(
-        service: ManagedProviderJobServicePort,
+    // This is deliberately private until opc-session-store exposes its
+    // concrete least-authority facade. Production must not accept an arbitrary
+    // trait object at a public network constructor.
+    #[cfg(test)]
+    fn new(
+        service: ManagedProviderJobServiceAdapter,
         tls: opc_tls::AuthenticatedServerConfig,
         scope: SessionConsumerScope,
         voter: SpiffeId,
@@ -1106,6 +1317,22 @@ impl ManagedProviderJobServer {
     pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
         self
+    }
+    #[cfg(test)]
+    fn for_test(
+        service: Arc<dyn ManagedProviderJobNetworkFacade>,
+        tls: opc_tls::AuthenticatedServerConfig,
+        scope: SessionConsumerScope,
+        voter: SpiffeId,
+        client: SpiffeId,
+    ) -> Self {
+        Self::new(
+            ManagedProviderJobServiceAdapter::for_test(service),
+            tls,
+            scope,
+            voter,
+            client,
+        )
     }
     pub async fn listen(
         self,
@@ -1168,7 +1395,7 @@ impl ManagedProviderJobServerHandle {
 }
 async fn serve_connection(
     stream: TcpStream,
-    service: ManagedProviderJobServicePort,
+    service: ManagedProviderJobServiceAdapter,
     tls: opc_tls::AuthenticatedServerConfig,
     scope: SessionConsumerScope,
     voter: SpiffeId,
@@ -1237,21 +1464,35 @@ async fn serve_connection(
                 admission,
                 protected_checkpoint,
                 ordinal,
-            } => match FencedMutationRosterOrdinal::new(ordinal) {
-                Ok(ordinal) => result_to_wire(
-                    service
-                        .0
-                        .run_member(admission, protected_checkpoint, ordinal)
-                        .await,
-                ),
+            } => match validated_admission(admission, scope, &client) {
+                Ok(admission) => match FencedMutationRosterOrdinal::new(ordinal) {
+                    Ok(ordinal) => result_to_wire(
+                        service
+                            .0
+                            .run_member(admission, protected_checkpoint, ordinal)
+                            .await,
+                    ),
+                    Err(_) => WireCallResult {
+                        status: None,
+                        error: Some(WireError::InvalidMember),
+                    },
+                },
                 Err(_) => WireCallResult {
                     status: None,
                     error: Some(WireError::InvalidMember),
                 },
             },
             WireOperation::Status { admission, ordinal } => {
-                match FencedMutationRosterOrdinal::new(ordinal) {
-                    Ok(ordinal) => result_to_wire(service.0.job_status(admission, ordinal).await),
+                match validated_admission(admission, scope, &client) {
+                    Ok(admission) => match FencedMutationRosterOrdinal::new(ordinal) {
+                        Ok(ordinal) => {
+                            result_to_wire(service.0.job_status(admission, ordinal).await)
+                        }
+                        Err(_) => WireCallResult {
+                            status: None,
+                            error: Some(WireError::InvalidMember),
+                        },
+                    },
                     Err(_) => WireCallResult {
                         status: None,
                         error: Some(WireError::InvalidMember),
@@ -1266,6 +1507,26 @@ async fn serve_connection(
         )
         .await?;
     }
+}
+fn validated_admission(
+    admission: FencedMutationRosterAdmission,
+    scope: SessionConsumerScope,
+    client: &SpiffeId,
+) -> Result<FencedMutationRosterAdmission, ()> {
+    admission.validate().map_err(|_| ())?;
+    let mut identity = Sha256::new();
+    identity.update(b"openpacketcore/tls/local-spiffe-identity-commitment/v1\0");
+    identity.update(
+        u16::try_from(client.as_str().len())
+            .map_err(|_| ())?
+            .to_be_bytes(),
+    );
+    identity.update(client.as_str().as_bytes());
+    let expected = derive_fenced_mutation_roster_scope(identity.finalize().into(), scope);
+    if admission.scope() != expected {
+        return Err(());
+    }
+    Ok(admission)
 }
 fn result_to_wire(
     result: Result<ManagedProviderJobStatus, ManagedProviderJobError>,
@@ -1292,6 +1553,40 @@ fn result_to_wire(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct FaultWriter {
+        limits: VecDeque<usize>,
+        flush_fails: bool,
+    }
+
+    impl AsyncWrite for FaultWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            match self.limits.pop_front().unwrap_or(bytes.len()) {
+                0 => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "test close"))),
+                limit => Poll::Ready(Ok(limit.min(bytes.len()))),
+            }
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.flush_fails {
+                self.flush_fails = false;
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "test close")))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn pool_config_keeps_the_aggregate_queue_immutable() {
@@ -1324,11 +1619,45 @@ mod tests {
     }
 
     #[test]
+    fn injectable_server_path_is_test_only() {
+        let _ = ManagedProviderJobServiceAdapter::for_test;
+        let _ = ManagedProviderJobServer::for_test;
+    }
+
+    #[test]
     fn unknown_public_response_fields_are_rejected() {
         assert!(serde_json::from_str::<WireResponse>(r#"{"kind":"Reject","extra":true}"#).is_err());
         assert!(serde_json::from_str::<WireCallResult>(
             r#"{"status":null,"error":null,"receipt":"forbidden"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn returned_service_unavailable_is_not_a_prewrite_failure() {
+        assert_eq!(
+            WireCallResult {
+                status: None,
+                error: Some(WireError::Unavailable),
+            }
+            .into_result(),
+            Err(ManagedProviderClientError::ServiceUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_writer_marks_only_prewrite_close_not_transmitted() {
+        for (limits, flush_fails, expected) in [
+            (vec![0], false, FrameWriteError::NotTransmitted),
+            (vec![1, 0], false, FrameWriteError::OutcomeUnknown),
+            (vec![4, 0], false, FrameWriteError::OutcomeUnknown),
+            (vec![usize::MAX], true, FrameWriteError::OutcomeUnknown),
+        ] {
+            let mut writer = FaultWriter {
+                limits: limits.into(),
+                flush_fails,
+            };
+            assert_eq!(write_raw(&mut writer, b"body").await, Err(expected));
+        }
     }
 }
