@@ -1314,7 +1314,9 @@ struct PersistentFencedMutationRosterPool {
     attested_pending: Arc<Semaphore>,
     attested_lane: Mutex<Option<FencedMutationRosterV4LaneConnection>>,
     attested_warm: AtomicBool,
-    attested_inflight: AtomicU64,
+    attested_setup_inflight: AtomicU64,
+    attested_calls_inflight: AtomicU64,
+    attested_drained_calls: AtomicU64,
     scheduler: StdMutex<Option<mpsc::Sender<FencedMutationRosterSchedulerCommand>>>,
     started: AtomicBool,
     phase: AtomicU8,
@@ -1381,7 +1383,9 @@ impl PersistentFencedMutationRosterClient {
                 attested_pending: Arc::new(Semaphore::new(1)),
                 attested_lane: Mutex::new(None),
                 attested_warm: AtomicBool::new(false),
-                attested_inflight: AtomicU64::new(0),
+                attested_setup_inflight: AtomicU64::new(0),
+                attested_calls_inflight: AtomicU64::new(0),
+                attested_drained_calls: AtomicU64::new(0),
                 scheduler: StdMutex::new(None),
                 started: AtomicBool::new(false),
                 phase: AtomicU8::new(PersistentFencedMutationRosterPoolPhase::Running as u8),
@@ -1426,7 +1430,7 @@ impl PersistentFencedMutationRosterClient {
             .acquire_owned()
             .await
             .map_err(|_| SessionConsumerClientError::ShuttingDown)?;
-        let _inflight = FencedMutationRosterAttestedInFlight::new(&self.pool);
+        let _setup = FencedMutationRosterAttestedSetupInFlight::new(&self.pool);
         let existing = {
             let mut lane = self.pool.attested_lane.lock().await;
             lane.take()
@@ -1450,17 +1454,7 @@ impl PersistentFencedMutationRosterClient {
                 }
             }
         };
-        if PersistentFencedMutationRosterPoolPhase::load(&self.pool.phase)
-            != PersistentFencedMutationRosterPoolPhase::Running
-        {
-            return Err(SessionConsumerClientError::ShuttingDown);
-        }
-        let mut stored = self.pool.attested_lane.lock().await;
-        if stored.is_none() {
-            *stored = Some(lane);
-            self.pool.attested_warm.store(true, Ordering::Release);
-        }
-        Ok(())
+        publish_attested_lane(&self.pool, lane).await
     }
 
     /// Request certificate/identity rotation before subsequent lane admission.
@@ -1651,7 +1645,6 @@ impl PersistentFencedMutationRosterClient {
             .map_err(|_| {
                 SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Overloaded)
             })?;
-        let _inflight = FencedMutationRosterAttestedInFlight::new(&self.pool);
         let mut connection = {
             let mut lane = self.pool.attested_lane.try_lock().map_err(|_| {
                 SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Overloaded)
@@ -1660,6 +1653,7 @@ impl PersistentFencedMutationRosterClient {
             lane.take()
         };
         if connection.is_none() {
+            let _setup = FencedMutationRosterAttestedSetupInFlight::new(&self.pool);
             let connect = connect_fenced_mutation_roster_v4_lane(&self.pool);
             tokio::pin!(connect);
             let forced = self.pool.force_notify.notified();
@@ -1677,6 +1671,7 @@ impl PersistentFencedMutationRosterClient {
                 _ = &mut forced => return Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::ShuttingDown)),
             });
         }
+        let _call = FencedMutationRosterAttestedCallInFlight::new(&self.pool);
         let progress = FrameWriteProgress::new();
         let result = match connection.as_mut() {
             Some(connection) => {
@@ -1716,11 +1711,16 @@ impl PersistentFencedMutationRosterClient {
                 )
             })
         {
-            let mut lane = self.pool.attested_lane.lock().await;
-            if lane.is_none() {
-                *lane = connection;
-                self.pool.attested_warm.store(true, Ordering::Release);
+            if let Some(connection) = connection {
+                let _ = publish_attested_lane(&self.pool, connection).await;
             }
+        }
+        if PersistentFencedMutationRosterPoolPhase::load(&self.pool.phase)
+            == PersistentFencedMutationRosterPoolPhase::Draining
+        {
+            self.pool
+                .attested_drained_calls
+                .fetch_add(1, Ordering::Relaxed);
         }
         result
     }
@@ -1908,7 +1908,8 @@ impl PersistentFencedMutationRosterClient {
         loop {
             if self.pool.counters.queued.load(Ordering::Acquire) == 0
                 && self.pool.counters.inflight.load(Ordering::Acquire) == 0
-                && self.pool.attested_inflight.load(Ordering::Acquire) == 0
+                && self.pool.attested_setup_inflight.load(Ordering::Acquire) == 0
+                && self.pool.attested_calls_inflight.load(Ordering::Acquire) == 0
             {
                 break;
             }
@@ -1928,8 +1929,9 @@ impl PersistentFencedMutationRosterClient {
             .queued
             .load(Ordering::Relaxed)
             .saturating_add(self.pool.counters.inflight.load(Ordering::Relaxed));
-        let forced_calls =
-            forced_calls.saturating_add(self.pool.attested_inflight.load(Ordering::Relaxed));
+        let forced_calls = forced_calls
+            .saturating_add(self.pool.attested_setup_inflight.load(Ordering::Relaxed))
+            .saturating_add(self.pool.attested_calls_inflight.load(Ordering::Relaxed));
         self.pool.phase.store(
             PersistentFencedMutationRosterPoolPhase::Forced as u8,
             Ordering::Release,
@@ -1941,11 +1943,7 @@ impl PersistentFencedMutationRosterClient {
         counter_increment(&self.pool.counters.forced);
         self.pool.force_notify.notify_waiters();
         self.pool.attested_warm.store(false, Ordering::Release);
-        let _ = self
-            .pool
-            .attested_lane
-            .try_lock()
-            .map(|mut lane| lane.take());
+        self.pool.attested_lane.lock().await.take();
         if let Some(sender) = self.pool.scheduler_sender() {
             let _ = sender
                 .send(FencedMutationRosterSchedulerCommand::Force)
@@ -1957,7 +1955,8 @@ impl PersistentFencedMutationRosterClient {
                 .counters
                 .drain
                 .load(Ordering::Relaxed)
-                .saturating_sub(1),
+                .saturating_sub(1)
+                .saturating_add(self.pool.attested_drained_calls.load(Ordering::Relaxed)),
             forced_calls,
         };
         *self
@@ -2061,26 +2060,66 @@ struct FencedMutationRosterV4LaneConnection {
     request_frame_size: usize,
 }
 
-/// Counts one admitted V4 exchange until completion or cancellation.
+/// Counts one V4 setup until completion or cancellation.
 ///
 /// The guard deliberately owns no socket: dropping the task also drops the
 /// taken lane, which poisons partial I/O rather than returning it to the pool.
-struct FencedMutationRosterAttestedInFlight<'a> {
+struct FencedMutationRosterAttestedSetupInFlight<'a> {
     pool: &'a PersistentFencedMutationRosterPool,
 }
 
-impl<'a> FencedMutationRosterAttestedInFlight<'a> {
+impl<'a> FencedMutationRosterAttestedSetupInFlight<'a> {
     fn new(pool: &'a PersistentFencedMutationRosterPool) -> Self {
-        pool.attested_inflight.fetch_add(1, Ordering::AcqRel);
+        pool.attested_setup_inflight.fetch_add(1, Ordering::AcqRel);
         Self { pool }
     }
 }
 
-impl Drop for FencedMutationRosterAttestedInFlight<'_> {
+impl Drop for FencedMutationRosterAttestedSetupInFlight<'_> {
     fn drop(&mut self) {
-        self.pool.attested_inflight.fetch_sub(1, Ordering::AcqRel);
+        self.pool
+            .attested_setup_inflight
+            .fetch_sub(1, Ordering::AcqRel);
         self.pool.drained_notify.notify_waiters();
     }
+}
+
+/// Counts one accepted V4 call until completion or cancellation.
+struct FencedMutationRosterAttestedCallInFlight<'a> {
+    pool: &'a PersistentFencedMutationRosterPool,
+}
+
+impl<'a> FencedMutationRosterAttestedCallInFlight<'a> {
+    fn new(pool: &'a PersistentFencedMutationRosterPool) -> Self {
+        pool.attested_calls_inflight.fetch_add(1, Ordering::AcqRel);
+        Self { pool }
+    }
+}
+
+impl Drop for FencedMutationRosterAttestedCallInFlight<'_> {
+    fn drop(&mut self) {
+        self.pool
+            .attested_calls_inflight
+            .fetch_sub(1, Ordering::AcqRel);
+        self.pool.drained_notify.notify_waiters();
+    }
+}
+
+async fn publish_attested_lane(
+    pool: &PersistentFencedMutationRosterPool,
+    lane: FencedMutationRosterV4LaneConnection,
+) -> Result<(), SessionConsumerClientError> {
+    let mut stored = pool.attested_lane.lock().await;
+    if PersistentFencedMutationRosterPoolPhase::load(&pool.phase)
+        != PersistentFencedMutationRosterPoolPhase::Running
+    {
+        return Err(SessionConsumerClientError::ShuttingDown);
+    }
+    if stored.is_none() {
+        *stored = Some(lane);
+        pool.attested_warm.store(true, Ordering::Release);
+    }
+    Ok(())
 }
 
 impl PersistentFencedMutationRosterPool {
@@ -2144,8 +2183,11 @@ impl PersistentFencedMutationRosterPool {
             warm_lanes: self.warm_lanes.load(Ordering::Relaxed) as u64,
             max_lanes: self.config.lane_workers as u64,
             persistent_connections: (self.warm_lanes.load(Ordering::Relaxed)
-                + usize::from(self.attested_warm.load(Ordering::Relaxed)))
-                as u64,
+                + usize::from(
+                    self.attested_warm.load(Ordering::Relaxed)
+                        || self.attested_setup_inflight.load(Ordering::Relaxed) != 0
+                        || self.attested_calls_inflight.load(Ordering::Relaxed) != 0,
+                )) as u64,
             max_persistent_connections: (self.config.lane_workers
                 + PERSISTENT_FENCED_MUTATION_ROSTER_ATTESTED_LANES)
                 as u64,
@@ -3072,6 +3114,11 @@ async fn execute_fenced_mutation_roster_v4_on_lane(
     request: &SessionConsumerV4Request,
     progress: &FrameWriteProgress,
 ) -> Result<SessionConsumerV4Response, SessionConsumerCallError> {
+    // Arm both subscriptions before sampling the authoritative lifecycle
+    // state. A publication between either operation is then observed rather
+    // than lost until a later call.
+    let mut reauthentication_changes = pool.client.reauthentication.subscribe();
+    let mut material_changes = Some(pool.client.tls_config.subscribe_material_changes());
     if connection.calls >= pool.config.connection_call_count
         || !consumer_connection_current(
             &mut connection.lifecycle,
@@ -3085,8 +3132,6 @@ async fn execute_fenced_mutation_roster_v4_on_lane(
         ));
     }
     let correlation = connection.next_correlation;
-    let mut reauthentication_changes = pool.client.reauthentication.subscribe();
-    let mut material_changes = Some(pool.client.tls_config.subscribe_material_changes());
     let request_bytes = v4_call_wire_bytes(correlation, request).ok_or(
         SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol),
     )?;
@@ -11733,6 +11778,8 @@ struct ConsumerV4ServerConnectionContext {
     lifecycle: ConnectionLifecycle,
     tls_config: opc_tls::AuthenticatedServerConfig,
     reauthentication: SessionReauthenticationControl,
+    reauthentication_changes: watch::Receiver<u64>,
+    material_changes: Option<opc_tls::TlsMaterialStatusReceiver>,
     rotation_jitter: Duration,
     cancellation: Arc<ConsumerServerCancellation>,
 }
@@ -11767,6 +11814,8 @@ where
         mut lifecycle,
         tls_config,
         reauthentication,
+        mut reauthentication_changes,
+        mut material_changes,
         rotation_jitter,
         cancellation,
     } = context;
@@ -11776,8 +11825,6 @@ where
     {
         return Err(ProtocolError::UnexpectedResponse);
     }
-    let mut reauthentication_changes = reauthentication.subscribe();
-    let mut material_changes = Some(tls_config.subscribe_material_changes());
     let hello = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Ok(()),
@@ -12132,6 +12179,8 @@ async fn handle_server_connection(
                     lifecycle,
                     tls_config,
                     reauthentication,
+                    reauthentication_changes,
+                    material_changes,
                     rotation_jitter,
                     cancellation,
                 },
@@ -14570,6 +14619,26 @@ mod tests {
         )
         .with_reauthentication_control(control);
         (client, material)
+    }
+
+    #[test]
+    fn attested_diagnostics_count_taken_setup_and_call_lanes() {
+        let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
+        let client = PersistentFencedMutationRosterClient::try_from_stateless(
+            stateless,
+            PersistentFencedMutationRosterConfig::default(),
+        )
+        .expect("bounded roster client");
+        assert_eq!(client.diagnostics().persistent_connections, 0);
+        {
+            let _setup = super::FencedMutationRosterAttestedSetupInFlight::new(&client.pool);
+            assert_eq!(client.diagnostics().persistent_connections, 1);
+        }
+        {
+            let _call = super::FencedMutationRosterAttestedCallInFlight::new(&client.pool);
+            assert_eq!(client.diagnostics().persistent_connections, 1);
+        }
+        assert_eq!(client.diagnostics().persistent_connections, 0);
     }
 
     fn roster_admission_with_caller_scope() -> FencedMutationRosterAdmission {
