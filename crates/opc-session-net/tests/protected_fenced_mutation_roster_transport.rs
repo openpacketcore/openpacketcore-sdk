@@ -26,8 +26,10 @@ use opc_session_net::{
     RemoteAddrResolver, SessionConsumerAuthorizer, SessionConsumerClientError,
     SessionQuorumConsumerServer, StatelessSessionConsumerClient,
     MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES, MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES,
-    SESSION_QUORUM_CONSUMER_V3_ALPN, SESSION_QUORUM_CONSUMER_V3_TRANSPORT_REVISION,
-    SESSION_QUORUM_CONSUMER_V4_ALPN, SESSION_QUORUM_CONSUMER_V4_TRANSPORT_REVISION,
+    MAX_PERSISTENT_FENCED_MUTATION_ROSTER_LANES, MAX_PERSISTENT_FENCED_MUTATION_ROSTER_V3_LANES,
+    PERSISTENT_FENCED_MUTATION_ROSTER_ATTESTED_LANES, SESSION_QUORUM_CONSUMER_V3_ALPN,
+    SESSION_QUORUM_CONSUMER_V3_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_V4_ALPN,
+    SESSION_QUORUM_CONSUMER_V4_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     ConsensusSessionStore, FenceToken, FencedMutationMemberAdoption,
@@ -476,6 +478,9 @@ async fn three_persistent_mtls_endpoints_terminalize_only_hmac_attested_provider
             .prewarm_attested()
             .await
             .expect("persistent V4 attested lane");
+        let diagnostics = client.diagnostics();
+        assert_eq!(diagnostics.persistent_connections, 2);
+        assert_eq!(diagnostics.max_persistent_connections, 2);
         clients.push(client);
     }
     let tenant = FencedMutationRosterTenant::new([0x87; 16]).expect("tenant");
@@ -623,6 +628,48 @@ fn fixed_roster_pool_bounds_reject_unbounded_or_empty_tenant_inputs() {
             Duration::from_millis(1),
         ),
         Err(PersistentFencedMutationRosterConfigError::Capacity)
+    );
+}
+
+#[test]
+fn fixed_roster_pool_reserves_the_attested_lane_within_the_total_connection_bound() {
+    assert_eq!(
+        MAX_PERSISTENT_FENCED_MUTATION_ROSTER_V3_LANES
+            + PERSISTENT_FENCED_MUTATION_ROSTER_ATTESTED_LANES,
+        MAX_PERSISTENT_FENCED_MUTATION_ROSTER_LANES,
+        "the V3 worker configuration and V4 lane share one total connection bound",
+    );
+    assert!(PersistentFencedMutationRosterConfig::try_new(
+        MAX_PERSISTENT_FENCED_MUTATION_ROSTER_V3_LANES,
+        1,
+        1,
+        1,
+        MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES,
+        MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES,
+        1,
+        1,
+        0,
+        1,
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+    )
+    .is_ok());
+    assert_eq!(
+        PersistentFencedMutationRosterConfig::try_new(
+            MAX_PERSISTENT_FENCED_MUTATION_ROSTER_LANES,
+            1,
+            1,
+            1,
+            MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES,
+            MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES,
+            1,
+            1,
+            0,
+            1,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        ),
+        Err(PersistentFencedMutationRosterConfigError::Capacity),
     );
 }
 

@@ -827,6 +827,12 @@ pub struct PersistentSessionConsumerShutdownReport {
 pub const DEFAULT_PERSISTENT_FENCED_MUTATION_ROSTER_LANES: usize = 4;
 /// Maximum long-lived lanes in one protected roster client.
 pub const MAX_PERSISTENT_FENCED_MUTATION_ROSTER_LANES: usize = 16;
+/// One authenticated revision-6 lane is permanently reserved alongside the
+/// configurable revision-5 workers.
+pub const PERSISTENT_FENCED_MUTATION_ROSTER_ATTESTED_LANES: usize = 1;
+/// Maximum configurable revision-5 workers after reserving the attested lane.
+pub const MAX_PERSISTENT_FENCED_MUTATION_ROSTER_V3_LANES: usize =
+    MAX_PERSISTENT_FENCED_MUTATION_ROSTER_LANES - PERSISTENT_FENCED_MUTATION_ROSTER_ATTESTED_LANES;
 /// Default number of opaque tenant handles retained by the fair scheduler.
 pub const DEFAULT_PERSISTENT_FENCED_MUTATION_ROSTER_TENANTS: usize = 32;
 /// Maximum opaque tenant handles retained by one protected roster client.
@@ -1013,7 +1019,7 @@ impl PersistentFencedMutationRosterConfig {
     }
 
     fn validate(&self) -> Result<(), PersistentFencedMutationRosterConfigError> {
-        if !(1..=MAX_PERSISTENT_FENCED_MUTATION_ROSTER_LANES).contains(&self.lane_workers)
+        if !(1..=MAX_PERSISTENT_FENCED_MUTATION_ROSTER_V3_LANES).contains(&self.lane_workers)
             || !(1..=MAX_PERSISTENT_FENCED_MUTATION_ROSTER_TENANTS).contains(&self.tenant_slots)
             || !(1..=MAX_PERSISTENT_FENCED_MUTATION_ROSTER_TENANT_QUEUE)
                 .contains(&self.per_tenant_queue)
@@ -1134,6 +1140,10 @@ pub struct PersistentFencedMutationRosterDiagnostics {
     pub setup_phase: Option<PersistentFencedMutationRosterSetupPhase>,
     pub warm_lanes: u64,
     pub max_lanes: u64,
+    /// Warm authenticated connections across V3 workers and the fixed V4 lane.
+    pub persistent_connections: u64,
+    /// Exact total persistent-connection ceiling across V3 and V4.
+    pub max_persistent_connections: u64,
     pub idle_lanes: u64,
     pub queued: u64,
     pub queue_high_water: u64,
@@ -1303,6 +1313,8 @@ struct PersistentFencedMutationRosterPool {
     // than creating a caller-owned connection or unbounded retained work.
     attested_pending: Arc<Semaphore>,
     attested_lane: Mutex<Option<FencedMutationRosterV4LaneConnection>>,
+    attested_warm: AtomicBool,
+    attested_inflight: AtomicU64,
     scheduler: StdMutex<Option<mpsc::Sender<FencedMutationRosterSchedulerCommand>>>,
     started: AtomicBool,
     phase: AtomicU8,
@@ -1368,6 +1380,8 @@ impl PersistentFencedMutationRosterClient {
                 terminal_adoption: Arc::new(Semaphore::new(config.terminal_adoption_entries)),
                 attested_pending: Arc::new(Semaphore::new(1)),
                 attested_lane: Mutex::new(None),
+                attested_warm: AtomicBool::new(false),
+                attested_inflight: AtomicU64::new(0),
                 scheduler: StdMutex::new(None),
                 started: AtomicBool::new(false),
                 phase: AtomicU8::new(PersistentFencedMutationRosterPoolPhase::Running as u8),
@@ -1408,9 +1422,43 @@ impl PersistentFencedMutationRosterClient {
         {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
-        let mut lane = self.pool.attested_lane.lock().await;
-        if lane.is_none() {
-            *lane = Some(connect_fenced_mutation_roster_v4_lane(&self.pool).await?);
+        let _pending = Arc::clone(&self.pool.attested_pending)
+            .acquire_owned()
+            .await
+            .map_err(|_| SessionConsumerClientError::ShuttingDown)?;
+        let _inflight = FencedMutationRosterAttestedInFlight::new(&self.pool);
+        let existing = {
+            let mut lane = self.pool.attested_lane.lock().await;
+            lane.take()
+        };
+        let lane = match existing {
+            Some(lane) => lane,
+            None => {
+                let connect = connect_fenced_mutation_roster_v4_lane(&self.pool);
+                tokio::pin!(connect);
+                let forced = self.pool.force_notify.notified();
+                tokio::pin!(forced);
+                forced.as_mut().enable();
+                if PersistentFencedMutationRosterPoolPhase::load(&self.pool.phase)
+                    != PersistentFencedMutationRosterPoolPhase::Running
+                {
+                    return Err(SessionConsumerClientError::ShuttingDown);
+                }
+                tokio::select! {
+                    result = &mut connect => result?,
+                    _ = &mut forced => return Err(SessionConsumerClientError::ShuttingDown),
+                }
+            }
+        };
+        if PersistentFencedMutationRosterPoolPhase::load(&self.pool.phase)
+            != PersistentFencedMutationRosterPoolPhase::Running
+        {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        let mut stored = self.pool.attested_lane.lock().await;
+        if stored.is_none() {
+            *stored = Some(lane);
+            self.pool.attested_warm.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -1603,30 +1651,76 @@ impl PersistentFencedMutationRosterClient {
             .map_err(|_| {
                 SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Overloaded)
             })?;
-        let mut lane = self.pool.attested_lane.try_lock().map_err(|_| {
-            SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Overloaded)
-        })?;
-        if lane.is_none() {
-            *lane = Some(
-                connect_fenced_mutation_roster_v4_lane(&self.pool)
-                    .await
-                    .map_err(SessionConsumerCallError::BeforeCallWrite)?,
-            );
+        let _inflight = FencedMutationRosterAttestedInFlight::new(&self.pool);
+        let mut connection = {
+            let mut lane = self.pool.attested_lane.try_lock().map_err(|_| {
+                SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Overloaded)
+            })?;
+            self.pool.attested_warm.store(false, Ordering::Release);
+            lane.take()
+        };
+        if connection.is_none() {
+            let connect = connect_fenced_mutation_roster_v4_lane(&self.pool);
+            tokio::pin!(connect);
+            let forced = self.pool.force_notify.notified();
+            tokio::pin!(forced);
+            forced.as_mut().enable();
+            if PersistentFencedMutationRosterPoolPhase::load(&self.pool.phase)
+                != PersistentFencedMutationRosterPoolPhase::Running
+            {
+                return Err(SessionConsumerCallError::BeforeCallWrite(
+                    SessionConsumerClientError::ShuttingDown,
+                ));
+            }
+            connection = Some(tokio::select! {
+                result = &mut connect => result.map_err(SessionConsumerCallError::BeforeCallWrite)?,
+                _ = &mut forced => return Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::ShuttingDown)),
+            });
         }
         let progress = FrameWriteProgress::new();
-        let result = match lane.as_mut() {
+        let result = match connection.as_mut() {
             Some(connection) => {
-                execute_fenced_mutation_roster_v4_on_lane(
+                let operation = execute_fenced_mutation_roster_v4_on_lane(
                     &self.pool, connection, &request, &progress,
-                )
-                .await
+                );
+                tokio::pin!(operation);
+                let forced = self.pool.force_notify.notified();
+                tokio::pin!(forced);
+                forced.as_mut().enable();
+                if PersistentFencedMutationRosterPoolPhase::load(&self.pool.phase)
+                    != PersistentFencedMutationRosterPoolPhase::Running
+                {
+                    return Err(roster_interrupted_call_error(
+                        &progress,
+                        SessionConsumerClientError::ShuttingDown,
+                    ));
+                }
+                tokio::select! {
+                    result = &mut operation => result,
+                    _ = &mut forced => Err(roster_interrupted_call_error(&progress, SessionConsumerClientError::ShuttingDown)),
+                }
             }
             None => Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Unavailable,
             )),
         };
-        if result.is_err() {
-            *lane = None;
+        if result.is_ok()
+            && PersistentFencedMutationRosterPoolPhase::load(&self.pool.phase)
+                == PersistentFencedMutationRosterPoolPhase::Running
+            && connection.as_mut().is_some_and(|connection| {
+                consumer_connection_current(
+                    &mut connection.lifecycle,
+                    &self.pool.client.tls_config,
+                    &self.pool.client.reauthentication,
+                    connection.rotation_jitter,
+                )
+            })
+        {
+            let mut lane = self.pool.attested_lane.lock().await;
+            if lane.is_none() {
+                *lane = connection;
+                self.pool.attested_warm.store(true, Ordering::Release);
+            }
         }
         result
     }
@@ -1814,6 +1908,7 @@ impl PersistentFencedMutationRosterClient {
         loop {
             if self.pool.counters.queued.load(Ordering::Acquire) == 0
                 && self.pool.counters.inflight.load(Ordering::Acquire) == 0
+                && self.pool.attested_inflight.load(Ordering::Acquire) == 0
             {
                 break;
             }
@@ -1833,6 +1928,8 @@ impl PersistentFencedMutationRosterClient {
             .queued
             .load(Ordering::Relaxed)
             .saturating_add(self.pool.counters.inflight.load(Ordering::Relaxed));
+        let forced_calls =
+            forced_calls.saturating_add(self.pool.attested_inflight.load(Ordering::Relaxed));
         self.pool.phase.store(
             PersistentFencedMutationRosterPoolPhase::Forced as u8,
             Ordering::Release,
@@ -1843,6 +1940,12 @@ impl PersistentFencedMutationRosterClient {
         );
         counter_increment(&self.pool.counters.forced);
         self.pool.force_notify.notify_waiters();
+        self.pool.attested_warm.store(false, Ordering::Release);
+        let _ = self
+            .pool
+            .attested_lane
+            .try_lock()
+            .map(|mut lane| lane.take());
         if let Some(sender) = self.pool.scheduler_sender() {
             let _ = sender
                 .send(FencedMutationRosterSchedulerCommand::Force)
@@ -1958,6 +2061,28 @@ struct FencedMutationRosterV4LaneConnection {
     request_frame_size: usize,
 }
 
+/// Counts one admitted V4 exchange until completion or cancellation.
+///
+/// The guard deliberately owns no socket: dropping the task also drops the
+/// taken lane, which poisons partial I/O rather than returning it to the pool.
+struct FencedMutationRosterAttestedInFlight<'a> {
+    pool: &'a PersistentFencedMutationRosterPool,
+}
+
+impl<'a> FencedMutationRosterAttestedInFlight<'a> {
+    fn new(pool: &'a PersistentFencedMutationRosterPool) -> Self {
+        pool.attested_inflight.fetch_add(1, Ordering::AcqRel);
+        Self { pool }
+    }
+}
+
+impl Drop for FencedMutationRosterAttestedInFlight<'_> {
+    fn drop(&mut self) {
+        self.pool.attested_inflight.fetch_sub(1, Ordering::AcqRel);
+        self.pool.drained_notify.notify_waiters();
+    }
+}
+
 impl PersistentFencedMutationRosterPool {
     fn scheduler_sender(&self) -> Option<mpsc::Sender<FencedMutationRosterSchedulerCommand>> {
         self.scheduler
@@ -2018,6 +2143,12 @@ impl PersistentFencedMutationRosterPool {
             )),
             warm_lanes: self.warm_lanes.load(Ordering::Relaxed) as u64,
             max_lanes: self.config.lane_workers as u64,
+            persistent_connections: (self.warm_lanes.load(Ordering::Relaxed)
+                + usize::from(self.attested_warm.load(Ordering::Relaxed)))
+                as u64,
+            max_persistent_connections: (self.config.lane_workers
+                + PERSISTENT_FENCED_MUTATION_ROSTER_ATTESTED_LANES)
+                as u64,
             idle_lanes: count(&self.counters.idle_lanes),
             queued: count(&self.counters.queued),
             queue_high_water: count(&self.counters.queue_high_water),
@@ -2954,6 +3085,8 @@ async fn execute_fenced_mutation_roster_v4_on_lane(
         ));
     }
     let correlation = connection.next_correlation;
+    let mut reauthentication_changes = pool.client.reauthentication.subscribe();
+    let mut material_changes = Some(pool.client.tls_config.subscribe_material_changes());
     let request_bytes = v4_call_wire_bytes(correlation, request).ok_or(
         SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol),
     )?;
@@ -2988,34 +3121,106 @@ async fn execute_fenced_mutation_roster_v4_on_lane(
         correlation,
         request: Box::new(request.clone()),
     });
-    write_frame_bounded_until_classified_with_progress(
+    let initial_hard_deadline = connection.lifecycle.hard_deadline().map_err(|_| {
+        SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol)
+    })?;
+    let write_deadline = deadline.min(initial_hard_deadline);
+    let write = write_frame_bounded_until_classified_with_progress(
         &mut connection.writer,
         &outbound,
         connection.request_frame_size,
-        deadline,
+        write_deadline,
         progress,
-    )
-    .await
-    .map_err(|error| match error {
-        FrameWriteError::BeforeWrite(error) => {
-            SessionConsumerCallError::BeforeCallWrite(error.into())
+    );
+    tokio::pin!(write);
+    loop {
+        let hard_deadline = connection.lifecycle.hard_deadline().map_err(|_| {
+            roster_interrupted_call_error(progress, SessionConsumerClientError::Protocol)
+        })?;
+        let result = tokio::select! {
+            biased;
+            result = &mut write => Some(result),
+            _ = wait_for_shortened_deadline(hard_deadline, write_deadline) => {
+                record_consumer_hard_overrun(&connection.lifecycle);
+                return Err(roster_interrupted_call_error(progress, SessionConsumerClientError::Deadline));
+            }
+            _ = reauthentication_changes.changed() => {
+                observe_consumer_rotation(&mut connection.lifecycle, tokio::time::Instant::now(), pool.client.reauthentication.generation(), pool.client.tls_config.material_status(), connection.rotation_jitter);
+                None
+            }
+            _ = wait_consumer_material_change(&mut material_changes) => {
+                observe_consumer_rotation(&mut connection.lifecycle, tokio::time::Instant::now(), pool.client.reauthentication.generation(), pool.client.tls_config.material_status(), connection.rotation_jitter);
+                None
+            }
+        };
+        if let Some(result) = result {
+            if hard_deadline <= write_deadline && tokio::time::Instant::now() >= hard_deadline {
+                record_consumer_hard_overrun(&connection.lifecycle);
+                return Err(roster_interrupted_call_error(
+                    progress,
+                    SessionConsumerClientError::Deadline,
+                ));
+            }
+            result.map_err(|error| match error {
+                FrameWriteError::BeforeWrite(error) => {
+                    SessionConsumerCallError::BeforeCallWrite(error.into())
+                }
+                FrameWriteError::MayHaveWritten(error) => {
+                    SessionConsumerCallError::MayHaveSent(error.into())
+                }
+            })?;
+            break;
         }
-        FrameWriteError::MayHaveWritten(error) => {
-            SessionConsumerCallError::MayHaveSent(error.into())
-        }
-    })?;
+    }
+    let initial_hard_deadline = connection
+        .lifecycle
+        .hard_deadline()
+        .map_err(|_| SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Protocol))?;
     let response = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV4WireResponse>(
         &mut connection.reader,
         pool.config.response_bytes.min(MAX_NEGOTIATED_FRAME_SIZE),
-        deadline,
+        deadline.min(initial_hard_deadline),
         effective_consumer_idle_timeout(pool.client.idle_timeout),
-    )
-    .await
-    .map_err(SessionConsumerClientError::from)
-    .map_err(SessionConsumerCallError::MayHaveSent)?
-    .ok_or(SessionConsumerCallError::MayHaveSent(
-        SessionConsumerClientError::Unavailable,
-    ))?;
+    );
+    tokio::pin!(response);
+    let response = loop {
+        let hard_deadline = connection.lifecycle.hard_deadline().map_err(|_| {
+            SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Protocol)
+        })?;
+        let response_deadline = deadline.min(hard_deadline);
+        let result = tokio::select! {
+            biased;
+            result = &mut response => Some(result),
+            _ = tokio::time::sleep_until(response_deadline) => {
+                if hard_deadline <= deadline { record_consumer_hard_overrun(&connection.lifecycle); }
+                return Err(SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Deadline));
+            }
+            _ = reauthentication_changes.changed() => {
+                observe_consumer_rotation(&mut connection.lifecycle, tokio::time::Instant::now(), pool.client.reauthentication.generation(), pool.client.tls_config.material_status(), connection.rotation_jitter);
+                None
+            }
+            _ = wait_consumer_material_change(&mut material_changes) => {
+                observe_consumer_rotation(&mut connection.lifecycle, tokio::time::Instant::now(), pool.client.reauthentication.generation(), pool.client.tls_config.material_status(), connection.rotation_jitter);
+                None
+            }
+        };
+        if let Some(result) = result {
+            if tokio::time::Instant::now() >= response_deadline {
+                if hard_deadline <= deadline {
+                    record_consumer_hard_overrun(&connection.lifecycle);
+                }
+                return Err(SessionConsumerCallError::MayHaveSent(
+                    SessionConsumerClientError::Deadline,
+                ));
+            }
+            break result
+                .map_err(SessionConsumerClientError::from)
+                .map_err(SessionConsumerCallError::MayHaveSent)?
+                .ok_or(SessionConsumerCallError::MayHaveSent(
+                    SessionConsumerClientError::Unavailable,
+                ))?;
+        }
+    };
     let ConsumerV4WireResponse::Response(ConsumerV4CallResponse {
         correlation: received,
         response,
@@ -11532,6 +11737,15 @@ struct ConsumerV4ServerConnectionContext {
     cancellation: Arc<ConsumerServerCancellation>,
 }
 
+fn observe_v4_server_rotation(
+    lifecycle: &mut ConnectionLifecycle,
+    tls_config: &opc_tls::AuthenticatedServerConfig,
+    reauthentication: &SessionReauthenticationControl,
+    rotation_jitter: Duration,
+) {
+    let _ = server_connection_current(lifecycle, tls_config, reauthentication, rotation_jitter);
+}
+
 async fn handle_server_connection_v4<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -11562,13 +11776,23 @@ where
     {
         return Err(ProtocolError::UnexpectedResponse);
     }
-    let hello = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV4WireRequest>(
-        reader,
-        max_frame_size,
-        setup_deadline.min(lifecycle.retire_at()),
-        idle_timeout,
-    )
-    .await?
+    let mut reauthentication_changes = reauthentication.subscribe();
+    let mut material_changes = Some(tls_config.subscribe_material_changes());
+    let hello = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Ok(()),
+        _ = reauthentication_changes.changed() => {
+            observe_v4_server_rotation(&mut lifecycle, &tls_config, &reauthentication, rotation_jitter);
+            return Ok(());
+        }
+        _ = wait_consumer_material_change(&mut material_changes) => {
+            observe_v4_server_rotation(&mut lifecycle, &tls_config, &reauthentication, rotation_jitter);
+            return Ok(());
+        }
+        hello = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV4WireRequest>(
+            reader, max_frame_size, setup_deadline.min(lifecycle.retire_at()), idle_timeout,
+        ) => hello?,
+    }
     .ok_or_else(|| consumer_setup_timeout("consumer V4 Hello deadline elapsed"))?;
     let ConsumerV4WireRequest::Hello(hello) = hello else {
         return Err(ProtocolError::UnexpectedResponse);
@@ -11601,18 +11825,30 @@ where
     ) {
         return Err(ProtocolError::Authentication);
     }
-    write_frame_bounded_until(
-        writer,
-        &ConsumerV4WireResponse::HelloAck(ConsumerV4HelloAck {
-            transport_revision: SESSION_QUORUM_CONSUMER_V4_TRANSPORT_REVISION,
-            scope,
-            request_frame_size: consumer_wire_frame_size(max_frame_size)?,
-            profile: SessionConsumerFencedMutationRosterProfile::v3(),
-        }),
-        response_frame_size,
-        setup_deadline.min(lifecycle.retire_at()),
-    )
-    .await?;
+    let hello_ack = ConsumerV4WireResponse::HelloAck(ConsumerV4HelloAck {
+        transport_revision: SESSION_QUORUM_CONSUMER_V4_TRANSPORT_REVISION,
+        scope,
+        request_frame_size: consumer_wire_frame_size(max_frame_size)?,
+        profile: SessionConsumerFencedMutationRosterProfile::v3(),
+    });
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Ok(()),
+        _ = reauthentication_changes.changed() => {
+            observe_v4_server_rotation(&mut lifecycle, &tls_config, &reauthentication, rotation_jitter);
+            return Ok(());
+        }
+        _ = wait_consumer_material_change(&mut material_changes) => {
+            observe_v4_server_rotation(&mut lifecycle, &tls_config, &reauthentication, rotation_jitter);
+            return Ok(());
+        }
+        result = write_frame_bounded_until(
+            writer,
+            &hello_ack,
+            response_frame_size,
+            setup_deadline.min(lifecycle.retire_at()),
+        ) => result?,
+    }
     let mut expected = NonZeroU32::MIN;
     for _ in 0..MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION {
         if cancellation.is_cancelled()
@@ -11629,13 +11865,21 @@ where
             .checked_add(operation_timeout)
             .ok_or(ProtocolError::InvalidWireValue)?
             .min(lifecycle.retire_at());
-        let call = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV4WireRequest>(
-            reader,
-            max_frame_size,
-            deadline,
-            idle_timeout,
-        )
-        .await?;
+        let call = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            _ = reauthentication_changes.changed() => {
+                observe_v4_server_rotation(&mut lifecycle, &tls_config, &reauthentication, rotation_jitter);
+                return Ok(());
+            }
+            _ = wait_consumer_material_change(&mut material_changes) => {
+                observe_v4_server_rotation(&mut lifecycle, &tls_config, &reauthentication, rotation_jitter);
+                return Ok(());
+            }
+            call = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV4WireRequest>(
+                reader, max_frame_size, deadline, idle_timeout,
+            ) => call?,
+        };
         let Some(call) = call else {
             return Ok(());
         };
@@ -11663,6 +11907,14 @@ where
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Ok(()),
+                _ = reauthentication_changes.changed() => {
+                    observe_v4_server_rotation(&mut lifecycle, &tls_config, &reauthentication, rotation_jitter);
+                    return Ok(());
+                }
+                _ = wait_consumer_material_change(&mut material_changes) => {
+                    observe_v4_server_rotation(&mut lifecycle, &tls_config, &reauthentication, rotation_jitter);
+                    return Ok(());
+                }
                 response = service.execute_v4(&identity, request.clone(), verifier.as_ref()) => response,
                 _ = tokio::time::sleep_until(deadline) => SessionConsumerV4Response::Rejected(SessionConsumerRejection::Unavailable),
             }
@@ -11670,16 +11922,28 @@ where
         if !v4_response_matches_request(&request, &response) {
             return Err(ProtocolError::UnexpectedResponse);
         }
-        write_frame_bounded_until(
-            writer,
-            &ConsumerV4WireResponse::Response(ConsumerV4CallResponse {
-                correlation,
-                response: Box::new(response),
-            }),
-            response_frame_size,
-            deadline,
-        )
-        .await?;
+        let wire_response = ConsumerV4WireResponse::Response(ConsumerV4CallResponse {
+            correlation,
+            response: Box::new(response),
+        });
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            _ = reauthentication_changes.changed() => {
+                observe_v4_server_rotation(&mut lifecycle, &tls_config, &reauthentication, rotation_jitter);
+                return Ok(());
+            }
+            _ = wait_consumer_material_change(&mut material_changes) => {
+                observe_v4_server_rotation(&mut lifecycle, &tls_config, &reauthentication, rotation_jitter);
+                return Ok(());
+            }
+            result = write_frame_bounded_until(
+                writer,
+                &wire_response,
+                response_frame_size,
+                deadline,
+            ) => result?,
+        }
     }
     Ok(())
 }
