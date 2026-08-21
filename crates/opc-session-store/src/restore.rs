@@ -450,7 +450,7 @@ impl RestoreScanCursor {
             _ => return Err("restore scan cursor version is unsupported"),
         }
         let mut bytes = Vec::with_capacity(decoded_len);
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let high =
                 decode_hex_nibble(pair[0]).ok_or("restore scan cursor is not hexadecimal")?;
             let low = decode_hex_nibble(pair[1]).ok_or("restore scan cursor is not hexadecimal")?;

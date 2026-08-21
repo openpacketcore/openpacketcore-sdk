@@ -402,7 +402,7 @@ fn capture_udp_esp(socket: &OwnedFd, expected_payload: &[u8]) -> (Vec<u8>, LinkA
 
 fn ipv4_checksum(header: &[u8]) -> u16 {
     let mut sum = 0_u32;
-    for chunk in header.chunks_exact(2) {
+    for chunk in header.as_chunks::<2>().0 {
         sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
     }
     while sum > u32::from(u16::MAX) {

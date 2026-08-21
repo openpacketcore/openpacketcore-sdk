@@ -2420,7 +2420,7 @@ fn decode_hex_16(text: &str) -> Option<[u8; 16]> {
         return None;
     }
     let mut decoded = [0_u8; 16];
-    for (output, pair) in decoded.iter_mut().zip(encoded.chunks_exact(2)) {
+    for (output, pair) in decoded.iter_mut().zip(encoded.as_chunks::<2>().0.iter()) {
         *output = decode_hex_nibble(pair[0])?
             .checked_mul(16)?
             .checked_add(decode_hex_nibble(pair[1])?)?;
