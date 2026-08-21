@@ -1918,7 +1918,9 @@ async fn fenced_mutation_roster_lane_worker(
             };
             counter_max(
                 &pool.counters.oldest_queue_age_millis,
-                duration_millis(tokio::time::Instant::now().saturating_duration_since(job.enqueued_at)),
+                duration_millis(
+                    tokio::time::Instant::now().saturating_duration_since(job.enqueued_at),
+                ),
             );
             job.inflight = true;
             let inflight = counter_increment(&pool.counters.inflight);
