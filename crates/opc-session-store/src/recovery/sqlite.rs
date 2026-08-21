@@ -417,7 +417,7 @@ fn inspect_current(
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let expected_schema_version = match roster_ledger_layout {
         consensus::FencedMutationRosterLedgerLayout::Activated => {
-            consensus::FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT
+            consensus::FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT
         }
         consensus::FencedMutationRosterLedgerLayout::Absent => match v2_ledger_layout {
             consensus::FencedTransitionV2LedgerLayout::Activated => {

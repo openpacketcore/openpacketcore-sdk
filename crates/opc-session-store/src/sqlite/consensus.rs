@@ -115,14 +115,16 @@ const FENCED_TRANSITION_V2_DATABASE_FORMAT: i64 = 3;
 // Format four is the immutable V1 roster protocol. Format five is its V2
 // successor: it raises the retained-result bound and changes the profiled
 // admission wire/digest. Format six adds the exact V4 verifier-dispatch
-// reservation ledger. Format seven adds the shared V4/V5 protocol claim and
-// bounded managed-provider member ledger. A V1 image is therefore an explicit upgrade boundary,
+// reservation ledger. Format seven freezes that published descriptor exactly.
+// Format eight adds the shared V4/V5 protocol claim and bounded
+// managed-provider member ledger. A V1 image is therefore an explicit upgrade boundary,
 // never a V2 exact-layout corruption or a silently reinterpreted receipt
 // history.
 const FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT: i64 = 4;
 pub(crate) const FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT: i64 = 5;
 pub(crate) const FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT: i64 = 6;
 pub(crate) const FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT: i64 = 7;
+pub(crate) const FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT: i64 = 8;
 const FENCED_MUTATION_ROSTER_V1_PROFILE_DIGEST: [u8; 32] = [
     0xa1, 0x84, 0x36, 0xce, 0xf6, 0x65, 0xf2, 0xdb, 0x3f, 0x25, 0x65, 0xf3, 0x4f, 0x36, 0x55, 0x7b,
     0x20, 0xa1, 0x30, 0x66, 0x1d, 0x6a, 0xad, 0x6c, 0xef, 0x84, 0xf3, 0x92, 0x91, 0x1f, 0x42, 0xda,
@@ -1638,6 +1640,7 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
     if identity_table_exists {
         ensure_fenced_mutation_roster_v2_upgrade_boundary_sync(&tx)?;
         ensure_fenced_mutation_roster_v4_reservation_upgrade_sync(&tx)?;
+        ensure_fenced_mutation_roster_v4_published_format_sync(&tx)?;
         ensure_fenced_mutation_roster_v5_managed_jobs_upgrade_sync(&tx)?;
     }
 
@@ -2110,6 +2113,7 @@ pub(crate) fn read_storage_identity_sync(
             || value == FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT
             || value == FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT
             || value == FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT
+            || value == FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT
     ) {
         return Err(SessionConsensusStorageError::SchemaVersionMismatch);
     }
@@ -4998,7 +5002,8 @@ fn fenced_transition_v2_ledger_layout_in_sync(
             | FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT
             | FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT
             | FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT
-            | FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT,
+            | FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT
+            | FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT,
             true,
             true,
             true,
@@ -5011,7 +5016,8 @@ fn fenced_transition_v2_ledger_layout_in_sync(
                 || version == FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT
                 || version == FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT
                 || version == FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT
-                || version == FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT =>
+                || version == FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT
+                || version == FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT =>
         {
             Ok(FencedTransitionV2LedgerLayout::Absent)
         }
@@ -5128,7 +5134,7 @@ fn fenced_mutation_roster_ledger_layout_in_sync(
         has_activation,
         has_history,
     ) {
-        (FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT, true, true, true, true, true, true, true)
+        (FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT, true, true, true, true, true, true, true)
             if fenced_mutation_roster_schema_is_exact_in_sync(conn, attached)? =>
         {
             Ok(FencedMutationRosterLedgerLayout::Activated)
@@ -5230,12 +5236,44 @@ fn ensure_fenced_mutation_roster_v4_reservation_upgrade_sync(
 /// claim layout.  Existing V4 reservations become durable V4 claims before
 /// the format marker moves, so neither a restarted V4 worker nor a new V5
 /// worker can win by observing half the migration.
-fn ensure_fenced_mutation_roster_v5_managed_jobs_upgrade_sync(
+fn ensure_fenced_mutation_roster_v4_published_format_sync(
     conn: &Connection,
 ) -> Result<(), SessionConsensusStorageError> {
     if persisted_schema_version_in_sync(conn, false)
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
         != FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT
+    {
+        return Ok(());
+    }
+    if !fenced_mutation_roster_v3_schema_is_exact_in_sync(conn, false)
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+    {
+        return Err(SessionConsensusStorageError::SchemaVersionMismatch);
+    }
+    let changed = conn
+        .execute(
+            "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1 AND schema_version = ?2",
+            params![
+                FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT,
+                FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT,
+            ],
+        )
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+    if changed != 1
+        || !fenced_mutation_roster_v3_schema_is_exact_in_sync(conn, false)
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+    {
+        return Err(SessionConsensusStorageError::SchemaVersionMismatch);
+    }
+    Ok(())
+}
+
+fn ensure_fenced_mutation_roster_v5_managed_jobs_upgrade_sync(
+    conn: &Connection,
+) -> Result<(), SessionConsensusStorageError> {
+    if persisted_schema_version_in_sync(conn, false)
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+        != FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT
     {
         return Ok(());
     }
@@ -5268,8 +5306,8 @@ fn ensure_fenced_mutation_roster_v5_managed_jobs_upgrade_sync(
         .execute(
             "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1 AND schema_version = ?2",
             params![
+                FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT,
                 FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT,
-                FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT,
             ],
         )
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
@@ -6229,7 +6267,7 @@ fn activate_fenced_transition_v2_scope_sync(
             .execute(
                 "UPDATE consensus_identity SET schema_version = CASE WHEN schema_version = ?1 THEN ?1 ELSE ?2 END, fenced_transition_receipt_ledger_activated = 1 WHERE singleton = 1 AND ((schema_version = ?3 AND fenced_transition_receipt_ledger_activated = 0) OR (schema_version = ?4 AND fenced_transition_receipt_ledger_activated = 1) OR (schema_version = ?1 AND fenced_transition_receipt_ledger_activated = 1))",
                 params![
-                    FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT,
+                    FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT,
                     FENCED_TRANSITION_V2_DATABASE_FORMAT,
                     i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
                     FENCED_TRANSITION_V1_DATABASE_FORMAT,
@@ -6583,7 +6621,7 @@ pub(crate) fn activate_fenced_mutation_roster_scope_sync(
             .execute(
                 "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1 AND schema_version IN (?2, ?3, ?4)",
                 params![
-                    FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT,
+                    FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT,
                     i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
                     FENCED_TRANSITION_V1_DATABASE_FORMAT,
                     FENCED_TRANSITION_V2_DATABASE_FORMAT,
@@ -6667,7 +6705,8 @@ fn fenced_transition_receipt_ledger_layout_in_sync(
                         || version == FENCED_MUTATION_ROSTER_V1_DATABASE_FORMAT
                         || version == FENCED_MUTATION_ROSTER_V2_DATABASE_FORMAT
                         || version == FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT
-                        || version == FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT =>
+                        || version == FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT
+                        || version == FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT =>
                 {
                     // Format three retains the exact V1 ledger but must also
                     // carry the complete V2 layout.  Accepting only the V1
@@ -20797,7 +20836,7 @@ mod tests {
 
         conn.execute(
             "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1",
-            [FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT + 1],
+            [FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT + 1],
         )
         .expect("inject unknown successor format");
         assert_eq!(
@@ -23763,15 +23802,15 @@ mod tests {
         );
         assert_eq!(
             persisted_schema_version_in_sync(&conn, false).expect("inspect format marker"),
-            FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT,
-            "later V2 activation must never lower the format-seven marker",
+            FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT,
+            "later V2 activation must never lower the format-eight marker",
         );
         validate_fenced_mutation_roster_receipts_sync(&conn, identity())
             .expect("empty V5 history remains canonical after V2 activation");
     }
 
     #[test]
-    fn roster_v4_verifier_reservation_upgrade_is_atomic_and_fences_old_readers() {
+    fn populated_published_format_seven_reopens_and_migrates_transactionally() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.blocking_lock();
         let voters = expected_members();
@@ -23829,7 +23868,7 @@ mod tests {
             .expect("atomically upgrade reservation fence");
         assert_eq!(
             persisted_schema_version_in_sync(&conn, false).expect("format-seven marker"),
-            FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT,
+            FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT,
         );
         assert_eq!(
             fenced_mutation_roster_ledger_layout_sync(&conn).expect("upgraded roster layout"),
@@ -23839,7 +23878,7 @@ mod tests {
         let admission = fenced_mutation_roster_admission(0xF0, 0x81);
         let tx = conn
             .unchecked_transaction()
-            .expect("format-six populated fixture transaction");
+            .expect("format-seven populated fixture transaction");
         fenced_mutation_roster_admit_sync(&tx, identity(), &admission, timestamp(2))
             .expect("admit roster before downgrade");
         let reserved = fenced_mutation_roster_reserve_v4_verifier_dispatch_sync(
@@ -23855,20 +23894,28 @@ mod tests {
              DROP TABLE consensus_fenced_mutation_roster_managed_provider_jobs; \
              DROP TABLE consensus_fenced_mutation_roster_protocol_claims;",
         )
-        .expect("remove format-seven tables from exact format-six fixture");
+        .expect("remove format-eight tables from exact published format-seven fixture");
         tx.execute(
             "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1",
-            [FENCED_MUTATION_ROSTER_V3_DATABASE_FORMAT],
+            [FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT],
         )
-        .expect("restore exact format-six marker");
-        tx.commit().expect("commit populated format-six fixture");
+        .expect("restore exact format-seven marker");
+        tx.commit().expect("commit populated format-seven fixture");
         assert!(
             fenced_mutation_roster_v3_schema_is_exact_in_sync(&conn, false)
-                .expect("recognize exact format-six roster")
+                .expect("recognize exact published format-seven roster")
+        );
+        assert_eq!(
+            persisted_schema_version_in_sync(&conn, false).expect("published format marker"),
+            FENCED_MUTATION_ROSTER_V4_DATABASE_FORMAT
         );
 
         initialize_schema(&conn, identity(), &voters)
-            .expect("atomically upgrade populated format-six roster");
+            .expect("atomically upgrade populated format-seven roster");
+        assert_eq!(
+            persisted_schema_version_in_sync(&conn, false).expect("migrated format marker"),
+            FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT
+        );
         let request_id = admission.request_id().to_bytes();
         let member_count: i64 = conn
             .query_row(
