@@ -87,6 +87,339 @@ pub const SESSION_CONSENSUS_ALPN: &[u8] = b"opc-session-consensus/2";
 /// before they can omit that authorization boundary.
 pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 4;
 
+/// Fixed revision of the protected roster consumer DTO family.
+///
+/// This is deliberately independent from the revision-3 and revision-4
+/// consumer envelopes.  A peer must select its own ALPN and prove this
+/// profile before an opaque roster body is accepted.
+pub const SESSION_CONSUMER_ROSTER_TRANSPORT_REVISION: u16 = 5;
+/// Width of the self-authenticating roster request identity.
+pub const SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES: usize = 56;
+/// Largest canonical admission body admitted by the roster DTO.
+pub const MAX_SESSION_CONSUMER_ROSTER_ADMISSION_BYTES: usize = 1_048_576;
+/// Largest canonical terminal body admitted by the roster DTO.
+pub const MAX_SESSION_CONSUMER_ROSTER_TERMINAL_BYTES: usize = 16_384;
+
+/// Exact capability and immutable resource profile for a roster consumer.
+///
+/// The protected bodies intentionally remain opaque here.  Their canonical
+/// codec belongs to the roster domain, while this transport only admits a
+/// fixed profile and bounded byte envelope.  This prevents the consumer
+/// network surface from importing consensus or administrative product APIs.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsumerRosterProfile {
+    /// Frozen roster-domain schema revision.
+    pub roster_schema_revision: u16,
+    /// Digest over every immutable roster-domain compatibility input.
+    pub roster_profile_digest: [u8; 32],
+    /// Maximum canonical admission body width.
+    pub max_admission_bytes: u32,
+    /// Maximum canonical terminal body width.
+    pub max_terminal_bytes: u32,
+}
+
+impl fmt::Debug for SessionConsumerRosterProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionConsumerRosterProfile")
+            .field("roster_schema_revision", &self.roster_schema_revision)
+            .field("profile_digest", &"<redacted>")
+            .field("max_admission_bytes", &self.max_admission_bytes)
+            .field("max_terminal_bytes", &self.max_terminal_bytes)
+            .finish()
+    }
+}
+
+impl SessionConsumerRosterProfile {
+    /// Build the sole bounded envelope profile for one roster-domain digest.
+    pub fn new(roster_schema_revision: u16, roster_profile_digest: [u8; 32]) -> Option<Self> {
+        let value = Self {
+            roster_schema_revision,
+            roster_profile_digest,
+            max_admission_bytes: MAX_SESSION_CONSUMER_ROSTER_ADMISSION_BYTES as u32,
+            max_terminal_bytes: MAX_SESSION_CONSUMER_ROSTER_TERMINAL_BYTES as u32,
+        };
+        value.is_well_formed().then_some(value)
+    }
+
+    /// Reject malformed profiles before a call body can be decoded.
+    pub const fn is_well_formed(self) -> bool {
+        self.roster_schema_revision != 0
+            && self.roster_profile_digest != [0; 32]
+            && self.max_admission_bytes == MAX_SESSION_CONSUMER_ROSTER_ADMISSION_BYTES as u32
+            && self.max_terminal_bytes == MAX_SESSION_CONSUMER_ROSTER_TERMINAL_BYTES as u32
+    }
+}
+
+/// Capability proof carried by both sides of the revision-5 bootstrap.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsumerRosterCapabilities {
+    /// The one exact protected-roster profile this side implements.
+    pub profile: SessionConsumerRosterProfile,
+}
+
+impl fmt::Debug for SessionConsumerRosterCapabilities {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionConsumerRosterCapabilities")
+            .field("profile", &self.profile)
+            .finish()
+    }
+}
+
+impl SessionConsumerRosterCapabilities {
+    /// Accept only an exactly equal, well-formed peer capability.
+    pub const fn negotiate(self, peer: Self) -> Result<Self, SessionConsumerRosterError> {
+        if !self.profile.is_well_formed() || !peer.profile.is_well_formed() {
+            Err(SessionConsumerRosterError::ProfileMismatch)
+        } else if self.profile != peer.profile {
+            Err(SessionConsumerRosterError::ProfileMismatch)
+        } else {
+            Ok(self)
+        }
+    }
+}
+
+/// Typed protected-roster consumer request.
+///
+/// Bodies are exact canonical roster-domain frames.  The transport never
+/// deserializes them into storage, consensus, or administration enums.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "operation",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum SessionConsumerRosterRequest {
+    /// Prove the exact roster capability/profile before operational calls.
+    Capabilities(SessionConsumerRosterCapabilities),
+    /// Admit one immutable roster body under its complete stable identity.
+    Admit {
+        /// Self-authenticating roster request identity.
+        request_id: [u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES],
+        /// Exact canonical admission body retained by the caller for retry.
+        admission: Box<[u8]>,
+    },
+    /// Read the status bound to one complete stable identity.
+    Status {
+        /// Self-authenticating roster request identity.
+        request_id: [u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES],
+    },
+    /// Record a terminal state under one complete stable identity.
+    Terminalize {
+        /// Self-authenticating roster request identity.
+        request_id: [u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES],
+        /// Exact canonical terminal body retained by the caller for retry.
+        terminal: Box<[u8]>,
+    },
+}
+
+impl fmt::Debug for SessionConsumerRosterRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let operation = match self {
+            Self::Capabilities(_) => "capabilities",
+            Self::Admit { .. } => "admit",
+            Self::Status { .. } => "status",
+            Self::Terminalize { .. } => "terminalize",
+        };
+        formatter
+            .debug_struct("SessionConsumerRosterRequest")
+            .field("operation", &operation)
+            .field("redacted", &true)
+            .finish()
+    }
+}
+
+impl SessionConsumerRosterRequest {
+    /// Verify envelope-only bounds without inspecting protected roster bytes.
+    pub fn validate(&self) -> Result<(), SessionConsumerRosterError> {
+        let valid_id = |request_id: &[u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES]| {
+            request_id.iter().any(|byte| *byte != 0)
+        };
+        match self {
+            Self::Capabilities(capabilities) if capabilities.profile.is_well_formed() => Ok(()),
+            Self::Capabilities(_) => Err(SessionConsumerRosterError::ProfileMismatch),
+            Self::Admit {
+                request_id,
+                admission,
+            } if valid_id(request_id)
+                && !admission.is_empty()
+                && admission.len() <= MAX_SESSION_CONSUMER_ROSTER_ADMISSION_BYTES =>
+            {
+                Ok(())
+            }
+            Self::Status { request_id } if valid_id(request_id) => Ok(()),
+            Self::Terminalize {
+                request_id,
+                terminal,
+            } if valid_id(request_id)
+                && !terminal.is_empty()
+                && terminal.len() <= MAX_SESSION_CONSUMER_ROSTER_TERMINAL_BYTES =>
+            {
+                Ok(())
+            }
+            _ => Err(SessionConsumerRosterError::MalformedRequest),
+        }
+    }
+
+    /// Return the stable identity carried by an operational request.
+    pub const fn request_id(&self) -> Option<[u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES]> {
+        match self {
+            Self::Capabilities(_) => None,
+            Self::Admit { request_id, .. }
+            | Self::Status { request_id }
+            | Self::Terminalize { request_id, .. } => Some(*request_id),
+        }
+    }
+}
+
+/// Typed roster status that never exposes consensus or administrative state.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "status",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum SessionConsumerRosterStatus {
+    /// Admission is durable but not terminal.
+    PollAdmitted,
+    /// A canonical terminal body is retained.
+    Terminal { terminal: Box<[u8]> },
+    /// No binding exists for the supplied identity.
+    NotFound,
+    /// Exact-result retention elapsed while replay remains closed.
+    Expired,
+    /// The identity was supplied with a nonidentical committed body.
+    RequestConflict,
+}
+
+impl fmt::Debug for SessionConsumerRosterStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterStatus(<redacted>)")
+    }
+}
+
+impl SessionConsumerRosterStatus {
+    /// Verify the transport bound for an optional protected terminal body.
+    pub fn validate(&self) -> Result<(), SessionConsumerRosterError> {
+        match self {
+            Self::Terminal { terminal }
+                if terminal.is_empty()
+                    || terminal.len() > MAX_SESSION_CONSUMER_ROSTER_TERMINAL_BYTES =>
+            {
+                Err(SessionConsumerRosterError::MalformedResponse)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Fixed, redaction-safe roster transport error class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SessionConsumerRosterError {
+    /// An envelope was malformed or exceeded a fixed bound.
+    MalformedRequest,
+    /// A response shape or bounded body was invalid.
+    MalformedResponse,
+    /// Peer capability/profile agreement failed closed.
+    ProfileMismatch,
+    /// The authenticated caller was not admitted to this scope.
+    Unauthorized,
+    /// The requested consumer scope did not match the authenticated scope.
+    ScopeMismatch,
+    /// The service could not complete a call within its bounded deadline.
+    Unavailable,
+}
+
+/// Typed roster response, independent of storage or consensus product enums.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "response",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum SessionConsumerRosterResponse {
+    /// Exact peer capability/profile proof.
+    Capabilities(SessionConsumerRosterCapabilities),
+    /// Result of an admission call.
+    Admitted(SessionConsumerRosterStatus),
+    /// Result of a status call.
+    Status(SessionConsumerRosterStatus),
+    /// Result of a terminalization call.
+    Terminalized(SessionConsumerRosterStatus),
+    /// Dispatch may have occurred; retain and retry/poll this exact request.
+    OutcomeUnknown {
+        /// The exact stable identity from the submitted request.
+        request_id: [u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES],
+    },
+    /// Deterministic rejection without a protected-body disclosure.
+    Rejected(SessionConsumerRosterError),
+}
+
+impl fmt::Debug for SessionConsumerRosterResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterResponse(<redacted>)")
+    }
+}
+
+impl SessionConsumerRosterResponse {
+    /// Check a response against the exact request and closed wire family.
+    pub fn matches_request(
+        &self,
+        request: &SessionConsumerRosterRequest,
+    ) -> Result<(), SessionConsumerRosterError> {
+        match (request, self) {
+            (SessionConsumerRosterRequest::Capabilities(local), Self::Capabilities(remote)) => {
+                local.negotiate(*remote).map(|_| ())
+            }
+            (SessionConsumerRosterRequest::Admit { .. }, Self::Admitted(status))
+            | (SessionConsumerRosterRequest::Status { .. }, Self::Status(status))
+            | (SessionConsumerRosterRequest::Terminalize { .. }, Self::Terminalized(status)) => {
+                status.validate()
+            }
+            (_, Self::Rejected(_)) => Ok(()),
+            (_, Self::OutcomeUnknown { request_id })
+                if Some(*request_id) == request.request_id() =>
+            {
+                Ok(())
+            }
+            _ => Err(SessionConsumerRosterError::MalformedResponse),
+        }
+    }
+}
+
+/// Effect-boundary error retaining the exact caller-owned roster body.
+#[derive(Clone, PartialEq, Eq)]
+pub enum SessionConsumerRosterExecuteError {
+    /// No call bytes were accepted; retrying the retained request is safe.
+    NotTransmitted {
+        request: SessionConsumerRosterRequest,
+    },
+    /// Call bytes may have been accepted; retry or poll the retained request.
+    OutcomeUnknown {
+        request: SessionConsumerRosterRequest,
+    },
+    /// A deterministic peer rejection with the retained exact request.
+    Rejected {
+        /// Exact request, including its stable body.
+        request: SessionConsumerRosterRequest,
+        /// Fixed rejection class.
+        error: SessionConsumerRosterError,
+    },
+}
+
+impl fmt::Debug for SessionConsumerRosterExecuteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterExecuteError(<redacted>)")
+    }
+}
+
 /// Exact resource and semantic profile for consensus-only connections.
 ///
 /// There is no subset negotiation. A mismatch is rejected before any
@@ -6296,5 +6629,50 @@ mod tests {
 
         let result = read_frame::<_, Response>(&mut reader, 128).await;
         assert!(matches!(result, Err(ProtocolError::FrameTooLarge(1024))));
+    }
+
+    #[test]
+    fn roster_profile_and_response_boundaries_fail_closed() {
+        let capabilities = SessionConsumerRosterCapabilities {
+            profile: SessionConsumerRosterProfile::new(1, [7; 32])
+                .expect("nonzero bounded profile"),
+        };
+        let mismatched = SessionConsumerRosterCapabilities {
+            profile: SessionConsumerRosterProfile::new(1, [8; 32])
+                .expect("nonzero bounded profile"),
+        };
+        assert_eq!(
+            capabilities.negotiate(mismatched),
+            Err(SessionConsumerRosterError::ProfileMismatch)
+        );
+
+        let request_id = [9; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES];
+        let request = SessionConsumerRosterRequest::Admit {
+            request_id,
+            admission: vec![1].into_boxed_slice(),
+        };
+        assert!(request.validate().is_ok());
+        assert_eq!(
+            SessionConsumerRosterResponse::OutcomeUnknown {
+                request_id: [8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES],
+            }
+            .matches_request(&request),
+            Err(SessionConsumerRosterError::MalformedResponse)
+        );
+        assert!(SessionConsumerRosterResponse::OutcomeUnknown { request_id }
+            .matches_request(&request)
+            .is_ok());
+
+        let oversized = SessionConsumerRosterRequest::Admit {
+            request_id,
+            admission: vec![0; MAX_SESSION_CONSUMER_ROSTER_ADMISSION_BYTES + 1].into_boxed_slice(),
+        };
+        assert_eq!(
+            oversized.validate(),
+            Err(SessionConsumerRosterError::MalformedRequest)
+        );
+        let debug = format!("{:?}", request);
+        assert!(!debug.contains("[1]"));
+        assert!(!debug.contains("[9"));
     }
 }

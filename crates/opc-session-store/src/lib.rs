@@ -50,6 +50,7 @@ pub mod consensus;
 pub mod consumer;
 pub mod error;
 pub mod fake;
+pub mod fenced_mutation_roster;
 pub mod fenced_transition;
 pub mod fenced_transition_journal;
 pub mod handover;
@@ -60,6 +61,7 @@ pub mod model;
 pub mod owned_session;
 pub mod ownership;
 pub mod payload_codec;
+pub mod protected_mutation_roster;
 pub mod quorum;
 pub mod readiness;
 pub mod record;
@@ -122,19 +124,47 @@ pub use consumer::{
     derive_consumer_consensus_request_id, session_consumer_batch_result,
     session_consumer_batch_result_into_store, SessionConsumerAuthorizationManifest,
     SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerChangeItem,
-    SessionConsumerChangeKind, SessionConsumerFencedTransitionError,
-    SessionConsumerFencedTransitionStatus, SessionConsumerIdentity, SessionConsumerIdentityError,
-    SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
-    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
-    SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
-    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
-    SessionQuorumConsumer, StatelessSessionConsumer, MAX_SESSION_CONSUMER_BATCH_OPERATIONS,
-    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES,
-    SESSION_CONSUMER_IDENTITY_MAX_BYTES, SESSION_CONSUMER_REQUEST_ID_BYTES,
+    SessionConsumerChangeKind, SessionConsumerFencedMutationRosterProfile,
+    SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+    SessionConsumerIdentity, SessionConsumerIdentityError, SessionConsumerLeaseError,
+    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
+    SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionConsumerV3Operation, SessionConsumerV3Request,
+    SessionConsumerV3Response, SessionQuorumConsumer, StatelessSessionConsumer,
+    MAX_SESSION_CONSUMER_BATCH_OPERATIONS, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES, SESSION_CONSUMER_IDENTITY_MAX_BYTES,
+    SESSION_CONSUMER_REQUEST_ID_BYTES,
 };
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;
+pub use fenced_mutation_roster::{
+    compute_fenced_mutation_roster_profile_digest, decode_fenced_mutation_roster_admission,
+    decode_fenced_mutation_roster_identity, decode_fenced_mutation_roster_member_manifest,
+    decode_fenced_mutation_roster_terminal, encode_fenced_mutation_roster_admission,
+    encode_fenced_mutation_roster_identity, encode_fenced_mutation_roster_member_manifest,
+    encode_fenced_mutation_roster_terminal, fenced_mutation_roster_profile_digest,
+    FencedMutationMemberAdoption, FencedMutationMemberDisposition, FencedMutationMemberOperationId,
+    FencedMutationMemberTerminalStatus, FencedMutationRosterAdmission,
+    FencedMutationRosterCapability, FencedMutationRosterError, FencedMutationRosterErrorStatus,
+    FencedMutationRosterExecuteError, FencedMutationRosterFenceIntent,
+    FencedMutationRosterHistoryState, FencedMutationRosterMember, FencedMutationRosterMembers,
+    FencedMutationRosterOperationId, FencedMutationRosterOutcome, FencedMutationRosterPhase,
+    FencedMutationRosterProfile, FencedMutationRosterProtectedPlan,
+    FencedMutationRosterProtectedResult, FencedMutationRosterRequestId, FencedMutationRosterScope,
+    FencedMutationRosterStatus, FencedMutationRosterTerminal,
+    FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,
+    FENCED_MUTATION_ROSTER_IDENTITY_CODEC_MAX_BYTES, FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES,
+    FENCED_MUTATION_ROSTER_MAX_LIVE, FENCED_MUTATION_ROSTER_MAX_MEMBERS,
+    FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES,
+    FENCED_MUTATION_ROSTER_MEMBER_MANIFEST_CODEC_MAX_BYTES, FENCED_MUTATION_ROSTER_MIN_MEMBERS,
+    FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET, FENCED_MUTATION_ROSTER_OPERATION_ID_BYTES,
+    FENCED_MUTATION_ROSTER_PROFILE_DIGEST, FENCED_MUTATION_ROSTER_RECLAIM_BATCH,
+    FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES, FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY,
+    FENCED_MUTATION_ROSTER_RETENTION_SECONDS, FENCED_MUTATION_ROSTER_SCHEMA_V1,
+    FENCED_MUTATION_ROSTER_SCOPE_BYTES, FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
+};
 pub use fenced_transition::{
     fenced_transition_v2_profile_digest, AtomicFencedTransitionCapability,
     FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,

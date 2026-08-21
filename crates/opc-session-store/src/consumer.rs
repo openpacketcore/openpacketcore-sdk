@@ -15,6 +15,12 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
+use crate::fenced_mutation_roster::{
+    compute_fenced_mutation_roster_profile_digest, FencedMutationRosterAdmission,
+    FencedMutationRosterCapability, FencedMutationRosterErrorStatus,
+    FencedMutationRosterHistoryState, FencedMutationRosterOutcome, FencedMutationRosterProfile,
+    FencedMutationRosterRequestId, FencedMutationRosterStatus, FencedMutationRosterTerminal,
+};
 use crate::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
     FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
@@ -546,6 +552,230 @@ impl fmt::Debug for SessionConsumerV2Request {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SessionConsumerV2Request")
+            .field("scope", &self.scope)
+            .field("request_id", &self.request_id)
+            .field("operation", &self.operation)
+            .finish()
+    }
+}
+
+/// The only profile that may be used by the revision-5 protected roster
+/// lane.  It deliberately includes the transport, operation, and error
+/// revisions in addition to the immutable domain profile digest: matching a
+/// digest alone must never permit a peer to reinterpret a roster response
+/// under a different wire error vocabulary.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsumerFencedMutationRosterProfile {
+    /// Dedicated consumer transport revision.
+    pub transport_revision: u16,
+    /// Closed roster operation vocabulary revision.
+    pub operation_revision: u16,
+    /// Closed roster error vocabulary revision.
+    pub error_revision: u16,
+    /// Immutable bounded storage and codec profile.
+    pub roster: FencedMutationRosterProfile,
+    /// Maximum exact roster member count.
+    pub max_members: u8,
+    /// Maximum protected plan or checkpoint bytes.
+    pub max_plan_or_checkpoint_bytes: u32,
+    /// Maximum protected exact result bytes.
+    pub max_exact_result_bytes: u32,
+    /// Maximum live admitted rosters.
+    pub max_live: u16,
+    /// Maximum retained result bindings.
+    pub retained_result_capacity: u32,
+    /// Maximum reclamation batch.
+    pub reclaim_batch: u16,
+    /// Exact result retention duration in seconds.
+    pub retention_seconds: u32,
+}
+
+impl SessionConsumerFencedMutationRosterProfile {
+    /// Construct the one accepted revision-5 roster profile.
+    pub fn v1() -> Self {
+        Self {
+            transport_revision: 5,
+            operation_revision: 1,
+            error_revision: 1,
+            roster: FencedMutationRosterProfile::v1(),
+            max_members: crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_MAX_MEMBERS as u8,
+            max_plan_or_checkpoint_bytes:
+                crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES
+                    as u32,
+            max_exact_result_bytes:
+                crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES as u32,
+            max_live: crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_MAX_LIVE as u16,
+            retained_result_capacity:
+                crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY
+                    as u32,
+            reclaim_batch: crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_RECLAIM_BATCH
+                as u16,
+            retention_seconds:
+                crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_RETENTION_SECONDS as u32,
+        }
+    }
+
+    /// Whether this is byte-for-byte the sole profile accepted on revision 5.
+    pub fn is_exact(self) -> bool {
+        self == Self::v1() && self.roster.digest == compute_fenced_mutation_roster_profile_digest()
+    }
+}
+
+impl fmt::Debug for SessionConsumerFencedMutationRosterProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionConsumerFencedMutationRosterProfile")
+            .field("transport_revision", &self.transport_revision)
+            .field("operation_revision", &self.operation_revision)
+            .field("error_revision", &self.error_revision)
+            .field("roster_schema", &self.roster.schema)
+            .field("profile_exact", &self.is_exact())
+            .field("max_members", &self.max_members)
+            .finish()
+    }
+}
+
+/// Explicit revision-5-only protected roster operations.
+///
+/// This separate family cannot decode on either frozen consumer lane.  It
+/// intentionally has no backend, membership, maintenance, snapshot, or raw
+/// consensus operation; an authenticated roster service receives only these
+/// six forms.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum SessionConsumerV3Operation {
+    /// Prove the entire immutable revision-5 roster profile.
+    FencedMutationRosterCapability,
+    /// Read bounded durable roster history state.
+    FencedMutationRosterHistoryState,
+    /// Durably admit exactly one complete roster body before any adapter work.
+    FencedMutationRosterAdmit {
+        /// Exact self-authenticating roster admission.
+        admission: Box<FencedMutationRosterAdmission>,
+    },
+    /// Read the status of exactly one complete roster admission body.
+    FencedMutationRosterStatus {
+        /// Exact self-authenticating roster admission.
+        admission: Box<FencedMutationRosterAdmission>,
+    },
+    /// Read exact stable roster IDs/descriptors without running an adapter.
+    FencedMutationRosterAdoption {
+        /// Exact self-authenticating roster admission.
+        admission: Box<FencedMutationRosterAdmission>,
+    },
+    /// Commit the conclusive terminal state of one admitted roster.
+    FencedMutationRosterTerminalize {
+        /// Exact roster admission previously committed by the authority.
+        admission: Box<FencedMutationRosterAdmission>,
+        /// Exact terminal disposition for that admission.
+        terminal: Box<FencedMutationRosterTerminal>,
+    },
+}
+
+impl fmt::Debug for SessionConsumerV3Operation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::FencedMutationRosterCapability => "FencedMutationRosterCapability",
+            Self::FencedMutationRosterHistoryState => "FencedMutationRosterHistoryState",
+            Self::FencedMutationRosterAdmit { .. } => "FencedMutationRosterAdmit",
+            Self::FencedMutationRosterStatus { .. } => "FencedMutationRosterStatus",
+            Self::FencedMutationRosterAdoption { .. } => "FencedMutationRosterAdoption",
+            Self::FencedMutationRosterTerminalize { .. } => "FencedMutationRosterTerminalize",
+        };
+        formatter.write_str(name)
+    }
+}
+
+impl SessionConsumerV3Operation {
+    fn request_id(&self) -> Option<FencedMutationRosterRequestId> {
+        match self {
+            Self::FencedMutationRosterAdmit { admission }
+            | Self::FencedMutationRosterStatus { admission }
+            | Self::FencedMutationRosterAdoption { admission }
+            | Self::FencedMutationRosterTerminalize { admission, .. } => {
+                Some(admission.request_id())
+            }
+            Self::FencedMutationRosterCapability | Self::FencedMutationRosterHistoryState => None,
+        }
+    }
+
+    /// Validate the complete roster identity/body/terminal binding before
+    /// dispatch. A valid body conflict remains dispatchable so durable status
+    /// can report its exact conflict; malformed structure is fail-closed.
+    pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
+        match self {
+            Self::FencedMutationRosterCapability | Self::FencedMutationRosterHistoryState => Ok(()),
+            Self::FencedMutationRosterAdmit { admission }
+            | Self::FencedMutationRosterStatus { admission }
+            | Self::FencedMutationRosterAdoption { admission } => admission
+                .validate()
+                .map_err(|_| SessionConsumerRejection::MalformedRequest),
+            Self::FencedMutationRosterTerminalize {
+                admission,
+                terminal,
+            } => admission
+                .validate()
+                .and_then(|()| terminal.validate_for_admission(admission))
+                .map_err(|_| SessionConsumerRejection::MalformedRequest),
+        }
+    }
+}
+
+/// One scope-bound revision-5 roster request.
+///
+/// The full 56-byte roster request identity sits outside and inside every
+/// effectful/read recovery body. This makes it impossible for a peer to
+/// substitute a truncated ID, a different full body, or a terminal body from
+/// another roster under a valid envelope.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsumerV3Request {
+    scope: SessionConsumerScope,
+    request_id: Option<FencedMutationRosterRequestId>,
+    operation: SessionConsumerV3Operation,
+}
+
+impl SessionConsumerV3Request {
+    /// Construct an exact revision-5 roster request.
+    pub fn new(scope: SessionConsumerScope, operation: SessionConsumerV3Operation) -> Self {
+        Self {
+            scope,
+            request_id: operation.request_id(),
+            operation,
+        }
+    }
+
+    /// Exact consensus scope carried on this request.
+    pub const fn scope(&self) -> SessionConsumerScope {
+        self.scope
+    }
+
+    /// Full roster identity for every body-bound operation.
+    pub const fn request_id(&self) -> Option<FencedMutationRosterRequestId> {
+        self.request_id
+    }
+
+    /// Closed revision-5 roster operation.
+    pub const fn operation(&self) -> &SessionConsumerV3Operation {
+        &self.operation
+    }
+
+    /// Validate the outer full roster identity and entire protected body.
+    pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
+        self.operation.validate()?;
+        if self.request_id != self.operation.request_id() {
+            return Err(SessionConsumerRejection::MalformedRequest);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for SessionConsumerV3Request {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionConsumerV3Request")
             .field("scope", &self.scope)
             .field("request_id", &self.request_id)
             .field("operation", &self.operation)
@@ -1301,6 +1531,63 @@ impl fmt::Debug for SessionConsumerV2Response {
     }
 }
 
+/// Typed response carried only by the revision-5 protected roster lane.
+///
+/// No discriminator is shared with the frozen revision-3 or revision-4
+/// families.  In particular, adoption is a read-only durable lookup: it
+/// never conveys an adapter command or an arbitrary backend result.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "response",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum SessionConsumerV3Response {
+    /// Exact roster capability and immutable profile proof.
+    FencedMutationRosterCapability(
+        Result<
+            (
+                FencedMutationRosterCapability,
+                SessionConsumerFencedMutationRosterProfile,
+            ),
+            SessionConsumerStoreError,
+        >,
+    ),
+    /// Bounded public durable roster-history state.
+    FencedMutationRosterHistoryState(
+        Result<FencedMutationRosterHistoryState, SessionConsumerStoreError>,
+    ),
+    /// Exact admission result.
+    FencedMutationRosterAdmit(Result<FencedMutationRosterOutcome, FencedMutationRosterErrorStatus>),
+    /// Exact retained-status result.
+    FencedMutationRosterStatus(Result<FencedMutationRosterStatus, SessionConsumerStoreError>),
+    /// Exact read-only adoption/status result.
+    FencedMutationRosterAdoption(Result<FencedMutationRosterStatus, SessionConsumerStoreError>),
+    /// Exact terminalization result.
+    FencedMutationRosterTerminalize(
+        Result<FencedMutationRosterOutcome, FencedMutationRosterErrorStatus>,
+    ),
+    /// The operation was rejected before application dispatch.
+    Rejected(SessionConsumerRejection),
+}
+
+impl fmt::Debug for SessionConsumerV3Response {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::FencedMutationRosterCapability(_) => "FencedMutationRosterCapability",
+            Self::FencedMutationRosterHistoryState(_) => "FencedMutationRosterHistoryState",
+            Self::FencedMutationRosterAdmit(_) => "FencedMutationRosterAdmit",
+            Self::FencedMutationRosterStatus(_) => "FencedMutationRosterStatus",
+            Self::FencedMutationRosterAdoption(_) => "FencedMutationRosterAdoption",
+            Self::FencedMutationRosterTerminalize(_) => "FencedMutationRosterTerminalize",
+            Self::Rejected(_) => "Rejected",
+        };
+        formatter.write_str(name)
+    }
+}
+
 impl fmt::Debug for SessionConsumerResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -1356,6 +1643,30 @@ pub trait SessionQuorumConsumer: Send + Sync {
         _request: SessionConsumerV2Request,
     ) -> SessionConsumerV2Response {
         SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable)
+    }
+
+    /// Return the one exact protected-roster profile this service can prove.
+    ///
+    /// The default is deliberately absent: an existing consumer service does
+    /// not accidentally advertise the revision-5 ALPN simply because it can
+    /// compile the new DTOs.
+    fn fenced_mutation_roster_profile(&self) -> Option<SessionConsumerFencedMutationRosterProfile> {
+        None
+    }
+
+    /// Execute one authenticated revision-5 protected roster request.
+    ///
+    /// Implementations must bind the request scope plus authenticated
+    /// consumer identity to their durable receipt domain and must never route
+    /// this port to a raw backend or adapter. The default is fail-closed so a
+    /// listener only enables the dedicated ALPN after explicit validated port
+    /// construction.
+    async fn execute_v3(
+        &self,
+        _identity: &SessionConsumerIdentity,
+        _request: SessionConsumerV3Request,
+    ) -> SessionConsumerV3Response {
+        SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unavailable)
     }
 
     /// Open a bounded committed-change watch after authenticated scope checks.

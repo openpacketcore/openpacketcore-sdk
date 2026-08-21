@@ -1057,6 +1057,11 @@ enum TopologyAdmissionBarrierAction {
     ConfirmFencedTransitionV2Profile {
         profile_digest: [u8; 32],
     },
+    /// Confirm the independent roster profile before a prospective learner is
+    /// replicated into a scope whose durable roster history is activated.
+    ConfirmFencedMutationRosterProfile {
+        profile_digest: [u8; 32],
+    },
     AppliedLearnerMarker {
         log_index: u64,
     },
@@ -1739,6 +1744,14 @@ impl ConsensusSessionStore {
             deadline,
         )
         .await?;
+        self.require_fenced_mutation_roster_prospective_learner_capability_before(
+            request,
+            &durable,
+            &current_members,
+            &desired_members,
+            deadline,
+        )
+        .await?;
         for learner in desired_members.difference(&current_members).copied() {
             operation_guard = self
                 .add_learner_before(learner, operation_guard, deadline)
@@ -1840,6 +1853,82 @@ impl ConsensusSessionStore {
                 transition_id: request.transition_id().as_bytes(),
                 request_digest: request.request_digest().as_bytes(),
                 action: TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile {
+                    profile_digest,
+                },
+            })
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            let wire = SessionConsensusWireRequest::try_new(
+                durable.scope.current_identity,
+                self.inner.local_node_id,
+                SessionConsensusRpcFamily::TopologyAdmissionBarrier,
+                payload,
+            )
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            let response = tokio::time::timeout_at(deadline, peer.call(wire))
+                .await
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            response
+                .validate()
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            let payload = response
+                .result
+                .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            let reply: TopologyAdmissionBarrierReply = decode_bounded(&payload)
+                .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            if !matches!(reply, TopologyAdmissionBarrierReply::Ready) {
+                return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+            }
+        }
+        Ok(())
+    }
+
+    /// Once roster history exists, every prospective learner must prove the
+    /// exact independent roster profile before it is added to Raft.  This is
+    /// deliberately separate from V2 history: neither profile certifies the
+    /// other, even where their predecessor voter sets happen to coincide.
+    async fn require_fenced_mutation_roster_prospective_learner_capability_before(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        durable: &DurableTransitionState,
+        current_members: &BTreeSet<SessionConsensusNodeId>,
+        desired_members: &BTreeSet<SessionConsensusNodeId>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionTopologyTransitionError> {
+        let history_is_activated = self
+            .inner
+            .backend
+            .consensus_fenced_mutation_roster_history_is_activated(self.inner.storage_identity)
+            .await
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        if !history_is_activated {
+            return Ok(());
+        }
+        if self.local_fenced_mutation_roster_capability()
+            != Some(crate::FencedMutationRosterCapability::V1)
+        {
+            return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+        }
+        let profile_digest = crate::fenced_mutation_roster::fenced_mutation_roster_profile_digest();
+        let peers = self.inner.topology_coordinator.staged_peers(request)?;
+        for learner in desired_members.difference(current_members).copied() {
+            if learner == self.inner.local_node_id {
+                // Keep the local case explicit: a future coordinator shape
+                // must not make roster support implicit for a joining node.
+                if self.local_fenced_mutation_roster_capability()
+                    != Some(crate::FencedMutationRosterCapability::V1)
+                {
+                    return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+                }
+                continue;
+            }
+            let peer = peers
+                .get(&learner)
+                .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+            let payload = encode_bounded(&TopologyAdmissionBarrierRequest {
+                transition_id: request.transition_id().as_bytes(),
+                request_digest: request.request_digest().as_bytes(),
+                action: TopologyAdmissionBarrierAction::ConfirmFencedMutationRosterProfile {
                     profile_digest,
                 },
             })
@@ -2963,6 +3052,7 @@ impl ConsensusSessionStore {
             action,
             TopologyAdmissionBarrierAction::ConfirmStaged
                 | TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile { .. }
+                | TopologyAdmissionBarrierAction::ConfirmFencedMutationRosterProfile { .. }
         ) {
             self.inner.topology_coordinator.transport()?;
             let _staged_request = self
@@ -2975,6 +3065,7 @@ impl ConsensusSessionStore {
         match action {
             TopologyAdmissionBarrierAction::ConfirmStaged => Ok(()),
             TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile { .. } => Ok(()),
+            TopologyAdmissionBarrierAction::ConfirmFencedMutationRosterProfile { .. } => Ok(()),
             TopologyAdmissionBarrierAction::AppliedLearnerMarker { log_index } => {
                 let observed_marker = durable
                     .evidence
@@ -3189,6 +3280,20 @@ impl ConsensusSessionStore {
                     Err(_) => return TopologyAdmissionBarrierReply::NotReady,
                 }
             }
+            TopologyAdmissionBarrierAction::ConfirmFencedMutationRosterProfile {
+                profile_digest,
+            } => match self.inner.peer_directory.current_scope() {
+                Ok((current_identity, current_members)) => (
+                    current_identity,
+                    current_members.contains(&authenticated_sender)
+                        && self.local_fenced_mutation_roster_capability()
+                            == Some(crate::FencedMutationRosterCapability::V1)
+                        && profile_digest
+                            == crate::fenced_mutation_roster::fenced_mutation_roster_profile_digest(
+                            ),
+                ),
+                Err(_) => return TopologyAdmissionBarrierReply::NotReady,
+            },
             TopologyAdmissionBarrierAction::AppliedLearnerMarker { .. }
             | TopologyAdmissionBarrierAction::AdmitJointVoting => (
                 request.desired_identity(),
@@ -3222,6 +3327,7 @@ impl ConsensusSessionStore {
         if matches!(
             barrier.action,
             TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile { .. }
+                | TopologyAdmissionBarrierAction::ConfirmFencedMutationRosterProfile { .. }
         ) {
             return TopologyAdmissionBarrierReply::Ready;
         }
@@ -3605,17 +3711,24 @@ mod scope_refresh_tests {
             }
             let barrier: TopologyAdmissionBarrierRequest = decode_bounded(&request.payload)
                 .map_err(|_| SessionConsensusPeerError::Protocol)?;
-            let TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile { profile_digest } =
-                barrier.action
-            else {
-                return Err(SessionConsensusPeerError::Protocol);
+            let profile_matches = match barrier.action {
+                TopologyAdmissionBarrierAction::ConfirmFencedTransitionV2Profile {
+                    profile_digest,
+                } => {
+                    profile_digest
+                        == crate::fenced_transition::fenced_transition_v2_profile_digest()
+                }
+                TopologyAdmissionBarrierAction::ConfirmFencedMutationRosterProfile {
+                    profile_digest,
+                } => {
+                    profile_digest
+                        == crate::fenced_mutation_roster::fenced_mutation_roster_profile_digest()
+                }
+                _ => return Err(SessionConsensusPeerError::Protocol),
             };
             self.calls.fetch_add(1, Ordering::SeqCst);
             let reply = match *self.reply.lock().expect("staged V2 reply mutex") {
-                StagedV2ProfileReply::ExactV2
-                    if profile_digest
-                        == crate::fenced_transition::fenced_transition_v2_profile_digest() =>
-                {
+                StagedV2ProfileReply::ExactV2 if profile_matches => {
                     TopologyAdmissionBarrierReply::Ready
                 }
                 // A V1 candidate cannot decode the staged V2 action, while a

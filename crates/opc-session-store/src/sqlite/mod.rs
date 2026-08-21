@@ -754,6 +754,22 @@ impl SqliteSessionBackend {
         .await
     }
 
+    pub(crate) async fn consensus_fenced_mutation_roster_activation_matches_scope(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        scope_identity: crate::consensus::SessionConsensusIdentity,
+        voters: &std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+        profile_digest: [u8; 32],
+    ) -> Result<bool, StoreError> {
+        self.consensus_fenced_transition_v2_activation_matches_scope(
+            storage_identity,
+            scope_identity,
+            voters.clone(),
+            profile_digest,
+        )
+        .await
+    }
+
     /// Read at a logical timestamp already committed by the consensus state
     /// machine. This path is read-only: expiry affects visibility but never
     /// prunes physical rows outside a committed command.
@@ -897,6 +913,14 @@ impl SqliteSessionBackend {
                 })
         })
         .await
+    }
+
+    pub(crate) async fn consensus_fenced_mutation_roster_history_is_activated(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+    ) -> Result<bool, StoreError> {
+        self.consensus_fenced_transition_v2_history_is_activated(storage_identity)
+            .await
     }
 
     /// Read the durable V2 history lifecycle after a caller-owned barrier.

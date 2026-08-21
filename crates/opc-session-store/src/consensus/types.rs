@@ -8,6 +8,10 @@ use sha2::{Digest, Sha256};
 
 use crate::backend::{CompareAndSet, CompareAndSetResult};
 use crate::error::StoreError;
+use crate::fenced_mutation_roster::{
+    FencedMutationRosterAdmission, FencedMutationRosterOutcome, FencedMutationRosterProtectedPlan,
+    FencedMutationRosterTerminal,
+};
 use crate::fenced_transition::{
     FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionV2HistoryEpoch,
     FencedTransitionV2Request,
@@ -36,6 +40,13 @@ pub const SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES: usize =
 const COMMAND_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/command/v1\0";
 const COMMAND_V2_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/command/v2-fixed\0";
 const COMMAND_V2_DIGEST_MAGIC: &[u8] = b"OPC-SC-V2-APPLIED\0";
+const COMMAND_ROSTER_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/fenced-mutation-roster/command/v1\0";
+const COMMAND_ROSTER_DIGEST_MAGIC: &[u8] = b"OPC-SC-FMR-APPLIED\0";
+const ROSTER_OUTER_REQUEST_ID_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/fenced-mutation-roster/outer-request-id/v1\0";
+const ROSTER_TERMINAL_OUTER_REQUEST_ID_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/fenced-mutation-roster/terminal-outer-request-id/v1\0";
 /// Fixed V2 applied-command digest encoding revision.
 ///
 /// This applies only to commands which carry a V2 intent (directly or in the
@@ -75,8 +86,35 @@ pub const SESSION_CONSENSUS_V2_COMMAND_WIRE_SCHEMA_DESCRIPTOR: &str = concat!(
     "maintain-v2=generation:u64|active:option(epoch:u64)|retired:u64|bound:u64;",
     "authorized=origin:node-id|authority:identity|box(intent)"
 );
+/// Fixed applied-command digest encoding revision for the separate roster
+/// protocol. This is not a V2 revision or compatibility profile.
+pub const SESSION_CONSENSUS_FENCED_MUTATION_ROSTER_APPLIED_DIGEST_ENCODING_VERSION: u16 = 1;
+/// Frozen roster applied-command digest input descriptor.
+pub const SESSION_CONSENSUS_FENCED_MUTATION_ROSTER_APPLIED_DIGEST_SCHEMA_DESCRIPTOR: &str = concat!(
+    "domain=openpacketcore/session-consensus/fenced-mutation-roster/command/v1\\0;",
+    "magic=OPC-SC-FMR-APPLIED\\0;revision:u16be=1;",
+    "prefix=sequence:u64be|previous-digest:bytes32|effective-time:timestamp;",
+    "command=schema:u16be|storage-identity:identity|outer-id:bytes16|logical-time:timestamp|intent;",
+    "timestamp=unix-secs:i64be|nanos:u32be;identity=cluster:bytes32|configuration:bytes32|epoch:u64be;",
+    "intent=admit(tag=1,admission:canonical-framed,scope:identity,voters:bytes32,profile:bytes32)|",
+    "terminalize(tag=2,admission:canonical-framed,terminal:canonical-framed,checkpoint:len32+bytes)|",
+    "authorized(tag=3,origin:u64be,authority:identity,mutation:intent)"
+);
+/// Frozen command-wire profile for roster intents appended after every V1/V2
+/// discriminant. The protected domain bodies retain their own explicit framed
+/// codec and never borrow V2's receipt or profile encoding.
+pub const SESSION_CONSENSUS_FENCED_MUTATION_ROSTER_COMMAND_WIRE_SCHEMA_DESCRIPTOR: &str = concat!(
+    "wire-profile=1;raft-rpc-codec=postcard;durable-log-codec=serde-json;",
+    "command-fields=schema-version,identity,request-id,logical-time,intent;",
+    "intent-discriminants=authorized:15|fenced-v1:16|activate-v1:17|fenced-v2:18|activate-v2:19|maintain-v2:20|",
+    "roster-admit:21|roster-terminalize:22;",
+    "roster-admission=canonical-framed;roster-terminal=canonical-framed;checkpoint=len32+protected-bytes;",
+    "roster-activate=scope:identity|voters:bytes32|profile:bytes32;authorized=origin:node-id|authority:identity|box(intent)"
+);
 const FENCED_TRANSITION_VOTER_SET_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-transition-voter-set/v1\0";
+const FENCED_MUTATION_ROSTER_VOTER_SET_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/fenced-mutation-roster-voter-set/v1\0";
 
 /// Produce the canonical, non-describing binding of one exact voter scope.
 ///
@@ -90,6 +128,24 @@ pub(crate) fn fenced_transition_voter_set_digest(
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(FENCED_TRANSITION_VOTER_SET_DIGEST_DOMAIN);
+    hasher.update(identity.cluster_id().as_bytes());
+    hasher.update(identity.configuration_id().as_bytes());
+    hasher.update(identity.configuration_epoch().get().to_be_bytes());
+    for voter in voters {
+        hasher.update(voter.get().to_be_bytes());
+    }
+    hasher.finalize().into()
+}
+
+/// Produce an exact voter binding for the independent roster certificate.
+///
+/// V1/V2 certificates never satisfy this binding, even for identical voters.
+pub(crate) fn fenced_mutation_roster_voter_set_digest(
+    identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(FENCED_MUTATION_ROSTER_VOTER_SET_DIGEST_DOMAIN);
     hasher.update(identity.cluster_id().as_bytes());
     hasher.update(identity.configuration_id().as_bytes());
     hasher.update(identity.configuration_epoch().get().to_be_bytes());
@@ -343,6 +399,36 @@ pub enum SessionMutationIntent {
         /// active epoch without changing the lifecycle generation.
         expected_bound_entries: u64,
     },
+    /// Atomically reserve and publish the exact admitted roster record.
+    ///
+    /// This is the sole nonterminal roster mutation.  It binds its immutable
+    /// roster body and the unanimous exact voter/profile proof in the very
+    /// same normal entry; a probe by itself never creates a certificate.
+    AdmitFencedMutationRoster {
+        /// Complete immutable caller body, including the 56-byte request ID.
+        admission: Box<FencedMutationRosterAdmission>,
+        /// Exact membership scope every current voter proved before proposal.
+        scope_identity: SessionConsensusIdentity,
+        /// Canonical digest of that exact voter set.
+        voter_set_digest: [u8; 32],
+        /// The independent roster profile every voter acknowledged.
+        profile_digest: [u8; 32],
+    },
+    /// Atomically bind every member's conclusive terminal disposition and
+    /// establish or abort an already admitted roster.
+    ///
+    /// Repeating the immutable admission body is intentional: followers and
+    /// replay do not consult caller-local state to verify owner, fence,
+    /// expected generation, ordered members, or the protected checkpoint.
+    TerminalizeFencedMutationRoster {
+        /// The exact previously admitted immutable roster body.
+        admission: Box<FencedMutationRosterAdmission>,
+        /// The complete terminal disposition and optional established result.
+        terminal: Box<FencedMutationRosterTerminal>,
+        /// Protected authoritative checkpoint bytes. The state machine applies
+        /// these only with the exact terminal transition, never on admission.
+        protected_checkpoint: FencedMutationRosterProtectedPlan,
+    },
 }
 
 impl fmt::Debug for SessionMutationIntent {
@@ -392,6 +478,15 @@ impl SessionConsensusCommand {
                     effective_logical_time,
                 )?,
             )
+        } else if self.intent.contains_fenced_mutation_roster() {
+            (
+                COMMAND_ROSTER_DIGEST_DOMAIN,
+                self.encode_roster_applied_digest_input(
+                    sequence,
+                    previous_digest,
+                    effective_logical_time,
+                )?,
+            )
         } else {
             (
                 COMMAND_DIGEST_DOMAIN,
@@ -431,6 +526,28 @@ impl SessionConsensusCommand {
         append_v2_applied_intent(&mut encoded, &self.intent)?;
         Ok(encoded)
     }
+
+    fn encode_roster_applied_digest_input(
+        &self,
+        sequence: u64,
+        previous_digest: SessionConsensusEntryDigest,
+        effective_logical_time: opc_types::Timestamp,
+    ) -> Result<Vec<u8>, StoreError> {
+        let mut encoded = Vec::with_capacity(256);
+        encoded.extend_from_slice(COMMAND_ROSTER_DIGEST_MAGIC);
+        encoded.extend_from_slice(
+            &SESSION_CONSENSUS_FENCED_MUTATION_ROSTER_APPLIED_DIGEST_ENCODING_VERSION.to_be_bytes(),
+        );
+        encoded.extend_from_slice(&sequence.to_be_bytes());
+        encoded.extend_from_slice(previous_digest.as_bytes());
+        append_v2_applied_timestamp(&mut encoded, effective_logical_time);
+        encoded.extend_from_slice(&self.schema_version.to_be_bytes());
+        append_v2_applied_identity(&mut encoded, self.identity);
+        encoded.extend_from_slice(self.request_id.as_bytes());
+        append_v2_applied_timestamp(&mut encoded, self.logical_time);
+        append_roster_applied_intent(&mut encoded, &self.intent)?;
+        Ok(encoded)
+    }
 }
 
 impl SessionMutationIntent {
@@ -442,6 +559,148 @@ impl SessionMutationIntent {
                 | Self::MaintainFencedTransitionV2History { .. }
         ) || matches!(self, Self::Authorized { mutation, .. } if mutation.contains_fenced_transition_v2())
     }
+
+    fn contains_fenced_mutation_roster(&self) -> bool {
+        matches!(
+            self,
+            Self::AdmitFencedMutationRoster { .. } | Self::TerminalizeFencedMutationRoster { .. }
+        ) || matches!(self, Self::Authorized { mutation, .. } if mutation.contains_fenced_mutation_roster())
+    }
+}
+
+fn append_roster_applied_frame(out: &mut Vec<u8>, frame: Vec<u8>) -> Result<(), StoreError> {
+    let length = u32::try_from(frame.len()).map_err(|_| {
+        StoreError::Serialization("fenced mutation roster applied frame exceeds u32".into())
+    })?;
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(&frame);
+    Ok(())
+}
+
+fn roster_admission_frame(
+    admission: &FencedMutationRosterAdmission,
+) -> Result<Vec<u8>, StoreError> {
+    // The full roster identity commits to the validated immutable admission
+    // body. Keeping this frame fixed-width also prevents the digest binding
+    // from inheriting any incidental Serde field-order representation.
+    Ok(roster_request_id_bytes(admission.request_id()).to_vec())
+}
+
+fn roster_terminal_frame(terminal: &FencedMutationRosterTerminal) -> Vec<u8> {
+    terminal.encode_canonical()
+}
+
+fn append_roster_applied_intent(
+    out: &mut Vec<u8>,
+    intent: &SessionMutationIntent,
+) -> Result<(), StoreError> {
+    match intent {
+        SessionMutationIntent::AdmitFencedMutationRoster {
+            admission,
+            scope_identity,
+            voter_set_digest,
+            profile_digest,
+        } => {
+            out.push(1);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            append_v2_applied_identity(out, *scope_identity);
+            out.extend_from_slice(voter_set_digest);
+            out.extend_from_slice(profile_digest);
+        }
+        SessionMutationIntent::TerminalizeFencedMutationRoster {
+            admission,
+            terminal,
+            protected_checkpoint,
+        } => {
+            out.push(2);
+            append_roster_applied_frame(out, roster_admission_frame(admission)?)?;
+            append_roster_applied_frame(out, roster_terminal_frame(terminal))?;
+            let checkpoint_len =
+                u32::try_from(protected_checkpoint.as_bytes().len()).map_err(|_| {
+                    StoreError::Serialization(
+                        "fenced mutation roster checkpoint exceeds u32".into(),
+                    )
+                })?;
+            out.extend_from_slice(&checkpoint_len.to_be_bytes());
+            out.extend_from_slice(protected_checkpoint.as_bytes());
+        }
+        SessionMutationIntent::Authorized {
+            origin,
+            authority_identity,
+            mutation,
+        } if mutation.contains_fenced_mutation_roster() => {
+            out.push(3);
+            out.extend_from_slice(&origin.get().to_be_bytes());
+            append_v2_applied_identity(out, *authority_identity);
+            append_roster_applied_intent(out, mutation)?;
+        }
+        _ => {
+            return Err(StoreError::Serialization(
+                "session consensus roster digest intent is invalid".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Derive the generic 16-byte durable receipt slot from a roster's complete
+/// 56-byte self-authenticating identity.  The protocol-specific domain keeps
+/// this namespace disjoint from V1, V2, and ordinary caller-generated IDs.
+pub(crate) fn fenced_mutation_roster_outer_request_id(
+    request_id: crate::fenced_mutation_roster::FencedMutationRosterRequestId,
+) -> SessionConsensusRequestId {
+    let mut hasher = Sha256::new();
+    hasher.update(ROSTER_OUTER_REQUEST_ID_DOMAIN);
+    hasher.update(roster_request_id_bytes(request_id));
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut outer = [0_u8; 16];
+    outer.copy_from_slice(&digest[..16]);
+    SessionConsensusRequestId::from_bytes(outer)
+}
+
+/// Derive the separate generic receipt slot for a terminalization action.
+///
+/// Admission and terminalization intentionally occupy different Raft normal
+/// entries.  A terminal request must therefore not collide with the retained
+/// `PollAdmitted` receipt merely because both actions name the same immutable
+/// 56-byte roster identity. Its canonical terminal frame is included before
+/// truncating the domain-separated digest to the generic 16-byte envelope ID.
+pub(crate) fn fenced_mutation_roster_terminal_outer_request_id(
+    admission: &FencedMutationRosterAdmission,
+    terminal: &FencedMutationRosterTerminal,
+) -> Result<SessionConsensusRequestId, StoreError> {
+    let admission = roster_admission_frame(admission)?;
+    let terminal = roster_terminal_frame(terminal);
+    let mut hasher = Sha256::new();
+    hasher.update(ROSTER_TERMINAL_OUTER_REQUEST_ID_DOMAIN);
+    hasher.update(
+        u32::try_from(admission.len())
+            .map_err(|_| {
+                StoreError::Serialization("fenced mutation roster admission exceeds u32".into())
+            })?
+            .to_be_bytes(),
+    );
+    hasher.update(admission);
+    hasher.update(
+        u32::try_from(terminal.len())
+            .map_err(|_| {
+                StoreError::Serialization("fenced mutation roster terminal exceeds u32".into())
+            })?
+            .to_be_bytes(),
+    );
+    hasher.update(terminal);
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut outer = [0_u8; 16];
+    outer.copy_from_slice(&digest[..16]);
+    Ok(SessionConsensusRequestId::from_bytes(outer))
+}
+
+fn roster_request_id_bytes(
+    request_id: crate::fenced_mutation_roster::FencedMutationRosterRequestId,
+) -> [u8; crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES] {
+    // Use the domain's canonical identity encoder so this binding stays exact
+    // if the opaque ID representation evolves internally.
+    request_id.to_bytes()
 }
 
 fn append_v2_applied_timestamp(out: &mut Vec<u8>, timestamp: opc_types::Timestamp) {
@@ -529,6 +788,8 @@ pub enum SessionMutationOutcome {
     Unit,
     /// Result of one atomic single-record fenced transition.
     FencedTransition(FencedTransitionOutcome),
+    /// Typed durable result of one protected atomic mutation roster phase.
+    FencedMutationRoster(FencedMutationRosterOutcome),
 }
 
 impl fmt::Debug for SessionMutationOutcome {
@@ -851,6 +1112,33 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn roster_profile_is_append_only_and_has_an_independent_voter_binding() {
+        // These discriminants sit strictly after the frozen #704 sequence
+        // through `MaintainFencedTransitionV2History` (20). Keeping the
+        // contract textual as well as the old golden postcard tests makes an
+        // accidental insertion into that sequence visible in review.
+        assert!(
+            SESSION_CONSENSUS_FENCED_MUTATION_ROSTER_COMMAND_WIRE_SCHEMA_DESCRIPTOR
+                .contains("roster-admit:21|roster-terminalize:22")
+        );
+        assert!(
+            !SESSION_CONSENSUS_FENCED_MUTATION_ROSTER_COMMAND_WIRE_SCHEMA_DESCRIPTOR
+                .contains("roster-activate")
+        );
+
+        let identity = legacy_identity();
+        let voters = BTreeSet::from([
+            SessionConsensusNodeId::new(3).expect("voter"),
+            SessionConsensusNodeId::new(7).expect("voter"),
+        ]);
+        assert_ne!(
+            fenced_mutation_roster_voter_set_digest(identity, &voters),
+            fenced_transition_voter_set_digest(identity, &voters),
+            "an identical topology must not borrow V1/V2 certificate material"
+        );
     }
 
     #[test]

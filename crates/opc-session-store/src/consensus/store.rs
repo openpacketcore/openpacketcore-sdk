@@ -33,7 +33,10 @@ use super::raft_adapter::{
     SessionRaftPeerDirectory, SessionRaftRpcHandler,
 };
 use super::storage::{self, SessionConsensusStorageError};
-use super::types::fenced_transition_voter_set_digest;
+use super::types::{
+    fenced_mutation_roster_outer_request_id, fenced_mutation_roster_terminal_outer_request_id,
+    fenced_mutation_roster_voter_set_digest, fenced_transition_voter_set_digest,
+};
 use super::{
     SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusIdentity,
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
@@ -64,6 +67,12 @@ use crate::consumer::{
     SessionQuorumConsumer, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use crate::error::{LeaseError, StoreError};
+use crate::fenced_mutation_roster::{
+    fenced_mutation_roster_profile_digest, FencedMutationRosterAdmission,
+    FencedMutationRosterCapability, FencedMutationRosterOutcome, FencedMutationRosterPhase,
+    FencedMutationRosterTerminal, FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,
+    FENCED_MUTATION_ROSTER_SCHEMA_V1, FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
+};
 use crate::fenced_transition::{
     AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionObservation,
     FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionStatus,
@@ -133,6 +142,8 @@ const TOPOLOGY_TLS_BINDING_DOMAIN: &[u8] =
     b"openpacketcore/session-store/topology-tls-binding/v1\0";
 const TOPOLOGY_BACKING_BINDING_DOMAIN: &[u8] =
     b"openpacketcore/session-store/topology-backing-binding/v1\0";
+const FENCED_MUTATION_ROSTER_CAPABILITY_PROBE_MAGIC: [u8; 8] = *b"OPCFMRCP";
+const FENCED_MUTATION_ROSTER_CAPABILITY_REPLY_MAGIC: [u8; 8] = *b"OPCFMRCR";
 /// Derive the fixed-width generic consensus envelope ID from V2's complete,
 /// authoritative 56-byte request ID.  V1 IDs are never used as input here;
 /// the domain separation keeps their collision namespaces distinct even though
@@ -486,6 +497,47 @@ fn fenced_transition_v2_capability_probe_reply(
     }
 }
 
+/// Roster's exact-profile probe is intentionally a distinct ReadBarrier
+/// payload.  A V1/V2-only voter cannot decode it and therefore cannot be
+/// counted as compatible during roster admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FencedMutationRosterCapabilityProbe {
+    /// Unique frame marker: structurally similar V2 probes must not decode as
+    /// roster support merely because they have a schema and digest field.
+    magic: [u8; 8],
+    schema_version: u16,
+    profile_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum FencedMutationRosterCapabilityReply {
+    V1 {
+        magic: [u8; 8],
+        profile_digest: [u8; 32],
+    },
+    Unsupported,
+}
+
+fn fenced_mutation_roster_capability_probe_reply(
+    probe: FencedMutationRosterCapabilityProbe,
+    local_capability: Option<FencedMutationRosterCapability>,
+) -> FencedMutationRosterCapabilityReply {
+    let profile_digest = fenced_mutation_roster_profile_digest();
+    if probe.magic == FENCED_MUTATION_ROSTER_CAPABILITY_PROBE_MAGIC
+        && probe.schema_version == FENCED_MUTATION_ROSTER_SCHEMA_V1
+        && probe.profile_digest == profile_digest
+        && local_capability == Some(FencedMutationRosterCapability::V1)
+    {
+        FencedMutationRosterCapabilityReply::V1 {
+            magic: FENCED_MUTATION_ROSTER_CAPABILITY_REPLY_MAGIC,
+            profile_digest,
+        }
+    } else {
+        FencedMutationRosterCapabilityReply::Unsupported
+    }
+}
+
 /// Exact V1 admission at one linearizable membership scope.
 ///
 /// A fresh proof is intentionally not cached: only a committed activation
@@ -500,6 +552,14 @@ enum FencedTransitionCapabilityAdmission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FencedTransitionV2CapabilityAdmission {
     Activated,
+    FreshUnanimous,
+}
+
+/// Roster compatibility is a fresh unanimous proof over the current exact
+/// voter scope.  It deliberately has no V2 lifecycle coupling and is never
+/// inferred from a quorum response or an older transition certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FencedMutationRosterCapabilityAdmission {
     FreshUnanimous,
 }
 
@@ -1012,6 +1072,27 @@ impl ConsensusSessionStore {
         )
     }
 
+    fn local_fenced_mutation_roster_capability(&self) -> Option<FencedMutationRosterCapability> {
+        // Roster commands are persisted by this concrete SQLite consensus
+        // state machine.  Do not derive support from V1/V2 transition bits:
+        // its profile carries independent arity, protected-body, retention,
+        // and lifecycle rules.  The entire canonical admission still has to
+        // fit both authenticated forwarding and the durable log.
+        if SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES
+            >= FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES
+            && self.inner.backend.consensus_log_entry_max_bytes()
+                >= FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES
+            && SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES
+                >= FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES
+            && self.inner.backend.consensus_log_entry_max_bytes()
+                >= FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES
+        {
+            Some(FencedMutationRosterCapability::V1)
+        } else {
+            None
+        }
+    }
+
     /// Admit V1 for one exact linearizable voter scope.
     ///
     /// A durable certificate first permits ordinary quorum availability.  In
@@ -1155,6 +1236,70 @@ impl ConsensusSessionStore {
         Ok(FencedTransitionV2CapabilityAdmission::FreshUnanimous)
     }
 
+    /// Require a fresh all-voter acknowledgement of the roster's immutable
+    /// profile.  There is intentionally no quorum shortcut: an old or
+    /// profile-mismatched voter must make admission fail before the command
+    /// reaches a leader proposal.
+    async fn require_fenced_mutation_roster_capability_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedMutationRosterCapabilityAdmission, StoreError> {
+        self.require_exact_membership_admission()?;
+        self.linearizable_barrier_before(deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        let expected_scope = self.current_scope()?;
+        if self.local_fenced_mutation_roster_capability()
+            != Some(FencedMutationRosterCapability::V1)
+        {
+            return Err(unsupported_fenced_mutation_roster());
+        }
+        if !expected_scope.1.contains(&self.inner.local_node_id) {
+            return Err(consensus_unavailable());
+        }
+        let profile_digest = fenced_mutation_roster_profile_digest();
+        let probes = expected_scope
+            .1
+            .iter()
+            .copied()
+            .filter(|member| *member != self.inner.local_node_id)
+            .map(|member| async move {
+                self.call_peer::<_, FencedMutationRosterCapabilityReply>(
+                    member,
+                    SessionConsensusRpcFamily::ReadBarrier,
+                    &FencedMutationRosterCapabilityProbe {
+                        magic: FENCED_MUTATION_ROSTER_CAPABILITY_PROBE_MAGIC,
+                        schema_version: FENCED_MUTATION_ROSTER_SCHEMA_V1,
+                        profile_digest,
+                    },
+                    deadline,
+                )
+                .await
+            });
+        if futures_util::future::join_all(probes)
+            .await
+            .into_iter()
+            .any(|reply| {
+                !matches!(
+                    reply,
+                    Ok(FencedMutationRosterCapabilityReply::V1 {
+                        magic,
+                        profile_digest: received,
+                    }) if magic == FENCED_MUTATION_ROSTER_CAPABILITY_REPLY_MAGIC
+                        && received == profile_digest
+                )
+            })
+        {
+            return Err(unsupported_fenced_mutation_roster());
+        }
+        if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
+            return Err(consensus_unavailable());
+        }
+        Ok(FencedMutationRosterCapabilityAdmission::FreshUnanimous)
+    }
+
     /// Advertise V1 after either the exact durable certificate or a fresh
     /// unanimous proof that can immediately seed the first transition.
     pub async fn fenced_transition_capability(
@@ -1179,6 +1324,20 @@ impl ConsensusSessionStore {
         self.require_fenced_transition_v2_capability_before(deadline)
             .await
             .map(|_| Some(FencedTransitionV2Capability::V2))
+    }
+
+    /// Expose roster support only inside the sealed crate flow after a fresh
+    /// unanimous exact-profile proof. It has no durable V1/V2 activation
+    /// certificate to borrow across topology changes.
+    pub(crate) async fn fenced_mutation_roster_capability(
+        &self,
+    ) -> Result<Option<FencedMutationRosterCapability>, StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.require_fenced_mutation_roster_capability_before(deadline)
+            .await
+            .map(|_| Some(FencedMutationRosterCapability::V1))
     }
 
     /// Obtain a fresh record plus the durable fence floor for one exact key.
@@ -2717,6 +2876,8 @@ impl ConsensusSessionStore {
                                 SessionMutationIntent::FencedTransition(_)
                                     | SessionMutationIntent::FencedTransitionV2(_)
                                     | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
+                                    | SessionMutationIntent::AdmitFencedMutationRoster { .. }
+                                    | SessionMutationIntent::TerminalizeFencedMutationRoster { .. }
                             )
                         {
                             return Err(consensus_outcome_unavailable(&request.intent));
@@ -3035,7 +3196,34 @@ impl ConsensusSessionStore {
                 }
             }
         }
-
+        if matches!(
+            &request.intent,
+            SessionMutationIntent::AdmitFencedMutationRoster { .. }
+        ) {
+            match self
+                .require_fenced_mutation_roster_capability_before(deadline)
+                .await
+            {
+                Ok(FencedMutationRosterCapabilityAdmission::FreshUnanimous) => {}
+                Err(_) => {
+                    return ForwardMutationReply::Applied(Box::new(
+                        SessionConsensusResponse::rejected(unsupported_fenced_mutation_roster()),
+                    ));
+                }
+            }
+        }
+        if matches!(
+            &request.intent,
+            SessionMutationIntent::TerminalizeFencedMutationRoster { .. }
+        ) && self
+            .require_fenced_mutation_roster_capability_before(deadline)
+            .await
+            .is_err()
+        {
+            return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
+                unsupported_fenced_mutation_roster(),
+            )));
+        }
         let logical_time = match tokio::time::timeout_at(
             deadline,
             self.inner
@@ -3079,6 +3267,20 @@ impl ConsensusSessionStore {
                 return ForwardMutationReply::Unavailable;
             }
         }
+        if let Some((scope_identity, voter_set_digest, profile_digest)) =
+            fenced_mutation_roster_admission_scope(&request.intent)
+        {
+            let Ok((current_identity, current_voters)) = self.current_scope() else {
+                return ForwardMutationReply::Unavailable;
+            };
+            if *scope_identity != current_identity
+                || *voter_set_digest
+                    != fenced_mutation_roster_voter_set_digest(current_identity, &current_voters)
+                || *profile_digest != fenced_mutation_roster_profile_digest()
+            {
+                return ForwardMutationReply::Unavailable;
+            }
+        }
         self.propose_on_local_leader(
             request,
             LocalProposalAuthority {
@@ -3115,6 +3317,16 @@ impl ConsensusSessionStore {
                     *profile_digest
                         != crate::fenced_transition::fenced_transition_v2_profile_digest()
                 })
+            {
+                return ForwardMutationReply::Unavailable;
+            }
+        }
+        if let Some((scope_identity, voter_set_digest, profile_digest)) =
+            fenced_mutation_roster_admission_scope(&request.intent)
+        {
+            if *scope_identity != identity
+                || *voter_set_digest != fenced_mutation_roster_voter_set_digest(identity, &voters)
+                || *profile_digest != fenced_mutation_roster_profile_digest()
             {
                 return ForwardMutationReply::Unavailable;
             }
@@ -4054,6 +4266,10 @@ fn unsupported_fenced_transition_v2() -> StoreError {
     StoreError::CapabilityNotSupported("atomic_fenced_transition_epoch_history_v2".into())
 }
 
+fn unsupported_fenced_mutation_roster() -> StoreError {
+    StoreError::CapabilityNotSupported("fenced_mutation_roster_v1".into())
+}
+
 fn fenced_transition_v2_capability_failure_reply(error: StoreError) -> ForwardMutationReply {
     if matches!(
         error,
@@ -4100,6 +4316,23 @@ fn fenced_transition_activation_scope(
     }
 }
 
+type FencedMutationRosterAdmissionScope<'a> =
+    (&'a SessionConsensusIdentity, &'a [u8; 32], &'a [u8; 32]);
+
+fn fenced_mutation_roster_admission_scope(
+    intent: &SessionMutationIntent,
+) -> Option<FencedMutationRosterAdmissionScope<'_>> {
+    match intent {
+        SessionMutationIntent::AdmitFencedMutationRoster {
+            scope_identity,
+            voter_set_digest,
+            profile_digest,
+            ..
+        } => Some((scope_identity, voter_set_digest, profile_digest)),
+        _ => None,
+    }
+}
+
 fn consensus_outcome_unavailable(intent: &SessionMutationIntent) -> StoreError {
     match intent {
         SessionMutationIntent::CompareAndSet(_) => StoreError::CasIdempotencyOutcomeUnavailable,
@@ -4108,6 +4341,10 @@ fn consensus_outcome_unavailable(intent: &SessionMutationIntent) -> StoreError {
         | SessionMutationIntent::FencedTransitionV2(_)
         | SessionMutationIntent::ActivateFencedTransitionV2 { .. } => {
             StoreError::FencedTransitionOutcomeUnknown
+        }
+        SessionMutationIntent::AdmitFencedMutationRoster { .. }
+        | SessionMutationIntent::TerminalizeFencedMutationRoster { .. } => {
+            StoreError::BackendOperationOutcomeUnavailable
         }
         _ => StoreError::BackendOperationOutcomeUnavailable,
     }
@@ -4237,6 +4474,11 @@ fn committed_response_matches_intent(
             SessionMutationIntent::FencedTransitionV2(request)
             | SessionMutationIntent::ActivateFencedTransitionV2 { request, .. },
         ) => fenced_transition_v2_outcome_matches_request(request, outcome, logical_time),
+        (
+            Ok(SessionMutationOutcome::FencedMutationRoster(outcome)),
+            intent @ (SessionMutationIntent::AdmitFencedMutationRoster { .. }
+            | SessionMutationIntent::TerminalizeFencedMutationRoster { .. }),
+        ) => fenced_mutation_roster_outcome_matches_intent(intent, outcome),
         _ => false,
     }
 }
@@ -4258,6 +4500,36 @@ fn fenced_transition_v2_outcome_matches_request(
     // identity, it validates the credential and acquisition-time details
     // that a hand-written partial match can accidentally omit.
     outcome.recorded_at() == logical_time && outcome.matches_v2_request(request)
+}
+
+fn fenced_mutation_roster_outcome_matches_intent(
+    intent: &SessionMutationIntent,
+    outcome: &FencedMutationRosterOutcome,
+) -> bool {
+    let Some((admission, terminal, terminalizes)) = fenced_mutation_roster_intent_parts(intent)
+    else {
+        return false;
+    };
+    let status = &outcome.status;
+    if status.request_id() != admission.request_id() {
+        return false;
+    }
+    match (terminalizes, status.phase(), terminal) {
+        (false, FencedMutationRosterPhase::PollAdmitted, None)
+        | (false, FencedMutationRosterPhase::Established, None)
+        | (false, FencedMutationRosterPhase::Aborted, None) => true,
+        // A terminal response must carry the exact durable terminal frame for
+        // establishment.  An abort is intentionally result-free, but only
+        // the already validated requested terminal can lead to that phase.
+        (true, FencedMutationRosterPhase::Established, Some(expected)) => {
+            expected.phase() == FencedMutationRosterPhase::Established
+                && status.terminal() == Some(expected)
+        }
+        (true, FencedMutationRosterPhase::Aborted, Some(expected)) => {
+            expected.phase() == FencedMutationRosterPhase::Aborted && status.terminal().is_none()
+        }
+        _ => false,
+    }
 }
 
 fn rejected_response_matches_intent(
@@ -4304,6 +4576,14 @@ fn rejected_error_matches_intent(intent: &SessionMutationIntent, error: &StoreEr
                 StoreError::CapabilityNotSupported(reason)
             ) if reason == "atomic_fenced_transition_v1"
         )
+        || matches!(
+            (intent, error),
+            (
+                SessionMutationIntent::AdmitFencedMutationRoster { .. }
+                    | SessionMutationIntent::TerminalizeFencedMutationRoster { .. },
+                StoreError::CapabilityNotSupported(reason)
+            ) if reason == "fenced_mutation_roster_v1"
+        )
 }
 
 fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreError) -> bool {
@@ -4324,6 +4604,8 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
                 | SessionMutationIntent::ActivateFencedTransition { .. }
                 | SessionMutationIntent::FencedTransitionV2(_)
                 | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
+                | SessionMutationIntent::AdmitFencedMutationRoster { .. }
+                | SessionMutationIntent::TerminalizeFencedMutationRoster { .. }
         );
     }
     match intent {
@@ -4399,6 +4681,11 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
                 | StoreError::FencedTransitionHistoryEpochNotActive
                 | StoreError::FencedTransitionRetentionExhausted
                 | StoreError::FencedTransitionStorageExhausted
+        ),
+        SessionMutationIntent::AdmitFencedMutationRoster { .. }
+        | SessionMutationIntent::TerminalizeFencedMutationRoster { .. } => matches!(
+            error,
+            StoreError::InvalidKey(_) | StoreError::StaleFence | StoreError::NotFound
         ),
         SessionMutationIntent::FinalizeOperatorRecovery { .. } => {
             matches!(error, StoreError::InvalidKey(reason) if reason == "operator_recovery_epoch_rejected")
@@ -4487,6 +4774,39 @@ fn validate_consensus_command_preproposal(
             crate::sqlite::validate_consensus_record(record)?;
         }
     }
+    if let Some((admission, terminal, terminalizes)) = fenced_mutation_roster_intent_parts(intent) {
+        let expected_request_id = if terminalizes {
+            fenced_mutation_roster_terminal_outer_request_id(
+                admission,
+                terminal.expect("terminalization carries terminal"),
+            )?
+        } else {
+            fenced_mutation_roster_outer_request_id(admission.request_id())
+        };
+        if command.request_id != expected_request_id {
+            return Err(StoreError::InvalidKey(
+                "fenced_mutation_roster_request_id_mismatch".into(),
+            ));
+        }
+        admission
+            .validate()
+            .map_err(|_| StoreError::InvalidKey("fenced_mutation_roster_invalid".into()))?;
+    }
+    if let SessionMutationIntent::TerminalizeFencedMutationRoster {
+        admission,
+        terminal,
+        protected_checkpoint,
+    } = intent
+    {
+        validate_fenced_mutation_roster_terminal(admission, terminal, protected_checkpoint)?;
+    }
+    if let SessionMutationIntent::AdmitFencedMutationRoster { profile_digest, .. } = intent {
+        if *profile_digest != fenced_mutation_roster_profile_digest() {
+            return Err(StoreError::CapabilityNotSupported(
+                "fenced_mutation_roster_profile_mismatch".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -4547,6 +4867,55 @@ fn validate_consensus_intent_with_recovery(
         if let Some(record) = request.mutation().record() {
             crate::sqlite::validate_consensus_record(record)?;
         }
+    }
+    if let Some((admission, _, _)) = fenced_mutation_roster_intent_parts(intent) {
+        admission
+            .validate()
+            .map_err(|_| StoreError::InvalidKey("fenced_mutation_roster_invalid".into()))?;
+    }
+    if let SessionMutationIntent::TerminalizeFencedMutationRoster {
+        admission,
+        terminal,
+        protected_checkpoint,
+    } = intent
+    {
+        validate_fenced_mutation_roster_terminal(admission, terminal, protected_checkpoint)?;
+    }
+    Ok(())
+}
+
+fn fenced_mutation_roster_intent_parts(
+    intent: &SessionMutationIntent,
+) -> Option<(
+    &FencedMutationRosterAdmission,
+    Option<&FencedMutationRosterTerminal>,
+    bool,
+)> {
+    match intent {
+        SessionMutationIntent::AdmitFencedMutationRoster { admission, .. } => {
+            Some((admission, None, false))
+        }
+        SessionMutationIntent::TerminalizeFencedMutationRoster {
+            admission,
+            terminal,
+            ..
+        } => Some((admission, Some(terminal), true)),
+        _ => None,
+    }
+}
+
+fn validate_fenced_mutation_roster_terminal(
+    admission: &FencedMutationRosterAdmission,
+    terminal: &FencedMutationRosterTerminal,
+    protected_checkpoint: &crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan,
+) -> Result<(), StoreError> {
+    terminal
+        .validate_for_admission(admission)
+        .map_err(|_| StoreError::InvalidKey("fenced_mutation_roster_terminal_invalid".into()))?;
+    if terminal.protected_checkpoint() != protected_checkpoint.as_bytes() {
+        return Err(StoreError::InvalidKey(
+            "fenced_mutation_roster_checkpoint_mismatch".into(),
+        ));
     }
     Ok(())
 }
@@ -4697,16 +5066,24 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                     };
                     return encode_service_reply(&reply);
                 }
+                if let Ok(probe) =
+                    decode_bounded::<FencedTransitionV2CapabilityProbe>(&request.payload)
+                {
+                    let reply = fenced_transition_v2_capability_probe_reply(
+                        probe,
+                        self.store.local_fenced_transition_v2_capability(),
+                    );
+                    return encode_service_reply(&reply);
+                }
                 let probe =
-                    match decode_bounded::<FencedTransitionV2CapabilityProbe>(&request.payload) {
+                    match decode_bounded::<FencedMutationRosterCapabilityProbe>(&request.payload) {
                         Ok(probe) => probe,
                         Err(_) => return protocol_rejection(),
                     };
-                let reply = fenced_transition_v2_capability_probe_reply(
+                encode_service_reply(&fenced_mutation_roster_capability_probe_reply(
                     probe,
-                    self.store.local_fenced_transition_v2_capability(),
-                );
-                encode_service_reply(&reply)
+                    self.store.local_fenced_mutation_roster_capability(),
+                ))
             }
             SessionConsensusRpcFamily::TopologyAdmissionBarrier => {
                 let barrier = match decode_bounded(&request.payload) {
