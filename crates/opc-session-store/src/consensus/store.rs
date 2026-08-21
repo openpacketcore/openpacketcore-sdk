@@ -7697,16 +7697,51 @@ mod membership_tests {
         .expect("roster admission terminal result")
     }
 
+    struct ConsumerV3AppliedRosterProvider;
+
+    impl crate::FencedMutationRosterMemberProvider for ConsumerV3AppliedRosterProvider {
+        type Error = std::convert::Infallible;
+
+        fn execute_member(
+            &self,
+            _context: &crate::FencedMutationRosterMemberExecutionContext<'_>,
+        ) -> Result<crate::FencedMutationRosterProviderOutcome, Self::Error> {
+            Ok(crate::FencedMutationRosterProviderOutcome::AppliedExecuted)
+        }
+
+        fn member_status(
+            &self,
+            _context: &crate::FencedMutationRosterMemberExecutionContext<'_>,
+        ) -> Result<crate::FencedMutationRosterProviderOutcome, Self::Error> {
+            Ok(crate::FencedMutationRosterProviderOutcome::AppliedExecuted)
+        }
+
+        fn adopt_member(
+            &self,
+            _context: &crate::FencedMutationRosterMemberExecutionContext<'_>,
+        ) -> Result<crate::FencedMutationRosterProviderOutcome, Self::Error> {
+            Ok(crate::FencedMutationRosterProviderOutcome::AppliedExecuted)
+        }
+    }
+
+    fn consumer_v3_roster_proof(
+        admission: &FencedMutationRosterAdmission,
+    ) -> crate::FencedMutationRosterMemberProof {
+        let member = &admission.members().as_slice()[0];
+        crate::FencedMutationRosterMemberExecutor::new()
+            .execute_member(
+                &ConsumerV3AppliedRosterProvider,
+                admission,
+                member.ordinal(),
+                admission.fence_intent().fence(),
+            )
+            .expect("SDK issues roster proof")
+    }
+
     fn consumer_v3_roster_terminal(
         admission: &FencedMutationRosterAdmission,
     ) -> FencedMutationRosterTerminal {
-        let member = &admission.members().as_slice()[0];
-        let proof = crate::FencedMutationRosterMemberProof::issue(
-            admission,
-            member,
-            admission.fence_intent().fence(),
-            crate::FencedMutationRosterProviderOutcome::AppliedExecuted,
-        );
+        let proof = consumer_v3_roster_proof(admission);
         FencedMutationRosterTerminal::from_member_proofs(
             admission,
             &[proof],
@@ -8020,13 +8055,7 @@ mod membership_tests {
             SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_))
         ));
 
-        let member = &admission.members().as_slice()[0];
-        let proof = crate::FencedMutationRosterMemberProof::issue(
-            &admission,
-            member,
-            admission.fence_intent().fence(),
-            crate::FencedMutationRosterProviderOutcome::AppliedExecuted,
-        );
+        let proof = consumer_v3_roster_proof(&admission);
         assert_eq!(
             FencedMutationRosterTerminal::from_member_proofs(
                 &admission,

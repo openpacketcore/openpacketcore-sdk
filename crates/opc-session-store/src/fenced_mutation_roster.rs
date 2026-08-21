@@ -1503,9 +1503,24 @@ pub enum FencedMutationRosterProviderOutcome {
     CompensatedReconciled,
 }
 
-/// Opaque SDK-issued evidence for one member operation.  Fields are private
-/// so a consumer cannot manufacture `Applied` or `NotApplied` terminal state.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Opaque SDK-issued evidence for one member operation. Fields are private so
+/// a consumer cannot manufacture `Applied` or `NotApplied` terminal state.
+///
+/// This proof deliberately implements neither `serde::Serialize` nor
+/// `serde::Deserialize`: it is process-local SDK evidence, not a caller wire
+/// value. Providers obtain it only from [`FencedMutationRosterMemberExecutor`]
+/// after supplying a conclusive result for an SDK-validated context.
+///
+/// ```compile_fail
+/// fn assert_deserialize<T: serde::de::DeserializeOwned>() {}
+/// assert_deserialize::<opc_session_store::FencedMutationRosterMemberProof>();
+/// ```
+///
+/// ```compile_fail
+/// use opc_session_store::FencedMutationRosterMemberProof;
+/// let _ = FencedMutationRosterMemberProof {};
+/// ```
+#[derive(Clone, PartialEq, Eq)]
 pub struct FencedMutationRosterMemberProof {
     roster_id: FencedMutationRosterRequestId,
     phase_commitment: [u8; 32],
@@ -1524,20 +1539,18 @@ impl fmt::Debug for FencedMutationRosterMemberProof {
 }
 
 impl FencedMutationRosterMemberProof {
-    pub(crate) fn issue(
-        admission: &FencedMutationRosterAdmission,
-        member: &FencedMutationRosterMember,
-        current_fence: FenceToken,
+    fn issue(
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
         outcome: FencedMutationRosterProviderOutcome,
     ) -> Self {
         Self {
-            roster_id: admission.request_id(),
-            phase_commitment: roster_body_commitment(&admission.canonical_body()),
-            ordinal: member.ordinal(),
-            member_operation_id: *member.caller_id(),
-            descriptor_commitment: roster_body_commitment(member.descriptor().as_bytes()),
-            expected_version: member.expected_version(),
-            execution_fence: current_fence,
+            roster_id: context.admission.request_id(),
+            phase_commitment: roster_body_commitment(&context.admission.canonical_body()),
+            ordinal: context.member.ordinal(),
+            member_operation_id: *context.member.caller_id(),
+            descriptor_commitment: roster_body_commitment(context.member.descriptor().as_bytes()),
+            expected_version: context.member.expected_version(),
+            execution_fence: context.current_fence,
             outcome,
         }
     }
@@ -1573,32 +1586,199 @@ impl FencedMutationRosterMemberProof {
     }
 }
 
-/// Generic opaque member provider.  The SDK owns proof issuance and all
-/// ambiguity handling; providers never assert terminal dispositions directly.
+/// SDK-validated context supplied to a roster member provider.
+///
+/// The context is constructed only by [`FencedMutationRosterMemberExecutor`].
+/// It binds the complete immutable admission, the selected canonical member
+/// ordinal, and a fence no older than the admission fence. Providers use this
+/// context to bind their durable evidence; they cannot construct or alter it.
+pub struct FencedMutationRosterMemberExecutionContext<'a> {
+    admission: &'a FencedMutationRosterAdmission,
+    member: &'a FencedMutationRosterMember,
+    current_fence: FenceToken,
+}
+
+impl FencedMutationRosterMemberExecutionContext<'_> {
+    /// Borrow the exact immutable admission being executed.
+    pub fn admission(&self) -> &FencedMutationRosterAdmission {
+        self.admission
+    }
+
+    /// Borrow the exact canonical member selected for this execution.
+    pub fn member(&self) -> &FencedMutationRosterMember {
+        self.member
+    }
+
+    /// Return the selected canonical member ordinal.
+    pub fn ordinal(&self) -> FencedMutationRosterOrdinal {
+        self.member.ordinal()
+    }
+
+    /// Return the current execution fence bound to the eventual proof.
+    pub fn current_fence(&self) -> FenceToken {
+        self.current_fence
+    }
+}
+
+impl fmt::Debug for FencedMutationRosterMemberExecutionContext<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FencedMutationRosterMemberExecutionContext(<redacted>)")
+    }
+}
+
+/// Provider or SDK-context failure while issuing a member proof.
+#[derive(PartialEq, Eq)]
+pub enum FencedMutationRosterMemberExecutionError<E> {
+    /// The admission, selected ordinal, or fence context was invalid.
+    Context(FencedMutationRosterError),
+    /// The provider did not produce conclusive durable evidence.
+    Provider(E),
+}
+
+impl<E> fmt::Debug for FencedMutationRosterMemberExecutionError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Context(error) => f.debug_tuple("Context").field(error).finish(),
+            Self::Provider(_) => f.write_str("Provider(<redacted>)"),
+        }
+    }
+}
+
+impl<E> fmt::Display for FencedMutationRosterMemberExecutionError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Context(error) => error.fmt(f),
+            Self::Provider(_) => f.write_str("roster member provider failed"),
+        }
+    }
+}
+
+impl<E: 'static> Error for FencedMutationRosterMemberExecutionError<E> {}
+
+/// Generic conclusive-evidence provider for one roster member.
+///
+/// Each returned outcome must be backed by the provider's durable evidence
+/// for the exact [`FencedMutationRosterMemberExecutionContext`]. The SDK maps
+/// that outcome to a terminal matrix only after it binds the result into an
+/// opaque proof; providers never construct proofs or terminal dispositions.
 pub trait FencedMutationRosterMemberProvider {
-    /// Provider error returned without creating a terminal proof.
+    /// Provider error returned without creating a proof.
     type Error;
-    /// Execute one member under the current guard.
+    /// Execute one member under the SDK-validated guard.
     fn execute_member(
         &self,
-        recovered: &FencedMutationRosterAdmission,
-        ordinal: FencedMutationRosterOrdinal,
-        current_fence: FenceToken,
-    ) -> Result<FencedMutationRosterMemberProof, Self::Error>;
-    /// Read exact durable status for one member.
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+    ) -> Result<FencedMutationRosterProviderOutcome, Self::Error>;
+    /// Read exact durable status for one SDK-validated member.
     fn member_status(
         &self,
-        recovered: &FencedMutationRosterAdmission,
-        ordinal: FencedMutationRosterOrdinal,
-        current_fence: FenceToken,
-    ) -> Result<FencedMutationRosterMemberProof, Self::Error>;
-    /// Adopt or reconcile one ambiguous member using durable evidence.
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+    ) -> Result<FencedMutationRosterProviderOutcome, Self::Error>;
+    /// Adopt or reconcile one ambiguous SDK-validated member using durable evidence.
     fn adopt_member(
         &self,
-        recovered: &FencedMutationRosterAdmission,
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+    ) -> Result<FencedMutationRosterProviderOutcome, Self::Error>;
+}
+
+/// SDK-owned issuer for opaque roster member proofs.
+///
+/// This executor validates the recovered admission, selected member ordinal,
+/// and monotonic fence context before invoking a provider. It is the only
+/// public path that constructs a [`FencedMutationRosterMemberProof`].
+#[derive(Clone, Copy, Default)]
+pub struct FencedMutationRosterMemberExecutor;
+
+impl FencedMutationRosterMemberExecutor {
+    /// Construct an SDK-owned roster member proof issuer.
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Execute one member and issue its bound proof from durable provider evidence.
+    pub fn execute_member<P>(
+        &self,
+        provider: &P,
+        admission: &FencedMutationRosterAdmission,
         ordinal: FencedMutationRosterOrdinal,
         current_fence: FenceToken,
-    ) -> Result<FencedMutationRosterMemberProof, Self::Error>;
+    ) -> Result<FencedMutationRosterMemberProof, FencedMutationRosterMemberExecutionError<P::Error>>
+    where
+        P: FencedMutationRosterMemberProvider + ?Sized,
+    {
+        let context = Self::context(admission, ordinal, current_fence)
+            .map_err(FencedMutationRosterMemberExecutionError::Context)?;
+        let outcome = provider
+            .execute_member(&context)
+            .map_err(FencedMutationRosterMemberExecutionError::Provider)?;
+        Ok(FencedMutationRosterMemberProof::issue(&context, outcome))
+    }
+
+    /// Read durable member status and issue its bound proof.
+    pub fn member_status<P>(
+        &self,
+        provider: &P,
+        admission: &FencedMutationRosterAdmission,
+        ordinal: FencedMutationRosterOrdinal,
+        current_fence: FenceToken,
+    ) -> Result<FencedMutationRosterMemberProof, FencedMutationRosterMemberExecutionError<P::Error>>
+    where
+        P: FencedMutationRosterMemberProvider + ?Sized,
+    {
+        let context = Self::context(admission, ordinal, current_fence)
+            .map_err(FencedMutationRosterMemberExecutionError::Context)?;
+        let outcome = provider
+            .member_status(&context)
+            .map_err(FencedMutationRosterMemberExecutionError::Provider)?;
+        Ok(FencedMutationRosterMemberProof::issue(&context, outcome))
+    }
+
+    /// Adopt or reconcile a member and issue its bound proof.
+    pub fn adopt_member<P>(
+        &self,
+        provider: &P,
+        admission: &FencedMutationRosterAdmission,
+        ordinal: FencedMutationRosterOrdinal,
+        current_fence: FenceToken,
+    ) -> Result<FencedMutationRosterMemberProof, FencedMutationRosterMemberExecutionError<P::Error>>
+    where
+        P: FencedMutationRosterMemberProvider + ?Sized,
+    {
+        let context = Self::context(admission, ordinal, current_fence)
+            .map_err(FencedMutationRosterMemberExecutionError::Context)?;
+        let outcome = provider
+            .adopt_member(&context)
+            .map_err(FencedMutationRosterMemberExecutionError::Provider)?;
+        Ok(FencedMutationRosterMemberProof::issue(&context, outcome))
+    }
+
+    fn context(
+        admission: &FencedMutationRosterAdmission,
+        ordinal: FencedMutationRosterOrdinal,
+        current_fence: FenceToken,
+    ) -> Result<FencedMutationRosterMemberExecutionContext<'_>, FencedMutationRosterError> {
+        admission.validate()?;
+        if current_fence < admission.fence_intent().fence() {
+            return Err(FencedMutationRosterError::StaleOwnerFence);
+        }
+        let member = admission
+            .members()
+            .as_slice()
+            .iter()
+            .find(|member| member.ordinal() == ordinal)
+            .ok_or(FencedMutationRosterError::LifecycleConflict)?;
+        Ok(FencedMutationRosterMemberExecutionContext {
+            admission,
+            member,
+            current_fence,
+        })
+    }
+}
+
+impl fmt::Debug for FencedMutationRosterMemberExecutor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FencedMutationRosterMemberExecutor")
+    }
 }
 /// Compatibility alias for callers using the profile digest spelling.
 pub fn compute_fenced_mutation_roster_profile_digest() -> [u8; 32] {
@@ -2070,6 +2250,102 @@ mod tests {
             FencedMutationRosterProtectedPlan::new(vec![3].into_boxed_slice()).unwrap(),
         )
         .unwrap()
+    }
+
+    struct ProbeProvider {
+        calls: std::cell::Cell<u8>,
+        result: Result<FencedMutationRosterProviderOutcome, FencedMutationRosterError>,
+    }
+
+    impl ProbeProvider {
+        fn result(&self) -> Result<FencedMutationRosterProviderOutcome, FencedMutationRosterError> {
+            self.calls.set(self.calls.get() + 1);
+            self.result
+        }
+    }
+
+    impl FencedMutationRosterMemberProvider for ProbeProvider {
+        type Error = FencedMutationRosterError;
+
+        fn execute_member(
+            &self,
+            _context: &FencedMutationRosterMemberExecutionContext<'_>,
+        ) -> Result<FencedMutationRosterProviderOutcome, Self::Error> {
+            self.result()
+        }
+
+        fn member_status(
+            &self,
+            _context: &FencedMutationRosterMemberExecutionContext<'_>,
+        ) -> Result<FencedMutationRosterProviderOutcome, Self::Error> {
+            self.result()
+        }
+
+        fn adopt_member(
+            &self,
+            _context: &FencedMutationRosterMemberExecutionContext<'_>,
+        ) -> Result<FencedMutationRosterProviderOutcome, Self::Error> {
+            self.result()
+        }
+    }
+
+    #[test]
+    fn member_proof_issuer_rejects_invalid_context_before_provider_or_proof() {
+        let admission = admission_with_member(admission_member(
+            0,
+            vec![1],
+            2,
+            3,
+            FencedMutationRosterDisposition::Pending,
+            FencedMutationRosterAdoption::Unreconciled,
+        ));
+        let issuer = FencedMutationRosterMemberExecutor::new();
+        let provider = ProbeProvider {
+            calls: std::cell::Cell::new(0),
+            result: Ok(FencedMutationRosterProviderOutcome::AppliedExecuted),
+        };
+
+        assert_eq!(
+            issuer.execute_member(
+                &provider,
+                &admission,
+                FencedMutationRosterOrdinal::new(1).unwrap(),
+                admission.fence_intent().fence(),
+            ),
+            Err(FencedMutationRosterMemberExecutionError::Context(
+                FencedMutationRosterError::LifecycleConflict,
+            ))
+        );
+        assert_eq!(provider.calls.get(), 0);
+        assert_eq!(
+            issuer.execute_member(
+                &provider,
+                &admission,
+                FencedMutationRosterOrdinal::new(0).unwrap(),
+                FenceToken::new(admission.fence_intent().fence().get() - 1),
+            ),
+            Err(FencedMutationRosterMemberExecutionError::Context(
+                FencedMutationRosterError::StaleOwnerFence,
+            ))
+        );
+        assert_eq!(provider.calls.get(), 0);
+
+        let failing_provider = ProbeProvider {
+            calls: std::cell::Cell::new(0),
+            result: Err(FencedMutationRosterError::Indeterminate),
+        };
+        assert_eq!(
+            issuer.execute_member(
+                &failing_provider,
+                &admission,
+                FencedMutationRosterOrdinal::new(0).unwrap(),
+                admission.fence_intent().fence(),
+            ),
+            Err(FencedMutationRosterMemberExecutionError::Provider(
+                FencedMutationRosterError::Indeterminate,
+            ))
+        );
+        assert_eq!(failing_provider.calls.get(), 1);
     }
 
     #[test]
