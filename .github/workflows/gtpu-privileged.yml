@@ -829,6 +829,7 @@ jobs:
           set -euo pipefail
           command -v readelf
           committed="${RUNNER_TEMP}/committed-opc-gtpu-datapath.bpf.o"
+          ./scripts/check-gtpu-ebpf-license.sh crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o
           cp crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o "${committed}"
           ./scripts/build-gtpu-ebpf.sh
           rebuilt="crates/opc-gtpu-dataplane-ebpf/target/bpfel-unknown-none/release/opc-gtpu-datapath"

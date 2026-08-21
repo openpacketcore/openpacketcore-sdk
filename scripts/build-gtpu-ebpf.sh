@@ -44,6 +44,9 @@ rustflags=(
     cargo "+${toolchain}" build --release --locked
 )
 
-cp "${target_dir}/bpfel-unknown-none/release/opc-gtpu-datapath" "${artifact}"
+built_object="${target_dir}/bpfel-unknown-none/release/opc-gtpu-datapath"
+"${repo_root}/scripts/check-gtpu-ebpf-license.sh" "${built_object}"
+cp "${built_object}" "${artifact}"
+"${repo_root}/scripts/check-gtpu-ebpf-license.sh" "${artifact}"
 echo "wrote ${artifact}"
 sha256sum "${artifact}"

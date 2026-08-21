@@ -168,6 +168,9 @@ rustup toolchain install nightly-2026-06-22 --profile minimal --component rust-s
 cargo install bpf-linker --version 0.10.3 --locked
 ```
 
+The helper also requires a GNU-compatible `readelf` (from binutils) to verify
+the generated object's kernel-readable license metadata.
+
 ## Roadmap
 
 - Keep the committed object reproducible from source and checked in CI.
