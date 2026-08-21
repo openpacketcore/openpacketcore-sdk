@@ -14,9 +14,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::stream::{self, BoxStream, StreamExt};
+use hmac::{Hmac, Mac};
 use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 
+use bytes::Bytes;
 use opc_session_net::{
     FencedMutationRosterServicePort, FencedMutationRosterTenant,
     PersistentFencedMutationRosterClient, PersistentFencedMutationRosterConfig,
@@ -25,12 +27,22 @@ use opc_session_net::{
     SessionQuorumConsumerServer, StatelessSessionConsumerClient,
     MAX_FENCED_MUTATION_ROSTER_V3_CALL_BYTES, MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES,
     SESSION_QUORUM_CONSUMER_V3_ALPN, SESSION_QUORUM_CONSUMER_V3_TRANSPORT_REVISION,
+    SESSION_QUORUM_CONSUMER_V4_ALPN, SESSION_QUORUM_CONSUMER_V4_TRANSPORT_REVISION,
 };
 use opc_session_store::{
-    ConsensusSessionStore, FencedMutationRosterCapability, QuorumReplicaDescriptor,
-    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
-    SessionConsensusIdentity, SessionConsumerChange, SessionConsumerFencedMutationRosterProfile,
-    SessionConsumerIdentity, SessionConsumerRejection, SessionConsumerRequest,
+    ConsensusSessionStore, FenceToken, FencedMutationMemberAdoption,
+    FencedMutationMemberDisposition, FencedMutationRosterAdmission, FencedMutationRosterCapability,
+    FencedMutationRosterFenceIntent, FencedMutationRosterMember,
+    FencedMutationRosterMemberAttestation, FencedMutationRosterMemberAttestationError,
+    FencedMutationRosterMemberAttestationProvider, FencedMutationRosterMemberAttestationVerifier,
+    FencedMutationRosterMembers, FencedMutationRosterOperationId,
+    FencedMutationRosterProtectedPlan, FencedMutationRosterProtectedResult,
+    FencedMutationRosterProviderOutcome, FencedTransitionLease, FencedTransitionMutation,
+    FencedTransitionRequest, FencedTransitionRequestId, Generation, OwnerId,
+    QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
+    ReplicaId, ReplicaTlsIdentity, SessionConsensusIdentity, SessionConsumerChange,
+    SessionConsumerFencedMutationRosterProfile, SessionConsumerIdentity, SessionConsumerOperation,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
     SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
     SessionConsumerV3Operation, SessionConsumerV3Request, SessionConsumerV3Response,
     SessionQuorumConsumer, SqliteSessionBackend, ValidatedQuorumTopology,
@@ -38,6 +50,7 @@ use opc_session_store::{
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::SpiffeId;
+use opc_types::{NetworkFunctionKind, TenantId};
 use tokio::sync::Barrier;
 
 struct TestPki {
@@ -154,6 +167,17 @@ fn spiffe(name: &str) -> String {
 async fn authorizer_and_scope(
     client_spiffe: &str,
 ) -> (SessionConsumerAuthorizer, SessionConsumerScope) {
+    let (_store, authorizer, scope) = store_authorizer_and_scope(client_spiffe).await;
+    (authorizer, scope)
+}
+
+async fn store_authorizer_and_scope(
+    client_spiffe: &str,
+) -> (
+    ConsensusSessionStore,
+    SessionConsumerAuthorizer,
+    SessionConsumerScope,
+) {
     let snapshots = tempfile::tempdir().expect("snapshot directory");
     let replica_id = ReplicaId::new("protected-roster-transport-test").expect("replica ID");
     let descriptor = QuorumReplicaDescriptor::new(
@@ -192,7 +216,82 @@ async fn authorizer_and_scope(
         [SpiffeId::new(client_spiffe).expect("client SPIFFE")],
     )
     .expect("consumer authorizer");
-    (authorizer, scope)
+    (store, authorizer, scope)
+}
+
+async fn activate_roster_capability(
+    store: &ConsensusSessionStore,
+    scope: SessionConsumerScope,
+    identity: &SessionConsumerIdentity,
+) {
+    let key = opc_session_store::SessionKey {
+        tenant: TenantId::new("attested-roster-activation").expect("activation tenant"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: opc_session_store::SessionKeyType::PduSession,
+        stable_id: Bytes::from_static(b"attested-roster-activation")
+            .try_into()
+            .expect("activation ID"),
+    };
+    let transition = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0x81; 16]),
+        FencedTransitionLease::acquire(
+            key,
+            OwnerId::new("attested-roster-owner").expect("activation owner"),
+            FenceToken::new(0),
+            Duration::from_secs(30),
+        )
+        .expect("activation lease"),
+        FencedTransitionMutation::delete(Generation::new(1)),
+    )
+    .expect("activation transition");
+    assert!(matches!(
+        store
+            .consumer_service()
+            .execute(
+                identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    SessionConsumerRequestId::from_bytes([0x81; 16]),
+                    SessionConsumerOperation::FencedTransition {
+                        request: Box::new(transition),
+                    },
+                ),
+            )
+            .await,
+        SessionConsumerResponse::FencedTransition(_)
+    ));
+}
+
+fn attested_roster_admission(tag: u8) -> FencedMutationRosterAdmission {
+    let member = FencedMutationRosterMember::new(
+        opc_session_store::fenced_mutation_roster::FencedMutationRosterOrdinal::new(0)
+            .expect("member ordinal"),
+        [tag; 16],
+        opc_session_store::fenced_mutation_roster::FencedMutationRosterDescriptor::new(Vec::new())
+            .expect("member descriptor"),
+        1,
+        1,
+        FencedMutationMemberDisposition::Pending,
+        FencedMutationMemberAdoption::Unreconciled,
+    )
+    .expect("member");
+    FencedMutationRosterAdmission::new(
+        1,
+        FencedMutationRosterOperationId::new([tag.wrapping_add(1); 16]).expect("operation ID"),
+        opc_session_store::FencedMutationRosterScope::from_digest([0; 32]),
+        FencedMutationRosterFenceIntent::new(
+            OwnerId::new("attested-roster-owner").expect("roster owner"),
+            FenceToken::new(u64::from(tag)),
+        ),
+        Generation::new(1),
+        FencedMutationRosterMembers::new([member]).expect("members"),
+        FencedMutationRosterProtectedPlan::new(Box::new([])).expect("plan"),
+    )
+    .expect("admission")
+    .with_terminal_result(
+        FencedMutationRosterProtectedResult::new(vec![0x84].into_boxed_slice()).expect("result"),
+    )
+    .expect("result-bound admission")
 }
 
 fn load_config(lanes: usize) -> PersistentFencedMutationRosterConfig {
@@ -213,13 +312,108 @@ fn load_config(lanes: usize) -> PersistentFencedMutationRosterConfig {
     .expect("bounded load configuration")
 }
 
+const ATTESTATION_TEST_KEY: [u8; 32] = [0x91; 32];
+
+fn attestation_signature(
+    identity: &str,
+    context: &opc_session_store::FencedMutationRosterMemberExecutionContext<'_>,
+    outcome: FencedMutationRosterProviderOutcome,
+) -> Vec<u8> {
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(&ATTESTATION_TEST_KEY).expect("fixed HMAC key");
+    mac.update(b"opc-session-net/attested-roster-provider/v1\0");
+    mac.update(
+        &u16::try_from(identity.len())
+            .expect("bounded identity")
+            .to_be_bytes(),
+    );
+    mac.update(identity.as_bytes());
+    mac.update(&context.attestation_commitment());
+    mac.update(&[match outcome {
+        FencedMutationRosterProviderOutcome::AppliedExecuted => 0,
+        FencedMutationRosterProviderOutcome::AppliedAdopted => 1,
+        FencedMutationRosterProviderOutcome::NotAppliedReconciled => 2,
+        FencedMutationRosterProviderOutcome::CompensatedReconciled => 3,
+    }]);
+    mac.finalize().into_bytes().to_vec()
+}
+
+struct HmacAttestationProvider {
+    effects: Arc<AtomicUsize>,
+    evidence_identity: String,
+    corrupt: bool,
+}
+
+#[async_trait]
+impl FencedMutationRosterMemberAttestationProvider for HmacAttestationProvider {
+    type Error = std::convert::Infallible;
+
+    async fn execute_member(
+        &self,
+        context: &opc_session_store::FencedMutationRosterMemberExecutionContext<'_>,
+    ) -> Result<FencedMutationRosterMemberAttestation, Self::Error> {
+        self.effects.fetch_add(1, Ordering::SeqCst);
+        let outcome = FencedMutationRosterProviderOutcome::AppliedExecuted;
+        let mut evidence = attestation_signature(&self.evidence_identity, context, outcome);
+        if self.corrupt {
+            evidence[0] ^= 0xff;
+        }
+        Ok(FencedMutationRosterMemberAttestation::new(
+            context,
+            outcome,
+            evidence.into_boxed_slice(),
+        )
+        .expect("bounded signed evidence"))
+    }
+}
+
+struct HmacAttestationVerifier;
+
+#[async_trait]
+impl FencedMutationRosterMemberAttestationVerifier for HmacAttestationVerifier {
+    async fn verify_member_attestation(
+        &self,
+        identity: &SessionConsumerIdentity,
+        context: &opc_session_store::FencedMutationRosterMemberExecutionContext<'_>,
+        attestation: &FencedMutationRosterMemberAttestation,
+    ) -> Result<FencedMutationRosterProviderOutcome, FencedMutationRosterMemberAttestationError>
+    {
+        attestation
+            .validate_for(context)
+            .map_err(|_| FencedMutationRosterMemberAttestationError::Rejected)?;
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&ATTESTATION_TEST_KEY)
+            .map_err(|_| FencedMutationRosterMemberAttestationError::Unavailable)?;
+        mac.update(b"opc-session-net/attested-roster-provider/v1\0");
+        mac.update(
+            &u16::try_from(identity.as_str().len())
+                .map_err(|_| FencedMutationRosterMemberAttestationError::Rejected)?
+                .to_be_bytes(),
+        );
+        mac.update(identity.as_str().as_bytes());
+        mac.update(&context.attestation_commitment());
+        mac.update(&[match attestation.outcome() {
+            FencedMutationRosterProviderOutcome::AppliedExecuted => 0,
+            FencedMutationRosterProviderOutcome::AppliedAdopted => 1,
+            FencedMutationRosterProviderOutcome::NotAppliedReconciled => 2,
+            FencedMutationRosterProviderOutcome::CompensatedReconciled => 3,
+        }]);
+        mac.verify_slice(attestation.evidence())
+            .map_err(|_| FencedMutationRosterMemberAttestationError::Rejected)?;
+        Ok(attestation.outcome())
+    }
+}
+
 #[test]
 fn revision_five_profile_and_alpn_are_isolated() {
     const QUALIFICATION_REQUIRED_BINDINGS: usize = 100 + 960_000;
 
     assert_eq!(SESSION_QUORUM_CONSUMER_V3_ALPN, b"opc-session-consumer/3");
     assert_eq!(SESSION_QUORUM_CONSUMER_V3_TRANSPORT_REVISION, 5);
+    assert_eq!(SESSION_QUORUM_CONSUMER_V4_ALPN, b"opc-session-consumer/4");
+    assert_eq!(SESSION_QUORUM_CONSUMER_V4_TRANSPORT_REVISION, 6);
     assert!(SessionConsumerFencedMutationRosterProfile::v2().is_exact());
+    assert!(SessionConsumerFencedMutationRosterProfile::v3().is_exact_v3());
+
     let profile = SessionConsumerFencedMutationRosterProfile::v2();
     assert_eq!(profile.operation_revision, 2);
     assert_eq!(
@@ -232,6 +426,178 @@ fn revision_five_profile_and_alpn_are_isolated() {
     let mut mixed = SessionConsumerFencedMutationRosterProfile::v2();
     mixed.transport_revision = 4;
     assert!(!mixed.is_exact());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_persistent_mtls_endpoints_terminalize_only_hmac_attested_provider_effects() {
+    const ENDPOINTS: usize = 3;
+    let pki = TestPki::new();
+    let client_spiffe = spiffe("attested-worker");
+    let (store, authorizer, scope) = store_authorizer_and_scope(&client_spiffe).await;
+    let worker_identity =
+        SessionConsumerIdentity::new(client_spiffe.clone()).expect("authenticated worker identity");
+    activate_roster_capability(&store, scope, &worker_identity).await;
+    let service: Arc<dyn SessionQuorumConsumer> = Arc::new(store.consumer_service());
+    let mut handles = Vec::with_capacity(ENDPOINTS);
+    let mut clients = Vec::with_capacity(ENDPOINTS);
+    for endpoint in 0..ENDPOINTS {
+        let server_spiffe = spiffe(&format!("attested-server-{endpoint}"));
+        let roster_port = FencedMutationRosterServicePort::with_attestation_verifier(
+            Arc::clone(&service),
+            Arc::new(HmacAttestationVerifier),
+        )
+        .expect("attested server verifier port");
+        let (handle, address) = SessionQuorumConsumerServer::new(
+            Arc::clone(&service),
+            pki.server_config(&server_spiffe),
+            authorizer.clone(),
+        )
+        .with_fenced_mutation_roster_service(roster_port)
+        .with_max_connections(2)
+        .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+        .await
+        .expect("start attested roster endpoint");
+        handles.push(handle);
+        let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+        let client = PersistentFencedMutationRosterClient::try_from_stateless(
+            StatelessSessionConsumerClient::new_with_resolver(
+                resolver,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+                scope,
+                pki.client_config(&client_spiffe),
+            )
+            .with_operation_timeout(Duration::from_secs(2)),
+            load_config(1),
+        )
+        .expect("persistent client");
+        client.prewarm().await.expect("persistent V3 status lane");
+        client
+            .prewarm_attested()
+            .await
+            .expect("persistent V4 attested lane");
+        clients.push(client);
+    }
+    let tenant = FencedMutationRosterTenant::new([0x87; 16]).expect("tenant");
+    let admitted = clients[0]
+        .bind_fenced_mutation_roster_admission(attested_roster_admission(0x88))
+        .expect("mTLS-bound admission");
+    assert!(matches!(
+        clients[0]
+            .execute(
+                tenant,
+                SessionConsumerV3Request::new(
+                    scope,
+                    SessionConsumerV3Operation::FencedMutationRosterAdmit {
+                        admission: Box::new(admitted.clone()),
+                    },
+                ),
+            )
+            .await,
+        Ok(SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_)))
+    ));
+    let effects = Arc::new(AtomicUsize::new(0));
+    let provider = HmacAttestationProvider {
+        effects: Arc::clone(&effects),
+        evidence_identity: client_spiffe.clone(),
+        corrupt: false,
+    };
+    assert!(matches!(
+        clients[0]
+            .execute_attested_terminalization(
+                tenant,
+                admitted.clone(),
+                vec![0x89].into_boxed_slice(),
+                &provider,
+            )
+            .await,
+        Ok(opc_session_store::SessionConsumerV4Response::FencedMutationRosterTerminalize(Ok(outcome)))
+            if outcome.status.phase() == opc_session_store::FencedMutationRosterPhase::Established
+    ));
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        clients[0]
+            .execute_attested_terminalization(
+                tenant,
+                admitted,
+                vec![0x89].into_boxed_slice(),
+                &provider,
+            )
+            .await,
+        Err(
+            opc_session_net::PersistentFencedMutationRosterProviderExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            }
+        )
+    ));
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        1,
+        "durable replay rejection runs before a second external worker effect"
+    );
+
+    for (tag, corrupt, evidence_identity) in [
+        (0x8a, true, client_spiffe.clone()),
+        (0x8c, false, spiffe("different-worker")),
+    ] {
+        let admission = clients[1]
+            .bind_fenced_mutation_roster_admission(attested_roster_admission(tag))
+            .expect("bound negative admission");
+        assert!(matches!(
+            clients[1]
+                .execute(
+                    tenant,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterAdmit {
+                            admission: Box::new(admission.clone()),
+                        },
+                    ),
+                )
+                .await,
+            Ok(SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_)))
+        ));
+        let negative = HmacAttestationProvider {
+            effects: Arc::clone(&effects),
+            evidence_identity,
+            corrupt,
+        };
+        assert!(
+            matches!(
+                clients[1]
+                    .execute_attested_terminalization(
+                        tenant,
+                        admission.clone(),
+                        vec![0x89].into_boxed_slice(),
+                        &negative,
+                    )
+                    .await,
+                Ok(opc_session_store::SessionConsumerV4Response::Rejected(
+                    SessionConsumerRejection::Unauthorized,
+                ))
+            ),
+            "forged or wrong-worker evidence must not reach terminal mutation"
+        );
+        assert!(matches!(
+            clients[1]
+                .execute(
+                    tenant,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterStatus {
+                            admission: Box::new(admission),
+                        },
+                    ),
+                )
+                .await,
+            Ok(SessionConsumerV3Response::FencedMutationRosterStatus(Ok(status)))
+                if status.phase() == opc_session_store::FencedMutationRosterPhase::PollAdmitted
+        ));
+    }
+    assert_eq!(effects.load(Ordering::SeqCst), 3);
+    for handle in handles {
+        handle.abort_and_wait().await;
+    }
 }
 
 #[test]

@@ -66,16 +66,18 @@ use crate::consumer::{
     SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
     SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
     SessionConsumerV3Operation, SessionConsumerV3Request, SessionConsumerV3Response,
-    SessionQuorumConsumer, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    SessionConsumerV4Request, SessionConsumerV4Response, SessionQuorumConsumer,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_mutation_roster::{
     fenced_mutation_roster_profile_digest, FencedMutationRosterAdmission,
     FencedMutationRosterCapability, FencedMutationRosterError, FencedMutationRosterHistoryState,
-    FencedMutationRosterMemberExecutionContext, FencedMutationRosterMemberExecutionError,
-    FencedMutationRosterMemberProof, FencedMutationRosterMemberProvider,
-    FencedMutationRosterOrdinal, FencedMutationRosterOutcome, FencedMutationRosterPhase,
-    FencedMutationRosterStatus, FencedMutationRosterTerminal,
+    FencedMutationRosterMemberAttestation, FencedMutationRosterMemberAttestationError,
+    FencedMutationRosterMemberAttestationVerifier, FencedMutationRosterMemberExecutionContext,
+    FencedMutationRosterMemberExecutionError, FencedMutationRosterMemberProof,
+    FencedMutationRosterMemberProvider, FencedMutationRosterOrdinal, FencedMutationRosterOutcome,
+    FencedMutationRosterPhase, FencedMutationRosterStatus, FencedMutationRosterTerminal,
     FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES, FENCED_MUTATION_ROSTER_SCHEMA_V2,
     FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
 };
@@ -757,6 +759,45 @@ impl FencedMutationRosterMemberExecutionAuthority {
             .adopt_member(&context)
             .await
             .map_err(FencedMutationRosterMemberExecutionError::Provider)?;
+        self.revalidate_current_receipt()
+            .await
+            .map_err(FencedMutationRosterMemberExecutionError::Authority)?;
+        Ok(FencedMutationRosterMemberProof::issue(&context, outcome))
+    }
+
+    /// Verify remote worker evidence and issue a private proof only after the
+    /// verifier and both durable receipt checks succeed.
+    ///
+    /// The verifier is server-configured. It receives the authenticated mTLS
+    /// identity and must cryptographically bind it to this exact context; the
+    /// serializable attestation is otherwise only untrusted input.
+    pub async fn verify_member_attestation(
+        self,
+        identity: &SessionConsumerIdentity,
+        verifier: &dyn FencedMutationRosterMemberAttestationVerifier,
+        attestation: &FencedMutationRosterMemberAttestation,
+    ) -> Result<
+        FencedMutationRosterMemberProof,
+        FencedMutationRosterMemberExecutionError<FencedMutationRosterMemberAttestationError>,
+    > {
+        let context = self
+            .context()
+            .map_err(FencedMutationRosterMemberExecutionError::Context)?;
+        attestation
+            .validate_for(&context)
+            .map_err(FencedMutationRosterMemberExecutionError::Context)?;
+        self.revalidate_current_receipt()
+            .await
+            .map_err(FencedMutationRosterMemberExecutionError::Authority)?;
+        let outcome = verifier
+            .verify_member_attestation(identity, &context, attestation)
+            .await
+            .map_err(FencedMutationRosterMemberExecutionError::Provider)?;
+        if outcome != attestation.outcome() {
+            return Err(FencedMutationRosterMemberExecutionError::Provider(
+                FencedMutationRosterMemberAttestationError::Rejected,
+            ));
+        }
         self.revalidate_current_receipt()
             .await
             .map_err(FencedMutationRosterMemberExecutionError::Authority)?;
@@ -4553,10 +4594,9 @@ impl ConsensusSessionStore {
         }
     }
 
-    // This is retained solely for the forthcoming attested successor
-    // transport. Revision 5 has no caller into it: its serde terminal is not
-    // evidence of a member effect.
-    #[allow(dead_code)]
+    // This internal submission path is reachable only after revision-6 derives
+    // a terminal from private member proofs. Revision 5 has no caller into it:
+    // its serde terminal is not evidence of a member effect.
     async fn consumer_fenced_mutation_roster_terminalize(
         &self,
         scope: SessionConsumerScope,
@@ -6458,6 +6498,14 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
             .map(|_| SessionConsumerFencedMutationRosterProfile::v2())
     }
 
+    fn fenced_mutation_roster_attested_profile(
+        &self,
+    ) -> Option<SessionConsumerFencedMutationRosterProfile> {
+        self.store
+            .local_fenced_mutation_roster_capability()
+            .map(|_| SessionConsumerFencedMutationRosterProfile::v3())
+    }
+
     async fn execute_v3(
         &self,
         identity: &SessionConsumerIdentity,
@@ -6578,6 +6626,132 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                 response
             }
             Err(rejection) => SessionConsumerV3Response::Rejected(rejection),
+        }
+    }
+
+    async fn execute_v4(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: SessionConsumerV4Request,
+        verifier: &dyn FencedMutationRosterMemberAttestationVerifier,
+    ) -> SessionConsumerV4Response {
+        let deadline = match self.operation_deadline() {
+            Ok(deadline) => deadline,
+            Err(rejection) => return SessionConsumerV4Response::Rejected(rejection),
+        };
+        if request.validate().is_err() {
+            return SessionConsumerV4Response::Rejected(SessionConsumerRejection::MalformedRequest);
+        }
+        // mTLS admission and the derived scope gate run before consulting any
+        // attestation, provider outcome, receipt, or mutation path.
+        let scope_admission = match self
+            .store
+            .admit_consumer_scope(request.scope(), deadline)
+            .await
+        {
+            Ok(admission) => admission,
+            Err(rejection) => return SessionConsumerV4Response::Rejected(rejection),
+        };
+        let authority_scope = derive_fenced_mutation_roster_scope_for_consumer(
+            identity,
+            SessionConsumerScope::new(scope_admission.required_scope),
+        );
+        drop(scope_admission);
+
+        let operation = request.operation().clone();
+        let admission = operation.admission().clone();
+        if admission.scope() != authority_scope {
+            return SessionConsumerV4Response::Rejected(SessionConsumerRejection::Unauthorized);
+        }
+
+        // Each store-owned authority supplies an independent pre- and
+        // post-verification durable `PollAdmitted` check. A competing or
+        // replayed terminalization moves the durable phase, causing the next
+        // check (or the terminal CAS) to fail closed before another terminal
+        // commit can occur.
+        let mut proofs = Vec::with_capacity(admission.members().len());
+        for (member, attestation) in admission
+            .members()
+            .as_slice()
+            .iter()
+            .zip(operation.attestations())
+        {
+            let authority = match self
+                .store
+                .fenced_mutation_roster_member_execution_authority(
+                    identity,
+                    request.scope(),
+                    admission.clone(),
+                    member.ordinal(),
+                )
+                .await
+            {
+                Ok(authority) => authority,
+                Err(_) => {
+                    return SessionConsumerV4Response::Rejected(
+                        SessionConsumerRejection::Unavailable,
+                    )
+                }
+            };
+            match authority
+                .verify_member_attestation(identity, verifier, attestation)
+                .await
+            {
+                Ok(proof) => proofs.push(proof),
+                Err(FencedMutationRosterMemberExecutionError::Context(_)) => {
+                    return SessionConsumerV4Response::Rejected(
+                        SessionConsumerRejection::MalformedRequest,
+                    )
+                }
+                Err(FencedMutationRosterMemberExecutionError::Provider(
+                    FencedMutationRosterMemberAttestationError::Rejected,
+                )) => {
+                    return SessionConsumerV4Response::Rejected(
+                        SessionConsumerRejection::Unauthorized,
+                    )
+                }
+                Err(_) => {
+                    return SessionConsumerV4Response::Rejected(
+                        SessionConsumerRejection::Unavailable,
+                    )
+                }
+            }
+        }
+
+        let terminal = match FencedMutationRosterTerminal::from_member_proofs(
+            &admission,
+            &proofs,
+            operation.protected_checkpoint().to_vec(),
+            admission.terminal_result().as_bytes().to_vec(),
+        ) {
+            Ok(terminal) => terminal,
+            Err(_) => {
+                return SessionConsumerV4Response::Rejected(
+                    SessionConsumerRejection::MalformedRequest,
+                )
+            }
+        };
+        let response = SessionConsumerV4Response::FencedMutationRosterTerminalize(
+            self.store
+                .consumer_fenced_mutation_roster_terminalize(
+                    request.scope(),
+                    admission,
+                    terminal,
+                    deadline,
+                )
+                .await
+                .map_err(|_| FencedMutationRosterError::Indeterminate),
+        );
+        match self
+            .store
+            .admit_consumer_scope(request.scope(), deadline)
+            .await
+        {
+            Ok(scope_admission) => {
+                drop(scope_admission);
+                response
+            }
+            Err(rejection) => SessionConsumerV4Response::Rejected(rejection),
         }
     }
 
@@ -7957,6 +8131,30 @@ mod membership_tests {
         }
     }
 
+    struct ConsumerV4TestAttestationVerifier;
+
+    #[async_trait::async_trait]
+    impl crate::FencedMutationRosterMemberAttestationVerifier for ConsumerV4TestAttestationVerifier {
+        async fn verify_member_attestation(
+            &self,
+            identity: &SessionConsumerIdentity,
+            context: &crate::FencedMutationRosterMemberExecutionContext<'_>,
+            attestation: &crate::FencedMutationRosterMemberAttestation,
+        ) -> Result<
+            crate::FencedMutationRosterProviderOutcome,
+            crate::FencedMutationRosterMemberAttestationError,
+        > {
+            if identity.as_str() == "spiffe://test.example/consumer/boundary"
+                && attestation.validate_for(context).is_ok()
+                && attestation.evidence() == [0xa5]
+            {
+                Ok(crate::FencedMutationRosterProviderOutcome::AppliedExecuted)
+            } else {
+                Err(crate::FencedMutationRosterMemberAttestationError::Rejected)
+            }
+        }
+    }
+
     struct ConsumerV3TerminalizingRosterProvider {
         store: ConsensusSessionStore,
         scope: SessionConsumerScope,
@@ -8524,6 +8722,247 @@ mod membership_tests {
             )),
             "a rejected V3 terminal never reaches the durable terminal mutation"
         );
+    }
+
+    #[tokio::test]
+    async fn consumer_v4_derives_terminal_only_after_verifier_bound_attestation() {
+        let (_directory, store, scope, identity, _key, _lease) = consumer_boundary_store().await;
+        activate_roster_predecessor(&store, scope, &identity).await;
+        let admission = consumer_v3_roster_admission(scope, &identity);
+        let service = store.consumer_service();
+        assert!(matches!(
+            service
+                .execute_v3(
+                    &identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterAdmit {
+                            admission: Box::new(admission.clone()),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_))
+        ));
+        let context = crate::FencedMutationRosterMemberExecutionContext::for_admission_member(
+            &admission,
+            admission.members().as_slice()[0].ordinal(),
+        )
+        .expect("member context");
+        let attestation = crate::FencedMutationRosterMemberAttestation::new(
+            &context,
+            crate::FencedMutationRosterProviderOutcome::AppliedExecuted,
+            vec![0xa5].into_boxed_slice(),
+        )
+        .expect("bounded attestation");
+        let request = SessionConsumerV4Request::new(
+            scope,
+            crate::SessionConsumerV4Operation::FencedMutationRosterTerminalizeAttested {
+                admission: Box::new(admission.clone()),
+                attestations: vec![attestation].into_boxed_slice(),
+                protected_checkpoint: vec![0x75].into_boxed_slice(),
+            },
+        );
+        let response = service
+            .execute_v4(
+                &identity,
+                request.clone(),
+                &ConsumerV4TestAttestationVerifier,
+            )
+            .await;
+        match response {
+            crate::SessionConsumerV4Response::FencedMutationRosterTerminalize(Ok(outcome)) => {
+                assert_eq!(
+                    outcome.status.phase(),
+                    FencedMutationRosterPhase::Established
+                )
+            }
+            crate::SessionConsumerV4Response::FencedMutationRosterTerminalize(Err(error)) => {
+                panic!("unexpected V4 terminal error: {error:?}")
+            }
+            crate::SessionConsumerV4Response::Rejected(rejection) => {
+                panic!("unexpected V4 rejection: {rejection:?}")
+            }
+        }
+        assert_eq!(
+            service
+                .execute_v4(&identity, request, &ConsumerV4TestAttestationVerifier)
+                .await,
+            crate::SessionConsumerV4Response::Rejected(SessionConsumerRejection::Unavailable),
+            "a durable terminal consumes the attestation authority before replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_v4_rejects_forged_identity_and_fence_mismatched_attestations_without_terminalizing(
+    ) {
+        let (_directory, store, scope, identity, _key, _lease) = consumer_boundary_store().await;
+        activate_roster_predecessor(&store, scope, &identity).await;
+        let admission = consumer_v3_roster_admission(scope, &identity);
+        let service = store.consumer_service();
+        assert!(matches!(
+            service
+                .execute_v3(
+                    &identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterAdmit {
+                            admission: Box::new(admission.clone()),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_))
+        ));
+        let current = scope.consensus_identity();
+        let stale_scope = SessionConsumerScope::new(SessionConsensusIdentity::new(
+            current.cluster_id(),
+            current.configuration_id(),
+            SessionConsensusConfigurationEpoch::new(current.configuration_epoch().get() + 1)
+                .expect("successor configuration epoch"),
+        ));
+        let context = crate::FencedMutationRosterMemberExecutionContext::for_admission_member(
+            &admission,
+            admission.members().as_slice()[0].ordinal(),
+        )
+        .expect("member context");
+        let forged = crate::FencedMutationRosterMemberAttestation::new(
+            &context,
+            crate::FencedMutationRosterProviderOutcome::AppliedExecuted,
+            vec![0x00].into_boxed_slice(),
+        )
+        .expect("forged bounded evidence");
+        let stale_scope_request = SessionConsumerV4Request::new(
+            stale_scope,
+            crate::SessionConsumerV4Operation::FencedMutationRosterTerminalizeAttested {
+                admission: Box::new(admission.clone()),
+                attestations: vec![forged.clone()].into_boxed_slice(),
+                protected_checkpoint: vec![0x75].into_boxed_slice(),
+            },
+        );
+        assert_eq!(
+            service
+                .execute_v4(
+                    &identity,
+                    stale_scope_request,
+                    &ConsumerV4TestAttestationVerifier
+                )
+                .await,
+            crate::SessionConsumerV4Response::Rejected(SessionConsumerRejection::ScopeMismatch),
+            "a mismatched consensus scope is rejected before verifier dispatch"
+        );
+        let forged_request = SessionConsumerV4Request::new(
+            scope,
+            crate::SessionConsumerV4Operation::FencedMutationRosterTerminalizeAttested {
+                admission: Box::new(admission.clone()),
+                attestations: vec![forged].into_boxed_slice(),
+                protected_checkpoint: vec![0x75].into_boxed_slice(),
+            },
+        );
+        assert_eq!(
+            service
+                .execute_v4(
+                    &identity,
+                    forged_request,
+                    &ConsumerV4TestAttestationVerifier
+                )
+                .await,
+            crate::SessionConsumerV4Response::Rejected(SessionConsumerRejection::Unauthorized)
+        );
+        let other = SessionConsumerIdentity::new("spiffe://test.example/consumer/other")
+            .expect("other identity");
+        let correct = crate::FencedMutationRosterMemberAttestation::new(
+            &context,
+            crate::FencedMutationRosterProviderOutcome::AppliedExecuted,
+            vec![0xa5].into_boxed_slice(),
+        )
+        .expect("correct evidence");
+        let identity_request = SessionConsumerV4Request::new(
+            scope,
+            crate::SessionConsumerV4Operation::FencedMutationRosterTerminalizeAttested {
+                admission: Box::new(admission.clone()),
+                attestations: vec![correct].into_boxed_slice(),
+                protected_checkpoint: vec![0x75].into_boxed_slice(),
+            },
+        );
+        assert_eq!(
+            service
+                .execute_v4(&other, identity_request, &ConsumerV4TestAttestationVerifier)
+                .await,
+            crate::SessionConsumerV4Response::Rejected(SessionConsumerRejection::Unauthorized)
+        );
+        let wrong_fence =
+            consumer_v3_roster_admission_with_fence(scope, &identity, FenceToken::new(2));
+        let wrong_context =
+            crate::FencedMutationRosterMemberExecutionContext::for_admission_member(
+                &wrong_fence,
+                wrong_fence.members().as_slice()[0].ordinal(),
+            )
+            .expect("wrong fence context");
+        let mismatch = crate::FencedMutationRosterMemberAttestation::new(
+            &wrong_context,
+            crate::FencedMutationRosterProviderOutcome::AppliedExecuted,
+            vec![0xa5].into_boxed_slice(),
+        )
+        .expect("mismatched attestation");
+        let mismatch_request = SessionConsumerV4Request::new(
+            scope,
+            crate::SessionConsumerV4Operation::FencedMutationRosterTerminalizeAttested {
+                admission: Box::new(admission.clone()),
+                attestations: vec![mismatch].into_boxed_slice(),
+                protected_checkpoint: vec![0x75].into_boxed_slice(),
+            },
+        );
+        assert_eq!(
+            service
+                .execute_v4(
+                    &identity,
+                    mismatch_request,
+                    &ConsumerV4TestAttestationVerifier
+                )
+                .await,
+            crate::SessionConsumerV4Response::Rejected(SessionConsumerRejection::MalformedRequest)
+        );
+        let outcome_mismatch = crate::FencedMutationRosterMemberAttestation::new(
+            &context,
+            crate::FencedMutationRosterProviderOutcome::AppliedAdopted,
+            vec![0xa5].into_boxed_slice(),
+        )
+        .expect("outcome-mismatched attestation");
+        let outcome_mismatch_request = SessionConsumerV4Request::new(
+            scope,
+            crate::SessionConsumerV4Operation::FencedMutationRosterTerminalizeAttested {
+                admission: Box::new(admission.clone()),
+                attestations: vec![outcome_mismatch].into_boxed_slice(),
+                protected_checkpoint: vec![0x75].into_boxed_slice(),
+            },
+        );
+        assert_eq!(
+            service
+                .execute_v4(
+                    &identity,
+                    outcome_mismatch_request,
+                    &ConsumerV4TestAttestationVerifier
+                )
+                .await,
+            crate::SessionConsumerV4Response::Rejected(SessionConsumerRejection::Unauthorized),
+            "a verifier result cannot silently reinterpret a claimed wire outcome"
+        );
+        assert!(matches!(
+            service
+                .execute_v3(
+                    &identity,
+                    SessionConsumerV3Request::new(
+                        scope,
+                        SessionConsumerV3Operation::FencedMutationRosterStatus {
+                            admission: Box::new(admission),
+                        },
+                    ),
+                )
+                .await,
+            SessionConsumerV3Response::FencedMutationRosterStatus(Ok(status))
+                if status.phase() == FencedMutationRosterPhase::PollAdmitted
+        ));
     }
 
     #[tokio::test]

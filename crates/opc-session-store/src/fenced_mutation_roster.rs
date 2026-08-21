@@ -34,6 +34,11 @@ pub const MEMBER_ID_BYTES: usize = 16;
 pub const MAX_DESCRIPTOR_BYTES: usize = 4_096;
 /// Maximum canonical status bytes for one member outcome.
 pub const MAX_STATUS_BYTES: usize = 4_096;
+/// Maximum opaque provider-attestation evidence bytes on the revision-6 lane.
+///
+/// The verifier contract makes the evidence meaningful; this bound only keeps
+/// untrusted wire input and retained request work fixed.
+pub const MAX_MEMBER_ATTESTATION_BYTES: usize = 4_096;
 /// Maximum opaque owner binding bytes.
 pub const MAX_OWNER_BYTES: usize = 1_024;
 /// Maximum opaque fence binding bytes.
@@ -95,6 +100,8 @@ const TERMINAL_MAGIC: &[u8; 8] = b"OPCFMRT1";
 const BODY_DOMAIN: &[u8] = b"opc-session-store/fenced-mutation-roster/body/v1";
 const REQUEST_DOMAIN: &[u8] = b"opc-session-store/fenced-mutation-roster/request/v1";
 const PROFILE_DOMAIN: &[u8] = b"opc-session-store/fenced-mutation-roster/profile/v2";
+const MEMBER_ATTESTATION_CONTEXT_DOMAIN: &[u8] =
+    b"opc-session-store/fenced-mutation-roster/member-attestation-context/v1";
 
 // Postcard encodes all integers and collection lengths as varints. These
 // bounds deliberately use the largest portable varint, rather than relying on
@@ -1629,6 +1636,26 @@ impl<'a> FencedMutationRosterMemberExecutionContext<'a> {
         }
     }
 
+    /// Construct a non-authoritative context for an exact admitted member.
+    ///
+    /// Remote provider workers use this only to bind an attestation to their
+    /// own effect. It conveys no authority to issue a proof or terminalize a
+    /// roster: the server still performs its durable `PollAdmitted` checks and
+    /// asks its configured verifier to authenticate the returned evidence.
+    pub fn for_admission_member(
+        admission: &'a FencedMutationRosterAdmission,
+        ordinal: FencedMutationRosterOrdinal,
+    ) -> Result<Self, FencedMutationRosterError> {
+        admission.validate()?;
+        let member = admission
+            .members()
+            .as_slice()
+            .iter()
+            .find(|member| member.ordinal() == ordinal)
+            .ok_or(FencedMutationRosterError::LifecycleConflict)?;
+        Ok(Self::new(admission, member))
+    }
+
     /// Borrow the exact immutable admission being executed.
     pub fn admission(&self) -> &FencedMutationRosterAdmission {
         self.admission
@@ -1648,12 +1675,157 @@ impl<'a> FencedMutationRosterMemberExecutionContext<'a> {
     pub fn current_fence(&self) -> FenceToken {
         self.current_fence
     }
+
+    /// Return a domain-separated commitment to the complete exact effect
+    /// context. A verifier must require this value in its authenticated
+    /// evidence together with the authenticated worker identity.
+    pub fn attestation_commitment(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(MEMBER_ATTESTATION_CONTEXT_DOMAIN);
+        hasher.update(self.admission.canonical_body());
+        hasher.update([self.member.ordinal().get()]);
+        hasher.update(self.member.caller_id());
+        hasher.update(self.member.expected_generation().to_be_bytes());
+        hasher.update(self.member.expected_version().to_be_bytes());
+        hasher.update(self.current_fence.get().to_be_bytes());
+        hasher.finalize().into()
+    }
 }
 
 impl fmt::Debug for FencedMutationRosterMemberExecutionContext<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("FencedMutationRosterMemberExecutionContext(<redacted>)")
     }
+}
+
+/// Opaque, bounded evidence returned by a remote provider worker.
+///
+/// This is intentionally serializable: it crosses the successor transport,
+/// unlike an SDK-issued [`FencedMutationRosterMemberProof`]. Its public bytes
+/// are never treated as a proof by themselves. A server-configured
+/// [`FencedMutationRosterMemberAttestationVerifier`] must authenticate them
+/// against the mTLS worker identity and the exact context commitment before
+/// the SDK issues a private proof.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FencedMutationRosterMemberAttestation {
+    context_commitment: [u8; 32],
+    outcome: FencedMutationRosterProviderOutcome,
+    evidence: Box<[u8]>,
+}
+
+impl FencedMutationRosterMemberAttestation {
+    /// Bind bounded provider evidence to one exact member context.
+    pub fn new(
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+        outcome: FencedMutationRosterProviderOutcome,
+        evidence: Box<[u8]>,
+    ) -> Result<Self, FencedMutationRosterError> {
+        checked_nonempty_len(
+            evidence.len(),
+            MAX_MEMBER_ATTESTATION_BYTES,
+            FencedMutationRosterError::ResultTooLarge,
+        )?;
+        Ok(Self {
+            context_commitment: context.attestation_commitment(),
+            outcome,
+            evidence,
+        })
+    }
+
+    /// Return the exact context commitment that the verifier must bind.
+    pub const fn context_commitment(&self) -> [u8; 32] {
+        self.context_commitment
+    }
+
+    /// Return the provider outcome that its evidence must authenticate.
+    pub const fn outcome(&self) -> FencedMutationRosterProviderOutcome {
+        self.outcome
+    }
+
+    /// Borrow opaque attestation bytes for the configured verifier.
+    pub fn evidence(&self) -> &[u8] {
+        &self.evidence
+    }
+
+    /// Recheck this untrusted wire value against one exact context.
+    pub fn validate_for(
+        &self,
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+    ) -> Result<(), FencedMutationRosterError> {
+        checked_nonempty_len(
+            self.evidence.len(),
+            MAX_MEMBER_ATTESTATION_BYTES,
+            FencedMutationRosterError::ResultTooLarge,
+        )?;
+        if self.context_commitment != context.attestation_commitment() {
+            return Err(FencedMutationRosterError::RequestConflict);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for FencedMutationRosterMemberAttestation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FencedMutationRosterMemberAttestation(<redacted>)")
+    }
+}
+
+/// Redaction-safe result of a configured provider-attestation verifier.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FencedMutationRosterMemberAttestationError {
+    /// The evidence did not authenticate the exact worker and effect context.
+    Rejected,
+    /// The verifier or its trust material was unavailable.
+    Unavailable,
+}
+
+impl fmt::Display for FencedMutationRosterMemberAttestationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected => f.write_str("roster provider attestation rejected"),
+            Self::Unavailable => f.write_str("roster provider attestation unavailable"),
+        }
+    }
+}
+
+impl Error for FencedMutationRosterMemberAttestationError {}
+
+/// Object-safe remote provider worker for the revision-6 attested lane.
+///
+/// The worker is the authenticated consumer that performs the external
+/// effect. It returns opaque evidence, not an outcome enum and not an SDK
+/// proof. The server decides whether the evidence is authentic through its
+/// configured verifier.
+#[async_trait]
+pub trait FencedMutationRosterMemberAttestationProvider: Send + Sync {
+    /// Provider error returned before a terminal request is transmitted.
+    type Error: Send + Sync + 'static;
+
+    /// Execute the exact member effect and return verifier-bound evidence.
+    async fn execute_member(
+        &self,
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+    ) -> Result<FencedMutationRosterMemberAttestation, Self::Error>;
+}
+
+/// Server-configured verifier for remote provider attestations.
+///
+/// Implementations must cryptographically authenticate `attestation.evidence`
+/// and bind both `identity` (from mTLS, never a request body) and
+/// `context.attestation_commitment()` to `attestation.outcome()`. mTLS
+/// authenticates the caller but does not by itself prove an external effect; a
+/// verifier that cannot establish that binding must return
+/// [`FencedMutationRosterMemberAttestationError::Rejected`].
+#[async_trait]
+pub trait FencedMutationRosterMemberAttestationVerifier: Send + Sync {
+    /// Authenticate one exact worker claim and return its conclusive outcome.
+    async fn verify_member_attestation(
+        &self,
+        identity: &crate::SessionConsumerIdentity,
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+        attestation: &FencedMutationRosterMemberAttestation,
+    ) -> Result<FencedMutationRosterProviderOutcome, FencedMutationRosterMemberAttestationError>;
 }
 
 /// Provider or SDK-context failure while issuing a member proof.

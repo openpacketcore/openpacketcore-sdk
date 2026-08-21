@@ -134,6 +134,7 @@ pub use consumer::{
     SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
     SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
     SessionConsumerV3Operation, SessionConsumerV3Request, SessionConsumerV3Response,
+    SessionConsumerV4Operation, SessionConsumerV4Request, SessionConsumerV4Response,
     SessionQuorumConsumer, StatelessSessionConsumer, MAX_SESSION_CONSUMER_BATCH_OPERATIONS,
     MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES,
     SESSION_CONSUMER_IDENTITY_MAX_BYTES, SESSION_CONSUMER_REQUEST_ID_BYTES,
@@ -151,6 +152,8 @@ pub use fenced_mutation_roster::{
     FencedMutationRosterCapability, FencedMutationRosterError, FencedMutationRosterErrorStatus,
     FencedMutationRosterExecuteError, FencedMutationRosterFenceIntent,
     FencedMutationRosterHistoryState, FencedMutationRosterMember,
+    FencedMutationRosterMemberAttestation, FencedMutationRosterMemberAttestationError,
+    FencedMutationRosterMemberAttestationProvider, FencedMutationRosterMemberAttestationVerifier,
     FencedMutationRosterMemberExecutionContext, FencedMutationRosterMemberExecutionError,
     FencedMutationRosterMemberProof, FencedMutationRosterMemberProvider,
     FencedMutationRosterMembers, FencedMutationRosterOperationId, FencedMutationRosterOutcome,
@@ -167,6 +170,7 @@ pub use fenced_mutation_roster::{
     FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES, FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY,
     FENCED_MUTATION_ROSTER_RETENTION_SECONDS, FENCED_MUTATION_ROSTER_SCHEMA_V2,
     FENCED_MUTATION_ROSTER_SCOPE_BYTES, FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
+    MAX_MEMBER_ATTESTATION_BYTES,
 };
 pub use fenced_transition::{
     fenced_transition_v2_profile_digest, AtomicFencedTransitionCapability,

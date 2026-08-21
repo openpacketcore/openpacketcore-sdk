@@ -3654,6 +3654,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
+ "hmac 0.12.1",
  "opc-consensus",
  "opc-identity",
  "opc-key",

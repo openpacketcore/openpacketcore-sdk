@@ -18,9 +18,11 @@ use serde::{Deserialize, Serialize};
 use crate::fenced_mutation_roster::{
     compute_fenced_mutation_roster_profile_digest, FencedMutationRosterAdmission,
     FencedMutationRosterCapability, FencedMutationRosterErrorStatus,
-    FencedMutationRosterHistoryState, FencedMutationRosterOutcome, FencedMutationRosterProfile,
-    FencedMutationRosterRequestId, FencedMutationRosterScope, FencedMutationRosterStatus,
-    FencedMutationRosterTerminal,
+    FencedMutationRosterHistoryState, FencedMutationRosterMemberAttestation,
+    FencedMutationRosterMemberAttestationVerifier, FencedMutationRosterMemberExecutionContext,
+    FencedMutationRosterOutcome, FencedMutationRosterProfile, FencedMutationRosterRequestId,
+    FencedMutationRosterScope, FencedMutationRosterStatus, FencedMutationRosterTerminal,
+    FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES,
 };
 use crate::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
@@ -682,9 +684,43 @@ impl SessionConsumerFencedMutationRosterProfile {
         }
     }
 
+    /// Construct the immutable revision-6 attested-roster profile.
+    ///
+    /// Revision 5 remains frozen. This successor changes the terminal wire
+    /// vocabulary from a caller-authored terminal receipt to verifier-bound
+    /// provider attestations and therefore has distinct transport, operation,
+    /// and error revisions.
+    pub fn v3() -> Self {
+        Self {
+            transport_revision: 6,
+            operation_revision: 2,
+            error_revision: 2,
+            roster: FencedMutationRosterProfile::v2(),
+            max_members: crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_MAX_MEMBERS as u8,
+            max_plan_or_checkpoint_bytes:
+                crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES
+                    as u32,
+            max_exact_result_bytes:
+                crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES as u32,
+            max_live: crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_MAX_LIVE as u16,
+            retained_result_capacity:
+                crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY
+                    as u32,
+            reclaim_batch: crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_RECLAIM_BATCH
+                as u16,
+            retention_seconds:
+                crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_RETENTION_SECONDS as u32,
+        }
+    }
+
     /// Whether this is byte-for-byte the sole profile accepted on revision 5.
     pub fn is_exact(self) -> bool {
         self == Self::v2() && self.roster.digest == compute_fenced_mutation_roster_profile_digest()
+    }
+
+    /// Whether this is byte-for-byte the sole revision-6 attested profile.
+    pub fn is_exact_v3(self) -> bool {
+        self == Self::v3() && self.roster.digest == compute_fenced_mutation_roster_profile_digest()
     }
 }
 
@@ -842,6 +878,152 @@ impl fmt::Debug for SessionConsumerV3Request {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SessionConsumerV3Request")
+            .field("scope", &self.scope)
+            .field("request_id", &self.request_id)
+            .field("operation", &self.operation)
+            .finish()
+    }
+}
+
+/// Revision-6-only operation carrying worker attestations instead of a
+/// caller-authored terminal receipt.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum SessionConsumerV4Operation {
+    /// Ask the server-configured verifier to authenticate all member effects
+    /// and derive the terminal receipt internally.
+    FencedMutationRosterTerminalizeAttested {
+        /// Exact roster admission previously committed by the authority.
+        admission: Box<FencedMutationRosterAdmission>,
+        /// One bounded, canonical-order provider attestation per member.
+        attestations: Box<[FencedMutationRosterMemberAttestation]>,
+        /// Bounded checkpoint committed into the internally derived terminal.
+        protected_checkpoint: Box<[u8]>,
+    },
+}
+
+impl fmt::Debug for SessionConsumerV4Operation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FencedMutationRosterTerminalizeAttested")
+    }
+}
+
+impl SessionConsumerV4Operation {
+    fn request_id(&self) -> FencedMutationRosterRequestId {
+        match self {
+            Self::FencedMutationRosterTerminalizeAttested { admission, .. } => {
+                admission.request_id()
+            }
+        }
+    }
+
+    /// Validate fixed bounds and exact canonical member-attestation binding.
+    pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
+        match self {
+            Self::FencedMutationRosterTerminalizeAttested {
+                admission,
+                attestations,
+                protected_checkpoint,
+            } => {
+                admission
+                    .validate()
+                    .map_err(|_| SessionConsumerRejection::MalformedRequest)?;
+                if protected_checkpoint.len() > FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES
+                    || attestations.len() != admission.members().len()
+                {
+                    return Err(SessionConsumerRejection::MalformedRequest);
+                }
+                for (attestation, member) in attestations.iter().zip(admission.members().as_slice())
+                {
+                    let context = FencedMutationRosterMemberExecutionContext::for_admission_member(
+                        admission,
+                        member.ordinal(),
+                    )
+                    .map_err(|_| SessionConsumerRejection::MalformedRequest)?;
+                    attestation
+                        .validate_for(&context)
+                        .map_err(|_| SessionConsumerRejection::MalformedRequest)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Borrow the exact admission for this terminalization.
+    pub fn admission(&self) -> &FencedMutationRosterAdmission {
+        match self {
+            Self::FencedMutationRosterTerminalizeAttested { admission, .. } => admission,
+        }
+    }
+
+    /// Borrow provider attestations in canonical member order.
+    pub fn attestations(&self) -> &[FencedMutationRosterMemberAttestation] {
+        match self {
+            Self::FencedMutationRosterTerminalizeAttested { attestations, .. } => attestations,
+        }
+    }
+
+    /// Borrow the bounded terminal checkpoint.
+    pub fn protected_checkpoint(&self) -> &[u8] {
+        match self {
+            Self::FencedMutationRosterTerminalizeAttested {
+                protected_checkpoint,
+                ..
+            } => protected_checkpoint,
+        }
+    }
+}
+
+/// One scope-bound revision-6 attested-roster request.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsumerV4Request {
+    scope: SessionConsumerScope,
+    request_id: FencedMutationRosterRequestId,
+    operation: SessionConsumerV4Operation,
+}
+
+impl SessionConsumerV4Request {
+    /// Construct an exact revision-6 terminalization request.
+    pub fn new(scope: SessionConsumerScope, operation: SessionConsumerV4Operation) -> Self {
+        let request_id = operation.request_id();
+        Self {
+            scope,
+            request_id,
+            operation,
+        }
+    }
+
+    /// Exact consensus scope carried on this request.
+    pub const fn scope(&self) -> SessionConsumerScope {
+        self.scope
+    }
+
+    /// Full immutable roster identity.
+    pub const fn request_id(&self) -> FencedMutationRosterRequestId {
+        self.request_id
+    }
+
+    /// Closed revision-6 attested operation.
+    pub const fn operation(&self) -> &SessionConsumerV4Operation {
+        &self.operation
+    }
+
+    /// Validate the outer full identity and complete attestation binding.
+    pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
+        self.operation.validate()?;
+        if self.request_id != self.operation.request_id() {
+            return Err(SessionConsumerRejection::MalformedRequest);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for SessionConsumerV4Request {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionConsumerV4Request")
             .field("scope", &self.scope)
             .field("request_id", &self.request_id)
             .field("operation", &self.operation)
@@ -1639,6 +1821,35 @@ pub enum SessionConsumerV3Response {
     Rejected(SessionConsumerRejection),
 }
 
+/// Typed response carried only by the revision-6 attested roster lane.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "response",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum SessionConsumerV4Response {
+    /// The verifier-authenticated, internally derived terminal result.
+    FencedMutationRosterTerminalize(
+        Result<FencedMutationRosterOutcome, FencedMutationRosterErrorStatus>,
+    ),
+    /// The operation was rejected before terminal mutation dispatch.
+    Rejected(SessionConsumerRejection),
+}
+
+impl fmt::Debug for SessionConsumerV4Response {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FencedMutationRosterTerminalize(_) => {
+                formatter.write_str("FencedMutationRosterTerminalize")
+            }
+            Self::Rejected(_) => formatter.write_str("Rejected"),
+        }
+    }
+}
+
 impl fmt::Debug for SessionConsumerV3Response {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -1720,6 +1931,15 @@ pub trait SessionQuorumConsumer: Send + Sync {
         None
     }
 
+    /// Return the exact revision-6 attested-roster profile this service can
+    /// prove. The default keeps existing services fail-closed until both an
+    /// implementation and a server verifier port explicitly opt in.
+    fn fenced_mutation_roster_attested_profile(
+        &self,
+    ) -> Option<SessionConsumerFencedMutationRosterProfile> {
+        None
+    }
+
     /// Execute one authenticated revision-5 protected roster request.
     ///
     /// Implementations must bind the request scope plus authenticated
@@ -1733,6 +1953,21 @@ pub trait SessionQuorumConsumer: Send + Sync {
         _request: SessionConsumerV3Request,
     ) -> SessionConsumerV3Response {
         SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unavailable)
+    }
+
+    /// Execute an authenticated revision-6 provider-attested terminalization.
+    ///
+    /// The listener supplies only a server-configured verifier. Implementors
+    /// must bind the mTLS identity, exact scope, and durable admission before
+    /// deriving a terminal from private SDK proofs. The default performs no
+    /// backend work and remains fail-closed.
+    async fn execute_v4(
+        &self,
+        _identity: &SessionConsumerIdentity,
+        _request: SessionConsumerV4Request,
+        _verifier: &dyn FencedMutationRosterMemberAttestationVerifier,
+    ) -> SessionConsumerV4Response {
+        SessionConsumerV4Response::Rejected(SessionConsumerRejection::Unavailable)
     }
 
     /// Open a bounded committed-change watch after authenticated scope checks.
