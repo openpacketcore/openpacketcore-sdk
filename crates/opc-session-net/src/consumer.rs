@@ -25,21 +25,21 @@ use opc_session_store::{
     checked_session_deadline, session_consumer_batch_result_into_store,
     validate_stored_record_expiry_profile, AtomicFencedTransitionCapability, BackendCapabilities,
     CompareAndSet, CompareAndSetResult, FencedMutationRosterAdmission,
-    FencedMutationRosterCapability, FencedMutationRosterHistoryState, FencedMutationRosterOutcome,
-    FencedMutationRosterPhase, FencedMutationRosterRequestId, FencedMutationRosterStatus,
-    FencedMutationRosterTerminal, FencedTransitionExecuteError, FencedTransitionObservation,
-    FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
-    FencedTransitionStatus, LeaseError, LeaseGuard, OwnerId, PreparedFencedTransition,
-    RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionBackend,
-    SessionConsumerAuthorizationManifest, SessionConsumerBatchResult, SessionConsumerChange,
-    SessionConsumerFencedMutationRosterProfile, SessionConsumerFencedTransitionError,
-    SessionConsumerFencedTransitionStatus, SessionConsumerIdentity, SessionConsumerLeaseError,
-    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2Operation,
-    SessionConsumerV2Request, SessionConsumerV2Response, SessionConsumerV3Operation,
-    SessionConsumerV3Request, SessionConsumerV3Response, SessionOp, SessionOpResult,
-    SessionPayloadEncoding, SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
+    FencedMutationRosterCapability, FencedMutationRosterOutcome, FencedMutationRosterPhase,
+    FencedMutationRosterRequestId, FencedMutationRosterStatus, FencedTransitionExecuteError,
+    FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
+    FencedTransitionRequestId, FencedTransitionStatus, LeaseError, LeaseGuard, OwnerId,
+    PreparedFencedTransition, RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest,
+    SessionBackend, SessionConsumerAuthorizationManifest, SessionConsumerBatchResult,
+    SessionConsumerChange, SessionConsumerFencedMutationRosterProfile,
+    SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+    SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
+    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
+    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerStoreError, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionConsumerV3Operation, SessionConsumerV3Request,
+    SessionConsumerV3Response, SessionOp, SessionOpResult, SessionPayloadEncoding,
+    SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
     MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use opc_types::SpiffeId;
@@ -1165,6 +1165,8 @@ struct PersistentFencedMutationRosterCounters {
     response_high_water: AtomicU64,
     request_bytes: AtomicU64,
     response_bytes: AtomicU64,
+    idle_lanes: AtomicU64,
+    oldest_queue_age_millis: AtomicU64,
     retries: AtomicU64,
     not_transmitted: AtomicU64,
     read_unavailable: AtomicU64,
@@ -1277,12 +1279,12 @@ impl PersistentFencedMutationRosterClient {
     }
 
     /// Return the exact fixed client policy.
-    pub const fn config(&self) -> PersistentFencedMutationRosterConfig {
+    pub fn config(&self) -> PersistentFencedMutationRosterConfig {
         self.pool.config
     }
 
     /// Return the exact quorum scope carried on every /3 Hello and call.
-    pub const fn scope(&self) -> SessionConsumerScope {
+    pub fn scope(&self) -> SessionConsumerScope {
         self.pool.client.scope
     }
 
@@ -1423,6 +1425,7 @@ impl PersistentFencedMutationRosterClient {
             request_bytes,
             enqueued_at: tokio::time::Instant::now(),
             reply,
+            inflight: false,
             _pending: pending,
             _response_cell: response_cell,
             _terminal_adoption: terminal_adoption,
@@ -1553,6 +1556,7 @@ struct FencedMutationRosterJob {
     request_bytes: usize,
     enqueued_at: tokio::time::Instant,
     reply: oneshot::Sender<FencedMutationRosterReply>,
+    inflight: bool,
     _pending: OwnedSemaphorePermit,
     _response_cell: OwnedSemaphorePermit,
     _terminal_adoption: Option<OwnedSemaphorePermit>,
@@ -1566,7 +1570,9 @@ impl FencedMutationRosterJob {
         pool: &PersistentFencedMutationRosterPool,
     ) {
         pool.counters.queued.fetch_sub(1, Ordering::Relaxed);
-        pool.counters.inflight.fetch_sub(1, Ordering::Relaxed);
+        if self.inflight {
+            pool.counters.inflight.fetch_sub(1, Ordering::Relaxed);
+        }
         pool.counters.response_cells.fetch_sub(1, Ordering::Relaxed);
         pool.counters.request_bytes.fetch_sub(
             u64::try_from(self.request_bytes).unwrap_or(u64::MAX),
@@ -1621,6 +1627,735 @@ struct FencedMutationRosterLaneConnection {
     next_correlation: NonZeroU32,
     calls: usize,
     request_frame_size: usize,
+}
+
+impl PersistentFencedMutationRosterPool {
+    fn scheduler_sender(&self) -> Option<mpsc::Sender<FencedMutationRosterSchedulerCommand>> {
+        self.scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+    }
+
+    fn ensure_started(self: &Arc<Self>) -> Result<(), SessionConsumerClientError> {
+        if self.started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Err(SessionConsumerClientError::Unavailable);
+        }
+        if self
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let (scheduler_tx, scheduler_rx) =
+            mpsc::channel::<FencedMutationRosterSchedulerCommand>(self.config.pending_calls);
+        let (event_tx, event_rx) = mpsc::channel::<FencedMutationRosterWorkerEvent>(
+            self.config.lane_workers.saturating_mul(2),
+        );
+        let mut worker_txs = Vec::with_capacity(self.config.lane_workers);
+        for lane in 0..self.config.lane_workers {
+            let (worker_tx, worker_rx) = mpsc::channel(1);
+            worker_txs.push(worker_tx);
+            tokio::spawn(fenced_mutation_roster_lane_worker(
+                Arc::clone(self),
+                lane,
+                worker_rx,
+                event_tx.clone(),
+            ));
+        }
+        *self
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scheduler_tx);
+        tokio::spawn(fenced_mutation_roster_scheduler(
+            Arc::downgrade(self),
+            scheduler_rx,
+            event_rx,
+            worker_txs,
+        ));
+        Ok(())
+    }
+
+    fn diagnostics(&self) -> PersistentFencedMutationRosterDiagnostics {
+        let count = |value: &AtomicU64| value.load(Ordering::Relaxed);
+        PersistentFencedMutationRosterDiagnostics {
+            setup_phase: Some(PersistentFencedMutationRosterSetupPhase::load(
+                &self.counters.phase,
+            )),
+            warm_lanes: self.warm_lanes.load(Ordering::Relaxed) as u64,
+            max_lanes: self.config.lane_workers as u64,
+            idle_lanes: count(&self.counters.idle_lanes),
+            queued: count(&self.counters.queued),
+            queue_high_water: count(&self.counters.queue_high_water),
+            inflight: count(&self.counters.inflight),
+            inflight_high_water: count(&self.counters.inflight_high_water),
+            response_cells: count(&self.counters.response_cells),
+            response_high_water: count(&self.counters.response_high_water),
+            request_bytes: count(&self.counters.request_bytes),
+            response_bytes: count(&self.counters.response_bytes),
+            oldest_queue_age_millis: count(&self.counters.oldest_queue_age_millis),
+            retries: count(&self.counters.retries),
+            not_transmitted: count(&self.counters.not_transmitted),
+            read_unavailable: count(&self.counters.read_unavailable),
+            outcome_unknown: count(&self.counters.outcome_unknown),
+            overload: count(&self.counters.overload),
+            profile_mismatch: count(&self.counters.profile_mismatch),
+            drain: count(&self.counters.drain),
+            forced: count(&self.counters.forced),
+            roster_size_bucket: self.counters.roster_size_bucket.load(Ordering::Relaxed),
+        }
+    }
+
+    fn set_warm_lanes(&self, warm_lanes: usize) {
+        self.warm_lanes.store(warm_lanes, Ordering::Release);
+        let ready = warm_lanes == self.config.lane_workers
+            && PersistentFencedMutationRosterPoolPhase::load(&self.phase)
+                == PersistentFencedMutationRosterPoolPhase::Running;
+        self.ready.store(ready, Ordering::Release);
+        self.counters.phase.store(
+            if ready {
+                PersistentFencedMutationRosterSetupPhase::Ready as u8
+            } else {
+                PersistentFencedMutationRosterSetupPhase::Idle as u8
+            },
+            Ordering::Relaxed,
+        );
+        self.ready_notify.notify_waiters();
+    }
+}
+
+async fn fenced_mutation_roster_scheduler(
+    pool: Weak<PersistentFencedMutationRosterPool>,
+    mut commands: mpsc::Receiver<FencedMutationRosterSchedulerCommand>,
+    mut events: mpsc::Receiver<FencedMutationRosterWorkerEvent>,
+    workers: Vec<mpsc::Sender<FencedMutationRosterJob>>,
+) {
+    let mut queues: BTreeMap<FencedMutationRosterTenant, VecDeque<FencedMutationRosterJob>> =
+        BTreeMap::new();
+    let mut round_robin = VecDeque::new();
+    let mut connected = vec![false; workers.len()];
+    let mut idle = VecDeque::new();
+    let mut draining = false;
+    loop {
+        let Some(pool_ref) = pool.upgrade() else {
+            break;
+        };
+        dispatch_fenced_mutation_roster_jobs(
+            &pool_ref,
+            &mut queues,
+            &mut round_robin,
+            &mut idle,
+            &workers,
+        );
+        pool_ref
+            .counters
+            .idle_lanes
+            .store(idle.len() as u64, Ordering::Relaxed);
+        drop(pool_ref);
+        tokio::select! {
+            command = commands.recv() => match command {
+                Some(FencedMutationRosterSchedulerCommand::Submit(job)) => {
+                    let Some(pool_ref) = pool.upgrade() else { break };
+                    if draining || PersistentFencedMutationRosterPoolPhase::load(&pool_ref.phase) != PersistentFencedMutationRosterPoolPhase::Running {
+                        job.complete(Err(PersistentFencedMutationRosterExecuteError::NotTransmitted { cause: SessionConsumerClientError::ShuttingDown }), 0, &pool_ref);
+                    } else {
+                        let tenant = job.tenant;
+                        let insertable = queues.contains_key(&tenant) || queues.len() < pool_ref.config.tenant_slots;
+                        if !insertable || queues.get(&tenant).is_some_and(|queue| queue.len() >= pool_ref.config.per_tenant_queue) {
+                            counter_increment(&pool_ref.counters.overload);
+                            job.complete(Err(PersistentFencedMutationRosterExecuteError::NotTransmitted { cause: SessionConsumerClientError::Overloaded }), 0, &pool_ref);
+                        } else {
+                            let queue = queues.entry(tenant).or_default();
+                            let was_empty = queue.is_empty();
+                            queue.push_back(job);
+                            if was_empty { round_robin.push_back(tenant); }
+                        }
+                    }
+                }
+                Some(FencedMutationRosterSchedulerCommand::Drain) => draining = true,
+                Some(FencedMutationRosterSchedulerCommand::Force) | None => {
+                    if let Some(pool_ref) = pool.upgrade() {
+                        while let Some(job) = pop_fenced_mutation_roster_fair(&mut queues, &mut round_robin) {
+                            job.complete(Err(PersistentFencedMutationRosterExecuteError::NotTransmitted { cause: SessionConsumerClientError::ShuttingDown }), 0, &pool_ref);
+                        }
+                        pool_ref.ready.store(false, Ordering::Release);
+                        pool_ref.ready_notify.notify_waiters();
+                    }
+                    break;
+                }
+            },
+            event = events.recv() => match event {
+                Some(FencedMutationRosterWorkerEvent::Ready(lane)) => {
+                    if lane < connected.len() && !connected[lane] {
+                        connected[lane] = true;
+                        idle.push_back(lane);
+                        if let Some(pool_ref) = pool.upgrade() {
+                            pool_ref.set_warm_lanes(connected.iter().filter(|ready| **ready).count());
+                        }
+                    }
+                }
+                Some(FencedMutationRosterWorkerEvent::Idle(lane)) => {
+                    if lane < connected.len() && connected[lane] && !idle.contains(&lane) {
+                        idle.push_back(lane);
+                    }
+                }
+                Some(FencedMutationRosterWorkerEvent::Lost(lane)) => {
+                    if lane < connected.len() && connected[lane] {
+                        connected[lane] = false;
+                        idle.retain(|candidate| *candidate != lane);
+                        if let Some(pool_ref) = pool.upgrade() {
+                            pool_ref.set_warm_lanes(connected.iter().filter(|ready| **ready).count());
+                        }
+                    }
+                }
+                None => break,
+            },
+        }
+    }
+}
+
+fn dispatch_fenced_mutation_roster_jobs(
+    pool: &PersistentFencedMutationRosterPool,
+    queues: &mut BTreeMap<FencedMutationRosterTenant, VecDeque<FencedMutationRosterJob>>,
+    round_robin: &mut VecDeque<FencedMutationRosterTenant>,
+    idle: &mut VecDeque<usize>,
+    workers: &[mpsc::Sender<FencedMutationRosterJob>],
+) {
+    while let (Some(lane), Some(job)) = (
+        idle.pop_front(),
+        pop_fenced_mutation_roster_fair(queues, round_robin),
+    ) {
+        match workers[lane].try_send(job) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(job)) => {
+                idle.push_front(lane);
+                let tenant = job.tenant;
+                let queue = queues.entry(tenant).or_default();
+                let was_empty = queue.is_empty();
+                queue.push_front(job);
+                if was_empty {
+                    round_robin.push_front(tenant);
+                }
+                break;
+            }
+            Err(mpsc::error::TrySendError::Closed(job)) => {
+                job.complete(
+                    Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {
+                        cause: SessionConsumerClientError::Unavailable,
+                    }),
+                    0,
+                    pool,
+                );
+            }
+        }
+    }
+}
+
+fn pop_fenced_mutation_roster_fair(
+    queues: &mut BTreeMap<FencedMutationRosterTenant, VecDeque<FencedMutationRosterJob>>,
+    round_robin: &mut VecDeque<FencedMutationRosterTenant>,
+) -> Option<FencedMutationRosterJob> {
+    let tenant = round_robin.pop_front()?;
+    let queue = queues.get_mut(&tenant)?;
+    let job = queue.pop_front()?;
+    if queue.is_empty() {
+        queues.remove(&tenant);
+    } else {
+        round_robin.push_back(tenant);
+    }
+    Some(job)
+}
+
+async fn fenced_mutation_roster_lane_worker(
+    pool: Arc<PersistentFencedMutationRosterPool>,
+    lane: usize,
+    mut jobs: mpsc::Receiver<FencedMutationRosterJob>,
+    events: mpsc::Sender<FencedMutationRosterWorkerEvent>,
+) {
+    let mut was_connected = false;
+    'reconnect: loop {
+        if PersistentFencedMutationRosterPoolPhase::load(&pool.phase)
+            == PersistentFencedMutationRosterPoolPhase::Forced
+        {
+            break;
+        }
+        let connection = connect_fenced_mutation_roster_lane(&pool).await;
+        let mut connection = match connection {
+            Ok(connection) => {
+                if events
+                    .send(FencedMutationRosterWorkerEvent::Ready(lane))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                was_connected = true;
+                connection
+            }
+            Err(_) => {
+                if was_connected {
+                    let _ = events
+                        .send(FencedMutationRosterWorkerEvent::Lost(lane))
+                        .await;
+                    was_connected = false;
+                }
+                counter_increment(&pool.counters.retries);
+                tokio::select! {
+                    _ = pool.force_notify.notified() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+                continue;
+            }
+        };
+        loop {
+            let Some(mut job) = jobs.recv().await else {
+                break 'reconnect;
+            };
+            counter_max(
+                &pool.counters.oldest_queue_age_millis,
+                duration_millis(tokio::time::Instant::now().saturating_duration_since(job.enqueued_at)),
+            );
+            job.inflight = true;
+            let inflight = counter_increment(&pool.counters.inflight);
+            counter_max(&pool.counters.inflight_high_water, inflight);
+            roster_size_bucket_max(
+                &pool.counters.roster_size_bucket,
+                roster_request_size_bucket(&job.request),
+            );
+            let progress = FrameWriteProgress::new();
+            // Retain the job-owned request unchanged for the completion
+            // boundary; the in-flight future owns this snapshot only.
+            let request = job.request.clone();
+            let operation =
+                execute_fenced_mutation_roster_on_lane(&pool, &mut connection, &request, &progress);
+            tokio::pin!(operation);
+            let forced = pool.force_notify.notified();
+            tokio::pin!(forced);
+            forced.as_mut().enable();
+            let result = tokio::select! {
+                result = &mut operation => result,
+                _ = &mut forced => Err(roster_interrupted_call_error(&progress, SessionConsumerClientError::ShuttingDown)),
+            };
+            drop(operation);
+            drop(forced);
+            let keep_connection = result.is_ok()
+                && PersistentFencedMutationRosterPoolPhase::load(&pool.phase)
+                    != PersistentFencedMutationRosterPoolPhase::Forced;
+            let response_bytes = result
+                .as_ref()
+                .ok()
+                .and_then(roster_response_wire_bytes)
+                .unwrap_or(0);
+            let result = result.map_err(|error| roster_execute_error(&job.request, error));
+            match &result {
+                Err(PersistentFencedMutationRosterExecuteError::NotTransmitted { .. }) => {
+                    counter_increment(&pool.counters.not_transmitted);
+                }
+                Err(PersistentFencedMutationRosterExecuteError::ReadUnavailable { .. }) => {
+                    counter_increment(&pool.counters.read_unavailable);
+                }
+                Err(PersistentFencedMutationRosterExecuteError::OutcomeUnknown { .. }) => {
+                    counter_increment(&pool.counters.outcome_unknown);
+                }
+                Ok(_) => {}
+            }
+            job.complete(result, response_bytes, &pool);
+            if !keep_connection {
+                let _ = events
+                    .send(FencedMutationRosterWorkerEvent::Lost(lane))
+                    .await;
+                was_connected = false;
+                continue 'reconnect;
+            }
+            if events
+                .send(FencedMutationRosterWorkerEvent::Idle(lane))
+                .await
+                .is_err()
+            {
+                break 'reconnect;
+            }
+        }
+    }
+    if was_connected {
+        let _ = events
+            .send(FencedMutationRosterWorkerEvent::Lost(lane))
+            .await;
+    }
+}
+
+fn roster_size_bucket_max(target: &AtomicU8, candidate: u8) {
+    let mut observed = target.load(Ordering::Relaxed);
+    while candidate > observed {
+        match target.compare_exchange_weak(
+            observed,
+            candidate,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(current) => observed = current,
+        }
+    }
+}
+
+fn roster_request_wire_bytes(request: &SessionConsumerV3Request) -> Option<usize> {
+    serde_json::to_vec(request).ok().map(|bytes| bytes.len())
+}
+
+fn roster_response_wire_bytes(response: &SessionConsumerV3Response) -> Option<usize> {
+    serde_json::to_vec(response).ok().map(|bytes| bytes.len())
+}
+
+fn roster_request_needs_terminal_adoption_slot(request: &SessionConsumerV3Request) -> bool {
+    matches!(
+        request.operation(),
+        SessionConsumerV3Operation::FencedMutationRosterAdoption { .. }
+            | SessionConsumerV3Operation::FencedMutationRosterTerminalize { .. }
+    )
+}
+
+fn roster_request_effectful(request: &SessionConsumerV3Request) -> bool {
+    match request.operation() {
+        SessionConsumerV3Operation::FencedMutationRosterCapability
+        | SessionConsumerV3Operation::FencedMutationRosterHistoryState
+        | SessionConsumerV3Operation::FencedMutationRosterStatus { .. }
+        | SessionConsumerV3Operation::FencedMutationRosterAdoption { .. } => false,
+        SessionConsumerV3Operation::FencedMutationRosterAdmit { .. }
+        | SessionConsumerV3Operation::FencedMutationRosterTerminalize { .. } => true,
+        _ => true,
+    }
+}
+
+fn roster_request_unknown_phase(request: &SessionConsumerV3Request) -> FencedMutationRosterPhase {
+    match request.operation() {
+        SessionConsumerV3Operation::FencedMutationRosterTerminalize { terminal, .. } => {
+            terminal.phase()
+        }
+        _ => FencedMutationRosterPhase::PollAdmitted,
+    }
+}
+
+fn roster_request_size_bucket(request: &SessionConsumerV3Request) -> u8 {
+    match request.operation() {
+        SessionConsumerV3Operation::FencedMutationRosterAdmit { admission }
+        | SessionConsumerV3Operation::FencedMutationRosterStatus { admission }
+        | SessionConsumerV3Operation::FencedMutationRosterAdoption { admission }
+        | SessionConsumerV3Operation::FencedMutationRosterTerminalize { admission, .. } => {
+            admission.members().len().min(u8::MAX as usize) as u8
+        }
+        SessionConsumerV3Operation::FencedMutationRosterCapability
+        | SessionConsumerV3Operation::FencedMutationRosterHistoryState => 0,
+        _ => u8::MAX,
+    }
+}
+
+fn roster_interrupted_call_error(
+    progress: &FrameWriteProgress,
+    error: SessionConsumerClientError,
+) -> SessionConsumerCallError {
+    if progress.accepted_any() {
+        SessionConsumerCallError::MayHaveSent(error)
+    } else {
+        SessionConsumerCallError::BeforeCallWrite(error)
+    }
+}
+
+fn roster_execute_error(
+    request: &SessionConsumerV3Request,
+    error: SessionConsumerCallError,
+) -> PersistentFencedMutationRosterExecuteError {
+    match error {
+        SessionConsumerCallError::BeforeCallWrite(cause) => {
+            PersistentFencedMutationRosterExecuteError::NotTransmitted { cause }
+        }
+        SessionConsumerCallError::MayHaveSent(cause) if !roster_request_effectful(request) => {
+            PersistentFencedMutationRosterExecuteError::ReadUnavailable { cause }
+        }
+        SessionConsumerCallError::MayHaveSent(cause) => match request.request_id() {
+            Some(request_id) => PersistentFencedMutationRosterExecuteError::OutcomeUnknown {
+                request_id,
+                phase: roster_request_unknown_phase(request),
+            },
+            // A future operation without a roster identity must never be
+            // treated as a harmless read. The public closed family cannot
+            // construct this shape, so fail it without a replay credential.
+            None => PersistentFencedMutationRosterExecuteError::ReadUnavailable { cause },
+        },
+    }
+}
+
+async fn connect_fenced_mutation_roster_lane(
+    pool: &Arc<PersistentFencedMutationRosterPool>,
+) -> Result<FencedMutationRosterLaneConnection, SessionConsumerClientError> {
+    let client = &pool.client;
+    if PersistentFencedMutationRosterPoolPhase::load(&pool.phase)
+        != PersistentFencedMutationRosterPoolPhase::Running
+    {
+        return Err(SessionConsumerClientError::ShuttingDown);
+    }
+    let deadline = tokio::time::Instant::now()
+        .checked_add(pool.config.setup_timeout)
+        .ok_or(SessionConsumerClientError::Deadline)?;
+    pool.counters.phase.store(
+        PersistentFencedMutationRosterSetupPhase::Resolve as u8,
+        Ordering::Relaxed,
+    );
+    let address = tokio::time::timeout_at(deadline, (client.resolve)())
+        .await
+        .map_err(|_| SessionConsumerClientError::Unavailable)?
+        .map_err(|_| SessionConsumerClientError::Unavailable)?;
+    let generation = client.reauthentication.generation();
+    pool.counters.phase.store(
+        PersistentFencedMutationRosterSetupPhase::Tcp as u8,
+        Ordering::Relaxed,
+    );
+    let stream = tokio::time::timeout_at(deadline, TcpStream::connect(address))
+        .await
+        .map_err(|_| SessionConsumerClientError::Unavailable)?
+        .map_err(|_| SessionConsumerClientError::Unavailable)?;
+    stream
+        .set_nodelay(true)
+        .map_err(|_| SessionConsumerClientError::Unavailable)?;
+    let handshake = client
+        .tls_config
+        .begin_handshake()
+        .map_err(|_| SessionConsumerClientError::Authentication)?;
+    pool.counters.phase.store(
+        PersistentFencedMutationRosterSetupPhase::Tls as u8,
+        Ordering::Relaxed,
+    );
+    let connector =
+        tokio_rustls::TlsConnector::from(consumer_client_tls_config_v3(handshake.rustls_config()));
+    let tls = tokio::time::timeout_at(
+        deadline,
+        connector.connect(client.server_name.clone(), stream),
+    )
+    .await
+    .map_err(|_| SessionConsumerClientError::Unavailable)?
+    .map_err(classify_tls_io_error)
+    .map_err(SessionConsumerClientError::from)?;
+    if tls.get_ref().1.alpn_protocol() != Some(SESSION_QUORUM_CONSUMER_V3_ALPN) {
+        counter_increment(&pool.counters.profile_mismatch);
+        return Err(SessionConsumerClientError::Protocol);
+    }
+    let established_at = tokio::time::Instant::now();
+    let peer = opc_tls::peer_tls_identity_from_client_connection(tls.get_ref().1)
+        .map_err(|_| SessionConsumerClientError::Authentication)?;
+    if peer.spiffe_id() != &client.expected_server_identity {
+        return Err(SessionConsumerClientError::Authentication);
+    }
+    let rotation_jitter = handshake.consumer_rotation_jitter(peer.spiffe_id());
+    let lifecycle = ConnectionLifecycle::new(
+        client.lifecycle_policy,
+        established_at,
+        Some(CertificateExpiryEvidence::capture(
+            handshake.leaf_expires_at(),
+            handshake.certificate_chain_expires_at(),
+            established_at,
+        )),
+        Some(CertificateExpiryEvidence::capture(
+            peer.leaf_expires_at(),
+            peer.certificate_chain_expires_at(),
+            established_at,
+        )),
+        generation,
+        Some(handshake.epoch()),
+    )
+    .map_err(|_| SessionConsumerClientError::Protocol)?;
+    let (mut reader, mut writer) = tokio::io::split(tls);
+    pool.counters.phase.store(
+        PersistentFencedMutationRosterSetupPhase::Hello as u8,
+        Ordering::Relaxed,
+    );
+    let hello = ConsumerV3WireRequest::Hello(ConsumerV3Hello {
+        transport_revision: SESSION_QUORUM_CONSUMER_V3_TRANSPORT_REVISION,
+        scope: client.scope,
+        response_frame_size: consumer_wire_frame_size(MAX_NEGOTIATED_FRAME_SIZE)
+            .map_err(SessionConsumerClientError::from)?,
+        profile: SessionConsumerFencedMutationRosterProfile::v1(),
+    });
+    write_frame_bounded_until(
+        &mut writer,
+        &hello,
+        MAX_NEGOTIATED_FRAME_SIZE,
+        deadline.min(lifecycle.retire_at()),
+    )
+    .await
+    .map_err(SessionConsumerClientError::from)?;
+    let ack = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV3WireResponse>(
+        &mut reader,
+        MAX_NEGOTIATED_FRAME_SIZE,
+        deadline.min(lifecycle.retire_at()),
+        effective_consumer_idle_timeout(client.idle_timeout),
+    )
+    .await
+    .map_err(SessionConsumerClientError::from)?
+    .ok_or(SessionConsumerClientError::Unavailable)?;
+    let request_frame_size = match ack {
+        ConsumerV3WireResponse::HelloAck(ack)
+            if ack.transport_revision == SESSION_QUORUM_CONSUMER_V3_TRANSPORT_REVISION
+                && ack.scope == client.scope
+                && ack.profile.is_exact() =>
+        {
+            checked_consumer_frame_size(ack.request_frame_size)
+                .map_err(SessionConsumerClientError::from)?
+        }
+        ConsumerV3WireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch) => {
+            return Err(SessionConsumerClientError::Scope);
+        }
+        ConsumerV3WireResponse::HelloRejected(SessionConsumerRejection::Unauthorized) => {
+            return Err(SessionConsumerClientError::Authentication);
+        }
+        _ => {
+            counter_increment(&pool.counters.profile_mismatch);
+            return Err(SessionConsumerClientError::Protocol);
+        }
+    };
+    let admission = handshake
+        .admit()
+        .map_err(|_| SessionConsumerClientError::Authentication)?;
+    if !consumer_fresh_admission_is_current(
+        generation,
+        admission.epoch(),
+        client.reauthentication.generation(),
+        client.tls_config.material_status().epoch(),
+    ) || lifecycle.retirement(tokio::time::Instant::now()).is_some()
+    {
+        return Err(SessionConsumerClientError::Deadline);
+    }
+    let mut connection = FencedMutationRosterLaneConnection {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        lifecycle,
+        rotation_jitter,
+        next_correlation: NonZeroU32::MIN,
+        calls: 0,
+        request_frame_size,
+    };
+    let capability = SessionConsumerV3Request::new(
+        client.scope,
+        SessionConsumerV3Operation::FencedMutationRosterCapability,
+    );
+    let progress = FrameWriteProgress::new();
+    let response =
+        execute_fenced_mutation_roster_on_lane(pool, &mut connection, &capability, &progress)
+            .await
+            .map_err(SessionConsumerCallError::into_client_error)?;
+    if !matches!(
+        response,
+        SessionConsumerV3Response::FencedMutationRosterCapability(Ok((
+            FencedMutationRosterCapability::V1,
+            profile,
+        ))) if profile.is_exact()
+    ) {
+        counter_increment(&pool.counters.profile_mismatch);
+        return Err(SessionConsumerClientError::Protocol);
+    }
+    Ok(connection)
+}
+
+async fn execute_fenced_mutation_roster_on_lane(
+    pool: &PersistentFencedMutationRosterPool,
+    connection: &mut FencedMutationRosterLaneConnection,
+    request: &SessionConsumerV3Request,
+    progress: &FrameWriteProgress,
+) -> Result<SessionConsumerV3Response, SessionConsumerCallError> {
+    if connection.calls >= pool.config.connection_call_count
+        || !consumer_connection_current(
+            &mut connection.lifecycle,
+            &pool.client.tls_config,
+            &pool.client.reauthentication,
+            connection.rotation_jitter,
+        )
+    {
+        return Err(SessionConsumerCallError::BeforeCallWrite(
+            SessionConsumerClientError::Unavailable,
+        ));
+    }
+    let request_bytes = roster_request_wire_bytes(request).ok_or(
+        SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol),
+    )?;
+    if request_bytes > pool.config.request_bytes || request_bytes > connection.request_frame_size {
+        return Err(SessionConsumerCallError::BeforeCallWrite(
+            SessionConsumerClientError::Protocol,
+        ));
+    }
+    let correlation = connection.next_correlation;
+    connection.next_correlation = NonZeroU32::new(
+        connection
+            .next_correlation
+            .get()
+            .checked_add(1)
+            .unwrap_or(1),
+    )
+    .ok_or(SessionConsumerCallError::BeforeCallWrite(
+        SessionConsumerClientError::Protocol,
+    ))?;
+    connection.calls = connection.calls.saturating_add(1);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(effective_consumer_operation_timeout(
+            pool.client.operation_timeout,
+        ))
+        .ok_or(SessionConsumerCallError::BeforeCallWrite(
+            SessionConsumerClientError::Deadline,
+        ))?
+        .min(connection.lifecycle.retire_at());
+    let outbound = ConsumerV3WireRequest::Call(ConsumerV3Call {
+        correlation,
+        request: Box::new(request.clone()),
+    });
+    write_frame_bounded_until_classified_with_progress(
+        &mut connection.writer,
+        &outbound,
+        connection.request_frame_size,
+        deadline,
+        progress,
+    )
+    .await
+    .map_err(|error| match error {
+        FrameWriteError::BeforeWrite(error) => {
+            SessionConsumerCallError::BeforeCallWrite(error.into())
+        }
+        FrameWriteError::MayHaveWritten(error) => {
+            SessionConsumerCallError::MayHaveSent(error.into())
+        }
+    })?;
+    let response = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV3WireResponse>(
+        &mut connection.reader,
+        pool.config.response_bytes.min(MAX_NEGOTIATED_FRAME_SIZE),
+        deadline,
+        effective_consumer_idle_timeout(pool.client.idle_timeout),
+    )
+    .await
+    .map_err(SessionConsumerClientError::from)
+    .map_err(SessionConsumerCallError::MayHaveSent)?
+    .ok_or(SessionConsumerCallError::MayHaveSent(
+        SessionConsumerClientError::Unavailable,
+    ))?;
+    let ConsumerV3WireResponse::Response(ConsumerV3CallResponse {
+        correlation: received,
+        response,
+    }) = response
+    else {
+        return Err(SessionConsumerCallError::MayHaveSent(
+            SessionConsumerClientError::Protocol,
+        ));
+    };
+    if exact_correlation(correlation, received).is_err()
+        || !v3_response_matches_request(request, &response)
+        || roster_response_wire_bytes(&response)
+            .is_none_or(|bytes| bytes > pool.config.response_bytes)
+    {
+        return Err(SessionConsumerCallError::MayHaveSent(
+            SessionConsumerClientError::Protocol,
+        ));
+    }
+    Ok(*response)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9952,10 +10687,10 @@ async fn handle_server_connection(
         }
     }
     let established_at = tokio::time::Instant::now();
-    let selected_alpn = tls.get_ref().1.alpn_protocol();
-    if selected_alpn != Some(SESSION_QUORUM_CONSUMER_ALPN)
-        && selected_alpn != Some(SESSION_QUORUM_CONSUMER_V2_ALPN)
-        && selected_alpn != Some(SESSION_QUORUM_CONSUMER_V3_ALPN)
+    let selected_alpn = tls.get_ref().1.alpn_protocol().map(ToOwned::to_owned);
+    if selected_alpn.as_deref() != Some(SESSION_QUORUM_CONSUMER_ALPN)
+        && selected_alpn.as_deref() != Some(SESSION_QUORUM_CONSUMER_V2_ALPN)
+        && selected_alpn.as_deref() != Some(SESSION_QUORUM_CONSUMER_V3_ALPN)
     {
         return Err(ProtocolError::UnexpectedResponse);
     }
@@ -9964,7 +10699,7 @@ async fn handle_server_connection(
     let identity = authorizer
         .authorize(peer.spiffe_id())
         .map_err(|_| ProtocolError::Authentication)?;
-    if selected_alpn == Some(SESSION_QUORUM_CONSUMER_V2_ALPN) {
+    if selected_alpn.as_deref() == Some(SESSION_QUORUM_CONSUMER_V2_ALPN) {
         return handle_server_connection_v2(
             tls,
             ConsumerV2ServerConnectionContext {
@@ -10005,7 +10740,7 @@ async fn handle_server_connection(
     let mut reauthentication_changes = reauthentication.subscribe();
     let mut material_changes = Some(tls_config.subscribe_material_changes());
     let (mut reader, mut writer) = tokio::io::split(tls);
-    if selected_alpn == Some(SESSION_QUORUM_CONSUMER_V3_ALPN) {
+    if selected_alpn.as_deref() == Some(SESSION_QUORUM_CONSUMER_V3_ALPN) {
         // Do not decode a V1/V2 Hello on this path. The exact fresh
         // certificate/material admission linearizes before the first
         // revision-5 protocol byte is consumed.

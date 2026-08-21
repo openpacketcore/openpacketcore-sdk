@@ -100,6 +100,56 @@ pub const MAX_SESSION_CONSUMER_ROSTER_ADMISSION_BYTES: usize = 1_048_576;
 /// Largest canonical terminal body admitted by the roster DTO.
 pub const MAX_SESSION_CONSUMER_ROSTER_TERMINAL_BYTES: usize = 16_384;
 
+/// Complete stable roster request identity.
+///
+/// This wrapper deliberately owns the fixed wire width.  `serde`'s array
+/// implementations are version-dependent above 32 elements, so exposing the
+/// identity through this type keeps the revision-5 DTO stable on every
+/// supported serde version rather than silently changing it to an unbounded
+/// byte vector.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionConsumerRosterRequestId([u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES]);
+
+impl SessionConsumerRosterRequestId {
+    /// Construct a nonzero complete request identity.
+    pub fn new(bytes: [u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES]) -> Option<Self> {
+        bytes.iter().any(|byte| *byte != 0).then_some(Self(bytes))
+    }
+
+    /// Return the exact fixed-width wire identity.
+    pub const fn as_bytes(&self) -> &[u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SessionConsumerRosterRequestId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterRequestId(<redacted>)")
+    }
+}
+
+impl Serialize for SessionConsumerRosterRequestId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionConsumerRosterRequestId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        let bytes: [u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES] = bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("invalid roster request identity width"))?;
+        Self::new(bytes).ok_or_else(|| serde::de::Error::custom("zero roster request identity"))
+    }
+}
+
 /// Exact capability and immutable resource profile for a roster consumer.
 ///
 /// The protected bodies intentionally remain opaque here.  Their canonical
@@ -144,7 +194,7 @@ impl SessionConsumerRosterProfile {
     }
 
     /// Reject malformed profiles before a call body can be decoded.
-    pub const fn is_well_formed(self) -> bool {
+    pub fn is_well_formed(self) -> bool {
         self.roster_schema_revision != 0
             && self.roster_profile_digest != [0; 32]
             && self.max_admission_bytes == MAX_SESSION_CONSUMER_ROSTER_ADMISSION_BYTES as u32
@@ -171,7 +221,7 @@ impl fmt::Debug for SessionConsumerRosterCapabilities {
 
 impl SessionConsumerRosterCapabilities {
     /// Accept only an exactly equal, well-formed peer capability.
-    pub const fn negotiate(self, peer: Self) -> Result<Self, SessionConsumerRosterError> {
+    pub fn negotiate(self, peer: Self) -> Result<Self, SessionConsumerRosterError> {
         if !self.profile.is_well_formed() || !peer.profile.is_well_formed() {
             Err(SessionConsumerRosterError::ProfileMismatch)
         } else if self.profile != peer.profile {
@@ -199,19 +249,19 @@ pub enum SessionConsumerRosterRequest {
     /// Admit one immutable roster body under its complete stable identity.
     Admit {
         /// Self-authenticating roster request identity.
-        request_id: [u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES],
+        request_id: SessionConsumerRosterRequestId,
         /// Exact canonical admission body retained by the caller for retry.
         admission: Box<[u8]>,
     },
     /// Read the status bound to one complete stable identity.
     Status {
         /// Self-authenticating roster request identity.
-        request_id: [u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES],
+        request_id: SessionConsumerRosterRequestId,
     },
     /// Record a terminal state under one complete stable identity.
     Terminalize {
         /// Self-authenticating roster request identity.
-        request_id: [u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES],
+        request_id: SessionConsumerRosterRequestId,
         /// Exact canonical terminal body retained by the caller for retry.
         terminal: Box<[u8]>,
     },
@@ -236,26 +286,25 @@ impl fmt::Debug for SessionConsumerRosterRequest {
 impl SessionConsumerRosterRequest {
     /// Verify envelope-only bounds without inspecting protected roster bytes.
     pub fn validate(&self) -> Result<(), SessionConsumerRosterError> {
-        let valid_id = |request_id: &[u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES]| {
-            request_id.iter().any(|byte| *byte != 0)
-        };
         match self {
             Self::Capabilities(capabilities) if capabilities.profile.is_well_formed() => Ok(()),
             Self::Capabilities(_) => Err(SessionConsumerRosterError::ProfileMismatch),
             Self::Admit {
                 request_id,
                 admission,
-            } if valid_id(request_id)
+            } if request_id.as_bytes().iter().any(|byte| *byte != 0)
                 && !admission.is_empty()
                 && admission.len() <= MAX_SESSION_CONSUMER_ROSTER_ADMISSION_BYTES =>
             {
                 Ok(())
             }
-            Self::Status { request_id } if valid_id(request_id) => Ok(()),
+            Self::Status { request_id } if request_id.as_bytes().iter().any(|byte| *byte != 0) => {
+                Ok(())
+            }
             Self::Terminalize {
                 request_id,
                 terminal,
-            } if valid_id(request_id)
+            } if request_id.as_bytes().iter().any(|byte| *byte != 0)
                 && !terminal.is_empty()
                 && terminal.len() <= MAX_SESSION_CONSUMER_ROSTER_TERMINAL_BYTES =>
             {
@@ -266,7 +315,7 @@ impl SessionConsumerRosterRequest {
     }
 
     /// Return the stable identity carried by an operational request.
-    pub const fn request_id(&self) -> Option<[u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES]> {
+    pub const fn request_id(&self) -> Option<SessionConsumerRosterRequestId> {
         match self {
             Self::Capabilities(_) => None,
             Self::Admit { request_id, .. }
@@ -356,7 +405,7 @@ pub enum SessionConsumerRosterResponse {
     /// Dispatch may have occurred; retain and retry/poll this exact request.
     OutcomeUnknown {
         /// The exact stable identity from the submitted request.
-        request_id: [u8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES],
+        request_id: SessionConsumerRosterRequestId,
     },
     /// Deterministic rejection without a protected-body disclosure.
     Rejected(SessionConsumerRosterError),
@@ -6646,7 +6695,9 @@ mod tests {
             Err(SessionConsumerRosterError::ProfileMismatch)
         );
 
-        let request_id = [9; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES];
+        let request_id =
+            SessionConsumerRosterRequestId::new([9; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES])
+                .expect("nonzero fixed request identity");
         let request = SessionConsumerRosterRequest::Admit {
             request_id,
             admission: vec![1].into_boxed_slice(),
@@ -6654,7 +6705,10 @@ mod tests {
         assert!(request.validate().is_ok());
         assert_eq!(
             SessionConsumerRosterResponse::OutcomeUnknown {
-                request_id: [8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES],
+                request_id: SessionConsumerRosterRequestId::new(
+                    [8; SESSION_CONSUMER_ROSTER_REQUEST_ID_BYTES],
+                )
+                .expect("nonzero fixed request identity"),
             }
             .matches_request(&request),
             Err(SessionConsumerRosterError::MalformedResponse)
