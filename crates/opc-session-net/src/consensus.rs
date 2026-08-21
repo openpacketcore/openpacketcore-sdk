@@ -493,15 +493,24 @@ struct ConsensusConnectionLaneState {
     changed: Arc<Notify>,
     reaper_started: AtomicBool,
     in_flight: Semaphore,
+    /// Level-triggered signal that the cached-connection reaper has emptied
+    /// this lane. Published as a watch because the async `connection` mutex
+    /// cannot be polled from `watch::Receiver::wait_for`'s synchronous
+    /// predicate; the reaper publishes the edge directly so tests park on the
+    /// transition instead of spin-yielding (which stalls a `start_paused`
+    /// clock).
+    emptied: tokio::sync::watch::Sender<bool>,
 }
 
 impl ConsensusConnectionLaneState {
     fn new() -> Self {
+        let (emptied, _) = tokio::sync::watch::channel(false);
         Self {
             connection: Mutex::new(None),
             changed: Arc::new(Notify::new()),
             reaper_started: AtomicBool::new(false),
             in_flight: Semaphore::new(1),
+            emptied,
         }
     }
 }
@@ -670,6 +679,7 @@ async fn reap_cached_consensus_connection(
                     let retired = cached.take();
                     drop(cached);
                     drop(retired);
+                    lane_state.emptied.send_replace(true);
                     continue;
                 }
                 Some(connection.lifecycle.retire_at())
@@ -3840,13 +3850,15 @@ mod tests {
         assert_eq!(superseded, 0);
         assert_eq!(abandoned, 0);
         drop(peer);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while accounting.snapshot().1 < attempts {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut accounting_changed = accounting.subscribe_changed();
+        let settled = Arc::clone(&accounting);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accounting_changed.wait_for(move |_| settled.snapshot().1 >= attempts),
+        )
         .await
-        .expect("pool shutdown must settle detached attempt accounting");
+        .expect("pool shutdown must settle detached attempt accounting")
+        .expect("accounting watch channel must outlive the waiter");
         assert_eq!(accounting.snapshot(), (attempts, attempts, 0, attempts));
     }
 
@@ -5234,17 +5246,22 @@ mod tests {
         }
     }
 
+    /// Waits until the cached-connection reaper empties `lane`.
+    ///
+    /// Parks on the lane's monotonic `emptied` latch (never reset to `false`)
+    /// instead of spin-yielding, so a `start_paused` clock can auto-advance
+    /// while the reaper runs. Callers must not re-populate the lane and then
+    /// wait again: the latch stays set, so a second wait returns immediately.
     async fn wait_for_cached_lane_to_empty(
         pool: &ConsensusConnectionPool,
         lane: ConsensusConnectionLane,
     ) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if pool.lane(lane).connection.lock().await.is_none() {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
+        let mut emptied = pool.lane(lane).emptied.subscribe();
+        tokio::time::timeout(Duration::from_secs(1), async move {
+            emptied
+                .wait_for(|was_emptied| *was_emptied)
+                .await
+                .expect("lane emptied watch channel must outlive the waiter");
         })
         .await
         .expect("cached consensus lane retirement");

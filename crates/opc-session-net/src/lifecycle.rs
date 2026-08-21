@@ -417,12 +417,29 @@ pub(crate) struct ConnectionAttemptMetricGuard {
 }
 
 #[cfg(test)]
-#[derive(Default)]
 pub(crate) struct ConnectionAttemptTestAccounting {
     attempts: AtomicU64,
     terminals: AtomicU64,
     superseded: AtomicU64,
     abandoned: AtomicU64,
+    /// Generation counter bumped on every recorded transition. Tests subscribe
+    /// and park on `watch::Receiver::wait_for` instead of spin-yielding, which
+    /// would keep the runtime non-idle and stall a `start_paused` clock.
+    changed: watch::Sender<u64>,
+}
+
+#[cfg(test)]
+impl Default for ConnectionAttemptTestAccounting {
+    fn default() -> Self {
+        let (changed, _) = watch::channel(0);
+        Self {
+            attempts: AtomicU64::new(0),
+            terminals: AtomicU64::new(0),
+            superseded: AtomicU64::new(0),
+            abandoned: AtomicU64::new(0),
+            changed,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -436,20 +453,37 @@ impl ConnectionAttemptTestAccounting {
         )
     }
 
+    /// Subscribes to the transition generation. Pair with
+    /// `watch::Receiver::wait_for` and a predicate over [`Self::snapshot`] to
+    /// wait for an accounting state without a `yield_now` spin: `wait_for`
+    /// evaluates the predicate against the current value before awaiting, so a
+    /// state already reached resolves immediately with no lost wakeup.
+    pub(crate) fn subscribe_changed(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
     fn record_attempt(&self) {
         self.attempts.fetch_add(1, Ordering::Relaxed);
+        self.bump_changed();
     }
 
     fn record_terminal(&self) {
         self.terminals.fetch_add(1, Ordering::Relaxed);
+        self.bump_changed();
     }
 
     fn record_superseded(&self) {
         self.superseded.fetch_add(1, Ordering::Relaxed);
+        self.bump_changed();
     }
 
     fn record_abandoned(&self) {
         self.abandoned.fetch_add(1, Ordering::Relaxed);
+        self.bump_changed();
+    }
+
+    fn bump_changed(&self) {
+        self.changed.send_modify(|generation| *generation += 1);
     }
 }
 
