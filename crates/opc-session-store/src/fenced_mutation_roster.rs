@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 pub const SCHEMA_V1: u16 = 1;
 /// Maximum members in one roster plan.
 pub const MAX_MEMBERS: usize = 8;
-/// Maximum protected plan bytes accepted by this profile.
+/// Maximum protected plan or terminal checkpoint bytes accepted by this profile.
 pub const MAX_PLAN_BYTES: usize = 1_048_576;
 /// Maximum protected terminal result bytes accepted by this profile.
 pub const MAX_RESULT_BYTES: usize = 16_384;
@@ -63,14 +63,26 @@ pub const FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY: usize = MAX_RETAINED_
 pub const FENCED_MUTATION_ROSTER_RECLAIM_BATCH: usize = RECLAIM_BATCH;
 /// Compatibility name for retention duration.
 pub const FENCED_MUTATION_ROSTER_RETENTION_SECONDS: u64 = RETENTION_SECS;
-/// Conservative admission codec bound.
-pub const FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES: usize = MAX_PLAN_BYTES + 32_768;
-/// Conservative terminal codec bound.
-pub const FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES: usize = MAX_RESULT_BYTES + 32_768;
+/// Conservative admission codec bound for every simultaneously legal field maximum.
+pub const FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES: usize =
+    POSTCARD_ADMISSION_FIXED_MAX_BYTES
+        + POSTCARD_MEMBER_MANIFEST_CODEC_MAX_BYTES
+        + POSTCARD_LENGTH_PREFIX_MAX_BYTES
+        + MAX_PLAN_BYTES
+        + POSTCARD_LENGTH_PREFIX_MAX_BYTES
+        + MAX_RESULT_BYTES;
+/// Conservative terminal codec bound for every simultaneously legal field maximum.
+pub const FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES: usize = TERMINAL_CODEC_FIXED_BYTES
+    + (MAX_MEMBERS * TERMINAL_MEMBER_OUTCOME_CODEC_MAX_BYTES)
+    + CANONICAL_LENGTH_PREFIX_BYTES
+    + MAX_PLAN_BYTES
+    + CANONICAL_LENGTH_PREFIX_BYTES
+    + MAX_RESULT_BYTES;
 /// Conservative identity codec bound.
 pub const FENCED_MUTATION_ROSTER_IDENTITY_CODEC_MAX_BYTES: usize = 128;
 /// Conservative member manifest codec bound.
-pub const FENCED_MUTATION_ROSTER_MEMBER_MANIFEST_CODEC_MAX_BYTES: usize = MAX_MEMBERS * 128;
+pub const FENCED_MUTATION_ROSTER_MEMBER_MANIFEST_CODEC_MAX_BYTES: usize =
+    POSTCARD_MEMBER_MANIFEST_CODEC_MAX_BYTES;
 /// Frozen profile digest for static metadata consumers.
 pub const FENCED_MUTATION_ROSTER_PROFILE_DIGEST: [u8; 32] = [
     0xa1, 0x84, 0x36, 0xce, 0xf6, 0x65, 0xf2, 0xdb, 0x3f, 0x25, 0x65, 0xf3, 0x4f, 0x36, 0x55, 0x7b,
@@ -82,6 +94,31 @@ const TERMINAL_MAGIC: &[u8; 8] = b"OPCFMRT1";
 const BODY_DOMAIN: &[u8] = b"opc-session-store/fenced-mutation-roster/body/v1";
 const REQUEST_DOMAIN: &[u8] = b"opc-session-store/fenced-mutation-roster/request/v1";
 const PROFILE_DOMAIN: &[u8] = b"opc-session-store/fenced-mutation-roster/profile/v1";
+
+// Postcard encodes all integers and collection lengths as varints. These
+// bounds deliberately use the largest portable varint, rather than relying on
+// the smaller encodings of the current profile maxima.
+const POSTCARD_U64_MAX_BYTES: usize = 10;
+const POSTCARD_LENGTH_PREFIX_MAX_BYTES: usize = 10;
+const POSTCARD_MEMBER_CODEC_MAX_BYTES: usize = 1
+    + MEMBER_ID_BYTES
+    + POSTCARD_LENGTH_PREFIX_MAX_BYTES
+    + MAX_DESCRIPTOR_BYTES
+    + (2 * POSTCARD_U64_MAX_BYTES)
+    + 2;
+const POSTCARD_MEMBER_MANIFEST_CODEC_MAX_BYTES: usize =
+    POSTCARD_LENGTH_PREFIX_MAX_BYTES + (MAX_MEMBERS * POSTCARD_MEMBER_CODEC_MAX_BYTES);
+const POSTCARD_ADMISSION_FIXED_MAX_BYTES: usize = POSTCARD_U64_MAX_BYTES
+    + MEMBER_ID_BYTES
+    + FENCED_MUTATION_ROSTER_SCOPE_BYTES
+    + POSTCARD_LENGTH_PREFIX_MAX_BYTES
+    + OwnerId::MAX_BYTES
+    + (2 * POSTCARD_U64_MAX_BYTES);
+
+const CANONICAL_LENGTH_PREFIX_BYTES: usize = 4;
+const TERMINAL_MEMBER_OUTCOME_CODEC_MAX_BYTES: usize =
+    1 + MEMBER_ID_BYTES + 2 + CANONICAL_LENGTH_PREFIX_BYTES + MAX_STATUS_BYTES;
+const TERMINAL_CODEC_FIXED_BYTES: usize = TERMINAL_MAGIC.len() + 2 + 32 + 1;
 
 /// One fixed canonical ordinal in the generic six-member roster.
 ///
@@ -433,7 +470,7 @@ impl FencedMutationRosterPlan {
         )?;
         checked_len(
             terminal_checkpoint.len(),
-            MAX_RESULT_BYTES,
+            MAX_PLAN_BYTES,
             FencedMutationRosterError::ResultTooLarge,
         )?;
         validate_members(&members)?;
@@ -587,7 +624,7 @@ impl FencedMutationRosterTerminal {
     ) -> Result<Self, FencedMutationRosterError> {
         checked_len(
             protected_checkpoint.len(),
-            MAX_RESULT_BYTES,
+            MAX_PLAN_BYTES,
             FencedMutationRosterError::ResultTooLarge,
         )?;
         checked_len(
@@ -1261,11 +1298,12 @@ impl FencedMutationRosterAdmission {
         out.extend_from_slice(&self.history_epoch.to_be_bytes());
         out.extend_from_slice(self.operation_id.as_bytes());
         out.extend_from_slice(&self.scope.0);
-        out.extend_from_slice(self.fence_intent.owner.as_str().as_bytes());
+        put_bytes(&mut out, self.fence_intent.owner.as_str().as_bytes());
         out.extend_from_slice(&self.fence_intent.fence.get().to_be_bytes());
         out.extend_from_slice(&self.expected_generation.get().to_be_bytes());
+        put_u32(&mut out, self.members.len());
         for member in self.members.as_slice() {
-            out.extend_from_slice(member.caller_id());
+            put_member(&mut out, member);
         }
         put_bytes(&mut out, self.protected_plan.as_bytes());
         put_bytes(&mut out, self.terminal_result.as_bytes());
@@ -1629,6 +1667,11 @@ pub fn encode_fenced_mutation_roster_member_manifest(
 pub fn decode_fenced_mutation_roster_member_manifest(
     bytes: &[u8],
 ) -> Result<FencedMutationRosterMembers, FencedMutationRosterError> {
+    checked_len(
+        bytes.len(),
+        FENCED_MUTATION_ROSTER_MEMBER_MANIFEST_CODEC_MAX_BYTES,
+        FencedMutationRosterError::MemberLimitExceeded,
+    )?;
     let (members, trailing): (FencedMutationRosterMembers, &[u8]) =
         postcard::take_from_bytes(bytes)
             .map_err(|_| FencedMutationRosterError::LifecycleConflict)?;
@@ -1911,6 +1954,8 @@ fn decode_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::OwnerId;
+
     fn id(value: u8) -> [u8; 16] {
         [value; 16]
     }
@@ -1941,6 +1986,220 @@ mod tests {
             vec![],
         )
         .unwrap()
+    }
+
+    fn admission_member(
+        ordinal: u8,
+        descriptor: Vec<u8>,
+        expected_generation: u64,
+        expected_version: u64,
+        disposition: FencedMutationRosterDisposition,
+        adoption: FencedMutationRosterAdoption,
+    ) -> FencedMutationRosterMember {
+        FencedMutationRosterMember::new(
+            FencedMutationRosterOrdinal::new(ordinal).unwrap(),
+            id(ordinal + 1),
+            FencedMutationRosterDescriptor::new(descriptor).unwrap(),
+            expected_generation,
+            expected_version,
+            disposition,
+            adoption,
+        )
+        .unwrap()
+    }
+
+    fn admission_with_member(member: FencedMutationRosterMember) -> FencedMutationRosterAdmission {
+        FencedMutationRosterAdmission::new(
+            7,
+            FencedMutationRosterOperationId::new(id(9)).unwrap(),
+            FencedMutationRosterScope::from_digest([4; 32]),
+            FencedMutationRosterFenceIntent::new(
+                OwnerId::new("roster-owner").unwrap(),
+                FenceToken::new(8),
+            ),
+            Generation::new(9),
+            FencedMutationRosterMembers::new([member]).unwrap(),
+            FencedMutationRosterProtectedPlan::new(vec![3].into_boxed_slice()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn admission_request_id_commits_to_every_frozen_member_field() {
+        let baseline = admission_with_member(admission_member(
+            0,
+            vec![1],
+            2,
+            3,
+            FencedMutationRosterDisposition::Pending,
+            FencedMutationRosterAdoption::Unreconciled,
+        ));
+        let baseline_id = baseline.request_id();
+        assert_eq!(baseline_id, baseline.clone().request_id());
+
+        let mut ordinal_changed = baseline.clone();
+        ordinal_changed.members.0[0].ordinal = FencedMutationRosterOrdinal::new(1).unwrap();
+        let mut caller_id_changed = baseline.clone();
+        caller_id_changed.members.0[0].caller_id = id(2);
+        let mut descriptor_changed = baseline.clone();
+        descriptor_changed.members.0[0].descriptor =
+            FencedMutationRosterDescriptor::new(vec![2]).unwrap();
+        let mut expected_generation_changed = baseline.clone();
+        expected_generation_changed.members.0[0].expected_generation = 4;
+        let mut expected_version_changed = baseline.clone();
+        expected_version_changed.members.0[0].expected_version = 5;
+        let mut disposition_changed = baseline.clone();
+        disposition_changed.members.0[0].disposition = FencedMutationRosterDisposition::Applied;
+        let mut adoption_changed = baseline.clone();
+        adoption_changed.members.0[0].adoption = FencedMutationRosterAdoption::Executed;
+
+        for changed in [
+            ordinal_changed,
+            caller_id_changed,
+            descriptor_changed,
+            expected_generation_changed,
+            expected_version_changed,
+            disposition_changed,
+            adoption_changed,
+        ] {
+            assert_ne!(baseline_id, changed.request_id());
+        }
+    }
+
+    fn maximum_member(ordinal: u8) -> FencedMutationRosterMember {
+        admission_member(
+            ordinal,
+            vec![ordinal; MAX_DESCRIPTOR_BYTES],
+            u64::MAX,
+            u64::MAX,
+            FencedMutationRosterDisposition::NotApplied,
+            FencedMutationRosterAdoption::Reconciled,
+        )
+    }
+
+    fn maximum_members<const N: usize>() -> FencedMutationRosterMembers {
+        let members: [FencedMutationRosterMember; N] =
+            std::array::from_fn(|ordinal| maximum_member(ordinal as u8));
+        FencedMutationRosterMembers::new(members).unwrap()
+    }
+
+    fn maximum_admission<const N: usize>() -> FencedMutationRosterAdmission {
+        FencedMutationRosterAdmission::new(
+            u64::MAX,
+            FencedMutationRosterOperationId::new(id(1)).unwrap(),
+            FencedMutationRosterScope::from_digest([2; 32]),
+            FencedMutationRosterFenceIntent::new(
+                OwnerId::new("o".repeat(OwnerId::MAX_BYTES)).unwrap(),
+                FenceToken::new(u64::MAX),
+            ),
+            Generation::new(u64::MAX),
+            maximum_members::<N>(),
+            FencedMutationRosterProtectedPlan::new(vec![3; MAX_PLAN_BYTES].into_boxed_slice())
+                .unwrap(),
+        )
+        .unwrap()
+        .with_terminal_result(
+            FencedMutationRosterProtectedResult::new(vec![4; MAX_RESULT_BYTES].into_boxed_slice())
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn maximum_terminal<const N: usize>() -> FencedMutationRosterTerminal {
+        let outcomes = (0..N)
+            .map(|ordinal| {
+                FencedMutationRosterMemberOutcome::new(
+                    FencedMutationRosterOrdinal::new(ordinal as u8).unwrap(),
+                    id(ordinal as u8 + 1),
+                    FencedMutationRosterDisposition::NotApplied,
+                    FencedMutationRosterAdoption::Reconciled,
+                    FencedMutationRosterStatusBytes::new(vec![ordinal as u8; MAX_STATUS_BYTES])
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        FencedMutationRosterTerminal::new(
+            [5; 32],
+            outcomes,
+            vec![6; MAX_PLAN_BYTES],
+            vec![7; MAX_RESULT_BYTES],
+        )
+        .unwrap()
+    }
+
+    fn assert_maximum_codec_round_trip<const N: usize>() {
+        let manifest = maximum_members::<N>();
+        let encoded_manifest = encode_fenced_mutation_roster_member_manifest(&manifest).unwrap();
+        assert!(encoded_manifest.len() <= FENCED_MUTATION_ROSTER_MEMBER_MANIFEST_CODEC_MAX_BYTES);
+        assert_eq!(
+            decode_fenced_mutation_roster_member_manifest(&encoded_manifest).unwrap(),
+            manifest
+        );
+
+        let admission = maximum_admission::<N>();
+        let encoded_admission = encode_fenced_mutation_roster_admission(&admission).unwrap();
+        assert!(encoded_admission.len() <= FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES);
+        assert_eq!(
+            decode_fenced_mutation_roster_admission(&encoded_admission).unwrap(),
+            admission
+        );
+
+        let terminal = maximum_terminal::<N>();
+        let encoded_terminal = encode_fenced_mutation_roster_terminal(&terminal).unwrap();
+        assert!(encoded_terminal.len() <= FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES);
+        assert_eq!(
+            decode_fenced_mutation_roster_terminal(&encoded_terminal).unwrap(),
+            terminal
+        );
+    }
+
+    #[test]
+    fn exact_maximum_codec_frames_round_trip_for_one_and_eight_members() {
+        assert_maximum_codec_round_trip::<1>();
+        assert_maximum_codec_round_trip::<MAX_MEMBERS>();
+    }
+
+    #[test]
+    fn codec_and_domain_bounds_reject_one_over() {
+        assert_eq!(
+            FencedMutationRosterProtectedPlan::new(vec![0; MAX_PLAN_BYTES + 1].into_boxed_slice()),
+            Err(FencedMutationRosterError::PlanTooLarge)
+        );
+        assert_eq!(
+            FencedMutationRosterProtectedResult::new(
+                vec![0; MAX_RESULT_BYTES + 1].into_boxed_slice()
+            ),
+            Err(FencedMutationRosterError::ResultTooLarge)
+        );
+        assert_eq!(
+            FencedMutationRosterTerminal::new([0; 32], vec![], vec![0; MAX_PLAN_BYTES + 1], vec![]),
+            Err(FencedMutationRosterError::ResultTooLarge)
+        );
+        assert_eq!(
+            decode_fenced_mutation_roster_member_manifest(&vec![
+                0;
+                FENCED_MUTATION_ROSTER_MEMBER_MANIFEST_CODEC_MAX_BYTES
+                    + 1
+            ]),
+            Err(FencedMutationRosterError::MemberLimitExceeded)
+        );
+        assert_eq!(
+            decode_fenced_mutation_roster_admission(&vec![
+                0;
+                FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES
+                    + 1
+            ]),
+            Err(FencedMutationRosterError::PlanTooLarge)
+        );
+        assert_eq!(
+            decode_fenced_mutation_roster_terminal(&vec![
+                0;
+                FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES
+                    + 1
+            ]),
+            Err(FencedMutationRosterError::ResultTooLarge)
+        );
     }
     #[test]
     fn accepted_member_arities_are_bounded() {
