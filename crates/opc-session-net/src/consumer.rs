@@ -2361,7 +2361,7 @@ async fn connect_fenced_mutation_roster_lane(
         scope: client.scope,
         response_frame_size: consumer_v3_response_wire_frame_size(pool.config.response_bytes)
             .map_err(SessionConsumerClientError::from)?,
-        profile: SessionConsumerFencedMutationRosterProfile::v1(),
+        profile: SessionConsumerFencedMutationRosterProfile::v2(),
     });
     write_frame_bounded_until(
         &mut writer,
@@ -2437,7 +2437,7 @@ async fn connect_fenced_mutation_roster_lane(
     if !matches!(
         response,
         SessionConsumerV3Response::FencedMutationRosterCapability(Ok((
-            FencedMutationRosterCapability::V1,
+            FencedMutationRosterCapability::V2,
             profile,
         ))) if profile.is_exact()
     ) {
@@ -3474,7 +3474,7 @@ fn v3_response_matches_request(
         (
             SessionConsumerV3Operation::FencedMutationRosterCapability,
             SessionConsumerV3Response::FencedMutationRosterCapability(Ok((capability, profile))),
-        ) => *capability == FencedMutationRosterCapability::V1 && profile.is_exact(),
+        ) => *capability == FencedMutationRosterCapability::V2 && profile.is_exact(),
         (
             SessionConsumerV3Operation::FencedMutationRosterCapability,
             SessionConsumerV3Response::FencedMutationRosterCapability(Err(_)),
@@ -10762,7 +10762,7 @@ where
             transport_revision: SESSION_QUORUM_CONSUMER_V3_TRANSPORT_REVISION,
             scope,
             request_frame_size: consumer_wire_frame_size(max_frame_size)?,
-            profile: SessionConsumerFencedMutationRosterProfile::v1(),
+            profile: SessionConsumerFencedMutationRosterProfile::v2(),
         }),
         response_frame_size,
         setup_deadline.min(lifecycle.retire_at()),
@@ -12129,7 +12129,7 @@ mod tests {
         fn fenced_mutation_roster_profile(
             &self,
         ) -> Option<SessionConsumerFencedMutationRosterProfile> {
-            Some(SessionConsumerFencedMutationRosterProfile::v1())
+            Some(SessionConsumerFencedMutationRosterProfile::v2())
         }
 
         async fn execute_v3(
@@ -12141,8 +12141,8 @@ mod tests {
             match request.operation() {
                 SessionConsumerV3Operation::FencedMutationRosterCapability => {
                     SessionConsumerV3Response::FencedMutationRosterCapability(Ok((
-                        FencedMutationRosterCapability::V1,
-                        SessionConsumerFencedMutationRosterProfile::v1(),
+                        FencedMutationRosterCapability::V2,
+                        SessionConsumerFencedMutationRosterProfile::v2(),
                     )))
                 }
                 _ => SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unavailable),
@@ -14086,8 +14086,8 @@ mod tests {
         for expected_setups in 2..=3 {
             let expected = Ok(SessionConsumerV3Response::FencedMutationRosterCapability(
                 Ok((
-                    FencedMutationRosterCapability::V1,
-                    SessionConsumerFencedMutationRosterProfile::v1(),
+                    FencedMutationRosterCapability::V2,
+                    SessionConsumerFencedMutationRosterProfile::v2(),
                 )),
             ));
             assert_eq!(

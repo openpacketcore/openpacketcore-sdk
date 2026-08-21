@@ -34,6 +34,7 @@ use opc_session_store::{
     SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
     SessionConsumerV3Operation, SessionConsumerV3Request, SessionConsumerV3Response,
     SessionQuorumConsumer, SqliteSessionBackend, ValidatedQuorumTopology,
+    FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET, FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::SpiffeId;
@@ -113,7 +114,7 @@ impl SessionQuorumConsumer for CountingRosterConsumer {
     }
 
     fn fenced_mutation_roster_profile(&self) -> Option<SessionConsumerFencedMutationRosterProfile> {
-        Some(SessionConsumerFencedMutationRosterProfile::v1())
+        Some(SessionConsumerFencedMutationRosterProfile::v2())
     }
 
     async fn execute_v3(
@@ -125,8 +126,8 @@ impl SessionQuorumConsumer for CountingRosterConsumer {
         match request.operation() {
             SessionConsumerV3Operation::FencedMutationRosterCapability => {
                 SessionConsumerV3Response::FencedMutationRosterCapability(Ok((
-                    FencedMutationRosterCapability::V1,
-                    SessionConsumerFencedMutationRosterProfile::v1(),
+                    FencedMutationRosterCapability::V2,
+                    SessionConsumerFencedMutationRosterProfile::v2(),
                 )))
             }
             _ => SessionConsumerV3Response::Rejected(SessionConsumerRejection::Unavailable),
@@ -214,11 +215,21 @@ fn load_config(lanes: usize) -> PersistentFencedMutationRosterConfig {
 
 #[test]
 fn revision_five_profile_and_alpn_are_isolated() {
+    const QUALIFICATION_REQUIRED_BINDINGS: usize = 100 + 960_000;
+
     assert_eq!(SESSION_QUORUM_CONSUMER_V3_ALPN, b"opc-session-consumer/3");
     assert_eq!(SESSION_QUORUM_CONSUMER_V3_TRANSPORT_REVISION, 5);
-    assert!(SessionConsumerFencedMutationRosterProfile::v1().is_exact());
+    assert!(SessionConsumerFencedMutationRosterProfile::v2().is_exact());
+    let profile = SessionConsumerFencedMutationRosterProfile::v2();
+    assert_eq!(profile.operation_revision, 2);
+    assert_eq!(
+        profile.retained_result_capacity as usize,
+        FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY,
+    );
+    assert!(profile.retained_result_capacity as usize >= QUALIFICATION_REQUIRED_BINDINGS);
+    assert!(FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET >= QUALIFICATION_REQUIRED_BINDINGS);
 
-    let mut mixed = SessionConsumerFencedMutationRosterProfile::v1();
+    let mut mixed = SessionConsumerFencedMutationRosterProfile::v2();
     mixed.transport_revision = 4;
     assert!(!mixed.is_exact());
 }
@@ -342,7 +353,7 @@ async fn three_mtls_endpoints_reuse_fixed_lanes_for_one_thousand_concurrent_acto
                 );
                 match client.execute(tenant, request).await {
                     Ok(SessionConsumerV3Response::FencedMutationRosterCapability(Ok((
-                        FencedMutationRosterCapability::V1,
+                        FencedMutationRosterCapability::V2,
                         profile,
                     )))) if profile.is_exact() => return,
                     Err(PersistentFencedMutationRosterExecuteError::NotTransmitted {

@@ -659,12 +659,12 @@ pub struct SessionConsumerFencedMutationRosterProfile {
 
 impl SessionConsumerFencedMutationRosterProfile {
     /// Construct the one accepted revision-5 roster profile.
-    pub fn v1() -> Self {
+    pub fn v2() -> Self {
         Self {
             transport_revision: 5,
-            operation_revision: 1,
+            operation_revision: 2,
             error_revision: 1,
-            roster: FencedMutationRosterProfile::v1(),
+            roster: FencedMutationRosterProfile::v2(),
             max_members: crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_MAX_MEMBERS as u8,
             max_plan_or_checkpoint_bytes:
                 crate::fenced_mutation_roster::FENCED_MUTATION_ROSTER_MAX_PLAN_OR_CHECKPOINT_BYTES
@@ -684,7 +684,7 @@ impl SessionConsumerFencedMutationRosterProfile {
 
     /// Whether this is byte-for-byte the sole profile accepted on revision 5.
     pub fn is_exact(self) -> bool {
-        self == Self::v1() && self.roster.digest == compute_fenced_mutation_roster_profile_digest()
+        self == Self::v2() && self.roster.digest == compute_fenced_mutation_roster_profile_digest()
     }
 }
 

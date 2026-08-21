@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// The frozen wire-schema revision for this roster profile.
-pub const SCHEMA_V1: u16 = 1;
+pub const SCHEMA_V2: u16 = 2;
 /// Maximum members in one roster plan.
 pub const MAX_MEMBERS: usize = 8;
 /// Maximum protected plan or terminal checkpoint bytes accepted by this profile.
@@ -22,7 +22,7 @@ pub const MAX_RESULT_BYTES: usize = 16_384;
 /// Maximum nonterminal admissions retained by an implementation.
 pub const MAX_LIVE_NONTERMINAL: usize = 1_024;
 /// Maximum terminal results retained by an implementation.
-pub const MAX_RETAINED_RESULTS: usize = 131_072;
+pub const MAX_RETAINED_RESULTS: usize = 1_048_576;
 /// Maximum receipts reclaimed in one bounded implementation batch.
 pub const RECLAIM_BATCH: usize = 1_024;
 /// Required terminal-result retention period, in seconds.
@@ -38,7 +38,7 @@ pub const MAX_OWNER_BYTES: usize = 1_024;
 /// Maximum opaque fence binding bytes.
 pub const MAX_FENCE_BYTES: usize = 1_024;
 /// Compatibility name for the frozen roster schema revision.
-pub const FENCED_MUTATION_ROSTER_SCHEMA_V1: u16 = SCHEMA_V1;
+pub const FENCED_MUTATION_ROSTER_SCHEMA_V2: u16 = SCHEMA_V2;
 /// Compatibility name for the fixed operation-ID width.
 pub const FENCED_MUTATION_ROSTER_OPERATION_ID_BYTES: usize = MEMBER_ID_BYTES;
 /// Exact encoded request-ID width.
@@ -56,7 +56,7 @@ pub const FENCED_MUTATION_ROSTER_MAX_EXACT_RESULT_BYTES: usize = MAX_RESULT_BYTE
 /// Compatibility name for the live roster bound.
 pub const FENCED_MUTATION_ROSTER_MAX_LIVE: usize = MAX_LIVE_NONTERMINAL;
 /// Operational target below permanent retained-result capacity.
-pub const FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET: usize = 100_000;
+pub const FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET: usize = 1_000_000;
 /// Compatibility name for retained-result capacity.
 pub const FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY: usize = MAX_RETAINED_RESULTS;
 /// Compatibility name for reclamation batch size.
@@ -85,15 +85,15 @@ pub const FENCED_MUTATION_ROSTER_MEMBER_MANIFEST_CODEC_MAX_BYTES: usize =
     POSTCARD_MEMBER_MANIFEST_CODEC_MAX_BYTES;
 /// Frozen profile digest for static metadata consumers.
 pub const FENCED_MUTATION_ROSTER_PROFILE_DIGEST: [u8; 32] = [
-    0xa1, 0x84, 0x36, 0xce, 0xf6, 0x65, 0xf2, 0xdb, 0x3f, 0x25, 0x65, 0xf3, 0x4f, 0x36, 0x55, 0x7b,
-    0x20, 0xa1, 0x30, 0x66, 0x1d, 0x6a, 0xad, 0x6c, 0xef, 0x84, 0xf3, 0x92, 0x91, 0x1f, 0x42, 0xda,
+    0x48, 0xd8, 0xb8, 0x43, 0x60, 0x8e, 0x40, 0x78, 0x64, 0x34, 0x77, 0xfb, 0xf5, 0x70, 0x55, 0x5f,
+    0x83, 0x88, 0xdf, 0x69, 0xa8, 0xc4, 0xd8, 0x32, 0x40, 0xdc, 0xa8, 0x35, 0x88, 0xc8, 0x43, 0xa6,
 ];
 
 const PLAN_MAGIC: &[u8; 8] = b"OPCFMRP1";
 const TERMINAL_MAGIC: &[u8; 8] = b"OPCFMRT1";
 const BODY_DOMAIN: &[u8] = b"opc-session-store/fenced-mutation-roster/body/v1";
 const REQUEST_DOMAIN: &[u8] = b"opc-session-store/fenced-mutation-roster/request/v1";
-const PROFILE_DOMAIN: &[u8] = b"opc-session-store/fenced-mutation-roster/profile/v1";
+const PROFILE_DOMAIN: &[u8] = b"opc-session-store/fenced-mutation-roster/profile/v2";
 
 // Postcard encodes all integers and collection lengths as varints. These
 // bounds deliberately use the largest portable varint, rather than relying on
@@ -1050,7 +1050,7 @@ pub fn fenced_mutation_roster_profile_digest() -> [u8; 32] {
     hash.update(PROFILE_DOMAIN);
     hash.update([0]);
     for value in [
-        SCHEMA_V1 as u64,
+        SCHEMA_V2 as u64,
         MAX_MEMBERS as u64,
         MAX_PLAN_BYTES as u64,
         MAX_RESULT_BYTES as u64,
@@ -1396,8 +1396,8 @@ impl fmt::Debug for FencedMutationMemberTerminalStatus {
 /// Capability proof emitted by a roster-capable implementation.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum FencedMutationRosterCapability {
-    /// Version-one bounded roster capability.
-    V1,
+    /// Version-two bounded roster capability.
+    V2,
 }
 /// Public immutable profile proof.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1408,10 +1408,10 @@ pub struct FencedMutationRosterProfile {
     pub digest: [u8; 32],
 }
 impl FencedMutationRosterProfile {
-    /// Return the sole version-one profile.
-    pub fn v1() -> Self {
+    /// Return the sole version-two profile.
+    pub fn v2() -> Self {
         Self {
-            schema: SCHEMA_V1,
+            schema: SCHEMA_V2,
             digest: fenced_mutation_roster_profile_digest(),
         }
     }
@@ -1807,7 +1807,7 @@ fn put_member(out: &mut Vec<u8>, member: &FencedMutationRosterMember) {
 fn encode_plan(plan: &FencedMutationRosterPlan) -> Vec<u8> {
     let mut out = Vec::with_capacity(128 + plan.protected_plan.len());
     out.extend_from_slice(PLAN_MAGIC);
-    out.extend_from_slice(&SCHEMA_V1.to_be_bytes());
+    out.extend_from_slice(&SCHEMA_V2.to_be_bytes());
     out.extend_from_slice(&plan.profile_commitment);
     out.extend_from_slice(&plan.scope_commitment);
     put_bytes(&mut out, &plan.owner);
@@ -1824,7 +1824,7 @@ fn encode_plan(plan: &FencedMutationRosterPlan) -> Vec<u8> {
 fn encode_terminal(terminal: &FencedMutationRosterTerminal) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + terminal.protected_result.len());
     out.extend_from_slice(TERMINAL_MAGIC);
-    out.extend_from_slice(&SCHEMA_V1.to_be_bytes());
+    out.extend_from_slice(&SCHEMA_V2.to_be_bytes());
     out.extend_from_slice(&terminal.admission_commitment);
     out.push(terminal.members.len() as u8);
     for member in &terminal.members {
@@ -1918,7 +1918,7 @@ fn adoption(tag: u8) -> Result<FencedMutationRosterAdoption, FencedMutationRoste
 }
 fn decode_plan(bytes: &[u8]) -> Result<FencedMutationRosterPlan, FencedMutationRosterError> {
     let mut reader = Reader::new(bytes);
-    if reader.take(8)? != PLAN_MAGIC || reader.u16()? != SCHEMA_V1 {
+    if reader.take(8)? != PLAN_MAGIC || reader.u16()? != SCHEMA_V2 {
         return Err(FencedMutationRosterError::LifecycleConflict);
     }
     let profile_commitment = reader.array32()?;
@@ -1968,7 +1968,7 @@ fn decode_terminal(
     bytes: &[u8],
 ) -> Result<FencedMutationRosterTerminal, FencedMutationRosterError> {
     let mut reader = Reader::new(bytes);
-    if reader.take(8)? != TERMINAL_MAGIC || reader.u16()? != SCHEMA_V1 {
+    if reader.take(8)? != TERMINAL_MAGIC || reader.u16()? != SCHEMA_V2 {
         return Err(FencedMutationRosterError::LifecycleConflict);
     }
     let admission_commitment = reader.array32()?;
@@ -2387,12 +2387,29 @@ mod tests {
     fn profile_digest_is_fixed_and_domain_separated() {
         assert_eq!(
             fenced_mutation_roster_profile_digest(),
+            FENCED_MUTATION_ROSTER_PROFILE_DIGEST,
+            "the published V2 profile digest binds the exact bounded contract",
+        );
+        assert_eq!(
+            fenced_mutation_roster_profile_digest(),
             fenced_mutation_roster_profile_digest()
         );
         assert_ne!(
             fenced_mutation_roster_profile_digest(),
             roster_body_commitment(&[])
         );
+    }
+
+    #[test]
+    fn qualification_capacity_includes_the_starting_bound() {
+        const STARTING_BOUND: usize = 100;
+        const UNIQUE_OPERATION_RECEIPTS: usize = 960_000;
+        const REQUIRED_BINDINGS: usize = STARTING_BOUND + UNIQUE_OPERATION_RECEIPTS;
+
+        assert_eq!(REQUIRED_BINDINGS, 960_100);
+        assert!(FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET >= REQUIRED_BINDINGS);
+        assert!(MAX_RETAINED_RESULTS >= FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET);
+        assert_eq!(MAX_RETAINED_RESULTS, 1_048_576);
     }
     #[test]
     fn ambiguity_carries_identity_but_not_nontransmission() {

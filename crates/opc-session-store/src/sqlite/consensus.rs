@@ -4841,7 +4841,7 @@ CREATE TABLE consensus_fenced_mutation_roster_history (
     active_epoch INTEGER CHECK (active_epoch IS NULL OR active_epoch > 0),
     retired_through_epoch INTEGER NOT NULL CHECK (retired_through_epoch >= 0),
     generation INTEGER NOT NULL CHECK (generation >= 0),
-    current_bound_count INTEGER NOT NULL CHECK (current_bound_count BETWEEN 0 AND 131072),
+    current_bound_count INTEGER NOT NULL CHECK (current_bound_count BETWEEN 0 AND 1048576),
     current_live_count INTEGER NOT NULL CHECK (current_live_count BETWEEN 0 AND 1024),
     reclaim_epoch INTEGER CHECK (reclaim_epoch IS NULL OR reclaim_epoch > 0),
     reclaim_cursor_ordinal INTEGER CHECK (
@@ -6825,7 +6825,7 @@ const FENCED_MUTATION_ROSTER_HISTORY_TABLE_SCHEMA_SQL: &str = r#"
             active_epoch INTEGER CHECK (active_epoch IS NULL OR active_epoch > 0),
             retired_through_epoch INTEGER NOT NULL CHECK (retired_through_epoch >= 0),
             generation INTEGER NOT NULL CHECK (generation >= 0),
-            current_bound_count INTEGER NOT NULL CHECK (current_bound_count BETWEEN 0 AND 131072),
+            current_bound_count INTEGER NOT NULL CHECK (current_bound_count BETWEEN 0 AND 1048576),
             current_live_count INTEGER NOT NULL CHECK (current_live_count BETWEEN 0 AND 1024),
             reclaim_epoch INTEGER CHECK (reclaim_epoch IS NULL OR reclaim_epoch > 0),
             reclaim_cursor_ordinal INTEGER CHECK (
@@ -19840,7 +19840,7 @@ mod tests {
         FencedMutationRosterTerminal,
         crate::fenced_mutation_roster::FencedMutationRosterProtectedPlan,
     ) {
-        let result = vec![0xD1].into_boxed_slice();
+        let result = Vec::new().into_boxed_slice();
         let plan = crate::fenced_mutation_roster::FencedMutationRosterPlan::new(
             fenced_mutation_roster_profile_digest(),
             admission.scope().digest(),
@@ -22383,7 +22383,7 @@ mod tests {
             vec![fenced_mutation_roster_admission_entry(2, 0xF0, first)],
         )
         .expect("initialize roster history");
-        // This bounded fixture represents the preceding 131071 retained
+        // This bounded fixture represents the preceding 1,048,575 retained
         // admissions and 1023 live reservations without generating a large
         // business-independent ledger in the unit test.
         conn.execute(
@@ -22407,7 +22407,7 @@ mod tests {
                 final_admission.clone(),
             )],
         )
-        .expect("1024th live and 131072nd reservation admit");
+        .expect("1024th live and 1,048,576th reservation admit");
         assert!(matches!(
             final_apply.responses.as_slice(),
             [SessionConsensusResponse {

@@ -1905,7 +1905,7 @@ impl ConsensusSessionStore {
             return Ok(());
         }
         if self.local_fenced_mutation_roster_capability()
-            != Some(crate::FencedMutationRosterCapability::V1)
+            != Some(crate::FencedMutationRosterCapability::V2)
         {
             return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
         }
@@ -1916,7 +1916,7 @@ impl ConsensusSessionStore {
                 // Keep the local case explicit: a future coordinator shape
                 // must not make roster support implicit for a joining node.
                 if self.local_fenced_mutation_roster_capability()
-                    != Some(crate::FencedMutationRosterCapability::V1)
+                    != Some(crate::FencedMutationRosterCapability::V2)
                 {
                     return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
                 }
@@ -3287,7 +3287,7 @@ impl ConsensusSessionStore {
                     current_identity,
                     current_members.contains(&authenticated_sender)
                         && self.local_fenced_mutation_roster_capability()
-                            == Some(crate::FencedMutationRosterCapability::V1)
+                            == Some(crate::FencedMutationRosterCapability::V2)
                         && profile_digest
                             == crate::fenced_mutation_roster::fenced_mutation_roster_profile_digest(
                             ),

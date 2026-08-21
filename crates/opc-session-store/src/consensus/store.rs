@@ -74,7 +74,7 @@ use crate::fenced_mutation_roster::{
     FencedMutationRosterCapability, FencedMutationRosterError, FencedMutationRosterHistoryState,
     FencedMutationRosterOutcome, FencedMutationRosterPhase, FencedMutationRosterStatus,
     FencedMutationRosterTerminal, FENCED_MUTATION_ROSTER_ADMISSION_CODEC_MAX_BYTES,
-    FENCED_MUTATION_ROSTER_SCHEMA_V1, FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
+    FENCED_MUTATION_ROSTER_SCHEMA_V2, FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES,
 };
 use crate::fenced_transition::{
     AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionObservation,
@@ -515,7 +515,7 @@ struct FencedMutationRosterCapabilityProbe {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum FencedMutationRosterCapabilityReply {
-    V1 {
+    V2 {
         magic: [u8; 8],
         profile_digest: [u8; 32],
     },
@@ -528,11 +528,11 @@ fn fenced_mutation_roster_capability_probe_reply(
 ) -> FencedMutationRosterCapabilityReply {
     let profile_digest = fenced_mutation_roster_profile_digest();
     if probe.magic == FENCED_MUTATION_ROSTER_CAPABILITY_PROBE_MAGIC
-        && probe.schema_version == FENCED_MUTATION_ROSTER_SCHEMA_V1
+        && probe.schema_version == FENCED_MUTATION_ROSTER_SCHEMA_V2
         && probe.profile_digest == profile_digest
-        && local_capability == Some(FencedMutationRosterCapability::V1)
+        && local_capability == Some(FencedMutationRosterCapability::V2)
     {
-        FencedMutationRosterCapabilityReply::V1 {
+        FencedMutationRosterCapabilityReply::V2 {
             magic: FENCED_MUTATION_ROSTER_CAPABILITY_REPLY_MAGIC,
             profile_digest,
         }
@@ -1095,13 +1095,13 @@ impl ConsensusSessionStore {
             && self.inner.backend.consensus_log_entry_max_bytes()
                 >= FENCED_MUTATION_ROSTER_TERMINAL_CODEC_MAX_BYTES
         {
-            Some(FencedMutationRosterCapability::V1)
+            Some(FencedMutationRosterCapability::V2)
         } else {
             None
         }
     }
 
-    /// Admit V1 for one exact linearizable voter scope.
+    /// Admit V2 for one exact linearizable voter scope.
     ///
     /// A durable certificate first permits ordinary quorum availability.  In
     /// its absence every exact voter must answer the authenticated V1 probe;
@@ -1260,7 +1260,7 @@ impl ConsensusSessionStore {
             .await?;
         let expected_scope = self.current_scope()?;
         if self.local_fenced_mutation_roster_capability()
-            != Some(FencedMutationRosterCapability::V1)
+            != Some(FencedMutationRosterCapability::V2)
         {
             return Err(unsupported_fenced_mutation_roster());
         }
@@ -1299,7 +1299,7 @@ impl ConsensusSessionStore {
                     SessionConsensusRpcFamily::ReadBarrier,
                     &FencedMutationRosterCapabilityProbe {
                         magic: FENCED_MUTATION_ROSTER_CAPABILITY_PROBE_MAGIC,
-                        schema_version: FENCED_MUTATION_ROSTER_SCHEMA_V1,
+                        schema_version: FENCED_MUTATION_ROSTER_SCHEMA_V2,
                         profile_digest,
                     },
                     deadline,
@@ -1312,7 +1312,7 @@ impl ConsensusSessionStore {
             .any(|reply| {
                 !matches!(
                     reply,
-                    Ok(FencedMutationRosterCapabilityReply::V1 {
+                    Ok(FencedMutationRosterCapabilityReply::V2 {
                         magic,
                         profile_digest: received,
                     }) if magic == FENCED_MUTATION_ROSTER_CAPABILITY_REPLY_MAGIC
@@ -4230,7 +4230,7 @@ impl ConsensusSessionStore {
                 _ => consensus_unavailable(),
             })?;
         drop(admission);
-        Ok(FencedMutationRosterCapability::V1)
+        Ok(FencedMutationRosterCapability::V2)
     }
 
     async fn consumer_fenced_mutation_roster_history_state(
@@ -6258,7 +6258,7 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
         // leader/quorum authority through the durable store path below.
         self.store
             .local_fenced_mutation_roster_capability()
-            .map(|_| SessionConsumerFencedMutationRosterProfile::v1())
+            .map(|_| SessionConsumerFencedMutationRosterProfile::v2())
     }
 
     async fn execute_v3(
@@ -6305,7 +6305,7 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                         .consumer_fenced_mutation_roster_capability(request.scope(), deadline)
                         .await
                         .map(|capability| {
-                            (capability, SessionConsumerFencedMutationRosterProfile::v1())
+                            (capability, SessionConsumerFencedMutationRosterProfile::v2())
                         })
                         .map_err(SessionConsumerStoreError::from),
                 )
@@ -7814,7 +7814,7 @@ mod membership_tests {
 
         assert_eq!(
             store.consumer_service().fenced_mutation_roster_profile(),
-            Some(crate::SessionConsumerFencedMutationRosterProfile::v1())
+            Some(crate::SessionConsumerFencedMutationRosterProfile::v2())
         );
     }
 
@@ -7834,8 +7834,8 @@ mod membership_tests {
                 )
                 .await,
             SessionConsumerV3Response::FencedMutationRosterCapability(Ok((
-                FencedMutationRosterCapability::V1,
-                SessionConsumerFencedMutationRosterProfile::v1(),
+                FencedMutationRosterCapability::V2,
+                SessionConsumerFencedMutationRosterProfile::v2(),
             )))
         );
         assert_eq!(
