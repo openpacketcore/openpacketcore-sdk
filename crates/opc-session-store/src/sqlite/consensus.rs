@@ -20269,8 +20269,21 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
         if incoming_has_roster && local_roster_layout == FencedMutationRosterLedgerLayout::Absent {
             // Materialize V5 only inside the installation transaction that is
             // about to copy its format-five marker and complete object set.
-            tx.execute_batch(FENCED_MUTATION_ROSTER_SCHEMA)
+            if incoming_roster_layout == FencedMutationRosterLedgerLayout::PublishedFormatSeven {
+                tx.execute_batch(&format!(
+                    "{FENCED_MUTATION_ROSTER_OPERATIONS_TABLE_SCHEMA_SQL};\
+                     {FENCED_MUTATION_ROSTER_MEMBERS_TABLE_SCHEMA_SQL};\
+                     {FENCED_MUTATION_ROSTER_V4_RESERVATIONS_TABLE_SCHEMA_SQL};\
+                     {FENCED_MUTATION_ROSTER_RECLAIM_INDEX_SCHEMA_SQL};\
+                     {FENCED_MUTATION_ROSTER_DUE_INDEX_SCHEMA_SQL};\
+                     {FENCED_MUTATION_ROSTER_ACTIVATION_TABLE_SCHEMA_SQL};\
+                     {FENCED_MUTATION_ROSTER_HISTORY_TABLE_SCHEMA_SQL};"
+                ))
                 .map_err(db_error)?;
+            } else {
+                tx.execute_batch(FENCED_MUTATION_ROSTER_SCHEMA)
+                    .map_err(db_error)?;
+            }
         }
         // Identity itself is adapter-owned and otherwise intentionally remains
         // local on snapshot install.  These two fields are replicated
@@ -24248,6 +24261,97 @@ mod tests {
         assert_eq!(mode, 1, "the V4 reservation remains the durable winner");
         validate_fenced_mutation_roster_receipts_sync(&conn, identity())
             .expect("migrated populated roster is valid");
+    }
+
+    #[test]
+    fn exact_published_format_seven_snapshot_imports_and_upgrades_before_use() {
+        let source = SqliteSessionBackend::in_memory().expect("source backend");
+        let source_conn = source.conn.blocking_lock();
+        let voters = expected_members();
+        initialize_schema(&source_conn, identity(), &voters).expect("source schema");
+        apply_entries_sync(
+            &source_conn,
+            identity(),
+            &source.caps,
+            vec![
+                membership_entry(),
+                fenced_transition_entry(
+                    1,
+                    fenced_transition_request(0xF1, "format-seven-snapshot-owner"),
+                    timestamp(1),
+                ),
+            ],
+        )
+        .expect("source activation prerequisites");
+        activate_fenced_mutation_roster_scope_sync(
+            &source_conn,
+            identity(),
+            identity(),
+            &voters,
+            fenced_mutation_roster_profile_digest(),
+            FENCED_MUTATION_ROSTER_INITIAL_HISTORY_EPOCH,
+        )
+        .expect("activate source roster");
+        let admission = fenced_mutation_roster_admission(0xF2, 0xF3);
+        fenced_mutation_roster_admit_sync(&source_conn, identity(), &admission, timestamp(2))
+            .expect("populate source roster");
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("published-format-seven.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                .expect("build source snapshot");
+        drop(source_conn);
+
+        let snapshot = Connection::open(&snapshot_path).expect("open source snapshot");
+        snapshot
+            .execute_batch(
+                "DROP INDEX consensus_fenced_mutation_roster_managed_provider_jobs_recovery; \
+                 DROP TABLE consensus_fenced_mutation_roster_managed_provider_jobs; \
+                 DROP TABLE consensus_fenced_mutation_roster_managed_provider_authorities; \
+                 DROP TABLE consensus_fenced_mutation_roster_protocol_claims; \
+                 UPDATE consensus_identity SET schema_version = 7 WHERE singleton = 1;",
+            )
+            .expect("restore exact published format-seven descriptor");
+        assert!(
+            fenced_mutation_roster_v3_schema_is_exact_in_sync(&snapshot, false)
+                .expect("recognize exact format-seven snapshot")
+        );
+        snapshot
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint format-seven snapshot");
+        drop(snapshot);
+
+        let target = SqliteSessionBackend::in_memory().expect("target backend");
+        let target_conn = target.conn.blocking_lock();
+        initialize_schema(&target_conn, identity(), &voters).expect("target schema");
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "published-format-seven".into(),
+        };
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "published-format-seven.opc",
+            [0xF4; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("snapshot metadata")
+                .len(),
+        )
+        .expect("format-seven snapshot upgrades atomically at import");
+        assert_eq!(
+            persisted_schema_version_in_sync(&target_conn, false).expect("migrated marker"),
+            FENCED_MUTATION_ROSTER_V5_DATABASE_FORMAT
+        );
+        assert_eq!(
+            fenced_mutation_roster_ledger_layout_sync(&target_conn)
+                .expect("migrated snapshot layout"),
+            FencedMutationRosterLedgerLayout::Activated
+        );
+        validate_fenced_mutation_roster_receipts_sync(&target_conn, identity())
+            .expect("migrated snapshot is valid before serving work");
     }
 
     #[test]
