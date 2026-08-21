@@ -222,9 +222,10 @@ impl fmt::Debug for SessionConsumerRosterCapabilities {
 impl SessionConsumerRosterCapabilities {
     /// Accept only an exactly equal, well-formed peer capability.
     pub fn negotiate(self, peer: Self) -> Result<Self, SessionConsumerRosterError> {
-        if !self.profile.is_well_formed() || !peer.profile.is_well_formed() {
-            Err(SessionConsumerRosterError::ProfileMismatch)
-        } else if self.profile != peer.profile {
+        if !self.profile.is_well_formed()
+            || !peer.profile.is_well_formed()
+            || self.profile != peer.profile
+        {
             Err(SessionConsumerRosterError::ProfileMismatch)
         } else {
             Ok(self)

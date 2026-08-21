@@ -1850,7 +1850,7 @@ impl PersistentFencedMutationRosterClient {
             Ordering::Relaxed,
         );
         if scheduler
-            .try_send(FencedMutationRosterSchedulerCommand::Submit(job))
+            .try_send(FencedMutationRosterSchedulerCommand::Submit(Box::new(job)))
             .is_err()
         {
             counter_increment(&self.pool.counters.overload);
@@ -2060,7 +2060,7 @@ impl FencedMutationRosterReply {
 }
 
 enum FencedMutationRosterSchedulerCommand {
-    Submit(FencedMutationRosterJob),
+    Submit(Box<FencedMutationRosterJob>),
     Drain,
     Force,
 }
@@ -2296,6 +2296,7 @@ async fn fenced_mutation_roster_scheduler(
         tokio::select! {
             command = commands.recv() => match command {
                 Some(FencedMutationRosterSchedulerCommand::Submit(job)) => {
+                    let job = *job;
                     let Some(pool_ref) = pool.upgrade() else { break };
                     if draining || PersistentFencedMutationRosterPoolPhase::load(&pool_ref.phase) != PersistentFencedMutationRosterPoolPhase::Running {
                         job.complete(Err(PersistentFencedMutationRosterExecuteError::NotTransmitted { cause: SessionConsumerClientError::ShuttingDown }), 0, &pool_ref);
@@ -13769,8 +13770,10 @@ mod tests {
             request_one_over.validate(),
             Err(PersistentFencedMutationRosterConfigError::Capacity)
         );
-        let mut response_one_over = PersistentFencedMutationRosterConfig::default();
-        response_one_over.response_bytes = MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES - 1;
+        let response_one_over = PersistentFencedMutationRosterConfig {
+            response_bytes: MAX_FENCED_MUTATION_ROSTER_V3_RESPONSE_BYTES - 1,
+            ..PersistentFencedMutationRosterConfig::default()
+        };
         assert_eq!(
             response_one_over.validate(),
             Err(PersistentFencedMutationRosterConfigError::Capacity)
@@ -14934,6 +14937,7 @@ mod tests {
         else {
             panic!("bound roster request reaches the scheduler");
         };
+        let job = *job;
         let SessionConsumerV3Operation::FencedMutationRosterAdmit {
             admission: queued_admission,
         } = job.request.operation()
@@ -15006,6 +15010,7 @@ mod tests {
         else {
             panic!("validated terminal roster request reaches the scheduler");
         };
+        let job = *job;
         let SessionConsumerV3Operation::FencedMutationRosterTerminalize {
             admission: queued_admission,
             terminal: queued_terminal,
@@ -15128,8 +15133,10 @@ mod tests {
             .expect("closed roster capability request encodes")
             .len();
         assert!(request_bytes > inner_request_bytes);
-        let mut config = PersistentFencedMutationRosterConfig::default();
-        config.lane_workers = 1;
+        let config = PersistentFencedMutationRosterConfig {
+            lane_workers: 1,
+            ..PersistentFencedMutationRosterConfig::default()
+        };
         let control = SessionReauthenticationControl::new();
         let (stateless, _material) = stateless_test_client(control);
         let client = PersistentFencedMutationRosterClient::try_from_stateless(stateless, config)
@@ -15164,6 +15171,7 @@ mod tests {
         else {
             panic!("first request is retained as a scheduler submission");
         };
+        let job = *job;
         assert_eq!(
             client.diagnostics().request_bytes,
             u64::try_from(request_bytes).expect("test request length fits diagnostics")
@@ -15219,10 +15227,12 @@ mod tests {
                 })
             }
         });
-        let mut config = PersistentFencedMutationRosterConfig::default();
-        config.lane_workers = 1;
-        config.retries = 1;
-        config.setup_timeout = Duration::from_millis(100);
+        let config = PersistentFencedMutationRosterConfig {
+            lane_workers: 1,
+            retries: 1,
+            setup_timeout: Duration::from_millis(100),
+            ..PersistentFencedMutationRosterConfig::default()
+        };
         let client = PersistentFencedMutationRosterClient::try_from_stateless(stateless, config)
             .expect("bounded roster configuration");
         client
@@ -15464,9 +15474,11 @@ mod tests {
             scope(),
             client_material.config(),
         );
-        let mut config = PersistentFencedMutationRosterConfig::default();
-        config.lane_workers = 1;
-        config.connection_call_count = 1;
+        let config = PersistentFencedMutationRosterConfig {
+            lane_workers: 1,
+            connection_call_count: 1,
+            ..PersistentFencedMutationRosterConfig::default()
+        };
         let client = PersistentFencedMutationRosterClient::try_from_stateless(stateless, config)
             .expect("one-call roster lane configuration");
         client.prewarm().await.expect("initial fixed lane setup");

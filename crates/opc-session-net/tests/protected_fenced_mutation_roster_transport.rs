@@ -423,7 +423,9 @@ fn revision_five_profile_and_alpn_are_isolated() {
         FENCED_MUTATION_ROSTER_RETAINED_RESULT_CAPACITY,
     );
     assert!(profile.retained_result_capacity as usize >= QUALIFICATION_REQUIRED_BINDINGS);
-    assert!(FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET >= QUALIFICATION_REQUIRED_BINDINGS);
+    const {
+        assert!(FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET >= QUALIFICATION_REQUIRED_BINDINGS);
+    }
 
     let mut mixed = SessionConsumerFencedMutationRosterProfile::v2();
     mixed.transport_revision = 4;
