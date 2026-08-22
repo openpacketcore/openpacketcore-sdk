@@ -13,10 +13,15 @@ the corresponding codec, apply, persistence, snapshot, and recovery seams.
 Required qualification coverage is:
 
 - V2 exact-capacity acceptance at 131,072 bindings, deterministic rejection of
-  fresh attempt 131,073 without a lease, record, watch, or second effect, and
-  one committed successor-epoch binding on attempt 131,074 after reclamation;
-- at least 100,000 unique committed V2 transitions, crossing a retirement
-  window, with the history state/counters and 31,072-entry headroom observed;
+  a fresh attempt 131,073 without a lease, record, watch, or second effect,
+  and immediate successor rotation while the eight-epoch retained window has
+  room;
+- the authoritative 1,010,000-operation release workload crossing seven
+  successor rotations, with one active plus seven replay epochs, exact
+  history state/counters, and 31,072-entry per-epoch headroom observed;
+- at the eight-epoch bound, deterministic refusal to open a ninth epoch,
+  ordered reclamation of only the oldest eligible replay epoch, and continued
+  writes through the existing active epoch during every reclaim batch;
 - delayed old retries before, during, and after replicated retirement: exact
   old body is `Retired`, an old full ID with a changed body is conflict, and
   neither executes;
@@ -47,8 +52,8 @@ restart paths.
 | V3 snapshot retains a live V2 receipt, exact replay, and changed-body conflict | `sqlite::consensus::fenced_transition_v2_snapshot_installs_exact_replay_and_rejects_live_omission` |
 | Snapshot during reclaim retains retired floor/cursor/remaining state and rejects regression | `sqlite::consensus::fenced_transition_v2_snapshot_during_reclaim_preserves_cursor_and_rejects_regression` |
 | Reopen/recovery retains V3 lifecycle branch and rejects lifecycle/profile/receipt corruption | `recovery::tests::current_recovery_inspection_accepts_populated_v3_history_and_reopen_preserves_branch`; `current_recovery_v3_rejects_lifecycle_corruption_and_distinguishes_floor`; `current_recovery_v3_rejects_profile_and_receipt_commitment_corruption` |
-| Retirement advances the floor, deletes ordered 1,024-row batches, holds the successor inactive, then opens only the next epoch | `sqlite::consensus::fenced_transition_v2_reclaims_exactly_1024_then_opens_next_epoch`; `fenced_transition_v2_maintenance_exact_empty_or_too_early_is_unit_but_stale_is_not_active` |
-| Delayed-ID classification seams: full-ID/body commitment, persisted exact replay/conflict, and retired-to-successor lifecycle | `fenced_transition::v2_id_is_deterministic_and_commits_the_complete_body`; `sqlite::consensus::fenced_transition_v2_snapshot_installs_exact_replay_and_rejects_live_omission`; `fenced_transition_v2_reclaims_exactly_1024_then_opens_next_epoch` |
+| Capacity rotation opens successors while a replay slot is free; at eight epochs retirement advances only the oldest floor, deletes ordered 1,024-row batches, and leaves the active epoch writable | `sqlite::consensus::fenced_transition_v2_capacity_opens_successor_and_bounds_eight_exact_epochs`; `fenced_transition_v2_floor_reclaims_oldest_while_successor_remains_writable`; `fenced_transition_v2_maintenance_exact_empty_or_too_early_is_unit_but_stale_is_not_active` |
+| Delayed-ID classification seams: full-ID/body commitment, persisted exact replay/conflict, and retired-floor lifecycle | `fenced_transition::v2_id_is_deterministic_and_commits_the_complete_body`; `sqlite::consensus::fenced_transition_v2_snapshot_installs_exact_replay_and_rejects_live_omission`; `fenced_transition_v2_post_reclaim_deletion_keeps_retired_and_conflict_closed` |
 | Exact capacity and no-effect one-over rejection | `sqlite::consensus::fenced_transition_v2_cap_accepts_last_binding_and_rejects_next_without_effect` |
 | First activation and reactivation bind an exact scope without resetting durable V2 history | `consensus::store::v2_preproposal_binds_full_id_and_first_activation_scope`; `v2_reactivation_at_active_epoch_is_admitted_and_external_maintenance_rejects`; `sqlite::consensus::revoked_activation_wrapper_after_cutover_is_no_effect_and_does_not_poison_successor` |
 | Cutover/snapshot certificate rule: preserve a current exact certificate, but accept a successor scope only without the old certificate | `sqlite::consensus::activated_snapshot_preserves_a_current_certificate_but_accepts_successor_without_one` |
@@ -60,21 +65,21 @@ restart paths.
 | One-over capacity rejection preserves the complete lease row including expiry, application/watch sequence, record and fence; exact retry and same-ID/different-body conflict remain no-effect | `sqlite::consensus::fenced_transition_v2_cap_accepts_last_binding_and_rejects_next_without_effect`; `fenced_transition_v2_qualification::sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity` |
 | Fixed response codec/profile contract | `sqlite::consensus::fenced_transition_v2_response_codec_is_fixed_and_round_trips_all_admitted_results`; `fenced_transition::v2_constants_leave_required_headroom_and_profile_is_fixed` |
 
-The exact-capacity workload may be ignored only when its normal CI cost is
-unreasonable. It remains a release qualification: it must run in the dedicated
-qualification job with a published command and measured metrics. The ordinary
-focused CI tests cover the smaller activation, exact-replay, and changed-body
-admission paths; the 131,072/one-over capacity check is intentionally part of
-the release qualification rather than being silently reduced.
+The authoritative successor-scale workload may be ignored only when its normal
+CI cost is unreasonable. It remains a release qualification: it must run in
+the dedicated qualification job with a published command and measured
+metrics. Ordinary focused CI covers smaller activation, rotation, exact
+replay, changed-body, and oldest-epoch reclamation paths; the complete
+eight-epoch/1,010,000-operation check is intentionally part of release
+qualification rather than being silently reduced.
 
 `fenced_transition_v2_qualification::sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity`
-is the ignored three-voter fixed-quorum workload. It performs 131,074 unique
-attempts through Openraft and SQLite apply: 131,072 admitted into epoch 1, one
-deterministic one-over rejection, and one successor-epoch commit after
-reclamation. It therefore commits 131,073 transitions while checking the exact
-131,072 per-epoch bound, and records elapsed time plus per-run database and
-snapshot bytes. It does not seed receipt rows or call private state-machine
-functions.
+is retained only as the historical pre-successor three-voter artifact. It
+performed 131,074 unique attempts through Openraft and SQLite apply: 131,072
+admitted into epoch 1, one deterministic one-over rejection, and one
+successor-epoch commit after the then-required reclamation. It does not prove
+the current active-plus-seven-replay lifecycle; the successor-scale release
+gate below is authoritative for that contract.
 
 The frozen pre-fix V1 RED is preserved separately by
 `sqlite::consensus::tests::frozen_v1_history_cap_is_absorbing_after_every_binding_applies`.
@@ -115,13 +120,14 @@ permits a bounded retry of the same expected lifecycle state. Deterministic
 results are never classified as transient.
 
 The continuation makes these linearized assertions, not merely observes row
-counts: after the first reclaim command and
-through every intermediate ordered 1,024-row batch, a well-formed request for
-epoch `retired + 1` reports `FencedTransitionV2Status::EpochNotActive`; after
-the final batch it is the active epoch and its new request is `NotFound` before
-submission (then may execute). The delayed old full-ID exact retry must report
-`Retired` before, during, and after that sequence, while the same full ID with
-a changed body must report conflict in each phase.
+counts: the first reclaim command advances only the oldest closed epoch's
+floor, and every ordered 1,024-row batch preserves the existing active epoch.
+A fresh request in that active epoch executes during reclamation. A request
+for the not-yet-opened immediate successor reports
+`FencedTransitionV2Status::EpochNotActive` until reclamation frees a slot and a
+separate full-active maintenance rotation opens it. The delayed old full-ID
+exact retry reports `Retired` before, during, and after physical deletion,
+while the same full ID with a changed body reports conflict in each phase.
 
 ## Mutation matrix
 
@@ -133,8 +139,8 @@ a changed body must report conflict in each phase.
 | Permit local/age-only deletion | restart/follower cannot agree on floor or retry result | recovery/topology |
 | Delete rows before advancing floor | old exact retry can become `NotFound` or execute | maintenance apply |
 | Make reclamation batch variable or unordered | observed deletion is not exactly the oldest 1,024 rows | maintenance apply |
-| Reclaim while active epoch exists | maintenance is admitted before close | maintenance admission |
-| Open an arbitrary next epoch | final batch does not open `retired + 1` | maintenance apply |
+| Reclaim a non-oldest or unexpired replay epoch | floor advances outside the exact oldest-retention gate | maintenance admission/apply |
+| Clear or replace the active epoch during reclaim | active writes stop or target a fabricated successor | maintenance apply |
 | Accept a V1 reply, quorum, or mismatched V2 profile | mixed/prospective voter activates V2 | capability probe |
 | Preserve a certificate across topology cutover | successor scope does not reprobe | topology apply |
 | Separate format/certificate/first receipt from transition | crash/recovery sees partial activation | consensus apply + snapshot |

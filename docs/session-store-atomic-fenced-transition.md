@@ -575,10 +575,11 @@ it never executes. This ordering is security-significant.
 A valid request above the retired floor that does not name the current active
 epoch returns `FencedTransitionHistoryEpochNotActive` (status
 `EpochNotActive`) without an effect. This includes the immediate successor
-while its predecessor is being reclaimed. Unlike `Retired`, this state is not
-terminal for that epoch: the successor becomes active only after reclamation
-finishes, so callers must re-read the linearized history state before deriving
-new work.
+while all eight retained epoch slots are occupied. Unlike `Retired`, this
+state is not terminal for that epoch: after eligible reclamation frees the
+oldest replay slot, a separate maintenance linearization may open the
+immediate successor only when the current active epoch is full. Callers must
+re-read the linearized history state before deriving new work.
 
 ### Epoch lifecycle and maintenance
 
