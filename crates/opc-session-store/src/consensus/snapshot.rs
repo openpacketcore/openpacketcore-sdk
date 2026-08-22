@@ -1028,6 +1028,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receiving_snapshot_rewind_rejects_overwriting_written_bytes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming.part");
+        let original = b"original snapshot";
+        let mut snapshot = SessionSnapshotFile::create(path.clone()).await?;
+        snapshot.write_all(original).await?;
+        snapshot.rewind().await?;
+
+        let error = snapshot
+            .write_all(b"overwritten bytes")
+            .await
+            .err()
+            .ok_or("rewound receive accepted an overwrite")?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        snapshot.sync_all().await?;
+        assert_eq!(snapshot.metadata().await?.len(), original.len() as u64);
+        assert_eq!(std::fs::read(path)?, original);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cancellation_immediately_after_receive_create_cleans_the_exact_artifact(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
