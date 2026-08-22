@@ -56,6 +56,7 @@ use opc_types::{NetworkFunctionKind, TenantId};
 use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use tempfile::TempDir;
+use tokio::sync::Notify;
 
 const MEMBER_COUNT: usize = 3;
 const OPERATION_TIMEOUT: Duration = Duration::from_millis(750);
@@ -104,6 +105,7 @@ struct ManagedProviderAdapterDouble {
     execute_calls: Arc<AtomicUsize>,
     status_calls: Arc<AtomicUsize>,
     adopt_calls: Arc<AtomicUsize>,
+    execute_gate: Option<Arc<AppendEntriesApplyGate>>,
 }
 
 #[derive(Clone, Copy)]
@@ -120,6 +122,7 @@ impl ManagedProviderAdapterDouble {
             execute_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
             adopt_calls: Arc::new(AtomicUsize::new(0)),
+            execute_gate: None,
         }
     }
 
@@ -130,6 +133,7 @@ impl ManagedProviderAdapterDouble {
             execute_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
             adopt_calls: Arc::new(AtomicUsize::new(0)),
+            execute_gate: None,
         }
     }
 
@@ -140,6 +144,7 @@ impl ManagedProviderAdapterDouble {
             execute_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
             adopt_calls: Arc::new(AtomicUsize::new(0)),
+            execute_gate: None,
         }
     }
 
@@ -150,7 +155,14 @@ impl ManagedProviderAdapterDouble {
             execute_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
             adopt_calls: Arc::new(AtomicUsize::new(0)),
+            execute_gate: None,
         }
+    }
+
+    fn applied_arming(gate: Arc<AppendEntriesApplyGate>) -> Self {
+        let mut provider = Self::applied();
+        provider.execute_gate = Some(gate);
+        provider
     }
 
     fn attestation(
@@ -171,6 +183,9 @@ impl ManagedProviderJobRemoteProvider for ManagedProviderAdapterDouble {
         context: &FencedMutationRosterMemberExecutionContext<'_>,
     ) -> Result<FencedMutationRosterMemberAttestation, Self::Error> {
         self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = &self.execute_gate {
+            gate.arm();
+        }
         self.execute_outcome
             .ok_or(())
             .and_then(|outcome| Self::attestation(context, outcome))
@@ -303,6 +318,51 @@ async fn admit_managed_provider_adapter_roster(
     admission
 }
 
+async fn activate_managed_provider_adapter_roster(
+    store: &ConsensusSessionStore,
+    scope: SessionConsumerScope,
+    marker: u8,
+) {
+    let (transition, _) = fenced_acquire_create_request(
+        session_key([marker, 0x51]),
+        owner(format!("managed-provider-gate-activation-{marker:02x}")),
+        FenceToken::new(0),
+        [marker; 16],
+        Duration::from_secs(30),
+        b"managed-provider-gate-activation",
+    );
+    store
+        .fenced_transition(transition)
+        .await
+        .expect("activate fenced-transition receipt ledger");
+    let identity = SessionConsumerIdentity::new(format!(
+        "spiffe://managed-adapter/gate-activation-{marker:02x}"
+    ))
+    .expect("activation identity");
+    let admission = managed_provider_adapter_admission(marker, 1).with_scope(
+        derive_fenced_mutation_roster_scope(identity.spiffe_identity_commitment(), scope),
+    );
+    let response = store
+        .consumer_service()
+        .execute_v3(
+            &identity,
+            SessionConsumerV3Request::new(
+                scope,
+                SessionConsumerV3Operation::FencedMutationRosterAdmit {
+                    admission: Box::new(admission),
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            response,
+            SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_))
+        ),
+        "public roster activation must commit: {response:?}"
+    );
+}
+
 async fn terminalize_predecessor_adapter_roster(
     store: &ConsensusSessionStore,
     scope: SessionConsumerScope,
@@ -396,6 +456,82 @@ struct AppendEntriesRequestDelay {
     delay_millis: u64,
 }
 
+/// A one-shot test gate placed before the receiving voter handles the chosen
+/// replicated entry.  Unlike a duration-based delay, its caller can prove
+/// that a quorum committed while this particular replica is still unable to
+/// advance its SQLite state machine.
+struct AppendEntriesApplyGate {
+    request_id: Box<[u8]>,
+    receipt_marker: Box<[u8]>,
+    armed: AtomicBool,
+    receipt_seen: AtomicBool,
+    was_reached: AtomicBool,
+    was_released: AtomicBool,
+    reached: Notify,
+    release: Notify,
+}
+
+impl AppendEntriesApplyGate {
+    fn after_record(request_id: Box<[u8]>, receipt_marker: Box<[u8]>) -> Arc<Self> {
+        Arc::new(Self {
+            request_id,
+            receipt_marker,
+            armed: AtomicBool::new(false),
+            receipt_seen: AtomicBool::new(false),
+            was_reached: AtomicBool::new(false),
+            was_released: AtomicBool::new(false),
+            reached: Notify::new(),
+            release: Notify::new(),
+        })
+    }
+
+    async fn wait_if_selected(&self, payload: &[u8]) {
+        if !self.armed.load(Ordering::SeqCst) || !contains_bytes(payload, &self.request_id) {
+            return;
+        }
+        // Record carries the verifier commitment while Finalize does not.
+        // Ignore repeated Record replication and block only the first later
+        // roster append, which is the exact Finalize application.
+        if !self.receipt_seen.load(Ordering::SeqCst) {
+            if contains_bytes(payload, &self.receipt_marker) {
+                self.receipt_seen.store(true, Ordering::SeqCst);
+            }
+            return;
+        }
+        if contains_bytes(payload, &self.receipt_marker) {
+            return;
+        }
+        self.was_reached.store(true, Ordering::SeqCst);
+        self.reached.notify_waiters();
+        loop {
+            let released = self.release.notified();
+            if self.was_released.load(Ordering::SeqCst) {
+                break;
+            }
+            released.await;
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    async fn reached(&self) {
+        loop {
+            let reached = self.reached.notified();
+            if self.was_reached.load(Ordering::SeqCst) {
+                break;
+            }
+            reached.await;
+        }
+    }
+
+    fn release(&self) {
+        self.was_released.store(true, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
 #[derive(Clone)]
 struct LoopbackPeer {
     target: SessionConsensusNodeId,
@@ -408,6 +544,7 @@ struct LoopbackPeer {
     forward_response_delay_millis: Arc<AtomicU64>,
     delayed_forward_responses: Arc<AtomicUsize>,
     append_entries_request_delay: Arc<StdMutex<Option<AppendEntriesRequestDelay>>>,
+    append_entries_apply_gate: Arc<StdMutex<Option<Arc<AppendEntriesApplyGate>>>>,
     delayed_append_entries: Arc<AtomicUsize>,
     rpc_delay_millis: Arc<AtomicU64>,
     delayed_calls: Arc<AtomicUsize>,
@@ -427,6 +564,7 @@ impl LoopbackPeer {
             forward_response_delay_millis: Arc::new(AtomicU64::new(0)),
             delayed_forward_responses: Arc::new(AtomicUsize::new(0)),
             append_entries_request_delay: Arc::new(StdMutex::new(None)),
+            append_entries_apply_gate: Arc::new(StdMutex::new(None)),
             delayed_append_entries: Arc::new(AtomicUsize::new(0)),
             rpc_delay_millis: Arc::new(AtomicU64::new(0)),
             delayed_calls: Arc::new(AtomicUsize::new(0)),
@@ -497,6 +635,20 @@ impl LoopbackPeer {
             .append_entries_request_delay
             .lock()
             .expect("append-entries request delay mutex") = None;
+    }
+
+    fn install_append_entries_apply_gate(&self, gate: Arc<AppendEntriesApplyGate>) {
+        *self
+            .append_entries_apply_gate
+            .lock()
+            .expect("append-entries apply gate mutex") = Some(gate);
+    }
+
+    fn clear_append_entries_apply_gate(&self) {
+        self.append_entries_apply_gate
+            .lock()
+            .expect("append-entries apply gate mutex")
+            .take();
     }
 
     fn delayed_append_entries(&self) -> usize {
@@ -629,6 +781,19 @@ impl SessionConsensusPeer for LoopbackPeer {
         if let Some(delay) = append_entries_delay {
             self.delayed_append_entries.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(delay).await;
+        }
+
+        let append_entries_apply_gate =
+            if request.family == SessionConsensusRpcFamily::AppendEntries {
+                self.append_entries_apply_gate
+                    .lock()
+                    .expect("append-entries apply gate mutex")
+                    .clone()
+            } else {
+                None
+            };
+        if let Some(gate) = append_entries_apply_gate {
+            gate.wait_if_selected(&request.payload).await;
         }
 
         {
@@ -1077,6 +1242,25 @@ impl TestCluster {
                     .stop_delaying_append_entries_for_request();
             }
         }
+    }
+
+    fn gate_append_entries_to(
+        &self,
+        source: usize,
+        target: usize,
+        gate: Arc<AppendEntriesApplyGate>,
+    ) {
+        self.paths
+            .get(&(source, target))
+            .expect("outbound path")
+            .install_append_entries_apply_gate(gate);
+    }
+
+    fn clear_append_entries_gate_to(&self, source: usize, target: usize) {
+        self.paths
+            .get(&(source, target))
+            .expect("outbound path")
+            .clear_append_entries_apply_gate();
     }
 
     fn delayed_forward_responses(&self, source: usize) -> usize {
@@ -5988,4 +6172,103 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         "a reopened predecessor terminal remains frozen"
     );
     assert_no_provider_io(&reopened_provider);
+}
+
+#[tokio::test]
+async fn managed_provider_finalize_forwarded_by_a_stale_follower_waits_for_its_exact_applied_index()
+{
+    let cluster =
+        TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+            .await;
+    let (leader, _, _) = cluster.observed_leader();
+    let caller = (leader + 1) % MEMBER_COUNT;
+    let scope = cluster.stores[leader]
+        .consumer_scope()
+        .expect("current consumer scope");
+    activate_managed_provider_adapter_roster(&cluster.stores[leader], scope, 0xf4).await;
+    let worker = SessionConsumerIdentity::new("spiffe://managed-adapter/exact-local-apply")
+        .expect("worker identity");
+    let admission = admit_managed_provider_adapter_roster(
+        &cluster.stores[leader],
+        scope,
+        &worker,
+        managed_provider_adapter_admission(0xf5, 1),
+    )
+    .await;
+    // Arm only after Start has committed and provider execution begins. The
+    // next matching append is Record and the one after it is Finalize.
+    let gate = AppendEntriesApplyGate::after_record(Box::new([0xf5; 16]), Box::new([0xf7; 32]));
+    let provider = ManagedProviderAdapterDouble::applied_arming(gate.clone());
+    let caller_facade = cluster.stores[caller]
+        .managed_provider_job_facade(
+            scope,
+            worker.clone(),
+            [0xf6; 32],
+            [0xf7; 32],
+            provider.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct follower facade");
+    // Gate Finalize before the caller's handler, leaving the leader and the
+    // third voter as the committing majority.
+    cluster.gate_append_entries_to(leader, caller, gate.clone());
+    let forwards_before = cluster.forward_mutation_calls(caller);
+    let replay_admission = admission.clone();
+    let mut task = tokio::spawn(async move {
+        caller_facade
+            .run_member(
+                admission,
+                Box::new([0xf8]),
+                FencedMutationRosterOrdinal::new(0).expect("test ordinal"),
+            )
+            .await
+    });
+
+    tokio::select! {
+        () = gate.reached() => {}
+        result = &mut task => panic!("forwarded managed operation finished before Finalize gate: {result:?}"),
+    }
+    assert!(
+        cluster.forward_mutation_calls(caller) > forwards_before,
+        "the managed mutation was forwarded through the non-leader caller"
+    );
+    tokio::task::yield_now().await;
+    assert!(
+        !task.is_finished(),
+        "the forwarding caller must not classify stale SQLite state before Finalize applies locally"
+    );
+
+    gate.release();
+    let result = task
+        .await
+        .expect("forwarded managed operation task joins")
+        .expect("exact local applied-index wait returns terminal status");
+    cluster.clear_append_entries_gate_to(leader, caller);
+    assert_eq!(result.mode(), ManagedProviderJobMode::ManagedV5);
+    assert_eq!(result.phase(), ManagedProviderJobMemberPhase::Established);
+    assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+
+    // An accepted replay shares the public coordinator path and must read the
+    // terminal instead of executing the provider again.
+    let replay_provider = ManagedProviderAdapterDouble::applied();
+    let replay = cluster.stores[caller]
+        .managed_provider_job_facade(
+            scope,
+            SessionConsumerIdentity::new("spiffe://managed-adapter/exact-local-apply")
+                .expect("worker identity"),
+            [0xf6; 32],
+            [0xf7; 32],
+            replay_provider.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct replay facade")
+        .run_member(
+            replay_admission,
+            Box::new([0xf8]),
+            FencedMutationRosterOrdinal::new(0).expect("test ordinal"),
+        )
+        .await
+        .expect("accepted terminal replay");
+    assert_eq!(replay.phase(), ManagedProviderJobMemberPhase::Established);
+    assert_no_provider_io(&replay_provider);
 }
