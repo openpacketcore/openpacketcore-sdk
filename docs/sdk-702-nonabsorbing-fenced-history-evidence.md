@@ -230,10 +230,16 @@ or a 1,000 operations/second claim. The authoritative release-scale command is
 now:
 
 ```text
-cargo test --locked -p opc-session-store --test fenced_transition_v2_qualification \
+cargo test --locked --release -p opc-session-store --test fenced_transition_v2_qualification \
   --all-features release_1010000_operation_successor_scale_is_bounded_and_recoverable \
   -- --ignored --exact --nocapture
 ```
+
+The optimized Cargo `release` profile is part of the evidence contract. The
+test fails closed before allocating voter state when `debug_assertions` are
+enabled, and its fixed-dimension phase and final summaries record
+`cargo_profile=release`. Default unoptimized test-profile output is diagnostic
+only and cannot qualify the performance gate.
 
 `release_1010000_operation_successor_scale_is_bounded_and_recoverable` opens
 three real fixed durable-quorum OpenRaft voters backed by SQLite. It submits

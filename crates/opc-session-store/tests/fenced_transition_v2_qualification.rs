@@ -1497,6 +1497,16 @@ async fn pace_release_phase(phase_started: Instant, submitted: usize, per_second
     }
 }
 
+#[cfg(debug_assertions)]
+fn require_release_qualification_profile() {
+    panic!(
+        "SDK-702 release qualification requires cargo test --release; debug-profile output is non-acceptance evidence"
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn require_release_qualification_profile() {}
+
 /// Full SDK-702 release workload through a real three-voter OpenRaft quorum.
 ///
 /// This is intentionally ignored: it submits the real 1,010,000 operations
@@ -1508,6 +1518,7 @@ async fn pace_release_phase(phase_started: Instant, submitted: usize, per_second
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "SDK-702 real 1,010,000-operation three-voter release qualification"]
 async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() {
+    require_release_qualification_profile();
     let started = Instant::now();
     let directory = tempfile::tempdir().expect("SDK-702 release qualification directory");
     let start = Timestamp::from_offset_datetime(
@@ -1784,7 +1795,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         let (batch_p99, batch_p999, item_p99, item_p999) = latency.p99_and_p999();
         let achieved_ops_per_second = operations as f64 / elapsed.as_secs_f64();
         eprintln!(
-            "sdk-702 successor phase: name={phase_name} offered_ops_per_second={target_rate} achieved_ops_per_second={achieved_ops_per_second:.6} operations={operations} batch_samples={batch_samples} item_samples={item_samples} peak_unjoined_batch_task_slots={peak_unjoined_batch_task_slots} batch_p99_us={} batch_p999_us={} item_p99_us={} item_p999_us={} elapsed_ms={}",
+            "sdk-702 successor phase: cargo_profile=release name={phase_name} offered_ops_per_second={target_rate} achieved_ops_per_second={achieved_ops_per_second:.6} operations={operations} batch_samples={batch_samples} item_samples={item_samples} peak_unjoined_batch_task_slots={peak_unjoined_batch_task_slots} batch_p99_us={} batch_p999_us={} item_p99_us={} item_p999_us={} elapsed_ms={}",
             batch_p99.as_micros(),
             batch_p999.as_micros(),
             item_p99.as_micros(),
@@ -2009,7 +2020,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         .collect::<Vec<_>>();
     let peak_rss_kib = process_peak_rss_kib();
     eprintln!(
-        "sdk-702 successor qualification: elapsed_ms={} topology_voters={} release_operations_committed={} active_reclaim_operations_committed=1 total_operations_committed={} rotations={} semantic_history_ceiling_bytes={} transient_exact_retries={} pre_reclaim_db_bytes_by_voter={database_bytes_before_reclaim_by_voter:?} pre_reclaim_snapshot_bytes_by_voter={snapshot_bytes_before_reclaim_by_voter:?} post_reclaim_db_bytes_by_voter={database_bytes_by_voter:?} post_reclaim_snapshot_bytes_by_voter={snapshot_bytes_by_voter:?} reclaimed_entries={} reclaim_remaining={} peak_rss_kib={peak_rss_kib}",
+        "sdk-702 successor qualification: cargo_profile=release elapsed_ms={} topology_voters={} release_operations_committed={} active_reclaim_operations_committed=1 total_operations_committed={} rotations={} semantic_history_ceiling_bytes={} transient_exact_retries={} pre_reclaim_db_bytes_by_voter={database_bytes_before_reclaim_by_voter:?} pre_reclaim_snapshot_bytes_by_voter={snapshot_bytes_before_reclaim_by_voter:?} post_reclaim_db_bytes_by_voter={database_bytes_by_voter:?} post_reclaim_snapshot_bytes_by_voter={snapshot_bytes_by_voter:?} reclaimed_entries={} reclaim_remaining={} peak_rss_kib={peak_rss_kib}",
         started.elapsed().as_millis(),
         stores.len(),
         QUALIFICATION_RELEASE_TRANSITIONS,
