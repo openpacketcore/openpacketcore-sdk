@@ -3415,10 +3415,32 @@ struct PersistentReconnectSetup {
 }
 
 impl PersistentReconnectSetup {
+    async fn superseded(&self) {
+        match &self.attempt {
+            Some(attempt) => attempt.superseded().await,
+            None => std::future::pending().await,
+        }
+    }
+
     fn succeeded(mut self) {
         if let Some(attempt) = self.attempt.take() {
             attempt.succeeded();
         }
+    }
+}
+
+async fn poll_persistent_reconnect_setup<F, T>(
+    future: F,
+    reconnect_setup: &PersistentReconnectSetup,
+) -> Result<T, SessionConsumerClientError>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        _ = reconnect_setup.superseded() => Err(SessionConsumerClientError::Deadline),
+        value = &mut future => Ok(value),
     }
 }
 
@@ -4240,20 +4262,29 @@ impl StatelessSessionConsumerClient {
         };
         let resolve_attempt =
             ConsumerSetupPhaseAttempt::begin(setup_counters, ConsumerSetupPhase::Resolve);
-        let address = tokio::time::timeout_at(
-            pre_request_deadline,
-            poll_persistent_consumer_setup_io((self.resolve)(), shutdown_io.as_ref()),
+        let address = poll_persistent_reconnect_setup(
+            tokio::time::timeout_at(
+                pre_request_deadline,
+                poll_persistent_consumer_setup_io((self.resolve)(), shutdown_io.as_ref()),
+            ),
+            &reconnect_setup,
         )
-        .await
+        .await?
         .map_err(|_| SessionConsumerClientError::Unavailable)?
         .map_err(|_| SessionConsumerClientError::Unavailable)?;
         resolve_attempt.complete();
         let tcp_attempt = ConsumerSetupPhaseAttempt::begin(setup_counters, ConsumerSetupPhase::Tcp);
-        let tcp = tokio::time::timeout_at(
-            pre_request_deadline,
-            poll_persistent_consumer_setup_io(TcpStream::connect(address), shutdown_io.as_ref()),
+        let tcp = poll_persistent_reconnect_setup(
+            tokio::time::timeout_at(
+                pre_request_deadline,
+                poll_persistent_consumer_setup_io(
+                    TcpStream::connect(address),
+                    shutdown_io.as_ref(),
+                ),
+            ),
+            &reconnect_setup,
         )
-        .await
+        .await?
         .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
         .map_err(|_| SessionConsumerClientError::Unavailable)?;
         tcp.set_nodelay(true)
@@ -4272,14 +4303,17 @@ impl StatelessSessionConsumerClient {
             .map_err(|_| SessionConsumerClientError::Authentication)?;
         let connector =
             tokio_rustls::TlsConnector::from(consumer_client_tls_config(handshake.rustls_config()));
-        let tls = tokio::time::timeout_at(
-            pre_request_deadline,
-            poll_persistent_consumer_setup_io(
-                connector.connect(self.server_name.clone(), tcp),
-                shutdown_io.as_ref(),
+        let tls = poll_persistent_reconnect_setup(
+            tokio::time::timeout_at(
+                pre_request_deadline,
+                poll_persistent_consumer_setup_io(
+                    connector.connect(self.server_name.clone(), tcp),
+                    shutdown_io.as_ref(),
+                ),
             ),
+            &reconnect_setup,
         )
-        .await
+        .await?
         .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
         .map_err(|error| SessionConsumerClientError::from(classify_tls_io_error(error)))
         .map_err(|error| pre_request_error(error, pre_request_budget_active))?;
@@ -4350,6 +4384,9 @@ impl StatelessSessionConsumerClient {
                 }
                 let result = tokio::select! {
                     biased;
+                    _ = reconnect_setup.superseded() => {
+                        return Err(SessionConsumerClientError::Deadline);
+                    }
                     _ = tokio::time::sleep_until(setup_deadline) => {
                         return Err(pre_request_timeout_error(pre_request_budget_active));
                     }
@@ -4398,6 +4435,9 @@ impl StatelessSessionConsumerClient {
                 }
                 let result = tokio::select! {
                     biased;
+                    _ = reconnect_setup.superseded() => {
+                        return Err(SessionConsumerClientError::Deadline);
+                    }
                     _ = tokio::time::sleep_until(setup_deadline) => {
                         return Err(pre_request_timeout_error(pre_request_budget_active));
                     }

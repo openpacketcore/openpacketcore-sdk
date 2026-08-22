@@ -737,6 +737,49 @@ fn persistent_client(
         .expect("persistent client")
 }
 
+struct ResolverAttemptGuard {
+    active: Arc<AtomicUsize>,
+    first_dropped: Arc<AtomicBool>,
+    ordinal: usize,
+}
+
+impl ResolverAttemptGuard {
+    fn enter(
+        active: Arc<AtomicUsize>,
+        peak: &AtomicUsize,
+        first_dropped: Arc<AtomicBool>,
+        ordinal: usize,
+    ) -> Self {
+        let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut observed_peak = peak.load(Ordering::SeqCst);
+        while concurrent > observed_peak {
+            match peak.compare_exchange_weak(
+                observed_peak,
+                concurrent,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => observed_peak = actual,
+            }
+        }
+        Self {
+            active,
+            first_dropped,
+            ordinal,
+        }
+    }
+}
+
+impl Drop for ResolverAttemptGuard {
+    fn drop(&mut self) {
+        if self.ordinal == 1 {
+            self.first_dropped.store(true, Ordering::SeqCst);
+        }
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn persistent_pool_shares_one_recovery_probe_across_twelve_callers() {
     const CALLERS: usize = 12;
@@ -906,6 +949,137 @@ async fn persistent_pool_shares_one_recovery_probe_across_twelve_callers() {
             .collect::<Vec<_>>(),
         "one pool publishes exact shared 50/100/200/400ms exponential recovery edges"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn credential_epoch_supersedes_blocked_pool_recovery_without_waiting_for_setup_deadline() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("superseded-recovery-server");
+    let client_spiffe = spiffe("superseded-recovery-client");
+    let (_authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let resolver_attempts = Arc::new(AtomicUsize::new(0));
+    let active_resolvers = Arc::new(AtomicUsize::new(0));
+    let peak_resolvers = Arc::new(AtomicUsize::new(0));
+    let first_entered = Arc::new(AtomicBool::new(false));
+    let first_dropped = Arc::new(AtomicBool::new(false));
+    let second_saw_first_dropped = Arc::new(AtomicBool::new(false));
+    let resolver: RemoteAddrResolver = {
+        let resolver_attempts = Arc::clone(&resolver_attempts);
+        let active_resolvers = Arc::clone(&active_resolvers);
+        let peak_resolvers = Arc::clone(&peak_resolvers);
+        let first_entered = Arc::clone(&first_entered);
+        let first_dropped = Arc::clone(&first_dropped);
+        let second_saw_first_dropped = Arc::clone(&second_saw_first_dropped);
+        Arc::new(move || {
+            let resolver_attempts = Arc::clone(&resolver_attempts);
+            let active_resolvers = Arc::clone(&active_resolvers);
+            let peak_resolvers = Arc::clone(&peak_resolvers);
+            let first_entered = Arc::clone(&first_entered);
+            let first_dropped = Arc::clone(&first_dropped);
+            let second_saw_first_dropped = Arc::clone(&second_saw_first_dropped);
+            Box::pin(async move {
+                let ordinal = resolver_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                let _activity = ResolverAttemptGuard::enter(
+                    active_resolvers,
+                    peak_resolvers.as_ref(),
+                    Arc::clone(&first_dropped),
+                    ordinal,
+                );
+                if ordinal == 1 {
+                    first_entered.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                    unreachable!("the stale resolver is cancelled by the fresh epoch");
+                }
+                second_saw_first_dropped
+                    .store(first_dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+                Err(std::io::Error::other(
+                    "fresh-epoch test resolver unavailable",
+                ))
+            })
+        })
+    };
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::try_from("persistent-consumer.test.invalid")
+            .expect("test server name"),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    )
+    .with_operation_timeout(Duration::from_secs(2));
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        stateless,
+        PersistentSessionConsumerConfig::try_new(
+            2,
+            0,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(1_500),
+            1,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("fixed supersession config"),
+    )
+    .expect("persistent client");
+    let first_client = client.clone();
+    let first = tokio::spawn(async move { first_client.capabilities().await });
+    for _ in 0..128 {
+        if first_entered.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        first_entered.load(Ordering::SeqCst),
+        "the first epoch owns the blocked resolver setup"
+    );
+
+    client
+        .request_reauthentication()
+        .expect("publish a fresh credential epoch");
+    let fresh_epoch_started_at = tokio::time::Instant::now();
+    let second_client = client.clone();
+    let second = tokio::spawn(async move { second_client.capabilities().await });
+    for _ in 0..128 {
+        if resolver_attempts.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        resolver_attempts.load(Ordering::SeqCst),
+        2,
+        "the fresh epoch must begin without waiting for the stale setup deadline"
+    );
+    assert_eq!(
+        tokio::time::Instant::now(),
+        fresh_epoch_started_at,
+        "credential supersession consumes no virtual setup time"
+    );
+    assert!(
+        first_dropped.load(Ordering::SeqCst),
+        "the stale resolver future is cancelled before the fresh setup begins"
+    );
+    assert!(
+        second_saw_first_dropped.load(Ordering::SeqCst),
+        "the serial permit transfers only after stale setup cancellation"
+    );
+    assert_eq!(
+        peak_resolvers.load(Ordering::SeqCst),
+        1,
+        "credential supersession preserves one pool-wide recovery probe"
+    );
+    assert!(matches!(
+        first.await.expect("stale caller task completes"),
+        Err(SessionConsumerClientError::Deadline)
+    ));
+    assert!(matches!(
+        second.await.expect("fresh caller task completes"),
+        Err(SessionConsumerClientError::Unavailable)
+    ));
+    client.shutdown().await;
 }
 
 #[tokio::test]

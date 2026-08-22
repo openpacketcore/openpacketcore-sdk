@@ -24,7 +24,7 @@ independent logical clients, as independent persistent constructors do.
 The closure successor starts exactly at SDK commit
 `f2ed1181c85540cc01ea0b4611fa3620891375fd`, tree
 `945ceab3870d2c1d2d1396aff29e819288fce76a`. It does not contain, rebase, or
-merge the stale qualification branch. Three focused regressions retained the
+merge the stale qualification branch. Four focused regressions retained the
 following current-main RED evidence before the generic correction:
 
 ```text
@@ -34,11 +34,13 @@ persistent_pool_shares_one_recovery_probe_across_twelve_callers
   peak simultaneous resolver calls: observed 12, required 1
 pre_staged_future_rejection_after_a_completed_call_is_outcome_unknown
   observed typed Rejected(Unavailable), required OutcomeUnknown
+credential_epoch_supersedes_blocked_pool_recovery_without_waiting_for_setup_deadline
+  fresh-epoch resolver calls without advancing the paused clock: observed 1, required 2
 ```
 
 The causal correction is consumer transport revision 5. It retains the
 tenant-scoped mTLS/SPIFFE/ALPN/Hello authority and all fixed resource bounds,
-while adding four generic guarantees:
+while adding five generic guarantees:
 
 - explicit prewarm rolls every configured lane through a fresh
   resolver/TCP/TLS/Hello exchange and preserves refreshed plus unprocessed
@@ -46,6 +48,9 @@ while adding four generic guarantees:
 - all cold request, watch, and prewarm setups in one pool share one serialized
   recovery lane and one coalesced exponential backoff deadline for failed setup
   or proven cached-lane loss;
+- a newer credential/material epoch cancels the stale serialized
+  resolver/TCP/TLS/Hello setup before the fresh setup acquires that lane, with
+  no old-epoch cooldown publication and no setup-deadline wait;
 - each connection-local monotonic sequence is paired with a fresh
   unpredictable UUID nonce whose field is serialized only after the complete
   request, and the exact composite value is required in the response; and
@@ -72,16 +77,17 @@ cargo test -p opc-session-net --all-features \
   --test persistent_consumer_protocol \
   --test persistent_consumer_boundaries \
   --test persistent_consumer_transport
-  boundaries: 7 passed; protocol: 26 passed; transport: 29 passed
+  boundaries: 7 passed; protocol: 26 passed; transport: 30 passed
 cargo test -p opc-session-testkit --all-features --test qualification_profile
   19 passed; 0 failed
 ```
 
 The focused transport fixtures bind one serialized recovery probe across 12
-callers, coalesced bounded backoff, stale-epoch isolation, rolling fresh
-prewarm, production mTLS/SPIFFE/ALPN/Hello admission, exact composite
-correlation, below-TLS write classification, watch/request cancellation, and
-fixed request/watch/physical-admission bounds. They are correctness evidence;
+callers, coalesced bounded backoff, zero-time stale-epoch setup cancellation,
+rolling fresh prewarm, production mTLS/SPIFFE/ALPN/Hello admission, exact
+composite correlation, below-TLS write classification, watch/request
+cancellation, and fixed request/watch/physical-admission bounds. They are
+correctness evidence;
 they do not replace the still-required production three-voter network latency
 qualification.
 
