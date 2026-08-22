@@ -42,7 +42,8 @@ use opc_session_store::{
     SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerIdentity,
     SessionConsumerScope, SessionConsumerV3Operation, SessionConsumerV3Request,
-    SessionConsumerV3Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionConsumerV3Response, SessionConsumerV4Operation, SessionConsumerV4Request,
+    SessionConsumerV4Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
     SessionPayloadEncoding, SessionQuorumConsumer, SessionStorePlatformProfile,
     SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord, SystemClock,
     TopologyAttestationClaims, TopologyAttestationEvidence, TopologyAttestationPolicy,
@@ -102,6 +103,7 @@ struct ManagedProviderAdapterDouble {
     status_outcome: AdapterStatusOutcome,
     execute_calls: Arc<AtomicUsize>,
     status_calls: Arc<AtomicUsize>,
+    adopt_calls: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +119,7 @@ impl ManagedProviderAdapterDouble {
             status_outcome: AdapterStatusOutcome::Inconclusive,
             execute_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
+            adopt_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -126,6 +129,7 @@ impl ManagedProviderAdapterDouble {
             status_outcome: AdapterStatusOutcome::Inconclusive,
             execute_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
+            adopt_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -135,6 +139,7 @@ impl ManagedProviderAdapterDouble {
             status_outcome: AdapterStatusOutcome::NotApplied,
             execute_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
+            adopt_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -144,6 +149,7 @@ impl ManagedProviderAdapterDouble {
             status_outcome: AdapterStatusOutcome::Inconclusive,
             execute_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
+            adopt_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -193,6 +199,7 @@ impl ManagedProviderJobRemoteProvider for ManagedProviderAdapterDouble {
         context: &FencedMutationRosterMemberExecutionContext<'_>,
         _status: opc_session_store::ManagedProviderMemberStatus,
     ) -> Result<FencedMutationRosterMemberAttestation, Self::Error> {
+        self.adopt_calls.fetch_add(1, Ordering::SeqCst);
         Self::attestation(context, FencedMutationRosterProviderOutcome::AppliedAdopted)
     }
 }
@@ -294,6 +301,63 @@ async fn admit_managed_provider_adapter_roster(
         "public V3 roster admission must commit before the managed facade runs: {response:?}"
     );
     admission
+}
+
+async fn terminalize_predecessor_adapter_roster(
+    store: &ConsensusSessionStore,
+    scope: SessionConsumerScope,
+    identity: &SessionConsumerIdentity,
+    admission: &FencedMutationRosterAdmission,
+) {
+    let attestations = admission
+        .members()
+        .as_slice()
+        .iter()
+        .map(|member| {
+            let context = FencedMutationRosterMemberExecutionContext::for_admission_member(
+                admission,
+                member.ordinal(),
+            )
+            .expect("admitted predecessor member context");
+            ManagedProviderAdapterDouble::attestation(
+                &context,
+                FencedMutationRosterProviderOutcome::AppliedExecuted,
+            )
+            .expect("predecessor attestation")
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let response = store
+        .consumer_service_with_attestation_verifier(Arc::new(ManagedProviderAdapterVerifier))
+        .execute_v4(
+            identity,
+            SessionConsumerV4Request::new(
+                scope,
+                SessionConsumerV4Operation::FencedMutationRosterTerminalizeAttested {
+                    admission: Box::new(admission.clone()),
+                    attestations,
+                    protected_checkpoint: admission
+                        .protected_plan()
+                        .as_bytes()
+                        .to_vec()
+                        .into_boxed_slice(),
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            response,
+            SessionConsumerV4Response::FencedMutationRosterTerminalize(Ok(_))
+        ),
+        "public V4 predecessor terminal must commit before managed facade runs: {response:?}"
+    );
+}
+
+fn assert_no_provider_io(provider: &ManagedProviderAdapterDouble) {
+    assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.status_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
 }
 
 fn assert_no_managed_provider_rows(
@@ -5560,7 +5624,7 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
             .await,
         Err(ManagedProviderJobError::InvalidMember)
     );
-    assert_eq!(unadmitted_provider.execute_calls.load(Ordering::SeqCst), 0);
+    assert_no_provider_io(&unadmitted_provider);
     assert_no_managed_provider_rows(&cluster, leader, &unadmitted_admission);
     assert_eq!(
         unadmitted
@@ -5572,7 +5636,7 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
             .await,
         Err(ManagedProviderJobError::Unavailable)
     );
-    assert_eq!(unadmitted_provider.execute_calls.load(Ordering::SeqCst), 0);
+    assert_no_provider_io(&unadmitted_provider);
     assert_no_managed_provider_rows(&cluster, leader, &unadmitted_admission);
 
     // All matching members: Ensure, Start, Record, and Finalize report the
@@ -5719,28 +5783,24 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         ConsensusConfigurationEpoch::new(current.configuration_epoch().get() + 1)
             .expect("successor epoch"),
     ));
+    let stale_provider = ManagedProviderAdapterDouble::applied();
     let unauthorized = cluster.stores[leader]
         .managed_provider_job_facade(
             stale_scope,
             worker.clone(),
             [0xb1; 32],
             [0xb2; 32],
-            inconclusive.clone(),
+            stale_provider.clone(),
             ManagedProviderAdapterVerifier,
         )
         .expect("factory seals stale scope for pre-I/O rejection");
-    let calls_before_unauthorized = inconclusive.execute_calls.load(Ordering::SeqCst);
     assert_eq!(
         unauthorized
             .run_member(reconciliation_admission, Box::new([0x93]), ordinal)
             .await,
         Err(ManagedProviderJobError::Unavailable)
     );
-    assert_eq!(
-        inconclusive.execute_calls.load(Ordering::SeqCst),
-        calls_before_unauthorized,
-        "unauthorized scope reaches no provider I/O"
-    );
+    assert_no_provider_io(&stale_provider);
 
     // Conclusive NotApplied after EffectStarted records the verifier-bound
     // receipt and invokes the Abort command.  Its replicated abort latch is
@@ -5850,4 +5910,62 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
     assert_eq!(replay.mode(), ManagedProviderJobMode::ManagedV5);
     assert_eq!(replay.phase(), ManagedProviderJobMemberPhase::Aborted);
     assert_eq!(compensated_provider.execute_calls.load(Ordering::SeqCst), 1);
+
+    // A predecessor terminal also uses mode 3, but it has no matching
+    // managed authority/job commitment. The facade must not reinterpret that
+    // durable predecessor terminal as V5 or touch any provider path.
+    let predecessor_provider = ManagedProviderAdapterDouble::applied();
+    let predecessor = cluster.stores[leader]
+        .managed_provider_job_facade(
+            scope,
+            worker.clone(),
+            [0xe1; 32],
+            [0xe2; 32],
+            predecessor_provider.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct predecessor facade");
+    let predecessor_admission = admit_managed_provider_adapter_roster(
+        &cluster.stores[leader],
+        scope,
+        &worker,
+        managed_provider_adapter_admission(0xe0, 1),
+    )
+    .await;
+    terminalize_predecessor_adapter_roster(
+        &cluster.stores[leader],
+        scope,
+        &worker,
+        &predecessor_admission,
+    )
+    .await;
+    assert_eq!(
+        predecessor
+            .run_member(predecessor_admission.clone(), Box::new([0xe3]), ordinal,)
+            .await,
+        Err(ManagedProviderJobError::FrozenV4Terminal)
+    );
+    assert_no_provider_io(&predecessor_provider);
+    // A fresh facade on a different file-backed voter has no process-local
+    // memory of the terminal; it must derive the same frozen result from the
+    // replicated predecessor state after reopening the public surface.
+    let reopened_provider = ManagedProviderAdapterDouble::applied();
+    let reopened = cluster.stores[(leader + 1) % MEMBER_COUNT]
+        .managed_provider_job_facade(
+            scope,
+            worker,
+            [0xe1; 32],
+            [0xe2; 32],
+            reopened_provider.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct reopened predecessor facade");
+    assert_eq!(
+        reopened
+            .run_member(predecessor_admission, Box::new([0xe3]), ordinal)
+            .await,
+        Err(ManagedProviderJobError::FrozenV4Terminal),
+        "a reopened predecessor terminal remains frozen"
+    );
+    assert_no_provider_io(&reopened_provider);
 }

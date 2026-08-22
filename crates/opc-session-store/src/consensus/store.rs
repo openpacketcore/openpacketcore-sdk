@@ -892,15 +892,19 @@ impl fmt::Debug for ConsensusSessionStore {
     }
 }
 
-fn managed_provider_status(mode: u8, phase: u8) -> Result<ManagedProviderJobStatus, StoreError> {
+fn managed_provider_status(
+    mode: u8,
+    phase: u8,
+    managed_terminal: bool,
+) -> Result<ManagedProviderJobStatus, StoreError> {
     let mode = match mode {
         0 => ManagedProviderJobMode::Unselected,
         1 => ManagedProviderJobMode::FrozenV4Terminal,
-        // Mode 3 is the managed terminal claim. A terminal command returns
-        // its terminal phase, while an exact replay returns phase zero and
-        // the subsequent durable member lookup supplies the terminal phase.
-        // Neither is a predecessor V4 terminal.
-        3 => ManagedProviderJobMode::ManagedV5,
+        // Mode 3 is shared by the ordinary predecessor terminal and the V5
+        // terminal.  Only the latter has an exact persisted V5 authority and
+        // terminal job set; mode alone must remain frozen.
+        3 if managed_terminal => ManagedProviderJobMode::ManagedV5,
+        3 => ManagedProviderJobMode::FrozenV4Terminal,
         2 => ManagedProviderJobMode::ManagedV5,
         _ => return Err(consensus_unavailable()),
     };
@@ -968,7 +972,8 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
             .await?;
         match response.result? {
             SessionMutationOutcome::ManagedProviderJob(outcome) => {
-                managed_provider_status(outcome.mode, outcome.phase)
+                self.managed_provider_outcome_status(admission, authority, outcome)
+                    .await
             }
             _ => Err(consensus_unavailable()),
         }
@@ -995,7 +1000,13 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
                 authority.worker_identity_commitment(),
             )
             .await?;
-        managed_provider_status(mode, phase)
+        let managed_terminal = if mode == 3 {
+            self.managed_provider_terminal_is_managed(id.roster(), authority)
+                .await?
+        } else {
+            false
+        };
+        managed_provider_status(mode, phase, managed_terminal)
     }
 
     async fn mark_member_effect_started(
@@ -1014,7 +1025,7 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
             .submit_request_before(
                 SessionConsensusRequestId::new(),
                 SessionMutationIntent::StartManagedProviderMember {
-                    admission: Box::new(admission),
+                    admission: Box::new(admission.clone()),
                     ordinal: id.ordinal().get(),
                     worker_digest: authority.worker_identity_commitment(),
                 },
@@ -1028,7 +1039,8 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
             }
             SessionMutationOutcome::ManagedProviderJob(outcome) => {
                 Ok(ManagedProviderJobEffectStart::Existing(
-                    managed_provider_status(outcome.mode, outcome.phase)?,
+                    self.managed_provider_outcome_status(&admission, authority, outcome)
+                        .await?,
                 ))
             }
             _ => Err(consensus_unavailable()),
@@ -1052,7 +1064,7 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
             .submit_request_before(
                 SessionConsensusRequestId::new(),
                 SessionMutationIntent::RecordManagedProviderReceipt {
-                    admission: Box::new(admission),
+                    admission: Box::new(admission.clone()),
                     ordinal: id.ordinal().get(),
                     worker_digest: authority.worker_identity_commitment(),
                     verifier_digest: authority.verifier_identity_commitment(),
@@ -1065,7 +1077,8 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
             .await?;
         match response.result? {
             SessionMutationOutcome::ManagedProviderJob(outcome) => {
-                managed_provider_status(outcome.mode, outcome.phase)
+                self.managed_provider_outcome_status(&admission, authority, outcome)
+                    .await
             }
             _ => Err(consensus_unavailable()),
         }
@@ -1093,7 +1106,8 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
             .await?;
         match response.result? {
             SessionMutationOutcome::ManagedProviderJob(outcome) => {
-                managed_provider_status(outcome.mode, outcome.phase)
+                self.managed_provider_outcome_status(admission, authority, outcome)
+                    .await
             }
             _ => Err(consensus_unavailable()),
         }
@@ -1144,7 +1158,7 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
             .submit_request_before(
                 SessionConsensusRequestId::new(),
                 SessionMutationIntent::AbortManagedProviderNotApplied {
-                    admission: Box::new(admission),
+                    admission: Box::new(admission.clone()),
                     ordinal: id.ordinal().get(),
                     worker_digest: authority.worker_identity_commitment(),
                 },
@@ -1154,7 +1168,8 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
             .await?;
         match response.result? {
             SessionMutationOutcome::ManagedProviderJob(outcome) => {
-                managed_provider_status(outcome.mode, outcome.phase)
+                self.managed_provider_outcome_status(&admission, authority, outcome)
+                    .await
             }
             _ => Err(consensus_unavailable()),
         }
@@ -1176,7 +1191,7 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
             .submit_request_before(
                 SessionConsensusRequestId::new(),
                 SessionMutationIntent::RequireManagedProviderReconciliation {
-                    admission: Box::new(admission),
+                    admission: Box::new(admission.clone()),
                     ordinal: id.ordinal().get(),
                     worker_digest: authority.worker_identity_commitment(),
                 },
@@ -1186,7 +1201,8 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
             .await?;
         match response.result? {
             SessionMutationOutcome::ManagedProviderJob(outcome) => {
-                managed_provider_status(outcome.mode, outcome.phase)
+                self.managed_provider_outcome_status(&admission, authority, outcome)
+                    .await
             }
             _ => Err(consensus_unavailable()),
         }
@@ -1269,6 +1285,37 @@ impl ConsensusSessionStore {
             return Err(StoreError::TopologyAuthorityRevoked);
         }
         Ok(admission)
+    }
+
+    async fn managed_provider_terminal_is_managed(
+        &self,
+        request_id: FencedMutationRosterRequestId,
+        authority: ManagedProviderJobAuthority,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .backend
+            .consensus_managed_provider_terminal_is_managed(
+                self.inner.storage_identity,
+                request_id.to_bytes(),
+                authority.worker_identity_commitment(),
+                authority.verifier_identity_commitment(),
+            )
+            .await
+    }
+
+    async fn managed_provider_outcome_status(
+        &self,
+        admission: &FencedMutationRosterAdmission,
+        authority: ManagedProviderJobAuthority,
+        outcome: ManagedProviderJobMutationOutcome,
+    ) -> Result<ManagedProviderJobStatus, StoreError> {
+        let managed_terminal = if outcome.mode == 3 {
+            self.managed_provider_terminal_is_managed(admission.request_id(), authority)
+                .await?
+        } else {
+            false
+        };
+        managed_provider_status(outcome.mode, outcome.phase, managed_terminal)
     }
 
     fn require_dynamic_consensus_platform() -> Result<(), ConsensusSessionStoreOpenError> {
@@ -5641,21 +5688,15 @@ fn managed_provider_outcome_matches_intent(
     intent: &SessionMutationIntent,
     outcome: &ManagedProviderJobMutationOutcome,
 ) -> bool {
-    let valid_mode_phase = |mode, phase| {
-        matches!(
-            (mode, phase),
-            (0, 0) | (1, 0..=5) | (2, 0..=5) | (3, 0 | 4 | 5)
-        )
-    };
-    if !valid_mode_phase(outcome.mode, outcome.phase) {
-        return false;
-    }
     match intent {
         SessionMutationIntent::EnsureManagedProviderJob { .. } => {
             !outcome.execute
                 && matches!(
                     (outcome.mode, outcome.phase),
-                    (1, 0) | (2, 0) | (3, 0 | 4 | 5)
+                    // Ensure creates or observes V5 ownership.  Any prior
+                    // terminal is an exact phase-zero replay; only Finalize
+                    // can return a terminal phase.
+                    (1, 0) | (2, 0) | (3, 0)
                 )
         }
         SessionMutationIntent::StartManagedProviderMember { .. } => {
@@ -5663,32 +5704,26 @@ fn managed_provider_outcome_matches_intent(
                 || (!outcome.execute
                     && matches!(
                         (outcome.mode, outcome.phase),
-                        (1, 0..=5) | (2, 1..=5) | (3, 0)
+                        // Mode 0/1/3 are non-applicable replays, all with
+                        // phase zero. The V5 rows can only be in one of the
+                        // durable nonterminal or abort-latched states here.
+                        (0 | 1 | 3, 0) | (2, 1 | 2 | 3 | 5)
                     ))
         }
         SessionMutationIntent::RecordManagedProviderReceipt { .. } => {
-            !outcome.execute
-                && matches!(
-                    (outcome.mode, outcome.phase),
-                    (2, 2 | 5) | (1, 0..=5) | (3, 0)
-                )
+            !outcome.execute && matches!((outcome.mode, outcome.phase), (0 | 1 | 3, 0) | (2, 2 | 5))
         }
         SessionMutationIntent::RequireManagedProviderReconciliation { .. } => {
-            !outcome.execute
-                && matches!(
-                    (outcome.mode, outcome.phase),
-                    (2, 3 | 5) | (1, 0..=5) | (3, 0)
-                )
+            !outcome.execute && matches!((outcome.mode, outcome.phase), (0 | 1 | 3, 0) | (2, 3 | 5))
         }
         SessionMutationIntent::AbortManagedProviderNotApplied { .. } => {
-            !outcome.execute
-                && matches!((outcome.mode, outcome.phase), (2, 5) | (1, 0..=5) | (3, 0))
+            !outcome.execute && matches!((outcome.mode, outcome.phase), (0 | 1 | 3, 0) | (2, 5))
         }
         SessionMutationIntent::FinalizeManagedProviderJob { .. } => {
             !outcome.execute
                 && matches!(
                     (outcome.mode, outcome.phase),
-                    (2, 5) | (3, 0 | 4 | 5) | (1, 0..=5)
+                    (0 | 1, 0) | (2, 5) | (3, 0 | 4 | 5)
                 )
         }
         _ => false,
@@ -9303,23 +9338,49 @@ mod membership_tests {
                 },
             ),
         ];
-        for (intent, outcome) in intents {
-            assert!(managed_provider_outcome_matches_intent(&intent, &outcome));
-            let mismatched = if outcome.execute {
-                ManagedProviderJobMutationOutcome {
-                    mode: 2,
-                    phase: 0,
-                    execute: true,
+        for (command, (intent, expected_outcome)) in intents.into_iter().enumerate() {
+            for mode in 0..=3 {
+                for phase in 0..=5 {
+                    for execute in [false, true] {
+                        let outcome = ManagedProviderJobMutationOutcome {
+                            mode,
+                            phase,
+                            execute,
+                        };
+                        let expected = match command {
+                            // Ensure creates V5 or observes a phase-zero
+                            // predecessor/terminal replay.
+                            0 => !execute && matches!((mode, phase), (1..=3, 0)),
+                            // Start alone permits provider I/O, exactly at
+                            // Ready -> EffectStarted.
+                            1 => {
+                                (execute && (mode, phase) == (2, 1))
+                                    || (!execute
+                                        && matches!(
+                                            (mode, phase),
+                                            (0 | 1 | 3, 0) | (2, 1 | 2 | 3 | 5)
+                                        ))
+                            }
+                            2 => !execute && matches!((mode, phase), (0 | 1 | 3, 0) | (2, 2 | 5)),
+                            3 => !execute && matches!((mode, phase), (0 | 1 | 3, 0) | (2, 3 | 5)),
+                            4 => !execute && matches!((mode, phase), (0 | 1 | 3, 0) | (2, 5)),
+                            5 => {
+                                !execute
+                                    && matches!((mode, phase), (0 | 1, 0) | (2, 5) | (3, 0 | 4 | 5))
+                            }
+                            _ => unreachable!("six managed commands"),
+                        };
+                        assert_eq!(
+                            managed_provider_outcome_matches_intent(&intent, &outcome),
+                            expected,
+                            "command={command} mode={mode} phase={phase} execute={execute}"
+                        );
+                    }
                 }
-            } else {
-                ManagedProviderJobMutationOutcome {
-                    execute: true,
-                    ..outcome
-                }
-            };
+            }
             assert!(
-                !managed_provider_outcome_matches_intent(&intent, &mismatched),
-                "execute is an I/O permit only for Ready -> EffectStarted"
+                managed_provider_outcome_matches_intent(&intent, &expected_outcome),
+                "each actual positive tuple remains accepted"
             );
         }
     }

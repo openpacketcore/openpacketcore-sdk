@@ -945,6 +945,25 @@ impl SqliteSessionBackend {
         .await
     }
 
+    pub(crate) async fn consensus_managed_provider_terminal_is_managed(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        request_id: [u8; crate::FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES],
+        worker_digest: [u8; 32],
+        verifier_digest: [u8; 32],
+    ) -> Result<bool, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::managed_provider_terminal_is_managed_sync(
+                conn,
+                identity,
+                request_id,
+                worker_digest,
+                verifier_digest,
+            )
+        })
+        .await
+    }
+
     pub(crate) async fn consensus_managed_provider_admission(
         &self,
         identity: crate::consensus::SessionConsensusIdentity,

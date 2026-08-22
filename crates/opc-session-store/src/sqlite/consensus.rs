@@ -16276,6 +16276,68 @@ pub(crate) fn managed_provider_job_status_sync(
     Ok((result.mode, result.phase))
 }
 
+/// Prove that a mode-3 terminal belongs to the managed V5 protocol rather
+/// than the frozen predecessor terminalization path.  Mode alone is shared
+/// by both paths, so every component of the V5 authority and every member
+/// job must be durably present and terminal before this returns true.
+pub(crate) fn managed_provider_terminal_is_managed_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request_id: [u8; FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES],
+    worker_digest: [u8; 32],
+    verifier_digest: [u8; 32],
+) -> Result<bool, StoreError> {
+    if read_storage_identity_sync(conn).map_err(|_| {
+        StoreError::BackendUnavailable("managed provider terminal origin is unavailable".into())
+    })? != identity
+    {
+        return Err(StoreError::BackendUnavailable(
+            "managed provider terminal origin is unavailable".into(),
+        ));
+    }
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM consensus_fenced_mutation_roster_protocol_claims AS claim
+            JOIN consensus_fenced_mutation_roster_operations AS operation
+              ON operation.request_id = claim.request_id
+            JOIN consensus_fenced_mutation_roster_managed_provider_authorities AS authority
+              ON authority.request_id = claim.request_id
+            WHERE claim.request_id = ?1
+              AND claim.mode = 3
+              AND operation.phase IN (2, 3)
+              AND authority.worker_digest = ?2
+              AND authority.verifier_digest = ?3
+              AND authority.abort_latched = 0
+              AND (SELECT COUNT(*) FROM consensus_fenced_mutation_roster_members AS member
+                   WHERE member.request_id = claim.request_id)
+                  = (SELECT COUNT(*) FROM consensus_fenced_mutation_roster_managed_provider_jobs AS job
+                     WHERE job.request_id = claim.request_id)
+              AND EXISTS (
+                  SELECT 1
+                  FROM consensus_fenced_mutation_roster_managed_provider_jobs AS job
+                  WHERE job.request_id = claim.request_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM consensus_fenced_mutation_roster_managed_provider_jobs AS job
+                  WHERE job.request_id = claim.request_id
+                    AND (job.effect_owner_digest IS NOT authority.worker_digest
+                         OR job.phase NOT IN (4, 5))
+              )
+        )",
+        params![
+            request_id.as_slice(),
+            worker_digest.as_slice(),
+            verifier_digest.as_slice()
+        ],
+        |row| row.get(0),
+    )
+    .map_err(|_| {
+        StoreError::BackendUnavailable("managed provider terminal origin is unavailable".into())
+    })
+}
+
 pub(crate) fn managed_provider_admission_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -24218,6 +24280,15 @@ mod tests {
         )
         .expect("reserve V4 verifier before downgrade");
         assert_eq!(reserved.1, Some(true));
+        let (terminal, checkpoint) = fenced_mutation_roster_established_terminal(&admission, 0x82);
+        fenced_mutation_roster_terminalize_sync(
+            &tx,
+            identity(),
+            &admission,
+            &terminal,
+            &checkpoint,
+        )
+        .expect("terminalize predecessor before format-seven downgrade");
         tx.execute_batch(
             "DROP INDEX consensus_fenced_mutation_roster_managed_provider_jobs_recovery; \
              DROP TABLE consensus_fenced_mutation_roster_managed_provider_jobs; \
@@ -24272,7 +24343,21 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read migrated V4 claim");
-        assert_eq!(mode, 1, "the V4 reservation remains the durable winner");
+        assert_eq!(
+            mode, 3,
+            "the migrated predecessor terminal retains mode three"
+        );
+        assert!(
+            !managed_provider_terminal_is_managed_sync(
+                &conn,
+                identity(),
+                admission.request_id().to_bytes(),
+                [0x61; 32],
+                [0x62; 32],
+            )
+            .expect("migrated predecessor origin lookup"),
+            "mode three without a matching V5 authority and terminal jobs remains frozen"
+        );
         validate_fenced_mutation_roster_receipts_sync(&conn, identity())
             .expect("migrated populated roster is valid");
     }
@@ -35390,6 +35475,28 @@ BEGIN IMMEDIATE;
             )
             .expect("read compensated terminal status"),
             (3, 5)
+        );
+        assert!(
+            managed_provider_terminal_is_managed_sync(
+                &conn,
+                identity(),
+                compensated_admission.request_id().to_bytes(),
+                worker,
+                verifier,
+            )
+            .expect("matching managed terminal origin"),
+            "the persisted authority plus every terminal job proves V5 origin"
+        );
+        assert!(
+            !managed_provider_terminal_is_managed_sync(
+                &conn,
+                identity(),
+                compensated_admission.request_id().to_bytes(),
+                worker,
+                [0xF2; 32],
+            )
+            .expect("mismatched verifier terminal origin"),
+            "a caller cannot classify a terminal as V5 with a different verifier commitment"
         );
         let replay = ensure_managed_provider_job_sync(
             &conn,
