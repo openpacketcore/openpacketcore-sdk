@@ -478,6 +478,14 @@ impl ManagedProviderJobFacade {
         protected_checkpoint: Box<[u8]>,
         ordinal: FencedMutationRosterOrdinal,
     ) -> Result<ManagedProviderJobStatus, ManagedProviderJobError> {
+        // Reject an invalid member before the coordinator can touch durable
+        // admission/claim state or cross the provider effect boundary.
+        if admission.validate().is_err()
+            || FencedMutationRosterMemberExecutionContext::for_admission_member(&admission, ordinal)
+                .is_err()
+        {
+            return Err(ManagedProviderJobError::InvalidMember);
+        }
         ManagedProviderJobCoordinator::new(
             &self.store,
             self.provider.as_ref(),
@@ -495,7 +503,10 @@ impl ManagedProviderJobFacade {
         admission: FencedMutationRosterAdmission,
         ordinal: FencedMutationRosterOrdinal,
     ) -> Result<ManagedProviderJobStatus, ManagedProviderJobError> {
-        if admission.validate().is_err() {
+        if admission.validate().is_err()
+            || FencedMutationRosterMemberExecutionContext::for_admission_member(&admission, ordinal)
+                .is_err()
+        {
             return Err(ManagedProviderJobError::InvalidMember);
         }
         let id = ManagedProviderJobId::for_member(admission.request_id(), ordinal);
@@ -578,6 +589,11 @@ where
         checkpoint: &[u8],
         ordinal: FencedMutationRosterOrdinal,
     ) -> Result<ManagedProviderJobStatus, ManagedProviderJobError> {
+        // This must precede Ensure. An ordinal outside the immutable roster
+        // cannot create durable managed state merely by being malformed.
+        let context =
+            FencedMutationRosterMemberExecutionContext::for_admission_member(admission, ordinal)
+                .map_err(|_| ManagedProviderJobError::InvalidMember)?;
         let ensured = self
             .store
             .ensure_job(admission, checkpoint, self.authority)
@@ -589,9 +605,6 @@ where
         if ensured.mode() != ManagedProviderJobMode::ManagedV5 {
             return Err(ManagedProviderJobError::Unavailable);
         }
-        let context =
-            FencedMutationRosterMemberExecutionContext::for_admission_member(admission, ordinal)
-                .map_err(|_| ManagedProviderJobError::InvalidMember)?;
         let id = ManagedProviderJobId::for_member(admission.request_id(), ordinal);
         let status = self
             .store

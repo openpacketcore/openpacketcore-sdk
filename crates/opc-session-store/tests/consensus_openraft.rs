@@ -52,7 +52,7 @@ use opc_session_store::{
     DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
-use rusqlite::OptionalExtension;
+use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use tempfile::TempDir;
 
@@ -133,6 +133,15 @@ impl ManagedProviderAdapterDouble {
         Self {
             execute_outcome: None,
             status_outcome: AdapterStatusOutcome::NotApplied,
+            execute_calls: Arc::new(AtomicUsize::new(0)),
+            status_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn compensated() -> Self {
+        Self {
+            execute_outcome: Some(FencedMutationRosterProviderOutcome::CompensatedReconciled),
+            status_outcome: AdapterStatusOutcome::Inconclusive,
             execute_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
         }
@@ -253,6 +262,68 @@ fn managed_provider_adapter_admission(
             .expect("test protected result"),
     )
     .expect("valid terminal result")
+}
+
+async fn admit_managed_provider_adapter_roster(
+    store: &ConsensusSessionStore,
+    scope: SessionConsumerScope,
+    identity: &SessionConsumerIdentity,
+    admission: FencedMutationRosterAdmission,
+) -> FencedMutationRosterAdmission {
+    let admission = admission.with_scope(derive_fenced_mutation_roster_scope(
+        identity.spiffe_identity_commitment(),
+        scope,
+    ));
+    let response = store
+        .consumer_service()
+        .execute_v3(
+            identity,
+            SessionConsumerV3Request::new(
+                scope,
+                SessionConsumerV3Operation::FencedMutationRosterAdmit {
+                    admission: Box::new(admission.clone()),
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            response,
+            SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_))
+        ),
+        "public V3 roster admission must commit before the managed facade runs: {response:?}"
+    );
+    admission
+}
+
+fn assert_no_managed_provider_rows(
+    cluster: &TestCluster,
+    leader: usize,
+    admission: &FencedMutationRosterAdmission,
+) {
+    let connection = rusqlite::Connection::open(
+        cluster
+            ._directory
+            .path()
+            .join(format!("node-{leader}.sqlite")),
+    )
+    .expect("open file-backed leader SQLite for read-only assertion");
+    let request_id = admission.request_id().to_bytes();
+    for table in [
+        "consensus_fenced_mutation_roster_operations",
+        "consensus_fenced_mutation_roster_protocol_claims",
+        "consensus_fenced_mutation_roster_managed_provider_jobs",
+        "consensus_fenced_mutation_roster_managed_provider_authorities",
+    ] {
+        let count: u64 = connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE request_id = ?1"),
+                params![request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("query exact managed-provider durable rows");
+        assert_eq!(count, 0, "unadmitted roster created {table} state");
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -5464,6 +5535,46 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         other => panic!("exact public roster activation failed: {other:?}"),
     }
 
+    // The facade is not an admission API. An invalid member and a valid
+    // member of an unadmitted roster both fail before a claim/job mutation or
+    // provider call.
+    let unadmitted_provider = ManagedProviderAdapterDouble::applied();
+    let unadmitted = cluster.stores[leader]
+        .managed_provider_job_facade(
+            scope,
+            worker.clone(),
+            [0x75; 32],
+            [0x76; 32],
+            unadmitted_provider.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct unadmitted facade");
+    let unadmitted_admission = managed_provider_adapter_admission(0x74, 1);
+    assert_eq!(
+        unadmitted
+            .run_member(
+                unadmitted_admission.clone(),
+                Box::new([0x77]),
+                FencedMutationRosterOrdinal::new(1).expect("out-of-manifest ordinal"),
+            )
+            .await,
+        Err(ManagedProviderJobError::InvalidMember)
+    );
+    assert_eq!(unadmitted_provider.execute_calls.load(Ordering::SeqCst), 0);
+    assert_no_managed_provider_rows(&cluster, leader, &unadmitted_admission);
+    assert_eq!(
+        unadmitted
+            .run_member(
+                unadmitted_admission.clone(),
+                Box::new([0x77]),
+                FencedMutationRosterOrdinal::new(0).expect("manifest ordinal"),
+            )
+            .await,
+        Err(ManagedProviderJobError::Unavailable)
+    );
+    assert_eq!(unadmitted_provider.execute_calls.load(Ordering::SeqCst), 0);
+    assert_no_managed_provider_rows(&cluster, leader, &unadmitted_admission);
+
     // All matching members: Ensure, Start, Record, and Finalize report the
     // committed status through the public facade, including a partial
     // verification before the second member establishes the roster.
@@ -5478,7 +5589,13 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
             ManagedProviderAdapterVerifier,
         )
         .expect("construct fixed facade");
-    let all_match_admission = managed_provider_adapter_admission(0x80, 2);
+    let all_match_admission = admit_managed_provider_adapter_roster(
+        &cluster.stores[leader],
+        scope,
+        &worker,
+        managed_provider_adapter_admission(0x80, 2),
+    )
+    .await;
     let checkpoint: Box<[u8]> = Box::new([0x83]);
     let first_result = all_match
         .run_member(
@@ -5543,7 +5660,13 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
             ManagedProviderAdapterVerifier,
         )
         .expect("construct reconciliation facade");
-    let reconciliation_admission = managed_provider_adapter_admission(0x90, 1);
+    let reconciliation_admission = admit_managed_provider_adapter_roster(
+        &cluster.stores[leader],
+        scope,
+        &worker,
+        managed_provider_adapter_admission(0x90, 1),
+    )
+    .await;
     let ordinal = FencedMutationRosterOrdinal::new(0).expect("only ordinal");
     assert_eq!(
         reconciliation
@@ -5624,18 +5747,25 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
     // roster-wide: sibling start attempts return FreshAdmissionRequired with
     // no provider execution, including through public status replay.
     let not_applied = ManagedProviderAdapterDouble::not_applied();
+    let abort_worker = SessionConsumerIdentity::new("spiffe://managed-adapter/abort-worker")
+        .expect("abort worker");
     let aborting = cluster.stores[leader]
         .managed_provider_job_facade(
             scope,
-            SessionConsumerIdentity::new("spiffe://managed-adapter/abort-worker")
-                .expect("abort worker"),
+            abort_worker.clone(),
             [0xc1; 32],
             [0xc2; 32],
             not_applied.clone(),
             ManagedProviderAdapterVerifier,
         )
         .expect("construct abort facade");
-    let abort_admission = managed_provider_adapter_admission(0xc0, 2);
+    let abort_admission = admit_managed_provider_adapter_roster(
+        &cluster.stores[leader],
+        scope,
+        &abort_worker,
+        managed_provider_adapter_admission(0xc0, 2),
+    )
+    .await;
     assert_eq!(
         aborting
             .run_member(abort_admission.clone(), Box::new([0xc3]), ordinal)
@@ -5673,4 +5803,51 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
             .phase(),
         ManagedProviderJobMemberPhase::Aborted
     );
+
+    // A conclusive compensated effect commits an aborted managed terminal.
+    // Its retry reaches the persisted terminal replay rather than returning a
+    // postcommit unavailable result or re-running provider I/O.
+    let compensated_provider = ManagedProviderAdapterDouble::compensated();
+    let compensated_worker =
+        SessionConsumerIdentity::new("spiffe://managed-adapter/compensated-worker")
+            .expect("compensated worker");
+    let compensated = cluster.stores[leader]
+        .managed_provider_job_facade(
+            scope,
+            compensated_worker.clone(),
+            [0xd1; 32],
+            [0xd2; 32],
+            compensated_provider.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct compensated facade");
+    let compensated_admission = admit_managed_provider_adapter_roster(
+        &cluster.stores[leader],
+        scope,
+        &compensated_worker,
+        managed_provider_adapter_admission(0xd0, 1),
+    )
+    .await;
+    let compensated_checkpoint = Box::new([0xd3]);
+    let compensated_status = compensated
+        .run_member(
+            compensated_admission.clone(),
+            compensated_checkpoint.clone(),
+            ordinal,
+        )
+        .await
+        .expect("compensated terminal is the exact committed managed result");
+    assert_eq!(compensated_status.mode(), ManagedProviderJobMode::ManagedV5);
+    assert_eq!(
+        compensated_status.phase(),
+        ManagedProviderJobMemberPhase::Aborted
+    );
+    assert_eq!(compensated_provider.execute_calls.load(Ordering::SeqCst), 1);
+    let replay = compensated
+        .run_member(compensated_admission, compensated_checkpoint, ordinal)
+        .await
+        .expect("post-terminal replay returns durable managed status");
+    assert_eq!(replay.mode(), ManagedProviderJobMode::ManagedV5);
+    assert_eq!(replay.phase(), ManagedProviderJobMemberPhase::Aborted);
+    assert_eq!(compensated_provider.execute_calls.load(Ordering::SeqCst), 1);
 }

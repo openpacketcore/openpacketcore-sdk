@@ -35391,6 +35391,19 @@ BEGIN IMMEDIATE;
             .expect("read compensated terminal status"),
             (3, 5)
         );
+        let replay = ensure_managed_provider_job_sync(
+            &conn,
+            &compensated_admission,
+            &checkpoint,
+            worker,
+            verifier,
+        )
+        .expect("replay compensated terminal claim");
+        assert_eq!(
+            (replay.mode, replay.phase, replay.execute),
+            (3, 0, false),
+            "exact terminal ensure replay uses the durable terminal-replay tuple"
+        );
         validate_fenced_mutation_roster_receipts_sync(&conn, identity())
             .expect("compensated terminal survives durable validation");
     }
@@ -35511,6 +35524,28 @@ BEGIN IMMEDIATE;
             )
             .expect("count sibling receipts");
         assert_eq!(sibling_receipts, 0, "the latch never fabricates a receipt");
+        let reconciliation = managed_provider_mutate_sync(
+            &conn,
+            &admission,
+            ManagedProviderMutation {
+                ordinal: first,
+                worker_digest: worker,
+                operation: 3,
+                verifier_digest: None,
+                receipt_digest: None,
+                outcome: None,
+            },
+        )
+        .expect("latched reconciliation is a deterministic no-effect");
+        assert_eq!(
+            (
+                reconciliation.mode,
+                reconciliation.phase,
+                reconciliation.execute
+            ),
+            (2, 5, false),
+            "abort latch blocks reconciliation after a verified NotApplied receipt"
+        );
         let terminal = finalize_managed_provider_job_sync(&conn, identity(), &admission, worker)
             .expect("latched finalization is a deterministic no-effect");
         assert_eq!(

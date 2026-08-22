@@ -896,8 +896,11 @@ fn managed_provider_status(mode: u8, phase: u8) -> Result<ManagedProviderJobStat
     let mode = match mode {
         0 => ManagedProviderJobMode::Unselected,
         1 => ManagedProviderJobMode::FrozenV4Terminal,
-        3 if phase == 4 => ManagedProviderJobMode::ManagedV5,
-        3 => ManagedProviderJobMode::FrozenV4Terminal,
+        // Mode 3 is the managed terminal claim. A terminal command returns
+        // its terminal phase, while an exact replay returns phase zero and
+        // the subsequent durable member lookup supplies the terminal phase.
+        // Neither is a predecessor V4 terminal.
+        3 => ManagedProviderJobMode::ManagedV5,
         2 => ManagedProviderJobMode::ManagedV5,
         _ => return Err(consensus_unavailable()),
     };
@@ -938,8 +941,18 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
-        self.consumer_fenced_mutation_roster_admit(scope, admission.clone(), deadline)
+        // A managed facade is deliberately not a roster-admission API. Its
+        // exact immutable body must already have passed the authenticated V3
+        // consumer admission path; otherwise ensure must not create an
+        // operation, claim, job row, or authority commitment.
+        let admitted = self
+            .managed_provider_admission(admission.request_id(), scope, deadline)
             .await?;
+        if admitted != *admission {
+            return Err(StoreError::InvalidKey(
+                "managed_provider_admission_conflict".into(),
+            ));
+        }
         let response = self
             .submit_request_before(
                 SessionConsensusRequestId::new(),
@@ -5628,40 +5641,55 @@ fn managed_provider_outcome_matches_intent(
     intent: &SessionMutationIntent,
     outcome: &ManagedProviderJobMutationOutcome,
 ) -> bool {
-    let valid_mode_phase =
-        |mode, phase| matches!((mode, phase), (0, 0) | (1, 0..=5) | (2, 0..=5) | (3, 4));
+    let valid_mode_phase = |mode, phase| {
+        matches!(
+            (mode, phase),
+            (0, 0) | (1, 0..=5) | (2, 0..=5) | (3, 0 | 4 | 5)
+        )
+    };
     if !valid_mode_phase(outcome.mode, outcome.phase) {
         return false;
     }
     match intent {
         SessionMutationIntent::EnsureManagedProviderJob { .. } => {
-            !outcome.execute && matches!((outcome.mode, outcome.phase), (1, 0) | (2, 0) | (3, 4))
+            !outcome.execute
+                && matches!(
+                    (outcome.mode, outcome.phase),
+                    (1, 0) | (2, 0) | (3, 0 | 4 | 5)
+                )
         }
         SessionMutationIntent::StartManagedProviderMember { .. } => {
             (outcome.execute && (outcome.mode, outcome.phase) == (2, 1))
                 || (!outcome.execute
                     && matches!(
                         (outcome.mode, outcome.phase),
-                        (1, 0..=5) | (2, 1..=5) | (3, 4)
+                        (1, 0..=5) | (2, 1..=5) | (3, 0)
                     ))
         }
         SessionMutationIntent::RecordManagedProviderReceipt { .. } => {
             !outcome.execute
                 && matches!(
                     (outcome.mode, outcome.phase),
-                    (2, 2 | 5) | (1, 0..=5) | (3, 4)
+                    (2, 2 | 5) | (1, 0..=5) | (3, 0)
                 )
         }
         SessionMutationIntent::RequireManagedProviderReconciliation { .. } => {
             !outcome.execute
-                && matches!((outcome.mode, outcome.phase), (2, 3) | (1, 0..=5) | (3, 4))
+                && matches!(
+                    (outcome.mode, outcome.phase),
+                    (2, 3 | 5) | (1, 0..=5) | (3, 0)
+                )
         }
         SessionMutationIntent::AbortManagedProviderNotApplied { .. } => {
             !outcome.execute
-                && matches!((outcome.mode, outcome.phase), (2, 5) | (1, 0..=5) | (3, 4))
+                && matches!((outcome.mode, outcome.phase), (2, 5) | (1, 0..=5) | (3, 0))
         }
         SessionMutationIntent::FinalizeManagedProviderJob { .. } => {
-            !outcome.execute && matches!((outcome.mode, outcome.phase), (3, 4) | (1, 0..=5))
+            !outcome.execute
+                && matches!(
+                    (outcome.mode, outcome.phase),
+                    (2, 5) | (3, 0 | 4 | 5) | (1, 0..=5)
+                )
         }
         _ => false,
     }
