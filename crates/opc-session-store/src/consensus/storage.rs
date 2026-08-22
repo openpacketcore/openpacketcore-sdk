@@ -1107,11 +1107,137 @@ async fn wait_until_applied(
     }
 }
 
+/// Build a file-backed snapshot from one independent WAL reader. The live
+/// consensus connection is held only long enough to pin and compare the exact
+/// applied/membership cut; validation, backup, and destination work never
+/// retain that mutex.
+#[allow(clippy::result_large_err)] // Openraft storage callbacks require this concrete error type.
+async fn build_file_backed_snapshot_database(
+    core: &SqliteConsensusCore,
+    raw_path: &Path,
+    snapshot_guard: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<
+    (
+        tokio::sync::OwnedMutexGuard<()>,
+        Option<(
+            (
+                Option<LogId<SessionConsensusNodeId>>,
+                StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+            ),
+            PinnedSqliteFile,
+        )>,
+    ),
+    StorageError<SessionConsensusNodeId>,
+> {
+    let (Some(database_path), Some(database_file_identity)) =
+        (&core.database_path, core.database_file_identity)
+    else {
+        return Ok((snapshot_guard, None));
+    };
+    let reader = consensus::open_snapshot_read_connection(database_path, database_file_identity)
+        .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
+    let source_cut = {
+        let conn = core.conn.lock().await;
+        match consensus::begin_snapshot_read_sync(&reader, core.storage_identity) {
+            Ok(source_cut) => {
+                match consensus::with_durable_authority_raw_read_sync(
+                    &conn,
+                    core.storage_identity,
+                    core.authority_profile,
+                    &core.expected_members,
+                    &core.expected_bindings,
+                    core.fixed_placement_policy,
+                    |conn| consensus::snapshot_applied_membership_sync(conn, core.storage_identity),
+                ) {
+                    Ok(live_cut) if live_cut == source_cut => Ok(source_cut),
+                    Ok(_) => Err(consensus::invalid_data(
+                        "session consensus snapshot reader does not match the live cut",
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    };
+    let source_cut = match source_cut {
+        Ok(source_cut) => source_cut,
+        Err(error) => {
+            let _ = consensus::release_snapshot_read_sync(&reader);
+            return Err(storage_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Read,
+                error,
+            ));
+        }
+    };
+
+    let storage_identity = core.storage_identity;
+    let authority_profile = core.authority_profile;
+    let expected_members = core.expected_members.clone();
+    let expected_bindings = core.expected_bindings.clone();
+    let fixed_placement_policy = core.fixed_placement_policy;
+    let raw_path = raw_path.to_path_buf();
+    let snapshot_observation = std::sync::Arc::clone(&core.snapshot_observation);
+    #[cfg(test)]
+    let snapshot_capture_gate = std::sync::Arc::clone(&core.snapshot_capture_gate);
+
+    // The owned guard moves into the worker and comes back with its result.
+    // Cancellation of the async caller therefore cannot detach a second
+    // snapshot worker or a second WAL-pinning reader for this consensus core.
+    let (snapshot_guard, captured) = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        snapshot_capture_gate.block_after_capture();
+
+        let captured = consensus::capture_snapshot_database_from_reader_sync(
+            &reader,
+            storage_identity,
+            authority_profile,
+            &expected_members,
+            &expected_bindings,
+            fixed_placement_policy,
+            &source_cut,
+            &raw_path,
+        );
+        // The source transaction is retained only through `Backup`; all
+        // cleanup, VACUUM, validation, hashing, and sealing follow this
+        // release and therefore cannot retain WAL frames.
+        let released = consensus::release_snapshot_read_sync(&reader);
+        let captured = match (captured, released) {
+            (Ok(captured), Ok(())) => {
+                let (captured_cut, raw_snapshot, wal_bytes) = captured;
+                snapshot_observation.record_source_wal(wal_bytes);
+                consensus::finalize_captured_snapshot_database_sync(
+                    storage_identity,
+                    &captured_cut,
+                    raw_snapshot,
+                )
+                .map(|raw_snapshot| (captured_cut, raw_snapshot))
+            }
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        };
+        (snapshot_guard, captured)
+    })
+    .await
+    .map_err(|_| {
+        storage_error(
+            ErrorSubject::Snapshot(None),
+            ErrorVerb::Write,
+            io::Error::other("session consensus snapshot worker is unavailable"),
+        )
+    })?;
+    let (captured_cut, raw_snapshot) = captured
+        .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))?;
+    Ok((snapshot_guard, Some((captured_cut, raw_snapshot))))
+}
+
 impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuilder {
     async fn build_snapshot(
         &mut self,
     ) -> Result<Snapshot<SessionRaftTypeConfig>, StorageError<SessionConsensusNodeId>> {
-        let _snapshot_guard = self.core.snapshot_gate.lock().await;
+        let snapshot_started = std::time::Instant::now();
+        let snapshot_guard = std::sync::Arc::clone(&self.core.snapshot_gate)
+            .lock_owned()
+            .await;
         let raw_path = self
             .core
             .snapshot_dir
@@ -1122,47 +1248,20 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             .core
             .snapshot_dir
             .join(format!("seal-{}.part", uuid::Uuid::new_v4()));
-        let ((last_log_id, last_membership), (mut snapshot, checksum, byte_length)) = if self
-            .core
-            .authority_profile
-            == ConsensusAuthorityProfile::Dynamic
-        {
-            let membership = {
-                let conn = self.core.conn.lock().await;
-                #[cfg(test)]
-                let membership = consensus::build_snapshot_database_with_capture_hook_sync(
-                    &conn,
-                    self.core.storage_identity,
-                    &raw_path,
-                    || self.core.snapshot_capture_gate.block_after_capture(),
-                );
-                #[cfg(not(test))]
-                let membership = consensus::build_snapshot_database_with_authority_sync(
-                    &conn,
-                    self.core.storage_identity,
-                    self.core.authority_profile,
-                    &self.core.expected_members,
-                    &self.core.expected_bindings,
-                    self.core.fixed_placement_policy,
-                    &raw_path,
-                );
-                membership
-            }
-            .map_err(|error| {
-                storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-            })?;
-            let sealed = seal_snapshot_database_from_path(&raw_path, &temporary_path, &final_path)
-                .await
-                .map_err(|error| {
-                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-                })?;
-            (membership, sealed)
-        } else {
-            let (membership, raw_snapshot) = {
-                let conn = self.core.conn.lock().await;
-                #[cfg(test)]
-                let snapshot =
-                    consensus::build_snapshot_database_pinned_with_authority_and_capture_hook_sync(
+        let (_snapshot_guard, file_backed) =
+            build_file_backed_snapshot_database(&self.core, &raw_path, snapshot_guard).await?;
+        let ((last_log_id, last_membership), (mut snapshot, checksum, byte_length)) =
+            if let Some((membership, raw_snapshot)) = file_backed {
+                let sealed = seal_snapshot_database(raw_snapshot, &temporary_path, &final_path)
+                    .await
+                    .map_err(|error| {
+                        storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                    })?;
+                (membership, sealed)
+            } else if self.core.authority_profile == ConsensusAuthorityProfile::Dynamic {
+                let membership = {
+                    let conn = self.core.conn.lock().await;
+                    consensus::build_snapshot_database_with_authority_sync(
                         &conn,
                         self.core.storage_identity,
                         self.core.authority_profile,
@@ -1170,30 +1269,41 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                         &self.core.expected_bindings,
                         self.core.fixed_placement_policy,
                         &raw_path,
-                        || self.core.snapshot_capture_gate.block_after_capture(),
-                    );
-                #[cfg(not(test))]
-                let snapshot = consensus::build_snapshot_database_pinned_with_authority_sync(
-                    &conn,
-                    self.core.storage_identity,
-                    self.core.authority_profile,
-                    &self.core.expected_members,
-                    &self.core.expected_bindings,
-                    self.core.fixed_placement_policy,
-                    &raw_path,
-                );
-                snapshot
-            }
-            .map_err(|error| {
-                storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-            })?;
-            let sealed = seal_snapshot_database(raw_snapshot, &temporary_path, &final_path)
-                .await
+                    )
+                }
                 .map_err(|error| {
                     storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
                 })?;
-            (membership, sealed)
-        };
+                let sealed =
+                    seal_snapshot_database_from_path(&raw_path, &temporary_path, &final_path)
+                        .await
+                        .map_err(|error| {
+                            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                        })?;
+                (membership, sealed)
+            } else {
+                let (membership, raw_snapshot) = {
+                    let conn = self.core.conn.lock().await;
+                    consensus::build_snapshot_database_pinned_with_authority_sync(
+                        &conn,
+                        self.core.storage_identity,
+                        self.core.authority_profile,
+                        &self.core.expected_members,
+                        &self.core.expected_bindings,
+                        self.core.fixed_placement_policy,
+                        &raw_path,
+                    )
+                }
+                .map_err(|error| {
+                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                })?;
+                let sealed = seal_snapshot_database(raw_snapshot, &temporary_path, &final_path)
+                    .await
+                    .map_err(|error| {
+                        storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                    })?;
+                (membership, sealed)
+            };
         tokio::fs::rename(&temporary_path, &final_path)
             .await
             .map_err(|error| {
@@ -1301,6 +1411,9 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 error,
             )
         })?;
+        self.core
+            .snapshot_observation
+            .record_completed(snapshot_started.elapsed());
         Ok(Snapshot {
             meta,
             snapshot: Box::new(snapshot),
@@ -2728,5 +2841,61 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(SessionConsensusStorageError::CorruptState, reopen_error);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_snapshot_build_retains_its_single_worker_ownership() {
+        let directory = tempfile::tempdir().expect("snapshot cancellation directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("sessions.sqlite"))
+            .expect("snapshot cancellation backend");
+        let (_, mut state_machine) = open(
+            &backend,
+            directory.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("snapshot cancellation storage");
+        state_machine
+            .apply([initial_membership_entry()])
+            .await
+            .expect("snapshot cancellation membership");
+
+        let capture_gate = backend.snapshot_capture_gate();
+        capture_gate.arm();
+        let core = state_machine.core.clone();
+        let mut builder = state_machine.get_snapshot_builder().await;
+        let build = tokio::spawn(async move { builder.build_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !capture_gate.started() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("snapshot worker reaches its fixed source cut");
+
+        build.abort();
+        assert!(
+            build
+                .await
+                .expect_err("snapshot future is cancelled")
+                .is_cancelled(),
+            "the fixture must cancel only the async snapshot caller"
+        );
+        assert!(
+            std::sync::Arc::clone(&core.snapshot_gate)
+                .try_lock_owned()
+                .is_err(),
+            "the detached blocking capture must retain the sole snapshot owner"
+        );
+
+        capture_gate.release();
+        let worker_released = tokio::time::timeout(
+            Duration::from_secs(5),
+            std::sync::Arc::clone(&core.snapshot_gate).lock_owned(),
+        )
+        .await
+        .expect("cancelled snapshot worker exits within the existing bounded test window");
+        drop(worker_released);
     }
 }

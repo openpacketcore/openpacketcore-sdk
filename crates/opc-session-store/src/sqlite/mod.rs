@@ -246,6 +246,7 @@ pub struct SqliteSessionBackend {
     // allocation. In-memory stores retain their single-connection behavior.
     consensus_acceptance_reader_pool: Option<Arc<ConsensusAcceptanceReaderPool>>,
     database_path: Option<Arc<PathBuf>>,
+    consensus_snapshot_observation: Arc<consensus::SnapshotBuildObservation>,
     caps: BackendCapabilities,
     clock: Arc<dyn Clock>,
     restore_scan_workers: Arc<tokio::sync::Semaphore>,
@@ -688,6 +689,7 @@ impl SqliteSessionBackend {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
             consensus_acceptance_reader_pool,
             database_path: database_path.map(Arc::new),
+            consensus_snapshot_observation: Arc::new(consensus::SnapshotBuildObservation::default()),
             caps: sqlite_capabilities(),
             clock: Arc::new(crate::clock::SystemClock),
             restore_scan_workers: Arc::new(tokio::sync::Semaphore::new(
@@ -1053,6 +1055,11 @@ impl SqliteSessionBackend {
     /// concrete volume identity.
     pub(crate) const fn is_file_backed(&self) -> bool {
         self.database_path.is_some()
+    }
+
+    /// Fixed-dimension observation shared by the consensus snapshot builder.
+    pub(crate) fn snapshot_observation(&self) -> Arc<consensus::SnapshotBuildObservation> {
+        Arc::clone(&self.consensus_snapshot_observation)
     }
 
     #[cfg(test)]

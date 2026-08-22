@@ -11,7 +11,9 @@ use std::io;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
@@ -361,10 +363,75 @@ pub(crate) fn clear_operator_recovery_latch_sync(
     .sync_all()
 }
 
-type ConsensusAppliedMembership = (
+pub(crate) type ConsensusAppliedMembership = (
     Option<LogId<SessionConsensusNodeId>>,
     StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
 );
+
+/// The inode identity of one file-backed SQLite consensus database.
+///
+/// A snapshot source is reopened only when this identity remains the same as
+/// the file admitted when the durable consensus core was initialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotSourceFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// Fixed-dimension snapshot-capture observations.
+///
+/// These counters deliberately exclude paths, session identifiers, and payload
+/// material. They are status/evidence values, not labelled metrics or
+/// per-subscriber state.
+#[derive(Default)]
+pub(crate) struct SnapshotBuildObservation {
+    latest_wal_bytes: AtomicU64,
+    peak_wal_bytes: AtomicU64,
+    last_duration_millis: AtomicU64,
+}
+
+impl SnapshotBuildObservation {
+    pub(crate) fn record_source_wal(&self, bytes: u64) {
+        self.latest_wal_bytes.store(bytes, Ordering::Relaxed);
+        self.peak_wal_bytes.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_completed(&self, duration: std::time::Duration) {
+        self.last_duration_millis.store(
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.latest_wal_bytes.load(Ordering::Relaxed),
+            self.peak_wal_bytes.load(Ordering::Relaxed),
+            self.last_duration_millis.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub(crate) fn snapshot_source_file_identity(path: &Path) -> io::Result<SnapshotSourceFileIdentity> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = std::fs::metadata(path)?;
+        Ok(SnapshotSourceFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "session consensus snapshot sources require Linux",
+        ))
+    }
+}
 
 /// Test-only coordination for holding snapshot capture after its source image
 /// has been fixed. It is deliberately absent from production builds.
@@ -1282,6 +1349,8 @@ pub(crate) fn install_migrated_operator_recovery_validation_schema_sync(
 pub(crate) struct SqliteConsensusCore {
     pub(crate) conn: Arc<tokio::sync::Mutex<Connection>>,
     pub(crate) database_path: Option<Arc<PathBuf>>,
+    pub(crate) database_file_identity: Option<SnapshotSourceFileIdentity>,
+    pub(crate) snapshot_observation: Arc<SnapshotBuildObservation>,
     /// Immutable database-incarnation identity used by legacy foreign keys.
     /// The active topology identity lives in `consensus_membership_scope`.
     pub(crate) storage_identity: SessionConsensusIdentity,
@@ -1377,6 +1446,12 @@ impl SqliteConsensusCore {
         let canonical_snapshot_dir = tokio::fs::canonicalize(&snapshot_dir)
             .await
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        let database_file_identity = backend
+            .database_path
+            .as_deref()
+            .map(|path| snapshot_source_file_identity(path.as_path()))
+            .transpose()
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
 
         let (storage_identity, applied) = {
             let conn = backend.conn.lock().await;
@@ -1399,6 +1474,8 @@ impl SqliteConsensusCore {
         Ok(Self {
             conn: Arc::clone(&backend.conn),
             database_path: backend.database_path.clone(),
+            database_file_identity,
+            snapshot_observation: backend.snapshot_observation(),
             storage_identity,
             authority_profile,
             fixed_placement_policy,
@@ -14871,25 +14948,11 @@ pub(crate) fn build_snapshot_database_sync(
     identity: SessionConsensusIdentity,
     path: &std::path::Path,
 ) -> io::Result<ConsensusAppliedMembership> {
-    build_snapshot_database_with_capture_hook_sync(conn, identity, path, || {})
-}
-
-pub(crate) fn build_snapshot_database_with_capture_hook_sync(
-    conn: &Connection,
-    identity: SessionConsensusIdentity,
-    path: &std::path::Path,
-    capture_hook: impl FnOnce(),
-) -> io::Result<ConsensusAppliedMembership> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
     validate_sealed_state_sync(&tx)?;
     validate_fenced_transition_receipts_sync(&tx, identity)?;
     let destination = create_pinned_snapshot_database(path)?;
-    let (snapshot, _) = build_snapshot_database_from_pinned_with_capture_hook_sync(
-        &tx,
-        identity,
-        destination,
-        capture_hook,
-    )?;
+    let (snapshot, _) = build_snapshot_database_from_pinned_sync(&tx, identity, destination)?;
     tx.commit().map_err(db_error)?;
     Ok(snapshot)
 }
@@ -14902,31 +14965,6 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
     expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     path: &std::path::Path,
-) -> io::Result<(
-    ConsensusAppliedMembership,
-    crate::consensus::snapshot::PinnedSqliteFile,
-)> {
-    build_snapshot_database_pinned_with_authority_and_capture_hook_sync(
-        conn,
-        identity,
-        authority_profile,
-        expected_members,
-        expected_bindings,
-        fixed_placement_policy,
-        path,
-        || {},
-    )
-}
-
-pub(crate) fn build_snapshot_database_pinned_with_authority_and_capture_hook_sync(
-    conn: &Connection,
-    identity: SessionConsensusIdentity,
-    authority_profile: ConsensusAuthorityProfile,
-    expected_members: &BTreeSet<SessionConsensusNodeId>,
-    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
-    fixed_placement_policy: Option<PlacementResiliencePolicy>,
-    path: &std::path::Path,
-    capture_hook: impl FnOnce(),
 ) -> io::Result<(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
@@ -14945,12 +14983,8 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_and_capture_hook_syn
     // Do not create even an empty snapshot artifact until the durable fixed
     // authority check has succeeded under the source read transaction.
     let destination = create_pinned_snapshot_database(path)?;
-    let (snapshot, destination) = build_snapshot_database_from_pinned_with_capture_hook_sync(
-        &tx,
-        identity,
-        destination,
-        capture_hook,
-    )?;
+    let (snapshot, destination) =
+        build_snapshot_database_from_pinned_sync(&tx, identity, destination)?;
     tx.commit().map_err(db_error)?;
     Ok((snapshot, destination))
 }
@@ -14988,19 +15022,7 @@ fn build_snapshot_database_from_pinned_sync(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
 )> {
-    build_snapshot_database_from_pinned_with_capture_hook_sync(conn, identity, destination, || {})
-}
-
-fn build_snapshot_database_from_pinned_with_capture_hook_sync(
-    conn: &Connection,
-    identity: SessionConsensusIdentity,
-    destination: crate::consensus::snapshot::PinnedSqliteFile,
-    capture_hook: impl FnOnce(),
-) -> io::Result<(
-    ConsensusAppliedMembership,
-    crate::consensus::snapshot::PinnedSqliteFile,
-)> {
-    capture_and_finalize_snapshot_database_sync(conn, identity, destination, capture_hook)
+    capture_and_finalize_snapshot_database_sync(conn, identity, destination)
 }
 
 #[allow(dead_code)]
@@ -15160,6 +15182,331 @@ fn verify_pinned_snapshot_descriptor(
     ))
 }
 
+// A reader can retain WAL frames only while one snapshot is being copied. Its
+// fixed envelope is deliberately no larger than the sealed snapshot envelope:
+// a corrupt or stalled source cannot retain more than one snapshot's worth of
+// additional database state.
+const SNAPSHOT_SOURCE_WAL_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// One descriptor-verified, independently pinned SQLite snapshot reader.
+///
+/// The live consensus connection is never moved into this reader. On Linux,
+/// `retained_descriptors` proves SQLite retained the exact file inode that was
+/// admitted with the consensus core, rather than merely reopening its path.
+pub(crate) struct SnapshotReadConnection {
+    pub(crate) connection: Connection,
+    source_path: PathBuf,
+    source_identity: SnapshotSourceFileIdentity,
+    retained_descriptors: BTreeSet<i32>,
+}
+
+fn snapshot_source_wal_path(path: &Path) -> PathBuf {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    PathBuf::from(wal)
+}
+
+fn verify_snapshot_source_path(
+    path: &Path,
+    expected_identity: SnapshotSourceFileIdentity,
+) -> io::Result<()> {
+    if std::fs::canonicalize(path)? != path
+        || snapshot_source_file_identity(path)? != expected_identity
+    {
+        return Err(invalid_data(
+            "session consensus snapshot source file identity changed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn matching_snapshot_source_descriptors(
+    expected_identity: SnapshotSourceFileIdentity,
+) -> io::Result<BTreeSet<i32>> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut descriptors = BTreeSet::new();
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let entry = entry?;
+        let Some(descriptor) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        match std::fs::metadata(entry.path()) {
+            Ok(metadata)
+                if metadata.dev() == expected_identity.device
+                    && metadata.ino() == expected_identity.inode =>
+            {
+                descriptors.insert(descriptor);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(descriptors)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn matching_snapshot_source_descriptors(
+    _expected_identity: SnapshotSourceFileIdentity,
+) -> io::Result<BTreeSet<i32>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "session consensus snapshot readers require Linux",
+    ))
+}
+
+fn verify_snapshot_read_connection(reader: &SnapshotReadConnection) -> io::Result<()> {
+    verify_snapshot_source_path(&reader.source_path, reader.source_identity)?;
+    let opened_path = reader
+        .connection
+        .path()
+        .ok_or_else(|| invalid_data("session consensus snapshot reader has no file path"))?;
+    if std::fs::canonicalize(opened_path)? != reader.source_path {
+        return Err(invalid_data(
+            "session consensus snapshot reader opened an unexpected file",
+        ));
+    }
+    let observed = matching_snapshot_source_descriptors(reader.source_identity)?;
+    if reader.retained_descriptors.is_empty() || !reader.retained_descriptors.is_subset(&observed) {
+        return Err(invalid_data(
+            "SQLite released the verified consensus snapshot source descriptor",
+        ));
+    }
+    Ok(())
+}
+
+/// Open one read-only, file-backed snapshot reader without sharing the live
+/// consensus connection. Its caller must still create exactly one read
+/// transaction before admitting a source cut.
+pub(crate) fn open_snapshot_read_connection(
+    path: &Path,
+    expected_identity: SnapshotSourceFileIdentity,
+) -> io::Result<SnapshotReadConnection> {
+    #[cfg(target_os = "linux")]
+    {
+        verify_snapshot_source_path(path, expected_identity)?;
+        let before = matching_snapshot_source_descriptors(expected_identity)?;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(db_error)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA query_only = ON;")
+            .map_err(db_error)?;
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .map_err(db_error)?;
+        if foreign_keys != 1 {
+            return Err(invalid_data(
+                "session consensus snapshot reader has no foreign key enforcement",
+            ));
+        }
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(db_error)?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(invalid_data(
+                "session consensus snapshot reader requires WAL mode",
+            ));
+        }
+        let after = matching_snapshot_source_descriptors(expected_identity)?;
+        let retained_descriptors = after.difference(&before).copied().collect::<BTreeSet<_>>();
+        if retained_descriptors.len() != 1 {
+            return Err(invalid_data(
+                "SQLite did not retain exactly one verified consensus snapshot source descriptor",
+            ));
+        }
+        let reader = SnapshotReadConnection {
+            connection: conn,
+            source_path: path.to_path_buf(),
+            source_identity: expected_identity,
+            retained_descriptors,
+        };
+        verify_snapshot_read_connection(&reader)?;
+        Ok(reader)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, expected_identity);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "session consensus snapshot readers require Linux",
+        ))
+    }
+}
+
+/// Read the exact applied/membership cut that names one SQLite snapshot.
+pub(crate) fn snapshot_applied_membership_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<ConsensusAppliedMembership> {
+    let applied = read_applied_sync(conn, identity)?;
+    let membership = read_membership_sync(conn, identity)?;
+    validate_membership_ids(&membership)?;
+    Ok((applied, membership))
+}
+
+/// Begin the sole snapshot-reader transaction and establish its source cut.
+pub(crate) fn begin_snapshot_read_sync(
+    reader: &SnapshotReadConnection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<ConsensusAppliedMembership> {
+    verify_snapshot_read_connection(reader)?;
+    reader
+        .connection
+        .execute_batch("BEGIN DEFERRED TRANSACTION;")
+        .map_err(db_error)?;
+    match snapshot_applied_membership_sync(&reader.connection, identity) {
+        Ok(cut) => Ok(cut),
+        Err(error) => {
+            let _ = reader.connection.execute_batch("ROLLBACK;");
+            Err(error)
+        }
+    }
+}
+
+/// Release a source reader as soon as its backup has completed.
+pub(crate) fn release_snapshot_read_sync(reader: &SnapshotReadConnection) -> io::Result<()> {
+    verify_snapshot_read_connection(reader)?;
+    reader
+        .connection
+        .execute_batch("ROLLBACK;")
+        .map_err(db_error)
+}
+
+/// Enforce a caller-selected WAL ceiling without identifying the source.
+///
+/// The production reader uses the one-snapshot fixed envelope; tests use a
+/// small caller-selected value to prove oversized retention fails closed.
+pub(crate) fn enforce_snapshot_source_wal_bound(bytes: u64, maximum: u64) -> io::Result<()> {
+    if bytes > maximum {
+        return Err(invalid_data(
+            "session consensus snapshot source WAL exceeds its fixed bound",
+        ));
+    }
+    Ok(())
+}
+
+/// Measure and reject an oversized WAL retained by the one active snapshot
+/// reader. The byte count is fixed-dimension diagnostic evidence for callers.
+pub(crate) fn validate_snapshot_source_wal_bound(
+    path: &Path,
+    expected_identity: SnapshotSourceFileIdentity,
+) -> io::Result<u64> {
+    verify_snapshot_source_path(path, expected_identity)?;
+    let wal = snapshot_source_wal_path(path);
+    let bytes = match std::fs::metadata(wal) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    enforce_snapshot_source_wal_bound(bytes, SNAPSHOT_SOURCE_WAL_MAX_BYTES)?;
+    Ok(bytes)
+}
+
+/// Copy one already-fixed source reader image into a descriptor-pinned raw
+/// snapshot. This never performs destination cleanup or validation while the
+/// source reader remains open.
+#[allow(clippy::too_many_arguments)] // The exact fixed authority and cut are intentionally explicit.
+pub(crate) fn capture_snapshot_database_from_reader_sync(
+    reader: &SnapshotReadConnection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    expected_cut: &ConsensusAppliedMembership,
+    path: &Path,
+) -> io::Result<(
+    ConsensusAppliedMembership,
+    crate::consensus::snapshot::PinnedSqliteFile,
+    u64,
+)> {
+    verify_snapshot_read_connection(reader)?;
+    validate_existing_schema(&reader.connection, identity)
+        .map_err(|_| invalid_data("session consensus snapshot source schema is invalid"))?;
+    validate_durable_authority_for_raw_access(
+        &reader.connection,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+    )?;
+    validate_sealed_state_sync(&reader.connection)?;
+    let observed_cut = snapshot_applied_membership_sync(&reader.connection, identity)?;
+    if &observed_cut != expected_cut {
+        return Err(invalid_data(
+            "session consensus snapshot source cut differs from the live cut",
+        ));
+    }
+
+    // No output path is created before identity, schema, authority, and
+    // sealed-state validation have all succeeded on the fixed reader image.
+    let mut pinned = create_pinned_snapshot_database(path)?;
+    let (mut destination, descriptor_fds) = open_pinned_snapshot_database(&pinned)?;
+    destination
+        .execute_batch("PRAGMA journal_mode = OFF;")
+        .map_err(db_error)?;
+    {
+        let backup = rusqlite::backup::Backup::new(&reader.connection, &mut destination)
+            .map_err(db_error)?;
+        backup
+            .run_to_completion(128, std::time::Duration::ZERO, None)
+            .map_err(db_error)?;
+    }
+    verify_snapshot_read_connection(reader)?;
+    let wal_bytes =
+        validate_snapshot_source_wal_bound(&reader.source_path, reader.source_identity)?;
+    pinned = refresh_pinned_snapshot_database(pinned)?;
+    verify_pinned_snapshot_descriptor(&pinned, &descriptor_fds)?;
+    drop(destination);
+    Ok((observed_cut, pinned, wal_bytes))
+}
+
+/// Finish a raw snapshot only after its reader has been released.
+pub(crate) fn finalize_captured_snapshot_database_sync(
+    identity: SessionConsensusIdentity,
+    expected_cut: &ConsensusAppliedMembership,
+    mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
+) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
+    let (destination, descriptor_fds) = open_pinned_snapshot_database(&pinned)?;
+    destination
+        .execute_batch(
+            r#"
+            DELETE FROM consensus_vote;
+            DELETE FROM consensus_committed;
+            DELETE FROM consensus_purged;
+            DELETE FROM consensus_log;
+            DELETE FROM consensus_snapshot;
+            PRAGMA journal_mode = OFF;
+            VACUUM;
+            "#,
+        )
+        .map_err(db_error)?;
+    ops::rotate_restore_scan_epoch_sync(&destination)
+        .map_err(|_| invalid_data("built session consensus snapshot restore metadata failed"))?;
+    validate_existing_schema(&destination, identity)
+        .map_err(|_| invalid_data("built session consensus snapshot failed validation"))?;
+    validate_sealed_state_sync(&destination)?;
+    let observed_cut = snapshot_applied_membership_sync(&destination, identity)?;
+    if &observed_cut != expected_cut {
+        return Err(invalid_data(
+            "session consensus snapshot metadata differs from its captured cut",
+        ));
+    }
+    pinned = refresh_pinned_snapshot_database(pinned)?;
+    verify_pinned_snapshot_descriptor(&pinned, &descriptor_fds)?;
+    drop(destination);
+    Ok(pinned)
+}
+
 /// Capture the source image while the caller holds the SQLite transaction that
 /// admitted it. The fixed-authority validation and backup therefore observe
 /// the same pinned source snapshot.
@@ -15167,7 +15514,6 @@ fn capture_and_finalize_snapshot_database_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
-    capture_hook: impl FnOnce(),
 ) -> io::Result<(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
@@ -15176,7 +15522,6 @@ fn capture_and_finalize_snapshot_database_sync(
     let applied = read_applied_sync(conn, identity)?;
     let membership = read_membership_sync(conn, identity)?;
     validate_membership_ids(&membership)?;
-    capture_hook();
 
     let (mut destination, descriptor_fds) = open_pinned_snapshot_database(&pinned)?;
     destination
@@ -16940,6 +17285,34 @@ mod tests {
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn snapshot_source_wal_bound_rejects_small_overflow() {
+        assert!(enforce_snapshot_source_wal_bound(1, 1).is_ok());
+        assert!(enforce_snapshot_source_wal_bound(2, 1).is_err());
+    }
+
+    #[test]
+    fn snapshot_reader_rejects_replaced_source_path() {
+        let directory = tempfile::tempdir().expect("snapshot source directory");
+        let source = directory.path().join("source.sqlite");
+        let replacement = directory.path().join("replacement.sqlite");
+        let source_connection = Connection::open(&source).expect("open source SQLite");
+        source_connection
+            .execute_batch("PRAGMA journal_mode = WAL;")
+            .expect("set source WAL mode");
+        drop(source_connection);
+        let expected_identity = snapshot_source_file_identity(&source).expect("source identity");
+        let replacement_connection =
+            Connection::open(&replacement).expect("open replacement SQLite");
+        replacement_connection
+            .execute_batch("PRAGMA journal_mode = WAL;")
+            .expect("set replacement WAL mode");
+        drop(replacement_connection);
+        std::fs::rename(&replacement, &source).expect("replace source path");
+
+        assert!(open_snapshot_read_connection(&source, expected_identity).is_err());
+    }
 
     #[test]
     fn fenced_transition_v2_closed_epoch_integrity_is_fail_closed() {

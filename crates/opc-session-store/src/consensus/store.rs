@@ -264,6 +264,12 @@ pub struct SessionConsensusStatus {
     pub applied_index: Option<u64>,
     /// Whether exact configured membership has been admitted and remains live.
     pub admitted: bool,
+    /// WAL bytes observed by the latest completed file-backed snapshot capture.
+    pub snapshot_wal_bytes: u64,
+    /// Highest WAL bytes observed by any completed file-backed snapshot capture.
+    pub peak_snapshot_wal_bytes: u64,
+    /// Duration of the latest completed snapshot, in milliseconds.
+    pub last_snapshot_duration_millis: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3352,6 +3358,8 @@ impl ConsensusSessionStore {
                             placement_policy,
                         )
                     }));
+        let (snapshot_wal_bytes, peak_snapshot_wal_bytes, last_snapshot_duration_millis) =
+            self.inner.backend.snapshot_observation().snapshot();
         SessionConsensusStatus {
             node_id: self.inner.local_node_id,
             term,
@@ -3359,6 +3367,9 @@ impl ConsensusSessionStore {
             last_log_index,
             applied_index,
             admitted,
+            snapshot_wal_bytes,
+            peak_snapshot_wal_bytes,
+            last_snapshot_duration_millis,
         }
     }
 
