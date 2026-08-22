@@ -54,8 +54,6 @@ const QUALIFICATION_RELEASE_TRANSITIONS: usize =
 const QUALIFICATION_TRANSITIONS: usize = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES + 1;
 const QUALIFICATION_HEADROOM_TRANSITIONS: usize =
     FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET;
-const RECLAIM_BATCHES: usize =
-    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES / FENCED_TRANSITION_V2_RECLAIM_BATCH;
 // Match the fixed durable quorum's bounded proposal-admission capacity. This
 // represents a small, realistic client burst while leaving consensus itself to
 // serialize and durably apply every proposal on the three voters.
@@ -1234,23 +1232,29 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
             .add_seconds(24 * 60 * 60 + 1)
             .expect("retention-boundary qualification time"),
     );
-    let mut history = retry_exact_consensus_operation(&transient_retries, || {
+    let history_before_successor = retry_exact_consensus_operation(&transient_retries, || {
         store.fenced_transition_v2_history_state()
     })
     .await
     .expect("commit advanced logical time through a public read barrier");
-    history = maintain_exact_history_batch(&stores, history, &transient_retries, None)
-        .await
-        .expect("first fixed-quorum retirement batch");
-    assert_eq!(history.active_epoch(), None);
-    assert_eq!(history.retired_through(), Some(first_epoch));
-    assert_eq!(history.reclaim_epoch(), Some(first_epoch));
-    assert_eq!(
-        history.reclaim_remaining(),
-        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - FENCED_TRANSITION_V2_RECLAIM_BATCH
-    );
+    let history =
+        maintain_exact_history_batch(&stores, history_before_successor, &transient_retries, None)
+            .await
+            .expect("full first epoch opens its fixed-quorum successor");
 
     let next_epoch = FencedTransitionV2HistoryEpoch::new(2).expect("next epoch");
+    assert_eq!(history.active_epoch(), Some(next_epoch));
+    assert_eq!(history.retired_through(), None);
+    assert_eq!(history.reclaim_epoch(), None);
+    assert_eq!(history.reclaim_remaining(), 0);
+    assert_eq!(history.bound_entries(), 0);
+    assert_eq!(history.reclaimed_entries(), 0);
+    assert_eq!(
+        history.generation(),
+        history_before_successor.generation() + 1,
+        "opening the immediate successor is exactly one replicated lifecycle transition"
+    );
+
     let next_key = key(QUALIFICATION_TRANSITIONS + 1);
     let next_observation = retry_exact_consensus_operation(&transient_retries, || {
         store.observe_fenced_transition(&next_key)
@@ -1270,15 +1274,15 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
             store.fenced_transition_v2_status(&old_request)
         })
         .await
-        .expect("retired old retry status during reclaim"),
-        FencedTransitionV2Status::Retired
+        .expect("old request remains bound in the first replay epoch"),
+        FencedTransitionV2Status::Expired
     );
     assert_eq!(
         retry_exact_consensus_operation(&transient_retries, || {
             store.fenced_transition_v2_status(&changed_old_request)
         })
         .await
-        .expect("altered old retry status during reclaim"),
+        .expect("altered old retry status after successor rotation"),
         FencedTransitionV2Status::RequestConflict
     );
     assert_eq!(
@@ -1286,8 +1290,8 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
             store.fenced_transition_v2(old_request.clone())
         })
         .await,
-        Err(StoreError::FencedTransitionHistoryEpochRetired),
-        "a delayed exact retry is terminal as soon as the replicated floor advances"
+        Err(StoreError::FencedTransitionRequestExpired),
+        "an expired retained binding must never execute again"
     );
     assert_eq!(
         retry_exact_consensus_operation(&transient_retries, || {
@@ -1295,118 +1299,52 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         })
         .await,
         Err(StoreError::FencedTransitionRequestConflict),
-        "body conflict must take precedence over a retired floor during reclamation"
+        "body conflict must remain deterministic after successor rotation"
     );
     assert_eq!(
         retry_exact_consensus_operation(&transient_retries, || {
             store.fenced_transition_v2_status(&next_request)
         })
         .await
-        .expect("next epoch status during reclaim"),
-        FencedTransitionV2Status::EpochNotActive
-    );
-    assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2(next_request.clone())
-        })
-        .await,
-        Err(StoreError::FencedTransitionHistoryEpochNotActive),
-        "next epoch must have no effect while reclamation is active"
+        .expect("next epoch status after successor rotation"),
+        FencedTransitionV2Status::NotFound
     );
     assert!(
         retry_exact_consensus_operation(&transient_retries, || store.get(&next_key))
             .await
-            .expect("read next epoch key during reclaim")
+            .expect("read next epoch key before execution")
             .is_none(),
-        "inactive next epoch must not install a business record"
-    );
-
-    assert_eq!(
-        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES % FENCED_TRANSITION_V2_RECLAIM_BATCH,
-        0,
-        "qualification assumes ordered full reclamation batches"
-    );
-    for batch in 1..RECLAIM_BATCHES {
-        history = maintain_exact_history_batch(&stores, history, &transient_retries, None)
-            .await
-            .expect("ordered fixed-quorum retirement batch");
-        if batch + 1 < RECLAIM_BATCHES {
-            assert_eq!(history.active_epoch(), None);
-            assert_eq!(history.reclaim_epoch(), Some(first_epoch));
-            assert_eq!(
-                history.reclaim_remaining(),
-                FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
-                    - (batch + 1) * FENCED_TRANSITION_V2_RECLAIM_BATCH
-            );
-        }
-    }
-    assert_eq!(history.active_epoch(), Some(next_epoch));
-    assert_eq!(history.retired_through(), Some(first_epoch));
-    assert_eq!(history.reclaim_epoch(), None);
-    assert_eq!(history.reclaim_remaining(), 0);
-    assert_eq!(history.bound_entries(), 0);
-    assert_eq!(
-        history.reclaimed_entries(),
-        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64
-    );
-    assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2_status(&old_request)
-        })
-        .await
-        .expect("retired old retry status after final batch"),
-        FencedTransitionV2Status::Retired
-    );
-    assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2_status(&changed_old_request)
-        })
-        .await
-        .expect("altered old retry status after final batch"),
-        FencedTransitionV2Status::RequestConflict
-    );
-    assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2(old_request.clone())
-        })
-        .await,
-        Err(StoreError::FencedTransitionHistoryEpochRetired),
-        "physical deletion must not make an exact old retry executable"
-    );
-    assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2(changed_old_request.clone())
-        })
-        .await,
-        Err(StoreError::FencedTransitionRequestConflict),
-        "physical deletion must preserve altered-body conflict classification"
-    );
-    assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.get(old_request.lease().key())
-        })
-        .await
-        .expect("read old request record after delayed retries"),
-        Some(old_record_before_retries),
-        "replay, retirement, and altered-body conflict must not duplicate or roll back business state"
-    );
-    assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2_status(&next_request)
-        })
-        .await
-        .expect("next epoch status after final batch"),
-        FencedTransitionV2Status::NotFound
+        "a status read must not install a business record"
     );
     let next_outcome = retry_exact_consensus_operation(&transient_retries, || {
         store.fenced_transition_v2(next_request.clone())
     })
     .await
-    .expect("next epoch must execute after final reclamation batch");
+    .expect("active successor epoch must execute without retiring its predecessor");
     assert!(matches!(
         next_outcome.mutation(),
         FencedTransitionMutationResult::Created
     ));
+    assert_eq!(
+        retry_exact_consensus_operation(&transient_retries, || {
+            store.get(old_request.lease().key())
+        })
+        .await
+        .expect("read old request record after retained replay"),
+        Some(old_record_before_retries),
+        "expiry, body conflict, and successor execution must not duplicate or roll back old business state"
+    );
+    let history = retry_exact_consensus_operation(&transient_retries, || {
+        store.fenced_transition_v2_history_state()
+    })
+    .await
+    .expect("read history after successor execution");
+    assert_eq!(history.active_epoch(), Some(next_epoch));
+    assert_eq!(history.retired_through(), None);
+    assert_eq!(history.reclaim_epoch(), None);
+    assert_eq!(history.reclaim_remaining(), 0);
+    assert_eq!(history.bound_entries(), 1);
+    assert_eq!(history.reclaimed_entries(), 0);
 
     let database_bytes_by_voter = database_paths
         .iter()
