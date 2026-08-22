@@ -12680,7 +12680,8 @@ mod tests {
         SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionConsumerRejection,
         SessionQuorumConsumer, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
         DEFAULT_CONSUMER_IDLE_TIMEOUT, DEFAULT_CONSUMER_MAX_CONNECTIONS,
-        DEFAULT_CONSUMER_OPERATION_TIMEOUT, DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+        DEFAULT_CONSUMER_OPERATION_TIMEOUT, DEFAULT_CONSUMER_SETUP_TIMEOUT,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
@@ -19678,16 +19679,17 @@ mod tests {
             .expect("client TLS task")
             .expect("TLS completes within the first setup phase");
 
-        // Freeze only after the real TCP/TLS exchange has completed, then
-        // consume the exact remaining absolute budget while the server is
-        // paused between TLS and Hello. This avoids wall-clock sensitivity
-        // while proving the next phase receives no fresh timeout.
+        // Freeze after the real TCP/TLS exchange, then consume the complete
+        // 1,500 ms accept-to-HelloAck budget while the server is paused
+        // between TLS and Hello. The short typed-request deadline is not a
+        // setup deadline and cannot reset either bootstrap phase.
         tokio::time::pause();
-        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::time::advance(DEFAULT_CONSUMER_SETUP_TIMEOUT).await;
         // At the exact absolute boundary a newly supplied complete Hello must
         // not receive an Ack. A phase-reset implementation would grant a new
-        // 500 ms read/write budget and publish the lane.
+        // 1,500 ms read/write budget and publish the lane.
         hooks.continue_after_tls.notify_one();
+        tokio::time::resume();
         let _ = super::write_frame_bounded_until(
             &mut tls,
             &ConsumerWireRequest::Hello(super::ConsumerHello {
@@ -19711,6 +19713,64 @@ mod tests {
         assert!(
             !matches!(response, Ok(Ok(ConsumerWireResponse::HelloAck(_)))),
             "no complete HelloAck crosses the absolute setup boundary"
+        );
+        server.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn listener_setup_does_not_consume_the_typed_call_deadline() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("setup-dispatch-client");
+        let server_identity = material_spiffe("setup-dispatch-server");
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let hooks = Arc::new(ConsumerServerSetupTestHooks::new());
+        let entered = Arc::new(Notify::new());
+        let service = Arc::new(V2BlockingTestConsumer {
+            entered: Arc::clone(&entered),
+        });
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity.clone()],
+            std::iter::empty(),
+        )
+        .expect("setup-dispatch authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            service,
+            material.trusted_server_config(server_identity.as_str()),
+            authorizer,
+        )
+        .with_operation_timeout(Duration::from_millis(20))
+        .with_setup_test_hooks(Arc::clone(&hooks))
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for setup-dispatch deadline test");
+        let client = StatelessSessionConsumerClient::new(
+            address,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            server_identity,
+            scope(),
+            material.config(),
+        )
+        .with_operation_timeout(Duration::from_secs(5));
+        let request = v2_effectful_request(0x87);
+        let request_id = request.request_id().expect("V2 call has a full ID");
+        let call = tokio::spawn(async move { client.execute_v2(request).await });
+
+        hooks.accepted.notified().await;
+        hooks.continue_after_accept.notify_one();
+        hooks.tls_complete.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(21)).await;
+        hooks.continue_after_tls.notify_one();
+
+        entered.notified().await;
+        tokio::time::advance(Duration::from_millis(20)).await;
+        assert_eq!(
+            call.await.expect("join setup-dispatch caller"),
+            Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknown { request_id }),
+            "the fresh typed Call deadline bounds its dispatch and response after setup exceeded it"
         );
         server.abort_and_wait().await;
     }
