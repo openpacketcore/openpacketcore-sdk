@@ -16,10 +16,65 @@ use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::linux::fs::MetadataExt as _;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 /// Maximum payload bytes admitted in one consensus snapshot envelope.
 pub(crate) const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// Maximum bytes accepted from a snapshot sender, including its fixed footer.
 pub(crate) const SNAPSHOT_MAX_ENVELOPE_BYTES: u64 = SNAPSHOT_MAX_BYTES + 48;
+
+/// Test-only coordination around a snapshot artifact lifecycle boundary.
+#[cfg(test)]
+pub(crate) struct SnapshotArtifactGate {
+    armed: AtomicBool,
+    started: AtomicBool,
+    started_notify: tokio::sync::Notify,
+    released: AtomicBool,
+    released_notify: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl SnapshotArtifactGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            started: AtomicBool::new(false),
+            started_notify: tokio::sync::Notify::new(),
+            released: AtomicBool::new(false),
+            released_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) fn arm(&self) {
+        self.started.store(false, Ordering::Release);
+        self.released.store(false, Ordering::Release);
+        self.armed.store(true, Ordering::Release);
+    }
+
+    pub(crate) async fn wait_started(&self) {
+        while !self.started.load(Ordering::Acquire) {
+            self.started_notify.notified().await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.released_notify.notify_waiters();
+    }
+
+    pub(crate) async fn block_if_armed(&self) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        self.started.store(true, Ordering::Release);
+        self.started_notify.notify_waiters();
+        while !self.released.load(Ordering::Acquire) {
+            self.released_notify.notified().await;
+        }
+        self.armed.store(false, Ordering::Release);
+    }
+}
 
 /// Immutable identity taken from an already-open SQLite file descriptor.
 ///
@@ -295,8 +350,26 @@ pub(crate) struct SessionSnapshotFile {
 impl SessionSnapshotFile {
     /// Create a new receiving file. Existing data is never reused.
     pub(crate) async fn create(path: PathBuf) -> io::Result<Self> {
+        #[cfg(test)]
+        {
+            return Self::create_inner(path, None).await;
+        }
+        #[cfg(not(test))]
+        {
+            Self::create_inner(path).await
+        }
+    }
+
+    async fn create_inner(
+        path: PathBuf,
+        #[cfg(test)] after_create: Option<&SnapshotArtifactGate>,
+    ) -> io::Result<Self> {
         reject_symlink(&path).await?;
         let file = snapshot_open_options(true, true, true).open(&path).await?;
+        #[cfg(test)]
+        if let Some(after_create) = after_create {
+            after_create.block_if_armed().await;
+        }
         let cleanup = UnpublishedSnapshotArtifact::from_metadata(
             path.clone(),
             &file.metadata().await?,
@@ -607,12 +680,14 @@ impl AsyncSeek for SessionSnapshotFile {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     #[cfg(target_os = "linux")]
     use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
 
-    use super::SessionSnapshotFile;
     #[cfg(target_os = "linux")]
     use super::{PinnedSqliteFile, UnpublishedSnapshotArtifact};
+    use super::{SessionSnapshotFile, SnapshotArtifactGate};
     use tempfile::tempdir;
 
     #[cfg(target_os = "linux")]
@@ -718,6 +793,35 @@ mod tests {
             .err()
             .ok_or("create succeeded")?;
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_immediately_after_receive_create_cleans_the_exact_artifact(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming-cancelled.part");
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let task_path = path.clone();
+        let task_gate = Arc::clone(&gate);
+        let task = tokio::spawn(async move {
+            let _snapshot =
+                SessionSnapshotFile::create_inner(task_path, Some(task_gate.as_ref())).await?;
+            Ok::<(), io::Error>(())
+        });
+
+        gate.wait_started().await;
+        assert!(path.is_file(), "the created receive artifact is observable");
+        task.abort();
+        assert!(task
+            .await
+            .expect_err("receive task is cancelled")
+            .is_cancelled());
+        assert!(
+            !path.exists(),
+            "cancellation after create must clean the exact receive artifact"
+        );
         Ok(())
     }
 

@@ -20,6 +20,8 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::raft_adapter::{SessionRaftAdapterError, SessionRaftPeerDirectory};
+#[cfg(test)]
+use super::snapshot::SnapshotArtifactGate;
 use super::snapshot::{
     PinnedSqliteFile, SessionSnapshotFile, UnpublishedSnapshotArtifact, SNAPSHOT_MAX_BYTES,
 };
@@ -36,6 +38,26 @@ const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCSNP01";
 const SNAPSHOT_FOOTER_BYTES: u64 = 8 + 8 + 32;
 const SNAPSHOT_DIRECTORY_MAX_ENTRIES: usize = 8_192;
 const SNAPSHOT_APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(test)]
+fn promoted_verify_gate() -> &'static std::sync::Mutex<Option<std::sync::Arc<SnapshotArtifactGate>>>
+{
+    static GATE: std::sync::OnceLock<
+        std::sync::Mutex<Option<std::sync::Arc<SnapshotArtifactGate>>>,
+    > = std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+async fn wait_before_promoted_verify() {
+    let gate = promoted_verify_gate()
+        .lock()
+        .map(|gate| gate.clone())
+        .unwrap_or(None);
+    if let Some(gate) = gate {
+        gate.block_if_armed().await;
+    }
+}
 
 /// Fail-closed errors emitted while binding an existing SQLite database to a
 /// durable consensus identity.
@@ -870,6 +892,8 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                     )
                 })?;
         drop(snapshot);
+        #[cfg(test)]
+        wait_before_promoted_verify().await;
 
         let mut promoted_snapshot = SessionSnapshotFile::open(final_path.clone())
             .await
@@ -1642,6 +1666,33 @@ async fn copy_and_promote_from_reader<R>(
 where
     R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
 {
+    #[cfg(test)]
+    {
+        return copy_and_promote_from_reader_inner(
+            source,
+            temporary,
+            final_path,
+            expected_length,
+            None,
+        )
+        .await;
+    }
+    #[cfg(not(test))]
+    {
+        copy_and_promote_from_reader_inner(source, temporary, final_path, expected_length).await
+    }
+}
+
+async fn copy_and_promote_from_reader_inner<R>(
+    source: &mut R,
+    temporary: &Path,
+    final_path: &Path,
+    expected_length: u64,
+    #[cfg(test)] after_rename: Option<&SnapshotArtifactGate>,
+) -> io::Result<UnpublishedSnapshotArtifact>
+where
+    R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
+{
     source.seek(io::SeekFrom::Start(0)).await?;
     let (mut output, mut cleanup) = create_unpublished_snapshot_output(temporary, false)?;
     let copied = tokio::io::copy(source, &mut output).await?;
@@ -1654,6 +1705,10 @@ where
     output.sync_all().await?;
     drop(output);
     tokio::fs::rename(temporary, final_path).await?;
+    #[cfg(test)]
+    if let Some(after_rename) = after_rename {
+        after_rename.block_if_armed().await;
+    }
     cleanup.rebind_path(final_path.to_path_buf());
     let parent = final_path
         .parent()
@@ -1732,6 +1787,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -2048,6 +2104,169 @@ mod tests {
                 .expect("read current snapshot after restart")
                 .is_some(),
             "restart reads the candidate that durable metadata references"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_snapshot_copy_failure_cleans_the_exact_created_artifact() {
+        let directory = tempfile::tempdir().expect("raw snapshot cleanup directory");
+        let source_path = directory.path().join("source.opc");
+        tokio::fs::write(&source_path, [])
+            .await
+            .expect("write empty source");
+        let mut source = SessionSnapshotFile::open(source_path)
+            .await
+            .expect("open empty source");
+        let raw_path = directory.path().join("install-copy-failure.sqlite");
+
+        assert!(
+            extract_snapshot_database_from_reader(&mut source, &raw_path, 1)
+                .await
+                .is_err(),
+            "incomplete raw copy must fail"
+        );
+        assert!(
+            !raw_path.exists(),
+            "a raw artifact created before a copy failure must be cleaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_immediately_after_promotion_keeps_no_final_artifact() {
+        let directory = tempfile::tempdir().expect("promotion cancellation directory");
+        let source_path = directory.path().join("source.opc");
+        tokio::fs::write(&source_path, b"snapshot envelope")
+            .await
+            .expect("write source envelope");
+        let temporary = directory.path().join("promote.part");
+        let final_path = directory.path().join("snapshot.opc");
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let task_gate = Arc::clone(&gate);
+        let task_final_path = final_path.clone();
+        let task = tokio::spawn(async move {
+            let mut source = SessionSnapshotFile::open(source_path)
+                .await
+                .expect("open source envelope");
+            copy_and_promote_from_reader_inner(
+                &mut source,
+                &temporary,
+                &task_final_path,
+                b"snapshot envelope".len() as u64,
+                Some(task_gate.as_ref()),
+            )
+            .await
+        });
+
+        gate.wait_started().await;
+        assert!(
+            final_path.is_file(),
+            "the promoted name is visible at the cancellation boundary"
+        );
+        task.abort();
+        assert!(match task.await {
+            Err(error) => error.is_cancelled(),
+            Ok(_) => false,
+        });
+        assert!(
+            !final_path.exists(),
+            "cancellation after rename must clean the exact promoted artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn promoted_mismatch_never_unlinks_a_same_name_replacement() {
+        let source_directory = tempfile::tempdir().expect("mismatch source directory");
+        let source_backend =
+            SqliteSessionBackend::open(source_directory.path().join("sessions.sqlite"))
+                .expect("mismatch source backend");
+        let (_, mut source) = open(
+            &source_backend,
+            source_directory.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("mismatch source storage");
+        source
+            .apply([initial_membership_entry()])
+            .await
+            .expect("mismatch source membership");
+        let mut first_builder = source.get_snapshot_builder().await;
+        let mut first = first_builder
+            .build_snapshot()
+            .await
+            .expect("build first snapshot");
+        source
+            .apply([normal_entry(1, advance_time_command(identity(1), 1, 1))])
+            .await
+            .expect("advance mismatch source");
+        let mut second_builder = source.get_snapshot_builder().await;
+        let second = second_builder
+            .build_snapshot()
+            .await
+            .expect("build replacement snapshot");
+        let replacement_bytes = tokio::fs::read(second.snapshot.path())
+            .await
+            .expect("read replacement bytes");
+        let replacement_path = second.snapshot.path().to_path_buf();
+
+        let target_directory = tempfile::tempdir().expect("mismatch target directory");
+        let target_backend =
+            SqliteSessionBackend::open(target_directory.path().join("sessions.sqlite"))
+                .expect("mismatch target backend");
+        let (_, mut target) = open(
+            &target_backend,
+            target_directory.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("mismatch target storage");
+        let mut receiving = target
+            .begin_receiving_snapshot()
+            .await
+            .expect("mismatch receiving snapshot");
+        first
+            .snapshot
+            .rewind()
+            .await
+            .expect("rewind first snapshot");
+        tokio::io::copy(&mut first.snapshot, &mut receiving)
+            .await
+            .expect("copy first snapshot");
+
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        *promoted_verify_gate()
+            .lock()
+            .expect("set promoted verify gate") = Some(Arc::clone(&gate));
+        let meta = first.meta.clone();
+        let install = tokio::spawn(async move { target.install_snapshot(&meta, receiving).await });
+        gate.wait_started().await;
+        let final_path = std::fs::read_dir(target_directory.path().join("snapshots"))
+            .expect("read promoted snapshot directory")
+            .map(|entry| entry.expect("promoted snapshot entry").path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "opc"))
+            .expect("locate promoted snapshot");
+        std::fs::rename(&replacement_path, &final_path).expect("replace promoted snapshot name");
+        gate.release();
+        assert!(
+            install
+                .await
+                .expect("join mismatched snapshot install")
+                .is_err(),
+            "the replacement must fail promoted-content verification"
+        );
+        *promoted_verify_gate()
+            .lock()
+            .expect("clear promoted verify gate") = None;
+        assert_eq!(
+            replacement_bytes,
+            tokio::fs::read(&final_path)
+                .await
+                .expect("same-name replacement survives mismatch cleanup"),
+            "mismatch cleanup must not unlink a replacement inode"
         );
     }
 
