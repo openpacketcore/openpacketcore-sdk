@@ -22,7 +22,9 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::raft_adapter::{SessionRaftAdapterError, SessionRaftPeerDirectory};
-use super::snapshot::{PinnedSqliteFile, SessionSnapshotFile, UnpublishedSnapshotArtifact};
+use super::snapshot::{
+    PinnedSqliteFile, SessionSnapshotFile, UnpublishedSnapshotArtifact, SNAPSHOT_MAX_BYTES,
+};
 use super::{
     SessionConsensusIdentity, SessionConsensusNodeId, SessionRaftTypeConfig,
     SessionTopologyMemberBinding,
@@ -34,7 +36,6 @@ use crate::sqlite::SqliteSessionBackend;
 
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCSNP01";
 const SNAPSHOT_FOOTER_BYTES: u64 = 8 + 8 + 32;
-const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 // At most one published image and a bounded set of interrupted-attempt
 // artifacts may coexist under the one snapshot gate.
 const SNAPSHOT_DIRECTORY_MAX_ENTRIES: usize = 32;
@@ -977,43 +978,21 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
 
         let file_name = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
         let final_path = self.core.snapshot_dir.join(&file_name);
-        let final_artifact = SnapshotArtifact::new(
-            final_path.clone(),
-            Arc::clone(&self.core.snapshot_cleanup_failed),
-        );
         let promoted_path = self
             .core
             .snapshot_dir
             .join(format!("promote-{}.part", uuid::Uuid::new_v4()));
-        let promoted_artifact = SnapshotArtifact::new(
-            promoted_path.clone(),
-            Arc::clone(&self.core.snapshot_cleanup_failed),
-        );
-        copy_and_promote_from_reader(&mut snapshot, &promoted_path, &final_path, total_length)
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Write,
-                    error,
-                )
-            })?;
-        // The name has moved atomically to `final_path`; observing the absent
-        // temporary name also disarms its cancellation fallback.
-        promoted_artifact.remove().await.map_err(|error| {
-            storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Write,
-                error,
-            )
-        })?;
-        snapshot.close_and_cleanup().await.map_err(|error| {
-            storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Write,
-                error,
-            )
-        })?;
+        let mut promoted_cleanup =
+            copy_and_promote_from_reader(&mut snapshot, &promoted_path, &final_path, total_length)
+                .await
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Write,
+                        error,
+                    )
+                })?;
+        drop(snapshot);
 
         let mut promoted_snapshot = SessionSnapshotFile::open(final_path.clone())
             .await
@@ -1106,19 +1085,30 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                     ));
                 }
             }
-            match consensus::install_snapshot_database_from_pinned_with_authority_sync(
+            match publish_snapshot_metadata_with_readback(
                 &conn,
                 self.core.storage_identity,
-                self.core.authority_profile,
-                Some(&self.core.expected_members),
-                Some(&self.core.expected_bindings),
-                self.core.fixed_placement_policy,
-                raw_snapshot,
-                promoted_pin.as_ref().map(|pin| (pin, final_path.as_path())),
                 meta,
                 &file_name,
                 checksum,
                 total_length,
+                &mut promoted_cleanup,
+                || {
+                    consensus::install_snapshot_database_from_pinned_with_authority_sync(
+                        &conn,
+                        self.core.storage_identity,
+                        self.core.authority_profile,
+                        Some(&self.core.expected_members),
+                        Some(&self.core.expected_bindings),
+                        self.core.fixed_placement_policy,
+                        raw_snapshot,
+                        promoted_pin.as_ref().map(|pin| (pin, final_path.as_path())),
+                        meta,
+                        &file_name,
+                        checksum,
+                        total_length,
+                    )
+                },
             ) {
                 Err(error) => Err(storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
@@ -1136,9 +1126,8 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             Ok(previous) => previous,
             Err(error) => return Err(error),
         };
-        // Durable metadata now names `final_path`; do not let an error while
-        // reclaiming superseded artifacts delete the authoritative image.
-        final_artifact.retain();
+        // The readback helper has disarmed the exact published-file guard, so
+        // later staging reclamation cannot delete the authoritative image.
         self.core.applied_progress.send_replace(meta.last_log_id);
         raw_artifact.remove().await.map_err(|error| {
             storage_error(
@@ -1929,7 +1918,7 @@ where
     }
     destination.flush().await?;
     destination.sync_all().await?;
-    PinnedSqliteFile::from_file(destination.into_std().await, destination_path)?.pin_immutable()
+    PinnedSqliteFile::from_new_file(destination.into_std().await, destination_path)?.pin_immutable()
 }
 
 async fn copy_and_promote_from_reader<R>(
@@ -1937,14 +1926,12 @@ async fn copy_and_promote_from_reader<R>(
     temporary: &Path,
     final_path: &Path,
     expected_length: u64,
-) -> io::Result<()>
+) -> io::Result<UnpublishedSnapshotArtifact>
 where
     R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
 {
     source.seek(io::SeekFrom::Start(0)).await?;
-    let mut output = secure_snapshot_create_options(false)
-        .open(temporary)
-        .await?;
+    let (mut output, mut cleanup) = create_unpublished_snapshot_output(temporary, false)?;
     let copied = tokio::io::copy(source, &mut output).await?;
     if copied != expected_length {
         return Err(consensus::invalid_data(
@@ -1955,10 +1942,12 @@ where
     output.sync_all().await?;
     drop(output);
     tokio::fs::rename(temporary, final_path).await?;
+    cleanup.rebind_path(final_path.to_path_buf());
     let parent = final_path
         .parent()
         .ok_or_else(|| consensus::invalid_data("session consensus snapshot has no parent"))?;
-    sync_directory(parent)
+    sync_directory(parent)?;
+    Ok(cleanup)
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
@@ -2323,9 +2312,18 @@ mod tests {
                 target_directory
                     .path()
                     .join("snapshots")
-                    .join(file_name)
+                    .join(&file_name)
                     .is_file(),
                 "a current snapshot candidate survives a post-commit DETACH error"
+            );
+            let artifacts = std::fs::read_dir(target_directory.path().join("snapshots"))
+                .expect("read target snapshot directory")
+                .map(|entry| entry.expect("snapshot directory entry").file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                vec![std::ffi::OsString::from(file_name)],
+                artifacts,
+                "a post-commit error leaves no incoming, raw, or promotion artifact"
             );
         }
         drop(target);

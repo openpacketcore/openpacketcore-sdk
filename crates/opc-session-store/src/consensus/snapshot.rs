@@ -19,6 +19,11 @@ use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::linux::fs::MetadataExt as _;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+/// Maximum payload bytes admitted in one consensus snapshot envelope.
+pub(crate) const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Maximum bytes accepted from a snapshot sender, including its fixed footer.
+pub(crate) const SNAPSHOT_MAX_ENVELOPE_BYTES: u64 = SNAPSHOT_MAX_BYTES + 48;
+
 /// Immutable identity taken from an already-open SQLite file descriptor.
 ///
 /// On Linux this is deliberately based on the descriptor rather than its
@@ -80,9 +85,17 @@ impl UnpublishedSnapshotArtifact {
         path: PathBuf,
         sqlite_sidecars: bool,
     ) -> io::Result<Self> {
+        Self::from_metadata(path, &file.metadata()?, sqlite_sidecars)
+    }
+
+    pub(crate) fn from_metadata(
+        path: PathBuf,
+        metadata: &std::fs::Metadata,
+        sqlite_sidecars: bool,
+    ) -> io::Result<Self> {
         Ok(Self {
             path,
-            identity: file_identity(&file.metadata()?)?,
+            identity: file_identity(metadata)?,
             sqlite_sidecars,
             sidecars: Vec::new(),
             armed: true,
@@ -373,6 +386,7 @@ pub(crate) struct SessionSnapshotFile {
 
 struct SnapshotCleanupGuard {
     path: PathBuf,
+    identity: FileIdentity,
     armed: bool,
     cleanup_failed: Option<Arc<AtomicBool>>,
 }
@@ -380,6 +394,32 @@ struct SnapshotCleanupGuard {
 impl SnapshotCleanupGuard {
     async fn remove(&mut self) -> io::Result<()> {
         if !self.armed {
+            return Ok(());
+        }
+        let metadata = match tokio::fs::symlink_metadata(&self.path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.armed = false;
+                return Ok(());
+            }
+            Err(error) => {
+                if let Some(cleanup_failed) = &self.cleanup_failed {
+                    cleanup_failed.store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
+        };
+        let identity = match file_identity(&metadata) {
+            Ok(identity) => identity,
+            Err(error) => {
+                if let Some(cleanup_failed) = &self.cleanup_failed {
+                    cleanup_failed.store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
+        };
+        if !metadata.is_file() || !same_file_object(identity, self.identity) {
+            self.armed = false;
             return Ok(());
         }
         match tokio::fs::remove_file(&self.path).await {
@@ -404,6 +444,28 @@ impl SnapshotCleanupGuard {
 impl Drop for SnapshotCleanupGuard {
     fn drop(&mut self) {
         if !self.armed {
+            return;
+        }
+        let metadata = match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(_) => {
+                if let Some(cleanup_failed) = &self.cleanup_failed {
+                    cleanup_failed.store(true, Ordering::Release);
+                }
+                return;
+            }
+        };
+        let identity = match file_identity(&metadata) {
+            Ok(identity) => identity,
+            Err(_) => {
+                if let Some(cleanup_failed) = &self.cleanup_failed {
+                    cleanup_failed.store(true, Ordering::Release);
+                }
+                return;
+            }
+        };
+        if !metadata.is_file() || !same_file_object(identity, self.identity) {
             return;
         }
         match std::fs::remove_file(&self.path) {
@@ -448,9 +510,11 @@ impl SessionSnapshotFile {
     ) -> io::Result<Self> {
         reject_symlink(&path).await?;
         let file = snapshot_open_options(true, true, true).open(&path).await?;
+        let identity = file_identity(&file.metadata().await?)?;
         let mut snapshot = Self::from_file(file, path).await?;
         snapshot.cleanup = Some(SnapshotCleanupGuard {
             path: snapshot.path.clone(),
+            identity,
             armed: true,
             cleanup_failed,
         });
@@ -853,6 +917,21 @@ mod tests {
             .err()
             .ok_or("create succeeded")?;
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn abandoned_receive_cleanup_never_unlinks_a_same_name_replacement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming.part");
+        let receiving = SessionSnapshotFile::create(path.clone()).await?;
+        let replacement = directory.path().join("replacement.part");
+        std::fs::write(&replacement, b"replacement")?;
+        std::fs::rename(&replacement, &path)?;
+        drop(receiving);
+        assert_eq!(std::fs::read(path)?, b"replacement");
         Ok(())
     }
 
