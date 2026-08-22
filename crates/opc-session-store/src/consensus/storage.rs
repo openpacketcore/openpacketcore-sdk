@@ -1548,7 +1548,7 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 .await
                 .map_err(|error| {
                     storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-                })?;
+            })?;
             (membership, sealed, None)
         };
         tokio::fs::rename(&temporary_path, &final_path)

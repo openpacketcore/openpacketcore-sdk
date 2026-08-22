@@ -452,13 +452,14 @@ impl SnapshotCaptureGate {
     }
 
     pub(crate) fn block_after_capture(&self) {
-        if !self.armed.swap(false, Ordering::SeqCst) {
+        if !self.armed.load(Ordering::SeqCst) {
             return;
         }
         self.started.store(true, Ordering::SeqCst);
         while !self.released.load(Ordering::SeqCst) {
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        self.armed.store(false, Ordering::SeqCst);
     }
 }
 
@@ -15238,11 +15239,25 @@ pub(crate) fn build_snapshot_database_sync(
     identity: SessionConsensusIdentity,
     path: &std::path::Path,
 ) -> io::Result<ConsensusAppliedMembership> {
+    build_snapshot_database_with_capture_hook_sync(conn, identity, path, || {})
+}
+
+pub(crate) fn build_snapshot_database_with_capture_hook_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    path: &std::path::Path,
+    capture_hook: impl FnOnce(),
+) -> io::Result<ConsensusAppliedMembership> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
     validate_sealed_state_sync(&tx)?;
     validate_fenced_transition_receipts_sync(&tx, identity)?;
     let destination = create_pinned_snapshot_database(path)?;
-    let (snapshot, _) = build_snapshot_database_from_pinned_sync(&tx, identity, destination)?;
+    let (snapshot, _) = build_snapshot_database_from_pinned_with_capture_hook_sync(
+        &tx,
+        identity,
+        destination,
+        capture_hook,
+    )?;
     tx.commit().map_err(db_error)?;
     Ok(snapshot)
 }
@@ -15255,6 +15270,31 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
     expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     path: &std::path::Path,
+) -> io::Result<(
+    ConsensusAppliedMembership,
+    crate::consensus::snapshot::PinnedSqliteFile,
+)> {
+    build_snapshot_database_pinned_with_authority_and_capture_hook_sync(
+        conn,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+        path,
+        || {},
+    )
+}
+
+pub(crate) fn build_snapshot_database_pinned_with_authority_and_capture_hook_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    path: &std::path::Path,
+    capture_hook: impl FnOnce(),
 ) -> io::Result<(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
@@ -15273,8 +15313,12 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
     // Do not create even an empty snapshot artifact until the durable fixed
     // authority check has succeeded under the source read transaction.
     let destination = create_pinned_snapshot_database(path)?;
-    let (snapshot, destination) =
-        capture_and_finalize_snapshot_database_sync(&tx, identity, destination)?;
+    let (snapshot, destination) = build_snapshot_database_from_pinned_with_capture_hook_sync(
+        &tx,
+        identity,
+        destination,
+        capture_hook,
+    )?;
     tx.commit().map_err(db_error)?;
     Ok((snapshot, destination))
 }
@@ -15312,7 +15356,19 @@ fn build_snapshot_database_from_pinned_sync(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
 )> {
-    capture_and_finalize_snapshot_database_sync(conn, identity, destination)
+    build_snapshot_database_from_pinned_with_capture_hook_sync(conn, identity, destination, || {})
+}
+
+fn build_snapshot_database_from_pinned_with_capture_hook_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    destination: crate::consensus::snapshot::PinnedSqliteFile,
+    capture_hook: impl FnOnce(),
+) -> io::Result<(
+    ConsensusAppliedMembership,
+    crate::consensus::snapshot::PinnedSqliteFile,
+)> {
+    capture_and_finalize_snapshot_database_sync(conn, identity, destination, capture_hook)
 }
 
 #[allow(dead_code)]
@@ -15944,6 +16000,7 @@ fn capture_and_finalize_snapshot_database_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    capture_hook: impl FnOnce(),
 ) -> io::Result<(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
@@ -15952,6 +16009,7 @@ fn capture_and_finalize_snapshot_database_sync(
     let applied = read_applied_sync(conn, identity)?;
     let membership = read_membership_sync(conn, identity)?;
     validate_membership_ids(&membership)?;
+    capture_hook();
 
     let mut destination = open_pinned_snapshot_database(&pinned)?;
     destination
