@@ -179,6 +179,16 @@ impl PinnedSqliteFile {
         Ok(())
     }
 
+    /// Reject link-count authorization on platforms where the descriptor
+    /// identity and link count cannot be established by this adapter.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn verify_linked_identity(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "linked SQLite file identity requires Linux",
+        ))
+    }
+
     /// Compare a pathname with the pinned identity for diagnostics or cleanup.
     ///
     /// This follows the path at the time of comparison and is intentionally
@@ -698,6 +708,22 @@ mod tests {
             .err()
             .ok_or("mutated immutable artifact was accepted")?;
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn linked_identity_fails_closed_without_linux_descriptor_authority(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("snapshot");
+        std::fs::write(&path, b"snapshot")?;
+        let pinned = PinnedSqliteFile::from_file(std::fs::File::open(&path)?, path)?;
+
+        let error = pinned
+            .verify_linked_identity()
+            .expect_err("non-Linux platforms must not synthesize linked-descriptor authority");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
         Ok(())
     }
 
