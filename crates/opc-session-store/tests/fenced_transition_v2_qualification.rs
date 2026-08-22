@@ -1590,7 +1590,11 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         let mut completed = 0usize;
         let mut in_flight: JoinSet<Result<ReleaseBatchCompletion, StoreError>> = JoinSet::new();
         let mut in_flight_session_slots = BTreeSet::new();
-        let mut peak_in_flight_batches = 0usize;
+        // `JoinSet::len()` counts submitted batch tasks until they are
+        // joined, including a task that has already completed. It bounds
+        // outstanding/unjoined client task slots; it is not a measurement of
+        // simultaneously executing consensus calls.
+        let mut peak_unjoined_batch_task_slots = 0usize;
         while completed < operations {
             if active_entries == FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
                 assert!(
@@ -1716,7 +1720,8 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
                     })
                 });
                 submitted += batch_len;
-                peak_in_flight_batches = peak_in_flight_batches.max(in_flight.len());
+                peak_unjoined_batch_task_slots =
+                    peak_unjoined_batch_task_slots.max(in_flight.len());
                 continue;
             }
             let batch_len = collect_next_release_batch(
@@ -1733,14 +1738,14 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         assert_eq!(submitted, operations);
         assert!(in_flight.is_empty());
         assert!(in_flight_session_slots.is_empty());
-        assert!(peak_in_flight_batches <= QUALIFICATION_IN_FLIGHT_CLIENTS);
+        assert!(peak_unjoined_batch_task_slots <= QUALIFICATION_IN_FLIGHT_CLIENTS);
         let elapsed = phase_started.elapsed();
         let batch_samples = latency.batch.len();
         let item_samples = latency.item_scheduled_to_completion.len();
         let (batch_p99, batch_p999, item_p99, item_p999) = latency.p99_and_p999();
         let achieved_ops_per_second = operations as f64 / elapsed.as_secs_f64();
         eprintln!(
-            "sdk-702 successor phase: name={phase_name} offered_ops_per_second={target_rate} achieved_ops_per_second={achieved_ops_per_second:.6} operations={operations} batch_samples={batch_samples} item_samples={item_samples} peak_in_flight_batches={peak_in_flight_batches} batch_p99_us={} batch_p999_us={} item_p99_us={} item_p999_us={} elapsed_ms={}",
+            "sdk-702 successor phase: name={phase_name} offered_ops_per_second={target_rate} achieved_ops_per_second={achieved_ops_per_second:.6} operations={operations} batch_samples={batch_samples} item_samples={item_samples} peak_unjoined_batch_task_slots={peak_unjoined_batch_task_slots} batch_p99_us={} batch_p999_us={} item_p99_us={} item_p999_us={} elapsed_ms={}",
             batch_p99.as_micros(),
             batch_p999.as_micros(),
             item_p99.as_micros(),
