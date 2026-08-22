@@ -14,13 +14,17 @@ use std::str::FromStr;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+#[cfg(test)]
+use std::sync::{Condvar, Mutex};
 
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
 use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 #[cfg(target_os = "linux")]
 use rusqlite::OpenFlags;
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    backup::StepResult, params, Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
 use sha2::{Digest, Sha256};
 
 use crate::backend::{
@@ -404,7 +408,8 @@ pub(crate) fn snapshot_source_file_identity(path: &Path) -> io::Result<SnapshotS
 pub(crate) struct SnapshotCaptureGate {
     armed: AtomicBool,
     started: AtomicBool,
-    released: AtomicBool,
+    started_notify: tokio::sync::Notify,
+    release: (Mutex<bool>, Condvar),
 }
 
 #[cfg(test)]
@@ -413,13 +418,14 @@ impl SnapshotCaptureGate {
         Self {
             armed: AtomicBool::new(false),
             started: AtomicBool::new(false),
-            released: AtomicBool::new(false),
+            started_notify: tokio::sync::Notify::new(),
+            release: (Mutex::new(false), Condvar::new()),
         }
     }
 
     pub(crate) fn arm(&self) {
         self.started.store(false, Ordering::SeqCst);
-        self.released.store(false, Ordering::SeqCst);
+        *self.release.0.lock().expect("snapshot gate mutex") = false;
         self.armed.store(true, Ordering::SeqCst);
     }
 
@@ -427,8 +433,20 @@ impl SnapshotCaptureGate {
         self.started.load(Ordering::SeqCst)
     }
 
+    pub(crate) async fn wait_started(&self) {
+        loop {
+            let notified = self.started_notify.notified();
+            if self.started() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub(crate) fn release(&self) {
-        self.released.store(true, Ordering::SeqCst);
+        let mut released = self.release.0.lock().expect("snapshot gate mutex");
+        *released = true;
+        self.release.1.notify_all();
     }
 
     pub(crate) fn block_after_capture(&self) {
@@ -436,8 +454,10 @@ impl SnapshotCaptureGate {
             return;
         }
         self.started.store(true, Ordering::SeqCst);
-        while !self.released.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        self.started_notify.notify_waiters();
+        let mut released = self.release.0.lock().expect("snapshot gate mutex");
+        while !*released {
+            released = self.release.1.wait(released).expect("snapshot gate mutex");
         }
         self.armed.store(false, Ordering::SeqCst);
     }
@@ -1410,15 +1430,14 @@ impl SqliteConsensusCore {
         let canonical_snapshot_dir = tokio::fs::canonicalize(&snapshot_dir)
             .await
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-        let database_file_identity = backend
-            .database_path
-            .as_deref()
-            .map(|path| snapshot_source_file_identity(path.as_path()))
-            .transpose()
-            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-
-        let (storage_identity, applied) = {
+        let (storage_identity, applied, database_file_identity) = {
             let conn = backend.conn.lock().await;
+            let database_file_identity = backend
+                .database_path
+                .as_deref()
+                .map(|path| snapshot_connection_file_identity(&conn, path.as_path()))
+                .transpose()
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
             let storage_identity = initialize_schema_with_storage_anchor_and_pending_and_bindings(
                 &conn,
                 required_storage_identity,
@@ -1431,7 +1450,7 @@ impl SqliteConsensusCore {
             )?;
             let applied = read_applied_sync(&conn, storage_identity)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?;
-            (storage_identity, applied)
+            (storage_identity, applied, database_file_identity)
         };
         let (applied_progress, _) = tokio::sync::watch::channel(applied);
 
@@ -14915,8 +14934,10 @@ pub(crate) fn build_snapshot_database_sync(
     validate_sealed_state_sync(&tx)?;
     validate_fenced_transition_receipts_sync(&tx, identity)?;
     let destination = create_pinned_snapshot_database(path)?;
-    let (snapshot, _) = build_snapshot_database_from_pinned_sync(&tx, identity, destination)?;
+    let (snapshot, mut destination) =
+        build_snapshot_database_from_pinned_sync(&tx, identity, destination)?;
     tx.commit().map_err(db_error)?;
+    destination.disarm_cleanup();
     Ok(snapshot)
 }
 
@@ -14962,9 +14983,6 @@ pub(crate) fn build_snapshot_database_with_authority_sync(
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     path: &std::path::Path,
 ) -> io::Result<ConsensusAppliedMembership> {
-    if authority_profile == ConsensusAuthorityProfile::Dynamic {
-        return build_snapshot_database_sync(conn, identity, path);
-    }
     build_snapshot_database_pinned_with_authority_sync(
         conn,
         identity,
@@ -14974,7 +14992,10 @@ pub(crate) fn build_snapshot_database_with_authority_sync(
         fixed_placement_policy,
         path,
     )
-    .map(|(snapshot, _)| snapshot)
+    .map(|(snapshot, mut destination)| {
+        destination.disarm_cleanup();
+        snapshot
+    })
 }
 
 fn build_snapshot_database_from_pinned_sync(
@@ -15003,7 +15024,7 @@ fn create_pinned_snapshot_database(
             .write(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        crate::consensus::snapshot::PinnedSqliteFile::from_file(
+        crate::consensus::snapshot::PinnedSqliteFile::from_new_file(
             options.open(path)?,
             path.to_path_buf(),
         )
@@ -15021,8 +15042,7 @@ fn create_pinned_snapshot_database(
 fn refresh_pinned_snapshot_database(
     pinned: crate::consensus::snapshot::PinnedSqliteFile,
 ) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
-    let path = pinned.path().to_path_buf();
-    crate::consensus::snapshot::PinnedSqliteFile::from_file(pinned.into_file(), path)
+    pinned.refresh_identity()
 }
 
 #[cfg(target_os = "linux")]
@@ -15149,18 +15169,23 @@ fn verify_pinned_snapshot_descriptor(
 // fixed envelope is deliberately no larger than the sealed snapshot envelope:
 // a corrupt or stalled source cannot retain more than one snapshot's worth of
 // additional database state.
-const SNAPSHOT_SOURCE_WAL_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const SNAPSHOT_DATABASE_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const SNAPSHOT_SOURCE_WAL_MAX_BYTES: u64 = SNAPSHOT_DATABASE_MAX_BYTES;
+const SNAPSHOT_BACKUP_PAGES_PER_STEP: i32 = 128;
+const SNAPSHOT_BACKUP_BUSY_RETRY_LIMIT: usize = 8;
+const SNAPSHOT_BACKUP_STEP_LIMIT: usize =
+    (SNAPSHOT_DATABASE_MAX_BYTES as usize / 512 / SNAPSHOT_BACKUP_PAGES_PER_STEP as usize) + 1;
 
-/// One descriptor-verified, independently pinned SQLite snapshot reader.
+/// One VFS-verified, independently pinned SQLite snapshot reader.
 ///
 /// The live consensus connection is never moved into this reader. On Linux,
-/// `retained_descriptors` proves SQLite retained the exact file inode that was
-/// admitted with the consensus core, rather than merely reopening its path.
+/// SQLite's VFS movement probe and the expected source identity jointly prove
+/// that the connection still owns the main database admitted with the
+/// consensus core, rather than merely resolving the same pathname later.
 pub(crate) struct SnapshotReadConnection {
     pub(crate) connection: Connection,
     source_path: PathBuf,
     source_identity: SnapshotSourceFileIdentity,
-    retained_descriptors: BTreeSet<i32>,
 }
 
 fn snapshot_source_wal_path(path: &Path) -> PathBuf {
@@ -15183,65 +15208,46 @@ fn verify_snapshot_source_path(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn matching_snapshot_source_descriptors(
-    expected_identity: SnapshotSourceFileIdentity,
-) -> io::Result<BTreeSet<i32>> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let mut descriptors = BTreeSet::new();
-    for entry in std::fs::read_dir("/proc/self/fd")? {
-        let entry = entry?;
-        let Some(descriptor) = entry
-            .file_name()
-            .to_str()
-            .and_then(|value| value.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        match std::fs::metadata(entry.path()) {
-            Ok(metadata)
-                if metadata.dev() == expected_identity.device
-                    && metadata.ino() == expected_identity.inode =>
-            {
-                descriptors.insert(descriptor);
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(descriptors)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn matching_snapshot_source_descriptors(
-    _expected_identity: SnapshotSourceFileIdentity,
-) -> io::Result<BTreeSet<i32>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "session consensus snapshot readers require Linux",
-    ))
-}
-
-fn verify_snapshot_read_connection(reader: &SnapshotReadConnection) -> io::Result<()> {
-    verify_snapshot_source_path(&reader.source_path, reader.source_identity)?;
-    let opened_path = reader
-        .connection
+fn verify_snapshot_connection_binding(
+    connection: &Connection,
+    source_path: &Path,
+    source_identity: SnapshotSourceFileIdentity,
+) -> io::Result<()> {
+    verify_snapshot_source_path(source_path, source_identity)?;
+    let opened_path = connection
         .path()
         .ok_or_else(|| invalid_data("session consensus snapshot reader has no file path"))?;
-    if std::fs::canonicalize(opened_path)? != reader.source_path {
+    if std::fs::canonicalize(opened_path)? != source_path {
         return Err(invalid_data(
             "session consensus snapshot reader opened an unexpected file",
         ));
     }
-    let observed = matching_snapshot_source_descriptors(reader.source_identity)?;
-    if reader.retained_descriptors.is_empty() || !reader.retained_descriptors.is_subset(&observed) {
+    if opc_sqlite_file_control_sys::main_file_has_moved(connection).map_err(|_| {
+        invalid_data("session consensus snapshot reader file binding is unavailable")
+    })? {
         return Err(invalid_data(
-            "SQLite released the verified consensus snapshot source descriptor",
+            "session consensus snapshot reader file binding changed",
         ));
     }
+    verify_snapshot_source_path(source_path, source_identity)?;
     Ok(())
+}
+
+fn snapshot_connection_file_identity(
+    connection: &Connection,
+    source_path: &Path,
+) -> io::Result<SnapshotSourceFileIdentity> {
+    let source_identity = snapshot_source_file_identity(source_path)?;
+    verify_snapshot_connection_binding(connection, source_path, source_identity)?;
+    Ok(source_identity)
+}
+
+fn verify_snapshot_read_connection(reader: &SnapshotReadConnection) -> io::Result<()> {
+    verify_snapshot_connection_binding(
+        &reader.connection,
+        &reader.source_path,
+        reader.source_identity,
+    )
 }
 
 /// Open one read-only, file-backed snapshot reader without sharing the live
@@ -15254,7 +15260,6 @@ pub(crate) fn open_snapshot_read_connection(
     #[cfg(target_os = "linux")]
     {
         verify_snapshot_source_path(path, expected_identity)?;
-        let before = matching_snapshot_source_descriptors(expected_identity)?;
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -15278,18 +15283,10 @@ pub(crate) fn open_snapshot_read_connection(
                 "session consensus snapshot reader requires WAL mode",
             ));
         }
-        let after = matching_snapshot_source_descriptors(expected_identity)?;
-        let retained_descriptors = after.difference(&before).copied().collect::<BTreeSet<_>>();
-        if retained_descriptors.len() != 1 {
-            return Err(invalid_data(
-                "SQLite did not retain exactly one verified consensus snapshot source descriptor",
-            ));
-        }
         let reader = SnapshotReadConnection {
             connection: conn,
             source_path: path.to_path_buf(),
             source_identity: expected_identity,
-            retained_descriptors,
         };
         verify_snapshot_read_connection(&reader)?;
         Ok(reader)
@@ -15336,11 +15333,12 @@ pub(crate) fn begin_snapshot_read_sync(
 
 /// Release a source reader as soon as its backup has completed.
 pub(crate) fn release_snapshot_read_sync(reader: &SnapshotReadConnection) -> io::Result<()> {
-    verify_snapshot_read_connection(reader)?;
-    reader
+    let binding = verify_snapshot_read_connection(reader);
+    let rollback = reader
         .connection
         .execute_batch("ROLLBACK;")
-        .map_err(db_error)
+        .map_err(db_error);
+    binding.and(rollback)
 }
 
 /// Enforce a caller-selected WAL ceiling without identifying the source.
@@ -15371,6 +15369,126 @@ pub(crate) fn validate_snapshot_source_wal_bound(
     };
     enforce_snapshot_source_wal_bound(bytes, SNAPSHOT_SOURCE_WAL_MAX_BYTES)?;
     Ok(bytes)
+}
+
+fn copy_snapshot_backup_bounded(
+    source: &Connection,
+    destination: &mut Connection,
+    reader: &SnapshotReadConnection,
+    expected_pages: i32,
+    page_size: u64,
+) -> io::Result<()> {
+    let backup = rusqlite::backup::Backup::new(source, destination).map_err(db_error)?;
+    let mut busy_retries = 0_usize;
+    let mut previous_remaining = None;
+    for _ in 0..SNAPSHOT_BACKUP_STEP_LIMIT {
+        verify_snapshot_read_connection(reader)?;
+        validate_snapshot_source_wal_bound(&reader.source_path, reader.source_identity)?;
+        let result = backup
+            .step(SNAPSHOT_BACKUP_PAGES_PER_STEP)
+            .map_err(db_error)?;
+        let progress = backup.progress();
+        if progress.remaining < 0
+            || progress.pagecount < 0
+            || progress.remaining > progress.pagecount
+        {
+            return Err(invalid_data(
+                "session consensus snapshot backup progress is invalid",
+            ));
+        }
+        let page_count = u64::try_from(progress.pagecount)
+            .map_err(|_| invalid_data("session consensus snapshot backup progress is invalid"))?;
+        if page_count
+            .checked_mul(page_size)
+            .is_none_or(|bytes| bytes > SNAPSHOT_DATABASE_MAX_BYTES)
+        {
+            return Err(invalid_data(
+                "session consensus snapshot backup exceeds its fixed bound",
+            ));
+        }
+        match result {
+            StepResult::Done if progress.remaining == 0 => {
+                if progress.pagecount != expected_pages {
+                    return Err(invalid_data(
+                        "session consensus snapshot backup page count changed",
+                    ));
+                }
+                validate_snapshot_source_wal_bound(&reader.source_path, reader.source_identity)?;
+                return Ok(());
+            }
+            StepResult::Done => {
+                return Err(invalid_data(
+                    "session consensus snapshot backup completed inconsistently",
+                ));
+            }
+            StepResult::More => {
+                if progress.pagecount != expected_pages {
+                    return Err(invalid_data(
+                        "session consensus snapshot backup page count changed",
+                    ));
+                }
+                let remaining = progress.remaining;
+                if previous_remaining.is_some_and(|previous| remaining >= previous) {
+                    return Err(invalid_data(
+                        "session consensus snapshot backup made no progress",
+                    ));
+                }
+                previous_remaining = Some(remaining);
+                busy_retries = 0;
+            }
+            StepResult::Busy | StepResult::Locked => {
+                busy_retries = busy_retries.saturating_add(1);
+                if busy_retries > SNAPSHOT_BACKUP_BUSY_RETRY_LIMIT {
+                    return Err(invalid_data(
+                        "session consensus snapshot backup remained busy",
+                    ));
+                }
+            }
+            _ => {
+                return Err(invalid_data(
+                    "session consensus snapshot backup status is invalid",
+                ))
+            }
+        }
+    }
+    Err(invalid_data(
+        "session consensus snapshot backup exceeded its fixed step limit",
+    ))
+}
+
+fn validate_snapshot_database_extent(
+    page_count: i64,
+    page_size: i64,
+    maximum_bytes: u64,
+) -> io::Result<(i32, u64)> {
+    let page_count = i32::try_from(page_count)
+        .ok()
+        .filter(|count| *count >= 0)
+        .ok_or_else(|| invalid_data("session consensus snapshot page count is invalid"))?;
+    let page_size = u64::try_from(page_size)
+        .ok()
+        .filter(|size| (512..=65_536).contains(size) && size.is_power_of_two())
+        .ok_or_else(|| invalid_data("session consensus snapshot page size is invalid"))?;
+    let bytes = u64::try_from(page_count)
+        .ok()
+        .and_then(|count| count.checked_mul(page_size))
+        .ok_or_else(|| invalid_data("session consensus snapshot size is invalid"))?;
+    if bytes > maximum_bytes {
+        return Err(invalid_data(
+            "session consensus snapshot exceeds its fixed bound",
+        ));
+    }
+    Ok((page_count, page_size))
+}
+
+fn snapshot_database_extent_sync(conn: &Connection) -> io::Result<(i32, u64)> {
+    let page_count = conn
+        .query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))
+        .map_err(db_error)?;
+    let page_size = conn
+        .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+        .map_err(db_error)?;
+    validate_snapshot_database_extent(page_count, page_size, SNAPSHOT_DATABASE_MAX_BYTES)
 }
 
 /// Copy one already-fixed source reader image into a descriptor-pinned raw
@@ -15408,6 +15526,7 @@ pub(crate) fn capture_snapshot_database_from_reader_sync(
             "session consensus snapshot source cut differs from the live cut",
         ));
     }
+    let (expected_pages, page_size) = snapshot_database_extent_sync(&reader.connection)?;
 
     // No output path is created before identity, schema, authority, and
     // sealed-state validation have all succeeded on the fixed reader image.
@@ -15417,17 +15536,20 @@ pub(crate) fn capture_snapshot_database_from_reader_sync(
         .execute_batch("PRAGMA journal_mode = OFF;")
         .map_err(db_error)?;
     {
-        let backup = rusqlite::backup::Backup::new(&reader.connection, &mut destination)
-            .map_err(db_error)?;
-        backup
-            .run_to_completion(128, std::time::Duration::ZERO, None)
-            .map_err(db_error)?;
+        copy_snapshot_backup_bounded(
+            &reader.connection,
+            &mut destination,
+            reader,
+            expected_pages,
+            page_size,
+        )?;
     }
     verify_snapshot_read_connection(reader)?;
     validate_snapshot_source_wal_bound(&reader.source_path, reader.source_identity)?;
     pinned = refresh_pinned_snapshot_database(pinned)?;
     verify_pinned_snapshot_descriptor(&pinned, &descriptor_fds)?;
     drop(destination);
+    pinned.capture_created_sidecars();
     Ok((observed_cut, pinned))
 }
 
@@ -15465,6 +15587,7 @@ pub(crate) fn finalize_captured_snapshot_database_sync(
     pinned = refresh_pinned_snapshot_database(pinned)?;
     verify_pinned_snapshot_descriptor(&pinned, &descriptor_fds)?;
     drop(destination);
+    pinned.capture_created_sidecars();
     Ok(pinned)
 }
 
@@ -15483,6 +15606,7 @@ fn capture_and_finalize_snapshot_database_sync(
     let applied = read_applied_sync(conn, identity)?;
     let membership = read_membership_sync(conn, identity)?;
     validate_membership_ids(&membership)?;
+    let (expected_pages, page_size) = snapshot_database_extent_sync(conn)?;
 
     let (mut destination, descriptor_fds) = open_pinned_snapshot_database(&pinned)?;
     destination
@@ -15490,9 +15614,56 @@ fn capture_and_finalize_snapshot_database_sync(
         .map_err(db_error)?;
     {
         let backup = rusqlite::backup::Backup::new(conn, &mut destination).map_err(db_error)?;
-        backup
-            .run_to_completion(128, std::time::Duration::ZERO, None)
-            .map_err(db_error)?;
+        let mut busy_retries = 0_usize;
+        let mut completed = false;
+        for _ in 0..SNAPSHOT_BACKUP_STEP_LIMIT {
+            let result = backup
+                .step(SNAPSHOT_BACKUP_PAGES_PER_STEP)
+                .map_err(db_error)?;
+            let progress = backup.progress();
+            if progress.remaining < 0
+                || progress.pagecount != expected_pages
+                || progress.remaining > progress.pagecount
+                || u64::try_from(progress.pagecount)
+                    .ok()
+                    .and_then(|count| count.checked_mul(page_size))
+                    .is_none_or(|bytes| bytes > SNAPSHOT_DATABASE_MAX_BYTES)
+            {
+                return Err(invalid_data(
+                    "session consensus snapshot backup progress is invalid",
+                ));
+            }
+            match result {
+                StepResult::Done if progress.remaining == 0 => {
+                    completed = true;
+                    break;
+                }
+                StepResult::Done => {
+                    return Err(invalid_data(
+                        "session consensus snapshot backup completed inconsistently",
+                    ));
+                }
+                StepResult::More => busy_retries = 0,
+                StepResult::Busy | StepResult::Locked => {
+                    busy_retries = busy_retries.saturating_add(1);
+                    if busy_retries > SNAPSHOT_BACKUP_BUSY_RETRY_LIMIT {
+                        return Err(invalid_data(
+                            "session consensus snapshot backup remained busy",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(invalid_data(
+                        "session consensus snapshot backup status is invalid",
+                    ));
+                }
+            }
+        }
+        if !completed {
+            return Err(invalid_data(
+                "session consensus snapshot backup exceeded its fixed step limit",
+            ));
+        }
     }
     pinned = refresh_pinned_snapshot_database(pinned)?;
     verify_pinned_snapshot_descriptor(&pinned, &descriptor_fds)?;
@@ -17254,6 +17425,19 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_extent_uses_the_actual_sqlite_page_size() {
+        assert_eq!(
+            validate_snapshot_database_extent(8, 4_096, 32_768).expect("exact snapshot extent"),
+            (8, 4_096)
+        );
+        assert!(validate_snapshot_database_extent(9, 4_096, 32_768).is_err());
+        assert!(validate_snapshot_database_extent(64, 512, 32_768).is_ok());
+        assert!(validate_snapshot_database_extent(65, 512, 32_768).is_err());
+        assert!(validate_snapshot_database_extent(1, 1_000, 32_768).is_err());
+        assert!(validate_snapshot_database_extent(-1, 4_096, 32_768).is_err());
+    }
+
+    #[test]
     fn snapshot_reader_rejects_replaced_source_path() {
         let directory = tempfile::tempdir().expect("snapshot source directory");
         let source = directory.path().join("source.sqlite");
@@ -17273,6 +17457,50 @@ mod tests {
         std::fs::rename(&replacement, &source).expect("replace source path");
 
         assert!(open_snapshot_read_connection(&source, expected_identity).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_reader_vfs_binding_rejects_an_aba_source_replacement() {
+        let directory = tempfile::tempdir().expect("snapshot source directory");
+        let source = directory.path().join("source.sqlite");
+        let original = directory.path().join("original.sqlite");
+        let replacement = directory.path().join("replacement.sqlite");
+        let source_connection = Connection::open(&source).expect("open source SQLite");
+        source_connection
+            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE source_only(value INTEGER);")
+            .expect("form source SQLite");
+        drop(source_connection);
+        let expected_identity = snapshot_source_file_identity(&source).expect("source identity");
+
+        let replacement_connection =
+            Connection::open(&replacement).expect("open replacement SQLite");
+        replacement_connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; CREATE TABLE replacement_only(value INTEGER);",
+            )
+            .expect("form replacement SQLite");
+        drop(replacement_connection);
+
+        std::fs::rename(&source, &original).expect("displace source A");
+        std::fs::rename(&replacement, &source).expect("publish replacement B");
+        let opened_replacement = Connection::open_with_flags(
+            &source,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("open replacement through admitted source name");
+        opened_replacement
+            .query_row("PRAGMA schema_version", [], |_| Ok(()))
+            .expect("materialize replacement VFS handle");
+        std::fs::rename(&source, &replacement).expect("displace replacement B");
+        std::fs::rename(&original, &source).expect("restore source A");
+
+        let reader = SnapshotReadConnection {
+            connection: opened_replacement,
+            source_path: source,
+            source_identity: expected_identity,
+        };
+        assert!(verify_snapshot_read_connection(&reader).is_err());
     }
 
     #[test]

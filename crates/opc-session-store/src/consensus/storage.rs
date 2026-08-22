@@ -20,7 +20,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::raft_adapter::{SessionRaftAdapterError, SessionRaftPeerDirectory};
-use super::snapshot::{PinnedSqliteFile, SessionSnapshotFile};
+use super::snapshot::{PinnedSqliteFile, SessionSnapshotFile, UnpublishedSnapshotArtifact};
 use super::{
     SessionConsensusIdentity, SessionConsensusNodeId, SessionRaftTypeConfig,
     SessionTopologyMemberBinding,
@@ -1247,68 +1247,67 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             .join(format!("seal-{}.part", uuid::Uuid::new_v4()));
         let (_snapshot_guard, file_backed) =
             build_file_backed_snapshot_database(&self.core, &raw_path, snapshot_guard).await?;
-        let ((last_log_id, last_membership), (mut snapshot, checksum, byte_length)) =
-            if let Some((membership, raw_snapshot)) = file_backed {
-                let sealed = seal_snapshot_database(raw_snapshot, &temporary_path, &final_path)
-                    .await
-                    .map_err(|error| {
-                        storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-                    })?;
-                (membership, sealed)
-            } else if self.core.authority_profile == ConsensusAuthorityProfile::Dynamic {
-                let membership = {
-                    let conn = self.core.conn.lock().await;
-                    consensus::build_snapshot_database_with_authority_sync(
-                        &conn,
-                        self.core.storage_identity,
-                        self.core.authority_profile,
-                        &self.core.expected_members,
-                        &self.core.expected_bindings,
-                        self.core.fixed_placement_policy,
-                        &raw_path,
-                    )
-                }
+        let (
+            (last_log_id, last_membership),
+            (mut snapshot, checksum, byte_length, raw_cleanup, mut published_cleanup),
+        ) = if let Some((membership, raw_snapshot)) = file_backed {
+            let sealed = seal_snapshot_database(raw_snapshot, &temporary_path, &final_path)
+                .await
                 .map_err(|error| {
                     storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
                 })?;
-                let sealed =
-                    seal_snapshot_database_from_path(&raw_path, &temporary_path, &final_path)
-                        .await
-                        .map_err(|error| {
-                            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-                        })?;
-                (membership, sealed)
-            } else {
-                let (membership, raw_snapshot) = {
-                    let conn = self.core.conn.lock().await;
-                    consensus::build_snapshot_database_pinned_with_authority_sync(
-                        &conn,
-                        self.core.storage_identity,
-                        self.core.authority_profile,
-                        &self.core.expected_members,
-                        &self.core.expected_bindings,
-                        self.core.fixed_placement_policy,
-                        &raw_path,
-                    )
-                }
-                .map_err(|error| {
-                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-                })?;
-                let sealed = seal_snapshot_database(raw_snapshot, &temporary_path, &final_path)
-                    .await
-                    .map_err(|error| {
-                        storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-                    })?;
-                (membership, sealed)
-            };
-        tokio::fs::rename(&temporary_path, &final_path)
-            .await
+            (membership, sealed)
+        } else {
+            let (membership, raw_snapshot) = {
+                let conn = self.core.conn.lock().await;
+                consensus::build_snapshot_database_pinned_with_authority_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    &raw_path,
+                )
+            }
             .map_err(|error| {
                 storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
             })?;
+            let sealed = seal_snapshot_database(raw_snapshot, &temporary_path, &final_path)
+                .await
+                .map_err(|error| {
+                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                })?;
+            (membership, sealed)
+        };
+        // Promotion and guard rebinding form one cancellation-free local
+        // filesystem step. If promotion fails the still-armed guard removes
+        // only the exact temporary inode; once it succeeds the same guard owns
+        // the exact final name until durable metadata publishes it.
+        std::fs::rename(&temporary_path, &final_path).map_err(|error| {
+            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+        })?;
+        published_cleanup.rebind_path(final_path.clone());
         sync_directory(&self.core.snapshot_dir).map_err(|error| {
             storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
         })?;
+        let (_, observed_checksum, observed_length) =
+            verify_snapshot_envelope_reader(&mut snapshot)
+                .await
+                .map_err(|error| {
+                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error)
+                })?;
+        if observed_checksum != checksum || observed_length != byte_length {
+            return Err(storage_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Read,
+                consensus::invalid_data("session consensus sealed snapshot is inconsistent"),
+            ));
+        }
+        snapshot
+            .rewind()
+            .await
+            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
         let snapshot_id = format!("session-{}", uuid::Uuid::new_v4());
         let meta = SnapshotMeta {
             last_log_id,
@@ -1361,17 +1360,28 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                     ));
                 }
             }
-            consensus::save_current_snapshot_with_authority_sync(
+            publish_snapshot_metadata_with_readback(
                 &conn,
                 self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
                 &meta,
                 &file_name,
                 checksum,
                 byte_length,
+                &mut published_cleanup,
+                || {
+                    consensus::save_current_snapshot_with_authority_sync(
+                        &conn,
+                        self.core.storage_identity,
+                        self.core.authority_profile,
+                        &self.core.expected_members,
+                        &self.core.expected_bindings,
+                        self.core.fixed_placement_policy,
+                        &meta,
+                        &file_name,
+                        checksum,
+                        byte_length,
+                    )
+                },
             )
             .map_err(|error| {
                 storage_error(
@@ -1382,32 +1392,13 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             })?;
             previous
         };
-        let _ = tokio::fs::remove_file(&raw_path).await;
-        remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name).await;
-        let (_, observed_checksum, observed_length) =
-            verify_snapshot_envelope_reader(&mut snapshot)
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-        if observed_checksum != checksum || observed_length != byte_length {
-            return Err(storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Read,
-                consensus::invalid_data("session consensus sealed snapshot is inconsistent"),
-            ));
+        // The raw SQLite artifact is no longer needed once the sealed file is
+        // durably named by snapshot metadata. The publication helper has
+        // already disarmed the sealed-file cleanup without an await boundary.
+        if let Some(raw_cleanup) = raw_cleanup {
+            drop(raw_cleanup);
         }
-        snapshot.rewind().await.map_err(|error| {
-            storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Read,
-                error,
-            )
-        })?;
+        remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name).await;
         Ok(Snapshot {
             meta,
             snapshot: Box::new(snapshot),
@@ -1456,6 +1447,25 @@ fn secure_snapshot_create_options(read: bool) -> tokio::fs::OpenOptions {
     options
 }
 
+fn create_unpublished_snapshot_output(
+    path: &Path,
+    read: bool,
+) -> io::Result<(tokio::fs::File, UnpublishedSnapshotArtifact)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).read(read).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let output = options.open(path)?;
+    let cleanup = UnpublishedSnapshotArtifact::from_file(&output, path.to_path_buf(), false)?;
+    Ok((tokio::fs::File::from_std(output), cleanup))
+}
+
 async fn snapshot_handle_pin(
     snapshot: &SessionSnapshotFile,
     path: &Path,
@@ -1468,7 +1478,13 @@ async fn seal_snapshot_database(
     raw_snapshot: PinnedSqliteFile,
     output_path: &Path,
     final_path: &Path,
-) -> io::Result<(SessionSnapshotFile, [u8; 32], u64)> {
+) -> io::Result<(
+    SessionSnapshotFile,
+    [u8; 32],
+    u64,
+    Option<UnpublishedSnapshotArtifact>,
+    UnpublishedSnapshotArtifact,
+)> {
     raw_snapshot.verify_identity()?;
     let payload_length = raw_snapshot.file().metadata()?.len();
     if payload_length == 0 || payload_length > SNAPSHOT_MAX_BYTES {
@@ -1476,10 +1492,12 @@ async fn seal_snapshot_database(
             "session consensus snapshot size is invalid",
         ));
     }
-    let mut source = tokio::fs::File::from_std(raw_snapshot.into_file());
-    let mut output = secure_snapshot_create_options(true)
-        .open(output_path)
-        .await?;
+    let (raw_file, raw_cleanup) = raw_snapshot.into_file_with_cleanup();
+    let mut source = tokio::fs::File::from_std(raw_file);
+    // Creation and cleanup arming contain no await point. Dropping this future
+    // at any later write/flush/sync boundary therefore removes the exact
+    // unpublished inode.
+    let (mut output, output_cleanup) = create_unpublished_snapshot_output(output_path, true)?;
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -1519,67 +1537,7 @@ async fn seal_snapshot_database(
     let total = payload_length
         .checked_add(SNAPSHOT_FOOTER_BYTES)
         .ok_or_else(|| consensus::invalid_data("session consensus snapshot length overflow"))?;
-    Ok((snapshot, checksum, total))
-}
-
-/// Seal a Dynamic snapshot using the internal path-based SQLite image flow.
-///
-/// Public dynamic consensus construction is Linux-only. This helper remains
-/// path-based within that boundary; it is not a portable consensus fallback.
-/// Fixed authority uses `seal_snapshot_database` above, whose descriptor
-/// pinning is an additional identity fence.
-async fn seal_snapshot_database_from_path(
-    raw_path: &Path,
-    output_path: &Path,
-    final_path: &Path,
-) -> io::Result<(SessionSnapshotFile, [u8; 32], u64)> {
-    let payload_length = tokio::fs::metadata(raw_path).await?.len();
-    if payload_length == 0 || payload_length > SNAPSHOT_MAX_BYTES {
-        return Err(consensus::invalid_data(
-            "session consensus snapshot size is invalid",
-        ));
-    }
-    let mut source = tokio::fs::File::open(raw_path).await?;
-    let mut output = secure_snapshot_create_options(true)
-        .open(output_path)
-        .await?;
-    let mut hasher = Sha256::new();
-    let mut copied = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = source.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        copied = copied
-            .checked_add(u64::try_from(read).map_err(|_| {
-                consensus::invalid_data("session consensus snapshot length overflow")
-            })?)
-            .ok_or_else(|| consensus::invalid_data("session consensus snapshot length overflow"))?;
-        if copied > SNAPSHOT_MAX_BYTES {
-            return Err(consensus::invalid_data(
-                "session consensus snapshot exceeds size limit",
-            ));
-        }
-        hasher.update(&buffer[..read]);
-        output.write_all(&buffer[..read]).await?;
-    }
-    if copied != payload_length {
-        return Err(consensus::invalid_data(
-            "session consensus snapshot changed while sealing",
-        ));
-    }
-    let checksum: [u8; 32] = hasher.finalize().into();
-    output.write_all(SNAPSHOT_FOOTER_MAGIC).await?;
-    output.write_all(&payload_length.to_be_bytes()).await?;
-    output.write_all(&checksum).await?;
-    output.flush().await?;
-    output.sync_all().await?;
-    let snapshot = SessionSnapshotFile::from_file(output, final_path.to_path_buf()).await?;
-    let total = payload_length
-        .checked_add(SNAPSHOT_FOOTER_BYTES)
-        .ok_or_else(|| consensus::invalid_data("session consensus snapshot length overflow"))?;
-    Ok((snapshot, checksum, total))
+    Ok((snapshot, checksum, total, raw_cleanup, output_cleanup))
 }
 
 async fn verify_snapshot_envelope_reader<R>(file: &mut R) -> io::Result<(u64, [u8; 32], u64)>
@@ -1716,6 +1674,57 @@ async fn remove_old_snapshot(
     }
 }
 
+/// Publish one already-durable snapshot file without deleting it after an
+/// ambiguous SQLite commit result.
+///
+/// SQLite may durably commit a transaction and then report an I/O/finalization
+/// error. The same locked connection therefore reads the singleton back before
+/// an armed error-path guard is allowed to unlink the candidate. An exact
+/// candidate or an unavailable readback is preserved; only a conclusive
+/// different/absent row leaves cleanup armed.
+#[allow(clippy::too_many_arguments)]
+fn publish_snapshot_metadata_with_readback<F>(
+    conn: &rusqlite::Connection,
+    identity: SessionConsensusIdentity,
+    meta: &SnapshotMeta<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+    file_name: &str,
+    checksum: [u8; 32],
+    byte_length: u64,
+    cleanup: &mut UnpublishedSnapshotArtifact,
+    publish: F,
+) -> io::Result<()>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    match publish() {
+        Ok(()) => {
+            cleanup.disarm();
+            Ok(())
+        }
+        Err(error) => {
+            let preserve = match consensus::read_current_snapshot_sync(conn, identity) {
+                Ok(Some((
+                    observed_meta,
+                    observed_file_name,
+                    observed_checksum,
+                    observed_length,
+                ))) => {
+                    observed_meta == *meta
+                        && observed_file_name == file_name
+                        && observed_checksum == checksum
+                        && observed_length == byte_length
+                }
+                Ok(None) => false,
+                Err(_) => true,
+            };
+            if preserve {
+                cleanup.disarm();
+            }
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -1774,6 +1783,112 @@ mod tests {
                 .expect("compare published inode"),
             "a verified handle must not authorize a replacement published name"
         );
+    }
+
+    #[tokio::test]
+    async fn publication_error_after_durable_metadata_never_unlinks_current_snapshot() {
+        let directory = tempfile::tempdir().expect("snapshot publication directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("sessions.sqlite"))
+            .expect("snapshot publication backend");
+        let (_, mut state_machine) = open(
+            &backend,
+            directory.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("snapshot publication storage");
+        state_machine
+            .apply([initial_membership_entry()])
+            .await
+            .expect("snapshot publication membership");
+        let (last_log_id, last_membership) = state_machine
+            .applied_state()
+            .await
+            .expect("snapshot publication applied state");
+        let meta = SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "publication-error-after-commit".to_owned(),
+        };
+        let file_name = "snapshot-publication-error.opc";
+        let candidate_path = directory.path().join("snapshots").join(file_name);
+        std::fs::write(&candidate_path, b"durable sealed snapshot fixture")
+            .expect("write snapshot publication candidate");
+        let candidate =
+            std::fs::File::open(&candidate_path).expect("open snapshot publication candidate");
+        let mut cleanup =
+            UnpublishedSnapshotArtifact::from_file(&candidate, candidate_path.clone(), false)
+                .expect("arm snapshot publication cleanup");
+        let checksum = [0x5a; 32];
+        let byte_length = candidate.metadata().expect("candidate metadata").len();
+
+        let conn = state_machine.core.conn.lock().await;
+        let publication = publish_snapshot_metadata_with_readback(
+            &conn,
+            state_machine.core.storage_identity,
+            &meta,
+            file_name,
+            checksum,
+            byte_length,
+            &mut cleanup,
+            || {
+                consensus::save_current_snapshot_sync(
+                    &conn,
+                    state_machine.core.storage_identity,
+                    &meta,
+                    file_name,
+                    checksum,
+                    byte_length,
+                )?;
+                Err(io::Error::other(
+                    "injected snapshot publication error after durable metadata",
+                ))
+            },
+        );
+        assert!(
+            publication.is_err(),
+            "the injected finalization error remains visible"
+        );
+        let observed =
+            consensus::read_current_snapshot_sync(&conn, state_machine.core.storage_identity)
+                .expect("read committed snapshot metadata")
+                .expect("snapshot metadata was durably committed");
+        assert_eq!(meta, observed.0);
+        assert_eq!(file_name, observed.1);
+        assert_eq!(checksum, observed.2);
+        assert_eq!(byte_length, observed.3);
+        drop(conn);
+
+        drop(cleanup);
+        assert!(
+            candidate_path.is_file(),
+            "an error-path guard must preserve the exact durably published snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_seal_output_removes_its_exact_unpublished_inode() {
+        let directory = tempfile::tempdir().expect("snapshot seal cancellation directory");
+        let output_path = directory.path().join("seal-cancelled.part");
+        let task_path = output_path.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (output, cleanup) = create_unpublished_snapshot_output(&task_path, true)
+                .expect("create guarded seal output");
+            started_tx.send(()).expect("signal guarded output");
+            std::future::pending::<()>().await;
+            drop((output, cleanup));
+        });
+
+        started_rx.await.expect("guarded output is armed");
+        assert!(output_path.exists());
+        task.abort();
+        assert!(task
+            .await
+            .expect_err("seal output task is cancelled")
+            .is_cancelled());
+        assert!(!output_path.exists());
     }
 
     fn identity(configuration_byte: u8) -> SessionConsensusIdentity {
@@ -2860,13 +2975,9 @@ mod tests {
         let core = state_machine.core.clone();
         let mut builder = state_machine.get_snapshot_builder().await;
         let build = tokio::spawn(async move { builder.build_snapshot().await });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !capture_gate.started() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("snapshot worker reaches its fixed source cut");
+        tokio::time::timeout(Duration::from_secs(5), capture_gate.wait_started())
+            .await
+            .expect("snapshot worker reaches its fixed source cut");
 
         build.abort();
         assert!(
@@ -2891,5 +3002,20 @@ mod tests {
         .await
         .expect("cancelled snapshot worker exits within the existing bounded test window");
         drop(worker_released);
+        let mut entries = tokio::fs::read_dir(directory.path().join("snapshots"))
+            .await
+            .expect("read snapshot directory after cancellation");
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .expect("read snapshot cancellation artifact")
+        {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.starts_with("build-") && !name.starts_with("seal-"),
+                "cancelled snapshot build must not retain an unpublished artifact"
+            );
+        }
     }
 }

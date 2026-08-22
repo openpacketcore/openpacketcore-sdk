@@ -46,6 +46,91 @@ pub(crate) struct PinnedSqliteFile {
     file: std::fs::File,
     path: PathBuf,
     identity: FileIdentity,
+    cleanup: Option<UnpublishedSnapshotArtifact>,
+}
+
+/// Exact ownership of an SDK-created snapshot artifact which is not yet
+/// published. Cleanup authenticates the object by its open-descriptor identity
+/// before unlinking the SDK-controlled name, so a same-name replacement is
+/// never removed.
+pub(crate) struct UnpublishedSnapshotArtifact {
+    path: PathBuf,
+    identity: FileIdentity,
+    sqlite_sidecars: bool,
+    sidecars: Vec<(PathBuf, FileIdentity)>,
+    armed: bool,
+}
+
+impl UnpublishedSnapshotArtifact {
+    pub(crate) fn from_file(
+        file: &std::fs::File,
+        path: PathBuf,
+        sqlite_sidecars: bool,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            path,
+            identity: file_identity(&file.metadata()?)?,
+            sqlite_sidecars,
+            sidecars: Vec::new(),
+            armed: true,
+        })
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    pub(crate) fn rebind_path(&mut self, path: PathBuf) {
+        self.path = path;
+    }
+
+    fn capture_sidecars(&mut self) {
+        if !self.sqlite_sidecars {
+            return;
+        }
+        self.sidecars.clear();
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = self.path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            let Ok(metadata) = std::fs::symlink_metadata(&sidecar) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            if let Ok(identity) = file_identity(&metadata) {
+                self.sidecars.push((sidecar, identity));
+            }
+        }
+    }
+
+    fn remove_if_owned(&self, path: &Path, identity: FileIdentity) {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if !metadata.is_file() {
+            return;
+        }
+        let Ok(observed) = file_identity(&metadata) else {
+            return;
+        };
+        if same_file_object(observed, identity) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl Drop for UnpublishedSnapshotArtifact {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.remove_if_owned(&self.path, self.identity);
+        for (sidecar, identity) in &self.sidecars {
+            self.remove_if_owned(sidecar, *identity);
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -59,7 +144,20 @@ impl PinnedSqliteFile {
             file,
             path,
             identity,
+            cleanup: None,
         })
+    }
+
+    /// Pin a newly-created SDK snapshot database and arm exact cleanup until
+    /// the caller has durably published its enclosing snapshot.
+    pub(crate) fn from_new_file(file: std::fs::File, path: PathBuf) -> io::Result<Self> {
+        let mut pinned = Self::from_file(file, path)?;
+        pinned.cleanup = Some(UnpublishedSnapshotArtifact::from_file(
+            &pinned.file,
+            pinned.path.clone(),
+            true,
+        )?);
+        Ok(pinned)
     }
 
     /// The SDK-controlled diagnostic path associated with this handle.
@@ -91,12 +189,45 @@ impl PinnedSqliteFile {
             file,
             path: self.path.clone(),
             identity: self.identity,
+            cleanup: None,
         })
     }
 
     /// Consume the wrapper and return the already-open OS handle.
-    pub(crate) fn into_file(self) -> std::fs::File {
+    pub(crate) fn into_file(mut self) -> std::fs::File {
+        self.cleanup = None;
         self.file
+    }
+
+    /// Transfer cleanup ownership alongside the descriptor for an
+    /// unpublished SDK-created artifact.
+    pub(crate) fn into_file_with_cleanup(
+        mut self,
+    ) -> (std::fs::File, Option<UnpublishedSnapshotArtifact>) {
+        let cleanup = self.cleanup.take();
+        (self.file, cleanup)
+    }
+
+    /// Mark the SDK-created database as intentionally retained by its caller.
+    pub(crate) fn disarm_cleanup(&mut self) {
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            cleanup.disarm();
+        }
+    }
+
+    /// Refresh the expected content identity after SQLite has written through
+    /// this same descriptor. Cleanup ownership remains attached to the inode.
+    pub(crate) fn refresh_identity(mut self) -> io::Result<Self> {
+        self.identity = file_identity(&self.file.metadata()?)?;
+        Ok(self)
+    }
+
+    /// Record the exact identities of any SQLite sidecars created for this
+    /// unique raw artifact, so later cleanup cannot remove replacements.
+    pub(crate) fn capture_created_sidecars(&mut self) {
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            cleanup.capture_sidecars();
+        }
     }
 
     /// Revalidate that the held handle itself has not changed identity.
@@ -240,10 +371,20 @@ fn file_identity(metadata: &std::fs::Metadata) -> io::Result<FileIdentity> {
     })
 }
 
+#[cfg(target_os = "linux")]
+fn same_file_object(left: FileIdentity, right: FileIdentity) -> bool {
+    left.device == right.device && left.inode == right.inode
+}
+
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
 fn file_identity(_metadata: &std::fs::Metadata) -> io::Result<FileIdentity> {
     Ok(FileIdentity)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn same_file_object(_left: FileIdentity, _right: FileIdentity) -> bool {
+    false
 }
 
 fn snapshot_open_options(create_new: bool, read: bool, write: bool) -> tokio::fs::OpenOptions {
@@ -322,10 +463,102 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::io::{Read as _, Write as _};
 
-    #[cfg(target_os = "linux")]
-    use super::PinnedSqliteFile;
     use super::SessionSnapshotFile;
+    #[cfg(target_os = "linux")]
+    use super::{PinnedSqliteFile, UnpublishedSnapshotArtifact};
     use tempfile::tempdir;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unpublished_sqlite_cleanup_removes_only_its_created_identity(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("build.sqlite");
+        let created = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let owned = PinnedSqliteFile::from_new_file(created, path.clone())?;
+        drop(owned);
+        assert!(!path.exists());
+
+        let created = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let owned = PinnedSqliteFile::from_new_file(created, path.clone())?;
+        let replacement = directory.path().join("replacement.sqlite");
+        std::fs::write(&replacement, b"replacement")?;
+        std::fs::rename(&replacement, &path)?;
+        drop(owned);
+        assert_eq!(std::fs::read(&path)?, b"replacement");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unpublished_sqlite_cleanup_fences_each_created_sidecar_identity(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("build.sqlite");
+        let created = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let mut owned = PinnedSqliteFile::from_new_file(created, path.clone())?;
+        let wal = directory.path().join("build.sqlite-wal");
+        let shm = directory.path().join("build.sqlite-shm");
+        std::fs::write(&wal, b"owned wal")?;
+        std::fs::write(&shm, b"owned shm")?;
+        owned.capture_created_sidecars();
+
+        let replacement = directory.path().join("replacement-wal");
+        std::fs::write(&replacement, b"foreign replacement")?;
+        std::fs::rename(&replacement, &wal)?;
+        drop(owned);
+
+        assert!(!path.exists());
+        assert!(!shm.exists());
+        assert_eq!(std::fs::read(wal)?, b"foreign replacement");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unpublished_snapshot_cleanup_tracks_atomic_promotion_and_publication(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let temporary = directory.path().join("seal.part");
+        let published = directory.path().join("snapshot.opc");
+        let created = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&temporary)?;
+        let mut cleanup =
+            UnpublishedSnapshotArtifact::from_file(&created, temporary.clone(), false)?;
+        std::fs::rename(&temporary, &published)?;
+        cleanup.rebind_path(published.clone());
+        drop(cleanup);
+        assert!(!published.exists());
+
+        let created = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&temporary)?;
+        let mut cleanup =
+            UnpublishedSnapshotArtifact::from_file(&created, temporary.clone(), false)?;
+        std::fs::rename(&temporary, &published)?;
+        cleanup.rebind_path(published.clone());
+        cleanup.disarm();
+        drop(cleanup);
+        assert!(published.exists());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn create_new_rejects_an_existing_file() -> Result<(), Box<dyn std::error::Error>> {
