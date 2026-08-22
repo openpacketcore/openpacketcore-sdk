@@ -825,14 +825,20 @@ impl FencedMutationRosterTerminal {
                     FencedMutationRosterAdoption::Executed | FencedMutationRosterAdoption::Adopted
                 )
         });
-        let aborted = self.members.iter().all(|member| {
+        let conclusive = self.members.iter().all(|member| {
             matches!(
-                member.disposition,
-                FencedMutationRosterDisposition::NotApplied
-                    | FencedMutationRosterDisposition::Compensated
-            ) && member.adoption == FencedMutationRosterAdoption::Reconciled
+                (member.disposition, member.adoption),
+                (
+                    FencedMutationRosterDisposition::Applied,
+                    FencedMutationRosterAdoption::Executed | FencedMutationRosterAdoption::Adopted,
+                ) | (
+                    FencedMutationRosterDisposition::NotApplied
+                        | FencedMutationRosterDisposition::Compensated,
+                    FencedMutationRosterAdoption::Reconciled,
+                )
+            )
         });
-        if established || aborted {
+        if established || conclusive {
             Ok(())
         } else {
             Err(FencedMutationRosterError::Indeterminate)

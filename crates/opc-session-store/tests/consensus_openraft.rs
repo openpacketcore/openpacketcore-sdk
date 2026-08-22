@@ -101,6 +101,7 @@ const RAW_KEY_MATERIAL_CANARY: &[u8; AES_256_GCM_SIV_KEY_LEN] = &[0x5a; AES_256_
 #[derive(Clone)]
 struct ManagedProviderAdapterDouble {
     execute_outcome: Option<FencedMutationRosterProviderOutcome>,
+    execute_outcomes: Option<Arc<BTreeMap<u8, FencedMutationRosterProviderOutcome>>>,
     status_outcome: AdapterStatusOutcome,
     execute_calls: Arc<AtomicUsize>,
     status_calls: Arc<AtomicUsize>,
@@ -118,6 +119,7 @@ impl ManagedProviderAdapterDouble {
     fn applied() -> Self {
         Self {
             execute_outcome: Some(FencedMutationRosterProviderOutcome::AppliedExecuted),
+            execute_outcomes: None,
             status_outcome: AdapterStatusOutcome::Inconclusive,
             execute_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
@@ -129,6 +131,7 @@ impl ManagedProviderAdapterDouble {
     fn inconclusive() -> Self {
         Self {
             execute_outcome: None,
+            execute_outcomes: None,
             status_outcome: AdapterStatusOutcome::Inconclusive,
             execute_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
@@ -140,6 +143,7 @@ impl ManagedProviderAdapterDouble {
     fn not_applied() -> Self {
         Self {
             execute_outcome: None,
+            execute_outcomes: None,
             status_outcome: AdapterStatusOutcome::NotApplied,
             execute_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
@@ -151,6 +155,7 @@ impl ManagedProviderAdapterDouble {
     fn compensated() -> Self {
         Self {
             execute_outcome: Some(FencedMutationRosterProviderOutcome::CompensatedReconciled),
+            execute_outcomes: None,
             status_outcome: AdapterStatusOutcome::Inconclusive,
             execute_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
@@ -162,6 +167,18 @@ impl ManagedProviderAdapterDouble {
     fn applied_arming(gate: Arc<AppendEntriesApplyGate>) -> Self {
         let mut provider = Self::applied();
         provider.execute_gate = Some(gate);
+        provider
+    }
+
+    fn applied_then_compensated() -> Self {
+        let mut provider = Self::applied();
+        provider.execute_outcomes = Some(Arc::new(BTreeMap::from([
+            (0, FencedMutationRosterProviderOutcome::AppliedExecuted),
+            (
+                1,
+                FencedMutationRosterProviderOutcome::CompensatedReconciled,
+            ),
+        ])));
         provider
     }
 
@@ -186,7 +203,10 @@ impl ManagedProviderJobRemoteProvider for ManagedProviderAdapterDouble {
         if let Some(gate) = &self.execute_gate {
             gate.arm();
         }
-        self.execute_outcome
+        self.execute_outcomes
+            .as_ref()
+            .and_then(|outcomes| outcomes.get(&context.ordinal().get()).copied())
+            .or(self.execute_outcome)
             .ok_or(())
             .and_then(|outcome| Self::attestation(context, outcome))
     }
@@ -6778,6 +6798,233 @@ async fn reopened_format_eight_managed_terminal_phase_bindings_fail_closed() {
             0,
             "rejected reopen performs no provider adoption I/O"
         );
+    }
+}
+
+#[tokio::test]
+async fn reopened_mixed_managed_v5_abort_preserves_per_ordinal_terminal_outcomes() {
+    let mut cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let scope = cluster.stores[leader]
+        .consumer_scope()
+        .expect("current consumer scope");
+    activate_managed_provider_adapter_roster(&cluster.stores[leader], scope, 0xd4).await;
+    let worker = SessionConsumerIdentity::new("spiffe://managed-adapter/mixed-terminal")
+        .expect("worker identity");
+    let admission = admit_managed_provider_adapter_roster(
+        &cluster.stores[leader],
+        scope,
+        &worker,
+        managed_provider_adapter_admission(0xd5, 2),
+    )
+    .await;
+    let provider = ManagedProviderAdapterDouble::applied_then_compensated();
+    let facade = cluster.stores[leader]
+        .managed_provider_job_facade(
+            scope,
+            worker.clone(),
+            [0xd6; 32],
+            [0xd7; 32],
+            provider.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct mixed terminal facade");
+    let checkpoint = Box::new([0xd8]);
+    assert_eq!(
+        facade
+            .run_member(
+                admission.clone(),
+                checkpoint.clone(),
+                FencedMutationRosterOrdinal::new(0).expect("first ordinal"),
+            )
+            .await,
+        Err(ManagedProviderJobError::Unavailable),
+        "the first verified member cannot terminalize a mixed roster"
+    );
+    let terminal = facade
+        .run_member(
+            admission.clone(),
+            checkpoint.clone(),
+            FencedMutationRosterOrdinal::new(1).expect("second ordinal"),
+        )
+        .await
+        .expect("mixed applied and compensated members commit an aborted terminal");
+    assert_eq!(terminal.mode(), ManagedProviderJobMode::ManagedV5);
+    assert_eq!(terminal.phase(), ManagedProviderJobMemberPhase::Aborted);
+    assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 2);
+
+    let request_id = admission.request_id().to_bytes();
+    cluster.close_path_backed_voters();
+    cluster
+        .reopen_path_backed_voters_through_production_open()
+        .await;
+    let (leader, _, _) = cluster.observed_leader();
+    let reopened_provider = ManagedProviderAdapterDouble::applied();
+    let reopened = cluster.stores[leader]
+        .managed_provider_job_facade(
+            scope,
+            worker,
+            [0xd6; 32],
+            [0xd7; 32],
+            reopened_provider.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct reopened mixed terminal facade");
+    assert_eq!(
+        reopened
+            .job_status(
+                admission,
+                FencedMutationRosterOrdinal::new(1).expect("second ordinal"),
+            )
+            .await
+            .expect("reopened mixed terminal status"),
+        terminal
+    );
+    assert_no_provider_io(&reopened_provider);
+    cluster.close_path_backed_voters();
+    for index in 0..MEMBER_COUNT {
+        let connection = rusqlite::Connection::open(
+            cluster
+                ._directory
+                .path()
+                .join(format!("node-{index}.sqlite")),
+        )
+        .expect("inspect reopened mixed terminal voter");
+        let operation_phase: i64 = connection
+            .query_row(
+                "SELECT phase FROM consensus_fenced_mutation_roster_operations WHERE request_id = ?1",
+                params![request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read mixed terminal operation phase");
+        assert_eq!(operation_phase, 3);
+        let outcomes = connection
+            .prepare(
+                "SELECT phase, outcome FROM consensus_fenced_mutation_roster_managed_provider_jobs \
+                 WHERE request_id = ?1 ORDER BY ordinal",
+            )
+            .expect("prepare mixed job query")
+            .query_map(params![request_id.as_slice()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("query mixed terminal jobs")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read mixed terminal jobs");
+        assert_eq!(outcomes, vec![(5, 0), (5, 3)]);
+    }
+}
+
+#[tokio::test]
+async fn reopened_mixed_managed_v5_terminal_corruption_fails_closed() {
+    #[derive(Clone, Copy)]
+    enum Corruption {
+        MixedPhases,
+        SwappedOutcomes,
+    }
+
+    for corruption in [Corruption::MixedPhases, Corruption::SwappedOutcomes] {
+        let mut cluster = TestCluster::start().await;
+        let (leader, _, _) = cluster.observed_leader();
+        let scope = cluster.stores[leader]
+            .consumer_scope()
+            .expect("current consumer scope");
+        let marker = match corruption {
+            Corruption::MixedPhases => 0xe1,
+            Corruption::SwappedOutcomes => 0xe5,
+        };
+        activate_managed_provider_adapter_roster(&cluster.stores[leader], scope, marker).await;
+        let worker = SessionConsumerIdentity::new(format!(
+            "spiffe://managed-adapter/mixed-corruption-{marker:02x}"
+        ))
+        .expect("worker identity");
+        let admission = admit_managed_provider_adapter_roster(
+            &cluster.stores[leader],
+            scope,
+            &worker,
+            managed_provider_adapter_admission(marker.wrapping_add(1), 2),
+        )
+        .await;
+        let provider = ManagedProviderAdapterDouble::applied_then_compensated();
+        let facade = cluster.stores[leader]
+            .managed_provider_job_facade(
+                scope,
+                worker,
+                [marker.wrapping_add(2); 32],
+                [marker.wrapping_add(3); 32],
+                provider.clone(),
+                ManagedProviderAdapterVerifier,
+            )
+            .expect("construct mixed corruption facade");
+        let checkpoint = Box::new([marker.wrapping_add(4)]);
+        assert_eq!(
+            facade
+                .run_member(
+                    admission.clone(),
+                    checkpoint.clone(),
+                    FencedMutationRosterOrdinal::new(0).expect("first ordinal"),
+                )
+                .await,
+            Err(ManagedProviderJobError::Unavailable)
+        );
+        assert_eq!(
+            facade
+                .run_member(
+                    admission.clone(),
+                    checkpoint,
+                    FencedMutationRosterOrdinal::new(1).expect("second ordinal"),
+                )
+                .await
+                .expect("commit mixed terminal")
+                .phase(),
+            ManagedProviderJobMemberPhase::Aborted
+        );
+        let request_id = admission.request_id().to_bytes();
+        cluster.close_path_backed_voters();
+        for index in 0..MEMBER_COUNT {
+            let connection = rusqlite::Connection::open(
+                cluster
+                    ._directory
+                    .path()
+                    .join(format!("node-{index}.sqlite")),
+            )
+            .expect("open closed mixed corruption voter");
+            match corruption {
+                Corruption::MixedPhases => {
+                    connection
+                        .execute(
+                            "UPDATE consensus_fenced_mutation_roster_managed_provider_jobs \
+                             SET phase = 4 WHERE request_id = ?1 AND ordinal = 1",
+                            params![request_id.as_slice()],
+                        )
+                        .expect("corrupt one terminal job phase");
+                }
+                Corruption::SwappedOutcomes => {
+                    connection
+                        .execute(
+                            "UPDATE consensus_fenced_mutation_roster_managed_provider_jobs \
+                             SET outcome = CASE ordinal WHEN 0 THEN 3 WHEN 1 THEN 0 END \
+                             WHERE request_id = ?1",
+                            params![request_id.as_slice()],
+                        )
+                        .expect("swap exact terminal member outcomes");
+                }
+            }
+            connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .expect("checkpoint corrupt voter");
+        }
+        assert!(
+            matches!(
+                cluster
+                    .try_reopen_path_backed_voters_through_production_open()
+                    .await,
+                Err(opc_session_store::ConsensusSessionStoreOpenError::RecoveryRequired)
+            ),
+            "public reopen rejects mixed terminal proof corruption"
+        );
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.status_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
     }
 }
 

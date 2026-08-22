@@ -12742,7 +12742,14 @@ OR EXISTS (
        OR (claim.mode NOT IN (2, 3) AND job.phase != 0)
        OR (authority.request_id IS NOT NULL AND job.effect_owner_digest != authority.worker_digest)
        OR (job.phase = 5 AND (
-              job.outcome NOT IN (2, 3)
+              job.outcome NOT IN (0, 1, 2, 3)
+           OR (job.outcome IN (0, 1) AND NOT EXISTS (
+                  SELECT 1 FROM {source} AS operation
+                  JOIN {claims_source} AS terminal_claim
+                    ON terminal_claim.request_id = operation.request_id
+                  WHERE operation.request_id = job.request_id
+                    AND operation.phase = 3 AND terminal_claim.mode = 3
+              ))
            OR (job.outcome = 2 AND authority.abort_latched != 1)
            OR (job.outcome = 3 AND authority.abort_latched != 0)
           ))
@@ -12973,6 +12980,15 @@ OR EXISTS (
             phase,
             terminal.as_ref(),
         )?;
+        validate_managed_provider_terminal_job_binding_sync(
+            conn,
+            jobs_source,
+            authorities_source,
+            &request_id,
+            claim_mode,
+            phase,
+            terminal.as_ref(),
+        )?;
     }
     if history.active_epoch.is_some() {
         if live != history.current_live_count {
@@ -12982,6 +12998,79 @@ OR EXISTS (
         return Err(invalid_data(
             "fenced mutation roster reclaim state is invalid",
         ));
+    }
+    Ok(())
+}
+
+/// Validate the V5-only per-member job proof against the decoded terminal.
+/// Mode-three predecessor terminals deliberately have no authority row and
+/// remain outside this V5 binding.
+fn validate_managed_provider_terminal_job_binding_sync(
+    conn: &Connection,
+    jobs_source: &str,
+    authorities_source: &str,
+    request_id: &[u8; FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES],
+    claim_mode: i64,
+    operation_phase: i64,
+    terminal: Option<&FencedMutationRosterTerminal>,
+) -> io::Result<()> {
+    if claim_mode != 3 || !matches!(operation_phase, 2 | 3) {
+        return Ok(());
+    }
+    let has_authority: bool = conn
+        .query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {authorities_source} WHERE request_id = ?1)"),
+            [request_id.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if !has_authority {
+        return Ok(());
+    }
+    let terminal =
+        terminal.ok_or_else(|| invalid_data("managed provider terminal binding is invalid"))?;
+    let required_job_phase = if operation_phase == 2 { 4 } else { 5 };
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT ordinal, phase, outcome FROM {jobs_source} WHERE request_id = ?1 ORDER BY ordinal ASC LIMIT 9"
+        ))
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([request_id.as_slice()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut found = 0_usize;
+    let mut compensated = false;
+    for (member, row) in terminal.members().iter().zip(rows) {
+        let (ordinal, job_phase, outcome) = row.map_err(db_error)?;
+        let expected_outcome = match (member.disposition(), member.adoption()) {
+            (FencedMutationRosterDisposition::Applied, FencedMutationRosterAdoption::Executed) => 0,
+            (FencedMutationRosterDisposition::Applied, FencedMutationRosterAdoption::Adopted) => 1,
+            (
+                FencedMutationRosterDisposition::Compensated,
+                FencedMutationRosterAdoption::Reconciled,
+            ) => 3,
+            _ => return Err(invalid_data("managed provider terminal binding is invalid")),
+        };
+        if ordinal != i64::from(member.ordinal().get())
+            || job_phase != required_job_phase
+            || outcome != Some(expected_outcome)
+            || (operation_phase == 2 && expected_outcome == 3)
+        {
+            return Err(invalid_data("managed provider terminal binding is invalid"));
+        }
+        compensated |= expected_outcome == 3;
+        found = found
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("managed provider terminal binding is invalid"))?;
+    }
+    if found != terminal.members().len() || (operation_phase == 3 && !compensated) {
+        return Err(invalid_data("managed provider terminal binding is invalid"));
     }
     Ok(())
 }
@@ -13043,7 +13132,7 @@ fn validate_fenced_mutation_roster_member_rows_sync(
         let phase_valid = match phase {
             1 => disposition == 0 && adoption == 0,
             2 => disposition == 1 && conclusive,
-            3 => matches!(disposition, 2 | 4) && conclusive,
+            3 => matches!(disposition, 1 | 2 | 4) && conclusive,
             _ => false,
         };
         if !phase_valid {
@@ -16387,7 +16476,7 @@ pub(crate) fn managed_provider_terminal_is_managed_sync(
             "managed provider terminal origin is unavailable".into(),
         ));
     }
-    conn.query_row(
+    let managed: bool = conn.query_row(
         "SELECT EXISTS(
             SELECT 1
             FROM consensus_fenced_mutation_roster_protocol_claims AS claim
@@ -16427,7 +16516,36 @@ pub(crate) fn managed_provider_terminal_is_managed_sync(
     )
     .map_err(|_| {
         StoreError::BackendUnavailable("managed provider terminal origin is unavailable".into())
-    })
+    })?;
+    if !managed {
+        return Ok(false);
+    }
+    let (operation_phase, terminal_blob): (i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT phase, terminal_blob FROM consensus_fenced_mutation_roster_operations \
+             WHERE request_id = ?1",
+            [request_id.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| {
+            StoreError::BackendUnavailable("managed provider terminal origin is unavailable".into())
+        })?;
+    let terminal = decode_fenced_mutation_roster_terminal(&terminal_blob).map_err(|_| {
+        StoreError::BackendUnavailable("managed provider terminal origin is unavailable".into())
+    })?;
+    validate_managed_provider_terminal_job_binding_sync(
+        conn,
+        "consensus_fenced_mutation_roster_managed_provider_jobs",
+        "consensus_fenced_mutation_roster_managed_provider_authorities",
+        &request_id,
+        3,
+        operation_phase,
+        Some(&terminal),
+    )
+    .map_err(|_| {
+        StoreError::BackendUnavailable("managed provider terminal origin is unavailable".into())
+    })?;
+    Ok(true)
 }
 
 pub(crate) fn managed_provider_admission_sync(
