@@ -50,18 +50,19 @@ pub const MAX_MANAGED_PROVIDER_POOL_LANES: usize = 16;
 /// Aggregate queued plus in-flight work bound.
 pub const MANAGED_PROVIDER_POOL_QUEUE_CAPACITY: usize = 1024;
 /// Maximum retained encoded request bytes across the pool.
-pub const DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES: usize = 3 * 1024 * 1024;
+pub const DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES: usize = 4_294_837;
 /// Maximum bounded public response bytes.
 pub const DEFAULT_MANAGED_PROVIDER_POOL_RESPONSE_BYTES: usize = 1024;
 /// No managed-provider listener may allocate more permits than Tokio accepts.
 pub const MAX_MANAGED_PROVIDER_SERVER_CONNECTIONS: usize = Semaphore::MAX_PERMITS;
 
-// The request profile has room for an exact legal V5 admission (including its
-// 1 MiB protected plan and 16 KiB terminal result), a second 1 MiB checkpoint,
-// and JSON's bounded base64 expansion plus closed-envelope metadata.  This is
-// deliberately a protocol constant: peers prove it in Hello instead of
-// silently accepting a caller-selected frame size.
-pub const MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES: usize = 3 * 1024 * 1024;
+// This is the exact JSON frame length for simultaneously maximal legal V5
+// fields: 8 members × 4096-byte descriptors, 1024-byte owner, 1 MiB plan,
+// 16 KiB terminal result, and a second 1 MiB checkpoint, including each
+// closed-envelope byte. The maximum-legal-frame test derives this value from
+// those source profile maxima. Peers prove it in Hello instead of silently
+// accepting a caller-selected frame size.
+pub const MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES: usize = 4_294_837;
 /// Fixed public result profile; status and every typed domain error fit here.
 pub const MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES: usize = 1024;
 /// One absolute setup budget spans resolver, TCP, TLS, Hello, and HelloAck.
@@ -2081,6 +2082,66 @@ mod tests {
             Err(ManagedProviderClientError::Overloaded)
         );
         assert!(bounded_json_len(&WireResponse::Reject, 64).is_ok());
+    }
+
+    #[test]
+    fn maximum_legal_v5_plan_and_checkpoint_fit_the_pinned_profile() {
+        use opc_session_store::fenced_mutation_roster as roster;
+        use opc_session_store::{FenceToken, Generation, OwnerId};
+
+        let members: [roster::FencedMutationRosterMember; roster::MAX_MEMBERS] =
+            std::array::from_fn(|ordinal| {
+                roster::FencedMutationRosterMember::new(
+                    roster::FencedMutationRosterOrdinal::new(ordinal as u8).expect("test ordinal"),
+                    [ordinal as u8 + 1; roster::MEMBER_ID_BYTES],
+                    roster::FencedMutationRosterDescriptor::new(vec![
+                        7;
+                        roster::MAX_DESCRIPTOR_BYTES
+                    ])
+                    .expect("test descriptor"),
+                    u64::MAX,
+                    u64::MAX,
+                    roster::FencedMutationMemberDisposition::NotApplied,
+                    roster::FencedMutationMemberAdoption::Reconciled,
+                )
+                .expect("test member")
+            });
+        let admission = FencedMutationRosterAdmission::new(
+            u64::MAX,
+            roster::FencedMutationRosterOperationId::new([1; roster::MEMBER_ID_BYTES])
+                .expect("test operation ID"),
+            roster::FencedMutationRosterScope::from_digest([2; 32]),
+            roster::FencedMutationRosterFenceIntent::new(
+                OwnerId::new("o".repeat(OwnerId::MAX_BYTES)).expect("test owner"),
+                FenceToken::new(u64::MAX),
+            ),
+            Generation::new(u64::MAX),
+            roster::FencedMutationRosterMembers::new(members).expect("test members"),
+            roster::FencedMutationRosterProtectedPlan::new(
+                vec![3; roster::MAX_PLAN_BYTES].into_boxed_slice(),
+            )
+            .expect("test plan"),
+        )
+        .expect("test admission")
+        .with_terminal_result(
+            roster::FencedMutationRosterProtectedResult::new(
+                vec![4; roster::MAX_RESULT_BYTES].into_boxed_slice(),
+            )
+            .expect("test result"),
+        )
+        .expect("test result-bound admission");
+        let frame = WireRequest::Call {
+            operation: WireOperation::Run {
+                admission,
+                protected_checkpoint: vec![5; roster::MAX_PLAN_BYTES].into_boxed_slice(),
+                ordinal: 0,
+            },
+        };
+        let length = bounded_json_len(&frame, usize::MAX).expect("maximum legal encoding");
+        assert!(
+            length <= MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES,
+            "{length}"
+        );
     }
 
     #[tokio::test]
