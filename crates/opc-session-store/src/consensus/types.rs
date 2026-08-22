@@ -328,17 +328,6 @@ pub enum SessionMutationIntent {
     /// command selected by local apply state.  Every replica therefore applies
     /// the fixed V2 receipt/history semantics encoded by this log entry.
     FencedTransitionV2(Box<FencedTransitionV2Request>),
-    /// Coalesce an ordered, same-epoch batch of independent V2 fenced
-    /// transitions into one replicated command.
-    ///
-    /// Each item retains its complete self-authenticating 56-byte request ID.
-    /// The store layer derives the command's outer id from those ordered full
-    /// IDs; this replicated vocabulary deliberately never truncates or
-    /// replaces them with a batch-local identity. One physical log entry is a
-    /// throughput optimization only: items have independent logical effects,
-    /// results, and singleton status identities. This is not an inter-item
-    /// conditional or all-or-nothing distributed transaction.
-    FencedTransitionV2Batch(Vec<FencedTransitionV2Request>),
     /// The first V2 fenced transition for one exact voter scope and immutable
     /// V2 history profile.
     ///
@@ -376,6 +365,17 @@ pub enum SessionMutationIntent {
         /// active epoch without changing the lifecycle generation.
         expected_bound_entries: u64,
     },
+    /// Coalesce an ordered, same-epoch batch of independent V2 fenced
+    /// transitions into one replicated command.
+    ///
+    /// Each item retains its complete self-authenticating 56-byte request ID.
+    /// The store layer derives the command's outer id from those ordered full
+    /// IDs; this replicated vocabulary deliberately never truncates or
+    /// replaces them with a batch-local identity. One physical log entry is a
+    /// throughput optimization only: items have independent logical effects,
+    /// results, and singleton status identities. This is not an inter-item
+    /// conditional or all-or-nothing distributed transaction.
+    FencedTransitionV2Batch(Vec<FencedTransitionV2Request>),
 }
 
 impl fmt::Debug for SessionMutationIntent {
@@ -1273,9 +1273,72 @@ mod tests {
             "01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a0f09e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a383864141414141414141414141414141414141414141414141414141414141414141021407d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d22ef551462247eb23931fd020dfc974ff9ff0cfc495735cf66c5bbd98b2047482000f6c65676163792d706f73746361726403736d660b7064752d73657373696f6e0a6c65676163792d6b65790f76322d6469676573742d6f776e6572003c000201e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5",
             "01e2c92e0cc34ebcb7585b587d72901be80ccd59355253f8d91c570c1a51a38386414141414141414141414141414141414141414141414141414141414141414102d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d114313937302d30312d30315430303a30303a33375a150b01070617",
         ];
+        let mut expected = expected.map(str::to_owned);
+        expected[1] = expected[1].replacen("5a14", "5a13", 1);
+        expected[2] = expected[2].replacen("0214", "0213", 1);
+        expected[3] = expected[3].replacen("5a15", "5a14", 1);
         for (index, (command, expected)) in commands.iter().zip(expected).enumerate() {
             let encoded = opc_consensus::encode_bounded(command).expect("V2 command postcard");
             assert_eq!(hex(&encoded), expected, "V2 command postcard {index}");
+        }
+    }
+
+    #[test]
+    fn v2_command_postcard_wire_ordinals_match_the_frozen_descriptor() {
+        let request = v2_digest_request();
+        let identity = legacy_identity();
+        let intents = [
+            (
+                "fenced-v2",
+                18,
+                SessionMutationIntent::FencedTransitionV2(Box::new(request.clone())),
+            ),
+            (
+                "activate-v2",
+                19,
+                SessionMutationIntent::ActivateFencedTransitionV2 {
+                    request: Box::new(request.clone()),
+                    scope_identity: identity,
+                    voter_set_digest: [0xD4; 32],
+                    profile_digest: [0xD5; 32],
+                },
+            ),
+            (
+                "maintain-v2",
+                20,
+                SessionMutationIntent::MaintainFencedTransitionV2History {
+                    expected_generation: 11,
+                    expected_active_epoch: Some(
+                        FencedTransitionV2HistoryEpoch::new(7).expect("epoch"),
+                    ),
+                    expected_retired_through: 6,
+                    expected_bound_entries: 23,
+                },
+            ),
+            (
+                "fenced-v2-batch",
+                21,
+                SessionMutationIntent::FencedTransitionV2Batch(vec![request]),
+            ),
+        ];
+        for (label, expected_tag, intent) in intents {
+            let intent_bytes =
+                opc_consensus::encode_bounded(&intent).expect("V2 intent postcard encoding");
+            assert_eq!(
+                intent_bytes.first().copied(),
+                Some(expected_tag),
+                "{label} Postcard discriminator must match the frozen V2 command wire descriptor",
+            );
+
+            let command = v2_digest_command(intent);
+            let command_bytes =
+                opc_consensus::encode_bounded(&command).expect("V2 command postcard encoding");
+            assert!(command_bytes.ends_with(&intent_bytes));
+            assert_eq!(
+                &command_bytes[command_bytes.len() - intent_bytes.len()..],
+                intent_bytes.as_slice(),
+                "{label} must retain its exact intent bytes in the replicated command",
+            );
         }
     }
 
