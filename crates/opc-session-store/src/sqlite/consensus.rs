@@ -24635,6 +24635,19 @@ mod tests {
         let admission = fenced_mutation_roster_admission(0xF2, 0xF3);
         fenced_mutation_roster_admit_sync(&source_conn, identity(), &admission, timestamp(2))
             .expect("populate source roster");
+        let reservation_request_digest = [0xA1; 32];
+        let reservation_worker_digest = [0xA2; 32];
+        assert_eq!(
+            fenced_mutation_roster_reserve_v4_verifier_dispatch_sync(
+                &source_conn,
+                &admission,
+                &reservation_request_digest,
+                &reservation_worker_digest,
+            )
+            .expect("reserve source V4 verifier")
+            .1,
+            Some(true)
+        );
         let directory = tempfile::tempdir().expect("snapshot directory");
         let snapshot_path = directory.path().join("published-format-seven.sqlite");
         let (last_log_id, last_membership) =
@@ -24656,6 +24669,28 @@ mod tests {
             fenced_mutation_roster_v3_schema_is_exact_in_sync(&snapshot, false)
                 .expect("recognize exact format-seven snapshot")
         );
+        let request_id = admission.request_id().to_bytes();
+        let expected_operation: String = snapshot
+            .query_row(
+                "SELECT hex(request_id) || '|' || history_epoch || '|' || ordinal || '|' || configuration_epoch || '|' || hex(body_digest) || '|' || hex(admission_digest) || '|' || hex(binding_digest) || '|' || retained_until || '|' || phase || '|' || member_count || '|' || hex(admission_blob) || '|' || hex(protected_plan) || '|' || COALESCE(hex(protected_checkpoint), 'NULL') || '|' || COALESCE(hex(terminal_blob), 'NULL') || '|' || COALESCE(hex(terminal_digest), 'NULL') || '|' || COALESCE(hex(terminal_result), 'NULL') || '|' || COALESCE(hex(terminal_result_digest), 'NULL') FROM consensus_fenced_mutation_roster_operations WHERE request_id = ?1",
+                [request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read exact V4 operation");
+        let expected_member: String = snapshot
+            .query_row(
+                "SELECT hex(request_id) || '|' || ordinal || '|' || hex(stable_member_id) || '|' || disposition || '|' || adoption FROM consensus_fenced_mutation_roster_members WHERE request_id = ?1",
+                [request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read exact V4 member");
+        let expected_reservation: (Vec<u8>, Vec<u8>) = snapshot
+            .query_row(
+                "SELECT request_digest, worker_digest FROM consensus_fenced_mutation_roster_v4_verifier_reservations WHERE request_id = ?1",
+                [request_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read exact V4 reservation");
         snapshot
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .expect("checkpoint format-seven snapshot");
@@ -24690,6 +24725,38 @@ mod tests {
                 .expect("migrated snapshot layout"),
             FencedMutationRosterLedgerLayout::Activated
         );
+        let actual_operation: String = target_conn
+            .query_row(
+                "SELECT hex(request_id) || '|' || history_epoch || '|' || ordinal || '|' || configuration_epoch || '|' || hex(body_digest) || '|' || hex(admission_digest) || '|' || hex(binding_digest) || '|' || retained_until || '|' || phase || '|' || member_count || '|' || hex(admission_blob) || '|' || hex(protected_plan) || '|' || COALESCE(hex(protected_checkpoint), 'NULL') || '|' || COALESCE(hex(terminal_blob), 'NULL') || '|' || COALESCE(hex(terminal_digest), 'NULL') || '|' || COALESCE(hex(terminal_result), 'NULL') || '|' || COALESCE(hex(terminal_result_digest), 'NULL') FROM consensus_fenced_mutation_roster_operations WHERE request_id = ?1",
+                [request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read migrated operation");
+        let actual_member: String = target_conn
+            .query_row(
+                "SELECT hex(request_id) || '|' || ordinal || '|' || hex(stable_member_id) || '|' || disposition || '|' || adoption FROM consensus_fenced_mutation_roster_members WHERE request_id = ?1",
+                [request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read migrated member");
+        let actual_reservation: (Vec<u8>, Vec<u8>) = target_conn
+            .query_row(
+                "SELECT request_digest, worker_digest FROM consensus_fenced_mutation_roster_v4_verifier_reservations WHERE request_id = ?1",
+                [request_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read migrated reservation");
+        assert_eq!(actual_operation, expected_operation);
+        assert_eq!(actual_member, expected_member);
+        assert_eq!(actual_reservation, expected_reservation);
+        let claim_mode: i64 = target_conn
+            .query_row(
+                "SELECT mode FROM consensus_fenced_mutation_roster_protocol_claims WHERE request_id = ?1",
+                [request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read migrated V4 claim");
+        assert_eq!(claim_mode, 1);
         validate_fenced_mutation_roster_receipts_sync(&target_conn, identity())
             .expect("migrated snapshot is valid before serving work");
     }
