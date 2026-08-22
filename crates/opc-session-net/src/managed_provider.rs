@@ -50,7 +50,7 @@ pub const MAX_MANAGED_PROVIDER_POOL_LANES: usize = 16;
 /// Aggregate queued plus in-flight work bound.
 pub const MANAGED_PROVIDER_POOL_QUEUE_CAPACITY: usize = 1024;
 /// Maximum retained encoded request bytes across the pool.
-pub const DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES: usize = 4_294_837;
+pub const DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES: usize = 8_587_781;
 /// Maximum bounded public response bytes.
 pub const DEFAULT_MANAGED_PROVIDER_POOL_RESPONSE_BYTES: usize = 1024;
 /// No managed-provider listener may allocate more permits than Tokio accepts.
@@ -62,7 +62,7 @@ pub const MAX_MANAGED_PROVIDER_SERVER_CONNECTIONS: usize = Semaphore::MAX_PERMIT
 // closed-envelope byte. The maximum-legal-frame test derives this value from
 // those source profile maxima. Peers prove it in Hello instead of silently
 // accepting a caller-selected frame size.
-pub const MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES: usize = 4_294_837;
+pub const MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES: usize = 8_587_781;
 /// Fixed public result profile; status and every typed domain error fit here.
 pub const MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES: usize = 1024;
 /// One absolute setup budget spans resolver, TCP, TLS, Hello, and HelloAck.
@@ -790,6 +790,15 @@ impl Pool {
             for mut handle in handles {
                 let _ = (&mut handle).await;
             }
+            // Aborting workers drops jobs still in their private mailbox or
+            // in a facade future without passing `complete`. Their owned
+            // semaphore permits have now been dropped, so reset only current
+            // gauges after every supervisor joined; high-water evidence is
+            // intentionally retained.
+            pool.counters.queued.store(0, Ordering::Relaxed);
+            pool.counters.inflight.store(0, Ordering::Relaxed);
+            pool.counters.request_bytes.store(0, Ordering::Relaxed);
+            pool.counters.response_cells.store(0, Ordering::Relaxed);
             pool.phase.store(Phase::Stopped as u8, Ordering::Release);
             let report = ManagedProviderShutdownReport {
                 drained: pool.counters.shutdown_drained.load(Ordering::Relaxed),
@@ -1302,7 +1311,9 @@ async fn read_json<R: AsyncRead + Unpin, T: for<'a> Deserialize<'a>>(
     let mut decoder = serde_json::Deserializer::from_slice(&bytes);
     let value = serde_ignored::deserialize(&mut decoder, |_| unknown = true)
         .map_err(|_| ManagedProviderClientError::Protocol)?;
-    if unknown {
+    // `deserialize` accepts one valid JSON value and deliberately leaves a
+    // suffix unread. The closed wire format admits exactly one value.
+    if unknown || decoder.end().is_err() {
         return Err(ManagedProviderClientError::Protocol);
     }
     Ok(value)
@@ -1312,9 +1323,10 @@ async fn read_json_until<R: AsyncRead + Unpin, T: for<'a> Deserialize<'a>>(
     bound: usize,
     deadline: tokio::time::Instant,
 ) -> Result<T, ManagedProviderClientError> {
-    tokio::time::timeout_at(deadline, read_json(reader, bound))
-        .await
-        .map_err(|_| ManagedProviderClientError::Unavailable)?
+    match tokio::time::timeout_at(deadline, read_json(reader, bound)).await {
+        Ok(result) if tokio::time::Instant::now() < deadline => result,
+        Ok(_) | Err(_) => Err(ManagedProviderClientError::Unavailable),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1476,7 +1488,6 @@ struct ServerConnectionGuard(Arc<ServerCounters>);
 impl Drop for ServerConnectionGuard {
     fn drop(&mut self) {
         self.0.connections.fetch_sub(1, Ordering::Relaxed);
-        self.0.tasks.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1536,7 +1547,10 @@ impl ManagedProviderJobServer {
         let listener = TcpListener::bind(bind).await?;
         let address = listener.local_addr()?;
         let cancelled = Arc::new(AtomicBool::new(false));
-        let tasks = Arc::new(Mutex::new(JoinSet::new()));
+        // The completed task retains its connection permit as its JoinSet
+        // output. A replacement cannot be accepted until reaping consumes
+        // that output, so retained entries are structurally bounded too.
+        let tasks = Arc::new(Mutex::new(JoinSet::<OwnedSemaphorePermit>::new()));
         let counters = Arc::new(ServerCounters::default());
         let permit = Arc::new(Semaphore::new(self.max_connections));
         let cancel = Arc::clone(&cancelled);
@@ -1549,7 +1563,9 @@ impl ManagedProviderJobServer {
                 tokio::select! {
                     _ = reap.tick() => {
                         let mut tasks = accept_tasks.lock().await;
-                        while tasks.try_join_next().is_some() {}
+                        while tasks.try_join_next().is_some() {
+                            accept_counters.tasks.fetch_sub(1, Ordering::Relaxed);
+                        }
                     }
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { continue };
@@ -1565,9 +1581,9 @@ impl ManagedProviderJobServer {
                         let tasks_current = counters.tasks.fetch_add(1, Ordering::Relaxed) + 1;
                         high(&counters.task_high_water, tasks_current);
                         accept_tasks.lock().await.spawn(async move {
-                            let _slot = slot;
                             let _connection = ServerConnectionGuard(counters);
                             let _ = serve_connection(stream, service, tls, scope, voter, client).await;
+                            slot
                         });
                     }
                 }
@@ -1587,7 +1603,7 @@ impl ManagedProviderJobServer {
 pub struct ManagedProviderJobServerHandle {
     handle: JoinHandle<()>,
     cancelled: Arc<AtomicBool>,
-    tasks: Arc<Mutex<JoinSet<()>>>,
+    tasks: Arc<Mutex<JoinSet<OwnedSemaphorePermit>>>,
     counters: Arc<ServerCounters>,
 }
 impl ManagedProviderJobServerHandle {
@@ -1692,6 +1708,12 @@ async fn serve_connection(
         let WireRequest::Call { operation } = request else {
             return Err(ManagedProviderClientError::Protocol);
         };
+        // Serde derives bypass constructors for nested store DTOs. Reapply the
+        // closed profile's invariant checks before the least-authority facade
+        // can observe any decoded value.
+        if !wire_operation_is_valid(&operation) {
+            return Err(ManagedProviderClientError::Protocol);
+        }
         let response = match operation {
             WireOperation::Run {
                 admission,
@@ -1754,6 +1776,45 @@ async fn serve_connection(
         )
         .await?;
     }
+}
+fn wire_operation_is_valid(operation: &WireOperation) -> bool {
+    use opc_session_store::fenced_mutation_roster::{
+        MAX_DESCRIPTOR_BYTES, MAX_PLAN_BYTES, MAX_RESULT_BYTES,
+    };
+
+    let (admission, checkpoint) = match operation {
+        WireOperation::Run {
+            admission,
+            protected_checkpoint,
+            ..
+        } => (admission, Some(protected_checkpoint.as_ref())),
+        WireOperation::Status { admission, .. } => (admission, None),
+    };
+    if admission.validate().is_err()
+        || admission.protected_plan().len() > MAX_PLAN_BYTES
+        || admission.terminal_result().as_bytes().len() > MAX_RESULT_BYTES
+        || checkpoint.is_some_and(|bytes| bytes.len() > MAX_PLAN_BYTES)
+        || admission.members().as_slice().iter().any(|member| {
+            member.caller_id().iter().all(|byte| *byte == 0)
+                || member.descriptor().as_bytes().len() > MAX_DESCRIPTOR_BYTES
+        })
+    {
+        return false;
+    }
+    // `FencedMutationRosterOperationId` has a constructor-only nonzero
+    // invariant but no public accessor. Inspecting this private transport
+    // value through serde is redaction-safe and lets the boundary reject a
+    // zero ID created by derived deserialization.
+    serde_json::to_value(admission)
+        .ok()
+        .and_then(|value| value.get("operation_id").cloned())
+        .and_then(|value| value.as_array().cloned())
+        .is_some_and(|bytes| {
+            bytes.len() == 16
+                && bytes
+                    .iter()
+                    .any(|value| value.as_u64().is_some_and(|byte| byte != 0))
+        })
 }
 fn validated_admission(
     admission: FencedMutationRosterAdmission,
@@ -2024,6 +2085,21 @@ mod tests {
         .is_err());
     }
 
+    #[tokio::test]
+    async fn closed_decoder_rejects_a_valid_value_with_trailing_bytes() {
+        let bytes = br#"{"kind":"Reject"}x"#;
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        writer
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .expect("test length");
+        writer.write_all(bytes).await.expect("test body");
+        assert!(matches!(
+            read_json::<_, WireResponse>(&mut reader, 128).await,
+            Err(ManagedProviderClientError::Protocol)
+        ));
+    }
+
     #[test]
     fn returned_service_unavailable_is_not_a_prewrite_failure() {
         assert_eq!(
@@ -2091,11 +2167,13 @@ mod tests {
 
         let members: [roster::FencedMutationRosterMember; roster::MAX_MEMBERS] =
             std::array::from_fn(|ordinal| {
+                let mut caller_id = [255; roster::MEMBER_ID_BYTES];
+                caller_id[roster::MEMBER_ID_BYTES - 1] = ordinal as u8 + 1;
                 roster::FencedMutationRosterMember::new(
                     roster::FencedMutationRosterOrdinal::new(ordinal as u8).expect("test ordinal"),
-                    [ordinal as u8 + 1; roster::MEMBER_ID_BYTES],
+                    caller_id,
                     roster::FencedMutationRosterDescriptor::new(vec![
-                        7;
+                        255;
                         roster::MAX_DESCRIPTOR_BYTES
                     ])
                     .expect("test descriptor"),
@@ -2108,9 +2186,9 @@ mod tests {
             });
         let admission = FencedMutationRosterAdmission::new(
             u64::MAX,
-            roster::FencedMutationRosterOperationId::new([1; roster::MEMBER_ID_BYTES])
+            roster::FencedMutationRosterOperationId::new([255; roster::MEMBER_ID_BYTES])
                 .expect("test operation ID"),
-            roster::FencedMutationRosterScope::from_digest([2; 32]),
+            roster::FencedMutationRosterScope::from_digest([255; 32]),
             roster::FencedMutationRosterFenceIntent::new(
                 OwnerId::new("o".repeat(OwnerId::MAX_BYTES)).expect("test owner"),
                 FenceToken::new(u64::MAX),
@@ -2118,14 +2196,14 @@ mod tests {
             Generation::new(u64::MAX),
             roster::FencedMutationRosterMembers::new(members).expect("test members"),
             roster::FencedMutationRosterProtectedPlan::new(
-                vec![3; roster::MAX_PLAN_BYTES].into_boxed_slice(),
+                vec![255; roster::MAX_PLAN_BYTES].into_boxed_slice(),
             )
             .expect("test plan"),
         )
         .expect("test admission")
         .with_terminal_result(
             roster::FencedMutationRosterProtectedResult::new(
-                vec![4; roster::MAX_RESULT_BYTES].into_boxed_slice(),
+                vec![255; roster::MAX_RESULT_BYTES].into_boxed_slice(),
             )
             .expect("test result"),
         )
@@ -2133,14 +2211,15 @@ mod tests {
         let frame = WireRequest::Call {
             operation: WireOperation::Run {
                 admission,
-                protected_checkpoint: vec![5; roster::MAX_PLAN_BYTES].into_boxed_slice(),
+                protected_checkpoint: vec![255; roster::MAX_PLAN_BYTES].into_boxed_slice(),
                 ordinal: 0,
             },
         };
         let length = bounded_json_len(&frame, usize::MAX).expect("maximum legal encoding");
-        assert!(
-            length <= MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES,
-            "{length}"
+        assert_eq!(length, MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES);
+        assert_eq!(
+            bounded_json_len(&frame, length - 1),
+            Err(ManagedProviderClientError::Overloaded)
         );
     }
 
