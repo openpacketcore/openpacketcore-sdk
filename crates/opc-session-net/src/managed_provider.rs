@@ -74,6 +74,17 @@ pub const MANAGED_PROVIDER_SETUP_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MANAGED_PROVIDER_FRAME_TIMEOUT: Duration = Duration::from_millis(250);
 /// A facade call cannot retain an admitted server connection indefinitely.
 pub const MANAGED_PROVIDER_FACADE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Largest supported caller-to-scheduler queue budget. It is exactly one
+/// bounded application-frame interval, so queued work cannot outlive the
+/// transport protocol's own fixed application deadline.
+pub const MAX_MANAGED_PROVIDER_POOL_QUEUE_TIMEOUT: Duration = MANAGED_PROVIDER_FRAME_TIMEOUT;
+/// Largest supported lane setup budget. Resolver, TCP, TLS, Hello, and Ack
+/// share the protocol's one fixed setup transaction budget.
+pub const MAX_MANAGED_PROVIDER_POOL_SETUP_TIMEOUT: Duration = MANAGED_PROVIDER_SETUP_TIMEOUT;
+/// Largest supported graceful drain. It covers the existing setup and facade
+/// budgets plus four bounded application-frame intervals, rounded to the
+/// established five-second managed-provider shutdown policy.
+pub const MAX_MANAGED_PROVIDER_POOL_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 const PROFILE_DOMAIN: &[u8] = b"opc-session-net/managed-provider/5/profile\0";
 
@@ -111,9 +122,9 @@ impl Default for ManagedProviderPoolConfig {
             queued_and_inflight: MANAGED_PROVIDER_POOL_QUEUE_CAPACITY,
             request_bytes: MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES,
             response_bytes: MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES,
-            queue_deadline: Duration::from_millis(250),
-            setup_timeout: Duration::from_secs(2),
-            shutdown_drain: Duration::from_secs(5),
+            queue_deadline: MAX_MANAGED_PROVIDER_POOL_QUEUE_TIMEOUT,
+            setup_timeout: MAX_MANAGED_PROVIDER_POOL_SETUP_TIMEOUT,
+            shutdown_drain: MAX_MANAGED_PROVIDER_POOL_SHUTDOWN_DRAIN,
         }
     }
 }
@@ -154,11 +165,11 @@ impl ManagedProviderPoolConfig {
             || self.request_bytes > Semaphore::MAX_PERMITS
             || self.queued_and_inflight > Semaphore::MAX_PERMITS
             || self.queue_deadline.is_zero()
+            || self.queue_deadline > MAX_MANAGED_PROVIDER_POOL_QUEUE_TIMEOUT
             || self.setup_timeout.is_zero()
+            || self.setup_timeout > MAX_MANAGED_PROVIDER_POOL_SETUP_TIMEOUT
             || self.shutdown_drain.is_zero()
-            || self.queue_deadline == Duration::MAX
-            || self.setup_timeout == Duration::MAX
-            || self.shutdown_drain == Duration::MAX
+            || self.shutdown_drain > MAX_MANAGED_PROVIDER_POOL_SHUTDOWN_DRAIN
         {
             return Err(ManagedProviderPoolConfigError);
         }
@@ -384,23 +395,12 @@ fn high(value: &AtomicU64, current: u64) {
     }
 }
 
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Running,
     Draining,
     Forced,
     Stopped,
-}
-impl Phase {
-    fn load(value: &AtomicU8) -> Self {
-        match value.load(Ordering::Acquire) {
-            1 => Self::Draining,
-            2 => Self::Forced,
-            3 => Self::Stopped,
-            _ => Self::Running,
-        }
-    }
 }
 
 /// A composite, fixed-width `/5` client. Construction validates exactly three
@@ -415,22 +415,36 @@ struct Pool {
     authority: ManagedProviderClientAuthority,
     endpoints: [ManagedVoterEndpoint; MANAGED_PROVIDER_JOB_VOTERS],
     config: ManagedProviderPoolConfig,
-    phase: AtomicU8,
-    started: AtomicBool,
     readiness: AtomicU8,
     warm: [AtomicUsize; MANAGED_PROVIDER_JOB_VOTERS],
     pending: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     cells: Arc<Semaphore>,
     counters: Arc<Counters>,
-    scheduler: StdMutex<Option<mpsc::Sender<Command>>>,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
-    shutdown_started: AtomicBool,
+    lifecycle: StdMutex<LifecycleState>,
+    startup_changed: Notify,
     shutdown_report: StdMutex<Option<ManagedProviderShutdownReport>>,
     shutdown_complete: Notify,
     readiness_changed: Notify,
-    active_admissions: AtomicUsize,
     admissions_changed: Notify,
+    #[cfg(test)]
+    test_hooks: ManagedProviderTestHooks,
+}
+
+/// The only mutable lifecycle authority for a managed-provider pool.
+///
+/// A caller either receives an admission guard while this record says
+/// `Running`, or shutdown changes that same record to `Draining` first. The
+/// task registry and scheduler publication use the same critical section, so
+/// shutdown can only take a complete set of owned handles.
+struct LifecycleState {
+    phase: Phase,
+    started: bool,
+    starting: bool,
+    shutdown_driver_started: bool,
+    active_admissions: usize,
+    scheduler: Option<mpsc::Sender<Command>>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 struct AdmissionGuard {
@@ -438,8 +452,164 @@ struct AdmissionGuard {
 }
 impl Drop for AdmissionGuard {
     fn drop(&mut self) {
-        self.pool.active_admissions.fetch_sub(1, Ordering::AcqRel);
+        let mut lifecycle = self.pool.lifecycle();
+        lifecycle.active_admissions = lifecycle.active_admissions.saturating_sub(1);
+        drop(lifecycle);
         self.pool.admissions_changed.notify_waiters();
+    }
+}
+
+/// Keeps the startup claim cancellable. A cancelled prewarm must release
+/// callers waiting to observe either the complete registry or the next
+/// startup attempt; it may never strand `starting` at true.
+struct StartupGuard {
+    pool: Arc<Pool>,
+    active: bool,
+}
+
+impl StartupGuard {
+    fn complete(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut lifecycle = self.pool.lifecycle();
+        lifecycle.starting = false;
+        drop(lifecycle);
+        self.active = false;
+        self.pool.startup_changed.notify_waiters();
+    }
+}
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        self.complete();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManagedProviderTestPause {
+    AdmissionBeforePermits,
+    AdmissionAfterPermits,
+    AdmissionAfterAccounting,
+    AdmissionBeforeSend,
+    StartupBeforeRegistry,
+    StartupAfterRegistry,
+}
+
+#[cfg(test)]
+struct ManagedProviderTestPauseHook {
+    armed: AtomicBool,
+    entered: AtomicUsize,
+    entered_changed: Notify,
+    released: Notify,
+}
+
+#[cfg(test)]
+impl ManagedProviderTestPauseHook {
+    fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            entered: AtomicUsize::new(0),
+            entered_changed: Notify::new(),
+            released: Notify::new(),
+        }
+    }
+
+    fn arm(&self) {
+        self.entered.store(0, Ordering::Release);
+        self.armed.store(true, Ordering::Release);
+    }
+
+    async fn pause(&self) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        self.entered.fetch_add(1, Ordering::AcqRel);
+        self.entered_changed.notify_waiters();
+        loop {
+            let released = self.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !self.armed.load(Ordering::Acquire) {
+                return;
+            }
+            released.await;
+        }
+    }
+
+    async fn entered(&self) {
+        loop {
+            let changed = self.entered_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.entered.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn release(&self) {
+        self.armed.store(false, Ordering::Release);
+        self.released.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+struct ManagedProviderTestHooks {
+    admission_before_permits: ManagedProviderTestPauseHook,
+    admission_after_permits: ManagedProviderTestPauseHook,
+    admission_after_accounting: ManagedProviderTestPauseHook,
+    admission_before_send: ManagedProviderTestPauseHook,
+    startup_before_registry: ManagedProviderTestPauseHook,
+    startup_after_registry: ManagedProviderTestPauseHook,
+}
+
+#[cfg(test)]
+impl ManagedProviderTestHooks {
+    fn new() -> Self {
+        Self {
+            admission_before_permits: ManagedProviderTestPauseHook::new(),
+            admission_after_permits: ManagedProviderTestPauseHook::new(),
+            admission_after_accounting: ManagedProviderTestPauseHook::new(),
+            admission_before_send: ManagedProviderTestPauseHook::new(),
+            startup_before_registry: ManagedProviderTestPauseHook::new(),
+            startup_after_registry: ManagedProviderTestPauseHook::new(),
+        }
+    }
+
+    async fn pause(&self, point: ManagedProviderTestPause) {
+        match point {
+            ManagedProviderTestPause::AdmissionBeforePermits => {
+                self.admission_before_permits.pause().await
+            }
+            ManagedProviderTestPause::AdmissionAfterPermits => {
+                self.admission_after_permits.pause().await
+            }
+            ManagedProviderTestPause::AdmissionAfterAccounting => {
+                self.admission_after_accounting.pause().await
+            }
+            ManagedProviderTestPause::AdmissionBeforeSend => {
+                self.admission_before_send.pause().await
+            }
+            ManagedProviderTestPause::StartupBeforeRegistry => {
+                self.startup_before_registry.pause().await
+            }
+            ManagedProviderTestPause::StartupAfterRegistry => {
+                self.startup_after_registry.pause().await
+            }
+        }
+    }
+
+    fn hook(&self, point: ManagedProviderTestPause) -> &ManagedProviderTestPauseHook {
+        match point {
+            ManagedProviderTestPause::AdmissionBeforePermits => &self.admission_before_permits,
+            ManagedProviderTestPause::AdmissionAfterPermits => &self.admission_after_permits,
+            ManagedProviderTestPause::AdmissionAfterAccounting => &self.admission_after_accounting,
+            ManagedProviderTestPause::AdmissionBeforeSend => &self.admission_before_send,
+            ManagedProviderTestPause::StartupBeforeRegistry => &self.startup_before_registry,
+            ManagedProviderTestPause::StartupAfterRegistry => &self.startup_after_registry,
+        }
     }
 }
 
@@ -463,22 +633,28 @@ impl PersistentManagedProviderJobClient {
                 authority,
                 endpoints,
                 config,
-                phase: AtomicU8::new(Phase::Running as u8),
-                started: AtomicBool::new(false),
                 readiness: AtomicU8::new(0),
                 warm: std::array::from_fn(|_| AtomicUsize::new(0)),
                 pending: Arc::new(Semaphore::new(config.queued_and_inflight)),
                 bytes: Arc::new(Semaphore::new(config.request_bytes)),
                 cells: Arc::new(Semaphore::new(config.queued_and_inflight)),
                 counters: Arc::new(Counters::default()),
-                scheduler: StdMutex::new(None),
-                tasks: Mutex::new(Vec::new()),
-                shutdown_started: AtomicBool::new(false),
+                lifecycle: StdMutex::new(LifecycleState {
+                    phase: Phase::Running,
+                    started: false,
+                    starting: false,
+                    shutdown_driver_started: false,
+                    active_admissions: 0,
+                    scheduler: None,
+                    tasks: Vec::new(),
+                }),
+                startup_changed: Notify::new(),
                 shutdown_report: StdMutex::new(None),
                 shutdown_complete: Notify::new(),
                 readiness_changed: Notify::new(),
-                active_admissions: AtomicUsize::new(0),
                 admissions_changed: Notify::new(),
+                #[cfg(test)]
+                test_hooks: ManagedProviderTestHooks::new(),
             }),
         })
     }
@@ -510,7 +686,7 @@ impl PersistentManagedProviderJobClient {
         }
     }
     pub async fn prewarm(&self) -> Result<ManagedProviderReadiness, ManagedProviderClientError> {
-        self.pool.start()?;
+        self.pool.start().await?;
         let deadline = tokio::time::Instant::now()
             .checked_add(self.pool.config.setup_timeout)
             .ok_or(ManagedProviderClientError::Unavailable)?;
@@ -519,11 +695,12 @@ impl PersistentManagedProviderJobClient {
             // notify in the check-to-wait gap.
             let notified = self.pool.readiness_changed.notified();
             tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.pool.phase() != Phase::Running {
+                return Err(ManagedProviderClientError::ShuttingDown);
+            }
             if self.readiness() == ManagedProviderReadiness::Ready {
                 return Ok(ManagedProviderReadiness::Ready);
-            }
-            if Phase::load(&self.pool.phase) != Phase::Running {
-                return Err(ManagedProviderClientError::ShuttingDown);
             }
             if tokio::time::timeout_at(deadline, &mut notified)
                 .await
@@ -562,6 +739,9 @@ impl PersistentManagedProviderJobClient {
         operation: WireOperation,
     ) -> Result<ManagedProviderJobStatus, ManagedProviderClientError> {
         let admission_guard = self.pool.enter_admission()?;
+        self.pool
+            .pause(ManagedProviderTestPause::AdmissionBeforePermits)
+            .await;
         if self.readiness() == ManagedProviderReadiness::Unready {
             return Err(ManagedProviderClientError::Unavailable);
         }
@@ -599,6 +779,9 @@ impl PersistentManagedProviderJobClient {
                 self.pool.counters.overload.fetch_add(1, Ordering::Relaxed);
                 ManagedProviderClientError::Overloaded
             })?;
+        self.pool
+            .pause(ManagedProviderTestPause::AdmissionAfterPermits)
+            .await;
         let (reply_tx, reply_rx) = oneshot::channel();
         let key = job_key(&frame);
         let job = Job {
@@ -616,13 +799,18 @@ impl PersistentManagedProviderJobClient {
             _cell: cells,
         };
         self.pool.track_enqueue(job.frame_bytes);
+        self.pool
+            .pause(ManagedProviderTestPause::AdmissionAfterAccounting)
+            .await;
         let tx = self
             .pool
+            .lifecycle()
             .scheduler
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or(ManagedProviderClientError::Unavailable)?;
+        self.pool
+            .pause(ManagedProviderTestPause::AdmissionBeforeSend)
+            .await;
         if tx.try_send(Command::Submit(Box::new(job))).is_err() {
             self.pool.counters.overload.fetch_add(1, Ordering::Relaxed);
             return Err(ManagedProviderClientError::Overloaded);
@@ -696,76 +884,125 @@ fn operation_matches_authority(
 }
 
 impl Pool {
-    fn enter_admission(self: &Arc<Self>) -> Result<AdmissionGuard, ManagedProviderClientError> {
-        loop {
-            if Phase::load(&self.phase) != Phase::Running {
-                return Err(ManagedProviderClientError::ShuttingDown);
-            }
-            self.active_admissions.fetch_add(1, Ordering::AcqRel);
-            if Phase::load(&self.phase) == Phase::Running {
-                return Ok(AdmissionGuard {
-                    pool: Arc::clone(self),
-                });
-            }
-            self.active_admissions.fetch_sub(1, Ordering::AcqRel);
-            self.admissions_changed.notify_waiters();
-        }
+    fn lifecycle(&self) -> std::sync::MutexGuard<'_, LifecycleState> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    fn phase(&self) -> Phase {
+        self.lifecycle().phase
+    }
+
+    fn running_and_started(&self) -> bool {
+        let lifecycle = self.lifecycle();
+        lifecycle.phase == Phase::Running && lifecycle.started
+    }
+
+    async fn pause(&self, point: ManagedProviderTestPause) {
+        #[cfg(test)]
+        self.test_hooks.pause(point).await;
+        #[cfg(not(test))]
+        let _ = point;
+    }
+
+    fn enter_admission(self: &Arc<Self>) -> Result<AdmissionGuard, ManagedProviderClientError> {
+        let mut lifecycle = self.lifecycle();
+        if lifecycle.phase != Phase::Running {
+            return Err(ManagedProviderClientError::ShuttingDown);
+        }
+        lifecycle.active_admissions = lifecycle.active_admissions.saturating_add(1);
+        Ok(AdmissionGuard {
+            pool: Arc::clone(self),
+        })
+    }
+
     async fn wait_admissions_closed(&self) {
         loop {
             let notified = self.admissions_changed.notified();
             tokio::pin!(notified);
-            if self.active_admissions.load(Ordering::Acquire) == 0 {
+            notified.as_mut().enable();
+            if self.lifecycle().active_admissions == 0 {
                 return;
             }
             notified.await;
         }
     }
-    fn start(self: &Arc<Self>) -> Result<(), ManagedProviderClientError> {
-        if self.started.load(Ordering::Acquire) {
-            return Ok(());
+
+    async fn start(self: &Arc<Self>) -> Result<(), ManagedProviderClientError> {
+        loop {
+            let notified = self.startup_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let claimed_startup = {
+                let mut lifecycle = self.lifecycle();
+                if lifecycle.phase != Phase::Running {
+                    return Err(ManagedProviderClientError::ShuttingDown);
+                }
+                if lifecycle.started {
+                    return Ok(());
+                }
+                if lifecycle.starting {
+                    false
+                } else {
+                    lifecycle.starting = true;
+                    true
+                }
+            };
+            if claimed_startup {
+                break;
+            }
+            notified.await;
         }
+        let mut startup_guard = StartupGuard {
+            pool: Arc::clone(self),
+            active: true,
+        };
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(ManagedProviderClientError::Unavailable);
         }
-        // Reserve the sole supervisor registry before spawning. A failed
-        // registry acquisition therefore cannot detach partially created
-        // workers from shutdown ownership.
-        let mut registered = self
-            .tasks
-            .try_lock()
-            .map_err(|_| ManagedProviderClientError::Unavailable)?;
-        if self.started.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-        let (tx, rx) = mpsc::channel(self.config.queued_and_inflight);
-        let (event_tx, event_rx) = mpsc::channel(self.config.total_lanes() * 2);
-        let mut worker_txs = Vec::with_capacity(self.config.total_lanes());
-        let mut handles = Vec::with_capacity(self.config.total_lanes() + 1);
-        for voter in 0..MANAGED_PROVIDER_JOB_VOTERS {
-            for lane in 0..self.config.lanes_per_voter {
-                let (worker_tx, worker_rx) = mpsc::channel(1);
-                worker_txs.push(worker_tx);
-                handles.push(tokio::spawn(lane_worker(
-                    Arc::clone(self),
-                    voter,
-                    lane,
-                    worker_rx,
-                    event_tx.clone(),
-                )));
+
+        self.pause(ManagedProviderTestPause::StartupBeforeRegistry)
+            .await;
+
+        // Reclaim the same lifecycle gate before spawning. Shutdown either
+        // closes this gate first, in which case no worker exists, or observes
+        // the complete scheduler and handle registry published below.
+        {
+            let mut lifecycle = self.lifecycle();
+            if lifecycle.phase != Phase::Running {
+                return Err(ManagedProviderClientError::ShuttingDown);
             }
+            let (tx, rx) = mpsc::channel(self.config.queued_and_inflight);
+            let (event_tx, event_rx) = mpsc::channel(self.config.total_lanes() * 2);
+            let mut worker_txs = Vec::with_capacity(self.config.total_lanes());
+            let mut handles = Vec::with_capacity(self.config.total_lanes() + 1);
+            for voter in 0..MANAGED_PROVIDER_JOB_VOTERS {
+                for lane in 0..self.config.lanes_per_voter {
+                    let (worker_tx, worker_rx) = mpsc::channel(1);
+                    worker_txs.push(worker_tx);
+                    handles.push(tokio::spawn(lane_worker(
+                        Arc::clone(self),
+                        voter,
+                        lane,
+                        worker_rx,
+                        event_tx.clone(),
+                    )));
+                }
+            }
+            handles.push(tokio::spawn(scheduler(
+                Arc::downgrade(self),
+                rx,
+                event_rx,
+                worker_txs,
+            )));
+            lifecycle.scheduler = Some(tx);
+            lifecycle.tasks = handles;
+            lifecycle.started = true;
         }
-        *self
-            .scheduler
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
-        handles.push(tokio::spawn(scheduler(
-            Arc::downgrade(self),
-            rx,
-            event_rx,
-            worker_txs,
-        )));
-        *registered = handles;
+        startup_guard.complete();
+        self.pause(ManagedProviderTestPause::StartupAfterRegistry)
+            .await;
         Ok(())
     }
     fn track_enqueue(&self, bytes: usize) {
@@ -786,6 +1023,11 @@ impl Pool {
         high(&self.counters.inflight_high_water, now);
     }
     fn update_readiness(&self) {
+        if !self.running_and_started() {
+            self.readiness.store(0, Ordering::Release);
+            self.readiness_changed.notify_waiters();
+            return;
+        }
         let voters = self
             .warm
             .iter()
@@ -806,25 +1048,44 @@ impl Pool {
         self.readiness_changed.notify_waiters();
     }
     fn request_shutdown(self: &Arc<Self>) {
-        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+        let start_driver = {
+            let mut lifecycle = self.lifecycle();
+            if lifecycle.shutdown_driver_started {
+                false
+            } else {
+                lifecycle.phase = Phase::Draining;
+                lifecycle.shutdown_driver_started = true;
+                true
+            }
+        };
+        if !start_driver {
             return;
         }
-        self.phase.store(Phase::Draining as u8, Ordering::Release);
+        self.readiness.store(0, Ordering::Release);
+        self.readiness_changed.notify_waiters();
         let pool = Arc::clone(self);
         tokio::spawn(async move {
             pool.wait_admissions_closed().await;
-            let scheduler = pool
-                .scheduler
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(tx) = scheduler {
-                let _ = tx.send(Command::Drain).await;
-                tokio::time::sleep(pool.config.shutdown_drain).await;
-                pool.phase.store(Phase::Forced as u8, Ordering::Release);
-                let _ = tx.send(Command::Force).await;
+            let scheduler = pool.lifecycle().scheduler.clone();
+            if let Some(deadline) =
+                tokio::time::Instant::now().checked_add(pool.config.shutdown_drain)
+            {
+                if let Some(tx) = scheduler {
+                    let _ = tokio::time::timeout_at(deadline, tx.send(Command::Drain)).await;
+                    tokio::time::sleep_until(deadline).await;
+                }
             }
-            let handles = std::mem::take(&mut *pool.tasks.lock().await);
+            let (scheduler, handles) = {
+                let mut lifecycle = pool.lifecycle();
+                lifecycle.phase = Phase::Forced;
+                (
+                    lifecycle.scheduler.take(),
+                    std::mem::take(&mut lifecycle.tasks),
+                )
+            };
+            if let Some(tx) = scheduler {
+                let _ = tx.try_send(Command::Force);
+            }
             // A hung TLS peer or service cannot hold a retained supervisor
             // beyond its drain deadline. Abort only after the bounded drain.
             pool.counters.shutdown_forced.fetch_add(
@@ -844,7 +1105,10 @@ impl Pool {
             debug_assert_eq!(pool.counters.inflight.load(Ordering::Relaxed), 0);
             debug_assert_eq!(pool.counters.request_bytes.load(Ordering::Relaxed), 0);
             debug_assert_eq!(pool.counters.response_cells.load(Ordering::Relaxed), 0);
-            pool.phase.store(Phase::Stopped as u8, Ordering::Release);
+            {
+                let mut lifecycle = pool.lifecycle();
+                lifecycle.phase = Phase::Stopped;
+            }
             let report = ManagedProviderShutdownReport {
                 drained: pool.counters.shutdown_drained.load(Ordering::Relaxed),
                 forced: pool.counters.shutdown_forced.load(Ordering::Relaxed),
@@ -864,6 +1128,7 @@ impl Pool {
             // protection as prewarm.
             let notified = self.shutdown_complete.notified();
             tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(report) = *self
                 .shutdown_report
                 .lock()
@@ -990,7 +1255,7 @@ async fn scheduler(
                 Some(Command::Submit(job)) => {
                     let job = *job;
                     let Some(p) = pool.upgrade() else { return };
-                    if Phase::load(&p.phase) != Phase::Running {
+                    if p.phase() != Phase::Running {
                         complete(&p, job, Err(ManagedProviderClientError::ShuttingDown));
                     } else if active.contains(&job.key) || queues.contains_key(&job.key) {
                         complete(&p, job, Err(ManagedProviderClientError::Overloaded));
@@ -1095,13 +1360,13 @@ async fn lane_worker(
     let mut generation = 0_u64;
     let mut reconnect_attempt = 0_u8;
     loop {
-        if matches!(Phase::load(&pool.phase), Phase::Forced | Phase::Stopped) {
+        if pool.phase() != Phase::Running {
             return;
         }
         let connection = connect_lane(&pool, voter).await;
         let mut connection = match connection {
             Ok(c) => {
-                if Phase::load(&pool.phase) != Phase::Running {
+                if pool.phase() != Phase::Running {
                     // Shutdown may have started while the absolute setup
                     // transaction was in progress; never publish a late lane.
                     return;
@@ -1133,7 +1398,7 @@ async fn lane_worker(
             }
         };
         while let Some(mut job) = jobs.recv().await {
-            if matches!(Phase::load(&pool.phase), Phase::Forced | Phase::Stopped) {
+            if matches!(pool.phase(), Phase::Forced | Phase::Stopped) {
                 pool.counters
                     .shutdown_forced
                     .fetch_add(1, Ordering::Relaxed);
@@ -1159,7 +1424,7 @@ async fn lane_worker(
             .await;
             match result {
                 Ok(value) => {
-                    if Phase::load(&pool.phase) == Phase::Draining {
+                    if pool.phase() == Phase::Draining {
                         pool.counters
                             .shutdown_drained
                             .fetch_add(1, Ordering::Relaxed);
@@ -1191,7 +1456,9 @@ async fn connect_lane(pool: &Pool, voter: usize) -> Result<ClientLane, ManagedPr
     let endpoint = &pool.endpoints[voter];
     // This deadline is deliberately created once.  Resolver, TCP, TLS, Hello,
     // and Ack are one setup transaction; no successful phase renews it.
-    let deadline = tokio::time::Instant::now() + pool.config.setup_timeout;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(pool.config.setup_timeout)
+        .ok_or(ManagedProviderClientError::Unavailable)?;
     let address = tokio::time::timeout_at(deadline, (endpoint.resolve)())
         .await
         .map_err(|_| ManagedProviderClientError::Unavailable)?
@@ -1698,7 +1965,9 @@ async fn serve_connection(
     voter: SpiffeId,
     client: SpiffeId,
 ) -> Result<(), ManagedProviderClientError> {
-    let setup_deadline = tokio::time::Instant::now() + MANAGED_PROVIDER_SETUP_TIMEOUT;
+    let setup_deadline = tokio::time::Instant::now()
+        .checked_add(MANAGED_PROVIDER_SETUP_TIMEOUT)
+        .ok_or(ManagedProviderClientError::Unavailable)?;
     let handshake = tls
         .begin_handshake()
         .map_err(|_| ManagedProviderClientError::Authentication)?;
@@ -1765,7 +2034,9 @@ async fn serve_connection(
     )
     .await?;
     loop {
-        let frame_deadline = tokio::time::Instant::now() + MANAGED_PROVIDER_FRAME_TIMEOUT;
+        let frame_deadline = tokio::time::Instant::now()
+            .checked_add(MANAGED_PROVIDER_FRAME_TIMEOUT)
+            .ok_or(ManagedProviderClientError::Unavailable)?;
         let request: WireRequest = read_json_until(
             &mut stream,
             MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES,
@@ -1834,7 +2105,9 @@ async fn serve_connection(
         // A completed facade call never renews the read budget. Its response
         // gets its own fixed write budget, so a slow-but-in-budget facade is
         // not converted into a late frame write.
-        let response_deadline = tokio::time::Instant::now() + MANAGED_PROVIDER_FRAME_TIMEOUT;
+        let response_deadline = tokio::time::Instant::now()
+            .checked_add(MANAGED_PROVIDER_FRAME_TIMEOUT)
+            .ok_or(ManagedProviderClientError::Unavailable)?;
         write_json_until(
             &mut stream,
             &WireResponse::Call(response),
@@ -2009,6 +2282,115 @@ mod tests {
         ))
     }
 
+    fn lifecycle_test_client(
+        resolver_calls: Arc<AtomicUsize>,
+    ) -> PersistentManagedProviderJobClient {
+        let pki = TestPki::new();
+        let client_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/lifecycle-client";
+        let endpoint_identities = [
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/lifecycle-voter-0",
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/lifecycle-voter-1",
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/lifecycle-voter-2",
+        ];
+        let endpoints = endpoint_identities.map(|identity| {
+            let resolver_calls = Arc::clone(&resolver_calls);
+            let resolver: RemoteAddrResolver = Arc::new(move || {
+                resolver_calls.fetch_add(1, AtomicOrdering::Relaxed);
+                Box::pin(std::future::pending()) as BoxFuture<'static, io::Result<_>>
+            });
+            ManagedVoterEndpoint::new(
+                resolver,
+                ServerName::IpAddress(std::net::Ipv4Addr::LOCALHOST.into()),
+                SpiffeId::new(identity).expect("test voter SPIFFE identity"),
+            )
+        });
+        PersistentManagedProviderJobClient::new(
+            ManagedProviderClientAuthority::new(test_scope(), pki.client_config(client_identity))
+                .expect("test authority"),
+            endpoints,
+            ManagedProviderPoolConfig::try_new(
+                1,
+                MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES,
+                MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES,
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+                Duration::from_millis(1),
+            )
+            .expect("short lifecycle configuration"),
+        )
+        .expect("test client")
+    }
+
+    fn lifecycle_test_operation() -> WireOperation {
+        use opc_session_store::fenced_mutation_roster as roster;
+        use opc_session_store::{FenceToken, Generation, OwnerId};
+
+        let client_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/lifecycle-client";
+        let mut commitment = Sha256::new();
+        commitment.update(b"openpacketcore/tls/local-spiffe-identity-commitment/v1\0");
+        commitment.update(
+            u16::try_from(client_identity.len())
+                .expect("test identity length")
+                .to_be_bytes(),
+        );
+        commitment.update(client_identity.as_bytes());
+        let members: [roster::FencedMutationRosterMember; roster::MAX_MEMBERS] =
+            std::array::from_fn(|index| {
+                roster::FencedMutationRosterMember::new(
+                    roster::FencedMutationRosterOrdinal::new(index as u8).expect("test ordinal"),
+                    [u8::try_from(index + 1).expect("test member ID"); roster::MEMBER_ID_BYTES],
+                    roster::FencedMutationRosterDescriptor::new(vec![1]).expect("test descriptor"),
+                    1,
+                    1,
+                    roster::FencedMutationMemberDisposition::Indeterminate,
+                    roster::FencedMutationMemberAdoption::Unreconciled,
+                )
+                .expect("test member")
+            });
+        let admission = FencedMutationRosterAdmission::new(
+            1,
+            roster::FencedMutationRosterOperationId::new([1; roster::MEMBER_ID_BYTES])
+                .expect("test operation ID"),
+            derive_fenced_mutation_roster_scope(commitment.finalize().into(), test_scope()),
+            roster::FencedMutationRosterFenceIntent::new(
+                OwnerId::new("owner").expect("test owner"),
+                FenceToken::new(1),
+            ),
+            Generation::new(1),
+            roster::FencedMutationRosterMembers::new(members).expect("test members"),
+            roster::FencedMutationRosterProtectedPlan::new(vec![1].into_boxed_slice())
+                .expect("test plan"),
+        )
+        .expect("test admission");
+        WireOperation::Run {
+            admission,
+            protected_checkpoint: vec![1].into_boxed_slice(),
+            ordinal: 0,
+        }
+    }
+
+    fn assert_zero_lifecycle_resources(client: &PersistentManagedProviderJobClient) {
+        let diagnostics = client.diagnostics();
+        assert_eq!(diagnostics.queued, 0);
+        assert_eq!(diagnostics.inflight, 0);
+        assert_eq!(diagnostics.request_bytes, 0);
+        assert_eq!(diagnostics.response_cells, 0);
+        assert_eq!(
+            client.pool.pending.available_permits(),
+            client.pool.config.queued_and_inflight
+        );
+        assert_eq!(
+            client.pool.bytes.available_permits(),
+            client.pool.config.request_bytes
+        );
+        assert_eq!(
+            client.pool.cells.available_permits(),
+            client.pool.config.queued_and_inflight
+        );
+    }
+
     struct NoopNetworkFacade;
 
     #[async_trait]
@@ -2146,6 +2528,242 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn pool_config_accepts_exact_operational_maxima_and_rejects_every_larger_duration() {
+        let config = |queue_deadline, setup_timeout, shutdown_drain| {
+            ManagedProviderPoolConfig::try_new(
+                DEFAULT_MANAGED_PROVIDER_POOL_LANES,
+                MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES,
+                MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES,
+                queue_deadline,
+                setup_timeout,
+                shutdown_drain,
+            )
+        };
+        assert!(config(
+            MAX_MANAGED_PROVIDER_POOL_QUEUE_TIMEOUT,
+            MAX_MANAGED_PROVIDER_POOL_SETUP_TIMEOUT,
+            MAX_MANAGED_PROVIDER_POOL_SHUTDOWN_DRAIN,
+        )
+        .is_ok());
+        for (queue_deadline, setup_timeout, shutdown_drain) in [
+            (
+                MAX_MANAGED_PROVIDER_POOL_QUEUE_TIMEOUT + Duration::from_nanos(1),
+                MAX_MANAGED_PROVIDER_POOL_SETUP_TIMEOUT,
+                MAX_MANAGED_PROVIDER_POOL_SHUTDOWN_DRAIN,
+            ),
+            (
+                MAX_MANAGED_PROVIDER_POOL_QUEUE_TIMEOUT,
+                MAX_MANAGED_PROVIDER_POOL_SETUP_TIMEOUT + Duration::from_nanos(1),
+                MAX_MANAGED_PROVIDER_POOL_SHUTDOWN_DRAIN,
+            ),
+            (
+                MAX_MANAGED_PROVIDER_POOL_QUEUE_TIMEOUT,
+                MAX_MANAGED_PROVIDER_POOL_SETUP_TIMEOUT,
+                MAX_MANAGED_PROVIDER_POOL_SHUTDOWN_DRAIN + Duration::from_nanos(1),
+            ),
+            (
+                Duration::MAX - Duration::from_nanos(1),
+                MAX_MANAGED_PROVIDER_POOL_SETUP_TIMEOUT,
+                MAX_MANAGED_PROVIDER_POOL_SHUTDOWN_DRAIN,
+            ),
+            (
+                MAX_MANAGED_PROVIDER_POOL_QUEUE_TIMEOUT,
+                Duration::MAX - Duration::from_nanos(1),
+                MAX_MANAGED_PROVIDER_POOL_SHUTDOWN_DRAIN,
+            ),
+            (
+                MAX_MANAGED_PROVIDER_POOL_QUEUE_TIMEOUT,
+                MAX_MANAGED_PROVIDER_POOL_SETUP_TIMEOUT,
+                Duration::MAX - Duration::from_nanos(1),
+            ),
+        ] {
+            assert!(config(queue_deadline, setup_timeout, shutdown_drain).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_each_admission_pause_and_cancellation_releases_every_resource() {
+        for point in [
+            ManagedProviderTestPause::AdmissionBeforePermits,
+            ManagedProviderTestPause::AdmissionAfterPermits,
+            ManagedProviderTestPause::AdmissionAfterAccounting,
+            ManagedProviderTestPause::AdmissionBeforeSend,
+        ] {
+            let client = lifecycle_test_client(Arc::new(AtomicUsize::new(0)));
+            client.pool.readiness.store(2, Ordering::Release);
+            if point == ManagedProviderTestPause::AdmissionBeforeSend {
+                let (scheduler, _receiver) = mpsc::channel(1);
+                client.pool.lifecycle().scheduler = Some(scheduler);
+            }
+            let hook = client.pool.test_hooks.hook(point);
+            hook.arm();
+            let caller = tokio::spawn({
+                let client = client.clone();
+                async move { client.call(lifecycle_test_operation()).await }
+            });
+            hook.entered().await;
+            let shutdown = tokio::spawn({
+                let client = client.clone();
+                async move { client.shutdown().await }
+            });
+            tokio::task::yield_now().await;
+            assert!(
+                !shutdown.is_finished(),
+                "shutdown must wait for the caller-local admission guard"
+            );
+            caller.abort();
+            let _ = caller.await;
+            let report = tokio::time::timeout(Duration::from_millis(250), shutdown)
+                .await
+                .expect("bounded shutdown after cancelled caller")
+                .expect("shutdown task joins");
+            assert_eq!(report.remaining_connections, 0);
+            assert_eq!(report.remaining_tasks, 0);
+            assert_zero_lifecycle_resources(&client);
+            assert_eq!(client.pool.phase(), Phase::Stopped);
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_admission_guard_releases_shutdown_and_repeated_waiters_share_one_report() {
+        let client = lifecycle_test_client(Arc::new(AtomicUsize::new(0)));
+        let panicking = tokio::spawn({
+            let pool = Arc::clone(&client.pool);
+            async move {
+                let _guard = pool.enter_admission().expect("test admission");
+                panic!("test caller panic")
+            }
+        });
+        assert!(panicking.await.is_err(), "test task panics");
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move { client.shutdown().await }
+        });
+        let second = tokio::spawn({
+            let client = client.clone();
+            async move { client.shutdown().await }
+        });
+        let report = client.shutdown().await;
+        assert_eq!(first.await.expect("first waiter joins"), report);
+        assert_eq!(second.await.expect("second waiter joins"), report);
+        assert_zero_lifecycle_resources(&client);
+        assert_eq!(client.pool.phase(), Phase::Stopped);
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_start_prevents_registry_publication_and_network_work() {
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let client = lifecycle_test_client(Arc::clone(&resolver_calls));
+        let hook = client
+            .pool
+            .test_hooks
+            .hook(ManagedProviderTestPause::StartupBeforeRegistry);
+        hook.arm();
+        let prewarm = tokio::spawn({
+            let client = client.clone();
+            async move { client.prewarm().await }
+        });
+        hook.entered().await;
+        let shutdown = tokio::spawn({
+            let client = client.clone();
+            async move { client.shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        hook.release();
+        assert_eq!(
+            prewarm.await.expect("prewarm task joins"),
+            Err(ManagedProviderClientError::ShuttingDown)
+        );
+        let report = shutdown.await.expect("shutdown task joins");
+        assert_eq!(report.remaining_tasks, 0);
+        assert_eq!(resolver_calls.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(
+            client.prewarm().await,
+            Err(ManagedProviderClientError::ShuttingDown)
+        );
+        assert_eq!(resolver_calls.load(AtomicOrdering::Relaxed), 0);
+        let lifecycle = client.pool.lifecycle();
+        assert!(!lifecycle.started);
+        assert!(lifecycle.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_prewarm_releases_the_startup_claim_for_the_next_caller() {
+        let client = lifecycle_test_client(Arc::new(AtomicUsize::new(0)));
+        let hook = client
+            .pool
+            .test_hooks
+            .hook(ManagedProviderTestPause::StartupBeforeRegistry);
+        hook.arm();
+        let cancelled = tokio::spawn({
+            let client = client.clone();
+            async move { client.prewarm().await }
+        });
+        hook.entered().await;
+        cancelled.abort();
+        let _ = cancelled.await;
+        hook.release();
+        assert_eq!(
+            client.prewarm().await,
+            Err(ManagedProviderClientError::Unavailable)
+        );
+        let report = client.shutdown().await;
+        assert_eq!(report.remaining_connections, 0);
+        assert_eq!(report.remaining_tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn complete_start_is_registered_once_and_shutdown_joins_every_worker() {
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let client = lifecycle_test_client(Arc::clone(&resolver_calls));
+        let hook = client
+            .pool
+            .test_hooks
+            .hook(ManagedProviderTestPause::StartupAfterRegistry);
+        hook.arm();
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move { client.prewarm().await }
+        });
+        hook.entered().await;
+        let second = tokio::spawn({
+            let client = client.clone();
+            async move { client.prewarm().await }
+        });
+        tokio::task::yield_now().await;
+        {
+            let lifecycle = client.pool.lifecycle();
+            assert!(lifecycle.started);
+            assert_eq!(lifecycle.tasks.len(), MANAGED_PROVIDER_JOB_VOTERS + 1);
+            assert!(lifecycle.scheduler.is_some());
+        }
+        let shutdown = tokio::spawn({
+            let client = client.clone();
+            async move { client.shutdown().await }
+        });
+        hook.release();
+        assert_eq!(
+            first.await.expect("first prewarm task joins"),
+            Err(ManagedProviderClientError::ShuttingDown)
+        );
+        assert_eq!(
+            second.await.expect("second prewarm task joins"),
+            Err(ManagedProviderClientError::ShuttingDown)
+        );
+        let report = shutdown.await.expect("shutdown task joins");
+        assert_eq!(report.remaining_connections, 0);
+        assert_eq!(report.remaining_tasks, 0);
+        let after_shutdown = resolver_calls.load(AtomicOrdering::Relaxed);
+        tokio::task::yield_now().await;
+        assert_eq!(resolver_calls.load(AtomicOrdering::Relaxed), after_shutdown);
+        assert_zero_lifecycle_resources(&client);
+        let lifecycle = client.pool.lifecycle();
+        assert!(lifecycle.tasks.is_empty());
+        assert!(lifecycle.scheduler.is_none());
+        assert_eq!(lifecycle.phase, Phase::Stopped);
     }
 
     #[test]
