@@ -3425,8 +3425,16 @@ impl ConsensusSessionStore {
         if let Some(record) = request.mutation().record() {
             crate::sqlite::validate_consensus_record(record)?;
         }
-        self.consumer_fenced_transition_capability(scope, deadline)
-            .await?;
+        // The local consumer service must not spend this one operation budget
+        // proving V1 and then ask the authoritative leader to prove the same
+        // exact voter set again before it can create the activation receipt.
+        // `apply_on_local_leader_inner` performs the only proof that may seed
+        // `ActivateFencedTransition`, after it has admitted this exact scope
+        // and established leader linearizability.  It also rechecks the scope
+        // identity and voter digest immediately before proposal.  Keeping that
+        // proof only at the proposal authority means its result is never
+        // detached from the activation command, while the caller retains the
+        // identical request body/ID if the response becomes ambiguous.
         // Unlike legacy consumer mutations this does not submit a separate
         // BindConsumerRequest marker. The transition's durable receipt binds
         // its complete body at the same single consensus position as lease and
@@ -3461,10 +3469,16 @@ impl ConsensusSessionStore {
                 _ => consensus_unavailable(),
             })?;
         drop(admission);
-        self.require_fenced_transition_capability_before(deadline)
-            .await?;
-        self.logical_read_time_before(Some(scope.consensus_identity()), deadline)
-            .await?;
+        // Exact receipt resolution is a read-only, leader-linearized
+        // operation.  It must not create `AdvanceLogicalTime` traffic or
+        // repeat an activation capability proof: either can consume the
+        // retained recovery budget and turn a durable receipt into a
+        // transport-looking ambiguity.  The post-barrier exact-scope
+        // admission and final application-authority check below still fence
+        // topology hand-off in flight.
+        self.linearizable_barrier_before(deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
         // Retain the exact-scope gate through the final authority check so a
         // topology writer cannot roll authority between the durable status
         // lookup and the successful consumer response.

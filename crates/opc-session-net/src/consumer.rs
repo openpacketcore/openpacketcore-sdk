@@ -699,7 +699,11 @@ impl PersistentSessionConsumerConfig {
     pub const fn setup_timeout(&self) -> Duration {
         self.setup_timeout
     }
-    /// Return the maximum safe pre-write attempt count.
+    /// Return the bounded attempt count for persistent calls.
+    ///
+    /// Mutations use it only for safe pre-write connection retries.  A
+    /// retained read-only fenced-transition receipt lookup may also consume
+    /// this bound after a lost response; it never resubmits a mutation.
     pub const fn connect_attempts(&self) -> usize {
         self.connect_attempts
     }
@@ -7113,6 +7117,34 @@ impl PersistentSessionConsumerClient {
             .ok_or(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Deadline,
             ))?;
+        self.execute_classified_before(request, deadline, self.pool.config.connect_attempts)
+            .await
+    }
+
+    /// Execute an exact request inside a caller-owned fixed operation budget.
+    ///
+    /// This is intentionally separate from [`Self::execute_classified`] so a
+    /// retained receipt lookup can reconnect after a post-write response loss
+    /// without starting another operation timeout.  Mutating calls invoke it
+    /// once and keep their internal retries pre-write-only; only the outer
+    /// read-only receipt-status helper re-enters it after ambiguity.
+    async fn execute_classified_before(
+        &self,
+        request: &SessionConsumerRequest,
+        deadline: tokio::time::Instant,
+        connect_attempts: usize,
+    ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        // A retained status lookup has one immutable operation deadline, but
+        // each bounded transport attempt must enter the pool at its own
+        // instant.  Reusing the original start here would make a response
+        // loss older than `pool_wait_timeout` fail locally as overloaded
+        // before its safe read-only reconnect can even acquire a lane.
+        let started = tokio::time::Instant::now();
+        if started >= deadline {
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Deadline,
+            ));
+        }
         if request.scope() != self.pool.client.scope {
             self.pool
                 .record_error(SessionConsumerClientError::Scope, false, false);
@@ -7158,7 +7190,13 @@ impl PersistentSessionConsumerClient {
             }
         };
         let result = self
-            .execute_admitted(request, started, deadline, &write_progress)
+            .execute_admitted(
+                request,
+                started,
+                deadline,
+                &write_progress,
+                connect_attempts,
+            )
             .await;
         outcome.complete();
         match result {
@@ -7192,6 +7230,83 @@ impl PersistentSessionConsumerClient {
                     consumer_operation_is_effectful(request.operation()),
                 );
                 Err(error)
+            }
+        }
+    }
+
+    /// Reconnect an exact, read-only fenced-transition receipt lookup after a
+    /// post-write transport loss.  Every attempt carries the same consumer
+    /// request ID and immutable transition body, and all attempts share one
+    /// original deadline.  A mutation is never retried here.
+    async fn execute_fenced_transition_status(
+        &self,
+        request: SessionConsumerRequest,
+    ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        if !matches!(
+            request.operation(),
+            SessionConsumerOperation::FencedTransitionStatus { .. }
+        ) {
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Protocol,
+            ));
+        }
+        let started = tokio::time::Instant::now();
+        let deadline = started
+            .checked_add(effective_consumer_operation_timeout(
+                self.pool.client.operation_timeout,
+            ))
+            .ok_or(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Deadline,
+            ))?;
+        let mut attempts = 0_usize;
+        loop {
+            attempts = attempts.saturating_add(1);
+            match self
+                // The outer recovery loop owns the complete attempt budget.
+                // Giving each inner call one transport attempt prevents a
+                // post-write retry from multiplying the configured bound via
+                // nested pre-write reconnect loops.
+                .execute_classified_before(&request, deadline, 1)
+                .await
+            {
+                Err(
+                    error @ (SessionConsumerCallError::BeforeCallWrite(
+                        SessionConsumerClientError::Unavailable
+                        | SessionConsumerClientError::Deadline,
+                    )
+                    | SessionConsumerCallError::MayHaveSent(
+                        SessionConsumerClientError::Unavailable
+                        | SessionConsumerClientError::Deadline,
+                    )),
+                ) if attempts < self.pool.config.connect_attempts
+                    && tokio::time::Instant::now() < deadline =>
+                {
+                    // Reuse the pool's existing bounded reconnect policy; do
+                    // not create a second timeout or a special recovery
+                    // budget for receipt status.
+                    let delay = self.pool.reconnect_delay();
+                    if !delay.is_zero() {
+                        let mut shutdown = self.pool.shutdown_tx.subscribe();
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_forced_shutdown(
+                                &mut shutdown,
+                                &self.pool.shutdown_phase,
+                            ) => {
+                                return Err(SessionConsumerCallError::BeforeCallWrite(
+                                    SessionConsumerClientError::ShuttingDown,
+                                ));
+                            }
+                            _ = tokio::time::sleep_until(
+                                (tokio::time::Instant::now() + delay).min(deadline),
+                            ) => {}
+                        }
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                }
+                result => return result,
             }
         }
     }
@@ -7331,7 +7446,7 @@ impl PersistentSessionConsumerClient {
     ) -> Result<SessionConsumerFencedTransitionStatus, StoreError> {
         let request_id = consumer_fenced_transition_request_id(request);
         match self
-            .execute_read(self.request(
+            .execute_fenced_transition_status(self.request(
                 request_id,
                 SessionConsumerOperation::FencedTransitionStatus {
                     request: Box::new(request.clone()),
@@ -7670,6 +7785,7 @@ impl PersistentSessionConsumerClient {
         started: tokio::time::Instant,
         deadline: tokio::time::Instant,
         write_progress: &FrameWriteProgress,
+        connect_attempts: usize,
     ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
         let (pre_request_deadline, pre_request_budget_active) =
             self.pool.client.pre_request_deadline(started, deadline);
@@ -7698,7 +7814,7 @@ impl PersistentSessionConsumerClient {
             let connection = match connection {
                 Ok(connection) => connection,
                 Err(error)
-                    if attempt < self.pool.config.connect_attempts
+                    if attempt < connect_attempts
                         && matches!(
                             error,
                             SessionConsumerClientError::Unavailable
@@ -7762,7 +7878,7 @@ impl PersistentSessionConsumerClient {
                     return Ok(response);
                 }
                 Err(SessionConsumerCallError::BeforeCallWrite(error))
-                    if attempt < self.pool.config.connect_attempts
+                    if attempt < connect_attempts
                         && matches!(
                             error,
                             SessionConsumerClientError::Unavailable

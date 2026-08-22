@@ -1,5 +1,6 @@
 //! Contract tests for the production stateless quorum-consumer boundary.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -9,7 +10,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
-use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
+use futures_util::StreamExt;
+use opc_consensus::{
+    decode_bounded, derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch,
+    ConsensusIdentity, DURABLE_CONSENSUS_TIMING_PROFILE,
+};
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_key::{
     KeyHandle, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider, Zeroizing,
@@ -17,10 +22,13 @@ use opc_key::{
 };
 use opc_session_net::{
     conservative_payload_budget, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-    RemoteAddrResolver, SessionConsumerAuthorizer, SessionConsumerClientError,
-    SessionConsumerFencedTransitionBackend, SessionConsumerLeaseMutationError,
-    SessionConsumerMutationError, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
-    MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
+    RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId,
+    SessionConfigurationGeneration, SessionConsensusServer, SessionConsensusServerHandle,
+    SessionConsumerAuthorizer, SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
+    SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionQuorumConsumerServer,
+    SessionReauthenticationControl, SessionReplicationManifest, StatelessSessionConsumerClient,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT, MAX_NEGOTIATED_FRAME_SIZE,
+    SESSION_QUORUM_CONSUMER_ALPN,
 };
 use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, ConsensusSessionStore,
@@ -28,9 +36,11 @@ use opc_session_store::{
     FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
     FencedTransitionRequestId, FencedTransitionStatus, Generation, OwnerId,
     PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
-    PreparedFencedTransitionLookup, QuorumReplicaDescriptor, RecordExpiryPreflight,
-    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
-    RestoreScanRequest, SessionBackend, SessionConsensusIdentity, SessionConsumerChange,
+    PreparedFencedTransitionLookup, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
+    ReplicaId, ReplicaTlsIdentity, RestoreScanRequest, SessionBackend, SessionConsensusIdentity,
+    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerChange,
     SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
     SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
     SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
@@ -109,6 +119,636 @@ impl TestPki {
             certificates: parse_certs_pem(&self.ca.pem()).expect("test trust bundle"),
         });
         build_identity_state(certificates, private_key, bundles).expect("test identity state")
+    }
+}
+
+const THREE_VOTER_COUNT: usize = 3;
+const THREE_VOTER_READY_TIMEOUT: Duration = Duration::from_secs(20);
+// One split vote can consume an election window; this mirrors the durable
+// profile's recovery qualification bound without changing any production
+// deadline.
+const THREE_VOTER_ELECTION_RECOVERY_TIMEOUT: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE
+        .election_timeout_max_millis
+        .saturating_mul(2)
+        .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis),
+);
+
+/// Keep the consensus transport real while making each authenticated
+/// read-barrier RPC consume a deterministic bounded interval.  A fresh V1
+/// capability proof sends two such probes from the leader.  The test below
+/// therefore distinguishes the one leader-side proof from the former
+/// follower-plus-leader duplicate under the normal operation deadline.
+#[derive(Debug)]
+struct GatedReadBarrierPeer {
+    inner: RemoteSessionConsensusPeer,
+    enabled: Arc<AtomicBool>,
+    delay: Duration,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl SessionConsensusPeer for GatedReadBarrierPeer {
+    fn node_id(&self) -> SessionConsensusNodeId {
+        self.inner.node_id()
+    }
+
+    fn scope_identity(&self) -> Option<ConsensusIdentity> {
+        self.inner.scope_identity()
+    }
+
+    async fn call(
+        &self,
+        request: SessionConsensusWireRequest,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
+        self.record_request(request.family).await;
+        self.inner.call(request).await
+    }
+
+    async fn call_with_timeout(
+        &self,
+        request: SessionConsensusWireRequest,
+        timeout: Duration,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
+        self.record_request(request.family).await;
+        self.inner.call_with_timeout(request, timeout).await
+    }
+}
+
+impl GatedReadBarrierPeer {
+    async fn record_request(&self, family: opc_session_store::SessionConsensusRpcFamily) {
+        if matches!(
+            family,
+            opc_session_store::SessionConsensusRpcFamily::ReadBarrier
+        ) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+        }
+    }
+}
+
+struct ThreeVoterConsumerFleet {
+    manifest: Arc<SessionReplicationManifest>,
+    pki: Arc<TestPki>,
+    path_enabled: BTreeMap<(usize, usize), Arc<AtomicBool>>,
+    consensus_peers: BTreeMap<(usize, usize), Arc<GatedReadBarrierPeer>>,
+    read_barrier_calls: Arc<AtomicUsize>,
+    reauthentication: Vec<SessionReauthenticationControl>,
+    address_slots: Vec<Arc<RwLock<Option<SocketAddr>>>>,
+    servers: Vec<Option<SessionConsensusServerHandle>>,
+    stores: Vec<ConsensusSessionStore>,
+    _backends: Vec<SqliteSessionBackend>,
+    _directory: tempfile::TempDir,
+}
+
+impl Drop for ThreeVoterConsumerFleet {
+    fn drop(&mut self) {
+        for server in &mut self.servers {
+            if let Some(server) = server.take() {
+                server.abort();
+            }
+        }
+    }
+}
+
+impl ThreeVoterConsumerFleet {
+    async fn start(pki: Arc<TestPki>, read_barrier_delay: Option<Duration>) -> Self {
+        let members = (0..THREE_VOTER_COUNT)
+            .map(three_voter_member)
+            .collect::<Vec<_>>();
+        let manifest = Arc::new(
+            SessionReplicationManifest::try_new_with_epoch(
+                SessionClusterId::new("consumer-three-voter-transition")
+                    .expect("three-voter cluster ID"),
+                SessionConfigurationGeneration::new("consumer-three-voter-v1")
+                    .expect("three-voter configuration generation"),
+                ConsensusConfigurationEpoch::new(1).expect("three-voter epoch"),
+                members.clone(),
+            )
+            .expect("three-voter replication manifest"),
+        );
+        let topologies = (0..THREE_VOTER_COUNT)
+            .map(|index| {
+                ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                    three_voter_replica_id(index),
+                    members.clone(),
+                    manifest.consensus_identity(),
+                ))
+                .expect("validate three-voter topology")
+            })
+            .collect::<Vec<_>>();
+        let directory = tempfile::tempdir().expect("three-voter fleet directory");
+        let backends = (0..THREE_VOTER_COUNT)
+            .map(|index| {
+                SqliteSessionBackend::open(directory.path().join(format!("node-{index}.sqlite")))
+                    .expect("open three-voter SQLite backend")
+            })
+            .collect::<Vec<_>>();
+        let address_slots = (0..THREE_VOTER_COUNT)
+            .map(|_| Arc::new(RwLock::new(None)))
+            .collect::<Vec<_>>();
+        let mut path_enabled = BTreeMap::new();
+        let mut consensus_peers = BTreeMap::new();
+        let read_barrier_calls = Arc::new(AtomicUsize::new(0));
+        let reauthentication = (0..THREE_VOTER_COUNT)
+            .map(|_| SessionReauthenticationControl::new())
+            .collect::<Vec<_>>();
+        let mut stores = Vec::with_capacity(THREE_VOTER_COUNT);
+        for index in 0..THREE_VOTER_COUNT {
+            let local = manifest
+                .bind_local(three_voter_replica_id(index))
+                .expect("three-voter local consensus binding");
+            let peers = (0..THREE_VOTER_COUNT)
+                .filter(|target| *target != index)
+                .map(|target| {
+                    let binding = local
+                        .bind_remote(three_voter_replica_id(target))
+                        .expect("three-voter remote consensus binding");
+                    let enabled = Arc::new(AtomicBool::new(true));
+                    let resolver_slot = Arc::clone(&address_slots[target]);
+                    let resolver_enabled = Arc::clone(&enabled);
+                    let resolver: RemoteAddrResolver = Arc::new(move || {
+                        let resolver_slot = Arc::clone(&resolver_slot);
+                        let resolver_enabled = Arc::clone(&resolver_enabled);
+                        Box::pin(async move {
+                            if !resolver_enabled.load(Ordering::Acquire) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::ConnectionRefused,
+                                    "three-voter consensus path is isolated",
+                                ));
+                            }
+                            resolver_slot
+                                .read()
+                                .map_err(|_| io::Error::other("three-voter address lock poisoned"))?
+                                .as_ref()
+                                .copied()
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::ConnectionRefused,
+                                        "three-voter consensus listener is unavailable",
+                                    )
+                                })
+                        })
+                    });
+                    let node_id = binding.remote_consensus_node_id();
+                    let remote = RemoteSessionConsensusPeer::new_profiled_with_resolver(
+                        binding,
+                        resolver,
+                        pki.client_config(&three_voter_spiffe(index)),
+                    )
+                    .with_reauthentication_control(reauthentication[index].clone());
+                    let peer = Arc::new(GatedReadBarrierPeer {
+                        inner: remote,
+                        enabled: Arc::clone(&enabled),
+                        delay: read_barrier_delay.unwrap_or(Duration::ZERO),
+                        calls: Arc::clone(&read_barrier_calls),
+                    });
+                    path_enabled.insert((index, target), enabled);
+                    consensus_peers.insert((index, target), Arc::clone(&peer));
+                    let peer: Arc<dyn SessionConsensusPeer> = peer;
+                    (node_id, peer)
+                })
+                .collect::<BTreeMap<_, _>>();
+            stores.push(
+                ConsensusSessionStore::open_with_operation_timeout(
+                    topologies[index].clone(),
+                    backends[index].clone(),
+                    directory.path().join(format!("snapshots-{index}")),
+                    peers,
+                    opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+                )
+                .await
+                .expect("open three-voter consensus store"),
+            );
+        }
+        let mut servers = Vec::with_capacity(THREE_VOTER_COUNT);
+        for index in 0..THREE_VOTER_COUNT {
+            let binding = manifest
+                .bind_local(three_voter_replica_id(index))
+                .expect("three-voter consensus server binding");
+            let (server, address) = SessionConsensusServer::new(
+                stores[index].rpc_handler(),
+                pki.server_config(&three_voter_spiffe(index)),
+                binding,
+            )
+            .with_reauthentication_control(reauthentication[index].clone())
+            .listen(
+                "127.0.0.1:0"
+                    .parse()
+                    .expect("three-voter consensus listener"),
+            )
+            .await
+            .expect("start three-voter consensus listener");
+            *address_slots[index]
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(address);
+            servers.push(Some(server));
+        }
+        let fleet = Self {
+            manifest,
+            pki,
+            path_enabled,
+            consensus_peers,
+            read_barrier_calls,
+            reauthentication,
+            address_slots,
+            servers,
+            stores,
+            _backends: backends,
+            _directory: directory,
+        };
+        for result in futures_util::future::join_all(
+            fleet
+                .stores
+                .iter()
+                .map(ConsensusSessionStore::initialize_cluster),
+        )
+        .await
+        {
+            result.expect("initialize three-voter cluster");
+        }
+        fleet.wait_all_ready().await;
+        fleet
+    }
+
+    async fn wait_all_ready(&self) {
+        tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
+            loop {
+                let reports = futures_util::future::join_all(
+                    self.stores
+                        .iter()
+                        .map(ConsensusSessionStore::probe_durable_readiness),
+                )
+                .await;
+                if reports.iter().all(|report| report.is_ready()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("three-voter cluster reaches durable readiness");
+    }
+
+    fn reset_read_barrier_calls(&self) {
+        self.read_barrier_calls.store(0, Ordering::SeqCst);
+    }
+
+    fn read_barrier_calls(&self) -> usize {
+        self.read_barrier_calls.load(Ordering::SeqCst)
+    }
+
+    fn observed_leader(&self) -> (usize, SessionConsensusNodeId, u64) {
+        let statuses = self
+            .stores
+            .iter()
+            .map(ConsensusSessionStore::status)
+            .collect::<Vec<_>>();
+        let leader_id = statuses
+            .first()
+            .and_then(|status| status.leader_id)
+            .expect("three-voter leader");
+        let term = statuses.first().expect("three-voter status").term;
+        assert!(statuses.iter().all(|status| {
+            status.leader_id == Some(leader_id) && status.term == term && status.admitted
+        }));
+        let leader = statuses
+            .iter()
+            .position(|status| status.node_id == leader_id)
+            .expect("leader belongs to fleet");
+        (leader, leader_id, term)
+    }
+
+    async fn isolate(&mut self, node: usize) {
+        for peer in 0..THREE_VOTER_COUNT {
+            if peer != node {
+                self.path_enabled
+                    .get(&(node, peer))
+                    .expect("outbound three-voter consensus path")
+                    .store(false, Ordering::Release);
+                self.path_enabled
+                    .get(&(peer, node))
+                    .expect("inbound three-voter consensus path")
+                    .store(false, Ordering::Release);
+            }
+        }
+        if let Some(server) = self.servers[node].take() {
+            server.abort_and_wait().await;
+        }
+        *self.address_slots[node]
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.reauthentication[node]
+            .request_reauthentication()
+            .expect("retire isolated node consensus lanes");
+    }
+
+    async fn restore(&mut self, node: usize) {
+        let binding = self
+            .manifest
+            .bind_local(three_voter_replica_id(node))
+            .expect("three-voter restored consensus server binding");
+        let (server, address) = SessionConsensusServer::new(
+            self.stores[node].rpc_handler(),
+            self.pki.server_config(&three_voter_spiffe(node)),
+            binding,
+        )
+        .with_reauthentication_control(self.reauthentication[node].clone())
+        .listen(
+            "127.0.0.1:0"
+                .parse()
+                .expect("three-voter restored consensus listener"),
+        )
+        .await
+        .expect("restore three-voter consensus listener");
+        *self.address_slots[node]
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(address);
+        self.servers[node] = Some(server);
+        for peer in 0..THREE_VOTER_COUNT {
+            if peer != node {
+                self.path_enabled
+                    .get(&(node, peer))
+                    .expect("restored outbound three-voter consensus path")
+                    .store(true, Ordering::Release);
+                self.path_enabled
+                    .get(&(peer, node))
+                    .expect("restored inbound three-voter consensus path")
+                    .store(true, Ordering::Release);
+            }
+        }
+    }
+
+    async fn wait_for_new_leader(
+        &self,
+        excluded: usize,
+        previous: SessionConsensusNodeId,
+        previous_term: u64,
+        deadline: tokio::time::Instant,
+    ) -> usize {
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                let survivors = (0..THREE_VOTER_COUNT)
+                    .filter(|index| *index != excluded)
+                    .collect::<Vec<_>>();
+                let statuses = survivors
+                    .iter()
+                    .map(|index| self.stores[*index].status())
+                    .collect::<Vec<_>>();
+                if let Some(leader) = statuses.first().and_then(|status| status.leader_id) {
+                    let term = statuses.first().expect("survivor status").term;
+                    if leader != previous
+                        && term > previous_term
+                        && statuses.iter().all(|status| {
+                            status.leader_id == Some(leader)
+                                && status.term == term
+                                && status.admitted
+                        })
+                    {
+                        return survivors
+                            .into_iter()
+                            .find(|index| self.stores[*index].status().node_id == leader)
+                            .expect("new leader is a survivor");
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("survivors elect a new leader")
+    }
+
+    async fn wait_for_split_vote(
+        &self,
+        excluded: usize,
+        previous_term: u64,
+        deadline: tokio::time::Instant,
+    ) -> u64 {
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                let statuses = (0..THREE_VOTER_COUNT)
+                    .filter(|index| *index != excluded)
+                    .map(|index| self.stores[index].status())
+                    .collect::<Vec<_>>();
+                let term = statuses.first().expect("surviving voter").term;
+                if term > previous_term
+                    && statuses
+                        .iter()
+                        .all(|status| status.term == term && status.leader_id.is_none())
+                {
+                    return term;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("survivors expose the expected split vote")
+    }
+
+    /// Break the test-runtime's observed same-tick split with one valid,
+    /// authenticated Raft Vote request over the production mTLS transport.
+    /// The target persists its ordinary OpenRaft vote, staggering one real
+    /// voter; either survivor must subsequently establish the later normal
+    /// quorum election before this test proceeds.  This never invokes the
+    /// state machine or fabricates an engine response.
+    async fn pregrant_successor_after_split(
+        &self,
+        successor: usize,
+        voter: usize,
+        previous_term: u64,
+        previous_leader: SessionConsensusNodeId,
+        split_term: u64,
+        deadline: tokio::time::Instant,
+    ) {
+        let successor_status = self.stores[successor].status();
+        let voter_status = self.stores[voter].status();
+        let last_log_index = successor_status
+            .last_log_index
+            .expect("successor has committed transition before tie-break");
+        assert_eq!(
+            Some(last_log_index),
+            voter_status.last_log_index,
+            "both surviving voters retain the exact committed log before the tie-break"
+        );
+        assert_eq!(
+            Some(last_log_index),
+            successor_status.applied_index,
+            "the successor has applied the exact advertised log before the tie-break"
+        );
+        assert_eq!(
+            Some(last_log_index),
+            voter_status.applied_index,
+            "the voter has applied the exact advertised log before the tie-break"
+        );
+        let peer = Arc::clone(
+            self.consensus_peers
+                .get(&(successor, voter))
+                .expect("selected successor has the installed mTLS peer"),
+        );
+        let next_term = split_term
+            .checked_add(1)
+            .expect("bounded test election term");
+        let vote = opc_consensus::engine::Vote::new(next_term, successor_status.node_id);
+        let request = opc_consensus::engine::raft::VoteRequest::new(
+            vote,
+            Some(opc_consensus::engine::LogId::new(
+                opc_consensus::engine::CommittedLeaderId::new(previous_term, previous_leader),
+                last_log_index,
+            )),
+        );
+        let wire = SessionConsensusWireRequest::try_new(
+            self.manifest.consensus_identity(),
+            successor_status.node_id,
+            opc_session_store::SessionConsensusRpcFamily::Vote,
+            opc_consensus::encode_bounded(&request).expect("bounded election vote request"),
+        )
+        .expect("scoped election vote request");
+        let payload = peer
+            .call_with_timeout(
+                wire,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("tie-break vote reaches surviving mTLS voter")
+            .result
+            .expect("surviving voter accepts authenticated vote envelope");
+        let response = decode_bounded::<
+            Result<
+                opc_consensus::engine::raft::VoteResponse<SessionConsensusNodeId>,
+                opc_consensus::engine::error::RaftError<SessionConsensusNodeId>,
+            >,
+        >(&payload)
+        .expect("decode tie-break vote response")
+        .expect("OpenRaft processes tie-break vote");
+        assert!(
+            response.vote_granted && response.vote == vote,
+            "the target durably pre-grants only the selected successor's next normal campaign"
+        );
+    }
+}
+
+fn three_voter_replica_id(index: usize) -> ReplicaId {
+    ReplicaId::new(format!("consumer-three-voter-{index}")).expect("three-voter replica ID")
+}
+
+fn three_voter_member(index: usize) -> QuorumReplicaDescriptor {
+    QuorumReplicaDescriptor::new(
+        three_voter_replica_id(index),
+        ReplicaEndpoint::new(format!("consumer-three-voter-{index}.test.invalid"), 7443)
+            .expect("three-voter replica endpoint"),
+        ReplicaTlsIdentity::new(three_voter_spiffe(index))
+            .expect("three-voter replica TLS identity"),
+        ReplicaFailureDomain::new(format!("consumer-three-voter-zone-{index}"))
+            .expect("three-voter failure domain"),
+        ReplicaBackingIdentity::new(format!("consumer-three-voter-disk-{index}"))
+            .expect("three-voter backing identity"),
+    )
+}
+
+fn three_voter_spiffe(index: usize) -> String {
+    format!("spiffe://test.example/tenant/test/ns/default/sa/session/nf/consensus/instance/{index}")
+}
+
+/// A real consumer listener wrapper that commits the inner operation then
+/// withholds exactly one response until the test tears down its connection.
+/// It never manufactures an outcome response or invokes a mutation twice.
+struct CommitThenLoseConsumerResponse {
+    inner: Arc<dyn SessionQuorumConsumer>,
+    lose_transition: AtomicBool,
+    lose_status: AtomicBool,
+    transition_committed: tokio::sync::Notify,
+    status_resolved: tokio::sync::Notify,
+    transition_calls: AtomicUsize,
+    status_calls: AtomicUsize,
+}
+
+impl CommitThenLoseConsumerResponse {
+    fn transition(inner: Arc<dyn SessionQuorumConsumer>) -> Self {
+        Self {
+            inner,
+            lose_transition: AtomicBool::new(true),
+            lose_status: AtomicBool::new(false),
+            transition_committed: tokio::sync::Notify::new(),
+            status_resolved: tokio::sync::Notify::new(),
+            transition_calls: AtomicUsize::new(0),
+            status_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn status(inner: Arc<dyn SessionQuorumConsumer>) -> Self {
+        Self {
+            inner,
+            lose_transition: AtomicBool::new(false),
+            lose_status: AtomicBool::new(true),
+            transition_committed: tokio::sync::Notify::new(),
+            status_resolved: tokio::sync::Notify::new(),
+            transition_calls: AtomicUsize::new(0),
+            status_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionQuorumConsumer for CommitThenLoseConsumerResponse {
+    async fn execute(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: SessionConsumerRequest,
+    ) -> SessionConsumerResponse {
+        let transition = matches!(
+            request.operation(),
+            SessionConsumerOperation::FencedTransition { .. }
+        );
+        let status = matches!(
+            request.operation(),
+            SessionConsumerOperation::FencedTransitionStatus { .. }
+        );
+        let response = self.inner.execute(identity, request).await;
+        if transition {
+            self.transition_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(response, SessionConsumerResponse::FencedTransition(Ok(_)))
+                && self
+                    .lose_transition
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                self.transition_committed.notify_waiters();
+                std::future::pending().await
+            }
+        }
+        if status {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(
+                response,
+                SessionConsumerResponse::FencedTransitionStatus(Ok(_))
+            ) && self
+                .lose_status
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                self.status_resolved.notify_waiters();
+                std::future::pending().await
+            }
+        }
+        response
+    }
+
+    async fn watch(
+        &self,
+        identity: &SessionConsumerIdentity,
+        scope: SessionConsumerScope,
+        start_sequence: u64,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+        SessionConsumerRejection,
+    > {
+        self.inner.watch(identity, scope, start_sequence).await
     }
 }
 
@@ -1773,6 +2413,482 @@ async fn stateless_and_persistent_consumers_accept_shorter_and_zero_ttl_renewals
 
     persistent.shutdown().await;
     handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn persistent_three_voter_first_transition_has_one_leader_activation_proof() {
+    // Two leader probes are delayed together for four seconds.  That leaves
+    // the normal ten-second operation deadline ample room for the one
+    // authoritative leader proof.  Before the regression fix, the follower
+    // spent eight seconds on a discarded local barrier+unanimity proof and
+    // the same operation then timed out before the leader's activation proof.
+    let pki = Arc::new(TestPki::new());
+    let fleet =
+        ThreeVoterConsumerFleet::start(Arc::clone(&pki), Some(Duration::from_secs(4))).await;
+    let (leader, _, _) = fleet.observed_leader();
+    let follower = (leader + 1) % THREE_VOTER_COUNT;
+    let server_spiffe = spiffe("three-voter-first-proof-server");
+    let client_spiffe = spiffe("three-voter-first-proof-client");
+    let manifest = fleet.stores[follower]
+        .consumer_authorization_manifest()
+        .await
+        .expect("first-proof consumer manifest");
+    let scope = manifest.scope();
+    let authorizer = SessionConsumerAuthorizer::try_new(
+        manifest,
+        [SpiffeId::new(&client_spiffe).expect("first-proof client SPIFFE")],
+    )
+    .expect("first-proof consumer authorizer");
+    let (server, address) = SessionQuorumConsumerServer::new(
+        Arc::new(fleet.stores[follower].consumer_service()),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("first-proof listener"),
+    )
+    .await
+    .expect("start first-proof listener");
+    let persistent = PersistentSessionConsumerClient::try_from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            Arc::new(move || Box::pin(async move { Ok(address) })),
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            SpiffeId::new(&server_spiffe).expect("first-proof server SPIFFE"),
+            scope,
+            pki.client_config(&client_spiffe),
+        ),
+        PersistentSessionConsumerConfig::default(),
+    )
+    .expect("persistent first-proof client");
+    let request = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0xa4; 16]),
+        FencedTransitionLease::acquire(
+            test_key(),
+            OwnerId::new("x").expect("first-proof owner"),
+            FenceToken::new(0),
+            Duration::from_secs(30),
+        )
+        .expect("first-proof lease"),
+        // A physical delete is valid without a payload envelope.  Its absent
+        // generation records a deterministic no-effect receipt, which keeps
+        // this focused proof regression independent from the protected-token
+        // path covered by the response-loss test below.
+        FencedTransitionMutation::delete(Generation::new(1)),
+    )
+    .expect("first-proof physical transition");
+    let before = fleet.stores[follower]
+        .max_replication_sequence()
+        .await
+        .expect("application sequence before first transition");
+    fleet.reset_read_barrier_calls();
+
+    let outcome = persistent
+        .fenced_transition(&request)
+        .await
+        .expect_err("absent delete returns its committed deterministic result");
+    assert!(matches!(
+        outcome,
+        opc_session_net::SessionConsumerFencedTransitionMutationError::Store(_)
+    ));
+    assert_eq!(
+        2,
+        fleet.read_barrier_calls(),
+        "only the elected leader sends the two fresh unanimous activation probes"
+    );
+    let status = persistent
+        .fenced_transition_status(&request)
+        .await
+        .expect("first transition has one durable receipt");
+    assert!(matches!(
+        status,
+        opc_session_store::SessionConsumerFencedTransitionStatus::Recorded(ref result)
+            if result.as_ref().is_err()
+    ));
+    assert_eq!(
+        before,
+        fleet.stores[leader]
+            .max_replication_sequence()
+            .await
+            .expect("application sequence after first transition"),
+        "the committed no-effect receipt, its activation proof, and its lookup do not fabricate a user mutation"
+    );
+    persistent.shutdown().await;
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction() {
+    const SNAPSHOT_COMMANDS: usize = 4_300;
+    let pki = Arc::new(TestPki::new());
+    let mut fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
+    let (old_leader, old_leader_id, old_term) = fleet.observed_leader();
+    let initial_follower = (old_leader + 1) % THREE_VOTER_COUNT;
+    let tie_break_voter = (0..THREE_VOTER_COUNT)
+        .find(|index| *index != old_leader && *index != initial_follower)
+        .expect("three-voter tie-break voter");
+    assert_ne!(initial_follower, old_leader, "execute starts on a follower");
+
+    let server_spiffe = spiffe("three-voter-server");
+    let client_spiffe = spiffe("three-voter-client");
+    let manifest = fleet.stores[initial_follower]
+        .consumer_authorization_manifest()
+        .await
+        .expect("three-voter consumer manifest");
+    let scope = manifest.scope();
+    let authorizer = SessionConsumerAuthorizer::try_new(
+        manifest,
+        [SpiffeId::new(&client_spiffe).expect("three-voter client SPIFFE")],
+    )
+    .expect("three-voter consumer authorizer");
+    let transition_loss = Arc::new(CommitThenLoseConsumerResponse::transition(Arc::new(
+        fleet.stores[initial_follower].consumer_service(),
+    )));
+    let (transition_server, transition_address) = SessionQuorumConsumerServer::new(
+        transition_loss.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer.clone(),
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("transition listener"),
+    )
+    .await
+    .expect("start transition response-loss listener");
+    let mut recovery_servers = Vec::with_capacity(THREE_VOTER_COUNT);
+    let mut recovery_addresses = Vec::with_capacity(THREE_VOTER_COUNT);
+    for index in 0..THREE_VOTER_COUNT {
+        let (server, address) = SessionQuorumConsumerServer::new(
+            Arc::new(fleet.stores[index].consumer_service()),
+            pki.server_config(&server_spiffe),
+            authorizer.clone(),
+        )
+        .listen(
+            "127.0.0.1:0"
+                .parse::<SocketAddr>()
+                .expect("recovery listener"),
+        )
+        .await
+        .expect("start recovery listener");
+        recovery_servers.push(server);
+        recovery_addresses.push(address);
+    }
+
+    let resolved_address = Arc::new(RwLock::new(transition_address));
+    let resolver_address = Arc::clone(&resolved_address);
+    let resolver: RemoteAddrResolver = Arc::new(move || {
+        let address = *resolver_address
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Box::pin(async move { Ok(address) })
+    });
+    let persistent = PersistentSessionConsumerClient::try_from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            resolver,
+            rustls_pki_types::ServerName::IpAddress(transition_address.ip().into()),
+            SpiffeId::new(&server_spiffe).expect("three-voter server SPIFFE"),
+            scope,
+            pki.client_config(&client_spiffe),
+        ),
+        PersistentSessionConsumerConfig::default(),
+    )
+    .expect("persistent three-voter consumer");
+    let journal_directory = tempfile::tempdir().expect("three-voter prepared journal directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(
+            journal_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make three-voter prepared journal directory private");
+    }
+    let journal = Arc::new(
+        PreparedFencedTransitionJournal::create_new(
+            journal_directory.path().join("prepared.sqlite"),
+            PreparedFencedTransitionJournalKey::from_bytes([0x3a; 32]),
+        )
+        .expect("create three-voter prepared journal"),
+    );
+    let provider = CountingKeyProvider::with_active_session_key();
+    let physical = Arc::new(
+        SessionConsumerFencedTransitionBackend::persistent(persistent.clone())
+            .expect("persistent physical fenced-transition backend"),
+    );
+    let outer: Arc<dyn SessionBackend> = Arc::new(
+        EncryptingSessionBackend::new(
+            Arc::clone(&physical),
+            Arc::clone(&provider),
+            "consumer-three-voter-protected",
+        )
+        .with_fenced_transition_journal(journal),
+    );
+    let logical_request = fenced_create_request(0xa1);
+    let prepared = outer
+        .prepare_fenced_transition(logical_request.clone())
+        .await
+        .expect("prepare one retained protected token");
+    let request_id = prepared.request_id();
+    let expected_token = Zeroizing::new(prepared.as_bytes().to_vec());
+    assert_eq!(
+        1,
+        provider.calls(),
+        "the caller prepares one exact protected token before dispatch"
+    );
+    let before = fleet.stores[initial_follower]
+        .max_replication_sequence()
+        .await
+        .expect("application sequence before transition");
+
+    let transition_committed = transition_loss.transition_committed.notified();
+    tokio::pin!(transition_committed);
+    transition_committed.as_mut().enable();
+    let execute_outer = Arc::clone(&outer);
+    let execute_token = prepared.clone();
+    let execute =
+        tokio::spawn(async move { execute_outer.fenced_transition(&execute_token).await });
+    if tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, &mut transition_committed)
+        .await
+        .is_err()
+    {
+        transition_server.abort_and_wait().await;
+        match execute.await.expect("execute task joins") {
+            Err(error) => panic!("follower did not reach durable transition commit: {error}"),
+            Ok(_) => panic!("follower returned before response loss"),
+        }
+    }
+    assert_eq!(
+        1,
+        transition_loss.transition_calls.load(Ordering::SeqCst),
+        "one physical consumer mutation reached the follower route"
+    );
+    fleet.wait_all_ready().await;
+    assert_eq!(
+        (old_leader, old_leader_id, old_term),
+        fleet.observed_leader(),
+        "every voter still reports the original leader and term immediately before isolation"
+    );
+    fleet.isolate(old_leader).await;
+    let election_deadline = tokio::time::Instant::now() + THREE_VOTER_ELECTION_RECOVERY_TIMEOUT;
+    let split_term = fleet
+        .wait_for_split_vote(old_leader, old_term, election_deadline)
+        .await;
+    assert_eq!(
+        old_term + 1,
+        split_term,
+        "the tie-break runs only after the observed first normal split vote"
+    );
+    fleet
+        .pregrant_successor_after_split(
+            initial_follower,
+            tie_break_voter,
+            old_term,
+            old_leader_id,
+            split_term,
+            election_deadline,
+        )
+        .await;
+    let new_leader = fleet
+        .wait_for_new_leader(old_leader, old_leader_id, old_term, election_deadline)
+        .await;
+    assert_ne!(new_leader, old_leader, "leader changes after commit");
+    assert!(
+        fleet.stores[new_leader].status().term > split_term,
+        "the authenticated pre-grant does not itself establish the final leader"
+    );
+    let status_target = (0..THREE_VOTER_COUNT)
+        .find(|index| *index != old_leader && *index != new_leader)
+        .expect("live follower status target after leader change");
+    assert_ne!(
+        status_target, new_leader,
+        "status response loss targets a live follower"
+    );
+    let status_loss = Arc::new(CommitThenLoseConsumerResponse::status(Arc::new(
+        fleet.stores[status_target].consumer_service(),
+    )));
+    let (status_server, status_address) = SessionQuorumConsumerServer::new(
+        status_loss.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer.clone(),
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("status listener"),
+    )
+    .await
+    .expect("start follower status response-loss listener");
+    *resolved_address
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = status_address;
+    transition_server.abort_and_wait().await;
+    assert!(matches!(
+        execute.await.expect("execute task joins"),
+        Err(FencedTransitionExecuteError::OutcomeUnknown {
+            request_id: returned_request_id
+        }) if returned_request_id == request_id
+    ));
+
+    let status_resolved = status_loss.status_resolved.notified();
+    tokio::pin!(status_resolved);
+    status_resolved.as_mut().enable();
+    let status_outer = Arc::clone(&outer);
+    let status_token = prepared.clone();
+    let recover =
+        tokio::spawn(async move { status_outer.fenced_transition_status(&status_token).await });
+    tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, &mut status_resolved)
+        .await
+        .expect("status target resolves durable receipt before response loss");
+    assert_eq!(
+        1,
+        status_loss.status_calls.load(Ordering::SeqCst),
+        "the first status request performed a real durable lookup"
+    );
+    tokio::time::sleep(
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT + Duration::from_millis(50),
+    )
+    .await;
+    *resolved_address
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = recovery_addresses[new_leader];
+    status_server.abort_and_wait().await;
+    let recorded = recover
+        .await
+        .expect("status task joins")
+        .expect("persistent retry resolves exact durable receipt");
+    assert!(matches!(
+        recorded,
+        FencedTransitionStatus::Recorded(ref result) if result.as_ref().is_ok()
+    ));
+    assert!(
+        persistent.diagnostics().await.reconnects >= 2,
+        "both response losses retire their persistent lanes before exact status recovery"
+    );
+
+    let transition_log_index = fleet.stores[new_leader]
+        .status()
+        .last_log_index
+        .expect("committed transition log index");
+    tokio::time::timeout(Duration::from_secs(5 * 60), async {
+        futures_util::stream::iter(0..SNAPSHOT_COMMANDS)
+            .map(|_| fleet.stores[new_leader].max_replication_sequence())
+            .buffer_unordered(16)
+            .for_each(|result| async {
+                result.expect("commit logical-time entry for snapshot qualification");
+            })
+            .await;
+    })
+    .await
+    .expect("snapshot qualification command batch completes");
+    tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
+        loop {
+            let progress = fleet.stores[new_leader]
+                .probe_durable_readiness()
+                .await
+                .recovery_progress();
+            if progress
+                .snapshot_index()
+                .is_some_and(|index| index >= transition_log_index)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("committed transition is compacted into a snapshot");
+    let after_compaction = outer
+        .fenced_transition_status(&prepared)
+        .await
+        .expect("receipt lookup after snapshot compaction");
+    assert_eq!(
+        recorded, after_compaction,
+        "response loss, reconnect, follower route, leader change, and compaction return one exact receipt"
+    );
+
+    let wrong_token_request = FencedTransitionRequest::new(
+        request_id,
+        FencedTransitionLease::acquire(
+            test_key(),
+            OwnerId::new("x").expect("test owner"),
+            FenceToken::new(1),
+            Duration::from_secs(30),
+        )
+        .expect("wrong-token lease"),
+        FencedTransitionMutation::delete(Generation::new(1)),
+    )
+    .expect("wrong-token request remains structurally valid");
+    let wrong_token = physical
+        .prepare_fenced_transition(wrong_token_request)
+        .await
+        .expect("prepare conflicting physical token");
+    assert!(matches!(
+        physical.fenced_transition_status(&wrong_token).await,
+        Ok(FencedTransitionStatus::RequestConflict)
+    ));
+    let wrong_id = outer
+        .prepare_fenced_transition(
+            FencedTransitionRequest::new(
+                FencedTransitionRequestId::from_bytes([0x72; 16]),
+                logical_request.lease().clone(),
+                logical_request.mutation().clone(),
+            )
+            .expect("wrong-ID request remains structurally valid"),
+        )
+        .await
+        .expect("prepare wrong-ID protected token");
+    assert!(matches!(
+        outer.fenced_transition_status(&wrong_id).await,
+        Ok(FencedTransitionStatus::NotFound)
+    ));
+    assert_eq!(
+        expected_token.as_slice(),
+        prepared.as_bytes(),
+        "execute and every status lookup retain the caller's one exact token"
+    );
+    assert_eq!(
+        2,
+        provider.calls(),
+        "status-only recovery never invokes the provider or reseals the committed token"
+    );
+    assert_eq!(
+        before + 1,
+        fleet.stores[new_leader]
+            .max_replication_sequence()
+            .await
+            .expect("application sequence after all status reads"),
+        "receipt recovery and all negative lookups add no application mutation or replay"
+    );
+    fleet.restore(old_leader).await;
+    fleet.wait_all_ready().await;
+    for (index, recovery_address) in recovery_addresses.iter().copied().enumerate() {
+        *resolved_address
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = recovery_address;
+        let before_route = persistent.diagnostics().await;
+        persistent
+            .request_reauthentication()
+            .expect("retire the prior idle lane before routing to each voter");
+        assert_eq!(
+            recorded,
+            outer
+                .fenced_transition_status(&prepared)
+                .await
+                .expect("each restored voter returns the exact protected receipt"),
+            "voter {index} returns the globally durable receipt without resubmit"
+        );
+        assert!(
+            persistent.diagnostics().await.resolve_attempts > before_route.resolve_attempts,
+            "voter {index} uses a fresh persistent mTLS connection after its resolver target changes"
+        );
+    }
+    persistent.shutdown().await;
+    for server in recovery_servers {
+        server.abort_and_wait().await;
+    }
 }
 
 #[tokio::test]
