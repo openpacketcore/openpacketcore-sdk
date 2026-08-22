@@ -7,11 +7,13 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use opc_session_store::fenced_mutation_roster::FencedMutationRosterOrdinal;
 use opc_session_store::{
     derive_fenced_mutation_roster_scope, FencedMutationRosterAdmission, ManagedProviderJobError,
@@ -50,7 +52,7 @@ pub const MAX_MANAGED_PROVIDER_POOL_LANES: usize = 16;
 /// Aggregate queued plus in-flight work bound.
 pub const MANAGED_PROVIDER_POOL_QUEUE_CAPACITY: usize = 1024;
 /// Maximum retained encoded request bytes across the pool.
-pub const DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES: usize = 8_587_781;
+pub const DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES: usize = 8_588_477;
 /// Maximum bounded public response bytes.
 pub const DEFAULT_MANAGED_PROVIDER_POOL_RESPONSE_BYTES: usize = 1024;
 /// No managed-provider listener may allocate more permits than Tokio accepts.
@@ -62,7 +64,7 @@ pub const MAX_MANAGED_PROVIDER_SERVER_CONNECTIONS: usize = Semaphore::MAX_PERMIT
 // closed-envelope byte. The maximum-legal-frame test derives this value from
 // those source profile maxima. Peers prove it in Hello instead of silently
 // accepting a caller-selected frame size.
-pub const MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES: usize = 8_587_781;
+pub const MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES: usize = 8_588_477;
 /// Fixed public result profile; status and every typed domain error fit here.
 pub const MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES: usize = 1024;
 /// One absolute setup budget spans resolver, TCP, TLS, Hello, and HelloAck.
@@ -416,7 +418,7 @@ struct Pool {
     pending: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     cells: Arc<Semaphore>,
-    counters: Counters,
+    counters: Arc<Counters>,
     scheduler: StdMutex<Option<mpsc::Sender<Command>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     shutdown_started: AtomicBool,
@@ -452,7 +454,7 @@ impl PersistentManagedProviderJobClient {
                 pending: Arc::new(Semaphore::new(config.queued_and_inflight)),
                 bytes: Arc::new(Semaphore::new(config.request_bytes)),
                 cells: Arc::new(Semaphore::new(config.queued_and_inflight)),
-                counters: Counters::default(),
+                counters: Arc::new(Counters::default()),
                 scheduler: StdMutex::new(None),
                 tasks: Mutex::new(Vec::new()),
                 shutdown_started: AtomicBool::new(false),
@@ -546,6 +548,12 @@ impl PersistentManagedProviderJobClient {
         if !operation_matches_authority(&operation, &self.pool.authority) {
             return Err(ManagedProviderClientError::Protocol);
         }
+        // Callers can construct the public DTO without transport constructors;
+        // reject malformed or oversized nested values before allocating a
+        // frame, acquiring queue permits, or writing any network byte.
+        if !wire_operation_is_valid(&operation) {
+            return Err(ManagedProviderClientError::Protocol);
+        }
         let pending = Arc::clone(&self.pool.pending)
             .try_acquire_owned()
             .map_err(|_| {
@@ -579,7 +587,8 @@ impl PersistentManagedProviderJobClient {
             frame_bytes,
             deadline: tokio::time::Instant::now() + self.pool.config.queue_deadline,
             inflight: false,
-            reply: reply_tx,
+            counters: Arc::clone(&self.pool.counters),
+            reply: Some(reply_tx),
             _pending: pending,
             _bytes: bytes,
             _cell: cells,
@@ -593,7 +602,6 @@ impl PersistentManagedProviderJobClient {
             .clone()
             .ok_or(ManagedProviderClientError::Unavailable)?;
         if tx.try_send(Command::Submit(Box::new(job))).is_err() {
-            self.pool.release_enqueue(frame_bytes);
             self.pool.counters.overload.fetch_add(1, Ordering::Relaxed);
             return Err(ManagedProviderClientError::Overloaded);
         }
@@ -720,24 +728,10 @@ impl Pool {
         let r = self.counters.response_cells.fetch_add(1, Ordering::Relaxed) + 1;
         high(&self.counters.response_high_water, r);
     }
-    fn release_enqueue(&self, bytes: usize) {
-        self.counters.queued.fetch_sub(1, Ordering::Relaxed);
-        self.counters
-            .request_bytes
-            .fetch_sub(bytes as u64, Ordering::Relaxed);
-        self.counters.response_cells.fetch_sub(1, Ordering::Relaxed);
-    }
     fn mark_inflight(&self) {
         self.counters.queued.fetch_sub(1, Ordering::Relaxed);
         let now = self.counters.inflight.fetch_add(1, Ordering::Relaxed) + 1;
         high(&self.counters.inflight_high_water, now);
-    }
-    fn release_inflight(&self, bytes: usize) {
-        self.counters.inflight.fetch_sub(1, Ordering::Relaxed);
-        self.counters
-            .request_bytes
-            .fetch_sub(bytes as u64, Ordering::Relaxed);
-        self.counters.response_cells.fetch_sub(1, Ordering::Relaxed);
     }
     fn update_readiness(&self) {
         let voters = self
@@ -790,15 +784,13 @@ impl Pool {
             for mut handle in handles {
                 let _ = (&mut handle).await;
             }
-            // Aborting workers drops jobs still in their private mailbox or
-            // in a facade future without passing `complete`. Their owned
-            // semaphore permits have now been dropped, so reset only current
-            // gauges after every supervisor joined; high-water evidence is
-            // intentionally retained.
-            pool.counters.queued.store(0, Ordering::Relaxed);
-            pool.counters.inflight.store(0, Ordering::Relaxed);
-            pool.counters.request_bytes.store(0, Ordering::Relaxed);
-            pool.counters.response_cells.store(0, Ordering::Relaxed);
+            // Every queued or in-flight Job owns its accounting. Joining all
+            // supervisors above runs its Drop exactly once, including abort
+            // and panic paths; never blind-zero racing gauges here.
+            debug_assert_eq!(pool.counters.queued.load(Ordering::Relaxed), 0);
+            debug_assert_eq!(pool.counters.inflight.load(Ordering::Relaxed), 0);
+            debug_assert_eq!(pool.counters.request_bytes.load(Ordering::Relaxed), 0);
+            debug_assert_eq!(pool.counters.response_cells.load(Ordering::Relaxed), 0);
             pool.phase.store(Phase::Stopped as u8, Ordering::Release);
             let report = ManagedProviderShutdownReport {
                 drained: pool.counters.shutdown_drained.load(Ordering::Relaxed),
@@ -848,10 +840,24 @@ struct Job {
     frame_bytes: usize,
     deadline: tokio::time::Instant,
     inflight: bool,
-    reply: oneshot::Sender<Result<ManagedProviderJobStatus, ManagedProviderClientError>>,
+    counters: Arc<Counters>,
+    reply: Option<oneshot::Sender<Result<ManagedProviderJobStatus, ManagedProviderClientError>>>,
     _pending: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
     _cell: OwnedSemaphorePermit,
+}
+impl Drop for Job {
+    fn drop(&mut self) {
+        if self.inflight {
+            self.counters.inflight.fetch_sub(1, Ordering::Relaxed);
+        } else {
+            self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.counters
+            .request_bytes
+            .fetch_sub(self.frame_bytes as u64, Ordering::Relaxed);
+        self.counters.response_cells.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 enum Command {
     Submit(Box<Job>),
@@ -1012,16 +1018,13 @@ async fn scheduler(
     }
 }
 fn complete(
-    pool: &Pool,
-    job: Job,
+    _pool: &Pool,
+    mut job: Job,
     result: Result<ManagedProviderJobStatus, ManagedProviderClientError>,
 ) {
-    if job.inflight {
-        pool.release_inflight(job.frame_bytes);
-    } else {
-        pool.release_enqueue(job.frame_bytes);
+    if let Some(reply) = job.reply.take() {
+        let _ = reply.send(result);
     }
-    let _ = job.reply.send(result);
 }
 
 async fn lane_worker(
@@ -1216,11 +1219,9 @@ async fn call_on_lane(
             return Err(ManagedProviderClientError::OutcomeUnknown);
         }
     }
-    let response: WireResponse =
-        tokio::time::timeout_at(deadline, read_json(connection, response_bound))
-            .await
-            .map_err(|_| ManagedProviderClientError::OutcomeUnknown)?
-            .map_err(|_| ManagedProviderClientError::OutcomeUnknown)?;
+    let response: WireResponse = read_json_until(connection, response_bound, deadline)
+        .await
+        .map_err(|_| ManagedProviderClientError::OutcomeUnknown)?;
     match response {
         WireResponse::Call(result) => match result.into_result() {
             Ok(status) => Ok(Ok(status)),
@@ -1547,9 +1548,9 @@ impl ManagedProviderJobServer {
         let listener = TcpListener::bind(bind).await?;
         let address = listener.local_addr()?;
         let cancelled = Arc::new(AtomicBool::new(false));
-        // The completed task retains its connection permit as its JoinSet
-        // output. A replacement cannot be accepted until reaping consumes
-        // that output, so retained entries are structurally bounded too.
+        // The task output retains its connection permit. A replacement cannot
+        // be accepted until reaping consumes that output; caught panics follow
+        // the same path, so retained entries stay structurally bounded.
         let tasks = Arc::new(Mutex::new(JoinSet::<OwnedSemaphorePermit>::new()));
         let counters = Arc::new(ServerCounters::default());
         let permit = Arc::new(Semaphore::new(self.max_connections));
@@ -1582,7 +1583,11 @@ impl ManagedProviderJobServer {
                         high(&counters.task_high_water, tasks_current);
                         accept_tasks.lock().await.spawn(async move {
                             let _connection = ServerConnectionGuard(counters);
-                            let _ = serve_connection(stream, service, tls, scope, voter, client).await;
+                            let _ = AssertUnwindSafe(serve_connection(
+                                stream, service, tls, scope, voter, client,
+                            ))
+                            .catch_unwind()
+                            .await;
                             slot
                         });
                     }
@@ -1801,20 +1806,12 @@ fn wire_operation_is_valid(operation: &WireOperation) -> bool {
     {
         return false;
     }
-    // `FencedMutationRosterOperationId` has a constructor-only nonzero
-    // invariant but no public accessor. Inspecting this private transport
-    // value through serde is redaction-safe and lets the boundary reject a
-    // zero ID created by derived deserialization.
-    serde_json::to_value(admission)
-        .ok()
-        .and_then(|value| value.get("operation_id").cloned())
-        .and_then(|value| value.as_array().cloned())
-        .is_some_and(|bytes| {
-            bytes.len() == 16
-                && bytes
-                    .iter()
-                    .any(|value| value.as_u64().is_some_and(|byte| byte != 0))
-        })
+    !admission
+        .request_id()
+        .operation_id()
+        .as_bytes()
+        .iter()
+        .all(|byte| *byte == 0)
 }
 fn validated_admission(
     admission: FencedMutationRosterAdmission,
@@ -2167,8 +2164,7 @@ mod tests {
 
         let members: [roster::FencedMutationRosterMember; roster::MAX_MEMBERS] =
             std::array::from_fn(|ordinal| {
-                let mut caller_id = [255; roster::MEMBER_ID_BYTES];
-                caller_id[roster::MEMBER_ID_BYTES - 1] = ordinal as u8 + 1;
+                let caller_id = [248 + ordinal as u8; roster::MEMBER_ID_BYTES];
                 roster::FencedMutationRosterMember::new(
                     roster::FencedMutationRosterOrdinal::new(ordinal as u8).expect("test ordinal"),
                     caller_id,
@@ -2179,8 +2175,8 @@ mod tests {
                     .expect("test descriptor"),
                     u64::MAX,
                     u64::MAX,
-                    roster::FencedMutationMemberDisposition::NotApplied,
-                    roster::FencedMutationMemberAdoption::Reconciled,
+                    roster::FencedMutationMemberDisposition::Indeterminate,
+                    roster::FencedMutationMemberAdoption::Unreconciled,
                 )
                 .expect("test member")
             });
@@ -2190,7 +2186,7 @@ mod tests {
                 .expect("test operation ID"),
             roster::FencedMutationRosterScope::from_digest([255; 32]),
             roster::FencedMutationRosterFenceIntent::new(
-                OwnerId::new("o".repeat(OwnerId::MAX_BYTES)).expect("test owner"),
+                OwnerId::new("\0".repeat(OwnerId::MAX_BYTES)).expect("test owner"),
                 FenceToken::new(u64::MAX),
             ),
             Generation::new(u64::MAX),
@@ -2218,7 +2214,7 @@ mod tests {
         let length = bounded_json_len(&frame, usize::MAX).expect("maximum legal encoding");
         assert_eq!(length, MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES);
         assert_eq!(
-            bounded_json_len(&frame, length - 1),
+            bounded_json_len(&frame, 8_588_476),
             Err(ManagedProviderClientError::Overloaded)
         );
     }
