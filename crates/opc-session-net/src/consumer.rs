@@ -7682,6 +7682,16 @@ impl PersistentSessionConsumerV2Pool {
                 .send_replace(Some(RetirementReason::Explicit));
             return false;
         }
+        true
+    }
+
+    /// A just-created lane has not yet been published for reusable work. It
+    /// therefore must still match the precise handshake material snapshot;
+    /// published lanes instead follow their actor-owned jittered lifecycle.
+    fn fresh_current(&self, connection: &mut PersistentV2Connection) -> bool {
+        if !self.current(connection) {
+            return false;
+        }
         if connection.admitted_material_epoch != self.client.tls_config.material_status().epoch() {
             connection
                 .retirement
@@ -8066,24 +8076,29 @@ impl PersistentSessionConsumerV2Pool {
         if connection.is_some() {
             counter_increment(&self.reused);
         }
-        let mut connection = match connection {
-            Some(connection) => connection,
-            None => {
+        let (mut connection, fresh) = match connection {
+            Some(connection) => (connection, false),
+            None => (
                 self.connect_until(self.setup_deadline(started, Some(deadline)).map_err(
                     |cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause },
                 )?)
                 .await
                 .map_err(|cause| {
                     PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }
-                })?
-            }
+                })?,
+                true,
+            ),
         };
         connection.idle_deadline = tokio::time::Instant::now()
             .checked_add(effective_consumer_idle_timeout(self.client.idle_timeout))
             .ok_or(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             })?;
-        if !self.current(&mut connection) {
+        if !(if fresh {
+            self.fresh_current(&mut connection)
+        } else {
+            self.current(&mut connection)
+        }) {
             return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Deadline,
             });
@@ -8234,7 +8249,7 @@ impl PersistentSessionConsumerV2Pool {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 idle.retain_mut(|entry| self.retainable_entry(entry));
-                staged.retain_mut(|connection| self.current(connection));
+                staged.retain_mut(|connection| self.fresh_current(connection));
                 idle.iter()
                     .filter(|entry| matches!(entry, PersistentV2PoolEntry::Lane(_)))
                     .count()
@@ -8285,7 +8300,7 @@ impl PersistentSessionConsumerV2Pool {
                 return Err(SessionConsumerClientError::ShuttingDown);
             }
             idle.retain_mut(|entry| self.retainable_entry(entry));
-            staged.retain_mut(|connection| self.current(connection));
+            staged.retain_mut(|connection| self.fresh_current(connection));
             complete_before_deadline((), setup_deadline, SessionConsumerClientError::Deadline)?;
             let published_lanes = idle
                 .iter()
@@ -16119,6 +16134,131 @@ mod tests {
                 idle: 1,
             },
             "the same server-enforced lane accepts correlation 1 then 2"
+        );
+        let _ = persistent.shutdown().await;
+        server.abort_and_wait().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_v2_published_lane_reuses_until_material_rotation_deadline() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("persistent-v2-published-rotation-client");
+        let server_identity = material_spiffe("persistent-v2-published-rotation-server");
+        let material = Arc::new(RotatableClientMaterial::new(client_identity.as_str()));
+        let client_config = material.config();
+        let lifecycle = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .expect("bounded published V2 material rotation lifecycle");
+        let rotation_jitter = client_config
+            .begin_handshake()
+            .expect("published V2 rotation handshake snapshot")
+            .consumer_rotation_jitter(&server_identity)
+            .min(lifecycle.rotation_jitter());
+        assert!(
+            !rotation_jitter.is_zero(),
+            "the fixed authenticated V2 edge must exercise cooperative material reuse"
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = Arc::new(V2CountingRejectingTestConsumer {
+            v2_calls: Arc::clone(&calls),
+        });
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity],
+            std::iter::empty(),
+        )
+        .expect("published V2 rotation authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            service,
+            material.trusted_server_config(server_identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for published V2 rotation");
+        let config = PersistentSessionConsumerConfig::try_new(
+            1,
+            0,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
+        )
+        .expect("one-lane published V2 rotation configuration");
+        let persistent = PersistentSessionConsumerClient::try_from_stateless(
+            StatelessSessionConsumerClient::new(
+                address,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                server_identity,
+                scope(),
+                client_config,
+            )
+            .with_connection_lifecycle(lifecycle),
+            config,
+        )
+        .expect("published V2 rotation client");
+        let request = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2Capability,
+        );
+        let expected = Ok(SessionConsumerV2Response::Rejected(
+            SessionConsumerRejection::Unavailable,
+        ));
+
+        assert_eq!(persistent.execute_v2(&request).await, expected.clone());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(persistent.v2_diagnostics().setup_successes, 1);
+
+        material.rotate();
+        tokio::time::advance(
+            rotation_jitter
+                .checked_sub(Duration::from_nanos(1))
+                .expect("nonzero material jitter exceeds one nanosecond"),
+        )
+        .await;
+        let connection = persistent
+            .v2_pool
+            .take_front_poison_or_idle_lane()
+            .expect("a published V2 lane is not poison")
+            .expect("the published V2 socket remains reusable before its deadline");
+        assert_eq!(
+            persistent.v2_diagnostics(),
+            super::PersistentSessionConsumerV2Diagnostics {
+                setup_successes: 1,
+                reused: 0,
+                reconnects: 0,
+                active: 1,
+                idle: 0,
+            },
+            "checking out the published socket before its deadline changes no setup or dispatch count"
+        );
+        persistent
+            .v2_pool
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(PersistentV2PoolEntry::Lane(connection));
+
+        let retired = persistent.v2_pool.drained_notify.notified();
+        tokio::pin!(retired);
+        retired.as_mut().enable();
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        retired.await;
+        assert_eq!(persistent.execute_v2(&request).await, expected);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            persistent.v2_diagnostics().setup_successes,
+            2,
+            "the post-deadline call reconnects only after the actor retires its published lane"
         );
         let _ = persistent.shutdown().await;
         server.abort_and_wait().await;
