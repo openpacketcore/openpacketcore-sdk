@@ -21,8 +21,8 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteE
 
 /// Maximum payload bytes admitted in one consensus snapshot envelope.
 pub(crate) const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-/// Maximum bytes accepted from a snapshot sender, including its fixed footer.
-pub(crate) const SNAPSHOT_MAX_ENVELOPE_BYTES: u64 = SNAPSHOT_MAX_BYTES + 48;
+/// Maximum bytes retained while checking an idempotent receiver replay.
+const SNAPSHOT_REPLAY_VERIFY_BYTES: usize = 64 * 1024;
 
 /// Test-only coordination around a snapshot artifact lifecycle boundary.
 #[cfg(test)]
@@ -430,11 +430,23 @@ pub(crate) struct SessionSnapshotFile {
     received_maximum: u64,
     cursor: u64,
     extent: u64,
+    receiving: bool,
     receive_limit_exceeded: bool,
     // Kept by a receiving artifact so cloned state-machine handles cannot
     // retain more than one unvalidated snapshot stream for one core.
     _receive_admission: Option<tokio::sync::OwnedSemaphorePermit>,
     seek_in_flight: bool,
+    replay: Option<SnapshotReplayRead>,
+    io_poisoned: bool,
+}
+
+/// An owned block read while proving a sender retry matches accepted bytes.
+///
+/// Tokio may return `Pending` after accepting the read request. The buffer is
+/// therefore owned by the snapshot rather than borrowed from `poll_write`.
+struct SnapshotReplayRead {
+    start: u64,
+    expected: Vec<u8>,
 }
 
 struct SnapshotCleanupGuard {
@@ -608,6 +620,7 @@ impl SessionSnapshotFile {
         });
         snapshot.received_maximum = received_maximum;
         snapshot._receive_admission = receive_admission;
+        snapshot.receiving = true;
         Ok(snapshot)
     }
 
@@ -632,9 +645,12 @@ impl SessionSnapshotFile {
             received_maximum: u64::MAX,
             cursor: 0,
             extent: metadata.len(),
+            receiving: false,
             receive_limit_exceeded: false,
             _receive_admission: None,
             seek_in_flight: false,
+            replay: None,
+            io_poisoned: false,
         })
     }
 
@@ -660,7 +676,7 @@ impl SessionSnapshotFile {
 
     /// Clone the held file handle without resolving its path again.
     pub(crate) async fn try_clone(&self) -> io::Result<Self> {
-        if self._receive_admission.is_some() {
+        if self._receive_admission.is_some() || self.receiving {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "snapshot receiver cannot be cloned",
@@ -671,6 +687,7 @@ impl SessionSnapshotFile {
         cloned.received_maximum = self.received_maximum;
         cloned.cursor = self.cursor;
         cloned.extent = self.extent;
+        cloned.receiving = self.receiving;
         cloned.receive_limit_exceeded = self.receive_limit_exceeded;
         Ok(cloned)
     }
@@ -709,7 +726,13 @@ impl SessionSnapshotFile {
     /// Flush both file content and metadata before promotion.
     pub(crate) async fn sync_all(&mut self) -> io::Result<()> {
         self.flush().await?;
-        self.file.sync_all().await
+        match self.file.sync_all().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.poison();
+                Err(error)
+            }
+        }
     }
 
     fn receiving_file_access(&self) -> io::Result<()> {
@@ -728,6 +751,150 @@ impl SessionSnapshotFile {
         io::Error::new(io::ErrorKind::InvalidData, message)
     }
 
+    fn poisoned_error(&self) -> io::Error {
+        io::Error::other("snapshot receiver I/O state is uncertain")
+    }
+
+    fn poison(&mut self) {
+        self.io_poisoned = true;
+    }
+
+    fn begin_seek_correction(&mut self, position: u64) -> io::Result<()> {
+        if self.seek_in_flight {
+            return Err(io::Error::other(
+                "snapshot seek correction is already in progress",
+            ));
+        }
+        Pin::new(&mut self.file).start_seek(io::SeekFrom::Start(position))?;
+        self.seek_in_flight = true;
+        Ok(())
+    }
+
+    /// Drain a pending replay read without accepting its caller-owned input,
+    /// then restore the file cursor to the unverified replay start.
+    fn poll_cancel_replay(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(mut replay) = self.as_mut().get_mut().replay.take() else {
+            return Poll::Ready(Ok(()));
+        };
+        let start = replay.start;
+        let mut read_buf = ReadBuf::new(&mut replay.expected);
+        match Pin::new(&mut self.as_mut().get_mut().file).poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => {
+                if let Err(error) = self.as_mut().get_mut().begin_seek_correction(start) {
+                    self.as_mut().get_mut().poison();
+                    return Poll::Ready(Err(error));
+                }
+                self.poll_complete_submitted_seek(cx)
+            }
+            Poll::Ready(Err(error)) => {
+                self.as_mut().get_mut().poison();
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => {
+                self.as_mut().get_mut().replay = Some(replay);
+                Poll::Pending
+            }
+        }
+    }
+
+    /// Reconcile a cancelled replay and any submitted seek before an action
+    /// that does not itself continue the receiver write.
+    fn poll_reconcile_before_other_action(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.as_ref().get_ref().io_poisoned {
+            return Poll::Ready(Err(self.as_ref().get_ref().poisoned_error()));
+        }
+        match self.as_mut().poll_cancel_replay(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+        self.poll_complete_submitted_seek(cx)
+    }
+
+    /// Compare one bounded overlap block with already accepted receiver data.
+    /// A successful comparison is reported as a short successful write, so a
+    /// caller such as `write_all` naturally continues with the missing suffix.
+    fn poll_verify_replay(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.as_ref().get_ref().io_poisoned {
+            return Poll::Ready(Err(self.as_ref().get_ref().poisoned_error()));
+        }
+        if self.as_ref().get_ref().replay.is_none() {
+            let this = self.as_mut().get_mut();
+            let overlap = this.extent.saturating_sub(this.cursor);
+            let block = overlap
+                .min(u64::try_from(buf.len()).unwrap_or(u64::MAX))
+                .min(SNAPSHOT_REPLAY_VERIFY_BYTES as u64) as usize;
+            if block == 0 {
+                this.poison();
+                return Poll::Ready(Err(io::Error::other(
+                    "snapshot receiver replay block is empty",
+                )));
+            }
+            this.replay = Some(SnapshotReplayRead {
+                start: this.cursor,
+                expected: vec![0; block],
+            });
+        }
+
+        let Some(mut replay) = self.as_mut().get_mut().replay.take() else {
+            self.as_mut().get_mut().poison();
+            return Poll::Ready(Err(io::Error::other(
+                "snapshot receiver replay state is absent",
+            )));
+        };
+        let start = replay.start;
+        let mut read_buf = ReadBuf::new(&mut replay.expected);
+        match Pin::new(&mut self.as_mut().get_mut().file).poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => {
+                let read = read_buf.filled().len();
+                if read == 0 {
+                    self.as_mut().get_mut().poison();
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "snapshot receiver replay reached an unexpected end of file",
+                    )));
+                }
+                if buf.len() < read {
+                    if let Err(error) = self.as_mut().get_mut().begin_seek_correction(start) {
+                        self.as_mut().get_mut().poison();
+                        return Poll::Ready(Err(error));
+                    }
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "snapshot receiver replay buffer changed while pending",
+                    )));
+                }
+                if replay.expected[..read] != buf[..read] {
+                    if let Err(error) = self.as_mut().get_mut().begin_seek_correction(start) {
+                        self.as_mut().get_mut().poison();
+                        return Poll::Ready(Err(error));
+                    }
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "snapshot receiver replay does not match accepted bytes",
+                    )));
+                }
+                self.as_mut().get_mut().cursor = start.saturating_add(read as u64);
+                Poll::Ready(Ok(read))
+            }
+            Poll::Ready(Err(error)) => {
+                self.as_mut().get_mut().poison();
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => {
+                self.as_mut().get_mut().replay = Some(replay);
+                Poll::Pending
+            }
+        }
+    }
+
     fn poll_complete_submitted_seek(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -737,7 +904,10 @@ impl SessionSnapshotFile {
         }
         match self.as_mut().poll_complete(cx) {
             Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Err(error)) => {
+                self.as_mut().get_mut().poison();
+                Poll::Ready(Err(error))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -833,10 +1003,16 @@ impl AsyncRead for SessionSnapshotFile {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.as_mut().poll_complete_submitted_seek(cx) {
+        match self.as_mut().poll_reconcile_before_other_action(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => return Poll::Pending,
+        }
+        if self.as_ref().get_ref().receiving {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "snapshot receiver is not sealed for reading",
+            )));
         }
         Pin::new(&mut self.file).poll_read(cx, buf)
     }
@@ -853,6 +1029,15 @@ impl AsyncWrite for SessionSnapshotFile {
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => return Poll::Pending,
         }
+        if self.as_ref().get_ref().io_poisoned {
+            return Poll::Ready(Err(self.as_ref().get_ref().poisoned_error()));
+        }
+        if !self.as_ref().get_ref().receiving {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot file is not receiving",
+            )));
+        }
         if self.receive_limit_exceeded {
             return Poll::Ready(Err(self.receive_limit_error(
                 "snapshot receiver size limit was previously exceeded",
@@ -866,16 +1051,6 @@ impl AsyncWrite for SessionSnapshotFile {
                 ));
             }
         };
-        let Some(next) = self.received_bytes.checked_add(requested) else {
-            return Poll::Ready(Err(
-                self.receive_limit_error("snapshot stream exceeds size limit")
-            ));
-        };
-        if next > self.received_maximum {
-            return Poll::Ready(Err(
-                self.receive_limit_error("snapshot stream exceeds size limit")
-            ));
-        }
         let Some(end) = self.cursor.checked_add(requested) else {
             return Poll::Ready(Err(
                 self.receive_limit_error("snapshot stream exceeds size limit")
@@ -886,6 +1061,15 @@ impl AsyncWrite for SessionSnapshotFile {
                 self.receive_limit_error("snapshot stream exceeds size limit")
             ));
         }
+        if self.cursor > self.extent {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot receiver cannot write a sparse range",
+            )));
+        }
+        if !buf.is_empty() && self.cursor < self.extent {
+            return self.as_mut().poll_verify_replay(cx, buf);
+        }
         match Pin::new(&mut self.file).poll_write(cx, buf) {
             Poll::Ready(Ok(written)) => {
                 self.received_bytes = self.received_bytes.saturating_add(written as u64);
@@ -893,29 +1077,49 @@ impl AsyncWrite for SessionSnapshotFile {
                 self.extent = self.extent.max(self.cursor);
                 Poll::Ready(Ok(written))
             }
-            outcome => outcome,
+            Poll::Ready(Err(error)) => {
+                self.poison();
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        match self.as_mut().poll_complete_submitted_seek(cx) {
+        match self.as_mut().poll_reconcile_before_other_action(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => return Poll::Pending,
         }
-        Pin::new(&mut self.file).poll_flush(cx)
+        match Pin::new(&mut self.file).poll_flush(cx) {
+            Poll::Ready(Err(error)) => {
+                self.as_mut().get_mut().poison();
+                Poll::Ready(Err(error))
+            }
+            outcome => outcome,
+        }
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        match self.as_mut().poll_complete_submitted_seek(cx) {
+        match self.as_mut().poll_reconcile_before_other_action(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => return Poll::Pending,
         }
-        Pin::new(&mut self.file).poll_shutdown(cx)
+        match Pin::new(&mut self.file).poll_shutdown(cx) {
+            Poll::Ready(Ok(())) => {
+                self.as_mut().get_mut().receiving = false;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => {
+                self.as_mut().get_mut().poison();
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -923,6 +1127,14 @@ impl AsyncSeek for SessionSnapshotFile {
     fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
         if self.seek_in_flight {
             return Err(io::Error::other("snapshot seek is already in progress"));
+        }
+        if self.replay.is_some() {
+            return Err(io::Error::other(
+                "snapshot replay must complete before another seek",
+            ));
+        }
+        if self.io_poisoned {
+            return Err(self.poisoned_error());
         }
         if self.receive_limit_exceeded {
             return Err(
@@ -935,6 +1147,12 @@ impl AsyncSeek for SessionSnapshotFile {
             io::SeekFrom::End(offset) => self.extent.checked_add_signed(offset),
         }
         .ok_or_else(|| self.receive_limit_error("snapshot seek is invalid"))?;
+        if self.receiving && target > self.extent {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot receiver cannot seek beyond accepted bytes",
+            ));
+        }
         if target > self.received_maximum {
             return Err(self.receive_limit_error("snapshot seek exceeds size limit"));
         }
@@ -952,10 +1170,13 @@ impl AsyncSeek for SessionSnapshotFile {
             }
             Poll::Ready(Ok(_)) => {
                 self.seek_in_flight = false;
-                Poll::Ready(Err(self.receive_limit_error("snapshot seek exceeds size limit")))
+                Poll::Ready(Err(
+                    self.receive_limit_error("snapshot seek exceeds size limit")
+                ))
             }
             Poll::Ready(Err(error)) => {
                 self.seek_in_flight = false;
+                self.poison();
                 Poll::Ready(Err(error))
             }
             pending => pending,
@@ -973,9 +1194,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use super::{PinnedSqliteFile, UnpublishedSnapshotArtifact};
-    use super::{SessionSnapshotFile, SnapshotArtifactGate};
+    use super::{SessionSnapshotFile, SnapshotArtifactGate, SnapshotReplayRead};
     use tempfile::tempdir;
-    use tokio::io::{AsyncSeek as _, AsyncSeekExt as _, AsyncWriteExt as _};
+    use tokio::io::{AsyncReadExt as _, AsyncSeek as _, AsyncSeekExt as _, AsyncWriteExt as _};
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -1084,7 +1305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receiving_snapshot_rewind_rejects_overwriting_written_bytes(
+    async fn receiving_snapshot_rewind_rejects_changed_overlapping_bytes(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("incoming.part");
@@ -1099,7 +1320,7 @@ mod tests {
             .await
             .err()
             .ok_or("rewound receive accepted an overwrite")?;
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         snapshot.sync_all().await?;
         assert_eq!(snapshot.metadata().await?.len(), original.len() as u64);
         assert_eq!(std::fs::read(path)?, original);
@@ -1107,7 +1328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receiving_snapshot_cancelled_seek_rejects_overwriting_written_bytes(
+    async fn receiving_snapshot_cancelled_seek_rejects_changed_overlapping_bytes(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("incoming.part");
@@ -1122,8 +1343,93 @@ mod tests {
             .await
             .err()
             .ok_or("cancelled receive seek accepted an overwrite")?;
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         snapshot.sync_all().await?;
+        assert_eq!(snapshot.metadata().await?.len(), original.len() as u64);
+        assert_eq!(std::fs::read(path)?, original);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receiving_snapshot_exact_rewind_retry_keeps_bytes_and_length(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming.part");
+        let original = b"exact snapshot retry";
+        let mut snapshot = SessionSnapshotFile::create(path.clone()).await?;
+        snapshot.write_all(original).await?;
+        snapshot.sync_all().await?;
+        snapshot.rewind().await?;
+
+        snapshot.write_all(original).await?;
+        snapshot.sync_all().await?;
+
+        assert_eq!(snapshot.metadata().await?.len(), original.len() as u64);
+        assert_eq!(std::fs::read(path)?, original);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receiving_snapshot_partial_exact_overlap_appends_only_missing_suffix(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming.part");
+        let mut snapshot = SessionSnapshotFile::create(path.clone()).await?;
+        snapshot.write_all(b"abcdef").await?;
+        snapshot.seek(io::SeekFrom::Start(3)).await?;
+
+        snapshot.write_all(b"defghi").await?;
+        snapshot.sync_all().await?;
+
+        assert_eq!(snapshot.metadata().await?.len(), 9);
+        assert_eq!(std::fs::read(path)?, b"abcdefghi");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receiving_snapshot_is_readable_only_after_exact_shutdown(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming.part");
+        let original = b"authenticated snapshot stream";
+        let mut snapshot = SessionSnapshotFile::create(path).await?;
+        snapshot.write_all(original).await?;
+        snapshot.rewind().await?;
+
+        let mut observed = Vec::new();
+        let error = snapshot
+            .read_to_end(&mut observed)
+            .await
+            .err()
+            .ok_or("active receiver allowed a read")?;
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        snapshot.shutdown().await?;
+        snapshot.rewind().await?;
+        snapshot.read_to_end(&mut observed).await?;
+        assert_eq!(observed, original);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_replay_and_submitted_seek_preserve_receiver_exactness(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming.part");
+        let original = b"abcdef";
+        let mut snapshot = SessionSnapshotFile::create(path.clone()).await?;
+        snapshot.write_all(original).await?;
+        snapshot.sync_all().await?;
+        snapshot.rewind().await?;
+
+        snapshot.replay = Some(SnapshotReplayRead {
+            start: 0,
+            expected: vec![0; original.len()],
+        });
+        snapshot.flush().await?;
+        Pin::new(&mut snapshot).start_seek(io::SeekFrom::Start(0))?;
+        snapshot.write_all(original).await?;
+        snapshot.sync_all().await?;
+
         assert_eq!(snapshot.metadata().await?.len(), original.len() as u64);
         assert_eq!(std::fs::read(path)?, original);
         Ok(())

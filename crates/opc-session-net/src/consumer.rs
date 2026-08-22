@@ -13155,16 +13155,16 @@ mod tests {
         classify_call_write_error, complete_before_deadline, consumer_connection_current,
         consumer_execute_into_fenced_transition, consumer_fresh_admission_is_current,
         consumer_payload_fragments_exceed_frame, consumer_public_response_from_wire,
-        consumer_request_has_exact_fenced_transition_id,
-        consumer_response_fits, consumer_watch_error_is_legal, consumer_wire_response_from_public,
+        consumer_request_has_exact_fenced_transition_id, consumer_response_fits,
+        consumer_watch_error_is_legal, consumer_wire_response_from_public,
         decode_consumer_frame_payload, ensure_pre_request_budget_remaining, exact_correlation,
         fenced_transition_response, lease_error_matches_operation,
         lease_mutation_status_matches_request, lease_mutation_status_wire_matches_request,
-        lease_response,
-        mutation_response, persistent_execute_error, poll_persistent_consumer_setup_io,
-        publish_monotonic_shutdown_phase, queued_consumer_watch_stream,
-        read_authenticated_consumer_frame_until, read_authenticated_consumer_frame_within,
-        response_is_outcome_unknown, response_matches_operation, response_matches_request,
+        lease_response, mutation_response, persistent_execute_error,
+        poll_persistent_consumer_setup_io, publish_monotonic_shutdown_phase,
+        queued_consumer_watch_stream, read_authenticated_consumer_frame_until,
+        read_authenticated_consumer_frame_within, response_is_outcome_unknown,
+        response_matches_operation, response_matches_request,
         response_retires_connection_authority, run_persistent_v2_lane, server_connection_current,
         store_error_matches_operation, v2_persistent_error, valid_consumer_operation_timeout,
         wait_for_forced_shutdown, write_consumer_call_rejection_supervised, BorrowedConsumerCall,
@@ -13173,12 +13173,11 @@ mod tests {
         ConsumerHelloAck, ConsumerLeaseWireContext, ConsumerOperationKind,
         ConsumerServerCancellation, ConsumerServerSetupTestHooks,
         ConsumerSessionLeaseMutationResultWire, ConsumerSessionLeaseMutationStatusWire,
-        ConsumerSessionResponseWire, ConsumerSetupPhase, ConsumerSetupPhaseAttempt,
-        ConsumerV2Call, ConsumerV2CallResponse,
-        ConsumerV2DispatchResult, ConsumerV2WireRequest, ConsumerV2WireResponse,
-        ConsumerWatchTerminal, ConsumerWatchTerminalSlot, ConsumerWireRequest,
-        ConsumerWireResponse, PersistentCheckedOutConnection, PersistentConsumerCounters,
-        PersistentConsumerIoBarrier, PersistentConsumerShutdownReader,
+        ConsumerSessionResponseWire, ConsumerSetupPhase, ConsumerSetupPhaseAttempt, ConsumerV2Call,
+        ConsumerV2CallResponse, ConsumerV2DispatchResult, ConsumerV2WireRequest,
+        ConsumerV2WireResponse, ConsumerWatchTerminal, ConsumerWatchTerminalSlot,
+        ConsumerWireRequest, ConsumerWireResponse, PersistentCheckedOutConnection,
+        PersistentConsumerCounters, PersistentConsumerIoBarrier, PersistentConsumerShutdownReader,
         PersistentConsumerShutdownWriter, PersistentSessionConsumerClient,
         PersistentSessionConsumerConfig, PersistentSessionConsumerConfigError,
         PersistentSessionConsumerExecuteError, PersistentSessionConsumerV2ExecuteError,
@@ -13228,11 +13227,11 @@ mod tests {
         SessionConsumerLeaseMutationResult, SessionConsumerLeaseMutationStatus,
         SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRequest,
         SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-        SessionConsumerStoreError,
-        SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
-        SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
-        SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType,
-        StoreError, StoredSessionRecord, MAX_SESSION_TTL,
+        SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
+        SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation,
+        SessionConsumerV2Request, SessionConsumerV2Response, SessionKey, SessionKeyType,
+        SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
+        MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
@@ -13553,106 +13552,6 @@ mod tests {
             SessionConsensusConfigurationId::from_bytes([2; 32]),
             SessionConsensusConfigurationEpoch::new(1).expect("non-zero configuration epoch"),
         ))
-    }
-
-    async fn authenticated_consumer_physical_create_request(
-        request_id: u8,
-        payload_len: usize,
-    ) -> FencedTransitionRequest {
-        let key = SessionKey {
-            tenant: TenantId::new("consumer-physical-admission").expect("test tenant"),
-            nf_kind: NetworkFunctionKind::smf(),
-            key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::from_static(b"consumer-physical-admission")
-                .try_into()
-                .expect("bounded stable ID"),
-        };
-        let owner = OwnerId::new("consumer-physical-admission-owner").expect("test owner");
-        let lease = FencedTransitionLease::acquire(
-            key.clone(),
-            owner.clone(),
-            FenceToken::new(0),
-            Duration::from_secs(30),
-        )
-        .expect("bounded acquire");
-        let mut record = StoredSessionRecord {
-            key,
-            generation: Generation::new(1),
-            owner,
-            fence: lease.committed_fence().expect("committed fence"),
-            state_class: StateClass::AuthoritativeSession,
-            state_type: StateType::from_static("consumer-physical-admission"),
-            expires_at: None,
-            payload: EncryptedSessionPayload::new([0]),
-        };
-        let provider = MemoryKeyProvider::new();
-        provider
-            .insert_active_key(
-                KeyId::new("consumer-physical-admission-key").expect("test key ID"),
-                KeyPurpose::Session,
-                record.key.tenant.clone(),
-                Zeroizing::new([0x85; AES_256_GCM_SIV_KEY_LEN]),
-            )
-            .expect("install test key");
-        let envelope_overhead =
-            EncryptedSessionPayload::encrypt(&provider, &record, "consumer-physical-admission")
-                .await
-                .expect("seal envelope probe")
-                .len()
-                .checked_sub(1)
-                .expect("envelope includes the probe byte");
-        record.payload =
-            EncryptedSessionPayload::new(vec![
-                0x86;
-                payload_len.checked_sub(envelope_overhead).expect(
-                    "payload budget exceeds envelope overhead"
-                )
-            ]);
-        record.payload =
-            EncryptedSessionPayload::encrypt(&provider, &record, "consumer-physical-admission")
-                .await
-                .expect("seal exact envelope");
-        assert_eq!(record.payload.len(), payload_len);
-        FencedTransitionRequest::new(
-            FencedTransitionRequestId::from_bytes([request_id; 16]),
-            lease,
-            FencedTransitionMutation::create(record),
-        )
-        .expect("physical create request")
-    }
-
-    async fn authenticated_consumer_record_free_request(
-        request_id: u8,
-        refresh: bool,
-    ) -> FencedTransitionRequest {
-        let key = SessionKey {
-            tenant: TenantId::new("consumer-record-free-admission").expect("test tenant"),
-            nf_kind: NetworkFunctionKind::smf(),
-            key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::from_static(b"consumer-record-free-admission")
-                .try_into()
-                .expect("bounded stable ID"),
-        };
-        let lease = FakeSessionBackend::new()
-            .acquire(
-                &key,
-                OwnerId::new("consumer-record-free-admission-owner").expect("test owner"),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("lease");
-        let mutation = if refresh {
-            FencedTransitionMutation::refresh_ttl(Generation::new(1), Duration::from_secs(30))
-                .expect("refresh")
-        } else {
-            FencedTransitionMutation::delete(Generation::new(1))
-        };
-        FencedTransitionRequest::new(
-            FencedTransitionRequestId::from_bytes([request_id; 16]),
-            FencedTransitionLease::renew(lease, Duration::from_secs(30)).expect("renewal"),
-            mutation,
-        )
-        .expect("record-free request")
     }
 
     fn v2_serialized_body_conflict(status: bool) -> SessionConsumerV2Request {

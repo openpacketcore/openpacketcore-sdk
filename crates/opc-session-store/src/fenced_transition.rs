@@ -1557,54 +1557,55 @@ mod prepared_fenced_transition_serde {
     use super::*;
 
     impl<'de> Deserialize<'de> for PreparedFencedTransition {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct PreparedVisitor;
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct PreparedVisitor;
 
-        impl<'de> serde::de::Visitor<'de> for PreparedVisitor {
-            type Value = PreparedFencedTransition;
+            impl<'de> serde::de::Visitor<'de> for PreparedVisitor {
+                type Value = PreparedFencedTransition;
 
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a bounded opaque prepared fenced transition")
-            }
-
-            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                PreparedFencedTransition::try_from_bytes(value)
-                    .map_err(|_| E::custom(INVALID_PREPARED_TRANSITION))
-            }
-
-            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                let value = Zeroizing::new(value);
-                self.visit_bytes(&value)
-            }
-
-            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                let mut bytes =
-                    Zeroizing::new(Vec::with_capacity(FENCED_TRANSITION_MAX_PREPARED_BYTES));
-                while let Some(byte) = sequence.next_element::<u8>()? {
-                    if bytes.len() == FENCED_TRANSITION_MAX_PREPARED_BYTES {
-                        return Err(serde::de::Error::custom(INVALID_PREPARED_TRANSITION));
-                    }
-                    bytes.push(byte);
+                fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str("a bounded opaque prepared fenced transition")
                 }
-                self.visit_bytes(&bytes)
-            }
-        }
 
-        deserializer
-            .deserialize_bytes(PreparedVisitor)
-            .map_err(|_| serde::de::Error::custom(INVALID_PREPARED_TRANSITION))
+                fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    PreparedFencedTransition::try_from_bytes(value)
+                        .map_err(|_| E::custom(INVALID_PREPARED_TRANSITION))
+                }
+
+                fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    let value = Zeroizing::new(value);
+                    self.visit_bytes(&value)
+                }
+
+                fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+                where
+                    A: serde::de::SeqAccess<'de>,
+                {
+                    let mut bytes =
+                        Zeroizing::new(Vec::with_capacity(FENCED_TRANSITION_MAX_PREPARED_BYTES));
+                    while let Some(byte) = sequence.next_element::<u8>()? {
+                        if bytes.len() == FENCED_TRANSITION_MAX_PREPARED_BYTES {
+                            return Err(serde::de::Error::custom(INVALID_PREPARED_TRANSITION));
+                        }
+                        bytes.push(byte);
+                    }
+                    self.visit_bytes(&bytes)
+                }
+            }
+
+            deserializer
+                .deserialize_bytes(PreparedVisitor)
+                .map_err(|_| serde::de::Error::custom(INVALID_PREPARED_TRANSITION))
+        }
     }
 }
 
@@ -1750,7 +1751,6 @@ fn prepared_transition_digest(body: &[u8]) -> [u8; 32] {
 
 fn invalid_prepared_transition() -> StoreError {
     StoreError::Serialization(INVALID_PREPARED_TRANSITION.into())
-}
 }
 
 impl<'de> Deserialize<'de> for FencedTransitionV2Request {

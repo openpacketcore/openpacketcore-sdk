@@ -226,6 +226,45 @@ where
     unreachable!("the bounded retry loop returns on its final attempt")
 }
 
+/// Select the store that can perform local-only maintenance from the newest
+/// Openraft observations. A former leader can retain a self-report briefly,
+/// so only a self-report in the highest observed admitted term is eligible.
+fn current_local_maintenance_leader_from_statuses(
+    statuses: &[SessionConsensusStatus],
+) -> Option<usize> {
+    let highest_term = statuses
+        .iter()
+        .filter(|status| status.admitted)
+        .map(|status| status.term)
+        .max()?;
+    let mut leaders = statuses.iter().enumerate().filter(|(_, status)| {
+        status.admitted && status.term == highest_term && status.leader_id == Some(status.node_id)
+    });
+    let (leader_index, _) = leaders.next()?;
+    leaders.next().is_none().then_some(leader_index)
+}
+
+/// Wait only for an unambiguous, current-term local leader. The maintenance
+/// call itself still enforces fixed-quorum admission and local leadership; this
+/// selector merely avoids invoking that intentionally non-forwarding API on a
+/// cached former leader.
+async fn current_local_maintenance_leader(stores: &[ConsensusSessionStore]) -> usize {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let statuses = stores
+                .iter()
+                .map(ConsensusSessionStore::status)
+                .collect::<Vec<_>>();
+            if let Some(leader) = current_local_maintenance_leader_from_statuses(&statuses) {
+                return leader;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixed quorum reports an unambiguous current-term local maintenance leader")
+}
+
 /// Retry an ambiguous lifecycle CAS only after a fresh linearized history read
 /// proves whether that exact CAS changed durable state.  Maintenance has no
 /// caller-supplied request ID, so replaying it blindly after a lost reply could
@@ -241,7 +280,7 @@ async fn maintain_exact_history_batch(
         // deliberately local-leader-only boundary and is never forwarded.
         // A release workload can span several election terms, so never cache
         // the leader selected before the 131k-transition phase.
-        let store = &stores[ready_leader(stores).await];
+        let store = &stores[current_local_maintenance_leader(stores).await];
         let result = store.maintain_fenced_transition_v2_history(expected).await;
         // This fault is deliberately after the public local-leader method
         // completed successfully: it models only the caller losing that
@@ -275,7 +314,7 @@ async fn maintain_exact_history_batch(
                 | StoreError::FencedTransitionHistoryEpochNotActive,
             ) if attempt < QUALIFICATION_TRANSIENT_RETRY_LIMIT => {
                 transient_retries.fetch_add(1, Ordering::Relaxed);
-                let observation_store = &stores[ready_leader(stores).await];
+                let observation_store = &stores[current_local_maintenance_leader(stores).await];
                 let observed = retry_exact_consensus_operation(transient_retries, || {
                     observation_store.fenced_transition_v2_history_state()
                 })
@@ -530,6 +569,7 @@ fn maintenance_leader_selection_replaces_a_stale_self_reported_three_voter_leade
         last_log_index: None,
         applied_index: None,
         admitted: true,
+        completed_snapshot_count: 0,
     };
 
     let initial_term = [
@@ -874,6 +914,250 @@ async fn fixed_quorum_v2_batch_preserves_input_order_and_independent_statuses() 
                 FencedTransitionV2Status::Recorded(result) if result.as_ref() == &Ok(outcome.clone())
             ));
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fixed_quorum_public_v2_batches_use_the_store_local_warm_route() {
+    const BATCHES: usize = 4;
+    const ITEMS_PER_BATCH: usize = 2;
+
+    let directory = tempfile::tempdir().expect("fixed-quorum public warm-route directory");
+    let start = Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_900_000_000)
+            .expect("fixed-quorum public warm-route start"),
+    );
+    let clock = Arc::new(MutableClock::new(start));
+    let (stores, _, _) = fixed_cluster(directory.path(), clock).await;
+    let leader = ready_leader(&stores).await;
+    let store = &stores[leader];
+    let provider = sealing_provider();
+    let epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
+
+    // The public singleton deliberately remains cold. Its definitive success
+    // is the only local proof which may seed the later public batch route.
+    let activation_key = key(0);
+    let activation_observation = store
+        .observe_fenced_transition(&activation_key)
+        .await
+        .expect("public singleton activation observation");
+    let activation = create_request(
+        0,
+        epoch,
+        activation_key,
+        activation_observation.current_fence(),
+        &provider,
+    )
+    .await;
+    store
+        .fenced_transition_v2(activation)
+        .await
+        .expect("public singleton activation seeds the batch route");
+
+    let before = store.diagnostic_snapshot();
+    for batch in 0..BATCHES {
+        let mut requests = Vec::with_capacity(ITEMS_PER_BATCH);
+        for item in 0..ITEMS_PER_BATCH {
+            let request_index = 1 + batch * ITEMS_PER_BATCH + item;
+            let transition_key = key(request_index);
+            let observation = store
+                .observe_fenced_transition(&transition_key)
+                .await
+                .expect("warm batch observation");
+            requests.push(
+                create_request(
+                    request_index,
+                    epoch,
+                    transition_key,
+                    observation.current_fence(),
+                    &provider,
+                )
+                .await,
+            );
+        }
+        let outcomes = store
+            .fenced_transition_v2_batch(requests)
+            .await
+            .expect("public warm V2 batch");
+        assert_eq!(outcomes.len(), ITEMS_PER_BATCH);
+        assert!(outcomes.into_iter().all(|outcome| matches!(
+            outcome,
+            Ok(outcome) if matches!(outcome.mutation(), FencedTransitionMutationResult::Created)
+        )));
+    }
+    let after = store.diagnostic_snapshot();
+
+    assert_eq!(
+        after.public_raw_v2_cold_admissions - before.public_raw_v2_cold_admissions,
+        0,
+        "warm public batches must not repeat generic V2 admission"
+    );
+    assert_eq!(
+        after.public_raw_v2_history_reads - before.public_raw_v2_history_reads,
+        0,
+        "warm public batches must not reread V2 history"
+    );
+    assert_eq!(
+        after.fixed_raw_v2_acceptance_snapshots - before.fixed_raw_v2_acceptance_snapshots,
+        BATCHES as u64,
+        "each warm batch consumes exactly one atomic acceptance snapshot"
+    );
+    assert_eq!(
+        after.fixed_raw_v2_proposals - before.fixed_raw_v2_proposals,
+        BATCHES as u64,
+        "each warm batch issues exactly one proposal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fixed_quorum_public_v2_stale_warm_hint_fails_closed_before_proposal() {
+    for fault in 0..3 {
+        let fault_name = match fault {
+            0 => "activation removal",
+            1 => "operator recovery pending state",
+            2 => "membership application-authority scope drift",
+            _ => unreachable!("the bounded fault matrix has exactly three entries"),
+        };
+        let directory = tempfile::tempdir().expect("fixed-quorum stale warm-route directory");
+        let start = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::from_unix_timestamp(1_900_000_000)
+                .expect("fixed-quorum stale warm-route start"),
+        );
+        let clock = Arc::new(MutableClock::new(start));
+        let (stores, database_paths, _) = fixed_cluster(directory.path(), clock).await;
+        let leader = ready_leader(&stores).await;
+        let store = &stores[leader];
+        let provider = sealing_provider();
+        let epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
+
+        // A definitive public singleton success is the only way to seed this
+        // store's later public-batch routing hint.
+        let activation_key = key(0);
+        let activation_observation = store
+            .observe_fenced_transition(&activation_key)
+            .await
+            .expect("public singleton activation observation");
+        store
+            .fenced_transition_v2(
+                create_request(
+                    0,
+                    epoch,
+                    activation_key,
+                    activation_observation.current_fence(),
+                    &provider,
+                )
+                .await,
+            )
+            .await
+            .expect("public singleton activation seeds the batch route");
+
+        // Even with that local hint set, a public singleton must retain the
+        // cold admission path rather than using the later batch route.
+        let singleton_key = key(1);
+        let singleton_observation = store
+            .observe_fenced_transition(&singleton_key)
+            .await
+            .expect("public singleton after warming observation");
+        let before_singleton = store.diagnostic_snapshot();
+        store
+            .fenced_transition_v2(
+                create_request(
+                    1,
+                    epoch,
+                    singleton_key,
+                    singleton_observation.current_fence(),
+                    &provider,
+                )
+                .await,
+            )
+            .await
+            .expect("public singleton after warming remains cold");
+        let after_singleton = store.diagnostic_snapshot();
+        assert_eq!(
+            after_singleton.public_raw_v2_cold_admissions
+                - before_singleton.public_raw_v2_cold_admissions,
+            1,
+            "a public singleton after warming must retain cold admission: {fault_name}"
+        );
+
+        let batch_key = key(2);
+        let batch_observation = store
+            .observe_fenced_transition(&batch_key)
+            .await
+            .expect("stale warm-route batch observation");
+        let batch = vec![
+            create_request(
+                2,
+                epoch,
+                batch_key,
+                batch_observation.current_fence(),
+                &provider,
+            )
+            .await,
+        ];
+
+        // Every exact voter must independently lose the same durable proof.
+        // The local hint remains set, so the public batch must reach its
+        // uncached fixed-quorum acceptance boundary and fail before proposal.
+        for database_path in &database_paths {
+            let connection =
+                rusqlite::Connection::open(database_path).expect("open fixed voter database");
+            match fault {
+                0 => {
+                    connection
+                        .execute(
+                            "DELETE FROM consensus_fenced_transition_v2_activation WHERE singleton = 1",
+                            [],
+                        )
+                        .expect("remove fixed V2 activation certificate");
+                }
+                1 => {
+                    connection
+                        .execute(
+                            "UPDATE consensus_operator_recovery \
+                             SET pending_epoch = recovery_epoch + 1, pending_plan_digest = zeroblob(32) \
+                             WHERE singleton = 1",
+                            [],
+                        )
+                        .expect("activate fixed operator recovery latch");
+                }
+                2 => {
+                    connection
+                        .execute(
+                            "UPDATE consensus_membership_scope \
+                             SET application_authority_epoch = application_authority_epoch + 1 \
+                             WHERE singleton = 1",
+                            [],
+                        )
+                        .expect("persist fixed application-authority scope drift");
+                }
+                _ => unreachable!("the bounded fault matrix has exactly three entries"),
+            }
+        }
+
+        let before_batch_logs = stores
+            .iter()
+            .map(|voter| voter.status().last_log_index)
+            .collect::<Vec<_>>();
+        let before_batch = store.diagnostic_snapshot();
+        assert!(
+            store.fenced_transition_v2_batch(batch).await.is_err(),
+            "a stale public warm hint must fail closed after {fault_name}"
+        );
+        let after_batch = store.diagnostic_snapshot();
+        assert_eq!(
+            after_batch.public_raw_v2_cold_admissions - before_batch.public_raw_v2_cold_admissions,
+            0,
+            "a stale warm route must not fall back to generic V2 admission: {fault_name}"
+        );
+        let after_batch_logs = stores
+            .iter()
+            .map(|voter| voter.status().last_log_index)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after_batch_logs, before_batch_logs,
+            "a stale public warm hint must fail before any Openraft proposal: {fault_name}"
+        );
     }
 }
 
@@ -1458,15 +1742,92 @@ async fn pace_release_phase(phase_started: Instant, submitted: usize, per_second
     }
 }
 
-#[cfg(debug_assertions)]
-fn require_release_qualification_profile() {
-    panic!(
-        "SDK-702 release qualification requires cargo test --release; debug-profile output is non-acceptance evidence"
-    );
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QualificationBuildProfile {
+    cargo_profile_family: &'static str,
+    cargo_opt_level: &'static str,
+    debug_assertions: bool,
 }
 
-#[cfg(not(debug_assertions))]
-fn require_release_qualification_profile() {}
+impl QualificationBuildProfile {
+    const fn observed() -> Self {
+        Self {
+            cargo_profile_family: env!("OPC_SESSION_STORE_CARGO_PROFILE_FAMILY"),
+            cargo_opt_level: env!("OPC_SESSION_STORE_CARGO_OPT_LEVEL"),
+            debug_assertions: cfg!(debug_assertions),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QualificationBuildProfileError {
+    NotReleaseQualified,
+}
+
+fn validate_release_qualification_profile(
+    profile: QualificationBuildProfile,
+) -> Result<(), QualificationBuildProfileError> {
+    if profile.cargo_profile_family == "release"
+        && profile.cargo_opt_level == "3"
+        && !profile.debug_assertions
+    {
+        Ok(())
+    } else {
+        Err(QualificationBuildProfileError::NotReleaseQualified)
+    }
+}
+
+fn require_release_qualification_profile() -> QualificationBuildProfile {
+    let profile = QualificationBuildProfile::observed();
+    if validate_release_qualification_profile(profile).is_err() {
+        panic!("SDK-702 release qualification requires the release profile contract");
+    }
+    profile
+}
+
+#[test]
+#[ignore = "release-profile sentinel for the ignored 1.01M qualification"]
+fn release_qualification_profile_guard() {
+    let profile = require_release_qualification_profile();
+    assert_eq!(validate_release_qualification_profile(profile), Ok(()));
+}
+
+#[test]
+fn release_qualification_build_profile_validation_matrix() {
+    let rejected = QualificationBuildProfileError::NotReleaseQualified;
+    assert_eq!(
+        validate_release_qualification_profile(QualificationBuildProfile {
+            cargo_profile_family: "release",
+            cargo_opt_level: "0",
+            debug_assertions: false,
+        }),
+        Err(rejected)
+    );
+    assert_eq!(
+        validate_release_qualification_profile(QualificationBuildProfile {
+            cargo_profile_family: "debug",
+            cargo_opt_level: "3",
+            debug_assertions: false,
+        }),
+        Err(rejected)
+    );
+    assert_eq!(
+        validate_release_qualification_profile(QualificationBuildProfile {
+            cargo_profile_family: "release",
+            cargo_opt_level: "3",
+            debug_assertions: true,
+        }),
+        Err(rejected)
+    );
+    assert_eq!(
+        validate_release_qualification_profile(QualificationBuildProfile {
+            cargo_profile_family: "release",
+            cargo_opt_level: "3",
+            debug_assertions: false,
+        }),
+        Ok(())
+    );
+}
 
 /// Full SDK-702 release workload through a real three-voter OpenRaft quorum.
 ///
@@ -1479,7 +1840,7 @@ fn require_release_qualification_profile() {}
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "SDK-702 real 1,010,000-operation three-voter release qualification"]
 async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() {
-    require_release_qualification_profile();
+    let build_profile = require_release_qualification_profile();
     let started = Instant::now();
     let directory = tempfile::tempdir().expect("SDK-702 release qualification directory");
     let start = Timestamp::from_offset_datetime(
@@ -1756,7 +2117,10 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         let (batch_p99, batch_p999, item_p99, item_p999) = latency.p99_and_p999();
         let achieved_ops_per_second = operations as f64 / elapsed.as_secs_f64();
         eprintln!(
-            "sdk-702 successor phase: cargo_profile=release name={phase_name} offered_ops_per_second={target_rate} achieved_ops_per_second={achieved_ops_per_second:.6} operations={operations} batch_samples={batch_samples} item_samples={item_samples} peak_unjoined_batch_task_slots={peak_unjoined_batch_task_slots} batch_p99_us={} batch_p999_us={} item_p99_us={} item_p999_us={} elapsed_ms={}",
+            "sdk-702 successor phase: cargo_profile_family={} cargo_opt_level={} debug_assertions={} name={phase_name} offered_ops_per_second={target_rate} achieved_ops_per_second={achieved_ops_per_second:.6} operations={operations} batch_samples={batch_samples} item_samples={item_samples} peak_unjoined_batch_task_slots={peak_unjoined_batch_task_slots} batch_p99_us={} batch_p999_us={} item_p99_us={} item_p999_us={} elapsed_ms={}",
+            build_profile.cargo_profile_family,
+            build_profile.cargo_opt_level,
+            build_profile.debug_assertions,
             batch_p99.as_micros(),
             batch_p999.as_micros(),
             item_p99.as_micros(),
@@ -1981,7 +2345,10 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         .collect::<Vec<_>>();
     let peak_rss_kib = process_peak_rss_kib();
     eprintln!(
-        "sdk-702 successor qualification: cargo_profile=release elapsed_ms={} topology_voters={} release_operations_committed={} active_reclaim_operations_committed=1 total_operations_committed={} rotations={} semantic_history_ceiling_bytes={} transient_exact_retries={} pre_reclaim_db_bytes_by_voter={database_bytes_before_reclaim_by_voter:?} pre_reclaim_snapshot_bytes_by_voter={snapshot_bytes_before_reclaim_by_voter:?} post_reclaim_db_bytes_by_voter={database_bytes_by_voter:?} post_reclaim_snapshot_bytes_by_voter={snapshot_bytes_by_voter:?} reclaimed_entries={} reclaim_remaining={} peak_rss_kib={peak_rss_kib}",
+        "sdk-702 successor qualification: cargo_profile_family={} cargo_opt_level={} debug_assertions={} elapsed_ms={} topology_voters={} release_operations_committed={} active_reclaim_operations_committed=1 total_operations_committed={} rotations={} semantic_history_ceiling_bytes={} transient_exact_retries={} pre_reclaim_db_bytes_by_voter={database_bytes_before_reclaim_by_voter:?} pre_reclaim_snapshot_bytes_by_voter={snapshot_bytes_before_reclaim_by_voter:?} post_reclaim_db_bytes_by_voter={database_bytes_by_voter:?} post_reclaim_snapshot_bytes_by_voter={snapshot_bytes_by_voter:?} reclaimed_entries={} reclaim_remaining={} peak_rss_kib={peak_rss_kib}",
+        build_profile.cargo_profile_family,
+        build_profile.cargo_opt_level,
+        build_profile.debug_assertions,
         started.elapsed().as_millis(),
         stores.len(),
         QUALIFICATION_RELEASE_TRANSITIONS,

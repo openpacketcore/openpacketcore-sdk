@@ -41,6 +41,7 @@ use opc_session_store::{
 use opc_types::{NetworkFunctionKind, TenantId};
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const MEMBER_COUNT: usize = 3;
@@ -64,6 +65,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 // fault-gap so a delayed peer response can never satisfy this assertion.
 const ATTESTATION_PROBE_TIMER_DISPATCH_TOLERANCE: Duration = Duration::from_millis(250);
 const MAX_CAPTURED_CONSENSUS_PAYLOADS: usize = 4_096;
+const MAX_CAPTURED_INSTALL_SNAPSHOT_OBSERVATIONS: usize = 64;
 // Keep the bounded election qualification from competing with the deliberately
 // expensive snapshot-compaction qualification under the parallel test harness.
 static ELECTION_AND_SNAPSHOT_TEST_PERMIT: tokio::sync::Semaphore =
@@ -86,6 +88,42 @@ struct AppendEntriesRequestDelay {
     delay_millis: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InstallSnapshotObservation {
+    snapshot_id: String,
+    offset: u64,
+    len: usize,
+    data_sha256: [u8; 32],
+    done: bool,
+}
+
+// This mirrors only the wire shape needed by the transport qualification. It
+// keeps snapshot bytes transient while the observation retains their digest.
+#[derive(Deserialize)]
+struct InstallSnapshotRequestObservation {
+    _vote: opc_consensus::engine::Vote<SessionConsensusNodeId>,
+    meta: opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    offset: u64,
+    data: Vec<u8>,
+    done: bool,
+}
+
+fn install_snapshot_observation(
+    request: &SessionConsensusWireRequest,
+) -> Option<InstallSnapshotObservation> {
+    let request = decode_bounded::<InstallSnapshotRequestObservation>(&request.payload).ok()?;
+    Some(InstallSnapshotObservation {
+        snapshot_id: request.meta.snapshot_id,
+        offset: request.offset,
+        len: request.data.len(),
+        data_sha256: Sha256::digest(&request.data).into(),
+        done: request.done,
+    })
+}
+
 #[derive(Clone)]
 struct LoopbackPeer {
     target: SessionConsensusNodeId,
@@ -102,6 +140,12 @@ struct LoopbackPeer {
     delayed_calls: Arc<AtomicUsize>,
     fenced_transition_v2_capability_probe_calls: Arc<AtomicUsize>,
     captured_payloads: Arc<StdMutex<Vec<Bytes>>>,
+    install_snapshot_responses_to_drop: Arc<AtomicUsize>,
+    dropped_install_snapshot_responses: Arc<AtomicUsize>,
+    install_snapshot_observations: Arc<StdMutex<Vec<InstallSnapshotObservation>>>,
+    dropped_install_snapshot_observation: Arc<StdMutex<Option<InstallSnapshotObservation>>>,
+    install_snapshot_observation_notify: Arc<tokio::sync::Notify>,
+    install_snapshot_response_drop_notify: Arc<tokio::sync::Notify>,
 }
 
 impl LoopbackPeer {
@@ -121,6 +165,12 @@ impl LoopbackPeer {
             delayed_calls: Arc::new(AtomicUsize::new(0)),
             fenced_transition_v2_capability_probe_calls: Arc::new(AtomicUsize::new(0)),
             captured_payloads: Arc::new(StdMutex::new(Vec::new())),
+            install_snapshot_responses_to_drop: Arc::new(AtomicUsize::new(0)),
+            dropped_install_snapshot_responses: Arc::new(AtomicUsize::new(0)),
+            install_snapshot_observations: Arc::new(StdMutex::new(Vec::new())),
+            dropped_install_snapshot_observation: Arc::new(StdMutex::new(None)),
+            install_snapshot_observation_notify: Arc::new(tokio::sync::Notify::new()),
+            install_snapshot_response_drop_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -231,6 +281,61 @@ impl LoopbackPeer {
             "consensus payload qualification capture was saturated"
         );
         captured
+    }
+
+    fn arm_one_install_snapshot_response_loss(&self) {
+        self.install_snapshot_responses_to_drop
+            .store(1, Ordering::SeqCst);
+        self.dropped_install_snapshot_responses
+            .store(0, Ordering::SeqCst);
+        self.install_snapshot_observations
+            .lock()
+            .expect("snapshot observation mutex")
+            .clear();
+        self.dropped_install_snapshot_observation
+            .lock()
+            .expect("dropped snapshot observation mutex")
+            .take();
+    }
+
+    fn dropped_install_snapshot_responses(&self) -> usize {
+        self.dropped_install_snapshot_responses
+            .load(Ordering::SeqCst)
+    }
+
+    fn dropped_install_snapshot_observation(&self) -> Option<InstallSnapshotObservation> {
+        self.dropped_install_snapshot_observation
+            .lock()
+            .expect("dropped snapshot observation mutex")
+            .clone()
+    }
+
+    fn observed_install_snapshot_retry(&self, dropped: &InstallSnapshotObservation) -> bool {
+        let observations = self
+            .install_snapshot_observations
+            .lock()
+            .expect("snapshot observation mutex");
+        assert!(
+            observations.len() < MAX_CAPTURED_INSTALL_SNAPSHOT_OBSERVATIONS,
+            "snapshot response-loss observation capture was saturated"
+        );
+        observations
+            .iter()
+            .position(|observation| observation == dropped)
+            .is_some_and(|position| {
+                observations
+                    .iter()
+                    .skip(position + 1)
+                    .any(|observation| observation == dropped)
+            })
+    }
+
+    fn install_snapshot_observation_notification(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.install_snapshot_observation_notify)
+    }
+
+    fn install_snapshot_response_drop_notification(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.install_snapshot_response_drop_notify)
     }
 }
 
@@ -393,7 +498,41 @@ impl SessionConsensusPeer for LoopbackPeer {
             .ok_or(SessionConsensusPeerError::Unavailable)?;
         let sender = request.sender;
         let family = request.family;
+        let snapshot_observation = (family == SessionConsensusRpcFamily::InstallSnapshot)
+            .then(|| install_snapshot_observation(&request))
+            .flatten();
         let response = handler.handle(sender, request).await;
+
+        if family == SessionConsensusRpcFamily::InstallSnapshot && response.result.is_ok() {
+            if let Some(observation) = snapshot_observation {
+                let mut observations = self
+                    .install_snapshot_observations
+                    .lock()
+                    .expect("snapshot observation mutex");
+                if observations.len() < MAX_CAPTURED_INSTALL_SNAPSHOT_OBSERVATIONS {
+                    observations.push(observation.clone());
+                }
+                drop(observations);
+                self.install_snapshot_observation_notify.notify_one();
+
+                if self
+                    .install_snapshot_responses_to_drop
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    *self
+                        .dropped_install_snapshot_observation
+                        .lock()
+                        .expect("dropped snapshot observation mutex") = Some(observation);
+                    self.dropped_install_snapshot_responses
+                        .fetch_add(1, Ordering::SeqCst);
+                    self.install_snapshot_response_drop_notify.notify_one();
+                    return Err(SessionConsensusPeerError::Unavailable);
+                }
+            }
+        }
 
         if family == SessionConsensusRpcFamily::ForwardMutation {
             let delay = self.forward_response_delay_millis.load(Ordering::SeqCst);
@@ -5084,7 +5223,45 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
     .await
     .expect("majority compacts beyond the isolated follower");
 
+    let snapshot_leader = [1, 2]
+        .into_iter()
+        .find(|index| {
+            let status = cluster.stores[*index].status();
+            status.leader_id == Some(status.node_id)
+        })
+        .expect("surviving majority has a snapshot leader");
+    let lagging_snapshot_path = Arc::clone(
+        cluster
+            .paths
+            .get(&(snapshot_leader, 0))
+            .expect("leader-to-lagging snapshot path"),
+    );
+    lagging_snapshot_path.arm_one_install_snapshot_response_loss();
+    let response_dropped = lagging_snapshot_path.install_snapshot_response_drop_notification();
+    let observation_recorded = lagging_snapshot_path.install_snapshot_observation_notification();
+
     cluster.heal(0);
+    tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, response_dropped.notified())
+        .await
+        .expect("lagging follower accepts one snapshot request before its response is lost");
+    assert_eq!(
+        1,
+        lagging_snapshot_path.dropped_install_snapshot_responses(),
+        "exactly one accepted snapshot response is lost"
+    );
+    let dropped_observation = lagging_snapshot_path
+        .dropped_install_snapshot_observation()
+        .expect("dropped snapshot response retains a bounded digest observation");
+    tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
+        loop {
+            if lagging_snapshot_path.observed_install_snapshot_retry(&dropped_observation) {
+                return;
+            }
+            observation_recorded.notified().await;
+        }
+    })
+    .await
+    .expect("leader retries the identical accepted snapshot request after response loss");
     if cluster
         .wait_all_ready(SNAPSHOT_RECOVERY_TIMEOUT)
         .await
@@ -5116,6 +5293,21 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
         recovered_progress.state()
     );
     assert!(recovered_progress.local_applied_index() >= compacted.snapshot_index());
+    let (recovered_leader, _, _) = cluster.observed_leader();
+    let leader_progress = cluster.stores[recovered_leader]
+        .probe_durable_readiness()
+        .await
+        .recovery_progress();
+    assert_eq!(
+        leader_progress.local_applied_index(),
+        recovered_progress.local_applied_index(),
+        "follower applied index converges after the lost snapshot response retry"
+    );
+    assert_eq!(
+        leader_progress.snapshot_index(),
+        recovered_progress.snapshot_index(),
+        "follower snapshot index converges after the lost snapshot response retry"
+    );
 }
 
 #[tokio::test]

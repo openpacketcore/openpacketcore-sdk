@@ -9670,7 +9670,7 @@ fn run_persistent_consumer_v2_multiprocess_qualification() {
         .build()
         .expect("V2 consumer qualification runtime");
     let consumer_identity_state = fleet.pki.consumer_identity_state(&consumer_identity);
-    let client_for = |node_index: usize| {
+    let client_for = |node_index: usize, operation_timeout: Option<Duration>| {
         let (_identity_source, identity_receiver) =
             watch::channel(Some(consumer_identity_state.clone()));
         let tls = TlsConfigBuilder::new(identity_receiver)
@@ -9694,13 +9694,17 @@ fn run_persistent_consumer_v2_multiprocess_qualification() {
             scope,
             tls,
         );
+        let stateless = match operation_timeout {
+            Some(timeout) => stateless.with_operation_timeout(timeout),
+            None => stateless,
+        };
         PersistentSessionConsumerClient::try_from_stateless(
             stateless,
             PersistentSessionConsumerConfig::default(),
         )
         .expect("fixed persistent V2 consumer configuration")
     };
-    let client = client_for(0);
+    let client = client_for(0, None);
     runtime
         .block_on(client.prewarm_v2())
         .expect("prewarm fixed V2 pool");
@@ -9841,7 +9845,7 @@ fn run_persistent_consumer_v2_multiprocess_qualification() {
         );
         thread::sleep(Duration::from_millis(50));
     };
-    let replacement_client = client_for(replacement);
+    let replacement_client = client_for(replacement, None);
     assert_eq!(
         runtime
             .block_on(replacement_client.execute_v2(&first_status))
@@ -9895,7 +9899,11 @@ fn run_persistent_consumer_v2_multiprocess_qualification() {
         );
         thread::sleep(Duration::from_millis(50));
     }
-    fleet.arm_stateless_consumer_outcome_unknown(replacement);
+    let delayed_client = client_for(replacement, Some(DELAYED_CONSUMER_CLIENT_DEADLINE));
+    runtime
+        .block_on(delayed_client.prewarm_v2())
+        .expect("prewarm the bounded delayed-response V2 client");
+    fleet.arm_stateless_consumer_delayed_response(replacement);
     let ambiguous = runtime.block_on(qualification_fenced_transition_v2_request(MEMBER_COUNT, 2));
     let ambiguous_execute = SessionConsumerV2Request::new(
         scope,
@@ -9905,13 +9913,14 @@ fn run_persistent_consumer_v2_multiprocess_qualification() {
     );
     assert_eq!(
         runtime
-            .block_on(replacement_client.execute_v2(&ambiguous_execute))
+            .block_on(delayed_client.execute_v2(&ambiguous_execute))
             .expect_err("post-commit V2 response-loss must be ambiguous"),
         PersistentSessionConsumerV2ExecuteError::OutcomeUnknown {
             request_id: ambiguous.request_id(),
         },
         "the post-commit response-loss seam returns the exact caller-retained V2 ID"
     );
+    drop(delayed_client);
     let ambiguous_status = SessionConsumerV2Request::new(
         scope,
         SessionConsumerV2Operation::FencedTransitionV2Status {
@@ -10699,7 +10708,41 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         .await;
     });
 
-    fleet.arm_stateless_consumer_outcome_unknown(replacement);
+    let (delayed_identity_source, delayed_identity_receiver) = watch::channel(Some(
+        fleet
+            .pki
+            .consumer_identity_state(&consumer_identities[replacement]),
+    ));
+    let delayed_tls = TlsConfigBuilder::new(delayed_identity_receiver)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("delayed V2 batch client mTLS configuration");
+    let delayed_initial_endpoint = endpoints
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)[replacement];
+    let delayed_resolved_endpoints = Arc::clone(&endpoints);
+    let delayed_resolver: RemoteAddrResolver = Arc::new(move || {
+        let endpoint = delayed_resolved_endpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[replacement];
+        Box::pin(async move { Ok(endpoint) })
+    });
+    let delayed_stateless = StatelessSessionConsumerClient::new_with_resolver(
+        delayed_resolver,
+        rustls_pki_types::ServerName::IpAddress(delayed_initial_endpoint.ip().into()),
+        SpiffeId::new(spiffe_id(replacement))
+            .expect("delayed V2 batch exact server SPIFFE identity"),
+        scope,
+        delayed_tls,
+    )
+    .with_operation_timeout(DELAYED_CONSUMER_CLIENT_DEADLINE);
+    let delayed_client =
+        PersistentSessionConsumerClient::try_from_stateless(delayed_stateless, pool_config)
+            .expect("bounded delayed-response V2 batch client");
+    runtime
+        .block_on(delayed_client.prewarm_v2())
+        .expect("prewarm the delayed-response V2 batch client");
+    fleet.arm_stateless_consumer_delayed_response(replacement);
     let ambiguous_requests = runtime.block_on(qualification_build_v2_batches(
         MEMBER_COUNT,
         1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
@@ -10710,14 +10753,13 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         .into_iter()
         .next()
         .expect("one bounded ambiguity batch");
-    let ambiguous_response = runtime.block_on(clients[replacement].execute_v2(
-        &SessionConsumerV2Request::new(
+    let ambiguous_response =
+        runtime.block_on(delayed_client.execute_v2(&SessionConsumerV2Request::new(
             scope,
             SessionConsumerV2Operation::FencedTransitionV2Batch {
                 requests: ambiguous_requests.clone(),
             },
-        ),
-    ));
+        )));
     assert_eq!(
         ambiguous_response.expect_err("post-commit V2 batch response loss is ambiguous"),
         PersistentSessionConsumerV2ExecuteError::OutcomeUnknownBatch {
@@ -10728,6 +10770,8 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         },
         "ambiguity retains every ordered complete V2 ID and forbids replay"
     );
+    runtime.block_on(delayed_client.shutdown());
+    drop(delayed_identity_source);
     runtime.block_on(async {
         for request in ambiguous_requests {
             qualification_execute_v2_status_sample(

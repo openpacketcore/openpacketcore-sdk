@@ -10,7 +10,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
-use futures_util::StreamExt;
 use opc_consensus::{
     decode_bounded, derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch,
     ConsensusIdentity, DURABLE_CONSENSUS_TIMING_PROFILE,
@@ -22,14 +21,14 @@ use opc_key::{
 };
 use opc_session_net::{
     conservative_payload_budget, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-    RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId,
-    SessionConfigurationGeneration, SessionConsensusServer, SessionConsensusServerHandle,
-    SessionConsumerAuthorizer, SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
-    SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionQuorumConsumerServer,
-    SessionReauthenticationControl, SessionReplicationManifest, StatelessSessionConsumerClient,
-    PersistentSessionConsumerV2ExecuteError,
+    PersistentSessionConsumerV2ExecuteError, RemoteAddrResolver, RemoteSessionConsensusPeer,
+    SessionClusterId, SessionConfigurationGeneration, SessionConsensusServer,
+    SessionConsensusServerHandle, SessionConsumerAuthorizer, SessionConsumerClientError,
+    SessionConsumerFencedTransitionBackend, SessionConsumerLeaseMutationError,
+    SessionConsumerMutationError, SessionQuorumConsumerServer, SessionReauthenticationControl,
+    SessionReplicationManifest, StatelessSessionConsumerClient,
     DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT, MAX_NEGOTIATED_FRAME_SIZE,
-    SESSION_QUORUM_CONSUMER_ALPN, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+    SESSION_QUORUM_CONSUMER_ALPN,
 };
 use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, ConsensusSessionStore,
@@ -528,112 +527,159 @@ impl ThreeVoterConsumerFleet {
         .expect("survivors elect a new leader")
     }
 
-    async fn wait_for_split_vote(
+    async fn probe_vote_state(
         &self,
-        excluded: usize,
+        source: usize,
+        target: usize,
         previous_term: u64,
         deadline: tokio::time::Instant,
-    ) -> u64 {
-        tokio::time::timeout_at(deadline, async {
-            loop {
-                let statuses = (0..THREE_VOTER_COUNT)
-                    .filter(|index| *index != excluded)
-                    .map(|index| self.stores[index].status())
-                    .collect::<Vec<_>>();
-                let term = statuses.first().expect("surviving voter").term;
-                if term > previous_term
-                    && statuses
-                        .iter()
-                        .all(|status| status.term == term && status.leader_id.is_none())
-                {
-                    return term;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("survivors expose the expected split vote")
-    }
-
-    /// Break the test-runtime's observed same-tick split with one valid,
-    /// authenticated Raft Vote request over the production mTLS transport.
-    /// The target persists its ordinary OpenRaft vote, staggering one real
-    /// voter; either survivor must subsequently establish the later normal
-    /// quorum election before this test proceeds.  This never invokes the
-    /// state machine or fabricates an engine response.
-    async fn pregrant_successor_after_split(
-        &self,
-        successor: usize,
-        voter: usize,
-        previous_term: u64,
-        previous_leader: SessionConsensusNodeId,
-        split_term: u64,
-        deadline: tokio::time::Instant,
-    ) {
-        let successor_status = self.stores[successor].status();
-        let voter_status = self.stores[voter].status();
-        let last_log_index = successor_status
-            .last_log_index
-            .expect("successor has committed transition before tie-break");
-        assert_eq!(
-            Some(last_log_index),
-            voter_status.last_log_index,
-            "both surviving voters retain the exact committed log before the tie-break"
-        );
-        assert_eq!(
-            Some(last_log_index),
-            successor_status.applied_index,
-            "the successor has applied the exact advertised log before the tie-break"
-        );
-        assert_eq!(
-            Some(last_log_index),
-            voter_status.applied_index,
-            "the voter has applied the exact advertised log before the tie-break"
-        );
-        let peer = Arc::clone(
-            self.consensus_peers
-                .get(&(successor, voter))
-                .expect("selected successor has the installed mTLS peer"),
-        );
-        let next_term = split_term
-            .checked_add(1)
-            .expect("bounded test election term");
-        let vote = opc_consensus::engine::Vote::new(next_term, successor_status.node_id);
+    ) -> opc_consensus::engine::raft::VoteResponse<SessionConsensusNodeId> {
+        let source_id = self.stores[source].status().node_id;
         let request = opc_consensus::engine::raft::VoteRequest::new(
-            vote,
-            Some(opc_consensus::engine::LogId::new(
-                opc_consensus::engine::CommittedLeaderId::new(previous_term, previous_leader),
-                last_log_index,
-            )),
+            opc_consensus::engine::Vote::new(previous_term, source_id),
+            None,
         );
         let wire = SessionConsensusWireRequest::try_new(
             self.manifest.consensus_identity(),
-            successor_status.node_id,
+            source_id,
             opc_session_store::SessionConsensusRpcFamily::Vote,
-            opc_consensus::encode_bounded(&request).expect("bounded election vote request"),
+            opc_consensus::encode_bounded(&request).expect("bounded stale vote probe"),
         )
-        .expect("scoped election vote request");
-        let payload = peer
+        .expect("scoped stale vote probe");
+        let payload = self
+            .consensus_peers
+            .get(&(source, target))
+            .expect("reverse survivor mTLS peer")
             .call_with_timeout(
                 wire,
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await
-            .expect("tie-break vote reaches surviving mTLS voter")
+            .expect("stale vote probe reaches surviving mTLS voter")
             .result
-            .expect("surviving voter accepts authenticated vote envelope");
+            .expect("surviving voter accepts authenticated stale vote envelope");
         let response = decode_bounded::<
             Result<
                 opc_consensus::engine::raft::VoteResponse<SessionConsensusNodeId>,
                 opc_consensus::engine::error::RaftError<SessionConsensusNodeId>,
             >,
         >(&payload)
-        .expect("decode tie-break vote response")
-        .expect("OpenRaft processes tie-break vote");
+        .expect("decode stale vote probe response")
+        .expect("OpenRaft processes stale vote probe");
         assert!(
-            response.vote_granted && response.vote == vote,
-            "the target durably pre-grants only the selected successor's next normal campaign"
+            !response.vote_granted,
+            "the stale authenticated probe cannot mutate the target vote"
         );
+        response
+    }
+
+    /// Observe the two ordinary survivor votes with stale authenticated
+    /// probes. Only an exact pair of noncommitted, incomparable votes permits
+    /// one ordinary tie-break request, which advertises the selected voter's
+    /// exact returned log ID. Compatible or committed votes are left to
+    /// converge naturally under the same absolute deadline.
+    async fn pregrant_successor_after_split(
+        &self,
+        preferred_successor: usize,
+        other_survivor: usize,
+        previous_term: u64,
+        previous_leader: SessionConsensusNodeId,
+        deadline: tokio::time::Instant,
+    ) -> u64 {
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                let preferred_status = self.stores[preferred_successor].status();
+                let other_status = self.stores[other_survivor].status();
+                if let Some(leader) = preferred_status.leader_id {
+                    if leader != previous_leader
+                        && preferred_status.term > previous_term
+                        && other_status.leader_id == Some(leader)
+                        && other_status.term == preferred_status.term
+                    {
+                        return preferred_status.term;
+                    }
+                }
+
+                let preferred_response = self
+                    .probe_vote_state(other_survivor, preferred_successor, previous_term, deadline)
+                    .await;
+                let other_response = self
+                    .probe_vote_state(preferred_successor, other_survivor, previous_term, deadline)
+                    .await;
+                let observed_term = preferred_response
+                    .vote
+                    .leader_id()
+                    .get_term()
+                    .max(other_response.vote.leader_id().get_term());
+                if observed_term > previous_term
+                    && !preferred_response.vote.is_committed()
+                    && !other_response.vote.is_committed()
+                    && preferred_response
+                        .vote
+                        .partial_cmp(&other_response.vote)
+                        .is_none()
+                {
+                    let (successor, voter, successor_response) = match preferred_response
+                        .last_log_id
+                        .cmp(&other_response.last_log_id)
+                    {
+                        std::cmp::Ordering::Less => {
+                            (other_survivor, preferred_successor, &other_response)
+                        }
+                        std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
+                            (preferred_successor, other_survivor, &preferred_response)
+                        }
+                    };
+                    let successor_id = self.stores[successor].status().node_id;
+                    let next_term = observed_term
+                        .checked_add(1)
+                        .expect("bounded test election term");
+                    let vote = opc_consensus::engine::Vote::new(next_term, successor_id);
+                    let request = opc_consensus::engine::raft::VoteRequest::new(
+                        vote,
+                        successor_response.last_log_id,
+                    );
+                    let wire = SessionConsensusWireRequest::try_new(
+                        self.manifest.consensus_identity(),
+                        successor_id,
+                        opc_session_store::SessionConsensusRpcFamily::Vote,
+                        opc_consensus::encode_bounded(&request)
+                            .expect("bounded election vote request"),
+                    )
+                    .expect("scoped election vote request");
+                    let payload = self
+                        .consensus_peers
+                        .get(&(successor, voter))
+                        .expect("selected successor has the installed mTLS peer")
+                        .call_with_timeout(
+                            wire,
+                            deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .await
+                        .expect("tie-break vote reaches surviving mTLS voter")
+                        .result
+                        .expect("surviving voter accepts authenticated vote envelope");
+                    let response = decode_bounded::<
+                        Result<
+                            opc_consensus::engine::raft::VoteResponse<SessionConsensusNodeId>,
+                            opc_consensus::engine::error::RaftError<SessionConsensusNodeId>,
+                        >,
+                    >(&payload)
+                    .expect("decode tie-break vote response")
+                    .expect("OpenRaft processes tie-break vote");
+                    if response.vote_granted {
+                        assert_eq!(
+                            response.vote, vote,
+                            "the target grants only the exact authenticated tie-break vote"
+                        );
+                    }
+                    return next_term.max(response.vote.leader_id().get_term());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("survivor votes converge or expose an exact authenticated split")
     }
 }
 
@@ -2761,30 +2807,25 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
     fleet.isolate(old_leader).await;
     let election_deadline = tokio::time::Instant::now() + THREE_VOTER_ELECTION_RECOVERY_TIMEOUT;
     let split_term = fleet
-        .wait_for_split_vote(old_leader, old_term, election_deadline)
-        .await;
-    assert_eq!(
-        old_term + 1,
-        split_term,
-        "the tie-break runs only after the observed first normal split vote"
-    );
-    fleet
         .pregrant_successor_after_split(
             initial_follower,
             tie_break_voter,
             old_term,
             old_leader_id,
-            split_term,
             election_deadline,
         )
         .await;
+    assert!(
+        split_term > old_term,
+        "the authenticated probes cannot advance or resolve the prior leader term"
+    );
     let new_leader = fleet
         .wait_for_new_leader(old_leader, old_leader_id, old_term, election_deadline)
         .await;
     assert_ne!(new_leader, old_leader, "leader changes after commit");
     assert!(
-        fleet.stores[new_leader].status().term > split_term,
-        "the authenticated pre-grant does not itself establish the final leader"
+        fleet.stores[new_leader].status().term >= split_term,
+        "the final leader preserves or advances the exact observed vote term"
     );
     let status_target = (0..THREE_VOTER_COUNT)
         .find(|index| *index != old_leader && *index != new_leader)
@@ -2860,16 +2901,26 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
         .last_log_index
         .expect("committed transition log index");
     tokio::time::timeout(Duration::from_secs(5 * 60), async {
-        futures_util::stream::iter(0..SNAPSHOT_COMMANDS)
-            .map(|_| fleet.stores[new_leader].max_replication_sequence())
-            .buffer_unordered(16)
-            .for_each(|result| async {
-                result.expect("commit logical-time entry for snapshot qualification");
-            })
-            .await;
+        // Each command must finish before the next begins. Concurrent
+        // logical-time reads intentionally share one bounded consensus
+        // proposal, while this proof must cross the production snapshot-log
+        // threshold with distinct committed entries.
+        for _ in 0..SNAPSHOT_COMMANDS {
+            fleet.stores[new_leader]
+                .max_replication_sequence()
+                .await
+                .expect("commit logical-time entry for snapshot qualification");
+        }
     })
     .await
     .expect("snapshot qualification command batch completes");
+    assert!(
+        fleet.stores[new_leader]
+            .status()
+            .last_log_index
+            .is_some_and(|index| index >= transition_log_index + SNAPSHOT_COMMANDS as u64),
+        "the qualification workload crosses the production snapshot-log threshold"
+    );
     tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
         loop {
             let progress = fleet.stores[new_leader]

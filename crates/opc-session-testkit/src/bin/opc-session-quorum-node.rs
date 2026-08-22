@@ -45,13 +45,12 @@ use opc_session_store::{
     SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
     SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerChange,
-    SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
-    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response, SessionKey,
-    SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer,
-    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
-    ValidatedQuorumTopology,
+    SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerStoreError, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionOpResult, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
+    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
     qualification_key_bytes_sha256, qualification_owner_sha256, qualification_state_type_sha256,
@@ -404,33 +403,27 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
         identity: &SessionConsumerIdentity,
         request: SessionConsumerV2Request,
     ) -> SessionConsumerV2Response {
-        let outcome_unknown = match request.operation() {
-            SessionConsumerV2Operation::FencedTransitionV2 { .. } => {
-                Some(OutcomeUnknownV2Response::Singleton)
-            }
-            SessionConsumerV2Operation::FencedTransitionV2Batch { requests } => {
-                Some(OutcomeUnknownV2Response::Batch(
-                    requests
-                        .iter()
-                        .map(|request| request.request_id())
-                        .collect(),
-                ))
-            }
-            _ => None,
-        };
+        let mutation = matches!(
+            request.operation(),
+            SessionConsumerV2Operation::FencedTransitionV2 { .. }
+                | SessionConsumerV2Operation::FencedTransitionV2Batch { .. }
+        );
         let response = self.inner.execute_v2(identity, request).await;
-        if let Some(outcome_unknown) = outcome_unknown {
-            if outcome_unknown.matches(&response)
-                && self
-                    .armed
-                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-            {
-                // This qualification-only seam withholds an already produced
-                // response; it does not bypass or alter the real consumer,
-                // consensus, or SQLite execution path.
-                return outcome_unknown.response();
-            }
+        if mutation
+            && matches!(
+                &response,
+                SessionConsumerV2Response::FencedTransitionV2(Ok(_))
+                    | SessionConsumerV2Response::FencedTransitionV2Batch(Ok(_))
+            )
+            && self
+                .armed
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            // Withhold the real successful response beyond the caller's
+            // bounded deadline. The qualification seam never fabricates a
+            // server-side ambiguity result or bypasses durable execution.
+            tokio::time::sleep(QUALIFICATION_DELAYED_CONSUMER_RESPONSE).await;
         }
         response
     }
@@ -445,39 +438,6 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
         SessionConsumerRejection,
     > {
         self.inner.watch(identity, scope, start_sequence).await
-    }
-}
-
-enum OutcomeUnknownV2Response {
-    Singleton,
-    Batch(Vec<opc_session_store::FencedTransitionV2RequestId>),
-}
-
-impl OutcomeUnknownV2Response {
-    fn matches(&self, response: &SessionConsumerV2Response) -> bool {
-        matches!(
-            (self, response),
-            (
-                Self::Singleton,
-                SessionConsumerV2Response::FencedTransitionV2(Ok(_))
-            ) | (
-                Self::Batch(_),
-                SessionConsumerV2Response::FencedTransitionV2Batch(Ok(_))
-            )
-        )
-    }
-
-    fn response(self) -> SessionConsumerV2Response {
-        match self {
-            Self::Singleton => SessionConsumerV2Response::FencedTransitionV2(Err(
-                SessionConsumerV2FencedTransitionError::OutcomeUnknown,
-            )),
-            Self::Batch(request_ids) => SessionConsumerV2Response::FencedTransitionV2Batch(Err(
-                opc_session_store::consumer::SessionConsumerV2FencedTransitionBatchError::OutcomeUnknown {
-                    request_ids,
-                },
-            )),
-        }
     }
 }
 

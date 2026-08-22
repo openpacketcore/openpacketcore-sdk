@@ -74,13 +74,16 @@ eight-epoch/1,010,000-operation check is intentionally part of release
 qualification rather than being silently reduced.
 
 `fenced_transition_v2_qualification::sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity`
-is retained only as the historical pre-successor three-voter artifact. It
-performed 131,074 unique attempts through Openraft and SQLite apply: 131,072
+is retained only as the historical reclaim-then-successor three-voter
+artifact. It performed 131,074 unique attempts through Openraft and SQLite apply: 131,072
 admitted into epoch 1, one deterministic one-over rejection, and one
-successor-epoch commit after immediate capacity rotation, with no reclamation.
-It does not prove
+successor-epoch commit after all 131,072 bindings were reclaimed in ordered
+1,024-row batches. It does not prove
 the current active-plus-seven-replay lifecycle; the successor-scale release
-gate below is authoritative for that contract.
+gate below is authoritative for that contract. Current immediate rotation
+while a replay slot remains free is separate focused evidence from
+`fenced_transition_v2_capacity_opens_successor_and_bounds_eight_exact_epochs`;
+it is not attributed retroactively to the historical `cc9ac896` run.
 
 The frozen pre-fix V1 RED is preserved separately by
 `sqlite::consensus::tests::frozen_v1_history_cap_is_absorbing_after_every_binding_applies`.
@@ -198,8 +201,8 @@ tree `fbccc8fd5546c6bdefc6aee54bfe0d36b1012f63`):
   committed unique transitions: 131,073
   epoch-1 bindings admitted: 131,072
   deterministic one-over rejections without business-state effect: 1
-  reclaimed bindings: 0
-  successor-epoch transitions committed after immediate capacity rotation: 1
+  reclaimed bindings: 131,072 in ordered 1,024-row batches
+  successor-epoch transitions committed after reclamation: 1
   transient exact-ID/body retries: 2,214
   database envelope: 2,182,756,256 bytes
   snapshot envelope: 2,077,053,072 bytes

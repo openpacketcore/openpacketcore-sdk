@@ -62,6 +62,10 @@ const SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS: usize = 3;
 const SQLITE_OPERATION_MAX_WORK: Duration = Duration::from_secs(2);
 const SQLITE_BUSY_TIMEOUT_MILLIS: u64 = 100;
 const SQLITE_OPERATION_PROGRESS_INTERVAL: i32 = 1_000;
+// Keep the file-backed writer's automatic WAL checkpoint threshold explicit.
+// This is SQLite's default, but the writer owns checkpoint policy rather than
+// acceptance readers, whose return path must remain a pure health check.
+const SQLITE_WRITER_WAL_AUTOCHECKPOINT_PAGES: i32 = 1_000;
 
 pub(crate) fn validate_consensus_record(record: &StoredSessionRecord) -> Result<(), StoreError> {
     let actual = record.payload.len();
@@ -246,6 +250,7 @@ pub struct SqliteSessionBackend {
     // allocation. In-memory stores retain their single-connection behavior.
     consensus_acceptance_reader_pool: Option<Arc<ConsensusAcceptanceReaderPool>>,
     database_path: Option<Arc<PathBuf>>,
+    consensus_snapshot_observation: Arc<consensus::SnapshotBuildObservation>,
     caps: BackendCapabilities,
     clock: Arc<dyn Clock>,
     restore_scan_workers: Arc<tokio::sync::Semaphore>,
@@ -356,7 +361,7 @@ impl ConsensusAcceptanceReaderPool {
         for _ in 0..SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS {
             let reader = Connection::open(database_path.as_ref())
                 .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
-            apply_pragma_profile(&reader, false)?;
+            apply_pragma_profile(&reader, false, false)?;
             sender.try_send(reader).map_err(|_| {
                 StoreError::BackendUnavailable("session acceptance reader pool unavailable".into())
             })?;
@@ -398,9 +403,6 @@ impl ConsensusAcceptanceReaderPool {
             && conn
                 .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
                 .is_ok()
-            // The passive checkpoint never waits for a writer. It ensures the
-            // next borrower starts from a clean WAL checkpoint discipline.
-            && conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)").is_ok()
     }
 
     fn replenish(&self) -> Option<Connection> {
@@ -409,7 +411,7 @@ impl ConsensusAcceptanceReaderPool {
             return None;
         }
         let reader = Connection::open(self.database_path.as_ref()).ok()?;
-        apply_pragma_profile(&reader, false).ok()?;
+        apply_pragma_profile(&reader, false, false).ok()?;
         Some(reader)
     }
 
@@ -550,7 +552,7 @@ impl SqliteSessionBackend {
         in_memory: bool,
         database_path: Option<PathBuf>,
     ) -> Result<Self, StoreError> {
-        apply_pragma_profile(&conn, in_memory)?;
+        apply_pragma_profile(&conn, in_memory, true)?;
 
         // Create table for storing session records
         conn.execute(
@@ -688,6 +690,7 @@ impl SqliteSessionBackend {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
             consensus_acceptance_reader_pool,
             database_path: database_path.map(Arc::new),
+            consensus_snapshot_observation: Arc::new(consensus::SnapshotBuildObservation::default()),
             caps: sqlite_capabilities(),
             clock: Arc::new(crate::clock::SystemClock),
             restore_scan_workers: Arc::new(tokio::sync::Semaphore::new(
@@ -1053,6 +1056,11 @@ impl SqliteSessionBackend {
     /// concrete volume identity.
     pub(crate) const fn is_file_backed(&self) -> bool {
         self.database_path.is_some()
+    }
+
+    /// Fixed-dimension observation shared by the consensus snapshot builder.
+    pub(crate) fn snapshot_observation(&self) -> Arc<consensus::SnapshotBuildObservation> {
+        Arc::clone(&self.consensus_snapshot_observation)
     }
 
     #[cfg(test)]
@@ -2355,7 +2363,11 @@ fn migrate_lease_acquired_at_schema(conn: &Connection) -> Result<(), StoreError>
     }
 }
 
-fn apply_pragma_profile(conn: &Connection, in_memory: bool) -> Result<(), StoreError> {
+fn apply_pragma_profile(
+    conn: &Connection,
+    in_memory: bool,
+    primary_write_connection: bool,
+) -> Result<(), StoreError> {
     if in_memory {
         conn.execute_batch(
             r#"
@@ -2379,6 +2391,23 @@ fn apply_pragma_profile(conn: &Connection, in_memory: bool) -> Result<(), StoreE
     .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
     conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MILLIS))
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+
+    if !in_memory && primary_write_connection {
+        conn.pragma_update(
+            None,
+            "wal_autocheckpoint",
+            SQLITE_WRITER_WAL_AUTOCHECKPOINT_PAGES,
+        )
+        .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        let wal_autocheckpoint: i32 = conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        if wal_autocheckpoint != SQLITE_WRITER_WAL_AUTOCHECKPOINT_PAGES {
+            return Err(StoreError::BackendUnavailable(
+                "failed to set SQLite WAL autocheckpoint threshold".into(),
+            ));
+        }
+    }
 
     let foreign_keys: i32 = conn
         .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
@@ -2853,6 +2882,7 @@ mod operation_lifetime_tests {
     };
     use bytes::Bytes;
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+    use rusqlite::hooks::{AuthAction, Authorization};
 
     fn key(stable_id: &'static [u8]) -> SessionKey {
         SessionKey {
@@ -3127,6 +3157,157 @@ mod operation_lifetime_tests {
         assert_eq!(
             pool.workers.available_permits(),
             SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS
+        );
+    }
+
+    #[tokio::test]
+    async fn file_backed_writer_sets_exact_wal_autocheckpoint_ceiling() {
+        let directory = tempfile::tempdir().expect("SQLite writer-profile directory");
+        let path = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
+        let writer = backend.conn.lock().await;
+        let wal_autocheckpoint: i32 = writer
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .expect("writer WAL autocheckpoint threshold");
+
+        assert_eq!(
+            wal_autocheckpoint, SQLITE_WRITER_WAL_AUTOCHECKPOINT_PAGES,
+            "the primary writer owns the fixed WAL autocheckpoint threshold",
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_reader_return_skips_checkpoint_and_next_transaction_sees_fresh_commit() {
+        let directory = tempfile::tempdir().expect("SQLite acceptance-reader directory");
+        let path = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
+        let pool = backend
+            .consensus_acceptance_reader_pool
+            .as_ref()
+            .expect("file-backed stores have acceptance readers");
+        {
+            let writer = backend.conn.lock().await;
+            writer
+                .execute_batch(
+                    "CREATE TABLE acceptance_reader_return_visibility (value INTEGER NOT NULL);",
+                )
+                .expect("create visibility table");
+        }
+
+        // Empty the channel so the returned reader is the next borrower. The
+        // two unreturned lanes are deliberately held only within this test.
+        let mut readers = {
+            let mut receiver = pool.receiver.lock().await;
+            let mut readers = Vec::with_capacity(SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS);
+            for _ in 0..SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS {
+                readers.push(receiver.recv().await.expect("reader pool lane"));
+            }
+            readers
+        };
+        let reader = readers.pop().expect("reader to return");
+        let checkpoint_attempts = Arc::new(AtomicUsize::new(0));
+        reader.authorizer(Some({
+            let checkpoint_attempts = Arc::clone(&checkpoint_attempts);
+            move |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                AuthAction::Pragma { pragma_name, .. }
+                    if pragma_name.eq_ignore_ascii_case("wal_checkpoint") =>
+                {
+                    checkpoint_attempts.fetch_add(1, Ordering::AcqRel);
+                    Authorization::Deny
+                }
+                _ => Authorization::Allow,
+            }
+        }));
+
+        let first = reader
+            .unchecked_transaction()
+            .expect("first reader transaction");
+        let first_visible: i64 = first
+            .query_row(
+                "SELECT COUNT(*) FROM acceptance_reader_return_visibility",
+                [],
+                |row| row.get(0),
+            )
+            .expect("first reader snapshot");
+        first.commit().expect("close first reader transaction");
+        assert_eq!(first_visible, 0);
+        {
+            let writer = backend.conn.lock().await;
+            writer
+                .execute(
+                    "INSERT INTO acceptance_reader_return_visibility (value) VALUES (1)",
+                    [],
+                )
+                .expect("writer commits fresh state");
+        }
+
+        let permit = pool
+            .workers
+            .clone()
+            .try_acquire_owned()
+            .expect("reader worker permit");
+        pool.return_or_retire(reader, permit);
+        assert_eq!(
+            checkpoint_attempts.load(Ordering::Acquire),
+            0,
+            "returning a reader never attempts a manual WAL checkpoint",
+        );
+
+        let returned = {
+            let mut receiver = pool.receiver.lock().await;
+            receiver.recv().await.expect("returned reader lane")
+        };
+        let next = returned
+            .unchecked_transaction()
+            .expect("next reader transaction");
+        let next_visible: i64 = next
+            .query_row(
+                "SELECT COUNT(*) FROM acceptance_reader_return_visibility",
+                [],
+                |row| row.get(0),
+            )
+            .expect("next reader snapshot");
+        next.commit().expect("close next reader transaction");
+        assert_eq!(
+            next_visible, 1,
+            "the next transaction sees the fresh commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_reader_health_requires_autocommit_and_select() {
+        let directory = tempfile::tempdir().expect("SQLite acceptance-reader directory");
+        let path = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
+        let pool = backend
+            .consensus_acceptance_reader_pool
+            .as_ref()
+            .expect("file-backed stores have acceptance readers");
+        let reader = {
+            let mut receiver = pool.receiver.lock().await;
+            receiver.recv().await.expect("reader pool lane")
+        };
+
+        assert!(pool.connection_is_usable(&reader));
+        reader
+            .execute_batch("BEGIN")
+            .expect("open reader transaction");
+        assert!(
+            !pool.connection_is_usable(&reader),
+            "a reader with an active transaction is not reusable",
+        );
+        reader
+            .execute_batch("ROLLBACK")
+            .expect("close reader transaction");
+        reader.authorizer(Some(
+            |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                AuthAction::Select => Authorization::Deny,
+                _ => Authorization::Allow,
+            },
+        ));
+        assert!(
+            !pool.connection_is_usable(&reader),
+            "a reader that cannot run its SELECT 1 health probe is retired",
         );
     }
 

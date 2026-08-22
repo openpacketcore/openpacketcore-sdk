@@ -14,9 +14,9 @@ use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(test)]
 use std::sync::Condvar;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
 use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
@@ -15282,13 +15282,18 @@ pub(crate) fn build_snapshot_database_with_capture_hook_sync(
     Ok(snapshot)
 }
 
+pub(crate) struct SnapshotBuildAuthority<'a> {
+    pub(crate) identity: SessionConsensusIdentity,
+    pub(crate) profile: ConsensusAuthorityProfile,
+    pub(crate) expected_members: &'a BTreeSet<SessionConsensusNodeId>,
+    pub(crate) expected_bindings:
+        &'a BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    pub(crate) fixed_placement_policy: Option<PlacementResiliencePolicy>,
+}
+
 pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
     conn: &Connection,
-    identity: SessionConsensusIdentity,
-    authority_profile: ConsensusAuthorityProfile,
-    expected_members: &BTreeSet<SessionConsensusNodeId>,
-    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
-    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    authority: SnapshotBuildAuthority<'_>,
     path: &std::path::Path,
 ) -> io::Result<(
     ConsensusAppliedMembership,
@@ -15296,11 +15301,7 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
 )> {
     build_snapshot_database_pinned_with_authority_and_capture_hook_sync(
         conn,
-        identity,
-        authority_profile,
-        expected_members,
-        expected_bindings,
-        fixed_placement_policy,
+        authority,
         path,
         || {},
     )
@@ -15308,11 +15309,7 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
 
 pub(crate) fn build_snapshot_database_pinned_with_authority_and_capture_hook_sync(
     conn: &Connection,
-    identity: SessionConsensusIdentity,
-    authority_profile: ConsensusAuthorityProfile,
-    expected_members: &BTreeSet<SessionConsensusNodeId>,
-    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
-    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    authority: SnapshotBuildAuthority<'_>,
     path: &std::path::Path,
     capture_hook: impl FnOnce(),
 ) -> io::Result<(
@@ -15322,20 +15319,20 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_and_capture_hook_syn
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
     validate_durable_authority_for_raw_access(
         &tx,
-        identity,
-        authority_profile,
-        expected_members,
-        expected_bindings,
-        fixed_placement_policy,
+        authority.identity,
+        authority.profile,
+        authority.expected_members,
+        authority.expected_bindings,
+        authority.fixed_placement_policy,
     )?;
     validate_sealed_state_sync(&tx)?;
-    validate_fenced_transition_receipts_sync(&tx, identity)?;
+    validate_fenced_transition_receipts_sync(&tx, authority.identity)?;
     // Do not create even an empty snapshot artifact until the durable fixed
     // authority check has succeeded under the source read transaction.
     let destination = create_pinned_snapshot_database(path)?;
     let (snapshot, destination) = build_snapshot_database_from_pinned_with_capture_hook_sync(
         &tx,
-        identity,
+        authority.identity,
         destination,
         capture_hook,
     )?;
@@ -15355,28 +15352,19 @@ pub(crate) fn build_snapshot_database_with_authority_sync(
 ) -> io::Result<ConsensusAppliedMembership> {
     build_snapshot_database_pinned_with_authority_sync(
         conn,
-        identity,
-        authority_profile,
-        expected_members,
-        expected_bindings,
-        fixed_placement_policy,
+        SnapshotBuildAuthority {
+            identity,
+            profile: authority_profile,
+            expected_members,
+            expected_bindings,
+            fixed_placement_policy,
+        },
         path,
     )
     .map(|(snapshot, mut destination)| {
         destination.disarm_cleanup();
         snapshot
     })
-}
-
-fn build_snapshot_database_from_pinned_sync(
-    conn: &Connection,
-    identity: SessionConsensusIdentity,
-    destination: crate::consensus::snapshot::PinnedSqliteFile,
-) -> io::Result<(
-    ConsensusAppliedMembership,
-    crate::consensus::snapshot::PinnedSqliteFile,
-)> {
-    build_snapshot_database_from_pinned_with_capture_hook_sync(conn, identity, destination, || {})
 }
 
 fn build_snapshot_database_from_pinned_with_capture_hook_sync(
@@ -15873,7 +15861,6 @@ where
             }
         }
     }
-
 }
 
 fn validate_snapshot_database_extent(
@@ -16083,9 +16070,7 @@ fn capture_and_finalize_snapshot_database_sync(
         let mut busy_retries = 0_usize;
         let mut completed = false;
         for _ in 0..SNAPSHOT_BACKUP_STEP_LIMIT {
-            let result = backup
-                .step(SNAPSHOT_BACKUP_PAGES_PER_STEP)
-                .map_err(db_error)?;
+            let result = backup.step(SNAPSHOT_BACKUP_STEP_PAGES).map_err(db_error)?;
             let progress = backup.progress();
             if progress.remaining < 0
                 || progress.pagecount != expected_pages
@@ -18042,7 +18027,7 @@ mod tests {
             identity(),
             &snapshot_path,
             &meta,
-            "truncated-v2.opc",
+            "snapshot-00000000-0000-4000-8000-0000000000e1.opc",
             [0xE1; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("snapshot metadata")
@@ -18057,12 +18042,6 @@ mod tests {
 
     const FIXED_TEST_PLACEMENT_POLICY: Option<PlacementResiliencePolicy> =
         Some(PlacementResiliencePolicy::RequireIndependentFailureDomains);
-
-    #[test]
-    fn snapshot_source_wal_bound_rejects_small_overflow() {
-        assert!(enforce_snapshot_source_wal_bound(1, 1).is_ok());
-        assert!(enforce_snapshot_source_wal_bound(2, 1).is_err());
-    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -22227,7 +22206,7 @@ LIMIT 20000;
                 last_membership,
                 snapshot_id: "v2-profile-mismatch".into(),
             },
-            "v2-profile-mismatch.opc",
+            "snapshot-00000000-0000-4000-8000-0000000000d3.opc",
             [0xD5; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("snapshot metadata")
@@ -22279,7 +22258,7 @@ LIMIT 20000;
             identity(),
             &snapshot_path,
             &meta,
-            "v2-live-receipt.opc",
+            "snapshot-00000000-0000-4000-8000-0000000000d6.opc",
             [0xD7; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("snapshot metadata")
@@ -22315,7 +22294,7 @@ LIMIT 20000;
             identity(),
             &omission_snapshot_path,
             &meta,
-            "v2-live-omission.opc",
+            "snapshot-00000000-0000-4000-8000-0000000000d7.opc",
             [0xD8; 32],
             std::fs::metadata(&omission_snapshot_path)
                 .expect("omission snapshot metadata")
@@ -22430,7 +22409,7 @@ LIMIT 20000;
             identity(),
             &snapshot_path,
             &meta,
-            "v2-reclaim.opc",
+            "snapshot-00000000-0000-4000-8000-0000000000d9.opc",
             [0xDA; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("snapshot metadata")
@@ -22471,7 +22450,7 @@ LIMIT 20000;
             identity(),
             &snapshot_path,
             &meta,
-            "v2-reclaim-regression.opc",
+            "snapshot-00000000-0000-4000-8000-0000000000da.opc",
             [0xDB; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("regression snapshot metadata")

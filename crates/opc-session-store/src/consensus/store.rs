@@ -68,10 +68,9 @@ use crate::consumer::{
     SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
     SessionConsumerRequest, SessionConsumerResponse, SessionConsumerScope,
     SessionConsumerStoreError, SessionConsumerV2FencedTransitionBatchError,
-    SessionConsumerV2FencedTransitionBatchResult,
-    SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
-    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
-    SessionQuorumConsumer, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    SessionConsumerV2FencedTransitionBatchResult, SessionConsumerV2FencedTransitionError,
+    SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionQuorumConsumer, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_transition::{
@@ -685,6 +684,14 @@ pub struct ConsensusStoreDiagnosticSnapshot {
     pub final_durable_ingress_admission_deadline: u64,
     /// Aggregate nanoseconds spent in final durable ingress admission.
     pub final_durable_ingress_admission_duration_nanos: u64,
+    /// Public raw V2 calls which retained the cold generic admission path.
+    pub public_raw_v2_cold_admissions: u64,
+    /// Public raw V2 cold paths which read receipt history before submit.
+    pub public_raw_v2_history_reads: u64,
+    /// Fixed raw V2 atomic authority/activation snapshots attempted locally.
+    pub fixed_raw_v2_acceptance_snapshots: u64,
+    /// Fixed raw V2 proposals accepted at the local OpenRaft boundary.
+    pub fixed_raw_v2_proposals: u64,
 }
 
 #[derive(Default)]
@@ -707,6 +714,13 @@ pub(crate) struct ConsensusStoreDiagnosticCounters {
     status_proposals: AtomicU64,
     final_durable_ingress_admission_deadline: AtomicU64,
     final_durable_ingress_admission_duration_nanos: AtomicU64,
+    public_raw_v2_cold_admissions: AtomicU64,
+    public_raw_v2_history_reads: AtomicU64,
+    fixed_raw_v2_acceptance_snapshots: AtomicU64,
+    fixed_raw_v2_proposals: AtomicU64,
+    // This is not a diagnostic value. Reusing the existing per-store Arc
+    // keeps the hint store-scoped across every construction path.
+    public_fixed_raw_v2_warm_route: AtomicBool,
 }
 
 impl ConsensusStoreDiagnosticCounters {
@@ -761,6 +775,14 @@ impl ConsensusStoreDiagnosticCounters {
             final_durable_ingress_admission_duration_nanos: self
                 .final_durable_ingress_admission_duration_nanos
                 .load(Ordering::Relaxed),
+            public_raw_v2_cold_admissions: self
+                .public_raw_v2_cold_admissions
+                .load(Ordering::Relaxed),
+            public_raw_v2_history_reads: self.public_raw_v2_history_reads.load(Ordering::Relaxed),
+            fixed_raw_v2_acceptance_snapshots: self
+                .fixed_raw_v2_acceptance_snapshots
+                .load(Ordering::Relaxed),
+            fixed_raw_v2_proposals: self.fixed_raw_v2_proposals.load(Ordering::Relaxed),
         }
     }
 }
@@ -2121,6 +2143,50 @@ impl ConsensusSessionStore {
             && self.fixed_raw_v2_consumer_warm_route(required_consumer_scope)
     }
 
+    /// Capture the current fixed-quorum scope for a public raw V2 batch warm
+    /// route.
+    ///
+    /// The bit is deliberately only a monotonic, store-local route hint. A
+    /// reopened store always starts cold, and a stale set bit never permits a
+    /// generic fallback: the leader receives this scope and must still pass
+    /// its operation gate, same-term raw-V2 barrier, and one atomic durable
+    /// authority/recovery/profile/activation snapshot before it can propose.
+    fn public_fixed_raw_v2_warm_scope(
+        &self,
+    ) -> Result<Option<SessionConsensusIdentity>, StoreError> {
+        if !self
+            .inner
+            .diagnostics
+            .public_fixed_raw_v2_warm_route
+            .load(Ordering::Acquire)
+        {
+            return Ok(None);
+        }
+        if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum {
+            return Err(consensus_unavailable());
+        }
+        if self.local_fenced_transition_v2_capability() != Some(FencedTransitionV2Capability::V2) {
+            return Err(unsupported_fenced_transition_v2());
+        }
+        self.require_exact_membership_admission()?;
+        self.current_scope().map(|(scope, _)| Some(scope))
+    }
+
+    /// Record only proof obtained by this process for its immutable storage
+    /// identity/profile. This is intentionally not a certificate and never
+    /// carries subscriber, consumer, or topology authority state.
+    fn seed_public_fixed_raw_v2_warm_route(&self) {
+        if self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
+            && self.local_fenced_transition_v2_capability()
+                == Some(FencedTransitionV2Capability::V2)
+        {
+            self.inner
+                .diagnostics
+                .public_fixed_raw_v2_warm_route
+                .store(true, Ordering::Release);
+        }
+    }
+
     /// Admit V1 for one exact linearizable voter scope.
     ///
     /// A durable certificate first permits ordinary quorum availability.  In
@@ -2473,8 +2539,18 @@ impl ConsensusSessionStore {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
-        self.fenced_transition_v2_before(request, None, deadline)
-            .await
+        // A singleton deliberately remains cold even after it seeds the
+        // store-local batch route hint. This preserves its existing exact
+        // activation admission shape and prevents a stale hint from ever
+        // converting an unactivated singleton into a fresh proposal.
+        let outcome = self
+            .fenced_transition_v2_before(request, None, deadline)
+            .await?;
+        // A cold successful singleton either observed the exact durable
+        // activation admission or committed the one permitted activation
+        // singleton. Only later public batches may consume this route hint.
+        self.seed_public_fixed_raw_v2_warm_route();
+        Ok(outcome)
     }
 
     /// Apply one V2 transition while preserving an optional consumer authority
@@ -2528,6 +2604,14 @@ impl ConsensusSessionStore {
     ) -> Result<SessionConsensusResponse, StoreError> {
         request.validate()?;
         if !self.fixed_raw_v2_consumer_warm_route(required_consumer_scope.as_ref()) {
+            if required_consumer_scope.is_none()
+                && self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
+            {
+                self.inner
+                    .diagnostics
+                    .public_raw_v2_cold_admissions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let admission = self
                 .require_fenced_transition_v2_capability_before(deadline)
                 .await?;
@@ -2541,6 +2625,14 @@ impl ConsensusSessionStore {
                 // existing active epoch). Check that deterministic lifecycle
                 // state before transmitting any activating proposal.
                 let (authority_identity, _) = self.current_scope()?;
+                if required_consumer_scope.is_none()
+                    && self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
+                {
+                    self.inner
+                        .diagnostics
+                        .public_raw_v2_history_reads
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let history = self
                     .inner
                     .backend
@@ -2581,6 +2673,14 @@ impl ConsensusSessionStore {
             return ConsensusSubmissionEffect::NotTransmitted(error);
         }
         if !self.fixed_raw_v2_consumer_warm_route(required_consumer_scope.as_ref()) {
+            if required_consumer_scope.is_none()
+                && self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
+            {
+                self.inner
+                    .diagnostics
+                    .public_raw_v2_cold_admissions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let admission = match self
                 .require_fenced_transition_v2_capability_before(deadline)
                 .await
@@ -2598,6 +2698,14 @@ impl ConsensusSessionStore {
                     Ok(scope) => scope,
                     Err(error) => return ConsensusSubmissionEffect::NotTransmitted(error),
                 };
+                if required_consumer_scope.is_none()
+                    && self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
+                {
+                    self.inner
+                        .diagnostics
+                        .public_raw_v2_history_reads
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let history = match self
                     .inner
                     .backend
@@ -2651,8 +2759,14 @@ impl ConsensusSessionStore {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
-        self.fenced_transition_v2_batch_before(requests, None, deadline)
-            .await
+        let route_scope = self.public_fixed_raw_v2_warm_scope()?;
+        let outcomes = self
+            .fenced_transition_v2_batch_before(requests, route_scope, deadline)
+            .await?;
+        // A fresh public batch keeps the existing singleton activation shape;
+        // only its definitive successful return can warm later public calls.
+        self.seed_public_fixed_raw_v2_warm_route();
+        Ok(outcomes)
     }
 
     /// Apply a V2 transition batch while preserving an optional consumer
@@ -2730,6 +2844,14 @@ impl ConsensusSessionStore {
             };
         }
 
+        if required_consumer_scope.is_none()
+            && self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
+        {
+            self.inner
+                .diagnostics
+                .public_raw_v2_cold_admissions
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let admission = self
             .require_fenced_transition_v2_capability_before(deadline)
             .await?;
@@ -2738,6 +2860,14 @@ impl ConsensusSessionStore {
         // epoch.  Every submitted batch uses the one currently active epoch;
         // the singleton activation below has the same exact precondition.
         let (authority_identity, _) = self.current_scope()?;
+        if required_consumer_scope.is_none()
+            && self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
+        {
+            self.inner
+                .diagnostics
+                .public_raw_v2_history_reads
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let history = self
             .inner
             .backend
@@ -2899,6 +3029,14 @@ impl ConsensusSessionStore {
             };
         }
 
+        if required_consumer_scope.is_none()
+            && self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
+        {
+            self.inner
+                .diagnostics
+                .public_raw_v2_cold_admissions
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let admission = match self
             .require_fenced_transition_v2_capability_before(deadline)
             .await
@@ -2910,6 +3048,14 @@ impl ConsensusSessionStore {
             Ok(scope) => scope,
             Err(error) => return FencedTransitionV2Effect::NotTransmitted(error),
         };
+        if required_consumer_scope.is_none()
+            && self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
+        {
+            self.inner
+                .diagnostics
+                .public_raw_v2_history_reads
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let history = match self
             .inner
             .backend
@@ -4866,6 +5012,10 @@ impl ConsensusSessionStore {
                     Some(policy) => policy,
                     None => return ForwardMutationReply::Unavailable,
                 };
+            self.inner
+                .diagnostics
+                .fixed_raw_v2_acceptance_snapshots
+                .fetch_add(1, Ordering::Relaxed);
             match tokio::time::timeout_at(
                 deadline,
                 self.inner
@@ -5165,6 +5315,12 @@ impl ConsensusSessionStore {
         // the Raft core can still reject it as `ForwardToLeader` before append.
         // Losing that receiver or crossing the deadline remains an unknown
         // outcome, as do receiver errors for protected/status-resolved writes.
+        if authority.fixed_raw_v2_snapshot {
+            self.inner
+                .diagnostics
+                .fixed_raw_v2_proposals
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let response =
             match tokio::time::timeout_at(deadline, self.inner.raft.client_write_ff(command)).await
             {
@@ -9035,6 +9191,18 @@ mod membership_tests {
         counters
             .route_metrics_watch_closed
             .fetch_add(11, Ordering::Relaxed);
+        counters
+            .public_raw_v2_cold_admissions
+            .fetch_add(12, Ordering::Relaxed);
+        counters
+            .public_raw_v2_history_reads
+            .fetch_add(13, Ordering::Relaxed);
+        counters
+            .fixed_raw_v2_acceptance_snapshots
+            .fetch_add(14, Ordering::Relaxed);
+        counters
+            .fixed_raw_v2_proposals
+            .fetch_add(15, Ordering::Relaxed);
 
         let snapshot = counters.snapshot();
         assert_eq!(
@@ -9051,6 +9219,10 @@ mod membership_tests {
                 client_write_ff_preaccept_failure: 9,
                 route_deadline: 10,
                 route_metrics_watch_closed: 11,
+                public_raw_v2_cold_admissions: 12,
+                public_raw_v2_history_reads: 13,
+                fixed_raw_v2_acceptance_snapshots: 14,
+                fixed_raw_v2_proposals: 15,
                 ..ConsensusStoreDiagnosticSnapshot::default()
             }
         );
@@ -9062,6 +9234,7 @@ mod membership_tests {
         }
         assert!(encoded.contains("sqlite_worker_permit_deadline"));
         assert!(encoded.contains("route_metrics_watch_closed"));
+        assert!(encoded.contains("fixed_raw_v2_acceptance_snapshots"));
     }
     use crate::{
         FencedTransitionLease, FencedTransitionMutation, FencedTransitionMutationResult,
