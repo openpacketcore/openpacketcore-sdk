@@ -119,8 +119,11 @@ impl DurableConsensusTimingProfile {
     ///
     /// A reconnect has to begin before the listener's fixed frame-idle
     /// ceiling. Reserving the complete cold-connect allowance gives resolver,
-    /// TCP, mutual-TLS, and bootstrap work a profile-owned safety margin
-    /// instead of coupling callers to a deployment-specific timeout.
+    /// TCP, mutual-TLS, and bootstrap work a profile-owned reconnection
+    /// margin instead of coupling callers to a deployment-specific timeout.
+    /// It is not a proof about response timing or client/server clock skew:
+    /// the transport records a successful use from an instant captured no
+    /// later than request dispatch.
     pub const fn client_connection_reuse_limit(self) -> Duration {
         Duration::from_millis(
             self.server_idle_timeout_millis

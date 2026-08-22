@@ -2412,9 +2412,9 @@ async fn consensus_reauthentication_and_material_epochs_replace_both_cached_lane
         .allow_any_trusted_peer()
         .build_authenticated_client_config()
         .expect("rotating consensus client config");
-    // This case verifies that both lanes are replaced by each epoch. Cached
-    // jitter is covered separately with paused time; keep it at zero here so
-    // the replacement assertion has no wall-clock sampling race.
+    // This case verifies both lanes at the idle reuse boundary and through
+    // each material epoch. Cached jitter is covered separately with paused
+    // time; keep it at zero here so rotation replacement has no sampling race.
     let immediate_rotation = ConnectionLifecyclePolicy::try_new(
         Duration::from_secs(60),
         Duration::from_secs(2),
@@ -2448,13 +2448,34 @@ async fn consensus_reauthentication_and_material_epochs_replace_both_cached_lane
     assert_consensus_call_pair(&peer, &manifest, b"initial-primary", b"initial-overflow").await;
     assert_eq!(resolutions.load(Ordering::SeqCst), 2);
 
+    let reuse_limit = DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit();
+    tokio::time::pause();
+    tokio::time::advance(reuse_limit - Duration::from_secs(1)).await;
+    tokio::time::resume();
+    assert_consensus_call_pair(&peer, &manifest, b"inside-primary", b"inside-overflow").await;
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "each cached lane remains reusable just inside the shared idle limit"
+    );
+
+    tokio::time::pause();
+    tokio::time::advance(reuse_limit).await;
+    tokio::time::resume();
+    assert_consensus_call_pair(&peer, &manifest, b"limit-primary", b"limit-overflow").await;
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        4,
+        "both cached lanes reconnect at the exact shared idle boundary"
+    );
+
     reauthentication
         .request_reauthentication()
         .expect("request explicit consensus reauthentication");
     assert_consensus_call_pair(&peer, &manifest, b"explicit-primary", b"explicit-overflow").await;
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
-        4,
+        6,
         "one explicit generation change must replace both established lanes"
     );
 
@@ -2464,10 +2485,10 @@ async fn consensus_reauthentication_and_material_epochs_replace_both_cached_lane
     assert_consensus_call_pair(&peer, &manifest, b"material-primary", b"material-overflow").await;
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
-        6,
+        8,
         "one admitted material epoch change must replace both established lanes"
     );
-    assert_eq!(handler.calls.load(Ordering::SeqCst), 6);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 10);
 
     handle.abort_and_wait().await;
 }
@@ -3192,7 +3213,7 @@ async fn consensus_idle_reuse_limit_evicts_before_the_server_idle_trap_without_r
     assert_eq!(resolutions.load(Ordering::SeqCst), 1);
 
     tokio::time::pause();
-    tokio::time::advance(reuse_limit - Duration::from_millis(1)).await;
+    tokio::time::advance(reuse_limit - Duration::from_secs(1)).await;
     tokio::time::resume();
     assert!(peer
         .call(request(&manifest, 1, b"inside-limit".to_vec()))
@@ -3377,10 +3398,23 @@ async fn correlated_unavailable_response_reuses_the_authenticated_connection() {
             })
         );
     }
+    tokio::time::pause();
+    tokio::time::advance(
+        DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit() - Duration::from_secs(1),
+    )
+    .await;
+    tokio::time::resume();
+    assert_eq!(
+        peer.call(request(&manifest, 1, b"refreshed-unavailable".to_vec()))
+            .await,
+        Ok(SessionConsensusWireResponse {
+            result: Err(SessionConsensusPeerError::Unavailable),
+        })
+    );
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
         1,
-        "a complete correlated Unavailable response must not create a TLS reconnect storm"
+        "a complete correlated Unavailable response refreshes the idle epoch without a TLS reconnect storm"
     );
 
     server.abort_and_wait().await;
