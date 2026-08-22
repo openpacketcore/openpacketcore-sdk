@@ -22,7 +22,9 @@ use opc_types::SpiffeId;
 use rustls_pki_types::ServerName;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
@@ -48,9 +50,26 @@ pub const MAX_MANAGED_PROVIDER_POOL_LANES: usize = 16;
 /// Aggregate queued plus in-flight work bound.
 pub const MANAGED_PROVIDER_POOL_QUEUE_CAPACITY: usize = 1024;
 /// Maximum retained encoded request bytes across the pool.
-pub const DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES: usize = 1_048_576;
+pub const DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES: usize = 3 * 1024 * 1024;
 /// Maximum bounded public response bytes.
 pub const DEFAULT_MANAGED_PROVIDER_POOL_RESPONSE_BYTES: usize = 1024;
+/// No managed-provider listener may allocate more permits than Tokio accepts.
+pub const MAX_MANAGED_PROVIDER_SERVER_CONNECTIONS: usize = Semaphore::MAX_PERMITS;
+
+// The request profile has room for an exact legal V5 admission (including its
+// 1 MiB protected plan and 16 KiB terminal result), a second 1 MiB checkpoint,
+// and JSON's bounded base64 expansion plus closed-envelope metadata.  This is
+// deliberately a protocol constant: peers prove it in Hello instead of
+// silently accepting a caller-selected frame size.
+pub const MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES: usize = 3 * 1024 * 1024;
+/// Fixed public result profile; status and every typed domain error fit here.
+pub const MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES: usize = 1024;
+/// One absolute setup budget spans resolver, TCP, TLS, Hello, and HelloAck.
+pub const MANAGED_PROVIDER_SETUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Each authenticated application frame has one non-renewing budget.
+pub const MANAGED_PROVIDER_FRAME_TIMEOUT: Duration = Duration::from_millis(250);
+/// A facade call cannot retain an admitted server connection indefinitely.
+pub const MANAGED_PROVIDER_FACADE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const PROFILE_DOMAIN: &[u8] = b"opc-session-net/managed-provider/5/profile\0";
 
@@ -59,6 +78,8 @@ fn profile_digest() -> [u8; 32] {
     hash.update(PROFILE_DOMAIN);
     hash.update(MANAGED_PROVIDER_JOB_TRANSPORT_REVISION.to_be_bytes());
     hash.update(MANAGED_PROVIDER_JOB_SEMANTIC_REVISION.to_be_bytes());
+    hash.update((MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES as u64).to_be_bytes());
+    hash.update((MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES as u64).to_be_bytes());
     hash.finalize().into()
 }
 
@@ -84,8 +105,8 @@ impl Default for ManagedProviderPoolConfig {
         Self {
             lanes_per_voter: DEFAULT_MANAGED_PROVIDER_POOL_LANES,
             queued_and_inflight: MANAGED_PROVIDER_POOL_QUEUE_CAPACITY,
-            request_bytes: DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES,
-            response_bytes: DEFAULT_MANAGED_PROVIDER_POOL_RESPONSE_BYTES,
+            request_bytes: MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES,
+            response_bytes: MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES,
             queue_deadline: Duration::from_millis(250),
             setup_timeout: Duration::from_secs(2),
             shutdown_drain: Duration::from_secs(5),
@@ -122,7 +143,8 @@ impl ManagedProviderPoolConfig {
             || self.queued_and_inflight != MANAGED_PROVIDER_POOL_QUEUE_CAPACITY
             || self.request_bytes == 0
             || self.response_bytes == 0
-            || self.response_bytes > 4096
+            || self.request_bytes != MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES
+            || self.response_bytes != MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES
             || self.request_bytes > u32::MAX as usize
             || self.response_bytes > u32::MAX as usize
             || self.request_bytes > Semaphore::MAX_PERMITS
@@ -270,6 +292,16 @@ pub struct ManagedProviderPoolDiagnostics {
     pub outcome_unknown: u64,
 }
 
+/// Aggregate listener state. Completed connection tasks are reaped before a
+/// new accept is admitted, so `connection_tasks` is bounded by `connections`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ManagedProviderServerDiagnostics {
+    pub connections: u64,
+    pub connection_high_water: u64,
+    pub connection_tasks: u64,
+    pub task_high_water: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagedProviderShutdownReport {
     pub drained: u64,
@@ -295,6 +327,16 @@ pub enum ManagedProviderClientError {
     OutcomeUnknown,
     #[error("managed provider service is unavailable")]
     ServiceUnavailable,
+    #[error("managed provider job is closed by a frozen terminal receipt")]
+    FrozenV4Terminal,
+    #[error("managed provider job requires reconciliation")]
+    ReconciliationRequired,
+    #[error("managed provider job requires fresh admission")]
+    FreshAdmissionRequired,
+    #[error("managed provider job attestation was rejected")]
+    AttestationRejected,
+    #[error("managed provider job member is invalid")]
+    InvalidMember,
 }
 
 #[derive(Default)]
@@ -1055,11 +1097,14 @@ async fn lane_worker(
 type ClientLane = tokio_rustls::client::TlsStream<TcpStream>;
 async fn connect_lane(pool: &Pool, voter: usize) -> Result<ClientLane, ManagedProviderClientError> {
     let endpoint = &pool.endpoints[voter];
-    let address = tokio::time::timeout(pool.config.setup_timeout, (endpoint.resolve)())
+    // This deadline is deliberately created once.  Resolver, TCP, TLS, Hello,
+    // and Ack are one setup transaction; no successful phase renews it.
+    let deadline = tokio::time::Instant::now() + pool.config.setup_timeout;
+    let address = tokio::time::timeout_at(deadline, (endpoint.resolve)())
         .await
         .map_err(|_| ManagedProviderClientError::Unavailable)?
         .map_err(|_| ManagedProviderClientError::Unavailable)?;
-    let stream = tokio::time::timeout(pool.config.setup_timeout, TcpStream::connect(address))
+    let stream = tokio::time::timeout_at(deadline, TcpStream::connect(address))
         .await
         .map_err(|_| ManagedProviderClientError::Unavailable)?
         .map_err(|_| ManagedProviderClientError::Unavailable)?;
@@ -1075,17 +1120,21 @@ async fn connect_lane(pool: &Pool, voter: usize) -> Result<ClientLane, ManagedPr
     config.alpn_protocols = vec![MANAGED_PROVIDER_JOB_ALPN.to_vec()];
     config.resumption = tokio_rustls::rustls::client::Resumption::disabled();
     config.enable_early_data = false;
-    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
-        .connect(endpoint.server_name.clone(), stream)
-        .await
-        .map_err(classify_tls_io_error)
-        .map_err(|e| {
-            if matches!(e, crate::ProtocolError::Authentication) {
-                ManagedProviderClientError::Authentication
-            } else {
-                ManagedProviderClientError::Unavailable
-            }
-        })?;
+    let mut tls = tokio::time::timeout_at(
+        deadline,
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(endpoint.server_name.clone(), stream),
+    )
+    .await
+    .map_err(|_| ManagedProviderClientError::Unavailable)?
+    .map_err(classify_tls_io_error)
+    .map_err(|e| {
+        if matches!(e, crate::ProtocolError::Authentication) {
+            ManagedProviderClientError::Authentication
+        } else {
+            ManagedProviderClientError::Unavailable
+        }
+    })?;
     if tls.get_ref().1.alpn_protocol() != Some(MANAGED_PROVIDER_JOB_ALPN) {
         return Err(ManagedProviderClientError::Protocol);
     }
@@ -1103,15 +1152,17 @@ async fn connect_lane(pool: &Pool, voter: usize) -> Result<ClientLane, ManagedPr
         response_frame_size: pool.config.response_bytes as u32,
         expected_voter: endpoint.identity.as_str().to_owned(),
     });
-    write_json(&mut tls, &hello, pool.config.request_bytes).await?;
-    let ack: WireResponse = read_json(&mut tls, pool.config.response_bytes).await?;
+    write_json_until(&mut tls, &hello, pool.config.request_bytes, deadline).await?;
+    let ack: WireResponse = read_json_until(&mut tls, pool.config.response_bytes, deadline).await?;
     match ack {
         WireResponse::HelloAck(ack)
             if ack.transport_revision == MANAGED_PROVIDER_JOB_TRANSPORT_REVISION
                 && ack.semantic_revision == MANAGED_PROVIDER_JOB_SEMANTIC_REVISION
                 && ack.scope == pool.authority.scope
                 && ack.profile_digest == profile_digest()
-                && ack.voter_identity == endpoint.identity.as_str() =>
+                && ack.voter_identity == endpoint.identity.as_str()
+                && ack.request_frame_size == MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES as u32
+                && ack.response_frame_size == MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES as u32 =>
         {
             handshake
                 .admit()
@@ -1144,25 +1195,27 @@ async fn call_on_lane(
             .map_err(|_| ManagedProviderClientError::OutcomeUnknown)?
             .map_err(|_| ManagedProviderClientError::OutcomeUnknown)?;
     match response {
-        WireResponse::Call(result) => Ok(result.into_result()),
-        _ => Err(ManagedProviderClientError::Protocol),
+        WireResponse::Call(result) => match result.into_result() {
+            Ok(status) => Ok(Ok(status)),
+            Err(ManagedProviderClientError::Protocol) => {
+                Err(ManagedProviderClientError::OutcomeUnknown)
+            }
+            Err(error) => Ok(Err(error)),
+        },
+        // The request crossed the transport boundary.  A wrong response is
+        // indistinguishable from an effect whose reply was lost or corrupted.
+        _ => Err(ManagedProviderClientError::OutcomeUnknown),
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FrameWriteError {
     NotTransmitted,
     OutcomeUnknown,
 }
-impl FrameWriteError {
-    const fn client_error(self) -> ManagedProviderClientError {
-        match self {
-            Self::NotTransmitted => ManagedProviderClientError::Unavailable,
-            Self::OutcomeUnknown => ManagedProviderClientError::OutcomeUnknown,
-        }
-    }
-}
 
+#[cfg(test)]
 async fn write_raw<W: AsyncWrite + Unpin>(
     writer: &mut W,
     bytes: &[u8],
@@ -1196,18 +1249,20 @@ async fn write_raw<W: AsyncWrite + Unpin>(
         .await
         .map_err(|_| FrameWriteError::OutcomeUnknown)
 }
-async fn write_json<W: AsyncWrite + Unpin, T: Serialize>(
+async fn write_json_until<W: AsyncWrite + Unpin, T: Serialize>(
     writer: &mut W,
     value: &T,
     bound: usize,
+    deadline: tokio::time::Instant,
 ) -> Result<(), ManagedProviderClientError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| ManagedProviderClientError::Protocol)?;
-    if bytes.len() > bound {
-        return Err(ManagedProviderClientError::Protocol);
-    }
-    write_raw(writer, &bytes)
+    write_frame_bounded_until_classified(writer, value, bound, deadline)
         .await
-        .map_err(FrameWriteError::client_error)
+        .map_err(|error| match error {
+            ProtocolFrameWriteError::BeforeWrite(_) => ManagedProviderClientError::Unavailable,
+            ProtocolFrameWriteError::MayHaveWritten(_) => {
+                ManagedProviderClientError::OutcomeUnknown
+            }
+        })
 }
 async fn read_json<R: AsyncRead + Unpin, T: for<'a> Deserialize<'a>>(
     reader: &mut R,
@@ -1233,6 +1288,15 @@ async fn read_json<R: AsyncRead + Unpin, T: for<'a> Deserialize<'a>>(
         return Err(ManagedProviderClientError::Protocol);
     }
     Ok(value)
+}
+async fn read_json_until<R: AsyncRead + Unpin, T: for<'a> Deserialize<'a>>(
+    reader: &mut R,
+    bound: usize,
+    deadline: tokio::time::Instant,
+) -> Result<T, ManagedProviderClientError> {
+    tokio::time::timeout_at(deadline, read_json(reader, bound))
+        .await
+        .map_err(|_| ManagedProviderClientError::Unavailable)?
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1280,6 +1344,8 @@ struct WireAck {
     scope: SessionConsumerScope,
     profile_digest: [u8; 32],
     voter_identity: String,
+    request_frame_size: u32,
+    response_frame_size: u32,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1312,10 +1378,22 @@ impl WireCallResult {
             // A returned application response proves transmission. It is not
             // interchangeable with a pre-write transport failure and must not
             // be treated as automatically replay-safe by a caller.
+            (None, Some(WireError::Frozen)) => Err(ManagedProviderClientError::FrozenV4Terminal),
+            (None, Some(WireError::Reconciliation)) => {
+                Err(ManagedProviderClientError::ReconciliationRequired)
+            }
+            (None, Some(WireError::FreshAdmission)) => {
+                Err(ManagedProviderClientError::FreshAdmissionRequired)
+            }
+            (None, Some(WireError::Attestation)) => {
+                Err(ManagedProviderClientError::AttestationRejected)
+            }
             (None, Some(WireError::Unavailable)) => {
                 Err(ManagedProviderClientError::ServiceUnavailable)
             }
-            (None, Some(_)) => Err(ManagedProviderClientError::Protocol),
+            (None, Some(WireError::InvalidMember)) => {
+                Err(ManagedProviderClientError::InvalidMember)
+            }
             _ => Err(ManagedProviderClientError::Protocol),
         }
     }
@@ -1368,6 +1446,22 @@ pub struct ManagedProviderJobServer {
     client: SpiffeId,
     max_connections: usize,
 }
+#[derive(Default)]
+struct ServerCounters {
+    connections: AtomicU64,
+    connection_high_water: AtomicU64,
+    tasks: AtomicU64,
+    task_high_water: AtomicU64,
+}
+
+struct ServerConnectionGuard(Arc<ServerCounters>);
+impl Drop for ServerConnectionGuard {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::Relaxed);
+        self.0.tasks.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl ManagedProviderJobServer {
     // This is deliberately private until opc-session-store exposes its
     // concrete least-authority facade. Production must not accept an arbitrary
@@ -1413,7 +1507,9 @@ impl ManagedProviderJobServer {
         self,
         bind: std::net::SocketAddr,
     ) -> io::Result<(ManagedProviderJobServerHandle, std::net::SocketAddr)> {
-        if self.max_connections == 0 {
+        if self.max_connections == 0
+            || self.max_connections > MAX_MANAGED_PROVIDER_SERVER_CONNECTIONS
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid managed provider listener",
@@ -1423,26 +1519,40 @@ impl ManagedProviderJobServer {
         let address = listener.local_addr()?;
         let cancelled = Arc::new(AtomicBool::new(false));
         let tasks = Arc::new(Mutex::new(JoinSet::new()));
+        let counters = Arc::new(ServerCounters::default());
         let permit = Arc::new(Semaphore::new(self.max_connections));
         let cancel = Arc::clone(&cancelled);
         let accept_tasks = Arc::clone(&tasks);
+        let accept_counters = Arc::clone(&counters);
         let handle = tokio::spawn(async move {
+            let mut reap = tokio::time::interval(Duration::from_millis(10));
+            reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             while !cancel.load(Ordering::Acquire) {
-                let Ok(slot) = permit.clone().acquire_owned().await else {
-                    return;
-                };
-                let Ok((stream, _)) = listener.accept().await else {
-                    continue;
-                };
-                let service = self.service.clone();
-                let tls = self.tls.clone();
-                let scope = self.scope;
-                let voter = self.voter.clone();
-                let client = self.client.clone();
-                accept_tasks.lock().await.spawn(async move {
-                    let _slot = slot;
-                    let _ = serve_connection(stream, service, tls, scope, voter, client).await;
-                });
+                tokio::select! {
+                    _ = reap.tick() => {
+                        let mut tasks = accept_tasks.lock().await;
+                        while tasks.try_join_next().is_some() {}
+                    }
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { continue };
+                        let Ok(slot) = permit.clone().try_acquire_owned() else { continue };
+                        let service = self.service.clone();
+                        let tls = self.tls.clone();
+                        let scope = self.scope;
+                        let voter = self.voter.clone();
+                        let client = self.client.clone();
+                        let counters = Arc::clone(&accept_counters);
+                        let current = counters.connections.fetch_add(1, Ordering::Relaxed) + 1;
+                        high(&counters.connection_high_water, current);
+                        let tasks_current = counters.tasks.fetch_add(1, Ordering::Relaxed) + 1;
+                        high(&counters.task_high_water, tasks_current);
+                        accept_tasks.lock().await.spawn(async move {
+                            let _slot = slot;
+                            let _connection = ServerConnectionGuard(counters);
+                            let _ = serve_connection(stream, service, tls, scope, voter, client).await;
+                        });
+                    }
+                }
             }
         });
         Ok((
@@ -1450,6 +1560,7 @@ impl ManagedProviderJobServer {
                 handle,
                 cancelled,
                 tasks,
+                counters,
             },
             address,
         ))
@@ -1459,8 +1570,18 @@ pub struct ManagedProviderJobServerHandle {
     handle: JoinHandle<()>,
     cancelled: Arc<AtomicBool>,
     tasks: Arc<Mutex<JoinSet<()>>>,
+    counters: Arc<ServerCounters>,
 }
 impl ManagedProviderJobServerHandle {
+    /// Return redaction-safe aggregate listener counters.
+    pub fn diagnostics(&self) -> ManagedProviderServerDiagnostics {
+        ManagedProviderServerDiagnostics {
+            connections: self.counters.connections.load(Ordering::Relaxed),
+            connection_high_water: self.counters.connection_high_water.load(Ordering::Relaxed),
+            connection_tasks: self.counters.tasks.load(Ordering::Relaxed),
+            task_high_water: self.counters.task_high_water.load(Ordering::Relaxed),
+        }
+    }
     pub async fn shutdown(mut self) {
         self.cancelled.store(true, Ordering::Release);
         self.handle.abort();
@@ -1476,16 +1597,20 @@ async fn serve_connection(
     voter: SpiffeId,
     client: SpiffeId,
 ) -> Result<(), ManagedProviderClientError> {
+    let setup_deadline = tokio::time::Instant::now() + MANAGED_PROVIDER_SETUP_TIMEOUT;
     let handshake = tls
         .begin_handshake()
         .map_err(|_| ManagedProviderClientError::Authentication)?;
     let mut config = handshake.rustls_config().as_ref().clone();
     config.alpn_protocols = vec![MANAGED_PROVIDER_JOB_ALPN.to_vec()];
-    let mut stream = tokio_rustls::TlsAcceptor::from(Arc::new(config))
-        .accept(stream)
-        .await
-        .map_err(classify_tls_io_error)
-        .map_err(|_| ManagedProviderClientError::Authentication)?;
+    let mut stream = tokio::time::timeout_at(
+        setup_deadline,
+        tokio_rustls::TlsAcceptor::from(Arc::new(config)).accept(stream),
+    )
+    .await
+    .map_err(|_| ManagedProviderClientError::Authentication)?
+    .map_err(classify_tls_io_error)
+    .map_err(|_| ManagedProviderClientError::Authentication)?;
     if stream.get_ref().1.alpn_protocol() != Some(MANAGED_PROVIDER_JOB_ALPN) {
         return Err(ManagedProviderClientError::Protocol);
     }
@@ -1494,8 +1619,12 @@ async fn serve_connection(
     if peer.spiffe_id() != &client {
         return Err(ManagedProviderClientError::Authentication);
     }
-    let hello: WireRequest =
-        read_json(&mut stream, DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES).await?;
+    let hello: WireRequest = read_json_until(
+        &mut stream,
+        MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES,
+        setup_deadline,
+    )
+    .await?;
     let WireRequest::Hello(hello) = hello else {
         return Err(ManagedProviderClientError::Protocol);
     };
@@ -1504,11 +1633,14 @@ async fn serve_connection(
         || hello.scope != scope
         || hello.profile_digest != profile_digest()
         || hello.expected_voter != voter.as_str()
+        || hello.request_frame_size != MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES as u32
+        || hello.response_frame_size != MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES as u32
     {
-        let _ = write_json(
+        let _ = write_json_until(
             &mut stream,
             &WireResponse::Reject,
-            DEFAULT_MANAGED_PROVIDER_POOL_RESPONSE_BYTES,
+            MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES,
+            setup_deadline,
         )
         .await;
         return Err(ManagedProviderClientError::Protocol);
@@ -1516,7 +1648,7 @@ async fn serve_connection(
     handshake
         .admit()
         .map_err(|_| ManagedProviderClientError::Authentication)?;
-    write_json(
+    write_json_until(
         &mut stream,
         &WireResponse::HelloAck(WireAck {
             transport_revision: MANAGED_PROVIDER_JOB_TRANSPORT_REVISION,
@@ -1524,13 +1656,21 @@ async fn serve_connection(
             scope,
             profile_digest: profile_digest(),
             voter_identity: voter.as_str().to_owned(),
+            request_frame_size: MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES as u32,
+            response_frame_size: MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES as u32,
         }),
-        DEFAULT_MANAGED_PROVIDER_POOL_RESPONSE_BYTES,
+        MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES,
+        setup_deadline,
     )
     .await?;
     loop {
-        let request: WireRequest =
-            read_json(&mut stream, DEFAULT_MANAGED_PROVIDER_POOL_REQUEST_BYTES).await?;
+        let frame_deadline = tokio::time::Instant::now() + MANAGED_PROVIDER_FRAME_TIMEOUT;
+        let request: WireRequest = read_json_until(
+            &mut stream,
+            MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES,
+            frame_deadline,
+        )
+        .await?;
         let WireRequest::Call { operation } = request else {
             return Err(ManagedProviderClientError::Protocol);
         };
@@ -1542,10 +1682,14 @@ async fn serve_connection(
             } => match validated_admission(admission, scope, &client) {
                 Ok(admission) => match FencedMutationRosterOrdinal::new(ordinal) {
                     Ok(ordinal) => result_to_wire(
-                        service
-                            .0
-                            .run_member(admission, protected_checkpoint, ordinal)
-                            .await,
+                        tokio::time::timeout(
+                            MANAGED_PROVIDER_FACADE_TIMEOUT,
+                            service
+                                .0
+                                .run_member(admission, protected_checkpoint, ordinal),
+                        )
+                        .await
+                        .map_err(|_| ManagedProviderClientError::OutcomeUnknown)?,
                     ),
                     Err(_) => WireCallResult {
                         status: None,
@@ -1560,9 +1704,14 @@ async fn serve_connection(
             WireOperation::Status { admission, ordinal } => {
                 match validated_admission(admission, scope, &client) {
                     Ok(admission) => match FencedMutationRosterOrdinal::new(ordinal) {
-                        Ok(ordinal) => {
-                            result_to_wire(service.0.job_status(admission, ordinal).await)
-                        }
+                        Ok(ordinal) => result_to_wire(
+                            tokio::time::timeout(
+                                MANAGED_PROVIDER_FACADE_TIMEOUT,
+                                service.0.job_status(admission, ordinal),
+                            )
+                            .await
+                            .map_err(|_| ManagedProviderClientError::OutcomeUnknown)?,
+                        ),
                         Err(_) => WireCallResult {
                             status: None,
                             error: Some(WireError::InvalidMember),
@@ -1575,10 +1724,15 @@ async fn serve_connection(
                 }
             }
         };
-        write_json(
+        // A completed facade call never renews the read budget. Its response
+        // gets its own fixed write budget, so a slow-but-in-budget facade is
+        // not converted into a late frame write.
+        let response_deadline = tokio::time::Instant::now() + MANAGED_PROVIDER_FRAME_TIMEOUT;
+        write_json_until(
             &mut stream,
             &WireResponse::Call(response),
-            DEFAULT_MANAGED_PROVIDER_POOL_RESPONSE_BYTES,
+            MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES,
+            response_deadline,
         )
         .await?;
     }
@@ -1818,6 +1972,15 @@ mod tests {
             Duration::from_millis(1),
         )
         .is_err());
+        assert!(ManagedProviderPoolConfig::try_new(
+            DEFAULT_MANAGED_PROVIDER_POOL_LANES,
+            MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES,
+            MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1853,6 +2016,45 @@ mod tests {
             .into_result(),
             Err(ManagedProviderClientError::ServiceUnavailable)
         );
+    }
+
+    #[test]
+    fn every_typed_v5_domain_error_survives_the_wire() {
+        for (wire, expected) in [
+            (
+                WireError::Frozen,
+                ManagedProviderClientError::FrozenV4Terminal,
+            ),
+            (
+                WireError::Reconciliation,
+                ManagedProviderClientError::ReconciliationRequired,
+            ),
+            (
+                WireError::FreshAdmission,
+                ManagedProviderClientError::FreshAdmissionRequired,
+            ),
+            (
+                WireError::Attestation,
+                ManagedProviderClientError::AttestationRejected,
+            ),
+            (
+                WireError::Unavailable,
+                ManagedProviderClientError::ServiceUnavailable,
+            ),
+            (
+                WireError::InvalidMember,
+                ManagedProviderClientError::InvalidMember,
+            ),
+        ] {
+            assert_eq!(
+                WireCallResult {
+                    status: None,
+                    error: Some(wire),
+                }
+                .into_result(),
+                Err(expected)
+            );
+        }
     }
 
     #[test]
@@ -2003,5 +2205,70 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_millis(100), tls.read_u8()).await;
         assert_eq!(service.calls.load(AtomicOrdering::Relaxed), 0);
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn profile_mismatch_is_rejected_before_any_service_call() {
+        let pki = TestPki::new();
+        let scope = test_scope();
+        let client_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/client";
+        let voter_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/voter";
+        let service = Arc::new(CountingNetworkFacade::default());
+        let (handle, address) = ManagedProviderJobServer::for_test(
+            service.clone(),
+            pki.server_config(voter_identity),
+            scope,
+            SpiffeId::new(voter_identity).expect("voter SPIFFE identity"),
+            SpiffeId::new(client_identity).expect("client SPIFFE identity"),
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("real host-local listener");
+        let client = pki.client_config(client_identity);
+        let mut config = client.rustls_config().as_ref().clone();
+        config.alpn_protocols = vec![MANAGED_PROVIDER_JOB_ALPN.to_vec()];
+        let stream = TcpStream::connect(address).await.expect("loopback connect");
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(ServerName::IpAddress(address.ip().into()), stream)
+            .await
+            .expect("real rustls mTLS handshake");
+        let mismatch = WireRequest::Hello(WireHello {
+            transport_revision: MANAGED_PROVIDER_JOB_TRANSPORT_REVISION,
+            semantic_revision: MANAGED_PROVIDER_JOB_SEMANTIC_REVISION,
+            scope,
+            profile_digest: profile_digest(),
+            request_frame_size: (MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES - 1) as u32,
+            response_frame_size: MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES as u32,
+            expected_voter: voter_identity.to_owned(),
+        });
+        let bytes = serde_json::to_vec(&mismatch).expect("test hello encoding");
+        write_raw(&mut tls, &bytes).await.expect("mismatch written");
+        let _ = tokio::time::timeout(Duration::from_millis(100), tls.read_u8()).await;
+        assert_eq!(service.calls.load(AtomicOrdering::Relaxed), 0);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn listener_rejects_an_unrepresentable_permit_count() {
+        let pki = TestPki::new();
+        let scope = test_scope();
+        let client_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/client";
+        let voter_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/voter";
+        let server = ManagedProviderJobServer::for_test(
+            Arc::new(NoopNetworkFacade),
+            pki.server_config(voter_identity),
+            scope,
+            SpiffeId::new(voter_identity).expect("voter SPIFFE identity"),
+            SpiffeId::new(client_identity).expect("client SPIFFE identity"),
+        )
+        .with_max_connections(MAX_MANAGED_PROVIDER_SERVER_CONNECTIONS.saturating_add(1));
+        assert!(server
+            .listen("127.0.0.1:0".parse().expect("loopback address"))
+            .await
+            .is_err());
     }
 }
