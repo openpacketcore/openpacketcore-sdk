@@ -102,7 +102,7 @@ impl SessionConsumerIdentity {
     /// A consumer identity is admitted only after mTLS SPIFFE authorization.
     /// The commitment deliberately preserves neither the SPIFFE text nor any
     /// certificate/key material in request, receipt, or diagnostic surfaces.
-    pub(crate) fn spiffe_identity_commitment(&self) -> [u8; 32] {
+    pub fn spiffe_identity_commitment(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
 
         let mut digest = Sha256::new();

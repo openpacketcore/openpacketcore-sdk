@@ -743,6 +743,15 @@ where
             .await
         {
             Ok(_) if outcome == FencedMutationRosterProviderOutcome::NotAppliedReconciled => {
+                // A verified NotApplied receipt is an operation-wide terminal
+                // decision, not merely one member's result. Commit the
+                // absorbing replicated abort before exposing fresh-admission
+                // semantics, so no sibling can obtain an effect-start permit
+                // through a retry, failover, reopen, or snapshot recovery.
+                self.store
+                    .abort_not_applied(id, self.authority)
+                    .await
+                    .map_err(|_| ManagedProviderJobError::Unavailable)?;
                 Err(ManagedProviderJobError::FreshAdmissionRequired)
             }
             Ok(_) => self
@@ -902,6 +911,7 @@ mod tests {
 
     struct Provider {
         executes: AtomicUsize,
+        execute_outcome: FencedMutationRosterProviderOutcome,
         status: ManagedProviderMemberStatus,
         adopts: AtomicUsize,
     }
@@ -917,7 +927,7 @@ mod tests {
             self.executes.fetch_add(1, Ordering::Relaxed);
             FencedMutationRosterMemberAttestation::new(
                 context,
-                FencedMutationRosterProviderOutcome::AppliedExecuted,
+                self.execute_outcome,
                 Box::new([0xa5]),
             )
             .map_err(|_| unreachable!("fixed test attestation is valid"))
@@ -1102,6 +1112,7 @@ mod tests {
         }));
         let provider = Provider {
             executes: AtomicUsize::new(0),
+            execute_outcome: FencedMutationRosterProviderOutcome::AppliedExecuted,
             status: ManagedProviderMemberStatus::Inconclusive,
             adopts: AtomicUsize::new(0),
         };
@@ -1125,6 +1136,7 @@ mod tests {
         }));
         let provider = Provider {
             executes: AtomicUsize::new(0),
+            execute_outcome: FencedMutationRosterProviderOutcome::AppliedExecuted,
             status: ManagedProviderMemberStatus::Established,
             adopts: AtomicUsize::new(0),
         };
@@ -1150,6 +1162,7 @@ mod tests {
         }));
         let provider = Provider {
             executes: AtomicUsize::new(0),
+            execute_outcome: FencedMutationRosterProviderOutcome::AppliedExecuted,
             status: ManagedProviderMemberStatus::NotApplied,
             adopts: AtomicUsize::new(0),
         };
@@ -1165,6 +1178,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn directly_verified_not_applied_commits_abort_before_returning_fresh_admission() {
+        let store = Store(Mutex::new(State {
+            mode: ManagedProviderJobMode::ManagedV5,
+            phase: ManagedProviderJobMemberPhase::Ready,
+            lose_record_ack: false,
+        }));
+        let provider = Provider {
+            executes: AtomicUsize::new(0),
+            execute_outcome: FencedMutationRosterProviderOutcome::NotAppliedReconciled,
+            status: ManagedProviderMemberStatus::Inconclusive,
+            adopts: AtomicUsize::new(0),
+        };
+        let result = coordinator(&store, &provider)
+            .run_member(
+                &admission(),
+                &[],
+                FencedMutationRosterOrdinal::new(0).expect("ordinal"),
+            )
+            .await;
+
+        assert_eq!(result, Err(ManagedProviderJobError::FreshAdmissionRequired));
+        assert_eq!(provider.executes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            store.0.lock().expect("test state lock").phase,
+            ManagedProviderJobMemberPhase::Aborted,
+            "fresh-admission response is never released before the abort latch commits"
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_receipt_write_is_resolved_by_status_without_provider_replay() {
         let store = Store(Mutex::new(State {
             mode: ManagedProviderJobMode::ManagedV5,
@@ -1173,6 +1216,7 @@ mod tests {
         }));
         let provider = Provider {
             executes: AtomicUsize::new(0),
+            execute_outcome: FencedMutationRosterProviderOutcome::AppliedExecuted,
             status: ManagedProviderMemberStatus::Inconclusive,
             adopts: AtomicUsize::new(0),
         };

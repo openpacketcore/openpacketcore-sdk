@@ -5647,7 +5647,10 @@ fn managed_provider_outcome_matches_intent(
         }
         SessionMutationIntent::RecordManagedProviderReceipt { .. } => {
             !outcome.execute
-                && matches!((outcome.mode, outcome.phase), (2, 2) | (1, 0..=5) | (3, 4))
+                && matches!(
+                    (outcome.mode, outcome.phase),
+                    (2, 2 | 5) | (1, 0..=5) | (3, 4)
+                )
         }
         SessionMutationIntent::RequireManagedProviderReconciliation { .. } => {
             !outcome.execute

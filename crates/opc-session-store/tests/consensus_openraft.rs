@@ -17,24 +17,39 @@ use opc_key::{
     KeyPurpose, MemoryKeyProvider, SessionAad, Zeroizing, AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN,
     AES_256_GCM_SIV_NONCE_LEN,
 };
+use opc_session_store::fenced_mutation_roster::{
+    FencedMutationRosterAdoption, FencedMutationRosterDescriptor, FencedMutationRosterDisposition,
+    FencedMutationRosterOrdinal,
+};
 use opc_session_store::{
-    AtomicFencedTransitionCapability, Clock, CompareAndSet, CompareAndSetResult,
-    ConsensusSessionStore, DurableReadinessReport, DurableReadinessScope, DurableReadinessState,
-    DurableRecoveryState, EncryptedSessionPayload, EncryptingSessionBackend, FenceToken,
-    FencedTransitionLease, FencedTransitionMutation, FencedTransitionMutationResult,
-    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus, Generation,
-    LeaseError, ObservedPhysicalNodeIdentity, OwnerId, QuorumReplicaDescriptor,
-    QuorumTopologyAttestor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
-    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationOp, RestoreScanRequest,
-    SessionBackend, SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
-    SessionConsensusWireResponse, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-    SessionPayloadEncoding, SessionStorePlatformProfile, SqliteSessionBackend, StateClass,
-    StateType, StoreError, StoredSessionRecord, SystemClock, TopologyAttestationClaims,
-    TopologyAttestationEvidence, TopologyAttestationPolicy, TopologyAttestationProvenance,
-    TopologyAttestationResult, TopologyAttestationTime, TopologyAttestationVerificationError,
-    TopologyAttestationVerificationInput, TopologyCollectorId, ValidatedQuorumTopology,
-    VerifiedQuorumTopologyAttestation, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    derive_fenced_mutation_roster_scope, AtomicFencedTransitionCapability, Clock, CompareAndSet,
+    CompareAndSetResult, ConsensusSessionStore, DurableReadinessReport, DurableReadinessScope,
+    DurableReadinessState, DurableRecoveryState, EncryptedSessionPayload, EncryptingSessionBackend,
+    FenceToken, FencedMutationRosterAdmission, FencedMutationRosterFenceIntent,
+    FencedMutationRosterMember, FencedMutationRosterMemberAttestation,
+    FencedMutationRosterMemberAttestationError, FencedMutationRosterMemberAttestationVerifier,
+    FencedMutationRosterMemberExecutionContext, FencedMutationRosterMembers,
+    FencedMutationRosterOperationId, FencedMutationRosterProtectedPlan,
+    FencedMutationRosterProtectedResult, FencedMutationRosterProviderOutcome,
+    FencedMutationRosterScope, FencedTransitionLease, FencedTransitionMutation,
+    FencedTransitionMutationResult, FencedTransitionRequest, FencedTransitionRequestId,
+    FencedTransitionStatus, Generation, LeaseError, ManagedProviderJobError,
+    ManagedProviderJobMemberPhase, ManagedProviderJobMode, ManagedProviderJobRemoteProvider,
+    ManagedProviderMemberStatusEvidence, ObservedPhysicalNodeIdentity, OwnerId,
+    QuorumReplicaDescriptor, QuorumTopologyAttestor, QuorumTopologyConfig, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationOp,
+    RestoreScanRequest, SessionBackend, SessionConsensusNodeId, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerIdentity,
+    SessionConsumerScope, SessionConsumerV3Operation, SessionConsumerV3Request,
+    SessionConsumerV3Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionPayloadEncoding, SessionQuorumConsumer, SessionStorePlatformProfile,
+    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord, SystemClock,
+    TopologyAttestationClaims, TopologyAttestationEvidence, TopologyAttestationPolicy,
+    TopologyAttestationProvenance, TopologyAttestationResult, TopologyAttestationTime,
+    TopologyAttestationVerificationError, TopologyAttestationVerificationInput,
+    TopologyCollectorId, ValidatedQuorumTopology, VerifiedQuorumTopologyAttestation,
+    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use rusqlite::OptionalExtension;
@@ -78,6 +93,168 @@ const PLAINTEXT_CANARY_AFTER_ROTATION: &[u8] =
     b"opc-session-consensus-plaintext-canary-after-key-rotation";
 const RAW_KEY_MATERIAL_CANARY: &[u8; AES_256_GCM_SIV_KEY_LEN] = &[0x5a; AES_256_GCM_SIV_KEY_LEN];
 
+/// A deterministic boundary double for the public durable-store adapter
+/// tests below.  This deliberately does not model a remote mTLS provider;
+/// the session-net qualification owns that transport proof.
+#[derive(Clone)]
+struct ManagedProviderAdapterDouble {
+    execute_outcome: Option<FencedMutationRosterProviderOutcome>,
+    status_outcome: AdapterStatusOutcome,
+    execute_calls: Arc<AtomicUsize>,
+    status_calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum AdapterStatusOutcome {
+    Inconclusive,
+    NotApplied,
+}
+
+impl ManagedProviderAdapterDouble {
+    fn applied() -> Self {
+        Self {
+            execute_outcome: Some(FencedMutationRosterProviderOutcome::AppliedExecuted),
+            status_outcome: AdapterStatusOutcome::Inconclusive,
+            execute_calls: Arc::new(AtomicUsize::new(0)),
+            status_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn inconclusive() -> Self {
+        Self {
+            execute_outcome: None,
+            status_outcome: AdapterStatusOutcome::Inconclusive,
+            execute_calls: Arc::new(AtomicUsize::new(0)),
+            status_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn not_applied() -> Self {
+        Self {
+            execute_outcome: None,
+            status_outcome: AdapterStatusOutcome::NotApplied,
+            execute_calls: Arc::new(AtomicUsize::new(0)),
+            status_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn attestation(
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+        outcome: FencedMutationRosterProviderOutcome,
+    ) -> Result<FencedMutationRosterMemberAttestation, ()> {
+        FencedMutationRosterMemberAttestation::new(context, outcome, Box::new([0x5a]))
+            .map_err(|_| ())
+    }
+}
+
+#[async_trait]
+impl ManagedProviderJobRemoteProvider for ManagedProviderAdapterDouble {
+    type Error = ();
+
+    async fn execute_member(
+        &self,
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+    ) -> Result<FencedMutationRosterMemberAttestation, Self::Error> {
+        self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        self.execute_outcome
+            .ok_or(())
+            .and_then(|outcome| Self::attestation(context, outcome))
+    }
+
+    async fn member_status(
+        &self,
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+    ) -> Result<ManagedProviderMemberStatusEvidence, Self::Error> {
+        self.status_calls.fetch_add(1, Ordering::SeqCst);
+        match self.status_outcome {
+            AdapterStatusOutcome::Inconclusive => {
+                Ok(ManagedProviderMemberStatusEvidence::Inconclusive)
+            }
+            AdapterStatusOutcome::NotApplied => Ok(ManagedProviderMemberStatusEvidence::attested(
+                Self::attestation(
+                    context,
+                    FencedMutationRosterProviderOutcome::NotAppliedReconciled,
+                )?,
+            )),
+        }
+    }
+
+    async fn adopt_member(
+        &self,
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+        _status: opc_session_store::ManagedProviderMemberStatus,
+    ) -> Result<FencedMutationRosterMemberAttestation, Self::Error> {
+        Self::attestation(context, FencedMutationRosterProviderOutcome::AppliedAdopted)
+    }
+}
+
+struct ManagedProviderAdapterVerifier;
+
+#[async_trait]
+impl FencedMutationRosterMemberAttestationVerifier for ManagedProviderAdapterVerifier {
+    async fn verify_member_attestation(
+        &self,
+        _identity: &SessionConsumerIdentity,
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+        attestation: &FencedMutationRosterMemberAttestation,
+    ) -> Result<FencedMutationRosterProviderOutcome, FencedMutationRosterMemberAttestationError>
+    {
+        attestation
+            .validate_for(context)
+            .map_err(|_| FencedMutationRosterMemberAttestationError::Rejected)?;
+        Ok(attestation.outcome())
+    }
+}
+
+fn managed_provider_adapter_admission(
+    operation_byte: u8,
+    member_count: usize,
+) -> FencedMutationRosterAdmission {
+    let members = (0..member_count)
+        .map(|index| {
+            FencedMutationRosterMember::new(
+                FencedMutationRosterOrdinal::new(
+                    u8::try_from(index).expect("bounded test ordinal"),
+                )
+                .expect("valid test ordinal"),
+                [operation_byte.wrapping_add(u8::try_from(index).expect("member byte")); 16],
+                FencedMutationRosterDescriptor::new(Vec::new()).expect("empty descriptor"),
+                1,
+                1,
+                FencedMutationRosterDisposition::Pending,
+                FencedMutationRosterAdoption::Unreconciled,
+            )
+            .expect("valid adapter member")
+        })
+        .collect::<Vec<_>>();
+    let members = match members.as_slice() {
+        [first] => FencedMutationRosterMembers::new([first.clone()]),
+        [first, second] => FencedMutationRosterMembers::new([first.clone(), second.clone()]),
+        _ => unreachable!("adapter coverage uses one or two members"),
+    }
+    .expect("valid adapter manifest");
+    FencedMutationRosterAdmission::new(
+        1,
+        FencedMutationRosterOperationId::new([operation_byte; 16]).expect("test operation ID"),
+        FencedMutationRosterScope::from_digest([operation_byte; 32]),
+        FencedMutationRosterFenceIntent::new(
+            OwnerId::new(format!("managed-adapter-owner-{operation_byte:02x}"))
+                .expect("test owner"),
+            FenceToken::new(1),
+        ),
+        Generation::new(1),
+        members,
+        FencedMutationRosterProtectedPlan::new(Box::new([operation_byte]))
+            .expect("test protected plan"),
+    )
+    .expect("valid adapter admission")
+    .with_terminal_result(
+        FencedMutationRosterProtectedResult::new(Box::new([operation_byte.wrapping_add(1)]))
+            .expect("test protected result"),
+    )
+    .expect("valid terminal result")
+}
+
 #[derive(Clone, Copy)]
 struct AppendEntriesRequestDelay {
     request_id: [u8; 16],
@@ -87,6 +264,7 @@ struct AppendEntriesRequestDelay {
 #[derive(Clone)]
 struct LoopbackPeer {
     target: SessionConsensusNodeId,
+    identity: ConsensusIdentity,
     handler: Arc<StdRwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
     forward_mutation_calls: Arc<AtomicUsize>,
@@ -102,9 +280,10 @@ struct LoopbackPeer {
 }
 
 impl LoopbackPeer {
-    fn new(target: SessionConsensusNodeId) -> Self {
+    fn new(target: SessionConsensusNodeId, identity: ConsensusIdentity) -> Self {
         Self {
             target,
+            identity,
             handler: Arc::new(StdRwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
             forward_mutation_calls: Arc::new(AtomicUsize::new(0)),
@@ -278,6 +457,10 @@ impl SessionConsensusRpcHandler for RejectFencedTransitionCapabilityProbeHandler
 impl SessionConsensusPeer for LoopbackPeer {
     fn node_id(&self) -> SessionConsensusNodeId {
         self.target
+    }
+
+    fn scope_identity(&self) -> Option<ConsensusIdentity> {
+        Some(self.identity)
     }
 
     async fn call(
@@ -508,12 +691,19 @@ impl TestCluster {
                     .expect("consensus node ID")
             })
             .collect::<Vec<_>>();
+        let identity = topologies
+            .first()
+            .and_then(ValidatedQuorumTopology::consensus_identity)
+            .expect("consensus identity");
 
         let mut paths = BTreeMap::new();
         for source in 0..MEMBER_COUNT {
             for (target, node_id) in node_ids.iter().copied().enumerate() {
                 if source != target {
-                    paths.insert((source, target), Arc::new(LoopbackPeer::new(node_id)));
+                    paths.insert(
+                        (source, target),
+                        Arc::new(LoopbackPeer::new(node_id, identity)),
+                    );
                 }
             }
         }
@@ -5203,4 +5393,284 @@ async fn committed_write_with_a_late_forward_result_is_typed_ambiguous_and_appli
     }
 
     panic!("no follower path was exercised while forward results were delayed");
+}
+
+#[tokio::test]
+async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_three_voter_store() {
+    // This is intentionally non-qualifying store-adapter evidence. It uses
+    // file-backed SQLite and public OpenRaft APIs, but deterministic local
+    // provider/verifier doubles rather than the authenticated mTLS network
+    // transport qualified in the dedicated session-net lane.
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let scope = cluster.stores[leader]
+        .consumer_scope()
+        .expect("current consumer scope");
+    let worker = SessionConsumerIdentity::new("spiffe://managed-adapter/worker")
+        .expect("test worker identity");
+    // The roster ledger is independently rooted in a current fenced-
+    // transition receipt. Seed that exact public prerequisite before the V3
+    // roster activation; no private backend or test-only admission path is
+    // used here.
+    let (fenced_transition_activation, _) = fenced_acquire_create_request(
+        session_key(b"managed-provider-facade-roster-activation"),
+        owner("managed-provider-facade-roster-activation"),
+        FenceToken::new(0),
+        [0x6f; 16],
+        Duration::from_secs(30),
+        b"managed-provider-facade-roster-activation",
+    );
+    cluster.stores[leader]
+        .fenced_transition(fenced_transition_activation)
+        .await
+        .expect("activate exact current fenced-transition receipt ledger");
+    let capability = cluster.stores[leader]
+        .fenced_mutation_roster_history_state()
+        .await;
+    assert!(
+        capability.is_ok(),
+        "public roster capability before activation: {capability:?}"
+    );
+
+    // Seed the exact current V2 roster activation through the public
+    // consumer adapter. Managed V5 subsequently performs its own fresh V5
+    // all-voter probe before every proposal; neither certificate can stand in
+    // for the other.
+    let activation_identity = SessionConsumerIdentity::new("spiffe://managed-adapter/activation")
+        .expect("activation identity");
+    let activation_admission = managed_provider_adapter_admission(0x70, 1).with_scope(
+        derive_fenced_mutation_roster_scope(
+            activation_identity.spiffe_identity_commitment(),
+            scope,
+        ),
+    );
+    let activation = cluster.stores[leader]
+        .consumer_service()
+        .execute_v3(
+            &activation_identity,
+            SessionConsumerV3Request::new(
+                scope,
+                SessionConsumerV3Operation::FencedMutationRosterAdmit {
+                    admission: Box::new(activation_admission.clone()),
+                },
+            ),
+        )
+        .await;
+    match activation {
+        SessionConsumerV3Response::FencedMutationRosterAdmit(Ok(_)) => {}
+        SessionConsumerV3Response::Rejected(rejection) => {
+            panic!("exact public roster activation rejected: {rejection:?}")
+        }
+        other => panic!("exact public roster activation failed: {other:?}"),
+    }
+
+    // All matching members: Ensure, Start, Record, and Finalize report the
+    // committed status through the public facade, including a partial
+    // verification before the second member establishes the roster.
+    let applied = ManagedProviderAdapterDouble::applied();
+    let all_match = cluster.stores[leader]
+        .managed_provider_job_facade(
+            scope,
+            worker.clone(),
+            [0x81; 32],
+            [0x82; 32],
+            applied.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct fixed facade");
+    let all_match_admission = managed_provider_adapter_admission(0x80, 2);
+    let checkpoint: Box<[u8]> = Box::new([0x83]);
+    let first_result = all_match
+        .run_member(
+            all_match_admission.clone(),
+            checkpoint.clone(),
+            FencedMutationRosterOrdinal::new(0).expect("first ordinal"),
+        )
+        .await;
+    assert_eq!(
+        first_result,
+        Err(ManagedProviderJobError::Unavailable),
+        "incomplete finalization is not a committed Finalize result"
+    );
+    assert_eq!(
+        applied.execute_calls.load(Ordering::SeqCst),
+        1,
+        "first member receives the sole effect-start permit"
+    );
+    assert_eq!(
+        all_match
+            .job_status(
+                all_match_admission.clone(),
+                FencedMutationRosterOrdinal::new(0).expect("first ordinal"),
+            )
+            .await
+            .expect("public partial verification status")
+            .phase(),
+        ManagedProviderJobMemberPhase::Verified,
+        "one verified member remains an exact nonterminal partial result"
+    );
+    let established_result = all_match
+        .run_member(
+            all_match_admission.clone(),
+            checkpoint.clone(),
+            FencedMutationRosterOrdinal::new(1).expect("second ordinal"),
+        )
+        .await;
+    assert_eq!(
+        applied.execute_calls.load(Ordering::SeqCst),
+        2,
+        "second member receives its independent effect-start permit"
+    );
+    let established = established_result.expect("second member finalizes matching roster");
+    assert_eq!(established.mode(), ManagedProviderJobMode::ManagedV5);
+    assert_eq!(
+        established.phase(),
+        ManagedProviderJobMemberPhase::Established
+    );
+    assert_eq!(applied.execute_calls.load(Ordering::SeqCst), 2);
+    let _ = all_match_admission;
+
+    // An indeterminate recovered effect is the exact committed
+    // RequireReconciliation outcome, not an additional provider execution.
+    let inconclusive = ManagedProviderAdapterDouble::inconclusive();
+    let reconciliation = cluster.stores[leader]
+        .managed_provider_job_facade(
+            scope,
+            worker.clone(),
+            [0x91; 32],
+            [0x92; 32],
+            inconclusive.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct reconciliation facade");
+    let reconciliation_admission = managed_provider_adapter_admission(0x90, 1);
+    let ordinal = FencedMutationRosterOrdinal::new(0).expect("only ordinal");
+    assert_eq!(
+        reconciliation
+            .run_member(reconciliation_admission.clone(), Box::new([0x93]), ordinal)
+            .await,
+        Err(ManagedProviderJobError::ReconciliationRequired),
+        "an unavailable initial effect leaves a durable recovery row"
+    );
+    let executions_before_recovery = inconclusive.execute_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        reconciliation
+            .run_member(reconciliation_admission.clone(), Box::new([0x93]), ordinal)
+            .await,
+        Err(ManagedProviderJobError::ReconciliationRequired),
+        "the recovered inconclusive status commits RequireReconciliation"
+    );
+    assert_eq!(
+        inconclusive.execute_calls.load(Ordering::SeqCst),
+        executions_before_recovery,
+        "recovery never repeats the durable effect start"
+    );
+    assert_eq!(
+        reconciliation
+            .job_status(reconciliation_admission.clone(), ordinal)
+            .await
+            .expect("public reconciliation status")
+            .phase(),
+        ManagedProviderJobMemberPhase::ReconciliationRequired
+    );
+
+    // The immutable checkpoint is checked before provider I/O.
+    let executes_before_mismatch = inconclusive.execute_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        reconciliation
+            .run_member(reconciliation_admission.clone(), Box::new([0x94]), ordinal)
+            .await,
+        Err(ManagedProviderJobError::Unavailable)
+    );
+    assert_eq!(
+        inconclusive.execute_calls.load(Ordering::SeqCst),
+        executes_before_mismatch,
+        "checkpoint mismatch reaches no provider I/O"
+    );
+
+    // The authenticated scope is checked before a provider call as well.
+    let current = scope.consensus_identity();
+    let stale_scope = SessionConsumerScope::new(ConsensusIdentity::new(
+        current.cluster_id(),
+        current.configuration_id(),
+        ConsensusConfigurationEpoch::new(current.configuration_epoch().get() + 1)
+            .expect("successor epoch"),
+    ));
+    let unauthorized = cluster.stores[leader]
+        .managed_provider_job_facade(
+            stale_scope,
+            worker.clone(),
+            [0xb1; 32],
+            [0xb2; 32],
+            inconclusive.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("factory seals stale scope for pre-I/O rejection");
+    let calls_before_unauthorized = inconclusive.execute_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        unauthorized
+            .run_member(reconciliation_admission, Box::new([0x93]), ordinal)
+            .await,
+        Err(ManagedProviderJobError::Unavailable)
+    );
+    assert_eq!(
+        inconclusive.execute_calls.load(Ordering::SeqCst),
+        calls_before_unauthorized,
+        "unauthorized scope reaches no provider I/O"
+    );
+
+    // Conclusive NotApplied after EffectStarted records the verifier-bound
+    // receipt and invokes the Abort command.  Its replicated abort latch is
+    // roster-wide: sibling start attempts return FreshAdmissionRequired with
+    // no provider execution, including through public status replay.
+    let not_applied = ManagedProviderAdapterDouble::not_applied();
+    let aborting = cluster.stores[leader]
+        .managed_provider_job_facade(
+            scope,
+            SessionConsumerIdentity::new("spiffe://managed-adapter/abort-worker")
+                .expect("abort worker"),
+            [0xc1; 32],
+            [0xc2; 32],
+            not_applied.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct abort facade");
+    let abort_admission = managed_provider_adapter_admission(0xc0, 2);
+    assert_eq!(
+        aborting
+            .run_member(abort_admission.clone(), Box::new([0xc3]), ordinal)
+            .await,
+        Err(ManagedProviderJobError::ReconciliationRequired),
+        "first unavailable effect durably starts only the first member"
+    );
+    assert_eq!(
+        aborting
+            .run_member(abort_admission.clone(), Box::new([0xc3]), ordinal)
+            .await,
+        Err(ManagedProviderJobError::FreshAdmissionRequired),
+        "verified NotApplied commits the absorbing abort outcome"
+    );
+    let calls_before_sibling = not_applied.execute_calls.load(Ordering::SeqCst);
+    let sibling = aborting
+        .run_member(
+            abort_admission.clone(),
+            Box::new([0xc3]),
+            FencedMutationRosterOrdinal::new(1).expect("sibling ordinal"),
+        )
+        .await
+        .expect("the replicated latch reports its committed aborted outcome");
+    assert_eq!(sibling.phase(), ManagedProviderJobMemberPhase::Aborted);
+    assert_eq!(
+        not_applied.execute_calls.load(Ordering::SeqCst),
+        calls_before_sibling,
+        "abort latch reaches no sibling provider I/O"
+    );
+    assert_eq!(
+        aborting
+            .job_status(abort_admission, ordinal)
+            .await
+            .expect("public aborted status")
+            .phase(),
+        ManagedProviderJobMemberPhase::Aborted
+    );
 }
