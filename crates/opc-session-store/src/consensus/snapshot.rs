@@ -696,12 +696,14 @@ mod tests {
     use std::io;
     #[cfg(target_os = "linux")]
     use std::io::{Read as _, Write as _};
+    use std::pin::Pin;
     use std::sync::Arc;
 
     #[cfg(target_os = "linux")]
     use super::{PinnedSqliteFile, UnpublishedSnapshotArtifact};
     use super::{SessionSnapshotFile, SnapshotArtifactGate};
     use tempfile::tempdir;
+    use tokio::io::AsyncSeek as _;
     use tokio::io::AsyncWriteExt as _;
 
     #[cfg(target_os = "linux")]
@@ -825,6 +827,29 @@ mod tests {
             .await
             .err()
             .ok_or("rewound receive accepted an overwrite")?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        snapshot.sync_all().await?;
+        assert_eq!(snapshot.metadata().await?.len(), original.len() as u64);
+        assert_eq!(std::fs::read(path)?, original);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receiving_snapshot_cancelled_seek_rejects_overwriting_written_bytes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming.part");
+        let original = b"original snapshot";
+        let mut snapshot = SessionSnapshotFile::create(path.clone()).await?;
+        snapshot.write_all(original).await?;
+        snapshot.sync_all().await?;
+        Pin::new(&mut snapshot).start_seek(io::SeekFrom::Start(0))?;
+
+        let error = snapshot
+            .write_all(b"overwritten bytes")
+            .await
+            .err()
+            .ok_or("cancelled receive seek accepted an overwrite")?;
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         snapshot.sync_all().await?;
         assert_eq!(snapshot.metadata().await?.len(), original.len() as u64);
